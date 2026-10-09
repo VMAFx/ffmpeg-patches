@@ -1,0 +1,130 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Reusable release build. It packages the series with `make dist`, writes an
+# SPDX SBOM and attests SLSA build provenance in the same job, so this
+# workflow's identity signs the attestation, isolated from the caller (SLSA
+# Build Level 3). It then signs SHA256SUMS keyless with cosign and uploads
+# everything for the caller's publish job. Nothing is downloaded or restored
+# from a cache before the attestation. release.yml is the only caller.
+#
+# A tag is vX.Y.Z or vX.Y.Z-rc.N; the tag step refuses any other shape, and
+# the `prerelease` output tells the publish job which kind of release to make.
+name: Release build
+
+'on':
+  workflow_call:
+    outputs:
+      artifact-name:
+        description: Name of the uploaded artefact that holds the release files
+        value: ${{ jobs.build.outputs.artifact-name }}
+      version:
+        description: Version the release files carry in their names
+        value: ${{ jobs.build.outputs.version }}
+      prerelease:
+        description: '"true" for vX.Y.Z-rc.N, "false" for vX.Y.Z, empty without a tag'
+        value: ${{ jobs.build.outputs.prerelease }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: release build (dist · SBOM · provenance · cosign)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      artifact-name: ${{ steps.package.outputs.artifact-name }}
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - name: Release tag shape
+        id: tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            # A manual run builds, attests and signs, but publish never runs.
+            echo "version=run-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          n='(0|[1-9][0-9]*)'
+          if [[ "$GITHUB_REF_NAME" =~ ^v$n\.$n\.$n$ ]]; then
+            prerelease=false
+          elif [[ "$GITHUB_REF_NAME" =~ ^v$n\.$n\.$n-rc\.[1-9][0-9]*$ ]]; then
+            prerelease=true
+          else
+            echo "::error::tag ${GITHUB_REF_NAME} is neither vX.Y.Z nor vX.Y.Z-rc.N"
+            exit 1
+          fi
+          echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+      - name: Series check
+        run: python3 scripts/series.py check
+      - name: Package the series
+        id: package
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          make dist VERSION="$VERSION"
+          python3 scripts/series.py notes "$VERSION" "$GITHUB_REPOSITORY" > dist/RELEASE_NOTES.md
+          echo "artifact-name=ffmpeg-patches-release-${VERSION}" >> "$GITHUB_OUTPUT"
+      - name: SBOM of the release tarball (SPDX JSON)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          file: dist/ffmpeg-patches-${{ steps.tag.outputs.version }}.tar.gz
+          format: spdx-json
+          output-file: dist/ffmpeg-patches-${{ steps.tag.outputs.version }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Checksums
+        working-directory: dist
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          sha256sum "ffmpeg-patches-${VERSION}.tar.gz" "ffmpeg-patches-${VERSION}.spdx.json" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Attest build provenance (SLSA v1.0)
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/ffmpeg-patches-${{ steps.tag.outputs.version }}.tar.gz
+            dist/ffmpeg-patches-${{ steps.tag.outputs.version }}.spdx.json
+      - name: Keep the provenance bundle with the release files
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: cp "$BUNDLE" "dist/ffmpeg-patches-${VERSION}.provenance.sigstore.json"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign SHA256SUMS (keyless)
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      - name: Verify the SHA256SUMS signature
+        working-directory: dist
+        run: |
+          cosign verify-blob \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-build.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --bundle SHA256SUMS.sigstore.json \
+            SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Upload the release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.artifact-name }}
+          path: dist/
+          if-no-files-found: error

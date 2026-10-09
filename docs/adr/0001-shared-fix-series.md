@@ -50,7 +50,9 @@ Checks:
   merged with different surrounding context.
 
 Releases are tagged; a consumer pins the tag and the sha256 of the series
-tarball. The release workflow is a separate change.
+tarball. A reusable workflow builds the tarball, its SBOM and its SLSA
+provenance in one job and signs the checksums with cosign, which meets the
+declared supply chain (SLSA Build Level 3) without an exception.
 
 ## Consequences
 
