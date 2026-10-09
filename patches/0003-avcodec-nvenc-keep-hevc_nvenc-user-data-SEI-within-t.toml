@@ -1,0 +1,14 @@
+status = "unsubmitted"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/24972"
+consumers = ["pelorus"]
+origin = "VMAFx/pelorus 7a496107c9a2 ffmpeg-patches/0022-nvenc-pelorus-udu-sei.patch, generic part"
+notes = """
+Pelorus keeps its blob map stripping as a patch on top: it shortens the \
+copied payload right before nvenc_hevc_sei_fits(). nvenc_sei_nal_size() \
+matches Pelorus pel_sei_nal_bytes() on 200000 random payloads and models \
+what the NVENC cap counts (Annex B, emulation prevention included). \
+Checked on an RTX 4090, driver 615.78.08, by the Pelorus GPU lane. \
+Separate NVENC defect, stock FFmpeg too and not handled here: some \
+zero-heavy SEI payloads are written truncated (one run of 63 or more zero \
+bytes, or several shorter runs); the exact rule is unknown. Link the pull \
+request here once it is open."""
