@@ -22,13 +22,11 @@ git push origin HEAD:refs/heads/paperclip/<issue-id>
 
 ## High-Integrity Invariants
 
-- HISS-01: recursion prohibited; call graph = DAG; Go, C/C++: zero `goto`
-- HISS-02: scalar upper bound on every loop; explicit deadline on every I/O
-  call; Go: I/O takes `context.Context` deadline
+- HISS-01: recursion prohibited; call graph = DAG
+- HISS-02: scalar upper bound on every loop; explicit deadline on every I/O call
 - HISS-04: McCabe cyclomatic <= 10, cognitive <= 12, statements <= 40; func
   LOC <= 60 (audit ceiling)
-- HISS-07: every error handled or wrapped with context; Go: zero unchecked
-  `error` return; Rust: zero `.unwrap()` / `.expect()` outside tests
+- HISS-07: every error handled or wrapped with context
 - HISS-10: zero warnings: compiler, linter, format sweeps
 - HISS-15: positive + negative + boundary tests, every public interface
 - HISS-16: single canonical `AGENTS.md`; vendor files compiled via `praetorctl

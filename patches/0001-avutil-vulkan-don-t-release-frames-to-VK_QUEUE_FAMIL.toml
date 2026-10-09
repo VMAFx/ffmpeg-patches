@@ -1,0 +1,8 @@
+status = "submitted"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970"
+consumers = ["pelorus"]
+origin = "VMAFx/pelorus 7a496107c9a2 ffmpeg-patches/0021-vulkan-frame-barrier-queue-family.patch"
+notes = """
+The pull request targets FFmpeg master, where the same change applies with \
+different context (master a50d8c7c58 reworked the barrier's source access). \
+This patch is its n9.0.2 form with the pull request's commit message."""

@@ -1,0 +1,7 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx"]
+origin = "VMAFx/vmafx c61115a0723e ffmpeg-patches/0019-ffmpeg-eliminate-gcc-14-build-diagnostics.patch"
+notes = """
+Touches 50 files in libavcodec, libavfilter, libavformat, libswresample, \
+tests and tools; an upstream submission needs one patch per area."""

@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Nightly report of the series against FFmpeg master. Consumers stay on the
+# pinned release, so a conflict here is information for the next base bump,
+# and a patch whose added lines already stand in master is a drop candidate.
+# The run fails only when the tool itself cannot run (exit status 2).
+name: series on FFmpeg master
+
+'on':
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  master:
+    name: series on FFmpeg master (conflicts · drop candidates)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - name: Load the pinned base
+        run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
+      - name: Fetch FFmpeg master and the pinned release
+        # The release's blobs let git am --3way rebuild each patch's preimage.
+        run: |
+          git init -q ffmpeg
+          git -C ffmpeg remote add origin "$FFMPEG_REMOTE"
+          git -C ffmpeg fetch -q --depth=1 origin \
+            master "refs/tags/${FFMPEG_TAG}:refs/tags/${FFMPEG_TAG}"
+          git -C ffmpeg checkout -q --detach FETCH_HEAD
+          git -C ffmpeg log -1 --format='FFmpeg master %H %cs %s'
+      - name: Apply every patch and report
+        run: |
+          status=0
+          python3 scripts/series.py apply --keep-going ffmpeg \
+            --report "$GITHUB_STEP_SUMMARY" > results.txt || status=$?
+          cat results.txt
+          while read -r result name; do
+            case "$result" in
+              conflict) echo "::warning title=Conflict on master::$name" ;;
+              upstream) echo "::warning title=Drop candidate::$name is already in master" ;;
+            esac
+          done < results.txt
+          if [ "$status" -gt 1 ]; then
+            exit "$status"
+          fi
