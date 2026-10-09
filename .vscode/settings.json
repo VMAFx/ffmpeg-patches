@@ -1,0 +1,23 @@
+{
+  "[c]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.formatOnSave": true
+  },
+  "[cpp]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.formatOnSave": true
+  },
+  "antigravity.searchMaxWorkspaceFileCount": 50000,
+  "clangd.arguments": [
+    "--header-insertion=never"
+  ],
+  "clangd.path": "clangd",
+  "files.watcherExclude": {
+    "**/.standards/worktrees/**": true,
+    "**/.workingdir/**": true,
+    "**/.workingdir2/**": true,
+    "**/bin/**": true,
+    "**/dist/**": true
+  },
+  "standards.sentinel.headroomMB": 1024
+}

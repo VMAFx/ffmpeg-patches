@@ -1,0 +1,18 @@
+---
+version: 1
+pinned_version: v0.0.0+catalog.33773a292166
+digest: sha256:135048067384796184442bbdc50ac062b257b6c9de68470bab304ea469dc8c3c
+profiles:
+  - id: native-gpu-systems
+    version: v0.0.0+catalog.33773a292166
+    digest:
+      sha256:9daa1ec1dc2da097e8a11553cc58448102091d018f034e30de891e40277d4e54
+facets:
+  - id: security:high
+    version: v0.0.0+catalog.33773a292166
+    digest:
+      sha256:9bd59f0725d472b1516ba74556feada0e3868f4642bc08dd2d67a2cc26e87778
+  - id: agent:sandboxed
+    version: v0.0.0+catalog.33773a292166
+    digest:
+      sha256:bc87486dea71e54d20549d6054dcf290d3d700e37b304cbdb6d6c1a2def895f2
