@@ -1,0 +1,18 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx", "pelorus"]
+origin = "new; rule measured by the Pelorus GPU lane (RTX 4090, driver 615.78.08)"
+notes = """
+Workaround for an NVENC defect that stock FFmpeg also hits: payloads with \
+more emulation prevention bytes than about a third of their size are written \
+truncated and undecodable. The rule matches 76870 single-payload and 1600 \
+multi-payload hardware cases; nvenc_udu_sei_truncated() matches the Pelorus \
+predicate on 300000 random payloads, the hardware edge table and 50000 \
+multi-payload cases. Checked on an RTX 4090 (driver 615.78.08) by the Pelorus GPU lane: 512 of \
+516 entry outcomes match an independent model, the 4 others being stock \
+hevc IDR pictures over the 1024 B cap; written NAL units complete and \
+decodable, A/53 unaffected, untouched output byte-identical to stock. \
+Refactors the 0003 escape-byte loop into nvenc_sei_epb_count() without \
+changing 0003's result. Drop once NVIDIA \
+fixes the driver and the fixed driver is the minimum FFmpeg supports. \
+Report the defect to NVIDIA and note it on FFmpeg issue #24972."""

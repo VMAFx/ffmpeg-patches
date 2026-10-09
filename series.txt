@@ -8,3 +8,4 @@
 0001-avutil-vulkan-don-t-release-frames-to-VK_QUEUE_FAMIL.patch
 0002-build-eliminate-GCC-14-and-16-diagnostics.patch
 0003-avcodec-nvenc-keep-hevc_nvenc-user-data-SEI-within-t.patch
+0004-avcodec-nvenc-drop-user-data-SEI-that-NVENC-would-wr.patch
