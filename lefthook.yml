@@ -1,0 +1,115 @@
+# Lefthook Configuration (Go, Rust & HISS Governance)
+# Go and Rust jobs follow the detected languages; both when none was detected.
+# Governance commands fail closed: a failing or missing praetorctl blocks the
+# commit or push. The pre-commit audit runs --offline; the pre-push audit
+# reads the forge's live Actions state when a token and a github.com origin
+# are present. The pre-push gate job signs a receipt only after a Go
+# (go.mod) or Cargo (Cargo.lock) toolchain stage ran. A root with neither
+# gets no receipt: the job names the languages it could not verify and
+# admits the push; a root with either fails when its stages did not run.
+# REUSE.toml or LICENSES/ was present at adoption: the reuse-lint job runs
+# reuse lint at the release line fsfe/reuse-action@v6 runs in CI.
+# It skips where reuse is not installed and fails on another reuse major.
+---
+agent-checkpoint-tool:
+  commands:
+    checkpoint:
+      run: >-
+        sh .config/lefthook/python.sh -B .config/lefthook/scripts/checkpoint.py
+        --event tool --json --marker
+agent-checkpoint-stop:
+  commands:
+    checkpoint:
+      run: >-
+        sh .config/lefthook/python.sh -B .config/lefthook/scripts/checkpoint.py
+        --event stop --json --marker
+pre-commit:
+  parallel: true
+  commands:
+    gofmt:
+      glob: "*.go"
+      run: gofmt -w {staged_files}
+      stage_fixed: true
+    govet:
+      glob: "*.go"
+      run: >-
+        if [ -f go.mod ]; then go vet ./...; else echo no go.mod at the
+        repository root, skipping go vet >&2; fi
+    rustfmt:
+      glob: "*.rs"
+      run: >-
+        if [ -f Cargo.toml ]; then cargo fmt --all --check; else echo no
+        Cargo.toml at the repository root, skipping cargo fmt >&2; fi
+    clippy:
+      glob: "*.rs"
+      run: >-
+        if [ -f Cargo.toml ]; then cargo clippy --workspace --all-targets -- -D
+        warnings; else echo no Cargo.toml at the repository root, skipping cargo
+        clippy >&2; fi
+    reuse-lint:
+      run: >-
+        if [ -f REUSE.toml ] || [ -d LICENSES ]; then if command -v reuse
+        >/dev/null 2>&1; then if [ x$(reuse --version | head -n 1 | tr -dc 0-9.
+        | cut -d . -f 1) = x6 ]; then reuse lint; else echo reuse 6.x is
+        required, the release line fsfe/reuse-action@v6 runs in CI >&2; exit 1;
+        fi; else echo reuse is not installed, skipping >&2; fi; else echo no
+        REUSE.toml or LICENSES/ at the repository root, skipping reuse lint >&2;
+        fi
+    context-check:
+      run: >-
+        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
+        standardsctl 2>/dev/null); then "$praetor_cli" compile-context --verify;
+        else echo HISS governance hook cannot run because neither praetorctl nor
+        standardsctl is installed >&2; exit 1; fi
+    hiss-audit:
+      run: >-
+        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
+        standardsctl 2>/dev/null); then "$praetor_cli" audit --offline; else
+        echo HISS governance hook cannot run because neither praetorctl nor
+        standardsctl is installed >&2; exit 1; fi
+
+post-commit:
+  commands:
+    state-sync:
+      run: >-
+        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
+        standardsctl 2>/dev/null); then "$praetor_cli" state sync .; else echo
+        HISS governance hook cannot run because neither praetorctl nor
+        standardsctl is installed >&2; exit 1; fi
+    dedupe-cadence:
+      run: >-
+        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
+        standardsctl 2>/dev/null); then "$praetor_cli" dedupe cadence
+        --threshold=20 --record .; else echo HISS governance hook cannot run
+        because neither praetorctl nor standardsctl is installed >&2; exit 1; fi
+
+pre-push:
+  parallel: false
+  commands:
+    security:
+      run: >-
+        if [ -f go.mod ]; then if command -v govulncheck >/dev/null 2>&1; then
+        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
+        standardsctl 2>/dev/null); then "$praetor_cli" security govuln; else
+        echo HISS governance hook cannot run because neither praetorctl nor
+        standardsctl is installed >&2; exit 1; fi; else echo govulncheck is not
+        installed, skipping >&2; fi; else echo no go.mod at the repository root,
+        skipping govulncheck >&2; fi
+    flavor-audit:
+      run: >-
+        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
+        standardsctl 2>/dev/null); then "$praetor_cli" flavor audit .; else echo
+        HISS governance hook cannot run because neither praetorctl nor
+        standardsctl is installed >&2; exit 1; fi
+    audit:
+      run: >-
+        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
+        standardsctl 2>/dev/null); then "$praetor_cli" audit; else echo HISS
+        governance hook cannot run because neither praetorctl nor standardsctl
+        is installed >&2; exit 1; fi
+    gate:
+      run: >-
+        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
+        standardsctl 2>/dev/null); then "$praetor_cli" gate run --path=.
+        --admit-unsupported; else echo HISS governance hook cannot run because
+        neither praetorctl nor standardsctl is installed >&2; exit 1; fi

@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Copyright and licence of every file in the repository. REUSE 3.3 applies only
+# the last table whose path matches a file, so the whole-tree default comes
+# first and every narrower table follows it.
+
+version = 1
+
+# Repository tooling, documentation and the files Praetor manages (agent
+# context projections, governance manifests) are EUPL-1.2. "closest" lets a
+# file's own SPDX header win where it has one.
+[[annotations]]
+path = ["*", ".*", "*/**", ".*/**"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Lusoris"
+SPDX-License-Identifier = "EUPL-1.2"
+
+# The patches change FFmpeg's own LGPL-2.1-or-later sources and carry their
+# context lines, so they keep FFmpeg's licence, and FFmpeg's copyright applies
+# next to the patch author's.
+[[annotations]]
+path = ["patches/*.patch"]
+precedence = "override"
+SPDX-FileCopyrightText = ["2000-2026 the FFmpeg developers", "2026 Lusoris"]
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+
+# The register skills' LICENSE files are the MIT texts of their upstreams,
+# installed byte for byte by Praetor. REUSE does not lint files named LICENSE,
+# so they need no table here.

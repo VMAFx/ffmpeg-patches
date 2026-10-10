@@ -1,0 +1,44 @@
+version: 1
+repository:
+  owner: VMAFx
+  name: ffmpeg-patches
+  forge: github
+  default_branch: main
+  visibility: public
+  description: "Shared FFmpeg fix patch series for VMAFx projects, tracked against FFmpeg master and sent upstream"
+  homepage: ""
+  topics: []
+# Pinned by hand: auto-detection reads the README-only seed as template-seed.
+# Re-adopt with the patch-series archetype once cordanaLLM/praetor#1110 lands.
+profiles:
+  - native-gpu-systems
+facets:
+  - security:high
+  - agent:sandboxed
+overrides:
+  branch_protection:
+    # Solo repository: no second maintainer or review bot can approve yet.
+    review_mode: single_maintainer
+register:
+  sources:
+    expected: 13
+    sha256:
+      sha256:acbff386189fe2604655e7162647e35f1f6b197cc185cd491742e4e0d4867378
+    inputs:
+      - path: .paperclip/harness.json
+        surface: prompts
+        kind: message
+        format: json
+        selector: operating_contract.*
+      - path: .paperclip/harness.json
+        surface: prompts
+        kind: message
+        format: json
+        selector: invariants.*
+# Declared per-file exceptions: one rule, one file, a reason and an expiry at
+# most 90 days ahead; an expired entry fails its gate like a missing one.
+exceptions:
+  - rule: "HISS-11"
+    path: ".github/workflows/release.yml"
+    reason: "no release workflow yet; the series release (tarball, sha256, SLSA 3 provenance, cosign, SBOM) lands with the series layout"
+    expires: "2027-01-07"
