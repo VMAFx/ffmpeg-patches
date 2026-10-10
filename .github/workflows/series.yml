@@ -130,8 +130,10 @@ jobs:
           cd build
           # Patches touch the Vulkan, NVENC and VAAPI code; enabling them explicitly
           # makes a missing dependency fail here instead of silently skipping files.
-          ../ffmpeg/configure --fatal-warnings --disable-doc --enable-vulkan --enable-nvenc \
-            --enable-vaapi --enable-libdrm \
+          # --enable-gpl builds the GPL-only filters 0002 changes (find_rect, mcdeint,
+          # eq and its checkasm test), which an LGPL build skips.
+          ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl --enable-vulkan \
+            --enable-nvenc --enable-vaapi --enable-libdrm \
             || { tail -40 ffbuild/config.log; exit 1; }
       - name: Build FFmpeg, its tools and test programs
         if: github.event.pull_request.draft != true
@@ -148,6 +150,11 @@ jobs:
           fi
           echo "FATE targets: ${#targets[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           make -j"$(nproc)" -k "${targets[@]}" 2>&1 | tee -a build.log
+      - name: Refuse a build that skipped a C file the series changes
+        # A file in a component this configuration leaves out would pass the
+        # warning gate unseen, so every changed C file needs a CC line.
+        if: github.event.pull_request.draft != true
+        run: python3 scripts/series.py coverage ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"
       - name: Refuse compiler warnings in the files the series changes
         # Warnings elsewhere depend on the runner's libraries and FFmpeg's own
         # sources; they are counted in the summary, not gated.

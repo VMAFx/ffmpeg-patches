@@ -330,6 +330,52 @@ class WarningsTest(SeriesTestCase):
         self.assertIn("2 elsewhere", out)
 
 
+class CoverageTest(SeriesTestCase):
+    def test_compiled_sources_reads_cc_lines_only(self) -> None:
+        log = ["CC\tlibavcodec/vlc.o", "LD\tffmpeg_g", "HOSTCC\tdoc/print_options.o", "X86ASM\tx.o"]
+        self.assertEqual(series.compiled_sources(log), {"libavcodec/vlc.c"})
+
+    def test_every_changed_c_file_compiled_passes(self) -> None:
+        files = {"libavcodec/vlc.c", "libavcodec/vlc.h"}
+        status, out = series.coverage_report(files, ["CC\tlibavcodec/vlc.o"])
+        self.assertEqual(status, 0)
+        self.assertIn("1 of 1 C file(s) the series changes were compiled", out[-1])
+
+    def test_file_in_a_disabled_component_fails(self) -> None:
+        files = {"libavcodec/vlc.c", "libavfilter/vf_mcdeint.c"}
+        status, out = series.coverage_report(files, ["CC\tlibavcodec/vlc.o"])
+        self.assertEqual(status, 1)
+        self.assertIn("not compiled: libavfilter/vf_mcdeint.c", out)
+        self.assertIn("1 of 2 C file(s)", out[-1])
+
+    def test_same_name_in_another_directory_does_not_count(self) -> None:
+        status, out = series.coverage_report({"lib.c"}, ["CC\tsub/lib.o"])
+        self.assertEqual(status, 1)
+        self.assertIn("not compiled: lib.c", out)
+
+    def test_included_templates_are_not_checked(self) -> None:
+        files = {"a.c", "b_template.c", "c.h"}
+        status, out = series.coverage_report(files, ["CC\ta.o"])
+        self.assertEqual(status, 0)
+        self.assertIn("1 of 1 C file(s)", out[-1])
+        self.assertIn("1 included template(s) not checked", out[-1])
+
+    def test_nothing_to_check_fails(self) -> None:
+        status, out = series.coverage_report({"c.h", "b_template.c"}, ["CC\ta.o"])
+        self.assertEqual(status, 1)
+        self.assertIn("0 of 0 C file(s)", out[-2])
+        self.assertIn("no C file to check", out[-1])
+
+    def test_gate_reads_the_series_files_from_the_tree(self) -> None:
+        series.apply_series(self.fx.root, self.fx.tree, True, False)
+        log = Path(self._scratch.name) / "build.log"
+        argv = ["--root", str(self.fx.root), "coverage", str(self.fx.tree), str(log)]
+        for text, expected in (("CC\tlib.o\n", 0), ("CC\tother.o\n", 1)):
+            log.write_text(text)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(series.main(argv), expected)
+
+
 class NotesTest(SeriesTestCase):
     def test_notes_list_every_patch_with_its_upstream_state(self) -> None:
         notes = series.release_notes(self.fx.root, "v1.2.3", "Org/repo")
