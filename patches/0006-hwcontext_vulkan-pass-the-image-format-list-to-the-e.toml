@@ -6,11 +6,13 @@ notes = """
 try_export_flags() queried the export capabilities of a mutable-format, \
 DRM-modifier-tiled frames context without the VkImageFormatListCreateInfo \
 from create_pnext, which the validation layer reports as \
-VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02313. Driven by the \
-validation layer: it compiles cleanly against n9.0.2, but a validation \
-run showing the VUID gone, and a hardware run, are still pending. \
-FFmpeg master ba987fe24d has the same query and takes the patch with a \
-3-way merge.
+VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02313. With the validation \
+layer (1.4.363) on a DRM-modifier frames pool mapped to VAAPI, every \
+export query reported the VUID without the patch (21 on ANV, 55 on RADV \
+in a 10-frame run) and none with it, on an Arc A380 and a Ryzen 9 \
+9950X3D iGPU (Mesa 26.2.4). No new VUID appears, every modifier's query \
+still succeeds and the encoded output is identical. FFmpeg master \
+ba987fe24d has the same query and takes the patch with a 3-way merge.
 
 Exception: rule HISS-04; function try_export_flags \
 (libavutil/hwcontext_vulkan.c); 71 -> 86 lines; reason: upstream \
