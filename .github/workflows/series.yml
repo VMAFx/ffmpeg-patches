@@ -90,9 +90,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential nasm pkg-config libvulkan-dev spirv-headers
+            build-essential nasm pkg-config libvulkan-dev spirv-headers libffmpeg-nvenc-dev
           gcc --version | head -1
-          pkg-config --modversion vulkan
+          pkg-config --modversion vulkan ffnvcodec
       - name: Fetch and verify the pinned FFmpeg source
         if: github.event.pull_request.draft != true
         run: |
@@ -123,7 +123,9 @@ jobs:
         run: |
           mkdir build
           cd build
-          ../ffmpeg/configure --fatal-warnings --disable-doc --enable-vulkan \
+          # Patches touch the Vulkan and NVENC code; enabling both explicitly makes a
+          # missing dependency fail here instead of silently skipping their files.
+          ../ffmpeg/configure --fatal-warnings --disable-doc --enable-vulkan --enable-nvenc \
             || { tail -40 ffbuild/config.log; exit 1; }
       - name: Build FFmpeg, its tools and test programs
         if: github.event.pull_request.draft != true
