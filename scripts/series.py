@@ -11,9 +11,11 @@
     series.py export TREE
         Regenerate patches/ and series.txt from the commits on TREE after
         the pinned base commit.
-    series.py warnings TREE LOG [--report FILE]
+    series.py warnings TREE LOG [--report FILE] [--base REF]
         Fail on every compiler warning in LOG that names a file the
         commits on TREE after the pinned base change; count the others.
+        On a tree that applies the series to another upstream commit,
+        --base names that commit.
     series.py notes VERSION REPOSITORY
         Print release notes: the pinned base, every patch with its status
         and upstream link, and how to verify and apply the release.
@@ -359,14 +361,24 @@ def write_series(root: Path, names: list[str]) -> None:
     path.write_text("\n".join([*header, *names]) + "\n")
 
 
-def export_series(root: Path, tree: Path) -> list[str]:
+def pinned_commit(root: Path) -> str:
+    """FFMPEG_COMMIT from base.env; an unusable base.env is a tool error."""
     findings = Findings()
     base = read_base(root, findings)
     if findings.errors:
         raise SeriesError("\n".join(findings.errors))
-    commit = base["FFMPEG_COMMIT"]
+    return base["FFMPEG_COMMIT"]
+
+
+def require_descendant(tree: Path, commit: str, message: str) -> None:
+    """Raise SeriesError with MESSAGE unless HEAD of TREE descends from COMMIT."""
     if git(tree, "merge-base", "--is-ancestor", commit, "HEAD", check=False).returncode:
-        raise SeriesError(f"{tree}: HEAD does not descend from the pinned base {commit}")
+        raise SeriesError(f"{tree}: {message}")
+
+
+def export_series(root: Path, tree: Path) -> list[str]:
+    commit = pinned_commit(root)
+    require_descendant(tree, commit, f"HEAD does not descend from the pinned base {commit}")
     patches = root / "patches"
     patches.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory() as scratch:
@@ -383,13 +395,26 @@ def export_series(root: Path, tree: Path) -> list[str]:
     return names
 
 
-def series_files(root: Path, tree: Path) -> set[str]:
-    """Paths the commits on TREE after the pinned base change."""
-    findings = Findings()
-    base = read_base(root, findings)
-    if findings.errors:
-        raise SeriesError("\n".join(findings.errors))
-    names = git(tree, "diff", "--name-only", base["FFMPEG_COMMIT"], "HEAD").stdout
+def series_files(root: Path, tree: Path, base: str | None = None) -> set[str]:
+    """Paths the commits on TREE after BASE (default: the pinned base) change.
+
+    BASE must be an ancestor of HEAD: on a tree that applies the series to a
+    newer upstream, the pinned base would count upstream changes as the
+    series' own.
+    """
+    if base is None:
+        base = pinned_commit(root)
+    resolved = git(tree, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+    if resolved.returncode:
+        raise SeriesError(f"{tree}: base {base!r} is not a commit")
+    commit = resolved.stdout.strip()
+    require_descendant(
+        tree,
+        commit,
+        f"base {base!r} is not an ancestor of HEAD; "
+        "pass --base with the upstream commit the series was applied to",
+    )
+    names = git(tree, "diff", "--name-only", commit, "HEAD").stdout
     return {name for name in names.splitlines() if name}
 
 
@@ -414,9 +439,11 @@ def triage_warnings(lines: list[str], files: set[str]) -> tuple[list[str], int]:
     return own, other
 
 
-def warnings_gate(root: Path, tree: Path, log: Path, report: Path | None) -> int:
+def warnings_gate(
+    root: Path, tree: Path, log: Path, report: Path | None, base: str | None = None
+) -> int:
     lines = log.read_text(errors="replace").splitlines()
-    own, other = triage_warnings(lines, series_files(root, tree))
+    own, other = triage_warnings(lines, series_files(root, tree, base))
     for line in own:
         print(line)
     summary = (
@@ -494,6 +521,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     warn.add_argument("tree", type=Path)
     warn.add_argument("log", type=Path)
     warn.add_argument("--report", type=Path, help="append the summary to this file")
+    warn.add_argument("--base", help="upstream commit under the series (default: FFMPEG_COMMIT)")
     notes = sub.add_parser("notes", help="print release notes for a tag")
     notes.add_argument("version")
     notes.add_argument("repository", help="owner/name on GitHub")
@@ -527,7 +555,7 @@ def run(args: argparse.Namespace) -> int:
         print(release_notes(args.root, args.version, args.repository), end="")
         return 0
     if args.command == "warnings":
-        return warnings_gate(args.root, args.tree, args.log, args.report)
+        return warnings_gate(args.root, args.tree, args.log, args.report, args.base)
     for name in export_series(args.root, args.tree):
         print(name)
     return 0

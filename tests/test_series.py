@@ -279,6 +279,56 @@ class WarningsTest(SeriesTestCase):
         self.assertIn("1 compiler warning(s) in files the series changes", out.getvalue())
         self.assertIn("1 elsewhere", out.getvalue())
 
+    def newer_upstream_tree(self) -> tuple[str, Path]:
+        """Apply the series on an upstream commit that adds other.c; return it and a log."""
+        self.fx.reset()
+        (self.fx.tree / "other.c").write_text("int other;\n")
+        run_git(self.fx.tree, "add", "other.c")
+        run_git(self.fx.tree, "commit", "-q", "-m", "upstream: add other.c")
+        upstream = run_git(self.fx.tree, "rev-parse", "HEAD")
+        series.apply_series(self.fx.root, self.fx.tree, False, False)
+        log = Path(self._scratch.name) / "build.log"
+        log.write_text("lib.c:5:1: warning: unused variable 'x'\nother.c:1:1: warning: y\n")
+        return upstream, log
+
+    def warnings_main(self, log: Path, *extra: str) -> tuple[int, str, str]:
+        argv = ["--root", str(self.fx.root), "warnings", str(self.fx.tree), str(log), *extra]
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            status = series.main(argv)
+        return status, out.getvalue(), err.getvalue()
+
+    def test_base_limits_the_gate_to_the_series_on_a_newer_upstream(self) -> None:
+        upstream, log = self.newer_upstream_tree()
+        self.assertEqual(series.series_files(self.fx.root, self.fx.tree), {"lib.c", "other.c"})
+        self.assertEqual(series.series_files(self.fx.root, self.fx.tree, upstream), {"lib.c"})
+        status, out, _ = self.warnings_main(log, "--base", upstream)
+        self.assertEqual(status, 1)
+        self.assertIn("1 compiler warning(s) in files the series changes", out)
+        self.assertIn("1 elsewhere", out)
+
+    def test_base_that_is_not_an_ancestor_is_a_tool_error(self) -> None:
+        side = self.fx.upstream_commit(4, "int line_5 = 7;")
+        _, log = self.newer_upstream_tree()
+        status, _, err = self.warnings_main(log, "--base", side)
+        self.assertEqual(status, 2)
+        self.assertIn("not an ancestor of HEAD", err)
+
+    def test_unknown_base_is_a_tool_error(self) -> None:
+        _, log = self.newer_upstream_tree()
+        status, _, err = self.warnings_main(log, "--base", "no-such-ref")
+        self.assertEqual(status, 2)
+        self.assertIn("'no-such-ref' is not a commit", err)
+
+    def test_base_at_head_gates_nothing(self) -> None:
+        _, log = self.newer_upstream_tree()
+        status, out, _ = self.warnings_main(log, "--base", "HEAD")
+        self.assertEqual(status, 0)
+        self.assertIn("0 compiler warning(s) in files the series changes", out)
+        self.assertIn("2 elsewhere", out)
+
 
 class NotesTest(SeriesTestCase):
     def test_notes_list_every_patch_with_its_upstream_state(self) -> None:
