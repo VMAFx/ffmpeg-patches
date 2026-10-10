@@ -12,12 +12,16 @@ name: series
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # release.yml runs the full gate on the tagged commit before it builds.
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: series-${{ github.ref }}
+  # In a called run the context is the caller's, so the workflow name keeps a
+  # release call out of a push or pull request run's group.
+  group: series-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:

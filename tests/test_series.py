@@ -280,6 +280,37 @@ class WarningsTest(SeriesTestCase):
         self.assertIn("1 elsewhere", out.getvalue())
 
 
+class NotesTest(SeriesTestCase):
+    def test_notes_list_every_patch_with_its_upstream_state(self) -> None:
+        notes = series.release_notes(self.fx.root, "v1.2.3", "Org/repo")
+        self.assertIn(f"FFmpeg base: `v1` (`{self.fx.base}`).", notes)
+        link = "[link](https://example.invalid/pulls/1)"
+        self.assertIn(f"| 0001 | lib: fix line five | submitted | {link} | a |", notes)
+        self.assertIn("| 0002 | lib: fix line thirty |", notes)
+        self.assertIn(".github/workflows/release-build.yml@refs/tags/v1.2.3", notes)
+        self.assertIn("gh attestation verify ffmpeg-patches-v1.2.3.tar.gz --repo Org/repo", notes)
+
+    def test_folded_subject_is_unfolded(self) -> None:
+        path = self.fx.patch(1)
+        text = path.read_text().replace(
+            "Subject: [PATCH] lib: fix line five", "Subject: [PATCH] lib: fix line\n five"
+        )
+        path.write_text(text)
+        self.assertEqual(series.patch_subject(path), "lib: fix line five")
+
+    def test_unsubmitted_patch_has_no_link(self) -> None:
+        self.fx.patch(2).with_suffix(".toml").write_text(
+            'status = "unsubmitted"\nupstream = ""\nconsumers = ["a", "b"]\n'
+        )
+        notes = series.release_notes(self.fx.root, "v1.2.3", "Org/repo")
+        self.assertIn("| unsubmitted | none | a, b |", notes)
+
+    def test_notes_refuse_a_series_without_base(self) -> None:
+        (self.fx.root / "base.env").unlink()
+        with self.assertRaises(series.SeriesError):
+            series.release_notes(self.fx.root, "v1.2.3", "Org/repo")
+
+
 class ExportTest(SeriesTestCase):
     def test_round_trip_is_byte_identical(self) -> None:
         before = {p.name: p.read_bytes() for p in (self.fx.root / "patches").iterdir()}

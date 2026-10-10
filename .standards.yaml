@@ -35,10 +35,3 @@ register:
         kind: message
         format: json
         selector: invariants.*
-# Declared per-file exceptions: one rule, one file, a reason and an expiry at
-# most 90 days ahead; an expired entry fails its gate like a missing one.
-exceptions:
-  - rule: "HISS-11"
-    path: ".github/workflows/release.yml"
-    reason: "no release workflow yet; the series release (tarball, sha256, SLSA 3 provenance, cosign, SBOM) lands with the series layout"
-    expires: "2027-01-07"

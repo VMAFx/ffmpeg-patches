@@ -14,6 +14,9 @@
     series.py warnings TREE LOG [--report FILE]
         Fail on every compiler warning in LOG that names a file the
         commits on TREE after the pinned base change; count the others.
+    series.py notes VERSION REPOSITORY
+        Print release notes: the pinned base, every patch with its status
+        and upstream link, and how to verify and apply the release.
 
 Exit status: 0 on success, 1 on findings or a failed apply, 2 when the
 tool cannot run (unreadable series files, unusable checkout).
@@ -427,6 +430,54 @@ def warnings_gate(root: Path, tree: Path, log: Path, report: Path | None) -> int
     return 1 if own else 0
 
 
+def patch_subject(path: Path) -> str:
+    """The Subject header without its [PATCH] prefix, unfolded."""
+    header = path.read_text(errors="replace").split("\n\n", 1)[0]
+    match = re.search(r"^Subject: \[PATCH\] (.*(?:\n .*)*)", header, re.MULTILINE)
+    return " ".join(match.group(1).split()) if match else path.name
+
+
+def note_row(root: Path, number: int, name: str) -> str:
+    path = root / "patches" / name
+    meta = tomllib.loads(path.with_suffix(".toml").read_text())
+    upstream = meta.get("upstream", "")
+    link = f"[link]({upstream})" if upstream else "none"
+    consumers = ", ".join(meta.get("consumers", []))
+    return f"| {number:04d} | {patch_subject(path)} | {meta['status']} | {link} | {consumers} |"
+
+
+def release_notes(root: Path, version: str, repository: str) -> str:
+    findings = Findings()
+    base = read_base(root, findings)
+    names = read_series(root, findings)
+    if findings.errors:
+        raise SeriesError("\n".join(findings.errors))
+    signer = (
+        f"https://github.com/{repository}/.github/workflows/release-build.yml@refs/tags/{version}"
+    )
+    lines = [
+        f"FFmpeg base: `{base['FFMPEG_TAG']}` (`{base['FFMPEG_COMMIT']}`).",
+        "",
+        "| # | Patch | Status | Upstream | Needed by |",
+        "| :-- | :-- | :-- | :-- | :-- |",
+        *(note_row(root, number, name) for number, name in enumerate(names, 1)),
+        "",
+        "Verify the release files:",
+        "",
+        "```bash",
+        "cosign verify-blob --bundle SHA256SUMS.sigstore.json \\",
+        f"  --certificate-identity '{signer}' \\",
+        "  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS",
+        "sha256sum --check SHA256SUMS",
+        f"gh attestation verify ffmpeg-patches-{version}.tar.gz --repo {repository}",
+        "```",
+        "",
+        "Apply the patches in `series.txt` order with `git am --3way` onto the base, "
+        "or run `scripts/series.py apply --expect-base <ffmpeg-tree>` from the tarball.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="series repository root")
@@ -443,6 +494,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     warn.add_argument("tree", type=Path)
     warn.add_argument("log", type=Path)
     warn.add_argument("--report", type=Path, help="append the summary to this file")
+    notes = sub.add_parser("notes", help="print release notes for a tag")
+    notes.add_argument("version")
+    notes.add_argument("repository", help="owner/name on GitHub")
     return parser.parse_args(argv)
 
 
@@ -469,6 +523,9 @@ def run(args: argparse.Namespace) -> int:
         results = apply_series(args.root, args.tree, args.expect_base, args.keep_going)
         write_report(results, args.tree, args.report)
         return 1 if apply_failed(results, args.expect_base) else 0
+    if args.command == "notes":
+        print(release_notes(args.root, args.version, args.repository), end="")
+        return 0
     if args.command == "warnings":
         return warnings_gate(args.root, args.tree, args.log, args.report)
     for name in export_series(args.root, args.tree):
