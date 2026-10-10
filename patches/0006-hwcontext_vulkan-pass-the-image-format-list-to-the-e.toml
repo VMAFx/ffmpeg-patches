@@ -10,4 +10,9 @@ VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02313. Driven by the \
 validation layer: it compiles cleanly against n9.0.2, but a validation \
 run showing the VUID gone, and a hardware run, are still pending. \
 FFmpeg master ba987fe24d has the same query and takes the patch with a \
-3-way merge."""
+3-way merge.
+
+Exception: rule HISS-04; function try_export_flags \
+(libavutil/hwcontext_vulkan.c); 71 -> 86 lines; reason: upstream \
+function, splitting it would bloat the upstream diff; review \
+2027-01-08."""
