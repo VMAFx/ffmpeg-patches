@@ -10,3 +10,4 @@
 0003-avcodec-nvenc-keep-hevc_nvenc-user-data-SEI-within-t.patch
 0004-avcodec-nvenc-drop-user-data-SEI-that-NVENC-would-wr.patch
 0005-hwcontext_vaapi-accept-GR1616-chroma-for-P010-and-P0.patch
+0006-hwcontext_vulkan-pass-the-image-format-list-to-the-e.patch
