@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 10 Oct 2026 08:30:55 +0200
+Subject: [PATCH] hwcontext_vaapi: accept GR1616 chroma for P010 and P012 DRM
+ import
+
+hwcontext_vulkan exports the chroma plane of P010 and P012 frames,
+VK_FORMAT_R16G16_UNORM, as DRM_FORMAT_GR1616: vulkan_fmt_to_drm()
+returns the first match in vulkan_drm_format_map, which lists GR1616
+before RG1616. The VAAPI DRM import table only knows RG1616 for these
+formats, so mapping a 10- or 12-bit Vulkan frame to VAAPI fails with
+"DRM format not supported by VAAPI".
+
+GR1616 carries R in the low 16 bits, which is the memory order of a
+Vulkan R16G16 plane. Accept it next to RG1616, as the table already
+does with GR88 and RG88 for NV12, which Vulkan exports as GR88.
+
+Tested on an Intel Arc A380 (iHD 26.3.5) and an AMD Radeon 610M
+(radeonsi), in a build that also waited on the CPU before the map
+instead of attaching a sync file: Vulkan P010 frames map to VAAPI, read
+back bit-exact and encode with hevc_vaapi Main10. Without this change
+the map is refused on both. P012 was not tested.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavutil/hwcontext_vaapi.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/libavutil/hwcontext_vaapi.c b/libavutil/hwcontext_vaapi.c
+index 98130f9fb1f230ee369393fcee1024b89b7466f3..d80e1409e29d5f0e48f4ee704a1cec8b7c037f25 100644
+--- a/libavutil/hwcontext_vaapi.c
++++ b/libavutil/hwcontext_vaapi.c
+@@ -1065,9 +1065,11 @@ static const struct {
+     DRM_MAP(NV12, 1, DRM_FORMAT_NV12),
+ #if defined(VA_FOURCC_P010) && defined(DRM_FORMAT_R16)
+     DRM_MAP(P010, 2, DRM_FORMAT_R16, DRM_FORMAT_RG1616),
++    DRM_MAP(P010, 2, DRM_FORMAT_R16, DRM_FORMAT_GR1616),
+ #endif
+ #if defined(VA_FOURCC_P012) && defined(DRM_FORMAT_R16)
+     DRM_MAP(P012, 2, DRM_FORMAT_R16, DRM_FORMAT_RG1616),
++    DRM_MAP(P012, 2, DRM_FORMAT_R16, DRM_FORMAT_GR1616),
+ #endif
+     DRM_MAP(BGRA, 1, DRM_FORMAT_ARGB8888),
+     DRM_MAP(BGRX, 1, DRM_FORMAT_XRGB8888),
