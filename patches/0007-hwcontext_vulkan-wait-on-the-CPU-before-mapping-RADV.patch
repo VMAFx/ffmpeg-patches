@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 10 Oct 2026 12:04:08 +0200
+Subject: [PATCH] hwcontext_vulkan: wait on the CPU before mapping RADV frames
+ to DRM
+
+vulkan_map_to_drm() attaches a sync file for the frame's pending work
+to each exported dma-buf and skips the CPU wait, relying on the
+importer to honour the dma-buf's fences. On RADV that never happens:
+RADV allocates exportable memory with AMDGPU_GEM_CREATE_EXPLICIT_SYNC,
+and amdgpu ignores the fences in a buffer's reservation object for
+every submission on an explicitly synchronized buffer. An importer on
+the same device gets the same buffer object, so a VAAPI driver reading
+the frame does not wait for the sync file and can read it before the
+Vulkan work has finished.
+
+On RADV, wait on the CPU instead, as is done when no sync file can be
+exported.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavutil/hwcontext_vulkan.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/libavutil/hwcontext_vulkan.c b/libavutil/hwcontext_vulkan.c
+index dd2117f8ede8217c8969c3840990f9387e85603d..d92a6a586208bd68c4849eead1e980f51164e9b3 100644
+--- a/libavutil/hwcontext_vulkan.c
++++ b/libavutil/hwcontext_vulkan.c
+@@ -4239,8 +4239,14 @@ static int vulkan_map_to_drm(AVHWFramesContext *hwfc, AVFrame *dst,
+         goto end;
+ 
+ #ifdef DMA_BUF_IOCTL_EXPORT_SYNC_FILE
++    /* RADV allocates exportable memory as explicitly synchronized
++     * (AMDGPU_GEM_CREATE_EXPLICIT_SYNC), and amdgpu then ignores the fences
++     * in the dma-buf for every submission on that buffer, including those of
++     * an importer such as the VAAPI driver. A sync file attached to the
++     * dma-buf would not be waited for, so wait on the CPU instead. */
+     if ((p->vkctx.extensions & FF_VK_EXT_EXTERNAL_FD_SEM) &&
+         f->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++        p->dprops.driverID != VK_DRIVER_ID_MESA_RADV &&
+         vk->GetSemaphoreFdKHR && vk->CreateSemaphore) {
+         err = vulkan_drm_export_sync_fd(hwfc, f, fp, nb_sems);
+         if (err < 0)
