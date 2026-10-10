@@ -94,7 +94,8 @@ Every pull request runs:
 - `make test`: series check, ruff, REUSE and the unit tests of
   `scripts/series.py`
 - apply on the pinned release, byte-identical regeneration, an FFmpeg build
-  with Vulkan, NVENC and VAAPI enabled and the FATE tests that need no samples
+  with the GPL components, Vulkan, NVENC and VAAPI enabled and the FATE tests
+  that need no samples
 - a warning gate: any compiler warning in a file the series changes fails
   the run; warnings elsewhere in FFmpeg are counted in the summary. On a
   tree that applies the series to another upstream commit, such as FFmpeg
