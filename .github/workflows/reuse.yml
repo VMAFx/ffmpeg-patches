@@ -33,9 +33,9 @@ jobs:
           exit 1
       - name: Check out the source
         if: github.event.pull_request.draft != true
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: reuse lint
         if: github.event.pull_request.draft != true
-        uses: fsfe/reuse-action@v6
+        uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
