@@ -10,11 +10,15 @@ submission on it, including a radeonsi importer of the same buffer \
 object (Linux 7.2 amdgpu_cs.c, amdgpu_sync.c). The sync file \
 vulkan_map_to_drm() attaches to the dma-buf is therefore never waited \
 for by VAAPI GPU work on RADV. Measured: a RADV dma-buf reports \
-alloc_flags 0x28e (EXPLICIT_SYNC set). On a Ryzen 9 9950X3D iGPU, 15 of \
-20 mapped frames differed from a Vulkan readback with the sync file and \
-0 of 20 with the CPU wait this patch selects on RADV; ANV with iHD \
-matched with the sync file. A run of this exact patch is still pending. \
-FFmpeg master ba987fe24d has the same map path.
+alloc_flags 0x28e (EXPLICIT_SYNC set). On a Ryzen 9 9950X3D iGPU \
+(Mesa 26.2.4, Linux 7.2.9), 12 to 15 of 20 mapped frames differed from a \
+Vulkan readback without this patch and 0 of 20 with it, in three \
+repetitions each. RADV no longer imports a sync file (21 imports per \
+run before, 0 after); ANV with iHD on an Arc A380 keeps the sync file \
+path (63 imports per run either way) and matches in both builds. The \
+exported sync file is still pending at hand-off in every frame, and \
+waiting on it on the CPU also removes the race, so the fence is correct \
+and only ignored. FFmpeg master ba987fe24d has the same map path.
 
 Exception: rule HISS-04; function vulkan_map_to_drm \
 (libavutil/hwcontext_vulkan.c); 163 -> 169 lines; reason: upstream \
