@@ -36,51 +36,24 @@ pre-commit:
         REUSE.toml or LICENSES/ at the repository root, skipping reuse lint >&2;
         fi
     context-check:
-      run: >-
-        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
-        standardsctl 2>/dev/null); then "$praetor_cli" compile-context --verify;
-        else echo HISS governance hook cannot run because neither praetorctl nor
-        standardsctl is installed >&2; exit 1; fi
+      run: sh .config/lefthook/engine.sh compile-context --verify
     hiss-audit:
-      run: >-
-        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
-        standardsctl 2>/dev/null); then "$praetor_cli" audit --offline; else
-        echo HISS governance hook cannot run because neither praetorctl nor
-        standardsctl is installed >&2; exit 1; fi
+      run: sh .config/lefthook/engine.sh audit --offline
 
 post-commit:
   commands:
     state-sync:
-      run: >-
-        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
-        standardsctl 2>/dev/null); then "$praetor_cli" state sync .; else echo
-        HISS governance hook cannot run because neither praetorctl nor
-        standardsctl is installed >&2; exit 1; fi
+      run: sh .config/lefthook/engine.sh state sync .
     dedupe-cadence:
       run: >-
-        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
-        standardsctl 2>/dev/null); then "$praetor_cli" dedupe cadence
-        --threshold=20 --record .; else echo HISS governance hook cannot run
-        because neither praetorctl nor standardsctl is installed >&2; exit 1; fi
+        sh .config/lefthook/engine.sh dedupe cadence --threshold=20 --record .
 
 pre-push:
   parallel: false
   commands:
     flavor-audit:
-      run: >-
-        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
-        standardsctl 2>/dev/null); then "$praetor_cli" flavor audit .; else echo
-        HISS governance hook cannot run because neither praetorctl nor
-        standardsctl is installed >&2; exit 1; fi
+      run: sh .config/lefthook/engine.sh flavor audit .
     audit:
-      run: >-
-        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
-        standardsctl 2>/dev/null); then "$praetor_cli" audit; else echo HISS
-        governance hook cannot run because neither praetorctl nor standardsctl
-        is installed >&2; exit 1; fi
+      run: sh .config/lefthook/engine.sh audit
     gate:
-      run: >-
-        if praetor_cli=$(command -v praetorctl 2>/dev/null || command -v
-        standardsctl 2>/dev/null); then "$praetor_cli" gate run --path=.
-        --admit-unsupported; else echo HISS governance hook cannot run because
-        neither praetorctl nor standardsctl is installed >&2; exit 1; fi
+      run: sh .config/lefthook/engine.sh gate run --path=. --admit-unsupported
