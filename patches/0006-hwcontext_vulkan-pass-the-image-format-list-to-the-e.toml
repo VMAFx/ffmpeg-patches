@@ -1,0 +1,18 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["pelorus"]
+origin = "found by the Pelorus Vulkan validation lane (DRM-modifier frames pool with a format list)"
+notes = """
+try_export_flags() queried the export capabilities of a mutable-format, \
+DRM-modifier-tiled frames context without the VkImageFormatListCreateInfo \
+from create_pnext, which the validation layer reports as \
+VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02313. Driven by the \
+validation layer: it compiles cleanly against n9.0.2, but a validation \
+run showing the VUID gone, and a hardware run, are still pending. \
+FFmpeg master ba987fe24d has the same query and takes the patch with a \
+3-way merge.
+
+Exception: rule HISS-04; function try_export_flags \
+(libavutil/hwcontext_vulkan.c); 71 -> 86 lines; reason: upstream \
+function, splitting it would bloat the upstream diff; review \
+2027-01-08."""
