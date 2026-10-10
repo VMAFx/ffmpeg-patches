@@ -150,6 +150,11 @@ jobs:
           fi
           echo "FATE targets: ${#targets[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           make -j"$(nproc)" -k "${targets[@]}" 2>&1 | tee -a build.log
+      - name: Refuse a build that skipped a C file the series changes
+        # A file in a component this configuration leaves out would pass the
+        # warning gate unseen, so every changed C file needs a CC line.
+        if: github.event.pull_request.draft != true
+        run: python3 scripts/series.py coverage ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"
       - name: Refuse compiler warnings in the files the series changes
         # Warnings elsewhere depend on the runner's libraries and FFmpeg's own
         # sources; they are counted in the summary, not gated.

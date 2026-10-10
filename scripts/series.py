@@ -16,6 +16,10 @@
         commits on TREE after the pinned base change; count the others.
         On a tree that applies the series to another upstream commit,
         --base names that commit.
+    series.py coverage TREE LOG [--report FILE] [--base REF]
+        Fail unless LOG shows a CC line for every C file those commits
+        change (included *_template.c files excepted), so a file in a
+        component the build left out cannot pass the warning gate unseen.
     series.py notes VERSION REPOSITORY
         Print release notes: the pinned base, every patch with its status
         and upstream link, and how to verify and apply the release.
@@ -49,6 +53,7 @@ FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 WARNING = re.compile(r"(^|\s)warning(\s|#|:)", re.IGNORECASE)
 LOCATION = re.compile(r"^(?P<path>[^:\s]+):\d+(:\d+)?: ")
+COMPILED = re.compile(r"^CC\t(?P<object>\S+)\.o$")
 GIT_IDENTITY = ("-c", "user.name=ffmpeg-patches", "-c", "user.email=ffmpeg-patches@invalid")
 # Deadline for one git call (HISS-02); a 3-way am of the largest patch takes seconds.
 GIT_TIMEOUT = 600
@@ -457,6 +462,44 @@ def warnings_gate(
     return 1 if own else 0
 
 
+def compiled_sources(lines: list[str]) -> set[str]:
+    """C sources of the objects a build log reports as compiled ("CC\tpath.o")."""
+    return {f"{m.group('object')}.c" for line in lines if (m := COMPILED.match(line))}
+
+
+def coverage_report(files: set[str], lines: list[str]) -> tuple[int, list[str]]:
+    """Check that the build compiled every C file in FILES.
+
+    Included *_template.c files have no object of their own and are not
+    checked. Nothing to check is a finding too: a gate over zero files proves
+    nothing. Return the exit status and the lines to print.
+    """
+    sources = sorted(name for name in files if name.endswith(".c"))
+    checked = [name for name in sources if not name.endswith("_template.c")]
+    compiled = compiled_sources(lines)
+    missing = [name for name in checked if name not in compiled]
+    out = [f"not compiled: {name}" for name in missing]
+    out.append(
+        f"{len(checked) - len(missing)} of {len(checked)} C file(s) the series changes "
+        f"were compiled; {len(sources) - len(checked)} included template(s) not checked."
+    )
+    if not checked:
+        out.append("error: no C file to check; the coverage gate proves nothing")
+    return (1 if missing or not checked else 0), out
+
+
+def coverage_gate(
+    root: Path, tree: Path, log: Path, report: Path | None, base: str | None = None
+) -> int:
+    lines = log.read_text(errors="replace").splitlines()
+    status, out = coverage_report(series_files(root, tree, base), lines)
+    print("\n".join(out))
+    if report is not None:
+        with report.open("a") as stream:
+            stream.write("\n".join(out) + "\n")
+    return status
+
+
 def patch_subject(path: Path) -> str:
     """The Subject header without its [PATCH] prefix, unfolded."""
     header = path.read_text(errors="replace").split("\n\n", 1)[0]
@@ -522,6 +565,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     warn.add_argument("log", type=Path)
     warn.add_argument("--report", type=Path, help="append the summary to this file")
     warn.add_argument("--base", help="upstream commit under the series (default: FFMPEG_COMMIT)")
+    cover = sub.add_parser("coverage", help="fail when the build skipped a C file of the series")
+    cover.add_argument("tree", type=Path)
+    cover.add_argument("log", type=Path)
+    cover.add_argument("--report", type=Path, help="append the summary to this file")
+    cover.add_argument("--base", help="upstream commit under the series (default: FFMPEG_COMMIT)")
     notes = sub.add_parser("notes", help="print release notes for a tag")
     notes.add_argument("version")
     notes.add_argument("repository", help="owner/name on GitHub")
@@ -556,6 +604,8 @@ def run(args: argparse.Namespace) -> int:
         return 0
     if args.command == "warnings":
         return warnings_gate(args.root, args.tree, args.log, args.report, args.base)
+    if args.command == "coverage":
+        return coverage_gate(args.root, args.tree, args.log, args.report, args.base)
     for name in export_series(args.root, args.tree):
         print(name)
     return 0
