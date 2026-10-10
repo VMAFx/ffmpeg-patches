@@ -96,7 +96,10 @@ Every pull request runs:
 - apply on the pinned release, byte-identical regeneration, an FFmpeg build
   with Vulkan, NVENC and VAAPI enabled and the FATE tests that need no samples
 - a warning gate: any compiler warning in a file the series changes fails
-  the run; warnings elsewhere in FFmpeg are counted in the summary
+  the run; warnings elsewhere in FFmpeg are counted in the summary. On a
+  tree that applies the series to another upstream commit, such as FFmpeg
+  master, `series.py warnings TREE LOG --base <commit>` names that commit,
+  so upstream changes are not counted as the series' own
 
 A nightly run applies the series onto FFmpeg master. It reports conflicts and
 drop candidates, and fails only when the tool itself cannot run.
