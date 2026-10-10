@@ -1,0 +1,12 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["pelorus"]
+origin = "found by the Pelorus GPU lane (Vulkan to VAAPI DRM-modifier mapping, Pelorus #103)"
+notes = """
+Vulkan exports the R16G16 chroma plane of P010/P012 as GR1616 \
+(vulkan_fmt_to_drm() takes the first match; GR1616 is listed before \
+RG1616), and the VAAPI DRM import table only knew RG1616. Shown on an \
+Arc A380 and a Radeon 610M in a build that also waited on the CPU before \
+the map; a run with this patch alone, and any P012 run, are still \
+pending. FFmpeg master ba987fe24d has the same table. The Radeon \
+read-back race is a separate defect, not fixed here."""
