@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Fri, 9 Oct 2026 02:54:28 +0200
+Subject: [PATCH] avutil/vulkan: don't release frames to
+ VK_QUEUE_FAMILY_IGNORED
+
+On a device with a single queue family, hwcontext_vulkan creates frames
+with VK_SHARING_MODE_EXCLUSIVE and tracks them as owned by that family.
+ff_vk_frame_barrier() copies the tracked family into srcQueueFamilyIndex,
+while every filter and codec caller passes VK_QUEUE_FAMILY_IGNORED as the
+new family. The first barrier on such a frame therefore has unequal
+indices, which the specification treats as a queue family ownership
+transfer, and its destination is VK_QUEUE_FAMILY_IGNORED, which an
+exclusive image does not allow (VUID-VkImageMemoryBarrier2-image-09118).
+
+The Khronos validation layer accepts the barrier but records it as a
+release that is never acquired. It does not apply the layout transition
+and reports every later use of the image against the old layout:
+VUID-vkCmdDispatch-imageLayout-00344 and VUID-vkCmdDraw-None-09600 for
+shaders that access the image, and
+VUID-VkCopyMemoryToImageInfo-dstImageLayout-09059 and
+VUID-VkCopyImageToMemoryInfo-srcImageLayout-09064 for the host image
+copies in hwupload and hwdownload.
+
+When the caller passes VK_QUEUE_FAMILY_IGNORED and the frame is owned by
+a concrete queue family, keep that family as the destination. Equal
+indices perform no transfer, and the tracked owner stays the family that
+hwcontext_vulkan uses for its own transitions on such devices. Frames on
+devices with several queue families are tracked as
+VK_QUEUE_FAMILY_IGNORED and are unaffected, as are frames owned by the
+external or foreign queue family.
+
+Tested with Mesa lavapipe, which has one queue family, and validation
+layer 1.4.363: gblur_vulkan and scdet_vulkan between hwupload and
+hwdownload no longer report the four layout errors. Intel ANV, RADV and
+the NVIDIA proprietary driver report the same messages as before.
+
+The validation layer gap is reported as
+https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/13405.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavutil/vulkan.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/libavutil/vulkan.c b/libavutil/vulkan.c
+index 3b2cc35bf903bdab3313a10c260377f742e0a22a..c37c108bdc962f8070e37b31b7cc8c41cca1fc5e 100644
+--- a/libavutil/vulkan.c
++++ b/libavutil/vulkan.c
+@@ -2099,6 +2099,7 @@ void ff_vk_frame_barrier(FFVulkanContext *s, FFVkExecContext *e,
+                          uint32_t              new_qf)
+ {
+     int found = -1;
++    uint32_t src_qf, dst_qf = new_qf;
+     AVVkFrame *vkf = (AVVkFrame *)pic->data[0];
+     const int nb_images = ff_vk_count_images(vkf);
+     for (int i = 0; i < e->nb_frame_deps; i++)
+@@ -2108,6 +2109,21 @@ void ff_vk_frame_barrier(FFVulkanContext *s, FFVkExecContext *e,
+             break;
+         }
+ 
++    src_qf = found >= 0 ? e->queue_family_dst[found] : vkf->queue_family[0];
++
++    /* Unequal queue family indices define a queue family ownership transfer,
++     * and an exclusive image can only be transferred to a queue family that
++     * exists (or to the external or foreign one), never to
++     * VK_QUEUE_FAMILY_IGNORED (VUID-VkImageMemoryBarrier2-image-09118).
++     * Frames on a device with a single queue family are tracked as owned by
++     * that family, so a caller that asks for no particular family keeps the
++     * current owner: equal indices mean no transfer. */
++    if (new_qf == VK_QUEUE_FAMILY_IGNORED &&
++        src_qf != VK_QUEUE_FAMILY_IGNORED &&
++        src_qf != VK_QUEUE_FAMILY_EXTERNAL &&
++        src_qf != VK_QUEUE_FAMILY_FOREIGN_EXT)
++        dst_qf = src_qf;
++
+     for (int i = 0; i < nb_images; i++) {
+         bar[*nb_bar] = (VkImageMemoryBarrier2) {
+             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+@@ -2118,8 +2134,8 @@ void ff_vk_frame_barrier(FFVulkanContext *s, FFVkExecContext *e,
+             .dstAccessMask = new_access,
+             .oldLayout = found >= 0 ? e->layout_dst[found] : vkf->layout[0],
+             .newLayout = new_layout,
+-            .srcQueueFamilyIndex = found >= 0 ? e->queue_family_dst[found] : vkf->queue_family[0],
+-            .dstQueueFamilyIndex = new_qf,
++            .srcQueueFamilyIndex = src_qf,
++            .dstQueueFamilyIndex = dst_qf,
+             .image = vkf->img[i],
+             .subresourceRange = (VkImageSubresourceRange) {
+                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,

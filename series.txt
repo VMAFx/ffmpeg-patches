@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Patch order against the base in base.env. Apply with `git am --3way` in
+# this order; the series is cumulative. Each patches/NNNN-slug.patch has
+# metadata in patches/NNNN-slug.toml. Regenerate with
+# `scripts/series.py export <ffmpeg-tree>`.
+0001-avutil-vulkan-don-t-release-frames-to-VK_QUEUE_FAMIL.patch
+0002-build-eliminate-GCC-14-and-16-diagnostics.patch
