@@ -40,7 +40,8 @@ apply:
 
 # Release tarball of the committed series, the same bytes for the same commit:
 #   make dist VERSION=v1.0.0
-DIST_FILES = base.env series.txt patches scripts/series.py LICENSE LICENSES README.md REUSE.toml
+DIST_FILES = base.env series.txt patches scripts/series.py upstream-contributions.json \
+	LICENSE LICENSES README.md REUSE.toml
 dist:
 	@test -n "$(VERSION)" || { echo 'set VERSION to the release tag, e.g. VERSION=v1.0.0' >&2; exit 1; }
 	@mkdir -p dist

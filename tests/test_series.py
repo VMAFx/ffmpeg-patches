@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import subprocess
 import sys
 import tempfile
@@ -64,9 +65,38 @@ class Fixture:
         commit_edit(self.tree, 29, "int line_30 = 300;", "lib: fix line thirty")
         with contextlib.redirect_stderr(io.StringIO()):
             self.names = series.export_series(self.root, self.tree)
-        for name in self.names:
-            (self.root / "patches" / name).with_suffix(".toml").write_text(METADATA)
+        for number, name in enumerate(self.names, 1):
+            metadata = METADATA.replace("pulls/1", f"pulls/{number}")
+            (self.root / "patches" / name).with_suffix(".toml").write_text(metadata)
+        (self.root / "README.md").write_text(
+            f"# Fixture\n\n{series.TABLE_START}\n{series.TABLE_END}\n\nText after the table.\n"
+        )
+        self.write_records([self.record(1), self.record(2)])
         self.reset()
+
+    def record(self, number: int, **changes: object) -> dict[str, object]:
+        """The record of pull request `number`; 1 and 2 carry the fixture's patches."""
+        entry: dict[str, object] = {
+            "number": number,
+            "url": f"https://example.invalid/pulls/{number}",
+            "title": f"lib: change {number}",
+            "base": "master",
+            "state": "open",
+            "merged_at": "",
+            "merged_commit": "",
+            "in_release": "",
+            "patch": self.names[number - 1] if number <= len(self.names) else "",
+            "project": "a",
+            "note": "",
+        }
+        return entry | changes
+
+    def write_records(self, entries: list[object], render: bool = True) -> None:
+        """Write the data file and, unless told otherwise, the README table from it."""
+        data = {"checked": "2026-01-02", "contributions": entries}
+        (self.root / series.CONTRIBUTIONS).write_text(json.dumps(data, indent=2) + "\n")
+        if render:
+            series.contributions(self.root, True)
 
     def reset(self, ref: str | None = None) -> None:
         run_git(self.tree, "checkout", "-q", "--detach", "-f", ref or self.base)
@@ -156,6 +186,10 @@ class CheckTest(SeriesTestCase):
 
     def test_merged_warns_but_passes(self) -> None:
         self.fx.patch(1).with_suffix(".toml").write_text(METADATA.replace("submitted", "merged"))
+        merged = self.fx.record(
+            1, state="merged", merged_at="2026-01-01T10:00:00Z", merged_commit=self.fx.base
+        )
+        self.fx.write_records([merged, self.fx.record(2)])
         findings = series.check(self.fx.root)
         self.assertEqual(findings.errors, [])
         self.assertIn("drop it", findings.warnings[0])
@@ -164,6 +198,7 @@ class CheckTest(SeriesTestCase):
         self.fx.patch(1).with_suffix(".toml").write_text(
             'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n'
         )
+        self.fx.write_records([self.fx.record(2)])
         self.assertEqual(series.check(self.fx.root).errors, [])
 
 
@@ -405,6 +440,226 @@ class NotesTest(SeriesTestCase):
         (self.fx.root / "base.env").unlink()
         with self.assertRaises(series.SeriesError):
             series.release_notes(self.fx.root, "v1.2.3", "Org/repo")
+
+
+class ContributionsTest(SeriesTestCase):
+    """The data file of upstream pull requests, its checks and the README table."""
+
+    MERGE = {"state": "merged", "merged_at": "2026-01-01T10:00:00Z"}
+
+    def data_file(self) -> Path:
+        return self.fx.root / series.CONTRIBUTIONS
+
+    def check_with(self, entries: list[object], render: bool = True) -> series.Findings:
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.fx.write_records(entries, render)
+        return series.check(self.fx.root)
+
+    def run_main(self, *arguments: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = series.main(["--root", str(self.fx.root), "contributions", *arguments])
+        return status, out.getvalue(), err.getvalue()
+
+    # Positive.
+
+    def test_table_has_one_row_per_pull_request(self) -> None:
+        status, out, _ = self.run_main()
+        self.assertEqual(status, 0)
+        self.assertIn("| Pull request | Target | State | Change | Series patch |", out)
+        row = "| [1](https://example.invalid/pulls/1) | `master` | open | lib: change 1 | 0001 |"
+        self.assertIn(row, out)
+        self.assertIn("| lib: change 2 | 0002 |", out)
+        self.assertIn("State read from the FFmpeg forge on 2026-01-02.", out)
+
+    def test_merged_row_names_day_commit_and_release(self) -> None:
+        merged = self.fx.record(3, **self.MERGE, merged_commit=self.fx.base, base="release/1.0")
+        entries = [self.fx.record(1), self.fx.record(2), merged]
+        self.assertEqual(self.check_with(entries).errors, [])
+        state = f"merged 2026-01-01 (`{self.fx.base[:12]}`)"
+        self.assertIn(f"| `release/1.0` | {state}, in no release yet |", self.run_main()[1])
+        entries[2] = merged | {"in_release": "v1.0.1"}
+        self.assertEqual(self.check_with(entries).errors, [])
+        self.assertIn(f"| {state}, in v1.0.1 | lib: change 3 | none |", self.run_main()[1])
+
+    def test_write_repairs_a_stale_table(self) -> None:
+        readme = self.fx.root / "README.md"
+        entries = [self.fx.record(1, title="lib: new title"), self.fx.record(2)]
+        self.assert_error(self.check_with(entries, render=False), "contribution table differs")
+        self.assertEqual(self.run_main("--write")[0], 0)
+        self.assertEqual(series.check(self.fx.root).errors, [])
+        text = readme.read_text()
+        self.assertIn("lib: new title", text)
+        self.assertTrue(text.startswith("# Fixture\n\n" + series.TABLE_START + "\n"))
+        self.assertTrue(text.endswith(series.TABLE_END + "\n\nText after the table.\n"))
+
+    # Boundary.
+
+    def test_record_without_a_series_patch_passes(self) -> None:
+        entries = [self.fx.record(1), self.fx.record(2), self.fx.record(3)]
+        self.assertEqual(self.check_with(entries).errors, [])
+        self.assertIn("| lib: change 3 | none |", self.run_main()[1])
+
+    def test_no_pull_request_at_all_passes(self) -> None:
+        for number in (1, 2):
+            self.fx.patch(number).with_suffix(".toml").write_text(
+                'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n'
+            )
+        self.assertEqual(self.check_with([]).errors, [])
+        self.assertEqual(len(self.run_main()[1].splitlines()), 4)
+
+    def test_rejected_patch_matches_a_closed_pull_request(self) -> None:
+        self.fx.patch(1).with_suffix(".toml").write_text(METADATA.replace("submitted", "rejected"))
+        entries = [self.fx.record(1, state="closed"), self.fx.record(2)]
+        self.assertEqual(self.check_with(entries).errors, [])
+
+    # Negative: the data file.
+
+    def test_missing_data_file_fails(self) -> None:
+        self.data_file().unlink()
+        self.assert_error(series.check(self.fx.root), f"{series.CONTRIBUTIONS}: missing")
+
+    def test_invalid_json_fails(self) -> None:
+        self.data_file().write_text("{")
+        self.assert_error(series.check(self.fx.root), "invalid JSON")
+
+    def test_duplicate_key_fails(self) -> None:
+        text = self.data_file().read_text().replace('"state": "open",', '"state": "open",\n' * 2, 1)
+        self.data_file().write_text(text)
+        self.assert_error(series.check(self.fx.root), "key 'state' is written twice")
+
+    def test_foreign_top_level_key_fails(self) -> None:
+        self.data_file().write_text('{"checked": "2026-01-02", "contributions": [], "x": 1}')
+        self.assert_error(series.check(self.fx.root), "top level must hold")
+
+    def test_checked_must_be_a_day(self) -> None:
+        self.data_file().write_text('{"checked": "yesterday", "contributions": []}')
+        self.assert_error(series.check(self.fx.root), "'checked' must be a YYYY-MM-DD date")
+
+    def test_unknown_and_missing_keys_fail(self) -> None:
+        entry = self.fx.record(1, labels="x")
+        del entry["note"]
+        findings = self.check_with([entry, self.fx.record(2)], render=False)
+        self.assert_error(findings, "entry 1: unknown key 'labels'")
+        self.assert_error(findings, "entry 1: lacks key 'note'")
+
+    def test_wrong_value_types_fail(self) -> None:
+        entries = [self.fx.record(1) | {"number": "1"}, self.fx.record(2, note=None), True]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, "entry 1: 'number' must be an integer")
+        self.assert_error(findings, "entry 2: 'note' must be a string")
+        self.assert_error(findings, "entry 3: is not an object")
+        truthy = self.check_with([self.fx.record(1) | {"number": True}], render=False)
+        self.assert_error(truthy, "entry 1: 'number' must be an integer")
+
+    def test_url_must_end_in_the_number(self) -> None:
+        entries = [self.fx.record(1), self.fx.record(2), self.fx.record(3, url="https://x/pulls/4")]
+        self.assert_error(self.check_with(entries, render=False), "ending in /pulls/<number>")
+        entries[2] = self.fx.record(3, url="http://example.invalid/pulls/3")
+        self.assert_error(self.check_with(entries, render=False), "ending in /pulls/<number>")
+
+    def test_table_breaking_text_fails(self) -> None:
+        entries = [self.fx.record(1, title="a | b"), self.fx.record(2, note="one\ntwo")]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, "1: 'title' holds a '|' or a line break")
+        self.assert_error(findings, "2: 'note' holds a '|' or a line break")
+        empty = self.check_with([self.fx.record(1, title=" "), self.fx.record(2)], render=False)
+        self.assert_error(empty, "1: 'title' is empty")
+
+    def test_unknown_state_fails(self) -> None:
+        entries = [self.fx.record(1, state="draft"), self.fx.record(2)]
+        self.assert_error(self.check_with(entries, render=False), "state must be one of")
+
+    def test_merge_fields_must_fit_the_state(self) -> None:
+        needle = "state 'merged', and only it"
+        cases = [
+            self.fx.record(3, **self.MERGE),
+            self.fx.record(3, **self.MERGE, merged_commit=self.fx.base[:12]),
+            self.fx.record(3, state="merged", merged_commit=self.fx.base, merged_at="2026-01-01"),
+            self.fx.record(3, merged_commit=self.fx.base),
+            self.fx.record(3, merged_at="2026-01-01T10:00:00Z"),
+            self.fx.record(3, in_release="v1.0.1"),
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                entries = [self.fx.record(1), self.fx.record(2), case]
+                self.assert_error(self.check_with(entries, render=False), needle)
+
+    def test_numbers_must_ascend_without_repeats(self) -> None:
+        needle = "numbers must be unique and ascending"
+        swapped = [self.fx.record(2), self.fx.record(1)]
+        self.assert_error(self.check_with(swapped, render=False), needle)
+        twice = [self.fx.record(1), self.fx.record(2), self.fx.record(3), self.fx.record(3)]
+        self.assert_error(self.check_with(twice, render=False), needle)
+
+    # Negative: records against the series metadata.
+
+    def test_upstream_link_without_record_fails(self) -> None:
+        findings = self.check_with([self.fx.record(1)], render=False)
+        self.assert_error(findings, f"{self.fx.names[1]}: upstream link")
+        self.assert_error(findings, "pulls/2 has no record")
+
+    def test_record_of_an_unlisted_patch_fails(self) -> None:
+        entries = [self.fx.record(1), self.fx.record(2), self.fx.record(3, patch="0009-x.patch")]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, "3: the metadata of 0009-x.patch does not link")
+
+    def test_record_must_carry_its_patch_link(self) -> None:
+        entries = [self.fx.record(1, patch=self.fx.names[1]), self.fx.record(2, patch="")]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, f"1: the metadata of {self.fx.names[1]} does not link")
+
+    def test_patch_recorded_twice_fails(self) -> None:
+        entries = [self.fx.record(1), self.fx.record(2), self.fx.record(3, patch=self.fx.names[0])]
+        self.assert_error(self.check_with(entries, render=False), "is recorded twice")
+
+    def test_state_must_follow_the_patch_status(self) -> None:
+        merged = self.fx.record(1, **self.MERGE, merged_commit=self.fx.base)
+        findings = self.check_with([merged, self.fx.record(2)], render=False)
+        self.assert_error(findings, "state 'merged' disagrees with status 'submitted'")
+
+    # Negative: the README table and the command.
+
+    def test_readme_without_one_block_fails(self) -> None:
+        readme = self.fx.root / "README.md"
+        whole = readme.read_text()
+        needle = "README.md: lacks one"
+        for text in (
+            whole.replace(series.TABLE_END, ""),
+            whole + series.TABLE_START + "\n" + series.TABLE_END + "\n",
+            f"{series.TABLE_END}\n{series.TABLE_START}\n",
+        ):
+            with self.subTest(text=text[:40]):
+                readme.write_text(text)
+                self.assert_error(series.check(self.fx.root), needle)
+                self.assertEqual(self.run_main("--write")[0], 2)
+        readme.unlink()
+        self.assert_error(series.check(self.fx.root), needle)
+
+    def test_hand_edited_table_fails(self) -> None:
+        readme = self.fx.root / "README.md"
+        readme.write_text(readme.read_text().replace("| open |", "| merged |", 1))
+        self.assert_error(
+            series.check(self.fx.root), "run `scripts/series.py contributions --write`"
+        )
+
+    def test_command_refuses_unsound_records(self) -> None:
+        readme = self.fx.root / "README.md"
+        before = readme.read_text()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.fx.write_records([self.fx.record(1, state="draft"), self.fx.record(2)], False)
+        for arguments in ((), ("--write",)):
+            status, out, err = self.run_main(*arguments)
+            self.assertEqual((status, out), (1, ""))
+            self.assertIn("state must be one of", err)
+        self.assertEqual(readme.read_text(), before)
+
+    def test_command_refuses_a_broken_series_list(self) -> None:
+        series_txt = self.fx.root / "series.txt"
+        series_txt.write_text(series_txt.read_text() + self.fx.names[0] + "\n")
+        status, out, err = self.run_main()
+        self.assertEqual((status, out), (1, ""))
+        self.assertIn("series.txt", err)
 
 
 class ExportTest(SeriesTestCase):
