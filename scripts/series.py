@@ -23,6 +23,10 @@
     series.py notes VERSION REPOSITORY
         Print release notes: the pinned base, every patch with its status
         and upstream link, and how to verify and apply the release.
+    series.py contributions [--write]
+        Print the table of upstream pull requests rendered from
+        upstream-contributions.json; --write puts it into README.md
+        between its two marker comments. `check` compares the two.
 
 Exit status: 0 on success, 1 on findings or a failed apply, 2 when the
 tool cannot run (unreadable series files, unusable checkout).
@@ -35,6 +39,7 @@ is applied or exported.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -51,6 +56,26 @@ METADATA_KEYS = {"status", "upstream", "consumers", "origin", "notes"}
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+CONTRIBUTIONS = "upstream-contributions.json"
+CONTRIBUTION_KEYS = (
+    "number",
+    "url",
+    "title",
+    "base",
+    "state",
+    "merged_at",
+    "merged_commit",
+    "in_release",
+    "patch",
+    "project",
+    "note",
+)
+# Patch status in the metadata -> state of its pull request on the forge.
+FORGE_STATES = {"submitted": "open", "merged": "merged", "rejected": "closed"}
+DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+INSTANT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+TABLE_START = "<!-- upstream-contributions:start -->"
+TABLE_END = "<!-- upstream-contributions:end -->"
 WARNING = re.compile(r"(^|\s)warning(\s|#|:)", re.IGNORECASE)
 LOCATION = re.compile(r"^(?P<path>[^:\s]+):\d+(:\d+)?: ")
 COMPILED = re.compile(r"^CC\t(?P<object>\S+)\.o$")
@@ -225,6 +250,212 @@ def check_tree(root: Path, names: list[str], findings: Findings) -> None:
             findings.error(path.name, "metadata without a listed patch")
 
 
+def refuse_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """JSON object hook: a key written twice is an error, not the last value."""
+    keys = [key for key, _ in pairs]
+    for key in keys:
+        if keys.count(key) > 1:
+            raise ValueError(f"key {key!r} is written twice")
+    return dict(pairs)
+
+
+def read_contributions(root: Path, findings: Findings) -> dict | None:
+    path = root / CONTRIBUTIONS
+    if not path.is_file():
+        findings.error(CONTRIBUTIONS, "missing")
+        return None
+    try:
+        data = json.loads(path.read_text(), object_pairs_hook=refuse_duplicates)
+    except ValueError as exc:
+        findings.error(CONTRIBUTIONS, f"invalid JSON: {exc}")
+        return None
+    if not isinstance(data, dict) or set(data) != {"checked", "contributions"}:
+        findings.error(CONTRIBUTIONS, "top level must hold 'checked' and 'contributions' only")
+        return None
+    if not isinstance(data["checked"], str) or not DAY.match(data["checked"]):
+        findings.error(CONTRIBUTIONS, "'checked' must be a YYYY-MM-DD date")
+        return None
+    if not isinstance(data["contributions"], list):
+        findings.error(CONTRIBUTIONS, "'contributions' must be a list")
+        return None
+    return data
+
+
+def entry_shape_ok(entry: object, position: int, findings: Findings) -> bool:
+    """Exactly the known keys, `number` an integer, every other value a string."""
+    where = f"{CONTRIBUTIONS}: entry {position}"
+    if not isinstance(entry, dict):
+        findings.error(where, "is not an object")
+        return False
+    before = len(findings.errors)
+    for key in sorted(set(entry) - set(CONTRIBUTION_KEYS)):
+        findings.error(where, f"unknown key {key!r}")
+    for key in CONTRIBUTION_KEYS:
+        if key not in entry:
+            findings.error(where, f"lacks key {key!r}")
+        elif key == "number" and type(entry[key]) is not int:
+            findings.error(where, "'number' must be an integer")
+        elif key != "number" and not isinstance(entry[key], str):
+            findings.error(where, f"{key!r} must be a string")
+    return len(findings.errors) == before
+
+
+def merge_fields_fit(entry: dict) -> bool:
+    """A merged pull request names its commit and instant; any other names neither."""
+    if entry["state"] == "merged":
+        return bool(COMMIT.match(entry["merged_commit"]) and INSTANT.match(entry["merged_at"]))
+    return not (entry["merged_commit"] or entry["merged_at"] or entry["in_release"])
+
+
+def check_entry(entry: dict, findings: Findings) -> None:
+    where = f"{CONTRIBUTIONS}: {entry['number']}"
+    url = entry["url"]
+    if not url.startswith("https://") or not url.endswith(f"/pulls/{entry['number']}"):
+        findings.error(where, "url must be an https link ending in /pulls/<number>")
+    for key in ("title", "base", "project"):
+        if not entry[key].strip():
+            findings.error(where, f"{key!r} is empty")
+    for key in CONTRIBUTION_KEYS[1:]:
+        if "|" in entry[key] or "\n" in entry[key]:
+            findings.error(where, f"{key!r} holds a '|' or a line break")
+    if entry["state"] not in FORGE_STATES.values():
+        findings.error(where, f"state must be one of {', '.join(FORGE_STATES.values())}")
+    elif not merge_fields_fit(entry):
+        findings.error(
+            where,
+            "state 'merged', and only it, carries a 40-hex merged_commit and a "
+            "merged_at instant (YYYY-MM-DDTHH:MM:SSZ); in_release needs both",
+        )
+
+
+def patch_links(root: Path, names: list[str]) -> dict[str, tuple[str, str]]:
+    """Map each listed patch that was sent upstream to (status, upstream link)."""
+    links: dict[str, tuple[str, str]] = {}
+    for name in names:
+        sidecar = (root / "patches" / name).with_suffix(".toml")
+        try:
+            data = tomllib.loads(sidecar.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            continue  # check_metadata() reports it
+        status, link = data.get("status"), str(data.get("upstream", ""))
+        if status in FORGE_STATES and link.startswith("https://"):
+            links[name] = (status, link)
+    return links
+
+
+def check_records(
+    entries: list[dict], links: dict[str, tuple[str, str]], findings: Findings
+) -> None:
+    """Each upstream link of the series has one record, each record's patch that link."""
+    recorded: set[str] = set()
+    for entry in entries:
+        patch = entry["patch"]
+        if not patch:
+            continue
+        where = f"{CONTRIBUTIONS}: {entry['number']}"
+        if patch in recorded:
+            findings.error(where, f"{patch} is recorded twice")
+        recorded.add(patch)
+        status, link = links.get(patch, ("", ""))
+        if link != entry["url"]:
+            findings.error(where, f"the metadata of {patch} does not link {entry['url']}")
+        elif FORGE_STATES[status] != entry["state"]:
+            findings.error(where, f"state {entry['state']!r} disagrees with status {status!r}")
+    for name, (_, link) in links.items():
+        if name not in recorded:
+            findings.error(name, f"upstream link {link} has no record in {CONTRIBUTIONS}")
+
+
+def checked_contributions(root: Path, names: list[str], findings: Findings) -> dict | None:
+    """Return the data file's content when every record is sound, else None."""
+    data = read_contributions(root, findings)
+    if data is None:
+        return None
+    before = len(findings.errors)
+    entries = [
+        entry
+        for position, entry in enumerate(data["contributions"], 1)
+        if entry_shape_ok(entry, position, findings)
+    ]
+    for entry in entries:
+        check_entry(entry, findings)
+    numbers = [entry["number"] for entry in entries]
+    if numbers != sorted(set(numbers)):
+        findings.error(CONTRIBUTIONS, "numbers must be unique and ascending")
+    check_records(entries, patch_links(root, names), findings)
+    return data if len(findings.errors) == before else None
+
+
+def contribution_state(entry: dict) -> str:
+    if entry["state"] != "merged":
+        return entry["state"]
+    release = f"in {entry['in_release']}" if entry["in_release"] else "in no release yet"
+    return f"merged {entry['merged_at'][:10]} (`{entry['merged_commit'][:12]}`), {release}"
+
+
+def contributions_table(data: dict) -> str:
+    """The README block: one row per pull request and the day the forge was read."""
+    lines = [
+        "| Pull request | Target | State | Change | Series patch |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for entry in data["contributions"]:
+        lines.append(
+            f"| [{entry['number']}]({entry['url']}) | `{entry['base']}` "
+            f"| {contribution_state(entry)} | {entry['title']} | {entry['patch'][:4] or 'none'} |"
+        )
+    lines += ["", f"State read from the FFmpeg forge on {data['checked']}."]
+    return "\n".join(lines)
+
+
+def readme_block(text: str) -> str | None:
+    """The text between the two markers, or None unless each occurs once, in order."""
+    if text.count(TABLE_START) != 1 or text.count(TABLE_END) != 1:
+        return None
+    start, end = text.index(TABLE_START), text.index(TABLE_END)
+    if end < start:
+        return None
+    return text[start + len(TABLE_START) : end].strip("\n")
+
+
+def check_contributions(root: Path, names: list[str], findings: Findings) -> None:
+    data = checked_contributions(root, names, findings)
+    if data is None:
+        return
+    readme = root / "README.md"
+    block = readme_block(readme.read_text()) if readme.is_file() else None
+    if block is None:
+        findings.error("README.md", f"lacks one {TABLE_START} ... {TABLE_END} block")
+    elif block != contributions_table(data):
+        findings.error(
+            "README.md",
+            f"contribution table differs from {CONTRIBUTIONS}: "
+            "run `scripts/series.py contributions --write`",
+        )
+
+
+def contributions(root: Path, write: bool) -> int:
+    """Print the table, or write it into the README block; 1 when the data is unsound."""
+    findings = Findings()
+    data = checked_contributions(root, read_series(root, findings), findings)
+    if data is None or findings.errors:
+        for line in findings.errors:
+            print(f"error: {line}", file=sys.stderr)
+        return 1
+    table = contributions_table(data)
+    if not write:
+        print(table)
+        return 0
+    readme = root / "README.md"
+    text = readme.read_text() if readme.is_file() else ""
+    if readme_block(text) is None:
+        raise SeriesError(f"README.md lacks one {TABLE_START} ... {TABLE_END} block")
+    head, _, rest = text.partition(TABLE_START)
+    tail = rest.partition(TABLE_END)[2]
+    readme.write_text(f"{head}{TABLE_START}\n{table}\n{TABLE_END}{tail}")
+    return 0
+
+
 def check(root: Path) -> Findings:
     findings = Findings()
     read_base(root, findings)
@@ -232,6 +463,7 @@ def check(root: Path) -> Findings:
     if not names and not findings.errors:
         findings.error("series.txt", "lists no patch")
     check_tree(root, names, findings)
+    check_contributions(root, names, findings)
     return findings
 
 
@@ -573,6 +805,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     notes = sub.add_parser("notes", help="print release notes for a tag")
     notes.add_argument("version")
     notes.add_argument("repository", help="owner/name on GitHub")
+    table = sub.add_parser("contributions", help="print the table of upstream pull requests")
+    table.add_argument("--write", action="store_true", help="write it into README.md")
     return parser.parse_args(argv)
 
 
@@ -587,6 +821,14 @@ def main(argv: list[str]) -> int:
         return 2
 
 
+def run_text(args: argparse.Namespace) -> int:
+    """The commands that print generated text."""
+    if args.command == "contributions":
+        return contributions(args.root, args.write)
+    print(release_notes(args.root, args.version, args.repository), end="")
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
     if args.command == "check":
         findings = check(args.root)
@@ -599,9 +841,8 @@ def run(args: argparse.Namespace) -> int:
         results = apply_series(args.root, args.tree, args.expect_base, args.keep_going)
         write_report(results, args.tree, args.report)
         return 1 if apply_failed(results, args.expect_base) else 0
-    if args.command == "notes":
-        print(release_notes(args.root, args.version, args.repository), end="")
-        return 0
+    if args.command in ("notes", "contributions"):
+        return run_text(args)
     if args.command == "warnings":
         return warnings_gate(args.root, args.tree, args.log, args.report, args.base)
     if args.command == "coverage":
