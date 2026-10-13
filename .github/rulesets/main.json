@@ -47,6 +47,15 @@
             "context": "REUSE lint"
           },
           {
+            "context": "scanners (gitleaks · secrets in history)"
+          },
+          {
+            "context": "scanners (semgrep · repository rules)"
+          },
+          {
+            "context": "scanners (trivy · vulnerabilities, secrets, misconfiguration)"
+          },
+          {
             "context": "series (apply · regenerate · build · FATE · warnings) on the pinned base"
           },
           {

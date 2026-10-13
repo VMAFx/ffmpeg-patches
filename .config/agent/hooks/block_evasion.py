@@ -79,12 +79,18 @@ RULES = [
     ),
 ]
 
-# The RULES judged without the words of read-only commands chained after a commit.
+# The RULES judged without the words of read-only commands chained after a commit. Each
+# pattern has a name of its own: wrapped inside the list, it would read as two items with
+# the comma between them forgotten.
+READ_ONLY_EXEMPT_1 = (
+    r"\bgit([ \t]+-[Cc][ \t]+(\x22[^\x22]*\x22|\x27[^\x27]*\x27|[^ \t\n\x22\x27][^ \t\n"
+    r"]*)|[ \t]+(--[A-Za-z][-A-Za-z]*|-[ABD-Zabd-z][-A-Za-z]*|-[Cc][A-Za-z]+)(=[^ \t\n]"
+    r"+)?)*\s+(commit\b[^\n]*\s-[aeiopqsvz]*|am\b[^\n]*\s-[3cikmqsu]*)n"
+)
+READ_ONLY_EXEMPT_2 = r"SKIP=.*git"
 READ_ONLY_EXEMPT = [
-    r"\bgit([ \t]+-[Cc][ \t]+(\x22[^\x22]*\x22|\x27[^\x27]*\x27|[^ \t\n\x22\x27][^ \t"
-    r"\n]*)|[ \t]+(--[A-Za-z][-A-Za-z]*|-[ABD-Zabd-z][-A-Za-z]*|-[Cc][A-Za-z]+)(=[^ \t"
-    r"\n]+)?)*\s+(commit\b[^\n]*\s-[aeiopqsvz]*|am\b[^\n]*\s-[3cikmqsu]*)n",
-    r"SKIP=.*git",
+    READ_ONLY_EXEMPT_1,
+    READ_ONLY_EXEMPT_2,
 ]
 READ_ONLY_WORDS = (
     r"((?:;|&&|\|\|?)[ \t]*(?:git[ \t]+(?:--no-pager[ \t]+)?(?:log|show|status|diff|rev"
@@ -92,9 +98,9 @@ READ_ONLY_WORDS = (
     r"\t]*sed)[ \t]+-n\b(?:[ \t]+[-A-Za-z0-9_./:=@,+~*?]+)*"
 )
 READ_ONLY_VETO = (
-    r"[^\t\x20-\x7e]|[\\\x60$(){}<>^!]|--%|%[;&|]|(?i:(?:^|[^-A-Za-z0-9_])(?:export|dec"
-    r"lare|typeset|set|setenv|alias|function|sal|nal|set-alias|new-alias|doskey|hash)(?"
-    r":[^-A-Za-z0-9_]|$))"
+    r"[^\t\x20-\x7e]|[\\\x60$(){}<>^!]|--%|%[;&|]|(?i:(?:\A|[^-A-Za-z0-9_])(?:export|de"
+    r"clare|typeset|set|setenv|alias|function|sal|nal|set-alias|new-alias|doskey|hash)("
+    r"?:[^-A-Za-z0-9_]|$))"
 )
 
 LEFTHOOK_DISABLED = [
@@ -135,7 +141,7 @@ def pending_command():
     try:
         return read_payload_command(sys.stdin.buffer)
     except (ValueError, OSError, RecursionError) as error:
-        raise Blocked(INVALID_INPUT_REFUSAL + str(error))
+        raise Blocked(INVALID_INPUT_REFUSAL + str(error)) from error
 
 
 def check_environment(environ):
