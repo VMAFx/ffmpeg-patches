@@ -88,3 +88,6 @@ index 3b2cc35bf903bdab3313a10c260377f742e0a22a..c37c108bdc962f8070e37b31b7cc8c41
              .image = vkf->img[i],
              .subresourceRange = (VkImageSubresourceRange) {
                  .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+-- 
+2.43.0
+
