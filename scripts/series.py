@@ -621,6 +621,11 @@ def export_series(root: Path, tree: Path) -> list[str]:
     with tempfile.TemporaryDirectory() as scratch:
         git(tree, *FORMAT_PATCH, "-o", scratch, f"{commit}..HEAD")
         new = sorted(Path(scratch).glob("*.patch"))
+        if not new:
+            # A tree at the base exports nothing; writing that would delete every patch.
+            raise SeriesError(
+                f"{tree}: no commit after the pinned base {commit}; patches/ left as it is"
+            )
         names = [p.name for p in new]
         for old in patches.glob("*.patch"):
             if old.name not in names:
@@ -739,9 +744,25 @@ def patch_subject(path: Path) -> str:
     return " ".join(match.group(1).split()) if match else path.name
 
 
+def note_metadata(path: Path) -> dict:
+    """The metadata of the listed patch at PATH; a missing or unreadable file is a tool error."""
+    sidecar = path.with_suffix(".toml")
+    if not path.is_file():
+        raise SeriesError(f"{path.name}: listed in series.txt but missing from patches/")
+    try:
+        meta = tomllib.loads(sidecar.read_text())
+    except FileNotFoundError:
+        raise SeriesError(f"{path.name}: no metadata file patches/{sidecar.name}") from None
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SeriesError(f"patches/{sidecar.name}: {exc}") from exc
+    if "status" not in meta:
+        raise SeriesError(f"patches/{sidecar.name}: no status")
+    return meta
+
+
 def note_row(root: Path, number: int, name: str) -> str:
     path = root / "patches" / name
-    meta = tomllib.loads(path.with_suffix(".toml").read_text())
+    meta = note_metadata(path)
     upstream = meta.get("upstream", "")
     link = f"[link]({upstream})" if upstream else "none"
     consumers = ", ".join(meta.get("consumers", []))
