@@ -139,7 +139,7 @@ jobs:
           # --enable-gpl builds the GPL-only filters 0002 changes (find_rect, mcdeint,
           # eq and its checkasm test), which an LGPL build skips.
           ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl --enable-vulkan \
-            --enable-nvenc --enable-vaapi --enable-libdrm \
+            --enable-nvenc --enable-libdrm \
             || { tail -40 ffbuild/config.log; exit 1; }
       - name: Build FFmpeg, its tools and test programs
         if: github.event.pull_request.draft != true
