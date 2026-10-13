@@ -35,6 +35,7 @@ jobs:
     steps:
       - name: Stop on a draft pull request
         if: github.event.pull_request.draft == true
+        shell: bash
         env:
           TITLE: Gate not run on a draft
           MESSAGE: >-
@@ -78,6 +79,7 @@ jobs:
     steps:
       - name: Stop on a draft pull request
         if: github.event.pull_request.draft == true
+        shell: bash
         env:
           TITLE: Gate not run on a draft
           MESSAGE: >-
@@ -107,6 +109,7 @@ jobs:
     steps:
       - name: Stop on a draft pull request
         if: github.event.pull_request.draft == true
+        shell: bash
         env:
           TITLE: Gate not run on a draft
           MESSAGE: >-
