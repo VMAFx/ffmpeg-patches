@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Findings the trivy job of .github/workflows/scanners.yml accepts. Every other
+# finding, of any severity, fails the job. One identifier per line, each with
+# its reason above it.
+
+# .devcontainer/Dockerfile.praetor builds an interactive development
+# container that runs no service, so there is nothing for a HEALTHCHECK to probe.
+DS-0026

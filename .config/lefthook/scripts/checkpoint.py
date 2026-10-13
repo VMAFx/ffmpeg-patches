@@ -4,11 +4,11 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import re
-import sys
 import stat
+import sys
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from common import HookError, run_bounded
@@ -109,29 +109,35 @@ def _policy_bytes(root):
 
 
 def _policy_bytes_relative(root):
-    descriptors = []
+    """Read the policy through descriptor-relative opens, closing every descriptor here.
+
+    One directory is held at a time: a parent is closed once its child is open, and the
+    last one once the policy file is open or an open failed. The stream is opened with
+    closefd=False and the descriptor closed below, because a wrap that fails (the policy
+    path is a directory) leaves a descriptor it was meant to own open.
+    """
+    directories = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
-        descriptors.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
-        for part in POLICY_PARTS:
-            descriptors.append(
-                os.open(
-                    part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=descriptors[-1],
-                )
+        directory = os.open(root, directories)
+        try:
+            for part in POLICY_PARTS:
+                parent = directory
+                directory = os.open(part, directories, dir_fd=parent)
+                os.close(parent)
+            descriptor = os.open(
+                POLICY_FILE,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory,
             )
-        descriptor = os.open(
-            POLICY_FILE,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=descriptors[-1],
-        )
-        with os.fdopen(descriptor, "rb") as stream:
-            return _read_policy(stream)
+        finally:
+            os.close(directory)
+        try:
+            with open(descriptor, "rb", closefd=False) as stream:
+                return _read_policy(stream)
+        finally:
+            os.close(descriptor)
     except FileNotFoundError:
         return None
-    finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
 
 
 def _redirects(info):
@@ -169,7 +175,19 @@ def _policy_bytes_checked(root):
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except FileNotFoundError:
         return None
-    with os.fdopen(descriptor, "rb") as stream:
+    try:
+        return _read_inspected(descriptor, inspected)
+    finally:
+        os.close(descriptor)
+
+
+def _read_inspected(descriptor, inspected):
+    """Read the policy from descriptor, which must be the file that was inspected.
+
+    The caller keeps the descriptor and closes it: a wrap that fails (the policy path is a
+    directory) leaves a descriptor it was meant to own open.
+    """
+    with open(descriptor, "rb", closefd=False) as stream:
         if not os.path.samestat(inspected, os.fstat(stream.fileno())):
             raise CheckpointError(
                 "checkpoint configuration was replaced while it was read"
@@ -327,11 +345,10 @@ def _paths(raw):
 
 
 def _public(path):
-    return (
-        path != ".standards-receipt.json"
-        and path != ".workingdir"
-        and not path.startswith(".workingdir/")
-    )
+    return path not in (
+        ".standards-receipt.json",
+        ".workingdir",
+    ) and not path.startswith(".workingdir/")
 
 
 WORKTREE_DIFF = ("--no-ext-diff", "--no-textconv", "--ignore-submodules=all")

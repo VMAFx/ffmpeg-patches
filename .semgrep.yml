@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Semgrep rules of this repository, run by the semgrep job of
+# .github/workflows/scanners.yml with --error: any finding fails the job.
+# The rules live here, not in the Semgrep Registry, so a run needs no network
+# and the rule set changes only with this file.
+rules:
+  - id: subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A subprocess started through the shell runs whatever the string expands
+      to. Pass an argument list and leave shell at its default.
+    pattern-either:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern: subprocess.$FUNC(..., shell=1, ...)
+
+  - id: subprocess-without-timeout
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Every subprocess this repository waits for is bounded. Pass timeout=,
+      as git() in scripts/series.py does.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run(...)
+          - pattern: subprocess.call(...)
+          - pattern: subprocess.check_call(...)
+          - pattern: subprocess.check_output(...)
+      - pattern-not: subprocess.$FUNC(..., timeout=$T, ...)
+
+  - id: os-shell-command
+    languages: [python]
+    severity: ERROR
+    message: os.system and os.popen run a string through the shell; use subprocess with an argument list.
+    pattern-either:
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+
+  - id: eval-or-exec
+    languages: [python]
+    severity: ERROR
+    message: eval and exec run text as code; parse the text instead.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: pickle-load
+    languages: [python]
+    severity: ERROR
+    message: Unpickling runs code from the data; use json or tomllib.
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+
+  - id: tempfile-mktemp
+    languages: [python]
+    severity: ERROR
+    message: tempfile.mktemp returns a name another process can take first; use mkstemp or TemporaryDirectory.
+    pattern: tempfile.mktemp(...)
