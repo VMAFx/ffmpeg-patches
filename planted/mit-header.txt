@@ -1,0 +1,3 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: MIT
+# Planted: MIT has no text under LICENSES/.
