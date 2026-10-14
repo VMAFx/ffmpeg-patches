@@ -50,13 +50,14 @@ carry.
 | [24970](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970) | `master` | open | avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED | 0001 |
 | [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | none |
 | [24974](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974) | `master` | open | avcodec/av1dec: remove the coding bias from exported chroma grain params | none |
-| [24975](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975) | `release/9.0` | merged 2026-10-12 (`7e93014c5bbb`), in no release yet | hwcontext_vulkan: only originate host image layout transitions from copyable layouts | none |
+| [24975](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975) | `release/9.0` | merged 2026-10-12 (`7e93014c5bbb`), in no release yet | [release/9.0] hwcontext_vulkan: only originate host image layout transitions from copyable layouts | none |
 | [24977](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24977) | `master` | open | avcodec/vaapi_encode_h265: enable cu_qp_delta for ROI in CQP mode | none |
 | [24978](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24978) | `master` | open | avfilter/vf_libvmaf: add max pool method, reject unknown ones | none |
 | [24993](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993) | `master` | open | avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit | 0003 |
 | [24994](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994) | `master` | open | avcodec/nvenc: drop user data SEI that NVENC would write truncated | 0004 |
+| [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | open | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0008 |
 
-State read from the FFmpeg forge on 2026-10-12.
+State read from the FFmpeg forge on 2026-10-14.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned
