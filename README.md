@@ -78,6 +78,7 @@ edit the file, then run `python3 scripts/series.py contributions --write`.
 | `upstream-contributions.json` | Every upstream pull request with its state; source of the table above |
 | `scripts/series.py` | `check`, `apply`, `export`, the `coverage` and `warnings` gates, the `contributions` table and release `notes` |
 | `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
+| `scripts/consumer_stacks.py` | Applies each consumer's patch stack on top of the applied series |
 
 Metadata keys:
 
@@ -151,6 +152,14 @@ A daily run (`upstream.yml`) reads every pull request in
 `upstream-contributions.json` from code.ffmpeg.org and fails when its state,
 title, base branch, merge instant or merge commit no longer matches the
 record. Update the record, regenerate the table and bump `checked`.
+
+`consumers.yml` applies the series on the pinned base, then the patch stacks
+of VMAFx/vmafx and VMAFx/pelorus (`ffmpeg-patches/series.txt` on their
+default branches) on top, with `git am --3way` as their builds do. It runs
+on every pull request, on `main` and nightly, and fails when a stack no
+longer applies, so a series change that breaks a consumer shows before a
+release carries it. It applies only; the consumers build in their own
+repositories.
 
 ## Releases
 

@@ -44,6 +44,9 @@
       "parameters": {
         "required_status_checks": [
           {
+            "context": "consumer stacks (vmafx · pelorus) on the series"
+          },
+          {
             "context": "REUSE lint"
           },
           {

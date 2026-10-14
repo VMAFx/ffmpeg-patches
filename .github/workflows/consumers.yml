@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# The consumers apply their own FFmpeg patch stacks on top of this series:
+# VMAFx/vmafx and VMAFx/pelorus, each from ffmpeg-patches/series.txt on its
+# default branch. This run applies the series on the pinned base, then each
+# consumer stack on top, the way their builds do, and fails when one no
+# longer applies. On a pull request it shows that a series change breaks a
+# consumer before a release carries it; the nightly run shows that a
+# consumer change no longer fits the series on main. Apply only: the
+# consumers' builds need their own libraries and run in their repositories.
+name: consumer stacks
+
+'on':
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '11 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: consumers-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  consumers:
+    name: consumer stacks (vmafx · pelorus) on the series
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.draft != true
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: github.event.pull_request.draft != true
+        with:
+          python-version-file: .python-version
+      - name: Load the pinned base
+        if: github.event.pull_request.draft != true
+        run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
+      - name: Fetch and verify the pinned FFmpeg source
+        if: github.event.pull_request.draft != true
+        run: |
+          git init -q ffmpeg
+          git -C ffmpeg remote add origin "$FFMPEG_REMOTE"
+          git -C ffmpeg fetch -q --depth=1 origin \
+            "refs/tags/${FFMPEG_TAG}:refs/tags/${FFMPEG_TAG}"
+          actual=$(git -C ffmpeg rev-parse --verify "refs/tags/${FFMPEG_TAG}^{commit}")
+          if [ "$actual" != "$FFMPEG_COMMIT" ]; then
+            echo "::error::${FFMPEG_TAG} peels to ${actual}, base.env pins ${FFMPEG_COMMIT}"
+            exit 1
+          fi
+          git -C ffmpeg checkout -q --detach "$FFMPEG_COMMIT"
+      - name: Apply the series
+        if: github.event.pull_request.draft != true
+        run: python3 scripts/series.py apply --expect-base ffmpeg
+      - name: Fetch the consumer stacks
+        if: github.event.pull_request.draft != true
+        run: |
+          for consumer in vmafx pelorus; do
+            git clone -q --depth=1 --filter=blob:none --sparse \
+              "https://github.com/VMAFx/${consumer}.git" "consumers/${consumer}"
+            git -C "consumers/${consumer}" sparse-checkout set ffmpeg-patches
+            git -C "consumers/${consumer}" log -1 --format="${consumer} %H %cs %s" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Apply each consumer stack on top of the series
+        if: github.event.pull_request.draft != true
+        run: |
+          python3 scripts/consumer_stacks.py ffmpeg \
+            vmafx=consumers/vmafx/ffmpeg-patches \
+            pelorus=consumers/pelorus/ffmpeg-patches \
+            --report "$GITHUB_STEP_SUMMARY"
