@@ -32,7 +32,8 @@ def consumer(text: str) -> tuple[str, Path]:
     name, separator, directory = text.partition("=")
     if not separator or not name or not directory:
         raise argparse.ArgumentTypeError(f"{text!r} is not NAME=DIR")
-    return name, Path(directory)
+    # git am runs in TREE (git -C), so a relative DIR would name the wrong file.
+    return name, Path(directory).resolve()
 
 
 def stack(directory: Path) -> list[Path]:

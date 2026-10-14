@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -163,6 +164,15 @@ class ConsumerStacksTest(unittest.TestCase):
     def test_list_without_a_patch_is_a_tool_error(self) -> None:
         self.fx.write_list(["# nothing", ""])
         self.assert_tool_error("lists no patch")
+
+    def test_relative_stack_directory_is_read_from_the_working_directory(self) -> None:
+        # CI passes consumers/<name>/ffmpeg-patches relative to the checkout,
+        # while git am runs inside the FFmpeg tree.
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.scratch)
+        status, out, _ = self.run_main(f"a={self.fx.stack.name}")
+        self.assertEqual(status, 0)
+        self.assertEqual(out.count("applied"), 2)
 
     def test_comments_and_blank_lines_are_skipped(self) -> None:
         self.fx.write_list(["", "# a", *self.fx.names[:1], "   ", "# b"])
