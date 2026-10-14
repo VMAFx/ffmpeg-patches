@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-12",
+  "checked": "2026-10-14",
   "contributions": [
     {
       "number": 24970,
@@ -43,7 +43,7 @@
     {
       "number": 24975,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975",
-      "title": "hwcontext_vulkan: only originate host image layout transitions from copyable layouts",
+      "title": "[release/9.0] hwcontext_vulkan: only originate host image layout transitions from copyable layouts",
       "base": "release/9.0",
       "state": "merged",
       "merged_at": "2026-10-12T03:43:42Z",
@@ -104,6 +104,19 @@
       "patch": "0004-avcodec-nvenc-drop-user-data-SEI-that-NVENC-would-wr.patch",
       "project": "pelorus",
       "note": ""
+    },
+    {
+      "number": 25060,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060",
+      "title": "[release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue",
+      "base": "release/9.0",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0008-vulkan-de-phase-queue-rotation-and-pin-video-pools-t.patch",
+      "project": "pelorus",
+      "note": "Backport of FFmpeg master commit d0d7d813178fec964716aa2c48f5896ce5c26284."
     }
   ]
 }
