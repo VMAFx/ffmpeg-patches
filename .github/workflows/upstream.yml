@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Daily comparison of upstream-contributions.json with the FFmpeg forge. A
+# pull request that merged, closed, changed its title or moved to another
+# base since the file was written fails the run (exit status 1), so the
+# README table cannot go stale unseen; the fix is a pull request that
+# updates the file and regenerates the table. The forge is read without a
+# token. A forge that cannot be read fails the run with exit status 2.
+name: upstream drift
+
+'on':
+  schedule:
+    - cron: '47 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  drift:
+    name: upstream pull requests (drift against code.ffmpeg.org)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - name: Compare every recorded pull request with the forge
+        run: python3 scripts/upstream_drift.py
