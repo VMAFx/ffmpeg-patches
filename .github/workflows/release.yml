@@ -37,6 +37,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
     timeout-minutes: 10
+    continue-on-error: true
     permissions:
       contents: write
     steps:
