@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -690,6 +693,226 @@ class ExportTest(SeriesTestCase):
         run_git(self.fx.tree, "commit", "-q", "-m", "unrelated")
         with self.assertRaises(series.SeriesError):
             series.export_series(self.fx.root, self.fx.tree)
+
+
+class InterfaceGapsTest(SeriesTestCase):
+    """Negative and boundary cases of the CLI that the gap audit listed (rows A4-1 to A4-9)."""
+
+    def run_main(self, *arguments: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = series.main(["--root", str(self.fx.root), *arguments])
+        return status, out.getvalue(), err.getvalue()
+
+    # A4-1: notes on a series whose metadata is missing or unreadable is a tool error.
+
+    def test_notes_without_metadata_exits_two_with_a_message(self) -> None:
+        sidecar = self.fx.patch(2).with_suffix(".toml")
+        for name, change in (
+            ("missing", sidecar.unlink),
+            ("invalid", lambda: sidecar.write_text("x =")),
+        ):
+            with self.subTest(name):
+                self.fx.patch(2).with_suffix(".toml").write_text(METADATA)
+                change()
+                status, out, err = self.run_main("notes", "v1.2.3", "Org/repo")
+                self.assertEqual((status, out), (2, ""))
+                self.assertIn(self.fx.names[1][:4], err)
+                self.assertNotIn("Traceback", err)
+
+    # A4-2: a series.txt that lists no patch.
+
+    def test_check_on_a_series_listing_no_patch_fails(self) -> None:
+        (self.fx.root / "series.txt").write_text("# header kept by export\n")
+        self.assert_error(series.check(self.fx.root), "series.txt: lists no patch")
+
+    # A4-3: base.env missing, with an unexpected line, with a key written twice.
+
+    def test_base_env_missing_unexpected_and_repeated_lines_fail(self) -> None:
+        env = self.fx.root / "base.env"
+        text = env.read_text()
+        env.write_text(text + "EXTRA=1\n")
+        self.assert_error(series.check(self.fx.root), "base.env:4: unexpected line 'EXTRA=1'")
+        env.write_text(text + "FFMPEG_TAG=v2\n")
+        self.assert_error(series.check(self.fx.root), "base.env:4: unexpected line 'FFMPEG_TAG=v2'")
+        env.unlink()
+        self.assert_error(series.check(self.fx.root), "base.env: missing")
+
+    # A4-4: a patch without the zero From line, and one without a diff.
+
+    def test_patch_without_from_line_or_diff_fails(self) -> None:
+        first, second = self.fx.patch(1), self.fx.patch(2)
+        lines = first.read_text().split("\n", 1)
+        first.write_text("From nobody\n" + lines[1])
+        second.write_text(second.read_text().replace("\ndiff --git ", "\nno diff here "))
+        findings = series.check(self.fx.root)
+        self.assert_error(findings, f"{first.name}: first line is not a format-patch From line")
+        self.assert_error(findings, f"{second.name}: no diff --git section")
+
+    # A4-5: invalid TOML metadata, and metadata whose patch is not listed.
+
+    def test_invalid_toml_and_orphan_metadata_fail(self) -> None:
+        self.fx.patch(1).with_suffix(".toml").write_text("status =\n")
+        (self.fx.root / "patches" / "0009-orphan.toml").write_text(METADATA)
+        findings = series.check(self.fx.root)
+        self.assert_error(findings, "invalid TOML")
+        self.assert_error(findings, "0009-orphan.toml: metadata without a listed patch")
+
+    # A4-6: apply refuses a tree with a git am session in progress.
+
+    def test_apply_refuses_a_git_am_session_in_progress(self) -> None:
+        session = Path(
+            run_git(
+                self.fx.tree, "rev-parse", "--path-format=absolute", "--git-path", "rebase-apply"
+            )
+        )
+        session.mkdir(parents=True)
+        with self.assertRaisesRegex(series.SeriesError, "a git am session is in progress"):
+            series.apply_series(self.fx.root, self.fx.tree, True, False)
+
+    # A4-7: export on a tree with no commit after the base keeps every patch.
+
+    def test_export_on_the_base_refuses_and_keeps_every_patch(self) -> None:
+        patches = self.fx.root / "patches"
+        before = {p.name: p.read_bytes() for p in patches.iterdir()}
+        series_before = (self.fx.root / "series.txt").read_bytes()
+        with self.assertRaisesRegex(series.SeriesError, "no commit after the pinned base"):
+            series.export_series(self.fx.root, self.fx.tree)
+        self.assertEqual({p.name: p.read_bytes() for p in patches.iterdir()}, before)
+        self.assertEqual((self.fx.root / "series.txt").read_bytes(), series_before)
+        status, _, err = self.run_main("export", str(self.fx.tree))
+        self.assertEqual(status, 2)
+        self.assertIn("patches/ left as it is", err)
+
+    # A4-8: --report appends the summary of warnings and coverage to the file.
+
+    def test_warnings_and_coverage_report_append_to_the_file(self) -> None:
+        commit_edit(self.fx.tree, 4, "int line_5 = 50;", "lib: fix line five")
+        scratch = Path(self._scratch.name)
+        log, report = scratch / "build.log", scratch / "summary.md"
+        log.write_text("CC\tlib.o\nlib.c:5:1: warning: unused variable 'x'\n")
+        report.write_text("# Summary\n")
+        tree = str(self.fx.tree)
+        for _ in range(2):
+            self.assertEqual(
+                self.run_main("warnings", tree, str(log), "--report", str(report))[0], 1
+            )
+        self.assertEqual(self.run_main("coverage", tree, str(log), "--report", str(report))[0], 0)
+        lines = report.read_text().splitlines()
+        self.assertEqual(lines[0], "# Summary")
+        gated = "1 compiler warning(s) in files the series changes (gated); 0 elsewhere in FFmpeg"
+        self.assertEqual(sum(line.startswith(gated) for line in lines), 2)
+        compiled = "1 of 1 C file(s) the series changes were compiled;"
+        self.assertTrue(any(line.startswith(compiled) for line in lines), lines)
+
+    # A4-9: a patch that only removes lines has no added content to find upstream.
+
+    def test_content_present_without_added_lines_is_false(self) -> None:
+        patch = Path(self._scratch.name) / "removal.patch"
+        patch.write_text(
+            "diff --git a/lib.c b/lib.c\n--- a/lib.c\n+++ b/lib.c\n"
+            "@@ -1,2 +1,1 @@\n-int line_1 = 1;\n int line_2 = 2;\n"
+        )
+        self.assertEqual(series.added_runs(patch.read_text()), {})
+        self.assertFalse(series.content_present(self.fx.tree, patch))
+
+
+# The files make dist puts in the tarball (Makefile, DIST_FILES), each a file or a directory.
+DIST_FILES = (
+    "base.env",
+    "series.txt",
+    "patches",
+    "scripts/series.py",
+    "upstream-contributions.json",
+    "LICENSE",
+    "LICENSES",
+    "README.md",
+    "REUSE.toml",
+)
+
+
+class MakeTargetsTest(unittest.TestCase):
+    """make dist and make apply, run in a clone of this repository's committed HEAD (rows A1-1,
+    A1-4, A4-10)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.make = shutil.which("make")
+        if cls.make is None:
+            raise unittest.SkipTest("make is not installed")
+        cls._scratch = tempfile.TemporaryDirectory()
+        cls.clone = Path(cls._scratch.name) / "clone"
+        subprocess.run(
+            ["git", "clone", "-q", "--no-hardlinks", str(series.ROOT), str(cls.clone)],
+            env=series.git_env(),
+            capture_output=True,
+            check=True,
+            timeout=120,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._scratch.cleanup()
+
+    def run_make(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [self.make, "-s", "-C", str(self.clone), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+
+    def dist(self, version: str) -> bytes:
+        result = self.run_make("dist", f"VERSION={version}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tarball = self.clone / result.stdout.strip()
+        data = tarball.read_bytes()
+        tarball.unlink()
+        return data
+
+    def test_dist_refuses_an_empty_version(self) -> None:
+        result = self.run_make("dist")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("set VERSION to the release tag", result.stderr)
+        self.assertFalse((self.clone / "dist" / "ffmpeg-patches-.tar.gz").exists())
+
+    def test_dist_is_the_same_bytes_for_the_same_commit(self) -> None:
+        first, second = self.dist("v9.9.9"), self.dist("v9.9.9")
+        self.assertEqual(hashlib.sha256(first).hexdigest(), hashlib.sha256(second).hexdigest())
+
+    def test_dist_holds_exactly_the_dist_files(self) -> None:
+        data = self.dist("v9.9.9")
+        archive = Path(self._scratch.name) / "check.tar.gz"
+        archive.write_bytes(data)
+        with tarfile.open(archive) as tar:
+            names = [member.name for member in tar.getmembers()]
+        prefix = "ffmpeg-patches-v9.9.9/"
+        top = prefix.rstrip("/")
+        self.assertTrue(all(name == top or name.startswith(prefix) for name in names), names[:5])
+        inside = [name[len(prefix) :] for name in names if name != prefix.rstrip("/")]
+        for entry in DIST_FILES:
+            self.assertTrue(any(n == entry or n.startswith(entry + "/") for n in inside), entry)
+        strays = [
+            n
+            for n in inside
+            if not any(n == e or n.startswith(e + "/") or e.startswith(n + "/") for e in DIST_FILES)
+        ]
+        self.assertEqual(strays, [])
+
+    def test_apply_refuses_an_empty_tree_and_passes_the_tree_on(self) -> None:
+        result = self.run_make("apply")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("set FFMPEG_TREE to an FFmpeg checkout", result.stderr)
+        tree = Path(self._scratch.name) / "not-the-base"
+        tree.mkdir()
+        run_git(tree, "init", "-q")
+        (tree / "file.c").write_text("int x;\n")
+        run_git(tree, "add", "file.c")
+        run_git(tree, "commit", "-q", "-m", "not the pinned base")
+        result = self.run_make("apply", f"FFMPEG_TREE={tree}")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("base.env pins", result.stderr)
 
 
 if __name__ == "__main__":
