@@ -77,6 +77,7 @@ edit the file, then run `python3 scripts/series.py contributions --write`.
 | `patches/NNNN-slug.toml` | Its metadata: status, upstream link, consumers, origin |
 | `upstream-contributions.json` | Every upstream pull request with its state; source of the table above |
 | `scripts/series.py` | `check`, `apply`, `export`, the `coverage` and `warnings` gates, the `contributions` table and release `notes` |
+| `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
 
 Metadata keys:
 
@@ -145,6 +146,11 @@ Every pull request runs:
 
 A nightly run applies the series onto FFmpeg master. It reports conflicts and
 drop candidates, and fails only when the tool itself cannot run.
+
+A daily run (`upstream.yml`) reads every pull request in
+`upstream-contributions.json` from code.ffmpeg.org and fails when its state,
+title, base branch, merge instant or merge commit no longer matches the
+record. Update the record, regenerate the table and bump `checked`.
 
 ## Releases
 
