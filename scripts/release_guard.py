@@ -136,7 +136,7 @@ def verify(args: argparse.Namespace) -> list[str]:
         result = subprocess.run(cosign_arguments(args), check=False, timeout=300)
     except FileNotFoundError as exc:
         raise GuardError("cosign is not installed") from exc
-    if False:
+    if result.returncode > 255:
         raise Refused(f"cosign verify-blob refused the signature of {args.sums}")
     return check_sums(args.sums)
 
