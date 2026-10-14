@@ -1,3 +1,4 @@
+---
 version: 1
 repository:
   owner: VMAFx
@@ -23,7 +24,7 @@ register:
   sources:
     expected: 13
     sha256:
-      sha256:acbff386189fe2604655e7162647e35f1f6b197cc185cd491742e4e0d4867378
+      sha256:25f491d6da25827a2808a10129bb738cf2bea1890a316051a1be30d6919c9dd7
     inputs:
       - path: .paperclip/harness.json
         surface: prompts
@@ -35,10 +36,3 @@ register:
         kind: message
         format: json
         selector: invariants.*
-# Declared per-file exceptions: one rule, one file, a reason and an expiry at
-# most 90 days ahead; an expired entry fails its gate like a missing one.
-exceptions:
-  - rule: "HISS-11"
-    path: ".github/workflows/release.yml"
-    reason: "no release workflow yet; the series release (tarball, sha256, SLSA 3 provenance, cosign, SBOM) lands with the series layout"
-    expires: "2027-01-07"

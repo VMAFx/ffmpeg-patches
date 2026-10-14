@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# A v* tag publishes a release after the full series gate passes on the tagged
+# commit. A manual run builds, attests and signs the same files but cannot
+# publish. A vX.Y.Z-rc.N tag publishes a prerelease that is never "latest".
+name: Release
+
+'on':
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    uses: ./.github/workflows/series.yml
+
+  # Build, SBOM, SLSA provenance and cosign signature in the reusable
+  # workflow: its identity, not this file's, signs the attestation.
+  build:
+    needs: gate
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-build.yml
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download the attested release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: dist
+      - name: Publish the GitHub release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          sha256sum --check SHA256SUMS
+          if [ "$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::release build named ${VERSION}, the tag is ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          # The release build classified the tag; an empty value is a bug, not "final".
+          case "$PRERELEASE" in
+            true) kind=(--prerelease --latest=false) ;;
+            false) kind=() ;;
+            *) echo "::error::release build did not classify ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+          gh release create "$VERSION" \
+            --title "ffmpeg-patches ${VERSION}" \
+            --notes-file RELEASE_NOTES.md \
+            "${kind[@]}" \
+            "ffmpeg-patches-${VERSION}.tar.gz" \
+            "ffmpeg-patches-${VERSION}.spdx.json" \
+            "ffmpeg-patches-${VERSION}.provenance.sigstore.json" \
+            SHA256SUMS \
+            SHA256SUMS.sigstore.json
+          actual="$(gh release view "$VERSION" --json isPrerelease --jq .isPrerelease)"
+          if [ "$actual" != "$PRERELEASE" ]; then
+            echo "::error::release ${VERSION} has isPrerelease=${actual}, expected ${PRERELEASE}"
+            exit 1
+          fi

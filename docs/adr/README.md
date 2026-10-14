@@ -8,3 +8,4 @@ record that supersedes it.
 | Number | Date | Title | Status |
 | :--- | :--- | :--- | :--- |
 | [0000](0000-template.md) | 2026-09-11 | ADR template | Accepted |
+| [0001](0001-shared-fix-series.md) | 2026-10-09 | One shared FFmpeg fix series for every consumer | Proposed |

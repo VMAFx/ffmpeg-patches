@@ -45,6 +45,21 @@
         "required_status_checks": [
           {
             "context": "REUSE lint"
+          },
+          {
+            "context": "scanners (gitleaks · secrets in history)"
+          },
+          {
+            "context": "scanners (semgrep · repository rules)"
+          },
+          {
+            "context": "scanners (trivy · vulnerabilities, secrets, misconfiguration)"
+          },
+          {
+            "context": "series (apply · regenerate · build · FATE · warnings) on the pinned base"
+          },
+          {
+            "context": "series (check · lint · unit tests)"
           }
         ],
         "strict_required_status_checks_policy": true

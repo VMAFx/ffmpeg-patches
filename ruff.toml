@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C90", "PL"]
+ignore = ["PLR2004"]
+
+[lint.mccabe]
+# Same bound as the profile's max_cyclomatic.
+max-complexity = 10

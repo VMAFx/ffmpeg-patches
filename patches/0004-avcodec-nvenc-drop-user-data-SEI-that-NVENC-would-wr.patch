@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Fri, 9 Oct 2026 23:53:57 +0200
+Subject: [PATCH] avcodec/nvenc: drop user data SEI that NVENC would write
+ truncated
+
+NVENC writes the user data unregistered SEI of a picture through an
+escape buffer of 4/3 of the largest payload of the picture plus 5
+bytes. A payload whose emulation prevention bytes do not fit is written
+truncated: the NAL unit stops inside the payload, has no rbsp trailing
+bits, and decoders discard it ("Skipping invalid undecodable NALU: 39").
+The encode itself succeeds, so the payload is lost without an error.
+
+Only payloads that need more emulation prevention bytes than about a
+third of their size are affected, which in practice means long runs of
+zero bytes. With P the payload size including the UUID, Pmax the
+largest payload of the picture and E the emulation prevention bytes of
+the payload's RBSP, the payload is truncated exactly when
+P + 3 + E > floor(4 * (Pmax + 5) / 3); for a single payload that is
+E > ceil(P / 3) + 3.
+
+Check every user data unregistered SEI against that before encoding and
+do not write the ones that would be truncated, so no undecodable NAL
+unit reaches the stream. The first one is a warning, later ones are
+verbose, and the total is a warning when the encoder closes. Dropping
+the largest payload shrinks the room of the others, so the check
+repeats until it drops nothing.
+
+Measured on an RTX 4090 with driver 615.78.08 for h264_nvenc and
+hevc_nvenc, on IDR and P pictures: the rule matches all 76870
+single-payload and 1600 multi-payload cases.
+
+Checked with the same driver on h264_nvenc and hevc_nvenc, IDR and P
+pictures: payloads the rule marks are not written, every SEI NAL unit
+that is written is complete and decodes, A/53 closed captions in the
+same pictures are unaffected, and output without such payloads is
+byte-identical to the unpatched encoder.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavcodec/nvenc.c | 92 ++++++++++++++++++++++++++++++++++++++++------
+ libavcodec/nvenc.h |  1 +
+ 2 files changed, 81 insertions(+), 12 deletions(-)
+
+diff --git a/libavcodec/nvenc.c b/libavcodec/nvenc.c
+index 272cc2286092d94070e7c5bd864d569ced73300e..042cf493f5c2ab7ba3d7b29935ca5ed21cb33b5c 100644
+--- a/libavcodec/nvenc.c
++++ b/libavcodec/nvenc.c
+@@ -2073,6 +2073,11 @@ av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
+                "payload(s) were not written: hevc_nvenc fails a picture whose "
+                "parameter sets and SEI exceed %d bytes.\n",
+                ctx->udu_sei_dropped, NVENC_HEVC_NON_VCL_LIMIT);
++    if (ctx->udu_sei_truncated)
++        av_log(avctx, AV_LOG_WARNING, "%"PRId64" user data unregistered SEI "
++               "payload(s) were not written: NVENC writes a payload truncated "
++               "when it needs more emulation prevention bytes than about a "
++               "third of its size.\n", ctx->udu_sei_truncated);
+ 
+     av_frame_free(&ctx->frame);
+ 
+@@ -2695,24 +2700,31 @@ static int output_ready(AVCodecContext *avctx, int flush)
+  * prevention bytes and the trailing bits, plus one byte for emulation
+  * prevention across the size and payload boundary. The payload is scanned only
+  * when the rest fits into limit. */
++/* Emulation prevention bytes size bytes of payload p need, after zeros zero
++ * bytes. */
++static size_t nvenc_sei_epb_count(const uint8_t *p, uint32_t size, int zeros)
++{
++    size_t epb = 0;
++
++    for (uint32_t i = 0; i < size; i++) {
++        if (zeros >= 2 && p[i] <= 3) {
++            epb++;
++            zeros = 0;
++        }
++        zeros = p[i] ? 0 : zeros + 1;
++    }
++    return epb;
++}
++
+ static size_t nvenc_sei_nal_size(const NV_ENC_SEI_PAYLOAD *sei, size_t limit)
+ {
+-    const uint8_t *p = sei->payload;
+     size_t size = 4 + 2 + sei->payloadType / 255 + 1 + sei->payloadSize / 255 + 1 +
+                   sei->payloadSize + 1 + 1;
+-    int zeros = 0;
+ 
+     if (size > limit)
+         return size;
+ 
+-    for (uint32_t i = 0; i < sei->payloadSize; i++) {
+-        if (zeros >= 2 && p[i] <= 3) {
+-            size++;
+-            zeros = 0;
+-        }
+-        zeros = p[i] ? 0 : zeros + 1;
+-    }
+-    return size;
++    return size + nvenc_sei_epb_count(sei->payload, sei->payloadSize, 0);
+ }
+ 
+ /* Charge one user data unregistered SEI against the picture's budget, or log
+@@ -2737,11 +2749,66 @@ static int nvenc_hevc_sei_fits(AVCodecContext *avctx, const AVFrame *frame,
+     return 0;
+ }
+ 
++/* NVENC escapes the user data unregistered SEI of a picture into a buffer of
++ * 4/3 of the largest payload of the picture plus 5 bytes. A payload whose
++ * emulation prevention bytes do not fit is written truncated, without its end
++ * and trailing bits, and decoders discard the NAL unit. Only a payload that
++ * needs more emulation prevention bytes than about a third of its size, as
++ * long runs of zero bytes do, can overflow it. Measured with driver
++ * 615.78.08 for h264_nvenc and hevc_nvenc. */
++static int nvenc_udu_sei_truncated(const NV_ENC_SEI_PAYLOAD *sei, uint32_t pmax)
++{
++    /* The last payload size byte is zero when the size is a multiple of 255. */
++    size_t epb  = nvenc_sei_epb_count(sei->payload, sei->payloadSize,
++                                      !(sei->payloadSize % 255));
++    size_t room = 4 * ((size_t)pmax + 5) / 3;
++
++    return sei->payloadSize + 3 + epb > room;
++}
++
++/* Drop the user data unregistered SEI in sei_data[first, count) that NVENC
++ * would truncate and return the new count. Dropping the largest payload
++ * shrinks the room of the others, so repeat until nothing is dropped. */
++static int nvenc_drop_truncated_udu_sei(AVCodecContext *avctx, const AVFrame *frame,
++                                        int first, int count)
++{
++    NvencContext *ctx = avctx->priv_data;
++    int dropped;
++
++    do {
++        uint32_t pmax = 0;
++        int kept = first;
++
++        for (int i = first; i < count; i++)
++            pmax = FFMAX(pmax, ctx->sei_data[i].payloadSize);
++
++        for (int i = first; i < count; i++) {
++            NV_ENC_SEI_PAYLOAD *sei = &ctx->sei_data[i];
++
++            if (!nvenc_udu_sei_truncated(sei, pmax)) {
++                ctx->sei_data[kept++] = *sei;
++                continue;
++            }
++
++            av_log(avctx, ctx->udu_sei_truncated ? AV_LOG_VERBOSE : AV_LOG_WARNING,
++                   "Not writing a %"PRIu32"-byte user data unregistered SEI at pts "
++                   "%"PRId64": NVENC would write it truncated, and decoders "
++                   "discard such a NAL unit.\n", sei->payloadSize, frame->pts);
++            ctx->udu_sei_truncated++;
++            av_freep(&sei->payload);
++        }
++        dropped = count - kept;
++        count   = kept;
++    } while (dropped && count > first);
++
++    return count;
++}
++
+ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+ {
+     NvencContext *ctx = avctx->priv_data;
+     size_t sei_budget = NVENC_HEVC_SEI_BUDGET;
+-    int sei_count = 0;
++    int sei_count = 0, udu_first;
+     int i, res;
+ 
+     if (ctx->a53_cc && av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC)) {
+@@ -2821,6 +2888,7 @@ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+             sei_budget -= FFMIN(sei_budget, nvenc_sei_nal_size(&ctx->sei_data[i], sei_budget));
+     }
+ 
++    udu_first = sei_count;
+     for (i = 0; i < frame->nb_side_data; i++) {
+         AVFrameSideData *side_data = frame->side_data[i];
+         void *tmp;
+@@ -2855,7 +2923,7 @@ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+         }
+     }
+ 
+-    return sei_count;
++    return nvenc_drop_truncated_udu_sei(avctx, frame, udu_first, sei_count);
+ 
+ error:
+     for (i = 0; i < sei_count; i++)
+diff --git a/libavcodec/nvenc.h b/libavcodec/nvenc.h
+index 4e9f3d98c0a6b73295136a908482d41853fa2e30..0af137e98333707d99c72d317cfcb19aa076fa0d 100644
+--- a/libavcodec/nvenc.h
++++ b/libavcodec/nvenc.h
+@@ -198,6 +198,7 @@ typedef struct NvencContext
+     NV_ENC_SEI_PAYLOAD *sei_data;
+     int sei_data_size;
+     int64_t udu_sei_dropped; ///< user data unregistered SEI not written, see prepare_sei_data_array()
++    int64_t udu_sei_truncated; ///< user data unregistered SEI NVENC would truncate, not written
+ 
+     struct {
+         void *ptr;

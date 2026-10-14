@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# The scanners the repository's policy declares: gitleaks and trivy (facet
+# security:high) and semgrep (profile native-gpu-systems, facet
+# agent:sandboxed). Each runs at a pinned version and fails the job on any
+# finding; none of them is advisory.
+name: scanners
+
+'on':
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scanners-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gitleaks:
+    name: scanners (gitleaks · secrets in history)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.draft != true
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks at the pinned version and digest
+        if: github.event.pull_request.draft != true
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSfL --max-time 300 -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Scan the history of the checked-out commit
+        # On a pull request HEAD is the merge commit: main's history plus the
+        # pull request's commits. Other branches in the fetch are not scanned.
+        if: github.event.pull_request.draft != true
+        run: |
+          gitleaks version
+          gitleaks git --log-opts="--full-history HEAD" --redact --exit-code 1 .
+
+  semgrep:
+    name: scanners (semgrep · repository rules)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    container:
+      # semgrep/semgrep:1.178.0, by digest. mirror.gcr.io serves the same
+      # digest as Docker Hub without its anonymous pull limit.
+      image: mirror.gcr.io/semgrep/semgrep:1.178.0@sha256:32e459968daabe7ab86968184a29109b9564aa00392401156f9788452b42786b
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.draft != true
+        with:
+          persist-credentials: false
+      - name: Run the rules in .semgrep.yml
+        if: github.event.pull_request.draft != true
+        run: |
+          semgrep --version
+          semgrep scan --config .semgrep.yml --error --metrics off --disable-version-check
+
+  trivy:
+    name: scanners (trivy · vulnerabilities, secrets, misconfiguration)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      TRIVY_VERSION: 0.74.0
+      TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.draft != true
+        with:
+          persist-credentials: false
+      - name: Install trivy at the pinned version and digest
+        if: github.event.pull_request.draft != true
+        run: |
+          archive="$RUNNER_TEMP/trivy.tar.gz"
+          curl -sSfL --max-time 300 -o "$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  $archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Scan the checkout
+        # Findings of every severity fail the job; .trivyignore lists the
+        # accepted ones with their reasons.
+        if: github.event.pull_request.draft != true
+        run: |
+          trivy --version
+          trivy fs --scanners vuln,secret,misconfig --exit-code 1 \
+            --ignorefile .trivyignore --skip-version-check --no-progress .

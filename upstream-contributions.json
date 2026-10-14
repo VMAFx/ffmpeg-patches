@@ -1,0 +1,109 @@
+{
+  "checked": "2026-10-12",
+  "contributions": [
+    {
+      "number": 24970,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970",
+      "title": "avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0001-avutil-vulkan-don-t-release-frames-to-VK_QUEUE_FAMIL.patch",
+      "project": "pelorus",
+      "note": ""
+    },
+    {
+      "number": 24973,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973",
+      "title": "avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context)",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "",
+      "project": "pelorus",
+      "note": "Four commits. The series carries none of them."
+    },
+    {
+      "number": 24974,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974",
+      "title": "avcodec/av1dec: remove the coding bias from exported chroma grain params",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "",
+      "project": "pelorus",
+      "note": "The series carries no form of it."
+    },
+    {
+      "number": 24975,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975",
+      "title": "hwcontext_vulkan: only originate host image layout transitions from copyable layouts",
+      "base": "release/9.0",
+      "state": "merged",
+      "merged_at": "2026-10-12T03:43:42Z",
+      "merged_commit": "7e93014c5bbb61e7c22afebb478bf92f7a08d59a",
+      "in_release": "",
+      "patch": "",
+      "project": "pelorus",
+      "note": "Backport of FFmpeg master commit ac16cfb86e3cdba0c05778ab09309b7d900a136c. The series never carried it."
+    },
+    {
+      "number": 24977,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24977",
+      "title": "avcodec/vaapi_encode_h265: enable cu_qp_delta for ROI in CQP mode",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "",
+      "project": "pelorus",
+      "note": "The series carries no form of it."
+    },
+    {
+      "number": 24978,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24978",
+      "title": "avfilter/vf_libvmaf: add max pool method, reject unknown ones",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "",
+      "project": "pelorus",
+      "note": "The series carries no form of it."
+    },
+    {
+      "number": 24993,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993",
+      "title": "avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0003-avcodec-nvenc-keep-hevc_nvenc-user-data-SEI-within-t.patch",
+      "project": "pelorus",
+      "note": ""
+    },
+    {
+      "number": 24994,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994",
+      "title": "avcodec/nvenc: drop user data SEI that NVENC would write truncated",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0004-avcodec-nvenc-drop-user-data-SEI-that-NVENC-would-wr.patch",
+      "project": "pelorus",
+      "note": ""
+    }
+  ]
+}

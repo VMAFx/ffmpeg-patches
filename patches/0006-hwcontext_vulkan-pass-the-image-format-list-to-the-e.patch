@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 10 Oct 2026 11:54:19 +0200
+Subject: [PATCH] hwcontext_vulkan: pass the image format list to the export
+ query
+
+try_export_flags() queries the external memory properties of a frames
+context with DRM format modifier tiling using the image creation flags,
+which include VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT for sampleable images,
+but without the VkImageFormatListCreateInfo the images are created
+with. The validation layer reports
+VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02313 for such a frames
+context.
+
+When the creation chain carries a format list, link a copy of it into
+the query, so the query describes the images that will be created. A
+mutable-format image with DRM format modifier tiling needs that list at
+creation anyway (VUID-VkImageCreateInfo-tiling-02353).
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavutil/hwcontext_vulkan.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/libavutil/hwcontext_vulkan.c b/libavutil/hwcontext_vulkan.c
+index 90d3d14dbb6ce2fec3fe081e57a884a10f04c0aa..dd2117f8ede8217c8969c3840990f9387e85603d 100644
+--- a/libavutil/hwcontext_vulkan.c
++++ b/libavutil/hwcontext_vulkan.c
+@@ -2777,6 +2777,10 @@ static void try_export_flags(AVHWFramesContext *hwfc,
+     const VkImageDrmFormatModifierListCreateInfoEXT *drm_mod_info =
+         ff_vk_find_struct(hwctx->create_pnext,
+                           VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
++    const VkImageFormatListCreateInfo *fmt_list_info =
++        ff_vk_find_struct(hwctx->create_pnext,
++                          VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
++    VkImageFormatListCreateInfo fmt_list;
+     int has_mods = hwctx->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && drm_mod_info;
+     int nb_mods;
+ 
+@@ -2811,6 +2815,17 @@ static void try_export_flags(AVHWFramesContext *hwfc,
+                   (hwctx->img_flags) : (VkImageCreateFlags)(VK_IMAGE_CREATE_ALIAS_BIT),
+     };
+ 
++    /* The query must describe the image as it will be created: a
++     * mutable-format image with DRM format modifier tiling carries the
++     * format list from the creation chain, and so must the query
++     * (VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02313). Copy only the
++     * format list, not the rest of the creation chain. */
++    if (has_mods && fmt_list_info) {
++        fmt_list       = *fmt_list_info;
++        fmt_list.pNext = NULL;
++        phy_dev_mod_info.pNext = &fmt_list;
++    }
++
+     nb_mods = has_mods ? drm_mod_info->drmFormatModifierCount : 1;
+     for (int i = 0; i < nb_mods; i++) {
+         if (has_mods)
