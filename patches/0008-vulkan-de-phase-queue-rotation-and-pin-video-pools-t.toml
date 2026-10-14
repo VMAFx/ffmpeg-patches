@@ -1,0 +1,16 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["pelorus"]
+origin = "backport of FFmpeg master d0d7d813178fec964716aa2c48f5896ce5c26284 (Lynne, 2026-07-18), found by the Pelorus forced-keyframe hang bisect (Pelorus #309)"
+notes = """
+Already on FFmpeg master; release/9.0 after n9.0.2 does not carry it. \
+Status stays unsubmitted until the release/9.0 backport request is \
+sent; drop the patch once the pinned base contains the commit. \
+The backport adds #include "thread.h" to libavutil/vulkan.c: master \
+gets ff_thread_once() through vulkan.h, n9.0.2 does not. \
+Measured on an RTX 4090 with a minimal FFmpeg build (hevc decoder, \
+hevc_vulkan encoder): Vulkan decode into hevc_vulkan with \
+-force_key_frames 2 on a 120-frame clip hangs at frame 61 on n9.0.2 \
+(first of 60 runs) and ends all 120 frames in 60 of 60 runs with this \
+patch. Bisect between n9.0.2 and master (60 runs per step) named \
+d0d7d81317 as the first good commit."""
