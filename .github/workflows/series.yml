@@ -63,6 +63,11 @@ jobs:
       - name: Install ruff and reuse
         if: github.event.pull_request.draft != true
         run: python3 -m pip install ruff==0.16.8 reuse==6.2.0
+      # The release guard tests sign and verify with a throwaway key; the same
+      # cosign as the release build, and no transparency log.
+      - name: Install cosign
+        if: github.event.pull_request.draft != true
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Series check, lint and unit tests
         if: github.event.pull_request.draft != true
         run: make test
