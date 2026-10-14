@@ -101,8 +101,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential nasm pkg-config libvulkan-dev spirv-headers libffmpeg-nvenc-dev \
-            libva-dev libdrm-dev
+            libva-dev libdrm-dev glslc
           gcc --version | head -1
+          glslc --version | head -1
           pkg-config --modversion vulkan ffnvcodec libva libdrm
       - name: Fetch and verify the pinned FFmpeg source
         if: github.event.pull_request.draft != true
@@ -138,6 +139,8 @@ jobs:
           # makes a missing dependency fail here instead of silently skipping files.
           # --enable-gpl builds the GPL-only filters 0002 changes (find_rect, mcdeint,
           # eq and its checkasm test), which an LGPL build skips.
+          # glslc provides spirv_compiler, without which configure drops the Vulkan
+          # encoders and filters that compile shaders, such as ffv1enc_vulkan.c (0008).
           ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl --enable-vulkan \
             --enable-nvenc --enable-vaapi --enable-libdrm \
             || { tail -40 ffbuild/config.log; exit 1; }
