@@ -54,23 +54,11 @@ jobs:
           python-version-file: .python-version
       - name: Release tag shape
         id: tag
+        # scripts/release_guard.py holds the rule; tests/test_release_guard.py
+        # plants each malformed tag and checks that this step still calls it.
         run: |
-          if [ "$GITHUB_REF_TYPE" != tag ]; then
-            # A manual run builds, attests and signs, but publish never runs.
-            echo "version=run-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          n='(0|[1-9][0-9]*)'
-          if [[ "$GITHUB_REF_NAME" =~ ^v$n\.$n\.$n$ ]]; then
-            prerelease=false
-          elif [[ "$GITHUB_REF_NAME" =~ ^v$n\.$n\.$n-rc\.[1-9][0-9]*$ ]]; then
-            prerelease=true
-          else
-            echo "::error::tag ${GITHUB_REF_NAME} is neither vX.Y.Z nor vX.Y.Z-rc.N"
-            exit 1
-          fi
-          echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          python3 scripts/release_guard.py tag \
+            "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - name: Series check
         run: python3 scripts/series.py check
       - name: Package the series
@@ -115,13 +103,11 @@ jobs:
         run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
       - name: Verify the SHA256SUMS signature
         working-directory: dist
+        # cosign verify-blob against this workflow's identity at this ref, then
+        # every file SHA256SUMS lists.
         run: |
-          cosign verify-blob \
-            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-build.yml@${GITHUB_REF}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            --bundle SHA256SUMS.sigstore.json \
-            SHA256SUMS
-          sha256sum --check SHA256SUMS
+          python3 ../scripts/release_guard.py verify SHA256SUMS SHA256SUMS.sigstore.json \
+            --workflow-of "$GITHUB_REPOSITORY" "$GITHUB_REF"
       - name: Upload the release files
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
