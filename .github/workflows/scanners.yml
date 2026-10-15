@@ -4,7 +4,8 @@
 # The scanners the repository's policy declares: gitleaks and trivy (facet
 # security:high) and semgrep (profile native-gpu-systems, facet
 # agent:sandboxed). Each runs at a pinned version and fails the job on any
-# finding; none of them is advisory.
+# finding; none of them is advisory. Semgrep and CodeQL also upload their
+# findings to code scanning.
 name: scanners
 
 'on':
@@ -72,6 +73,9 @@ jobs:
     name: scanners (semgrep · repository rules)
     runs-on: ubuntu-26.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # upload-sarif to the code scanning alerts
     container:
       # semgrep/semgrep:1.178.0, by digest. mirror.gcr.io serves the same
       # digest as Docker Hub without its anonymous pull limit.
@@ -97,7 +101,59 @@ jobs:
         if: github.event.pull_request.draft != true
         run: |
           semgrep --version
-          semgrep scan --config .semgrep.yml --error --metrics off --disable-version-check
+          semgrep scan --config .semgrep.yml --error --metrics off --disable-version-check \
+            --sarif-output=semgrep.sarif
+      # The findings also go to code scanning, so its alert list is read from an
+      # analysis instead of answering "no analysis found". A finding still fails
+      # the step above; the upload runs either way.
+      - name: Upload the findings to code scanning
+        if: always() && github.event.pull_request.draft != true && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-local
+
+  codeql:
+    name: scanners (codeql · ${{ matrix.language }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # codeql-action/analyze uploads its SARIF
+    strategy:
+      fail-fast: false
+      matrix:
+        # The tooling is Python; the workflows are GitHub Actions. The patches
+        # change FFmpeg's C sources, which the series workflow builds and
+        # gates on the pinned release; they are not source of this repository.
+        language: [python, actions]
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.draft != true
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: github.event.pull_request.draft != true
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: github.event.pull_request.draft != true
+        with:
+          category: /language:${{ matrix.language }}
 
   trivy:
     name: scanners (trivy · vulnerabilities, secrets, misconfiguration)
