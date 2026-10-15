@@ -1,6 +1,6 @@
 # ADR-0001: One shared FFmpeg fix series for every consumer
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-10-09
 - **Authors**: Lusoris
 
