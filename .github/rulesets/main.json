@@ -50,6 +50,12 @@
             "context": "REUSE lint"
           },
           {
+            "context": "scanners (codeql · python)"
+          },
+          {
+            "context": "scanners (codeql · actions)"
+          },
+          {
             "context": "scanners (gitleaks · secrets in history)"
           },
           {
