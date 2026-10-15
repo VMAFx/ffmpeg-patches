@@ -1,5 +1,5 @@
-status = "unsubmitted"
-upstream = ""
+status = "submitted"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111"
 consumers = ["vmafx"]
 origin = "VMAFx/vmafx c61115a0723e ffmpeg-patches/0019-ffmpeg-eliminate-gcc-14-build-diagnostics.patch"
 notes = """

@@ -1,5 +1,5 @@
-status = "unsubmitted"
-upstream = ""
+status = "submitted"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110"
 consumers = ["pelorus"]
 origin = "found by the Pelorus GPU lane (Vulkan to VAAPI DRM-modifier mapping, Pelorus #103)"
 notes = """
