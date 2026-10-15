@@ -795,8 +795,10 @@ def release_notes(root: Path, version: str, repository: str) -> str:
         f"gh attestation verify ffmpeg-patches-{version}.tar.gz --repo {repository}",
         "```",
         "",
-        "Apply the patches in `series.txt` order with `git am --3way` onto the base, "
-        "or run `scripts/series.py apply --expect-base <ffmpeg-tree>` from the tarball.",
+        (
+            "Apply the patches in `series.txt` order with `git am --3way` onto the base, "
+            "or run `scripts/series.py apply --expect-base <ffmpeg-tree>` from the tarball."
+        ),
     ]
     return "\n".join(lines) + "\n"
 

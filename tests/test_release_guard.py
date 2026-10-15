@@ -153,8 +153,10 @@ class SignerTest(unittest.TestCase):
             [
                 "cosign", "verify-blob", "--bundle", "S.json",
                 "--certificate-identity",
-                "https://github.com/VMAFx/ffmpeg-patches/.github/workflows/release-build.yml"
-                "@refs/tags/v1.0.0",
+                (
+                    "https://github.com/VMAFx/ffmpeg-patches/.github/workflows/release-build.yml"
+                    "@refs/tags/v1.0.0"
+                ),
                 "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
                 "S",
             ],
@@ -249,13 +251,17 @@ GUARDS = {
         r' "\$GITHUB_SHA" >> "\$GITHUB_OUTPUT"$',
     ],
     ("release-build.yml", "Verify the SHA256SUMS signature"): [
-        r"python3 \.\./scripts/release_guard\.py verify SHA256SUMS SHA256SUMS\.sigstore\.json"
-        r' --workflow-of "\$GITHUB_REPOSITORY" "\$GITHUB_REF"$',
+        (
+            r"python3 \.\./scripts/release_guard\.py verify SHA256SUMS SHA256SUMS\.sigstore\.json"
+            r' --workflow-of "\$GITHUB_REPOSITORY" "\$GITHUB_REF"$'
+        ),
     ],
     ("release.yml", "Publish the GitHub release"): [
         r"python3 \.\./scripts/release_guard\.py checksums SHA256SUMS$",
-        r'python3 \.\./scripts/release_guard\.py publish "\$VERSION" "\$GITHUB_REF_NAME"'
-        r' "\$PRERELEASE"$',
+        (
+            r'python3 \.\./scripts/release_guard\.py publish "\$VERSION" "\$GITHUB_REF_NAME"'
+            r' "\$PRERELEASE"$'
+        ),
         r'python3 \.\./scripts/release_guard\.py published "\$PRERELEASE" "\$actual"$',
     ],
 }
