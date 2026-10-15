@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-14",
+  "checked": "2026-10-15",
   "contributions": [
     {
       "number": 24970,
@@ -110,9 +110,9 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060",
       "title": "[release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue",
       "base": "release/9.0",
-      "state": "open",
-      "merged_at": "",
-      "merged_commit": "",
+      "state": "merged",
+      "merged_at": "2026-10-14T18:36:57Z",
+      "merged_commit": "669f5ab083c7732c10f1ce9e4f1915960dd88457",
       "in_release": "",
       "patch": "0008-vulkan-de-phase-queue-rotation-and-pin-video-pools-t.patch",
       "project": "pelorus",

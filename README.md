@@ -55,9 +55,9 @@ carry.
 | [24978](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24978) | `master` | open | avfilter/vf_libvmaf: add max pool method, reject unknown ones | none |
 | [24993](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993) | `master` | open | avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit | 0003 |
 | [24994](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994) | `master` | open | avcodec/nvenc: drop user data SEI that NVENC would write truncated | 0004 |
-| [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | open | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0008 |
+| [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | merged 2026-10-14 (`669f5ab083c7`), in no release yet | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0008 |
 
-State read from the FFmpeg forge on 2026-10-14.
+State read from the FFmpeg forge on 2026-10-15.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned

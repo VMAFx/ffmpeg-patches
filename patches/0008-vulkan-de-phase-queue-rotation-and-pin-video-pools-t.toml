@@ -1,11 +1,11 @@
-status = "submitted"
+status = "merged"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060"
 consumers = ["pelorus"]
 origin = "backport of FFmpeg master d0d7d813178fec964716aa2c48f5896ce5c26284 (Lynne, 2026-07-18), found by the Pelorus forced-keyframe hang bisect (Pelorus #309)"
 notes = """
 Already on FFmpeg master; release/9.0 after n9.0.2 does not carry it. \
-Backport request on release/9.0: FFmpeg pull request 25060. Drop the patch \
-once the pinned base contains the commit. \
+Backport on release/9.0: FFmpeg pull request 25060, merged 2026-10-14 as \
+669f5ab083c7. Drop the patch once the pinned base contains the commit. \
 The backport adds #include "thread.h" to libavutil/vulkan.c: master \
 gets ff_thread_once() through vulkan.h, n9.0.2 does not. \
 Measured on an RTX 4090 with a minimal FFmpeg build (hevc decoder, \
