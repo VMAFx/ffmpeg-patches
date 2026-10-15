@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-15",
+  "checked": "2026-10-16",
   "contributions": [
     {
       "number": 24970,
@@ -147,7 +147,7 @@
     {
       "number": 25111,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111",
-      "title": "Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat and tests",
+      "title": "Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat, libswscale and tests",
       "base": "master",
       "state": "open",
       "merged_at": "",
@@ -155,7 +155,20 @@
       "in_release": "",
       "patch": "0002-build-eliminate-GCC-14-and-16-diagnostics.patch",
       "project": "vmafx",
-      "note": "24 commits, one per warning class; the series carries them as one patch."
+      "note": "26 commits, one per warning class; the series carries them as one patch."
+    },
+    {
+      "number": 25112,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25112",
+      "title": "ffbuild/library.mak: add the devprogs target",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "",
+      "project": "vmafx",
+      "note": "Found while building the split of 0002: make build and make check name a devprogs target that no rule defines."
     }
   ]
 }
