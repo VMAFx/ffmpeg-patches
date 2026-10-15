@@ -56,6 +56,9 @@ carry.
 | [24993](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993) | `master` | open | avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit | 0003 |
 | [24994](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994) | `master` | open | avcodec/nvenc: drop user data SEI that NVENC would write truncated | 0004 |
 | [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | merged 2026-10-14 (`669f5ab083c7`), in no release yet | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0008 |
+| [25109](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109) | `master` | open | avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import | 0005 |
+| [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | open | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0007 |
+| [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | open | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat and tests | 0002 |
 
 State read from the FFmpeg forge on 2026-10-15.
 <!-- upstream-contributions:end -->

@@ -117,6 +117,45 @@
       "patch": "0008-vulkan-de-phase-queue-rotation-and-pin-video-pools-t.patch",
       "project": "pelorus",
       "note": "Backport of FFmpeg master commit d0d7d813178fec964716aa2c48f5896ce5c26284."
+    },
+    {
+      "number": 25109,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109",
+      "title": "avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0005-hwcontext_vaapi-accept-GR1616-chroma-for-P010-and-P0.patch",
+      "project": "pelorus",
+      "note": ""
+    },
+    {
+      "number": 25110,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110",
+      "title": "avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0007-hwcontext_vulkan-wait-on-the-CPU-before-mapping-RADV.patch",
+      "project": "pelorus",
+      "note": ""
+    },
+    {
+      "number": 25111,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111",
+      "title": "Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat and tests",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0002-build-eliminate-GCC-14-and-16-diagnostics.patch",
+      "project": "vmafx",
+      "note": "24 commits, one per warning class; the series carries them as one patch."
     }
   ]
 }
