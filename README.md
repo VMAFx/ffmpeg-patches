@@ -58,9 +58,10 @@ carry.
 | [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | merged 2026-10-14 (`669f5ab083c7`), in no release yet | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0008 |
 | [25109](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109) | `master` | open | avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import | 0005 |
 | [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | open | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0007 |
-| [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | open | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat and tests | 0002 |
+| [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | open | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat, libswscale and tests | 0002 |
+| [25112](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25112) | `master` | open | ffbuild/library.mak: add the devprogs target | none |
 
-State read from the FFmpeg forge on 2026-10-15.
+State read from the FFmpeg forge on 2026-10-16.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned
