@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
 #
-# Nightly report of the series against FFmpeg master. Consumers stay on the
-# pinned release, so a conflict here is information for the next base bump,
-# and a patch whose added lines already stand in master is a drop candidate.
-# The run fails only when the tool itself cannot run (exit status 2).
+# Nightly check of the series against FFmpeg master. Submitted patches use
+# their recorded upstream PR form, so conflicts fail the run. Consumers stay
+# on the pinned release; fixes already in master are reported as drop candidates.
 name: series on FFmpeg master
 
 'on':
@@ -24,6 +23,8 @@ jobs:
     name: series on FFmpeg master (conflicts · drop candidates)
     runs-on: ubuntu-26.04
     timeout-minutes: 20
+    env:
+      FFMPEG_FORGE: https://code.ffmpeg.org/FFmpeg/FFmpeg.git
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,22 +39,22 @@ jobs:
         run: |
           git init -q ffmpeg
           git -C ffmpeg remote add origin "$FFMPEG_REMOTE"
-          git -C ffmpeg fetch -q --depth=1 origin \
-            master "refs/tags/${FFMPEG_TAG}:refs/tags/${FFMPEG_TAG}"
+          git -C ffmpeg fetch -q --shallow-exclude="refs/tags/${FFMPEG_TAG}" origin master
           git -C ffmpeg checkout -q --detach FETCH_HEAD
+          git -C ffmpeg fetch -q --depth=1 origin "refs/tags/${FFMPEG_TAG}:refs/tags/${FFMPEG_TAG}"
           git -C ffmpeg log -1 --format='FFmpeg master %H %cs %s'
       - name: Apply every patch and report
         run: |
           status=0
           python3 scripts/series.py apply --keep-going ffmpeg \
+            --master-forms "$FFMPEG_FORGE" \
             --report "$GITHUB_STEP_SUMMARY" > results.txt || status=$?
           cat results.txt
           while read -r result name; do
             case "$result" in
               conflict) echo "::warning title=Conflict on master::$name" ;;
               upstream) echo "::warning title=Drop candidate::$name is already in master" ;;
+              master-form) echo "::warning title=Master form::$name applied as upstream PR head" ;;
             esac
           done < results.txt
-          if [ "$status" -gt 1 ]; then
-            exit "$status"
-          fi
+          exit "$status"

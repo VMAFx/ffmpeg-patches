@@ -15,6 +15,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -258,6 +259,291 @@ class ApplyTest(SeriesTestCase):
         text = report.read_text()
         for name in self.fx.names:
             self.assertIn(f"| `{name}` | applied |", text)
+
+
+class MasterFormTest(SeriesTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.forge = Path(self._scratch.name) / "forge"
+        run_git(Path(self._scratch.name), "clone", "-q", str(self.fx.tree), str(self.forge))
+        run_git(self.forge, "checkout", "-q", "-b", "pr", self.fx.base)
+        commit_edit(self.forge, 4, "int line_5 = 50;", "PR: line five")
+        commit_edit(self.forge, 6, "int line_7 = 70;", "PR: line seven")
+        self.head = run_git(self.forge, "rev-parse", "HEAD")
+        self.url = str(self.forge)
+        # Different release value makes the series conflict where the PR form merges.
+        commit_edit(self.fx.tree, 4, "int line_5 = 500;", "lib: fix line five")
+        commit_edit(self.fx.tree, 29, "int line_30 = 300;", "lib: fix line thirty")
+        self.fx.names = series.export_series(self.fx.root, self.fx.tree)
+        self.fx.reset()
+        self.set_form(self.fx.base, self.head)
+        self.master = self.fx.upstream_commit(4, "int line_5 = 50;")
+
+    def set_form(self, base: str, head: str) -> None:
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA + f'master_form = {{ base = "{base}", head = "{head}" }}\n'
+        )
+
+    def set_upstream(self, commit: str, status: str = "merged") -> None:
+        path = self.fx.patch(2).with_suffix(".toml")
+        metadata = METADATA.replace("pulls/1", "pulls/2").replace("submitted", status)
+        path.write_text(metadata + f'upstream_commit = "{commit}"\n')
+        record = self.fx.record(
+            2, state="merged", merged_at="2026-01-01T10:00:00Z", merged_commit=self.fx.base
+        )
+        if status != "merged":
+            record = self.fx.record(2)
+        self.fx.write_records([self.fx.record(1), record])
+
+    def apply(self, keep_going: bool = False) -> series.Results:
+        return series.apply_series(self.fx.root, self.fx.tree, False, keep_going, self.url)
+
+    def run_main(self, *arguments: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--root", str(self.fx.root), "apply", str(self.fx.tree), *arguments]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = series.main(argv)
+        return status, out.getvalue(), err.getvalue()
+
+    def assert_clean(self) -> None:
+        self.assertEqual(run_git(self.fx.tree, "status", "--porcelain"), "")
+        self.assertFalse(series.am_in_progress(self.fx.tree))
+
+    def test_fetches_and_applies_pr_head_on_moved_master(self) -> None:
+        self.assertNotEqual(
+            series.git(self.fx.tree, "cat-file", "-e", self.head, check=False).returncode, 0
+        )
+        results = self.apply()
+        self.assertEqual([s for _, s in results], ["master-form", "applied"])
+        self.assertFalse(series.apply_failed(results, False))
+        self.assertEqual(run_git(self.fx.tree, "rev-list", "--count", f"{self.master}..HEAD"), "2")
+        self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD~2"), self.master)
+        subject = run_git(self.fx.tree, "log", "-1", "--format=%s", "HEAD~1")
+        expected = f"{self.fx.names[0]}: master form {self.fx.base[:12]}..{self.head[:12]}"
+        self.assertEqual(subject, expected)
+        lines = (self.fx.tree / "lib.c").read_text().splitlines()
+        self.assertEqual(
+            (lines[4], lines[6], lines[29]),
+            ("int line_5 = 50;", "int line_7 = 70;", "int line_30 = 300;"),
+        )
+        self.assert_clean()
+
+    def test_main_and_report_include_master_form(self) -> None:
+        report = Path(self._scratch.name) / "report.md"
+        status, out, err = self.run_main("--master-forms", self.url, "--report", str(report))
+        self.assertEqual((status, err), (0, ""))
+        self.assertIn("master-form", out)
+        self.assertIn(f"| `{self.fx.names[0]}` | master-form |", report.read_text())
+
+    def test_conflict_cleans_tree_and_keep_going_exits_one(self) -> None:
+        commit_edit(self.fx.tree, 6, "int line_7 = 700;", "conflicting master")
+        conflicted = run_git(self.fx.tree, "rev-parse", "HEAD")
+        self.assertEqual([s for _, s in self.apply()], ["conflict", "not-tried"])
+        self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD"), conflicted)
+        self.assert_clean()
+        status, out, err = self.run_main("--master-forms", self.url, "--keep-going")
+        self.assertEqual((status, err), (1, ""))
+        self.assertIn("conflict", out)
+        self.assertIn("applied", out)
+        self.assert_clean()
+
+    def test_missing_forge_head_fails_closed_and_exits_two(self) -> None:
+        missing = "1" * 40
+        self.set_form(self.fx.base, missing)
+        with self.assertRaisesRegex(series.SeriesError, self.fx.names[0]) as error:
+            self.apply()
+        self.assertIn(self.url, str(error.exception))
+        self.assertIn(missing, str(error.exception))
+        status, _, err = self.run_main("--master-forms", self.url)
+        self.assertEqual(status, 2)
+        self.assertIn(self.fx.names[0], err)
+        self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD"), self.master)
+        self.assert_clean()
+
+    def test_master_form_fetch_keeps_the_history_of_a_shallow_master(self) -> None:
+        # CI tests a shallow master; a --depth fetch of a PR base inside that
+        # history would cut it there and hide a later upstream_commit.
+        scratch = Path(self._scratch.name)
+        commit_edit(self.fx.tree, 29, "int line_30 = 300;", "upstream takes fix thirty")
+        fixed = run_git(self.fx.tree, "rev-parse", "HEAD")
+        # A later rework of the line: only the ancestry check can say upstream.
+        commit_edit(self.fx.tree, 29, "int line_30 = 3000;", "later master")
+        later = run_git(self.fx.tree, "rev-parse", "HEAD")
+        forge = scratch / "forge-shallow"
+        run_git(scratch, "clone", "-q", str(self.fx.tree), str(forge))
+        run_git(forge, "checkout", "-q", "-b", "pr", later)
+        commit_edit(forge, 6, "int line_7 = 70;", "PR: line seven")
+        self.set_form(later, run_git(forge, "rev-parse", "HEAD"))
+        self.set_upstream(fixed)
+        tested = scratch / "shallow-master"
+        run_git(self.fx.tree, "branch", "-q", "-f", "tested", later)
+        clone = ("clone", "-q", "--depth=3", "--branch", "tested")
+        run_git(scratch, *clone, f"file://{self.fx.tree}", str(tested))
+        self.assertTrue((tested / ".git" / "shallow").is_file())
+        results = series.apply_series(self.fx.root, tested, False, True, f"file://{forge}")
+        self.assertEqual([s for _, s in results], ["master-form", "upstream"])
+
+    def test_unreachable_forge_fails_closed(self) -> None:
+        self.url = str(Path(self._scratch.name) / "missing-forge")
+        with self.assertRaisesRegex(series.SeriesError, self.fx.names[0]) as error:
+            self.apply()
+        self.assertIn(self.url, str(error.exception))
+        self.assertIn("does not appear to be a git repository", str(error.exception))
+        self.assert_clean()
+
+    def test_empty_forge_url_does_not_use_the_series_form(self) -> None:
+        self.url = ""
+        with self.assertRaisesRegex(series.SeriesError, self.fx.names[0]):
+            self.apply()
+        self.assert_clean()
+
+    def test_fetch_timeout_has_deadline_and_diagnostic(self) -> None:
+        real_git = series.git
+
+        def timed_out(tree: Path, *args: str, **kwargs: object):
+            if args[0] == "fetch":
+                self.assertEqual(kwargs["timeout"], 300)
+                raise subprocess.TimeoutExpired(args, 300, stderr=b"transport stalled")
+            return real_git(tree, *args, **kwargs)
+
+        with (
+            mock.patch.object(series, "git", side_effect=timed_out),
+            self.assertRaisesRegex(series.SeriesError, "transport stalled") as error,
+        ):
+            self.apply()
+        self.assertIn(self.fx.names[0], str(error.exception))
+        self.assertIn(self.url, str(error.exception))
+        self.assert_clean()
+
+    def test_fetch_must_resolve_both_commits(self) -> None:
+        real_git = series.git
+        for commit in (self.fx.base, self.head):
+            with self.subTest(commit=commit):
+
+                def unresolved(tree: Path, *args: str, missing: str = commit, **kwargs: object):
+                    if args == ("rev-parse", "--verify", f"{missing}^{{commit}}"):
+                        return subprocess.CompletedProcess(args, 128, "", "not a commit")
+                    return real_git(tree, *args, **kwargs)
+
+                with (
+                    mock.patch.object(series, "git", side_effect=unresolved),
+                    self.assertRaisesRegex(series.SeriesError, "did not resolve"),
+                ):
+                    self.apply()
+        self.assert_clean()
+
+    def test_empty_diff_is_a_tool_error(self) -> None:
+        self.set_form(self.fx.base, self.fx.base)
+        with self.assertRaisesRegex(series.SeriesError, "empty master form"):
+            self.apply()
+        self.assert_clean()
+
+    def test_without_option_uses_conflicting_series_form(self) -> None:
+        results = series.apply_series(self.fx.root, self.fx.tree, False, False)
+        self.assertEqual([s for _, s in results], ["conflict", "not-tried"])
+        self.assert_clean()
+
+    def test_pinned_apply_ignores_master_metadata_and_preserves_export(self) -> None:
+        before = [self.fx.patch(n).read_bytes() for n in (1, 2)]
+        self.set_form(self.fx.base, "1" * 40)
+        self.set_upstream("2" * 40)
+        self.fx.reset()
+        results = series.apply_series(self.fx.root, self.fx.tree, True, False)
+        self.assertEqual([s for _, s in results], ["applied", "applied"])
+        series.export_series(self.fx.root, self.fx.tree)
+        self.assertEqual([self.fx.patch(n).read_bytes() for n in (1, 2)], before)
+        self.assert_clean()
+
+    def test_recorded_upstream_ancestor_does_not_commit(self) -> None:
+        commit_edit(self.fx.tree, 29, "int line_30 = 300;", "upstream fix")
+        upstream = run_git(self.fx.tree, "rev-parse", "HEAD")
+        self.set_upstream(upstream)
+        self.assertEqual([s for _, s in self.apply()], ["master-form", "upstream"])
+        self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD~1"), upstream)
+        self.assert_clean()
+
+    def test_missing_upstream_commit_is_a_tool_error(self) -> None:
+        self.set_upstream("2" * 40)
+        with self.assertRaisesRegex(series.SeriesError, "not in the tested history") as error:
+            self.apply()
+        self.assertIn(self.fx.names[1], str(error.exception))
+        self.assertIn("2" * 40, str(error.exception))
+        self.assert_clean()
+
+    def test_upstream_commit_on_side_branch_falls_through(self) -> None:
+        run_git(self.fx.tree, "checkout", "-q", "-b", "side", self.fx.base)
+        commit_edit(self.fx.tree, 29, "int line_30 = 300;", "side branch fix")
+        self.set_upstream(run_git(self.fx.tree, "rev-parse", "HEAD"))
+        self.fx.reset(self.master)
+        self.assertEqual([s for _, s in self.apply()], ["master-form", "applied"])
+        self.assert_clean()
+
+    def test_ancestry_tool_failure_is_not_a_fallback(self) -> None:
+        self.set_upstream(self.fx.base)
+        real_git = series.git
+
+        def failed_ancestry(tree: Path, *args: str, **kwargs: object):
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                return subprocess.CompletedProcess(args, 128, "", "broken graph")
+            return real_git(tree, *args, **kwargs)
+
+        with (
+            mock.patch.object(series, "git", side_effect=failed_ancestry),
+            self.assertRaisesRegex(series.SeriesError, "broken graph"),
+        ):
+            self.apply()
+        self.assert_clean()
+
+    def test_valid_master_metadata_passes_check(self) -> None:
+        self.set_upstream(self.fx.base)
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_master_form_requires_submitted_status(self) -> None:
+        path = self.fx.patch(1).with_suffix(".toml")
+        path.write_text(path.read_text().replace("submitted", "merged"))
+        merged = self.fx.record(
+            1, state="merged", merged_at="2026-01-01T10:00:00Z", merged_commit=self.fx.base
+        )
+        self.fx.write_records([merged, self.fx.record(2)])
+        self.assert_error(series.check(self.fx.root), "master_form is allowed only")
+
+    def test_master_form_requires_exact_table_keys(self) -> None:
+        forms = (
+            '"not a table"',
+            "{}",
+            f'{{ base = "{self.fx.base}" }}',
+            f'{{ base = "{self.fx.base}", head = "{self.head}", extra = "x" }}',
+        )
+        for form in forms:
+            with self.subTest(form=form):
+                self.fx.patch(1).with_suffix(".toml").write_text(
+                    METADATA + f"master_form = {form}\n"
+                )
+                self.assert_error(series.check(self.fx.root), "exactly base and head")
+
+    def test_master_form_requires_lowercase_full_commit_ids(self) -> None:
+        for bad in ('"abc123"', '"' + "A" * 40 + '"', '"' + "g" * 40 + '"', "42"):
+            for key in ("base", "head"):
+                with self.subTest(bad=bad, key=key):
+                    values = {"base": f'"{self.fx.base}"', "head": f'"{self.head}"', key: bad}
+                    form = ", ".join(f"{k} = {v}" for k, v in values.items())
+                    self.fx.patch(1).with_suffix(".toml").write_text(
+                        METADATA + f"master_form = {{ {form} }}\n"
+                    )
+                    self.assert_error(series.check(self.fx.root), "full 40-hex commit")
+
+    def test_upstream_commit_requires_merged_status(self) -> None:
+        self.set_upstream(self.fx.base, status="submitted")
+        self.assert_error(series.check(self.fx.root), "upstream_commit is allowed only")
+
+    def test_upstream_commit_requires_lowercase_full_commit_id(self) -> None:
+        for bad in ("abc123", "A" * 40, "g" * 40):
+            with self.subTest(bad=bad):
+                self.set_upstream(bad)
+                self.assert_error(series.check(self.fx.root), "full 40-hex commit")
+        path = self.fx.patch(2).with_suffix(".toml")
+        path.write_text(path.read_text().replace(f'"{bad}"', "42"))
+        self.assert_error(series.check(self.fx.root), "full 40-hex commit")
 
 
 class MainTest(SeriesTestCase):

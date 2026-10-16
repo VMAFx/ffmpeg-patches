@@ -1,5 +1,6 @@
 status = "submitted"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970"
+master_form = { base = "f5d4fd186c68913240c4f6e9cda98443e1518b34", head = "109b51be85033945eb3eeb619e28fd6275997723" }
 consumers = ["pelorus"]
 origin = "VMAFx/pelorus 7a496107c9a2 ffmpeg-patches/0021-vulkan-frame-barrier-queue-family.patch"
 notes = """

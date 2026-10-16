@@ -95,7 +95,12 @@ Metadata keys:
   must know
 
 The series carries one form of each patch: the one for the pinned release.
-The pull request linked in `upstream` is the FFmpeg master form.
+The pull request linked in `upstream` is the FFmpeg master form. For a
+`submitted` patch, optional `master_form = { base = "<40-hex>", head = "<40-hex>" }`
+records the PR's merge base with master at submission and its head commit.
+Update these ids whenever the PR is pushed again. For a `merged` patch,
+optional `upstream_commit = "<40-hex>"` records the commit carrying the fix
+on FFmpeg master. All ids must be full lowercase commit hashes.
 
 ## Apply the series
 
@@ -149,8 +154,16 @@ Every pull request runs:
   master, `series.py warnings TREE LOG --base <commit>` names that commit,
   so upstream changes are not counted as the series' own
 
-A nightly run applies the series onto FFmpeg master. It reports conflicts and
-drop candidates, and fails only when the tool itself cannot run.
+A nightly run applies the series onto FFmpeg master with
+`series.py apply TREE --master-forms https://code.ffmpeg.org/FFmpeg/FFmpeg.git`.
+It fetches each recorded `master_form` and applies that PR diff instead of
+the pinned-release patch. A recorded `upstream_commit` that is an ancestor
+of the tested master reports the patch as upstream without applying it;
+a missing commit fails the run because its history cannot be checked.
+Other patches use the series form. The run reports drop candidates and
+fails on any conflict or tool error. Applying without `--master-forms`,
+including consumer and CI runs with `--expect-base`, uses only the
+pinned-release patches and ignores both metadata keys.
 
 A daily run (`upstream.yml`) reads every pull request in
 `upstream-contributions.json` from code.ffmpeg.org and fails when its state,
