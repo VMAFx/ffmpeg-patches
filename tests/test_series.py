@@ -14,8 +14,8 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -459,7 +459,7 @@ class MasterFormTest(SeriesTestCase):
             return real_git(tree, *args, **kwargs)
 
         with (
-            mock.patch.object(series, "git", side_effect=timed_out),
+            unittest.mock.patch.object(series, "git", side_effect=timed_out),
             self.assertRaisesRegex(series.SeriesError, "transport stalled") as error,
         ):
             self.apply()
@@ -478,7 +478,7 @@ class MasterFormTest(SeriesTestCase):
                     return real_git(tree, *args, **kwargs)
 
                 with (
-                    mock.patch.object(series, "git", side_effect=unresolved),
+                    unittest.mock.patch.object(series, "git", side_effect=unresolved),
                     self.assertRaisesRegex(series.SeriesError, "did not resolve"),
                 ):
                     self.apply()
@@ -540,7 +540,7 @@ class MasterFormTest(SeriesTestCase):
             return real_git(tree, *args, **kwargs)
 
         with (
-            mock.patch.object(series, "git", side_effect=failed_ancestry),
+            unittest.mock.patch.object(series, "git", side_effect=failed_ancestry),
             self.assertRaisesRegex(series.SeriesError, "broken graph"),
         ):
             self.apply()
