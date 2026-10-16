@@ -13,3 +13,4 @@
 0006-hwcontext_vulkan-pass-the-image-format-list-to-the-e.patch
 0007-hwcontext_vulkan-wait-on-the-CPU-before-mapping-RADV.patch
 0008-vulkan-de-phase-queue-rotation-and-pin-video-pools-t.patch
+0009-hwcontext_vulkan-import-a-frame-again-when-the-CUDA-.patch
