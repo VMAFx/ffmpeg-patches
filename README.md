@@ -60,7 +60,7 @@ carry.
 | [25109](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109) | `master` | open | avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import | 0005 |
 | [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | open | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0007 |
 | [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | open | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat, libswscale and tests | 0002 |
-| [25112](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25112) | `master` | open | ffbuild/library.mak: add the devprogs target | none |
+| [25112](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25112) | `master` | merged 2026-10-16 (`30b16e57ff3d`), in no release yet | ffbuild/library.mak: add the devprogs target | none |
 
 State read from the FFmpeg forge on 2026-10-16.
 <!-- upstream-contributions:end -->
