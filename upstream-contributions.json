@@ -106,6 +106,19 @@
       "note": ""
     },
     {
+      "number": 25053,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25053",
+      "title": "hwcontext_vulkan: import a frame again when the CUDA context changes",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0009-hwcontext_vulkan-import-a-frame-again-when-the-CUDA-.patch",
+      "project": "pelorus",
+      "note": "Fixes FFmpeg issue 25052."
+    },
+    {
       "number": 25060,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060",
       "title": "[release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue",
