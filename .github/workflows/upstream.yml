@@ -7,6 +7,8 @@
 # README table cannot go stale unseen; the fix is a pull request that
 # updates the file and regenerates the table. The forge is read without a
 # token. A forge that cannot be read fails the run with exit status 2.
+# Recorded master_form heads and merge bases are checked for drift.
+# A covered_by pull request that merges or closes also fails the run.
 name: upstream drift
 
 'on':

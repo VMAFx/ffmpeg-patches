@@ -62,7 +62,9 @@ METADATA_KEYS = {
     "notes",
     "master_form",
     "upstream_commit",
+    "covered_by",
 }
+PULL_URL = re.compile(r"(https://code\.ffmpeg\.org)/([^/]+)/([^/]+)/pulls/(\d+)")
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -238,6 +240,18 @@ def check_metadata(path: Path, findings: Findings) -> None:
     if status == "merged":
         findings.warn(name, "merged upstream: drop it once the pinned base contains it")
     check_master_metadata(data, name, findings)
+    check_covered_by(data, name, findings)
+
+
+def check_covered_by(data: dict, name: str, findings: Findings) -> None:
+    """Only an unsubmitted patch may be covered by another FFmpeg pull request."""
+    if "covered_by" not in data:
+        return
+    if data.get("status") != "unsubmitted":
+        findings.error(name, "covered_by is allowed only with status unsubmitted")
+    url = data["covered_by"]
+    if not isinstance(url, str) or not PULL_URL.fullmatch(url):
+        findings.error(name, "covered_by must be a pull request URL of code.ffmpeg.org")
 
 
 def check_master_form(form: object, name: str, findings: Findings) -> None:
