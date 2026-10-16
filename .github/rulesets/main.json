@@ -50,6 +50,9 @@
             "context": "REUSE lint"
           },
           {
+            "context": "scanners (actionlint · workflows)"
+          },
+          {
             "context": "scanners (codeql · python)"
           },
           {
