@@ -205,7 +205,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Stop on a draft pull request
-        if: github.event.pull_request.draft == true
+        if: github.evnet.pull_request.draft == true
         shell: bash
         env:
           TITLE: Gate not run on a draft
