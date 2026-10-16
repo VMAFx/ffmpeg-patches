@@ -1,0 +1,163 @@
+{
+    "graphs": [
+        {
+            "graph_index": -1,
+            "name": "Graph 0.-1",
+            "id": "Graph_0_-1",
+            "description": "format=yuv420p",
+            "graph_inputs": [
+                {
+                    "input_index": 0,
+                    "filter_id": "G0_graph__1_input_from_stream_0_0",
+                    "filter_name": "buffer",
+                    "media_type": "video"
+                }
+            ],
+            "graph_outputs": [
+                {
+                    "output_index": 0,
+                    "name": "#0:0",
+                    "filter_id": "G0_out__0_0",
+                    "filter_name": "buffersink",
+                    "media_type": "video"
+                }
+            ],
+            "filters": [
+                {
+                    "filter_name": "format",
+                    "description": "Convert the input video to one of the specified pixel formats.",
+                    "nb_inputs": 1,
+                    "nb_outputs": 1,
+                    "filter_inputs": [
+                        {
+                            "input_index": 0,
+                            "pad_name": "default",
+                            "source_filter_id": "in_0_0",
+                            "source_pad_name": "default",
+                            "filter_id": "G0_Parsed_format_0",
+                            "media_type": "video",
+                            "format": "yuv420p",
+                            "width": 64,
+                            "height": 64,
+                            "sar": "1:1",
+                            "sample_rate": "1/25"
+                        }
+                    ],
+                    "filter_outputs": [
+                        {
+                            "dest_filter_id": "out__0_0",
+                            "output_index": 0,
+                            "pad_name": "default",
+                            "dest_pad_name": "default",
+                            "filter_id": "G0_Parsed_format_0",
+                            "media_type": "video",
+                            "format": "yuv420p",
+                            "width": 64,
+                            "height": 64,
+                            "sar": "1:1",
+                            "sample_rate": "1/25"
+                        }
+                    ]
+                },
+                {
+                    "filter_name": "buffer",
+                    "description": "Buffer video frames, and make them accessible to the filterchain.",
+                    "nb_inputs": 0,
+                    "nb_outputs": 1,
+                    "filter_inputs": [
+
+                    ],
+                    "filter_outputs": [
+                        {
+                            "dest_filter_id": "G0_Parsed_format_0",
+                            "output_index": 0,
+                            "pad_name": "default",
+                            "dest_pad_name": "default",
+                            "filter_id": "G0_graph__1_input_from_stream_0_0",
+                            "media_type": "video",
+                            "format": "yuv420p",
+                            "width": 64,
+                            "height": 64,
+                            "sar": "1:1",
+                            "sample_rate": "1/25"
+                        }
+                    ]
+                },
+                {
+                    "filter_name": "buffersink",
+                    "description": "Buffer video frames, and make them available to the end of the filter graph.",
+                    "nb_inputs": 1,
+                    "nb_outputs": 0,
+                    "filter_inputs": [
+                        {
+                            "input_index": 0,
+                            "pad_name": "default",
+                            "source_filter_id": "G0_Parsed_format_0",
+                            "source_pad_name": "default",
+                            "filter_id": "G0_out__0_0",
+                            "media_type": "video",
+                            "format": "yuv420p",
+                            "width": 64,
+                            "height": 64,
+                            "sar": "1:1",
+                            "sample_rate": "1/25"
+                        }
+                    ],
+                    "filter_outputs": [
+
+                    ]
+                }
+            ]
+        }
+    ],
+    "inputfiles": [
+        {
+            "index": "0",
+            "demuxer_name": "lavfi",
+            "file_extension": "04",
+            "url": "testsrc2=s=64x64:d=0.04",
+            "inputstreams": [
+                {
+                    "id": "r_in_0_0",
+                    "name": "AVFrame to AVPacket passthrough",
+                    "index": "0",
+                    "media_type": "video"
+                }
+            ]
+        }
+    ],
+    "decoders": [
+        {
+            "source_id": "r_in_0_0",
+            "id": "in_0_0",
+            "name": "wrapped_avframe",
+            "media_type": "video"
+        }
+    ],
+    "encoders": [
+        {
+            "id": "out__0_0",
+            "dest_id": "r_out__0_0",
+            "name": "wrapped_avframe",
+            "media_type": "video"
+        }
+    ],
+    "outputfiles": [
+        {
+            "index": "0",
+            "muxer_name": "null",
+            "url": "pipe:",
+            "outputstreams": [
+                {
+                    "id": "r_out__0_0",
+                    "name": "AVFrame to AVPacket passthrough",
+                    "index": "0",
+                    "media_type": "video"
+                }
+            ]
+        }
+    ],
+    "streamlinks": [
+
+    ]
+}

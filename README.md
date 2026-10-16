@@ -84,6 +84,7 @@ edit the file, then run `python3 scripts/series.py contributions --write`.
 | `scripts/series.py` | `check`, `apply`, `export`, the `coverage` and `warnings` gates, the `contributions` table and release `notes` |
 | `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
 | `scripts/consumer_stacks.py` | Applies each consumer's patch stack on top of the applied series |
+| `scripts/graph_check.py` | Reports conversion filters FFmpeg inserted on its own into a filtergraph |
 
 Metadata keys:
 
@@ -183,6 +184,24 @@ on every pull request, on `main` and nightly, and fails when a stack no
 longer applies, so a series change that breaks a consumer shows before a
 release carries it. It applies only; the consumers build in their own
 repositories.
+
+## Graph check
+
+When two linked filters share no pixel or sample format, libavfilter inserts
+a converter named `auto_<filter>_<n>` without asking. On a hardware path
+(for example the Vulkan and CUDA import of 0009) that converter is a silent
+software round trip. FFmpeg 8.0 and later dump the negotiated graph, and
+`scripts/graph_check.py` exits 1 when the dump contains such a converter:
+
+```sh
+ffmpeg <inputs> <filters> <outputs> \
+    -print_graphs_file graphs.json -print_graphs_format json
+python3 scripts/graph_check.py graphs.json            # 1 on auto_scale_0 ...
+python3 scripts/graph_check.py graphs.json --allow aresample
+```
+
+`tests/test_graph_check.py` runs it on two real dumps, one with an
+`auto_scale_0` and one without.
 
 ## Releases
 
