@@ -3,8 +3,9 @@
 #
 # The scanners the repository's policy declares: gitleaks and trivy (facet
 # security:high) and semgrep (profile native-gpu-systems, facet
-# agent:sandboxed). Each runs at a pinned version and fails the job on any
-# finding; none of them is advisory. Semgrep and CodeQL also upload their
+# agent:sandboxed), plus actionlint with shellcheck on the workflows. Each
+# runs at a pinned version and fails the job on any finding; none of them is
+# advisory. Semgrep and CodeQL also upload their
 # findings to code scanning.
 name: scanners
 
@@ -197,3 +198,56 @@ jobs:
           trivy --version
           trivy fs --scanners vuln,secret,misconfig --exit-code 1 \
             --ignorefile .trivyignore --skip-version-check --no-progress .
+
+  actionlint:
+    name: scanners (actionlint · workflows)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+      SHELLCHECK_VERSION: 0.11.0
+      SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.draft != true
+        with:
+          persist-credentials: false
+      - name: Install actionlint and shellcheck at the pinned versions and digests
+        # shellcheck is pinned too: actionlint runs it on every run: script,
+        # and the runner image's own copy would change the result unannounced.
+        if: github.event.pull_request.draft != true
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -sSfL --max-time 300 -o "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" actionlint
+          archive="$RUNNER_TEMP/shellcheck.tar.gz"
+          curl -sSfL --max-time 300 -o "$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          echo "${SHELLCHECK_SHA256}  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" --strip-components=1 \
+            "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+      - name: Lint the workflows
+        # Every finding fails the job. .github/actionlint.yaml declares the
+        # runner labels actionlint does not know yet.
+        if: github.event.pull_request.draft != true
+        run: |
+          "$RUNNER_TEMP/bin/actionlint" -version
+          "$RUNNER_TEMP/bin/shellcheck" --version
+          "$RUNNER_TEMP/bin/actionlint" -no-color \
+            -shellcheck "$RUNNER_TEMP/bin/shellcheck" -pyflakes ''
