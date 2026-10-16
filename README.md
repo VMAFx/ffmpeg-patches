@@ -101,6 +101,11 @@ records the PR's merge base with master at submission and its head commit.
 Update these ids whenever the PR is pushed again. For a `merged` patch,
 optional `upstream_commit = "<40-hex>"` records the commit carrying the fix
 on FFmpeg master. All ids must be full lowercase commit hashes.
+The daily upstream drift check fails when a recorded `master_form` no longer
+matches the PR's head or merge base on the forge. An `unsubmitted` patch whose
+fix travels in another author's PR records it as
+`covered_by = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/<number>"`; the
+daily check fails once that PR merges or closes.
 
 ## Apply the series
 

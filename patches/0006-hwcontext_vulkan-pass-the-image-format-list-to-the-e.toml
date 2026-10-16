@@ -1,5 +1,6 @@
 status = "unsubmitted"
 upstream = ""
+covered_by = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24368"
 consumers = ["pelorus"]
 origin = "found by the Pelorus Vulkan validation lane (DRM-modifier frames pool with a format list)"
 notes = """

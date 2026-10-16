@@ -206,6 +206,58 @@ class CheckTest(SeriesTestCase):
         self.assertEqual(series.check(self.fx.root).errors, [])
 
 
+class CoveredByTest(SeriesTestCase):
+    def metadata(self, value: str, status: str = "unsubmitted") -> None:
+        """Set the first patch's covering URL without changing its contribution record."""
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA.replace('status = "submitted"', f'status = "{status}"')
+            + f"covered_by = {value}\n"
+        )
+
+    def test_unsubmitted_patch_with_covering_pull_passes(self) -> None:
+        self.metadata('"https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24368"')
+        self.fx.write_records([self.fx.record(2)])
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_other_statuses_reject_covered_by(self) -> None:
+        for status in ("submitted", "merged", "rejected"):
+            with self.subTest(status=status):
+                self.metadata('"https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24368"', status)
+                self.assert_error(
+                    series.check(self.fx.root), "covered_by is allowed only with status unsubmitted"
+                )
+
+    def test_invalid_covering_urls_fail(self) -> None:
+        urls = (
+            "https://example.invalid/FFmpeg/FFmpeg/pulls/24368",
+            "http://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24368",
+            "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24368/files",
+            "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24368?tab=files",
+            "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/",
+            "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/not-a-number",
+            "https://code.ffmpeg.org/FFmpeg//pulls/24368",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                self.metadata(f'"{url}"')
+                self.assert_error(
+                    series.check(self.fx.root), "covered_by must be a pull request URL"
+                )
+
+    def test_empty_and_nonstring_covering_urls_fail(self) -> None:
+        for value in ('""', "3", "false", "[]", "{}"):
+            with self.subTest(value=value):
+                self.metadata(value)
+                self.assert_error(
+                    series.check(self.fx.root), "covered_by must be a pull request URL"
+                )
+
+    def test_covering_pull_with_smallest_positive_number_passes(self) -> None:
+        self.metadata('"https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/1"')
+        self.fx.write_records([self.fx.record(2)])
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+
 class ApplyTest(SeriesTestCase):
     def apply(self, expect_base: bool = True, keep_going: bool = False) -> series.Results:
         return series.apply_series(self.fx.root, self.fx.tree, expect_base, keep_going)
