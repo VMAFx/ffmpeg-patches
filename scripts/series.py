@@ -5,9 +5,11 @@
 
     series.py check
         Lint base.env, series.txt, patches/*.patch and their metadata.
-    series.py apply TREE [--expect-base] [--keep-going] [--report FILE]
+    series.py apply TREE [--expect-base] [--keep-going] [--report FILE] [--master-forms URL]
         Apply the series with `git am --3way` onto the clean FFmpeg
-        checkout TREE and print one status per patch.
+        checkout TREE and print one status per patch. With --master-forms,
+        fetch recorded upstream PR forms from URL and recognise recorded
+        upstream commits already in the tested master's history.
     series.py export TREE
         Regenerate patches/ and series.txt from the commits on TREE after
         the pinned base commit.
@@ -52,7 +54,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BASE_KEYS = ("FFMPEG_REMOTE", "FFMPEG_TAG", "FFMPEG_COMMIT")
 STATUSES = ("unsubmitted", "submitted", "merged", "rejected")
-METADATA_KEYS = {"status", "upstream", "consumers", "origin", "notes"}
+METADATA_KEYS = {
+    "status",
+    "upstream",
+    "consumers",
+    "origin",
+    "notes",
+    "master_form",
+    "upstream_commit",
+}
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -82,6 +92,7 @@ COMPILED = re.compile(r"^CC\t(?P<object>\S+)\.o$")
 GIT_IDENTITY = ("-c", "user.name=ffmpeg-patches", "-c", "user.email=ffmpeg-patches@invalid")
 # Deadline for one git call (HISS-02); a 3-way am of the largest patch takes seconds.
 GIT_TIMEOUT = 600
+FETCH_TIMEOUT = 300
 GIT_POLICY = ("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false")
 FORMAT_PATCH = (
     "format-patch",
@@ -123,14 +134,16 @@ def git_env() -> dict[str, str]:
     return env
 
 
-def git(tree: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def git(
+    tree: Path, *args: str, check: bool = True, timeout: int = GIT_TIMEOUT
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(tree), *GIT_IDENTITY, *GIT_POLICY, *args],
         env=git_env(),
         capture_output=True,
         text=True,
         check=check,
-        timeout=GIT_TIMEOUT,
+        timeout=timeout,
     )
 
 
@@ -224,6 +237,27 @@ def check_metadata(path: Path, findings: Findings) -> None:
         findings.error(name, "consumers must be a non-empty list of names")
     if status == "merged":
         findings.warn(name, "merged upstream: drop it once the pinned base contains it")
+    check_master_metadata(data, name, findings)
+
+
+def check_master_form(form: object, name: str, findings: Findings) -> None:
+    if not isinstance(form, dict) or set(form) != {"base", "head"}:
+        findings.error(name, "master_form must be a table with exactly base and head")
+    elif not all(isinstance(v, str) and COMMIT.fullmatch(v) for v in form.values()):
+        findings.error(name, "master_form base and head must each be a full 40-hex commit")
+
+
+def check_master_metadata(data: dict, name: str, findings: Findings) -> None:
+    if "master_form" in data:
+        if data.get("status") != "submitted":
+            findings.error(name, "master_form is allowed only with status submitted")
+        check_master_form(data["master_form"], name, findings)
+    if "upstream_commit" in data:
+        commit = data["upstream_commit"]
+        if data.get("status") != "merged":
+            findings.error(name, "upstream_commit is allowed only with status merged")
+        if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+            findings.error(name, "upstream_commit must be a full 40-hex commit")
 
 
 def check_tree(root: Path, names: list[str], findings: Findings) -> None:
@@ -536,7 +570,74 @@ def apply_one(tree: Path, patch: Path) -> str:
     return "conflict"
 
 
-def apply_series(root: Path, tree: Path, expect_base: bool, keep_going: bool) -> Results:
+def recorded_upstream(tree: Path, patch: Path, commit: str) -> bool:
+    if git(tree, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
+        raise SeriesError(f"{patch.name}: upstream commit {commit} not in the tested history")
+    result = git(tree, "merge-base", "--is-ancestor", commit, "HEAD", check=False)
+    if result.returncode not in (0, 1):
+        raise SeriesError(f"{patch.name}: checking upstream commit {commit}: {result.stderr}")
+    return result.returncode == 0
+
+
+def fetch_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -> None:
+    # No --depth: in a shallow tree it would make the PR base, a commit of the
+    # tested history, a shallow boundary and hide older upstream commits.
+    try:
+        result = git(
+            tree,
+            "fetch",
+            "--no-tags",
+            url,
+            form["base"],
+            form["head"],
+            check=False,
+            timeout=FETCH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SeriesError(f"{patch.name}: fetch from {url} timed out: {exc.stderr or exc}") from exc
+    if result.returncode:
+        raise SeriesError(f"{patch.name}: fetch from {url} failed: {result.stderr}")
+    for commit in (form["base"], form["head"]):
+        resolved = git(tree, "rev-parse", "--verify", f"{commit}^{{commit}}", check=False)
+        if resolved.returncode:
+            raise SeriesError(
+                f"{patch.name}: fetch from {url} did not resolve {commit}: {resolved.stderr}"
+            )
+
+
+def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -> str:
+    fetch_master_form(tree, patch, url, form)
+    base, head = form["base"], form["head"]
+    diff = git(tree, "diff", "--binary", "--full-index", base, head).stdout
+    if not diff:
+        raise SeriesError(f"{patch.name}: empty master form {base}..{head} from {url}")
+    with tempfile.TemporaryDirectory() as scratch:
+        path = Path(scratch) / "master.patch"
+        path.write_text(diff)
+        applied = git(tree, "apply", "--3way", "--index", str(path), check=False)
+    if applied.returncode:
+        git(tree, "reset", "-q", "--hard", "HEAD")
+        return "conflict"
+    git(tree, "commit", "-q", "-m", f"{patch.name}: master form {base[:12]}..{head[:12]}")
+    return "master-form"
+
+
+def apply_for_master(tree: Path, patch: Path, url: str) -> str:
+    meta = note_metadata(patch)
+    findings = Findings()
+    check_master_metadata(meta, patch.name, findings)
+    if findings.errors:
+        raise SeriesError("\n".join(findings.errors))
+    if "upstream_commit" in meta and recorded_upstream(tree, patch, meta["upstream_commit"]):
+        return "upstream"
+    if "master_form" in meta:
+        return apply_master_form(tree, patch, url, meta["master_form"])
+    return apply_one(tree, patch)
+
+
+def apply_series(
+    root: Path, tree: Path, expect_base: bool, keep_going: bool, master_forms: str | None = None
+) -> Results:
     findings = Findings()
     base = read_base(root, findings)
     names = read_series(root, findings)
@@ -549,7 +650,12 @@ def apply_series(root: Path, tree: Path, expect_base: bool, keep_going: bool) ->
         if stopped:
             results.append((name, "not-tried"))
             continue
-        status = apply_one(tree, root / "patches" / name)
+        patch = root / "patches" / name
+        status = (
+            apply_for_master(tree, patch, master_forms)
+            if master_forms is not None
+            else apply_one(tree, patch)
+        )
         results.append((name, status))
         stopped = status == "conflict" and not keep_going
     return results
@@ -808,11 +914,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=ROOT, help="series repository root")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check", help="lint the series and its metadata")
-    apply = sub.add_parser("apply", help="apply the series onto an FFmpeg checkout")
+    apply = sub.add_parser(
+        "apply", help="apply pinned-release or recorded master forms onto FFmpeg"
+    )
     apply.add_argument("tree", type=Path)
     apply.add_argument("--expect-base", action="store_true", help="require HEAD == FFMPEG_COMMIT")
     apply.add_argument("--keep-going", action="store_true", help="try every patch after a conflict")
     apply.add_argument("--report", type=Path, help="append a Markdown table to this file")
+    apply.add_argument(
+        "--master-forms", metavar="URL", help="fetch recorded upstream PR forms from URL"
+    )
     export = sub.add_parser("export", help="regenerate patches/ from an FFmpeg checkout")
     export.add_argument("tree", type=Path)
     warn = sub.add_parser("warnings", help="gate compiler warnings in the series' files")
@@ -861,7 +972,9 @@ def run(args: argparse.Namespace) -> int:
             print(f"error: {line}", file=sys.stderr)
         return 1 if findings.errors else 0
     if args.command == "apply":
-        results = apply_series(args.root, args.tree, args.expect_base, args.keep_going)
+        results = apply_series(
+            args.root, args.tree, args.expect_base, args.keep_going, args.master_forms
+        )
         write_report(results, args.tree, args.report)
         return 1 if apply_failed(results, args.expect_base) else 0
     if args.command in ("notes", "contributions"):

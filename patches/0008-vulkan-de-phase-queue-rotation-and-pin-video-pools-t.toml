@@ -1,5 +1,6 @@
 status = "merged"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060"
+upstream_commit = "d0d7d813178fec964716aa2c48f5896ce5c26284"
 consumers = ["pelorus"]
 origin = "backport of FFmpeg master d0d7d813178fec964716aa2c48f5896ce5c26284 (Lynne, 2026-07-18), found by the Pelorus forced-keyframe hang bisect (Pelorus #309)"
 notes = """
