@@ -7,6 +7,8 @@ bin/
 __pycache__/
 # Release tarballs from make dist
 /dist/
+# Linked worktrees of local agent sessions
+/.claude/worktrees/
 
 # BEGIN praetor private artifacts (praetorctl adopt)
 .workingdir/
