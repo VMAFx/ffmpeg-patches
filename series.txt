@@ -15,3 +15,5 @@
 0008-vulkan-de-phase-queue-rotation-and-pin-video-pools-t.patch
 0009-hwcontext_vulkan-import-a-frame-again-when-the-CUDA-.patch
 0010-avcodec-qsvdec-discard-the-right-frames-on-MP4-edit-.patch
+0011-avfilter-dovi_reshape-add-a-Dolby-Vision-RPU-reshapi.patch
+0012-avfilter-add-dovi_reshape-filter.patch

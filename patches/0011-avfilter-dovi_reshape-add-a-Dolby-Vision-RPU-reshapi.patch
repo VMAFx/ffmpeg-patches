@@ -1,0 +1,605 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 18:19:15 +0200
+Subject: [PATCH] avfilter/dovi_reshape: add a Dolby Vision RPU reshaping
+ helper
+
+Dolby Vision profile 5 carries IPTPQc2 in its base layer and needs the
+per-frame RPU reshaping curves before any tone mapper can use it. Only
+vf_libplacebo applies them today, so every other tone-mapping path in
+libavfilter (zscale + tonemap, tonemap_opencl, tonemap_vaapi) shows the
+base layer with wrong colours.
+
+Add one internal helper that the filters can share: it validates the
+RPU, evaluates the polynomial and MMR curves per component, and decodes
+the reshaped signal to PQ BT.2020 RGB through the RPU's matrices. The
+steps follow libplacebo v7.360.1 (pl_shader_dovi_reshape and
+pl_shader_decode_color in src/shaders/colorspace.c, pl_map_dovi_metadata),
+whose notice the file carries. Streams with a
+residual enhancement layer (profile 7) are refused.
+
+The unit test builds RPUs with known curves and checks the helper
+against values from a separate double-precision model, including the
+pivot boundary, a planted wrong MMR coefficient, and the refusals.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavfilter/Makefile               |   2 +-
+ libavfilter/dovi_reshape.c         | 201 ++++++++++++++++++++++++++
+ libavfilter/dovi_reshape.h         |  81 +++++++++++
+ libavfilter/tests/dovi_reshape.c   | 221 +++++++++++++++++++++++++++++
+ tests/fate/filter-video.mak        |   4 +
+ tests/ref/fate/filter-dovi-reshape |  12 ++
+ 6 files changed, 520 insertions(+), 1 deletion(-)
+ create mode 100644 libavfilter/dovi_reshape.c
+ create mode 100644 libavfilter/dovi_reshape.h
+ create mode 100644 libavfilter/tests/dovi_reshape.c
+ create mode 100644 tests/ref/fate/filter-dovi-reshape
+
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index ce40cf3e65b6ced2e36988998dfc7312a587a840..c0731a5b0f31a6ed7059a47c6d6e06df1246d637 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -682,7 +682,7 @@ SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
+ SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
+ 
+ TOOLS     = graph2dot
+-TESTPROGS = drawutils filtfmts formats integral
++TESTPROGS = dovi_reshape drawutils filtfmts formats integral
+ 
+ TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
+ 
+diff --git a/libavfilter/dovi_reshape.c b/libavfilter/dovi_reshape.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb6faa138357736519201eebad3e333106ebff00
+--- /dev/null
++++ b/libavfilter/dovi_reshape.c
+@@ -0,0 +1,201 @@
++/*
++ * Dolby Vision profile 5 reshaping and IPT-PQ-C2 decoding
++ *
++ * The reshaping and decoding steps follow libplacebo v7.360.1
++ * (src/shaders/colorspace.c: pl_shader_dovi_reshape, pl_shader_decode_color;
++ * src/include/libplacebo/utils/libav_internal.h: pl_map_dovi_metadata),
++ * Copyright (C) Niklas Haas and the libplacebo contributors, licensed under
++ * the GNU Lesser General Public License version 2.1 or later.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <math.h>
++#include <string.h>
++
++#include "libavutil/common.h"
++#include "libavutil/csp.h"
++#include "libavutil/error.h"
++#include "libavutil/rational.h"
++
++#include "dovi_reshape.h"
++
++/* Dolby Vision always outputs BT.2020-referred Hunt-Pointer-Estevez LMS. */
++static const double hpe_lms_to_rgb[3][3] = {
++    {  3.06441879, -2.16597676,  0.10155818 },
++    { -0.65612108,  1.78554118, -0.12943749 },
++    {  0.01736321, -0.04725154,  1.03004253 },
++};
++
++static int map_curve(FFDoviCurve *dst, const AVDOVIReshapingCurve *src,
++                     int bl_bit_depth, int coef_log2_denom)
++{
++    const double pivot_scale = 1.0 / ((1 << bl_bit_depth) - 1);
++    const double coef_scale  = ldexp(1.0, -coef_log2_denom);
++
++    if (src->num_pivots < 2 || src->num_pivots > AV_DOVI_MAX_PIECES + 1)
++        return AVERROR_INVALIDDATA;
++
++    dst->num_pivots = src->num_pivots;
++    for (int i = 0; i < src->num_pivots; i++) {
++        if (i && src->pivots[i] < src->pivots[i - 1])
++            return AVERROR_INVALIDDATA;
++        dst->pivots[i] = pivot_scale * src->pivots[i];
++    }
++
++    for (int i = 0; i < src->num_pivots - 1; i++) {
++        dst->method[i] = src->mapping_idc[i];
++        switch (src->mapping_idc[i]) {
++        case AV_DOVI_MAPPING_POLYNOMIAL:
++            if (src->poly_order[i] < 1 || src->poly_order[i] > 2)
++                return AVERROR_INVALIDDATA;
++            for (int k = 0; k < 3; k++)
++                dst->poly[i][k] = k <= src->poly_order[i]
++                                ? coef_scale * src->poly_coef[i][k] : 0.0f;
++            break;
++        case AV_DOVI_MAPPING_MMR:
++            if (src->mmr_order[i] < 1 || src->mmr_order[i] > 3)
++                return AVERROR_INVALIDDATA;
++            dst->mmr_order[i]    = src->mmr_order[i];
++            dst->mmr_constant[i] = coef_scale * src->mmr_constant[i];
++            for (int j = 0; j < src->mmr_order[i]; j++)
++                for (int k = 0; k < 7; k++)
++                    dst->mmr[i][j][k] = coef_scale * src->mmr_coef[i][j][k];
++            break;
++        default:
++            return AVERROR_INVALIDDATA;
++        }
++    }
++    return 0;
++}
++
++static void map_color(FFDoviReshape *out, const AVDOVIColorMetadata *color)
++{
++    double lms[3][3];
++
++    for (int i = 0; i < 3; i++) {
++        out->ycc_offset[i] = av_q2d(color->ycc_to_rgb_offset[i]);
++        for (int j = 0; j < 3; j++) {
++            out->ycc_to_rgb[i][j] = av_q2d(color->ycc_to_rgb_matrix[3 * i + j]);
++            lms[i][j] = av_q2d(color->rgb_to_lms_matrix[3 * i + j]);
++        }
++    }
++
++    /* lms_to_rgb = hpe_lms_to_rgb * rgb_to_lms_matrix */
++    for (int i = 0; i < 3; i++)
++        for (int j = 0; j < 3; j++)
++            out->lms_to_rgb[i][j] = hpe_lms_to_rgb[i][0] * lms[0][j] +
++                                    hpe_lms_to_rgb[i][1] * lms[1][j] +
++                                    hpe_lms_to_rgb[i][2] * lms[2][j];
++
++    out->min_pq = color->source_min_pq / 4095.0f;
++    out->max_pq = color->source_max_pq / 4095.0f;
++}
++
++int ff_dovi_reshape_init(FFDoviReshape *out, const AVDOVIMetadata *md)
++{
++    const AVDOVIRpuDataHeader *header;
++    const AVDOVIDataMapping *mapping;
++    int ret;
++
++    memset(out, 0, sizeof(*out));
++    if (!md)
++        return AVERROR(EINVAL);
++
++    header  = av_dovi_get_header(md);
++    mapping = av_dovi_get_mapping(md);
++    if (!header->disable_residual_flag)
++        return AVERROR(ENOTSUP);
++    if (header->bl_bit_depth < 8 || header->bl_bit_depth > 16 ||
++        header->coef_log2_denom > 32)
++        return AVERROR_INVALIDDATA;
++
++    for (int c = 0; c < 3; c++) {
++        ret = map_curve(&out->curve[c], &mapping->curves[c],
++                        header->bl_bit_depth, header->coef_log2_denom);
++        if (ret < 0)
++            return ret;
++    }
++
++    map_color(out, av_dovi_get_color(md));
++    return 0;
++}
++
++static float reshape_mmr(const FFDoviCurve *curve, int i, const float sig[3])
++{
++    const float x[7] = {
++        sig[0], sig[1], sig[2],
++        sig[0] * sig[1], sig[0] * sig[2], sig[1] * sig[2],
++        sig[0] * sig[1] * sig[2],
++    };
++    float pow_x[7], s = curve->mmr_constant[i];
++
++    memcpy(pow_x, x, sizeof(pow_x));
++    for (int j = 0; j < curve->mmr_order[i]; j++) {
++        for (int k = 0; k < 7; k++)
++            s += curve->mmr[i][j][k] * pow_x[k];
++        for (int k = 0; k < 7; k++)
++            pow_x[k] *= x[k];
++    }
++    return s;
++}
++
++float ff_dovi_reshape_comp(const FFDoviCurve *curve, const float sig[3], int c)
++{
++    float s = sig[c];
++    int i = 0;
++
++    if (!curve->num_pivots)
++        return s;
++
++    /* The outer pivots only bound the output; the inner ones pick the piece. */
++    while (i < curve->num_pivots - 2 && s >= curve->pivots[i + 1])
++        i++;
++
++    if (curve->method[i] == AV_DOVI_MAPPING_POLYNOMIAL) {
++        const float *k = curve->poly[i];
++        s = (k[2] * s + k[1]) * s + k[0];
++    } else {
++        s = reshape_mmr(curve, i, sig);
++    }
++    return av_clipf(s, curve->pivots[0], curve->pivots[curve->num_pivots - 1]);
++}
++
++static void mul3(const float m[3][3], const float in[3], float out[3])
++{
++    for (int i = 0; i < 3; i++)
++        out[i] = m[i][0] * in[0] + m[i][1] * in[1] + m[i][2] * in[2];
++}
++
++void ff_dovi_reshape_pixel(const FFDoviReshape *s, const float ycc[3], float rgb[3])
++{
++    const av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
++    const av_csp_trc_function pq_oetf = av_csp_trc_func_from_id(AVCOL_TRC_SMPTE2084);
++    float sig[3], ipt[3], lms[3];
++
++    for (int c = 0; c < 3; c++)
++        sig[c] = av_clipf(ycc[c], 0.0f, 1.0f);
++    for (int c = 0; c < 3; c++)
++        ipt[c] = ff_dovi_reshape_comp(&s->curve[c], sig, c) - s->ycc_offset[c];
++
++    mul3(s->ycc_to_rgb, ipt, lms);
++    for (int c = 0; c < 3; c++)
++        lms[c] = pq_eotf(FFMAX(lms[c], 0.0f));
++    mul3(s->lms_to_rgb, lms, rgb);
++    for (int c = 0; c < 3; c++)
++        rgb[c] = pq_oetf(rgb[c]);
++}
+diff --git a/libavfilter/dovi_reshape.h b/libavfilter/dovi_reshape.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5e2543129f94225f5f9059006368aad1ce0d6a7
+--- /dev/null
++++ b/libavfilter/dovi_reshape.h
+@@ -0,0 +1,81 @@
++/*
++ * Dolby Vision profile 5 reshaping and IPT-PQ-C2 decoding
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_DOVI_RESHAPE_H
++#define AVFILTER_DOVI_RESHAPE_H
++
++#include <stdint.h>
++
++#include "libavutil/dovi_meta.h"
++
++/**
++ * Reshaping curve of one component, normalized to [0, 1] input and output.
++ * All members are 32-bit scalars or arrays of them, so the struct can be
++ * uploaded unchanged as an OpenCL or std430 Vulkan buffer.
++ */
++typedef struct FFDoviCurve {
++    int32_t num_pivots;                          ///< 0: identity, else [2, 9]
++    float   pivots[AV_DOVI_MAX_PIECES + 1];
++    int32_t method[AV_DOVI_MAX_PIECES];          ///< enum AVDOVIMappingMethod
++    float   poly[AV_DOVI_MAX_PIECES][3];         ///< x^0, x^1, x^2
++    int32_t mmr_order[AV_DOVI_MAX_PIECES];       ///< [1, 3]
++    float   mmr_constant[AV_DOVI_MAX_PIECES];
++    float   mmr[AV_DOVI_MAX_PIECES][3][7];
++} FFDoviCurve;
++
++/**
++ * Everything needed to turn the decoded base layer of a Dolby Vision
++ * profile 5 frame into nonlinear (PQ) BT.2020 RGB.
++ */
++typedef struct FFDoviReshape {
++    FFDoviCurve curve[3];
++    float ycc_to_rgb[3][3];  ///< reshaped IPT to L'M'S'
++    float ycc_offset[3];     ///< subtracted before ycc_to_rgb
++    float lms_to_rgb[3][3];  ///< linear LMS to linear BT.2020 RGB
++    float min_pq;            ///< source_min_pq, normalized to [0, 1]
++    float max_pq;            ///< source_max_pq, normalized to [0, 1]
++} FFDoviReshape;
++
++/**
++ * Fill out from the metadata of one frame.
++ *
++ * @return 0 on success, AVERROR(ENOTSUP) for a frame whose enhancement layer
++ *         carries a residual (not profile 5), AVERROR_INVALIDDATA for
++ *         metadata outside the ranges the RPU syntax allows
++ */
++int ff_dovi_reshape_init(FFDoviReshape *out, const AVDOVIMetadata *md);
++
++/**
++ * Reshape one component.
++ *
++ * @param sig all three components of the pixel, normalized to [0, 1]
++ * @return the reshaped component c, clamped to the outer pivots
++ */
++float ff_dovi_reshape_comp(const FFDoviCurve *curve, const float sig[3], int c);
++
++/**
++ * Reshape and decode one pixel.
++ *
++ * @param ycc the decoded base layer sample, normalized to [0, 1]
++ * @param rgb nonlinear (PQ) BT.2020 RGB, 1.0 = 10000 cd/m^2
++ */
++void ff_dovi_reshape_pixel(const FFDoviReshape *s, const float ycc[3], float rgb[3]);
++
++#endif /* AVFILTER_DOVI_RESHAPE_H */
+diff --git a/libavfilter/tests/dovi_reshape.c b/libavfilter/tests/dovi_reshape.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..8285ca116ac47e7ea7025659f9b6381e907c753c
+--- /dev/null
++++ b/libavfilter/tests/dovi_reshape.c
+@@ -0,0 +1,221 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <math.h>
++#include <stdio.h>
++
++#include "libavutil/dovi_meta.h"
++#include "libavutil/error.h"
++#include "libavutil/mem.h"
++
++#include "libavfilter/dovi_reshape.c"
++
++/*
++ * The expected values come from a double precision model of the libplacebo
++ * v7.360.1 reshaping and decoding, written separately from this port.
++ */
++static const struct {
++    float in[3], comp[3], rgb[3];
++} cases[] = {
++    { { 0.2f, 0.45f, 0.55f }, { 0.1920000f, 0.2922774f, 0.8250000f },
++      { 0.1276666f, 0.2802370f, 0.0000007f } },
++    { { 0.9f, 0.1f, 0.8f }, { 0.9050000f, 0.0438910f, 0.9384164f },
++      { 0.0000007f, 1.0554591f, 0.0000007f } },
++    { { 0.01f, 0.95f, 0.01f }, { 0.0190050f, 0.7270402f, 0.0625611f },
++      { 0.1545720f, 0.0000007f, 0.3284277f } },
++    { { 0.6f, 0.5f, 0.5f }, { 0.6050000f, 0.3681612f, 0.7500000f },
++      { 0.6063548f, 0.6728913f, 0.3535421f } },
++};
++
++static const int64_t cb_mmr[3][7] = {
++    {  419430, 7549747, -251658, 167772,  83886, -335544,  251658 },
++    {   83886, -419430,  167772,      0, 251658,   83886, -167772 },
++    {  -83886,  167772,       0,  83886, -83886,  167772,   83886 },
++};
++
++static const int ycc[9] = { 8192, 799, 1681, 8192, -933, 1091, 8192, 267, -5545 };
++/* Asymmetric, so that a transposed matrix product shows up. */
++static const int lms[9] = { 17081, -349, -349, -200, 16900, -316, -400, -300, 17084 };
++
++#define COMP_TOL 1e-5f
++#define RGB_TOL  2e-4f
++
++static void set_poly(AVDOVIReshapingCurve *c, int i, int order,
++                     int64_t c0, int64_t c1, int64_t c2)
++{
++    c->mapping_idc[i] = AV_DOVI_MAPPING_POLYNOMIAL;
++    c->poly_order[i]  = order;
++    c->poly_coef[i][0] = c0;
++    c->poly_coef[i][1] = c1;
++    c->poly_coef[i][2] = c2;
++}
++
++static void fill(AVDOVIMetadata *md)
++{
++    AVDOVIRpuDataHeader *hdr  = av_dovi_get_header(md);
++    AVDOVIDataMapping *map    = av_dovi_get_mapping(md);
++    AVDOVIColorMetadata *col  = av_dovi_get_color(md);
++    AVDOVIReshapingCurve *y   = &map->curves[0];
++    AVDOVIReshapingCurve *cb  = &map->curves[1];
++    AVDOVIReshapingCurve *cr  = &map->curves[2];
++
++    hdr->disable_residual_flag = 1;
++    hdr->bl_bit_depth = 10;
++    hdr->coef_log2_denom = 23;
++
++    /* Two polynomial pieces; the second is linear, so its x^2 term is unused. */
++    y->num_pivots = 3;
++    y->pivots[1] = 400;
++    y->pivots[2] = 1023;
++    set_poly(y, 0, 2, 83886, 7549747, 419430);
++    set_poly(y, 1, 1, 41943, 8388608, 1000);
++
++    cb->num_pivots = 2;
++    cb->pivots[1] = 1023;
++    cb->mapping_idc[0] = AV_DOVI_MAPPING_MMR;
++    cb->mmr_order[0] = 3;
++    cb->mmr_constant[0] = -838861;
++    memcpy(cb->mmr_coef[0], cb_mmr, sizeof(cb_mmr));
++
++    /* 1.5 * x, clamped to the outer pivots */
++    cr->num_pivots = 2;
++    cr->pivots[0] = 64;
++    cr->pivots[1] = 960;
++    set_poly(cr, 0, 1, 0, 12582912, 0);
++
++    for (int i = 0; i < 9; i++) {
++        col->ycc_to_rgb_matrix[i] = av_make_q(ycc[i], 1 << 13);
++        col->rgb_to_lms_matrix[i] = av_make_q(lms[i], 1 << 14);
++    }
++    col->ycc_to_rgb_offset[0] = av_make_q(0, 1);
++    col->ycc_to_rgb_offset[1] = av_make_q(1, 2);
++    col->ycc_to_rgb_offset[2] = av_make_q(1, 2);
++    col->source_min_pq = 62;
++    col->source_max_pq = 3696;
++}
++
++static int near(const float *got, const float *want, float tol)
++{
++    for (int i = 0; i < 3; i++)
++        if (!(fabsf(got[i] - want[i]) <= tol))
++            return 0;
++    return 1;
++}
++
++static int check_cases(const FFDoviReshape *s)
++{
++    int fails = 0;
++
++    for (size_t n = 0; n < FF_ARRAY_ELEMS(cases); n++) {
++        float comp[3], rgb[3];
++        for (int c = 0; c < 3; c++)
++            comp[c] = ff_dovi_reshape_comp(&s->curve[c], cases[n].in, c);
++        ff_dovi_reshape_pixel(s, cases[n].in, rgb);
++        printf("case %zu: reshape %s, decode %s\n", n,
++               near(comp, cases[n].comp, COMP_TOL) ? "ok" : "WRONG",
++               near(rgb, cases[n].rgb, RGB_TOL) ? "ok" : "WRONG");
++        fails += !near(comp, cases[n].comp, COMP_TOL) + !near(rgb, cases[n].rgb, RGB_TOL);
++    }
++    return fails;
++}
++
++/* A sample exactly on an inner pivot takes the upper piece: 0.005 + x. */
++static int check_pivot(const FFDoviReshape *s)
++{
++    float sig[3] = { s->curve[0].pivots[1], 0.5f, 0.5f };
++    float got = ff_dovi_reshape_comp(&s->curve[0], sig, 0);
++    int ok = fabsf(got - (0.005f + sig[0])) <= COMP_TOL;
++
++    printf("inner pivot takes the upper piece: %s\n", ok ? "ok" : "WRONG");
++    return !ok;
++}
++
++/* The planted error: one MMR weight off by 0.01 must miss the expected colour. */
++static int check_planted(AVDOVIMetadata *md)
++{
++    FFDoviReshape s;
++    float rgb[3];
++    int detected;
++
++    av_dovi_get_mapping(md)->curves[1].mmr_coef[0][0][1] += 83886;
++    ff_dovi_reshape_init(&s, md);
++    ff_dovi_reshape_pixel(&s, cases[3].in, rgb);
++    detected = !near(rgb, cases[3].rgb, RGB_TOL);
++    av_dovi_get_mapping(md)->curves[1].mmr_coef[0][0][1] -= 83886;
++    printf("planted wrong coefficient: %s\n", detected ? "detected" : "MISSED");
++    return !detected;
++}
++
++static int expect_refusal(AVDOVIMetadata *md, const char *what, int want)
++{
++    FFDoviReshape s;
++    int ret = ff_dovi_reshape_init(&s, md);
++
++    printf("%s: %s\n", what, ret == want ? "refused" : "ACCEPTED");
++    return ret != want;
++}
++
++static int check_refusals(AVDOVIMetadata *md)
++{
++    AVDOVIRpuDataHeader *hdr = av_dovi_get_header(md);
++    AVDOVIReshapingCurve *y  = &av_dovi_get_mapping(md)->curves[0];
++    int fails = 0;
++
++    fails += expect_refusal(NULL, "no metadata", AVERROR(EINVAL));
++    hdr->disable_residual_flag = 0;
++    fails += expect_refusal(md, "residual enhancement layer", AVERROR(ENOTSUP));
++    hdr->disable_residual_flag = 1;
++    y->num_pivots = 1;
++    fails += expect_refusal(md, "single pivot", AVERROR_INVALIDDATA);
++    y->num_pivots = 3;
++    y->pivots[1] = 1023;
++    y->pivots[2] = 400;
++    fails += expect_refusal(md, "descending pivots", AVERROR_INVALIDDATA);
++    y->pivots[1] = 400;
++    y->pivots[2] = 1023;
++    y->poly_order[0] = 3;
++    fails += expect_refusal(md, "polynomial order 3", AVERROR_INVALIDDATA);
++    y->poly_order[0] = 2;
++    return fails;
++}
++
++int main(void)
++{
++    AVDOVIMetadata *md = av_dovi_metadata_alloc(NULL);
++    FFDoviReshape s;
++    int ret, fails = 0;
++
++    if (!md)
++        return 1;
++    fill(md);
++
++    ret = ff_dovi_reshape_init(&s, md);
++    printf("init: %s\n", ret < 0 ? av_err2str(ret) : "ok");
++    if (ret < 0) {
++        av_free(md);
++        return 1;
++    }
++
++    fails += check_cases(&s);
++    fails += check_pivot(&s);
++    fails += check_planted(md);
++    fails += check_refusals(md);
++
++    av_free(md);
++    return fails != 0;
++}
+diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
+index 1b04816f2f805590a4fd3ac83542d78628216ae0..f9413cd3b4158d6d3f22a8eff55ada479d283fca 100644
+--- a/tests/fate/filter-video.mak
++++ b/tests/fate/filter-video.mak
+@@ -481,6 +481,10 @@ fate-filter-fps-down-eof-pass: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:eo
+ fate-filter-fps-start-drop: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:start_time=1.5
+ fate-filter-fps-start-fill: CMD = framecrc -lavfi testsrc2=r=7:d=1.5,setpts=PTS+14,fps=3:start_time=1.5
+ 
++FATE_FILTER-yes += fate-filter-dovi-reshape
++fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
++fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
++
+ DRAWVG_SCRIPT_ALL = $(SRC_PATH)/tests/ref/lavf/drawvg.all
+ 
+ FATE_FILTER-$(CONFIG_DRAWVG_FILTER) += fate-filter-drawvg-interpreter
+diff --git a/tests/ref/fate/filter-dovi-reshape b/tests/ref/fate/filter-dovi-reshape
+new file mode 100644
+index 0000000000000000000000000000000000000000..88faf0648db8be4fc6cdd11aafc65e343a7bb924
+--- /dev/null
++++ b/tests/ref/fate/filter-dovi-reshape
+@@ -0,0 +1,12 @@
++init: ok
++case 0: reshape ok, decode ok
++case 1: reshape ok, decode ok
++case 2: reshape ok, decode ok
++case 3: reshape ok, decode ok
++inner pivot takes the upper piece: ok
++planted wrong coefficient: detected
++no metadata: refused
++residual enhancement layer: refused
++single pivot: refused
++descending pivots: refused
++polynomial order 3: refused
