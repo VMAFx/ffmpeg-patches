@@ -85,6 +85,7 @@ edit the file, then run `python3 scripts/series.py contributions --write`.
 | `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
 | `scripts/consumer_stacks.py` | Applies each consumer's patch stack on top of the applied series |
 | `scripts/graph_check.py` | Reports conversion filters FFmpeg inserted on its own into a filtergraph |
+| `scripts/tonemap_parity.py` | Colour difference, time and VRAM of tone-map filter chains against `vf_libplacebo` (ADR-0002) |
 
 Metadata keys:
 
@@ -202,6 +203,38 @@ python3 scripts/graph_check.py graphs.json --allow aresample
 
 `tests/test_graph_check.py` runs it on two real dumps, one with an
 `auto_scale_0` and one without.
+
+## Tone-map parity
+
+[ADR-0002](docs/adr/0002-dovi-reshape-and-tone-mapping.md) lets a tone-map path
+land only when its mean CIEDE2000 against `vf_libplacebo` stays at or below
+2.3. `scripts/tonemap_parity.py` measures that. It runs one reference chain
+and any number of candidate chains on the same clip, compares every 30th frame
+in BT.709 / gamma 2.4 / D65, and reports the mean, 95th percentile and maximum
+difference, the wall time and the peak VRAM above idle (from `nvidia-smi`;
+"not measured" without it). It exits 1 when a candidate misses the bar or
+FFmpeg refuses to run it:
+
+```sh
+python3 scripts/tonemap_parity.py --ffmpeg ffmpeg --clip tests/fixtures/dv5/dv5.mp4 \
+    --ref 'libplacebo=tonemapping=hable:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p' \
+    --cand 'ocl=format=p010le,hwupload,tonemap_opencl=tonemap=hable:format=nv12,hwdownload,format=nv12' \
+    --pre 'ocl=-init_hw_device opencl=ocl:2.0 -filter_hw_device ocl' --json parity.json
+```
+
+`ocl:2.0` is OpenCL platform 2, device 0;
+`ffmpeg -v debug -init_hw_device opencl -f lavfi -i nullsrc=d=0.01 -f null -`
+lists them. On FFmpeg n9.0.2 without the series this example exits 1:
+`tonemap_opencl` refuses the IPT-C2 frames of the clip, and the script records
+that as a failed path with FFmpeg's exit status.
+
+`tests/fixtures/dv5/dv5.mp4` is a Dolby Vision profile 5 clip with reshape
+curves whose values are known; `tests/fixtures/dv5/dv5gen.c` wrote it and says
+how. The base layer holds arbitrary IPT content rather than a picture converted
+with the inverse matrices: the reference is whatever `vf_libplacebo` makes of
+the same RPUs, so no inverse is needed. `tests/test_tonemap_parity.py` checks
+the colour difference against the published CIEDE2000 test pairs and the
+gate's pass and fail decisions without FFmpeg.
 
 ## Releases
 
