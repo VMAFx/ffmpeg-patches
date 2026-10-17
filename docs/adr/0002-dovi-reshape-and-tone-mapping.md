@@ -28,9 +28,10 @@ Linking libplacebo for this one feature brings its tone-map path (about
 (about 440 against 610 MiB of VRAM), but with a mean CIEDE2000 of 8.5 to
 libplacebo's output.
 
-VMAFx/vmafx (HDR and Dolby Vision scoring inputs) and VMAFx/pelorus (a
-tone-map stage before encoding) both need this. Both apply this series
-first, as ADR-0001 sets out.
+VMAFx/vmafx (HDR and Dolby Vision scoring inputs, VMAFx/vmafx#2835) and
+VMAFx/pelorus (a tone-map stage before encoding, VMAFx/pelorus#356) both
+need this. Both apply this series first, as ADR-0001 sets out, and add no
+consumer code until it lands.
 
 ## Decision
 
