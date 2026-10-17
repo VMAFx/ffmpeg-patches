@@ -1,0 +1,20 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["pelorus"]
+origin = "found while checking a QSV frame-count report on MP4 input; the report itself did not reproduce, edit-list MP4 files showed this defect"
+notes = """
+h264_qsv and hevc_qsv set AV_FRAME_FLAG_DISCARD from the packet in \
+flight when a surface is allocated, not from the frame's own packet, and \
+the runtime returns negative TimeStamps rounded to a multiple of 2048, so \
+edit-list pre-roll frames survive, others are dropped and timestamps \
+shift. Measured on an Arc A380 (iHD 26.3.5, libvpl 2.17), n9.0.2 plus \
+0001-0009, framecrc against the software decoder of the same build: \
+without this patch, an H.264 edit-list MP4 gives 6482 frames in system \
+memory and 6484 on the hardware path at async_depth 1 (software 6483), \
+and an HEVC Main10 one gives 3271 in system memory (software 3270); with \
+it, system memory and the hardware path at async_depth default, 1 and 8 \
+give the software frames line for line on both files and on an MP4 \
+without an edit list (7137 frames). tests/test_qsv_editlist.py fails \
+without the patch and passes with it (QSV_FFMPEG, QSV_DEVICE). Does not \
+apply to FFmpeg master e9b3c55fe0 as is; the master form is not done \
+yet."""

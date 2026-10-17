@@ -149,7 +149,7 @@ Every pull request runs:
   this file equals the one generated from the records. The check does not
   ask the forge; the `checked` date says when the states were read
 - apply on the pinned release, byte-identical regeneration, an FFmpeg build
-  with the GPL components, Vulkan, NVENC and VAAPI enabled and the FATE tests
+  with the GPL components, Vulkan, NVENC, VAAPI and QSV (libvpl) enabled and the FATE tests
   that need no samples
 - a coverage gate: every C file the series changes must appear as compiled
   (`CC` line) in the build log, so a file in a component the configuration
