@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 01:47:15 +0200
+Subject: [PATCH] avfilter/vf_dovi_reshape: add a profile 8.1 RPU output mode
+
+Add the rpu option. The default, strip, keeps today's behaviour and
+removes the Dolby Vision metadata from the reshaped frames, because the
+profile 5 RPU describes the IPT base layer and not the reshaped BT.2020
+PQ pixels.
+
+rpu=p81 rewrites the metadata instead to a profile 8.1 RPU that fits
+the reshaped signal: identity polynomial mapping on all components, the
+profile 8.1 YCbCr to RGB and RGB to LMS coefficients, no residual, and
+the dynamic metadata (level 1, 2, 6 and the others) kept. Level 5 blocks
+are dropped, as the active area no longer applies after reshaping. The
+conversion is a port of p5_to_p81 from dovi_tool 2.3.4 (MIT).
+
+libx265 -dolbyvision 1 then writes a profile 8.1 stream. It needs
+mastering display data at open; the input's stream side data passes
+through unchanged, and an input without it needs
+-x265-params master-display=...
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi              |  24 ++++++-
+ libavfilter/dovi_reshape.c    | 117 ++++++++++++++++++++++++++++++++++
+ libavfilter/dovi_reshape.h    |   8 +++
+ libavfilter/vf_dovi_reshape.c |  45 ++++++++++---
+ 4 files changed, 184 insertions(+), 10 deletions(-)
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 9706f6408b28e6a2fe841cb3747a02ccc0d9cedf..ac6160951c44d2f78f11df4234f0bce6d120d153 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -12337,7 +12337,29 @@ frame metadata.
+ Frames without Dolby Vision metadata, limited range frames, and streams whose RPU
+ signals a residual enhancement layer (profile 7) are refused with an error.
+ 
+-The filter has no options.
++@subsection Options
++The filter accepts the following options:
++
++@table @option
++@item rpu
++Set the Dolby Vision RPU processing mode.
++
++It accepts the following values:
++@table @samp
++@item strip
++Remove the Dolby Vision metadata from the output frames. This is the default.
++
++@item p81
++Rewrite the Dolby Vision metadata to profile 8.1, which describes the
++reshaped BT.2020 PQ signal. The raw profile 5 RPU is removed.
++
++Profile 8.1 output is meant for libx265 @code{-dolbyvision 1}.
++libx265 needs mastering display data at open, pass
++@code{-x265-params master-display=...} when the input carries none.
++Level 5 (active area) extension blocks are dropped; dovi_tool documents
++that dropping Level 5 metadata produces spec non-conformant RPUs.
++@end table
++@end table
+ 
+ @subsection Example
+ Tone map a profile 5 file to SDR BT.709:
+diff --git a/libavfilter/dovi_reshape.c b/libavfilter/dovi_reshape.c
+index cb6faa138357736519201eebad3e333106ebff00..772dd818614e33daa360a72ecbb204c4084b193e 100644
+--- a/libavfilter/dovi_reshape.c
++++ b/libavfilter/dovi_reshape.c
+@@ -199,3 +199,120 @@ void ff_dovi_reshape_pixel(const FFDoviReshape *s, const float ycc[3], float rgb
+     for (int c = 0; c < 3; c++)
+         rgb[c] = pq_oetf(rgb[c]);
+ }
++
++/*
++ * Profile 8.1 conversion ported from dovi_tool by quietvoid, https://github.com/quietvoid/dovi_tool, tag 2.3.4
++ *
++ * MIT License
++ *
++ * Copyright (c) 2026 quietvoid
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++static void set_p81_header(AVDOVIRpuDataHeader *hdr)
++{
++    hdr->vdr_rpu_profile = 1;
++    hdr->bl_video_full_range_flag = 0;
++    hdr->el_spatial_resampling_filter_flag = 0;
++    hdr->disable_residual_flag = 1;
++}
++
++static void set_p81_mapping(AVDOVIDataMapping *mapping, int coef_log2_denom)
++{
++    mapping->nlq_method_idc = AV_DOVI_NLQ_NONE;
++    mapping->num_x_partitions = 1;
++    mapping->num_y_partitions = 1;
++    memset(mapping->nlq, 0, sizeof(mapping->nlq));
++    memset(mapping->nlq_pivots, 0, sizeof(mapping->nlq_pivots));
++
++    for (int c = 0; c < 3; c++) {
++        AVDOVIReshapingCurve *curve = &mapping->curves[c];
++        memset(curve, 0, sizeof(*curve));
++        curve->num_pivots = 2;
++        curve->pivots[0] = 0;
++        curve->pivots[1] = 1023;
++        curve->mapping_idc[0] = AV_DOVI_MAPPING_POLYNOMIAL;
++        curve->poly_order[0] = 1;
++        curve->poly_coef[0][0] = 0;
++        curve->poly_coef[0][1] = 1LL << coef_log2_denom;
++        curve->poly_coef[0][2] = 0;
++    }
++}
++
++static void set_p81_color(AVDOVIColorMetadata *color)
++{
++    static const int16_t ycc_to_rgb_matrix[9] = {
++        9574,     0, 13802,
++        9574, -1540, -5348,
++        9574, 17610,     0
++    };
++    static const int32_t ycc_to_rgb_offset[3] = {
++        16777216, 134217728, 134217728
++    };
++    static const int16_t rgb_to_lms_matrix[9] = {
++        7222,  8771,   390,
++        2654, 12430,  1300,
++           0,   422, 15962
++    };
++
++    for (int i = 0; i < 9; i++) {
++        color->ycc_to_rgb_matrix[i] = av_make_q(ycc_to_rgb_matrix[i], 8192);
++        color->rgb_to_lms_matrix[i] = av_make_q(rgb_to_lms_matrix[i], 16384);
++    }
++    for (int i = 0; i < 3; i++)
++        color->ycc_to_rgb_offset[i] = av_make_q(ycc_to_rgb_offset[i], 1 << 28);
++
++    color->signal_color_space = 0;
++}
++
++static void drop_l5_ext_blocks(AVDOVIMetadata *md)
++{
++    int w = 0;
++    for (int i = 0; i < md->num_ext_blocks; i++) {
++        AVDOVIDmData *ext = av_dovi_get_ext(md, i);
++        if (ext->level == 5)
++            continue;
++        if (w != i)
++            memmove(av_dovi_get_ext(md, w), ext, md->ext_block_size);
++        w++;
++    }
++    md->num_ext_blocks = w;
++}
++
++int ff_dovi_reshape_to_p81(AVDOVIMetadata *md)
++{
++    AVDOVIRpuDataHeader *hdr;
++    AVDOVIDataMapping *mapping;
++    AVDOVIColorMetadata *color;
++
++    if (!md)
++        return AVERROR(EINVAL);
++
++    hdr = av_dovi_get_header(md);
++    mapping = av_dovi_get_mapping(md);
++    color = av_dovi_get_color(md);
++
++    set_p81_header(hdr);
++    set_p81_mapping(mapping, hdr->coef_log2_denom);
++    set_p81_color(color);
++    drop_l5_ext_blocks(md);
++
++    return 0;
++}
+diff --git a/libavfilter/dovi_reshape.h b/libavfilter/dovi_reshape.h
+index f5e2543129f94225f5f9059006368aad1ce0d6a7..fe69158a74d07e4e286b6a5ab43dcc210525978d 100644
+--- a/libavfilter/dovi_reshape.h
++++ b/libavfilter/dovi_reshape.h
+@@ -78,4 +78,12 @@ float ff_dovi_reshape_comp(const FFDoviCurve *curve, const float sig[3], int c);
+  */
+ void ff_dovi_reshape_pixel(const FFDoviReshape *s, const float ycc[3], float rgb[3]);
+ 
++/**
++ * Convert Dolby Vision metadata in-place to profile 8.1.
++ *
++ * @param md metadata to convert
++ * @return 0 on success, negative AVERROR on failure
++ */
++int ff_dovi_reshape_to_p81(AVDOVIMetadata *md);
++
+ #endif /* AVFILTER_DOVI_RESHAPE_H */
+diff --git a/libavfilter/vf_dovi_reshape.c b/libavfilter/vf_dovi_reshape.c
+index ce81cb39bbe891bee0a61fd3a80a0346b8f48ac1..c218366ed253fa8d601eac7fca33a00a5e20c6da 100644
+--- a/libavfilter/vf_dovi_reshape.c
++++ b/libavfilter/vf_dovi_reshape.c
+@@ -30,6 +30,7 @@
+ #include "libavutil/frame.h"
+ #include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/mem.h"
++#include "libavutil/opt.h"
+ #include "libavutil/pixdesc.h"
+ 
+ #include "avfilter.h"
+@@ -44,8 +45,14 @@ typedef struct ChromaTaps {
+     float *w;
+ } ChromaTaps;
+ 
++enum DoviReshapeRPU {
++    RPU_STRIP = 0,
++    RPU_P81   = 1,
++};
++
+ typedef struct DoviReshapeContext {
+     const AVClass *class;
++    int rpu;
+     const AVPixFmtDescriptor *desc;
+     float norm;
+     int loc;                 ///< chroma location the taps were built for, or -1
+@@ -237,7 +244,7 @@ static int set_light_level(AVFrame *out, av_csp_trc_function pq_eotf)
+ }
+ 
+ /* The reshaped signal is described by the RPU, not by the base layer. */
+-static int set_output_props(AVFrame *out, const FFDoviReshape *rs)
++static int set_output_props(AVFrame *out, const FFDoviReshape *rs, int rpu)
+ {
+     const av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
+     const AVColorPrimariesDesc *bt2020 = av_csp_primaries_desc_from_id(AVCOL_PRI_BT2020);
+@@ -246,7 +253,21 @@ static int set_output_props(AVFrame *out, const FFDoviReshape *rs)
+ 
+     if (ret < 0)
+         return ret;
+-    av_frame_remove_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
++
++    if (rpu == RPU_P81) {
++        AVFrameSideData *sd = av_frame_get_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
++        if (!sd)
++            return AVERROR(EINVAL);
++        ret = av_buffer_make_writable(&sd->buf);
++        if (ret < 0)
++            return ret;
++        sd->data = sd->buf->data;
++        ret = ff_dovi_reshape_to_p81((AVDOVIMetadata *)sd->data);
++        if (ret < 0)
++            return ret;
++    } else {
++        av_frame_remove_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
++    }
+     av_frame_remove_side_data(out, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+     av_frame_remove_side_data(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+ 
+@@ -298,6 +319,7 @@ static int check_input(AVFilterContext *ctx, const AVFrame *in, FFDoviReshape *r
+ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+ {
+     AVFilterContext *ctx  = inlink->dst;
++    DoviReshapeContext *s = ctx->priv;
+     AVFilterLink *outlink = ctx->outputs[0];
+     FFDoviReshape rs;
+     ThreadData td;
+@@ -306,7 +328,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+ 
+     ret = check_input(ctx, in, &rs);
+     if (ret >= 0)
+-        ret = update_taps(ctx->priv, in);
++        ret = update_taps(s, in);
+     if (ret < 0) {
+         av_frame_free(&in);
+         return ret;
+@@ -319,7 +341,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+     }
+     ret = av_frame_copy_props(out, in);
+     if (ret >= 0)
+-        ret = set_output_props(out, &rs);
++        ret = set_output_props(out, &rs, s->rpu);
+     if (ret < 0) {
+         av_frame_free(&in);
+         av_frame_free(&out);
+@@ -341,13 +363,18 @@ static av_cold void uninit(AVFilterContext *ctx)
+     free_taps(&s->ty);
+ }
+ 
+-static const AVClass dovi_reshape_class = {
+-    .class_name = "dovi_reshape",
+-    .item_name  = av_default_item_name,
+-    .version    = LIBAVUTIL_VERSION_INT,
+-    .category   = AV_CLASS_CATEGORY_FILTER,
++#define OFFSET(x) offsetof(DoviReshapeContext, x)
++#define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
++
++static const AVOption dovi_reshape_options[] = {
++    { "rpu", "Dolby Vision RPU processing mode", OFFSET(rpu), AV_OPT_TYPE_INT, { .i64 = RPU_STRIP }, 0, 1, FLAGS, .unit = "rpu" },
++        { "strip", "remove Dolby Vision RPU metadata", 0, AV_OPT_TYPE_CONST, { .i64 = RPU_STRIP }, 0, 0, FLAGS, .unit = "rpu" },
++        { "p81",   "convert Dolby Vision RPU to profile 8.1", 0, AV_OPT_TYPE_CONST, { .i64 = RPU_P81 },   0, 0, FLAGS, .unit = "rpu" },
++    { NULL }
+ };
+ 
++AVFILTER_DEFINE_CLASS(dovi_reshape);
++
+ static const AVFilterPad dovi_reshape_inputs[] = {
+     {
+         .name         = "default",
