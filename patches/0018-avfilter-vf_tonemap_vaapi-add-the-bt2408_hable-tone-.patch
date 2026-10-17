@@ -1,0 +1,437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 20:54:47 +0200
+Subject: [PATCH] avfilter/vf_tonemap_vaapi: add the bt2408_hable tone map
+
+Add a tonemap option with the value bt2408_hable, which applies the
+tone map of vf_tonemap through the VAAPI 3D LUT filter instead of the
+driver's own curve. The filter fills the same FFBT2408Hable state as the
+CPU filter, samples it on the PQ R'G'B' grid of the largest 16-bit RGB
+3D LUT the driver offers, and uploads the table again when the peak or
+the input primaries change. A driver without such a 3D LUT filter is
+refused with an error; there is no fallback to the driver curve.
+
+The table maps to 8-bit full range BT.709 RGB. With a YUV output format
+the Intel media driver converts the table output once more and the
+colours come out wrong, so the curve requires an 8-bit RGB output
+format and defaults to rgba. A new peak option overrides the signal
+peak taken from the side data.
+
+On an Arc A380 with the iHD driver the output matches the CPU
+tonemap=bt2408_hable path within one code value on flat test colours.
+Against vf_libplacebo with tonemapping=hable the mean CIEDE2000 is 1.15
+on four frames of a 720p Dolby Vision profile 5 clip through
+dovi_reshape and 0.75 on ten frames of a 2160p HDR10 clip.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi               |  24 +++
+ libavfilter/Makefile           |   2 +-
+ libavfilter/vf_tonemap_vaapi.c | 270 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 289 insertions(+), 7 deletions(-)
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 6c9d6f2175ee1668a11af6854560b16fb85bbb0d..c816216b375410fc0f4926f2fb164a152014d976 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -28872,12 +28872,36 @@ the maximum average light level.
+ It is ignored for HDR-to-SDR tone-mapping, and optional for HDR-to-HDR
+ tone-mapping.
+ 
++@item tonemap
++Set the tone map curve. By default the driver applies its own curve.
++
++@table @samp
++@item bt2408_hable
++Use the curve of @code{tonemap=bt2408_hable} (@pxref{tonemap}). The filter
++fills a 3D lookup table from it and the driver applies the table, so the
++driver must support the 3D LUT filter. The output is 8-bit full range RGB in
++BT.709 primaries and transfer, whatever @option{primaries}, @option{transfer}
++and @option{matrix} say; @option{format} must be an 8-bit RGB format such as
++@code{rgba} or @code{bgra} and defaults to @code{rgba}. The option
++@option{display} cannot be combined with this curve.
++@end table
++
++@item peak
++Override the signal peak for @code{tonemap=bt2408_hable}, in units of
++100 nits. Default is 0, which takes the peak from the frame side data.
++
+ @end table
+ 
+ @subsection Example
+ 
+ @itemize
+ @item
++Tone map HDR10 or Dolby Vision profile 5 (after @code{dovi_reshape}) to SDR
++with the BT.2408 Hable curve, then convert to limited range BT.709 YUV
++@example
++format=p010,hwupload,tonemap_vaapi=tonemap=bt2408_hable,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p
++@end example
++@item
+ Convert HDR(HDR10) video to bt2020-transfer-characteristic p010 format
+ @example
+ tonemap_vaapi=format=p010:t=bt2020-10
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 047d0f1edb043efff9019ebe2f38f0aea4518558..a29004c0418e9f9d55d96d11ec7b365e26e84eca 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -542,7 +542,7 @@ OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o bt2408_hable.o
+ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2408_hable.o \
+                                                 opencl/tonemap.o opencl/bt2408_hable.o \
+                                                 opencl/colorspace_common.o
+-OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o
++OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o bt2408_hable.o
+ OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
+ OBJS-$(CONFIG_TRANSPOSE_FILTER)              += vf_transpose.o
+ OBJS-$(CONFIG_TRANSPOSE_CUDA_FILTER)         += vf_transpose_cuda.o vf_transpose_cuda.ptx.o \
+diff --git a/libavfilter/vf_tonemap_vaapi.c b/libavfilter/vf_tonemap_vaapi.c
+index 9fe82cbb1b6c54d588829f6173c63e44fcaf9753..f06a90125ca7d3bcec2e52b739b3a36ace8cf7ac 100644
+--- a/libavfilter/vf_tonemap_vaapi.c
++++ b/libavfilter/vf_tonemap_vaapi.c
+@@ -15,17 +15,27 @@
+  * License along with FFmpeg; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
++#include <float.h>
++#include <math.h>
+ #include <string.h>
+ 
++#include "libavutil/mem.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/pixdesc.h"
+ #include "libavutil/mastering_display_metadata.h"
+ 
+ #include "avfilter.h"
++#include "bt2408_hable.h"
++#include "colorspace.h"
+ #include "filters.h"
+ #include "vaapi_vpp.h"
+ #include "video.h"
+ 
++enum TonemapVAAPICurve {
++    TONEMAP_VAAPI_DRIVER,
++    TONEMAP_VAAPI_BT2408_HABLE,
++};
++
+ typedef struct HDRVAAPIContext {
+     VAAPIVPPContext vpp_ctx; // must be the first field
+ 
+@@ -47,6 +57,16 @@ typedef struct HDRVAAPIContext {
+ 
+     AVFrameSideData    *src_display;
+     AVFrameSideData    *src_light;
++
++    int                   tonemap;
++    double                peak;
++
++    FFBT2408Hable         bt2408;
++    double                bt2408_peak;
++    enum AVColorPrimaries bt2408_prim;
++    VAProcFilterCap3DLUT  lut_cap;
++    VASurfaceID           lut_surface;
++    uint16_t             *lut;
+ } HDRVAAPIContext;
+ 
+ static int tonemap_vaapi_save_metadata(AVFilterContext *avctx, AVFrame *input_frame)
+@@ -259,6 +279,204 @@ static int tonemap_vaapi_set_filter_params(AVFilterContext *avctx, AVFrame *inpu
+     return 0;
+ }
+ 
++static size_t tonemap_vaapi_lut_entries(const VAProcFilterCap3DLUT *cap)
++{
++    return (size_t)cap->lut_stride[0] * cap->lut_stride[1] * cap->lut_stride[2];
++}
++
++/* Pick the largest 3DLUT with 16-bit RGBA entries that maps RGB to RGB. */
++static int tonemap_vaapi_pick_lut(AVFilterContext *avctx)
++{
++    VAAPIVPPContext *vpp_ctx = avctx->priv;
++    HDRVAAPIContext *ctx     = avctx->priv;
++    VAProcFilterCap3DLUT caps[16];
++    unsigned int num_caps = FF_ARRAY_ELEMS(caps);
++    VAStatus vas;
++
++    memset(&ctx->lut_cap, 0, sizeof(ctx->lut_cap));
++    vas = vaQueryVideoProcFilterCaps(vpp_ctx->hwctx->display, vpp_ctx->va_context,
++                                     VAProcFilter3DLUT, caps, &num_caps);
++    if (vas != VA_STATUS_SUCCESS)
++        num_caps = 0;
++    for (unsigned int i = 0; i < FFMIN(num_caps, FF_ARRAY_ELEMS(caps)); i++) {
++        if (caps[i].bit_depth != 16 || caps[i].num_channel != 4 ||
++            !(caps[i].channel_mapping & VA_3DLUT_CHANNEL_RGB_RGB) ||
++            caps[i].lut_size < 2 || caps[i].lut_size > 256 ||
++            caps[i].lut_size > caps[i].lut_stride[0] ||
++            caps[i].lut_size > caps[i].lut_stride[1] ||
++            caps[i].lut_size > caps[i].lut_stride[2])
++            continue;
++        if (caps[i].lut_size > ctx->lut_cap.lut_size)
++            ctx->lut_cap = caps[i];
++    }
++    if (!ctx->lut_cap.lut_size) {
++        av_log(avctx, AV_LOG_ERROR, "VAAPI driver has no 3DLUT filter with "
++               "16-bit RGB entries, which tonemap=bt2408_hable needs.\n");
++        return AVERROR(ENOSYS);
++    }
++    av_log(avctx, AV_LOG_VERBOSE, "Using a %u^3 3DLUT.\n", ctx->lut_cap.lut_size);
++    return 0;
++}
++
++static int tonemap_vaapi_build_lut_params(AVFilterContext *avctx)
++{
++    VAAPIVPPContext *vpp_ctx = avctx->priv;
++    HDRVAAPIContext *ctx     = avctx->priv;
++    const VAProcFilterCap3DLUT *cap = &ctx->lut_cap;
++    VAProcFilterParameterBuffer3DLUT lut_param;
++    VASurfaceAttrib attr = {
++        .type          = VASurfaceAttribPixelFormat,
++        .flags         = VA_SURFACE_ATTRIB_SETTABLE,
++        .value.type    = VAGenericValueTypeInteger,
++        .value.value.i = VA_FOURCC_RGBA,
++    };
++    VAStatus vas;
++    int err;
++
++    err = tonemap_vaapi_pick_lut(avctx);
++    if (err < 0)
++        return err;
++
++    ctx->lut = av_calloc(tonemap_vaapi_lut_entries(cap), 4 * sizeof(*ctx->lut));
++    if (!ctx->lut)
++        return AVERROR(ENOMEM);
++    ctx->bt2408_peak = 0;
++
++    // 8 bytes per entry, laid out as RGBA pixels of 4 bytes
++    vas = vaCreateSurfaces(vpp_ctx->hwctx->display, VA_RT_FORMAT_RGB32,
++                           cap->lut_stride[0] * cap->lut_stride[2],
++                           cap->lut_stride[1] * 2, &ctx->lut_surface, 1, &attr, 1);
++    if (vas != VA_STATUS_SUCCESS) {
++        ctx->lut_surface = VA_INVALID_ID;
++        av_log(avctx, AV_LOG_ERROR, "Failed to create the 3DLUT surface: "
++               "%d (%s).\n", vas, vaErrorStr(vas));
++        return AVERROR(EIO);
++    }
++
++    memset(&lut_param, 0, sizeof(lut_param));
++    lut_param.type            = VAProcFilter3DLUT;
++    lut_param.lut_surface     = ctx->lut_surface;
++    lut_param.lut_size        = cap->lut_size;
++    memcpy(lut_param.lut_stride, cap->lut_stride, sizeof(lut_param.lut_stride));
++    lut_param.bit_depth       = cap->bit_depth;
++    lut_param.num_channel     = cap->num_channel;
++    lut_param.channel_mapping = VA_3DLUT_CHANNEL_RGB_RGB;
++
++    return ff_vaapi_vpp_make_param_buffers(avctx, VAProcFilterParameterBufferType,
++                                           &lut_param, sizeof(lut_param), 1);
++}
++
++static float tonemap_vaapi_pq_eotf(float x)
++{
++    const float m1 = 2610.0f / 4096.0f / 4.0f, m2 = 2523.0f / 4096.0f * 128.0f;
++    const float c1 = 3424.0f / 4096.0f, c2 = 2413.0f / 4096.0f * 32.0f;
++    const float c3 = 2392.0f / 4096.0f * 32.0f;
++    float p = powf(x, 1.0f / m2);
++
++    return powf(FFMAX(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1);
++}
++
++/* Fill the LUT from PQ encoded input RGB to BT.709 RGB for a 2.4 display. */
++static void tonemap_vaapi_compute_lut(HDRVAAPIContext *ctx)
++{
++    const VAProcFilterCap3DLUT *cap = &ctx->lut_cap;
++    const int size = cap->lut_size;
++    float axis[256];
++
++    for (int i = 0; i < size; i++)
++        axis[i] = tonemap_vaapi_pq_eotf((float)i / (size - 1)) * 10000.0f / REFERENCE_WHITE;
++
++    for (int r = 0; r < size; r++) {
++        for (int g = 0; g < size; g++) {
++            uint16_t *line = ctx->lut + 4 * (r * cap->lut_stride[1] + g) * cap->lut_stride[2];
++            for (int b = 0; b < size; b++) {
++                const float in[3] = { axis[r], axis[g], axis[b] };
++                float out[3];
++
++                ff_bt2408_hable_pixel(&ctx->bt2408, in, out);
++                for (int c = 0; c < 3; c++)
++                    line[4 * b + c] = lrintf(powf(av_clipf(out[c], 0.0f, 1.0f),
++                                                  1.0f / 2.4f) * 65535.0f);
++                line[4 * b + 3] = 65535;
++            }
++        }
++    }
++}
++
++/* Copy the LUT into its surface, a linear byte stream split into rows. */
++static int tonemap_vaapi_upload_lut(AVFilterContext *avctx)
++{
++    VAAPIVPPContext *vpp_ctx = avctx->priv;
++    HDRVAAPIContext *ctx     = avctx->priv;
++    VADisplay display = vpp_ctx->hwctx->display;
++    const size_t size = tonemap_vaapi_lut_entries(&ctx->lut_cap) * 4 * sizeof(*ctx->lut);
++    const uint8_t *src = (const uint8_t *)ctx->lut;
++    VAImage image;
++    uint8_t *dst;
++    size_t row;
++    VAStatus vas;
++    int err = 0;
++
++    vas = vaSyncSurface(display, ctx->lut_surface);
++    if (vas == VA_STATUS_SUCCESS)
++        vas = vaDeriveImage(display, ctx->lut_surface, &image);
++    if (vas != VA_STATUS_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to get the 3DLUT image: "
++               "%d (%s).\n", vas, vaErrorStr(vas));
++        return AVERROR(EIO);
++    }
++    row = (size_t)image.width * 4;
++    vas = vaMapBuffer(display, image.buf, (void **)&dst);
++    if (vas != VA_STATUS_SUCCESS || image.pitches[0] < row ||
++        row * image.height < size) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to map the 3DLUT image.\n");
++        err = AVERROR(EIO);
++    } else {
++        for (size_t y = 0; y * row < size; y++)
++            memcpy(dst + y * image.pitches[0], src + y * row, FFMIN(row, size - y * row));
++    }
++    if (vas == VA_STATUS_SUCCESS)
++        vaUnmapBuffer(display, image.buf);
++    vaDestroyImage(display, image.image_id);
++    return err;
++}
++
++static int tonemap_vaapi_setup_lut(AVFilterContext *avctx, const AVFrame *input)
++{
++    HDRVAAPIContext *ctx = avctx->priv;
++    double peak = ctx->peak ? ctx->peak : ff_determine_signal_peak((AVFrame *)input);
++    int err;
++
++    if (peak == ctx->bt2408_peak && input->color_primaries == ctx->bt2408_prim)
++        return 0;
++    err = ff_bt2408_hable_init(&ctx->bt2408, input->color_primaries, peak * REFERENCE_WHITE);
++    if (err < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Unsupported primaries '%s' or peak %f\n",
++               av_color_primaries_name(input->color_primaries), peak);
++        return err;
++    }
++    tonemap_vaapi_compute_lut(ctx);
++    err = tonemap_vaapi_upload_lut(avctx);
++    if (err < 0)
++        return err;
++    ctx->bt2408_peak = peak;
++    ctx->bt2408_prim = input->color_primaries;
++    return 0;
++}
++
++static void tonemap_vaapi_pipeline_uninit(AVFilterContext *avctx)
++{
++    VAAPIVPPContext *vpp_ctx = avctx->priv;
++    HDRVAAPIContext *ctx     = avctx->priv;
++
++    if (ctx->lut_surface != VA_INVALID_ID) {
++        vaDestroySurfaces(vpp_ctx->hwctx->display, &ctx->lut_surface, 1);
++        ctx->lut_surface = VA_INVALID_ID;
++    }
++    av_freep(&ctx->lut);
++    ff_vaapi_vpp_pipeline_uninit(avctx);
++}
++
+ static int tonemap_vaapi_build_filter_params(AVFilterContext *avctx)
+ {
+     VAAPIVPPContext *vpp_ctx   = avctx->priv;
+@@ -269,6 +487,9 @@ static int tonemap_vaapi_build_filter_params(AVFilterContext *avctx)
+     int num_query_caps;
+     int i;
+ 
++    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE)
++        return tonemap_vaapi_build_lut_params(avctx);
++
+     memset(&hdrtm_param, 0, sizeof(hdrtm_param));
+     memset(&ctx->in_metadata, 0, sizeof(ctx->in_metadata));
+ 
+@@ -348,11 +569,13 @@ static int tonemap_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame
+         return AVERROR(EINVAL);
+     }
+ 
+-    err = tonemap_vaapi_save_metadata(avctx, input_frame);
+-    if (err < 0)
+-        goto fail;
+-
+-    err = tonemap_vaapi_set_filter_params(avctx, input_frame);
++    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE) {
++        err = tonemap_vaapi_setup_lut(avctx, input_frame);
++    } else {
++        err = tonemap_vaapi_save_metadata(avctx, input_frame);
++        if (err >= 0)
++            err = tonemap_vaapi_set_filter_params(avctx, input_frame);
++    }
+     if (err < 0)
+         goto fail;
+ 
+@@ -395,6 +618,12 @@ static int tonemap_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame
+     if (ctx->color_matrix != AVCOL_SPC_UNSPECIFIED)
+         output_frame->colorspace = ctx->color_matrix;
+ 
++    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE) {
++        /* The 3D LUT writes full range RGB. */
++        output_frame->colorspace  = AVCOL_SPC_RGB;
++        output_frame->color_range = AVCOL_RANGE_JPEG;
++    }
++
+     if (ctx->mastering_display) {
+         err = tonemap_vaapi_update_sidedata(avctx, output_frame);
+         if (err < 0)
+@@ -443,10 +672,20 @@ static av_cold int tonemap_vaapi_init(AVFilterContext *avctx)
+ 
+     ff_vaapi_vpp_ctx_init(avctx);
+     vpp_ctx->build_filter_params = tonemap_vaapi_build_filter_params;
+-    vpp_ctx->pipeline_uninit = ff_vaapi_vpp_pipeline_uninit;
++    vpp_ctx->pipeline_uninit = tonemap_vaapi_pipeline_uninit;
++    ctx->lut_surface = VA_INVALID_ID;
++
++    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE && ctx->mastering_display) {
++        av_log(avctx, AV_LOG_ERROR, "tonemap=bt2408_hable maps to SDR and "
++               "cannot be combined with the display option.\n");
++        return AVERROR(EINVAL);
++    }
+ 
+     if (ctx->output_format_string) {
+         vpp_ctx->output_format = av_get_pix_fmt(ctx->output_format_string);
++    } else if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE) {
++        vpp_ctx->output_format = AV_PIX_FMT_RGBA;
++        av_log(avctx, AV_LOG_VERBOSE, "Output format not set, use default format RGBA for tonemap=bt2408_hable.\n");
+     } else {
+         if (ctx->mastering_display) {
+             vpp_ctx->output_format = AV_PIX_FMT_P010;
+@@ -457,6 +696,16 @@ static av_cold int tonemap_vaapi_init(AVFilterContext *avctx)
+         }
+     }
+ 
++    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE) {
++        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(vpp_ctx->output_format);
++        if (!desc || !(desc->flags & AV_PIX_FMT_FLAG_RGB) ||
++            desc->comp[0].depth != 8) {
++            av_log(avctx, AV_LOG_ERROR, "tonemap=bt2408_hable needs an 8-bit "
++                   "RGB output format such as rgba or bgra.\n");
++            return AVERROR(EINVAL);
++        }
++    }
++
+ #define STRING_OPTION(var_name, func_name, default_value) do { \
+         if (ctx->var_name ## _string) { \
+             int var = av_ ## func_name ## _from_name(ctx->var_name ## _string); \
+@@ -536,6 +785,15 @@ static const AVOption tonemap_vaapi_options[] = {
+     { "light",    "set content light level information",
+       OFFSET(content_light),          AV_OPT_TYPE_STRING,
+       { .str = NULL }, .flags = FLAGS },
++    { "tonemap",  "tone map curve, the driver's own by default",
++      OFFSET(tonemap),                AV_OPT_TYPE_INT,
++      { .i64 = TONEMAP_VAAPI_DRIVER }, TONEMAP_VAAPI_DRIVER,
++      TONEMAP_VAAPI_BT2408_HABLE, FLAGS, .unit = "tonemap" },
++    {     "bt2408_hable", 0, 0, AV_OPT_TYPE_CONST,
++          { .i64 = TONEMAP_VAAPI_BT2408_HABLE }, 0, 0, FLAGS, .unit = "tonemap" },
++    { "peak",     "signal peak override for tonemap=bt2408_hable",
++      OFFSET(peak),                   AV_OPT_TYPE_DOUBLE,
++      { .dbl = 0 }, 0, DBL_MAX, FLAGS },
+     { NULL }
+ };
+ 
