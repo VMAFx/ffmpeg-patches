@@ -14,9 +14,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 
@@ -57,7 +57,7 @@ class De2000(unittest.TestCase):
 
     def test_self_check_refuses_broken_formula(self):
         with (
-            mock.patch.object(tp, "de2000", lambda a, b: np.zeros(len(a))),
+            unittest.mock.patch.object(tp, "de2000", lambda a, b: np.zeros(len(a))),
             self.assertRaises(SystemExit),
         ):
             tp.self_check()
@@ -121,7 +121,7 @@ class Candidate(unittest.TestCase):
     session = tp.Session(SimpleNamespace(bar=2.3), Path("."), (2, 2))
 
     def run_with(self, got):
-        with mock.patch.object(tp, "measure", return_value=({"vf": "v", "pre": []}, got)):
+        with unittest.mock.patch.object(tp, "measure", return_value=({"vf": "v", "pre": []}, got)):
             return tp.candidate(self.session, "n", "v", [], self.ref)
 
     def test_pass_at_identity(self):
@@ -134,7 +134,7 @@ class Candidate(unittest.TestCase):
 
     def test_ffmpeg_refusal_is_a_failed_path(self):
         err = subprocess.CalledProcessError(187, ["ffmpeg"])
-        with mock.patch.object(tp, "measure", side_effect=err):
+        with unittest.mock.patch.object(tp, "measure", side_effect=err):
             row = tp.candidate(self.session, "n", "v", [], self.ref)
         self.assertEqual((row["error"], row["pass"]), ("ffmpeg exit 187", False))
 
