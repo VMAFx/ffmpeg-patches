@@ -29,22 +29,22 @@ must miss the expected colours; a limited range frame must be refused.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- doc/filters.texi                         |  31 ++
+ doc/filters.texi                         |  37 +++
  libavfilter/Makefile                     |   1 +
  libavfilter/allfilters.c                 |   1 +
- libavfilter/tests/dovi_reshape.c         | 200 ++++++++++++-
- libavfilter/vf_dovi_reshape.c            | 361 +++++++++++++++++++++++
+ libavfilter/tests/dovi_reshape.c         | 218 ++++++++++++-
+ libavfilter/vf_dovi_reshape.c            | 370 +++++++++++++++++++++++
  tests/fate/filter-video.mak              |   4 +
  tests/ref/fate/filter-dovi-reshape-graph |   5 +
- 7 files changed, 601 insertions(+), 2 deletions(-)
+ 7 files changed, 634 insertions(+), 2 deletions(-)
  create mode 100644 libavfilter/vf_dovi_reshape.c
  create mode 100644 tests/ref/fate/filter-dovi-reshape-graph
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 3534c87c9be9374db14189a28324cf95efc4b576..39b1d71386839ac9c3cc8d03d080aaf49d3fddef 100644
+index 3534c87c9be9374db14189a28324cf95efc4b576..1c29a51458b99c37b541946dc15497d47028e9ac 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -12308,6 +12308,37 @@ please use tools/python/tf_sess_config.py to get the configs of TensorFlow backe
+@@ -12308,6 +12308,43 @@ please use tools/python/tf_sess_config.py to get the configs of TensorFlow backe
  
  @end itemize
  
@@ -67,6 +67,12 @@ index 3534c87c9be9374db14189a28324cf95efc4b576..39b1d71386839ac9c3cc8d03d080aaf4
 +frame carried. When the RPU has a level 1 block, its maximum and average
 +luminance of the shot become the frame's content light level (MaxCLL and
 +MaxFALL); without one, content light level metadata is removed.
++
++In addition, the 12-bit PQ code values (0 to 4095) from the level 1 block are
++exported as frame metadata keys @code{lavfi.dovi.l1_max_pq} and
++@code{lavfi.dovi.l1_avg_pq}, corresponding to the shot's maximum and average PQ
++luminance. When a frame has no level 1 block, both keys are removed from the
++frame metadata.
 +
 +Frames without Dolby Vision metadata, limited range frames, and streams whose RPU
 +signals a residual enhancement layer (profile 7) are refused with an error.
@@ -107,16 +113,18 @@ index 402b843649b4f5369cf80714eef53755fad9ac9a..d6f1e832c44b94d19edaa3a989d0a3c1
  extern const FFFilter ff_vf_drawgraph;
  extern const FFFilter ff_vf_drawgrid;
 diff --git a/libavfilter/tests/dovi_reshape.c b/libavfilter/tests/dovi_reshape.c
-index 8285ca116ac47e7ea7025659f9b6381e907c753c..6092538793c1ad0a99cdb8a24944496a5bcbefaa 100644
+index 8285ca116ac47e7ea7025659f9b6381e907c753c..6cfae74c12bcafac207988a75f41ebc9f204c615 100644
 --- a/libavfilter/tests/dovi_reshape.c
 +++ b/libavfilter/tests/dovi_reshape.c
-@@ -18,11 +18,20 @@
+@@ -18,11 +18,22 @@
  
  #include <math.h>
  #include <stdio.h>
++#include <stdlib.h>
 +#include <string.h>
  
 +#include "libavutil/csp.h"
++#include "libavutil/dict.h"
  #include "libavutil/dovi_meta.h"
  #include "libavutil/error.h"
 +#include "libavutil/frame.h"
@@ -131,7 +139,7 @@ index 8285ca116ac47e7ea7025659f9b6381e907c753c..6092538793c1ad0a99cdb8a24944496a
  #include "libavfilter/dovi_reshape.c"
  
  /*
-@@ -194,15 +203,202 @@ static int check_refusals(AVDOVIMetadata *md)
+@@ -194,15 +205,218 @@ static int check_refusals(AVDOVIMetadata *md)
      return fails;
  }
  
@@ -189,7 +197,8 @@ index 8285ca116ac47e7ea7025659f9b6381e907c753c..6092538793c1ad0a99cdb8a24944496a
 +
 +/* Runs buffer -> dovi_reshape -> buffersink on one frame. */
 +static int run_filter(AVFrame *in, AVFrame *out)
-+{
+ {
+-    AVDOVIMetadata *md = av_dovi_metadata_alloc(NULL);
 +    AVFilterGraph *g = avfilter_graph_alloc();
 +    AVFilterContext *src = NULL, *dr = NULL, *sink = NULL;
 +    char args[128];
@@ -247,9 +256,25 @@ index 8285ca116ac47e7ea7025659f9b6381e907c753c..6092538793c1ad0a99cdb8a24944496a
 +    const AVFrameSideData *clm_sd = av_frame_get_side_data(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
 +    const AVMasteringDisplayMetadata *mdm;
 +    const AVContentLightMetadata *clm;
++    const AVDictionaryEntry *e_max, *e_avg;
++    char *end_max = NULL, *end_avg = NULL;
++    long max_pq, avg_pq;
 +
 +    if (av_frame_get_side_data(out, AV_FRAME_DATA_DOVI_METADATA) || !mdm_sd || !clm_sd)
 +        return 0;
++
++    e_max = av_dict_get(out->metadata, "lavfi.dovi.l1_max_pq", NULL, 0);
++    e_avg = av_dict_get(out->metadata, "lavfi.dovi.l1_avg_pq", NULL, 0);
++    if (!e_max || !e_avg || !e_max->value || !e_avg->value)
++        return 0;
++
++    max_pq = strtol(e_max->value, &end_max, 10);
++    avg_pq = strtol(e_avg->value, &end_avg, 10);
++    if (*end_max || *end_avg || end_max == e_max->value || end_avg == e_avg->value)
++        return 0;
++    if (max_pq != L1_MAX_PQ || avg_pq != L1_AVG_PQ)
++        return 0;
++
 +    mdm = (const AVMasteringDisplayMetadata *)mdm_sd->data;
 +    clm = (const AVContentLightMetadata *)clm_sd->data;
 +    return mdm->has_luminance &&
@@ -317,8 +342,7 @@ index 8285ca116ac47e7ea7025659f9b6381e907c753c..6092538793c1ad0a99cdb8a24944496a
 +}
 +
 +int main(int argc, char **argv)
- {
--    AVDOVIMetadata *md = av_dovi_metadata_alloc(NULL);
++{
 +    size_t md_size;
 +    AVDOVIMetadata *md = av_dovi_metadata_alloc(&md_size);
      FFDoviReshape s;
@@ -338,10 +362,10 @@ index 8285ca116ac47e7ea7025659f9b6381e907c753c..6092538793c1ad0a99cdb8a24944496a
      printf("init: %s\n", ret < 0 ? av_err2str(ret) : "ok");
 diff --git a/libavfilter/vf_dovi_reshape.c b/libavfilter/vf_dovi_reshape.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..b8ca43d2b026eb1b53bd17e9bb71cb5898b1c1dc
+index 0000000000000000000000000000000000000000..ce81cb39bbe891bee0a61fd3a80a0346b8f48ac1
 --- /dev/null
 +++ b/libavfilter/vf_dovi_reshape.c
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,370 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -369,6 +393,7 @@ index 0000000000000000000000000000000000000000..b8ca43d2b026eb1b53bd17e9bb71cb58
 +#include <math.h>
 +
 +#include "libavutil/csp.h"
++#include "libavutil/dict.h"
 +#include "libavutil/dovi_meta.h"
 +#include "libavutil/frame.h"
 +#include "libavutil/mastering_display_metadata.h"
@@ -557,18 +582,26 @@ index 0000000000000000000000000000000000000000..b8ca43d2b026eb1b53bd17e9bb71cb58
 +static int set_light_level(AVFrame *out, av_csp_trc_function pq_eotf)
 +{
 +    const AVFrameSideData *sd = av_frame_get_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
-+    const AVDOVIDmData *l1 = av_dovi_find_level((const AVDOVIMetadata *)sd->data, 1);
++    const AVDOVIDmData *l1 = sd ? av_dovi_find_level((const AVDOVIMetadata *)sd->data, 1) : NULL;
 +    AVContentLightMetadata *clm;
++    int ret;
 +
 +    av_frame_remove_side_data(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
-+    if (!l1)
++    if (!l1) {
++        av_dict_set(&out->metadata, "lavfi.dovi.l1_max_pq", NULL, 0);
++        av_dict_set(&out->metadata, "lavfi.dovi.l1_avg_pq", NULL, 0);
 +        return 0;
++    }
 +    clm = av_content_light_metadata_create_side_data(out);
 +    if (!clm)
 +        return AVERROR(ENOMEM);
 +    clm->MaxCLL  = lrint(pq_eotf(l1->l1.max_pq / 4095.0));
 +    clm->MaxFALL = lrint(pq_eotf(l1->l1.avg_pq / 4095.0));
-+    return 0;
++
++    ret = av_dict_set_int(&out->metadata, "lavfi.dovi.l1_max_pq", l1->l1.max_pq, 0);
++    if (ret < 0)
++        return ret;
++    return av_dict_set_int(&out->metadata, "lavfi.dovi.l1_avg_pq", l1->l1.avg_pq, 0);
 +}
 +
 +/* The reshaped signal is described by the RPU, not by the base layer. */

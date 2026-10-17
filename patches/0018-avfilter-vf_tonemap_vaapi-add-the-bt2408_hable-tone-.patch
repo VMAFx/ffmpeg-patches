@@ -31,10 +31,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  3 files changed, 289 insertions(+), 7 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 6c9d6f2175ee1668a11af6854560b16fb85bbb0d..c816216b375410fc0f4926f2fb164a152014d976 100644
+index 4ef76ab4ae0421a98fdeca15cb0e14c28d23d66b..88505736fe1ce8aea06bc0f88c54843d646bdfb9 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -28872,12 +28872,36 @@ the maximum average light level.
+@@ -28878,12 +28878,36 @@ the maximum average light level.
  It is ignored for HDR-to-SDR tone-mapping, and optional for HDR-to-HDR
  tone-mapping.
  

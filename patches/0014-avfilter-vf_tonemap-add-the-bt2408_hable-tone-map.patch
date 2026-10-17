@@ -26,10 +26,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 tests/ref/fate/filter-tonemap-bt2408-hable
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 39b1d71386839ac9c3cc8d03d080aaf49d3fddef..bec0ee99d8bf91684dbabea697d677e4f86740ac 100644
+index 1c29a51458b99c37b541946dc15497d47028e9ac..06e09698a80ffd28c9c9b949c163976958604132 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -24242,6 +24242,12 @@ data should be linearized beforehand (and possibly correctly tagged).
+@@ -24248,6 +24248,12 @@ data should be linearized beforehand (and possibly correctly tagged).
  ffmpeg -i INPUT -vf zscale=transfer=linear,tonemap=clip,zscale=transfer=bt709,format=yuv420p OUTPUT
  @end example
  
@@ -42,7 +42,7 @@ index 39b1d71386839ac9c3cc8d03d080aaf49d3fddef..bec0ee99d8bf91684dbabea697d677e4
  @subsection Options
  The filter accepts the following options.
  
-@@ -24277,6 +24283,18 @@ important than color and brightness accuracy.
+@@ -24283,6 +24289,18 @@ important than color and brightness accuracy.
  Smoothly map out-of-range values, while retaining contrast and colors for
  in-range material as much as possible. Use it when color accuracy is more
  important than detail preservation.

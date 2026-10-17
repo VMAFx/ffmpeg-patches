@@ -10,3 +10,4 @@ record that supersedes it.
 | [0000](0000-template.md) | 2026-09-11 | ADR template | Accepted |
 | [0001](0001-shared-fix-series.md) | 2026-10-09 | One shared FFmpeg fix series for every consumer | Accepted |
 | [0002](0002-dovi-reshape-and-tone-mapping.md) | 2026-10-17 | Dolby Vision reshape and peak detection in FFmpeg's own tone-map filters | Accepted |
+| [0003](0003-peak-detection-follows-libplacebo.md) | 2026-10-17 | Peak detection follows libplacebo and the Dolby Vision level 1 peak | Accepted |
