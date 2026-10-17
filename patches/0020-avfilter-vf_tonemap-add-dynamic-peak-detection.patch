@@ -18,14 +18,23 @@ measured; its Dolby Vision level 1 peak is used instead, which is what
 libplacebo does with the RPU. With peak_detect left at 0 the output is
 unchanged.
 
+The frame-independent parts, the percentile, the smoothing and the
+level 1 lookup, live in the new tonemap_peak.c so that a hardware tone
+map filter can share them; the per-pixel tile code stays in vf_tonemap.c.
+
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- doc/filters.texi                          |  16 +
- libavfilter/tests/bt2408_hable.c          | 282 ++++++++++++-
- libavfilter/vf_tonemap.c                  | 464 +++++++++++++++++++---
+ doc/filters.texi                          |  16 ++
+ libavfilter/Makefile                      |   2 +-
+ libavfilter/tests/bt2408_hable.c          | 282 ++++++++++++++++++-
+ libavfilter/tonemap_peak.c                | 136 +++++++++
+ libavfilter/tonemap_peak.h                |  88 ++++++
+ libavfilter/vf_tonemap.c                  | 324 +++++++++++++++++++---
  tests/fate/filter-video.mak               |   4 +
  tests/ref/fate/filter-tonemap-peak-detect |   6 +
- 5 files changed, 716 insertions(+), 56 deletions(-)
+ 8 files changed, 801 insertions(+), 57 deletions(-)
+ create mode 100644 libavfilter/tonemap_peak.c
+ create mode 100644 libavfilter/tonemap_peak.h
  create mode 100644 tests/ref/fate/filter-tonemap-peak-detect
 
 diff --git a/doc/filters.texi b/doc/filters.texi
@@ -55,6 +64,19 @@ index 285410a8ae7dd59c14beade76a77f6f01285d905..286c6b2992147c5c78756170b9aac79b
  @end table
  
  @section tpad
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 2d10cdb28f1221d17f3b808cda486af4a1adf856..8d072e272d6e5e1a50f856420202cb6f0084a47a 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -538,7 +538,7 @@ OBJS-$(CONFIG_TLUT2_FILTER)                  += vf_lut2.o framesync.o
+ OBJS-$(CONFIG_TMEDIAN_FILTER)                += vf_xmedian.o framesync.o
+ OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
+ OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
+-OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o bt2408_hable.o
++OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2408_hable.o \
+                                                 opencl/tonemap.o opencl/bt2408_hable.o \
+                                                 opencl/colorspace_common.o
 diff --git a/libavfilter/tests/bt2408_hable.c b/libavfilter/tests/bt2408_hable.c
 index f867ba2bfb7bb5d8bfb0f1c0a3a01d5496d026e2..2ba569564ad1c435e9a63ff31a2a2d3d39c4b3f4 100644
 --- a/libavfilter/tests/bt2408_hable.c
@@ -391,8 +413,244 @@ index f867ba2bfb7bb5d8bfb0f1c0a3a01d5496d026e2..2ba569564ad1c435e9a63ff31a2a2d3d
  
      if (ff_bt2408_hable_init(&s, AVCOL_PRI_BT2020, PEAK) < 0) {
          printf("init failed\n");
+diff --git a/libavfilter/tonemap_peak.c b/libavfilter/tonemap_peak.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f08d06b522c8af733395ecd5dc5f9d2ea8df94d
+--- /dev/null
++++ b/libavfilter/tonemap_peak.c
+@@ -0,0 +1,136 @@
++/*
++ * The dynamic peak detection follows libplacebo v7.360.1
++ * (src/shaders/colorspace.c: pl_shader_detect_peak, measure_peak,
++ * update_peak_buf), Copyright (C) Niklas Haas and the libplacebo
++ * contributors, licensed under the GNU Lesser General Public License
++ * version 2.1 or later.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <float.h>
++#include <math.h>
++#include <stdlib.h>
++
++#include "libavutil/common.h"
++#include "libavutil/csp.h"
++#include "libavutil/dict.h"
++#include "colorspace.h"
++#include "tonemap_peak.h"
++
++float ff_tonemap_peak_measure(const uint32_t *hist, uint32_t frame_max_pq, float percentile)
++{
++    const float frame_max = (float)frame_max_pq / PQ_MAX;
++    uint32_t total_pixels = 0;
++    uint32_t target_pixel;
++    uint32_t sum = 0;
++
++    if (percentile <= 0.0f || percentile >= 100.0f)
++        return frame_max;
++
++    for (int i = 0; i < HIST_BINS; i++)
++        total_pixels += hist[i];
++
++    if (!total_pixels)
++        return frame_max;
++
++    target_pixel = (uint32_t)ceilf(percentile / 100.0f * (float)total_pixels);
++    if (target_pixel >= total_pixels)
++        return frame_max;
++
++    for (int i = 0; i < HIST_BINS; i++) {
++        uint32_t count_low, count_high;
++        float pq_low, pq_high, ratio;
++        uint32_t next = sum + hist[i];
++
++        if (next < target_pixel) {
++            sum = next;
++            continue;
++        }
++
++        count_low  = sum;
++        count_high = next + 1;
++        pq_low  = (float)HIST_PQ(i) / PQ_MAX;
++        pq_high = (float)HIST_PQ(i + 1) / PQ_MAX;
++
++        if (count_high > total_pixels)
++            pq_high = frame_max;
++
++        ratio = (float)(target_pixel - count_low) / (float)(count_high - count_low);
++        return pq_low * (1.0f - ratio) + pq_high * ratio;
++    }
++
++    return frame_max;
++}
++
++double ff_tonemap_peak_update(FFTonemapPeak *s, const FFTonemapPeakStats *stats)
++{
++    float avg_pq, max_pq;
++    const float coeff = 1.0f - expf(-1.0f / 20.0f);
++
++    if (stats->wg_active) {
++        avg_pq = (float)stats->sum_pq / (stats->wg_active * PQ_MAX);
++        max_pq = ff_tonemap_peak_measure(stats->hist, stats->max_pq, 99.995f);
++    } else {
++        avg_pq = max_pq = 1e-6f;
++    }
++
++    if (!s->avg_pq) {
++        s->avg_pq = avg_pq;
++        s->max_pq = max_pq;
++    } else {
++        static const float epsilon = 1.0f / PQ_MAX;
++        if (fabsf(avg_pq - s->avg_pq) < epsilon)
++            avg_pq = s->avg_pq;
++        if (fabsf(max_pq - s->max_pq) < epsilon)
++            max_pq = s->max_pq;
++    }
++
++    s->avg_pq += coeff * (avg_pq - s->avg_pq);
++    s->max_pq += coeff * (max_pq - s->max_pq);
++
++    if (s->threshold > 0.0) {
++        const float thresh_low = 5.0f * s->threshold * 1e-2f;
++        const float thresh_high = 15.0f * s->threshold * 1e-2f;
++        const float bias = stats->wg_count ? (float)stats->wg_active / (float)stats->wg_count : 0.0f;
++        const float delta = bias * fabsf(avg_pq - s->avg_pq);
++        const float mix_coeff = ff_tonemap_peak_smoothstep(thresh_low, thresh_high, delta);
++        s->avg_pq = s->avg_pq * (1.0f - mix_coeff) + avg_pq * mix_coeff;
++        s->max_pq = s->max_pq * (1.0f - mix_coeff) + max_pq * mix_coeff;
++    }
++
++    return FFMAX(1.0, (double)(ff_tonemap_peak_eotf(s->max_pq) * 10000.0f / REFERENCE_WHITE));
++}
++
++int ff_tonemap_peak_read_l1(const AVFrame *in, double *peak_out)
++{
++    const AVDictionaryEntry *e;
++    char *end = NULL;
++    long max_pq = -1;
++
++    e = av_dict_get(in->metadata, "lavfi.dovi.l1_max_pq", NULL, 0);
++    if (e && e->value && *e->value)
++        max_pq = strtol(e->value, &end, 10);
++
++    if (e && e->value && end && !*end && end != e->value && max_pq >= 0 && max_pq <= 4095) {
++        av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
++        *peak_out = pq_eotf(max_pq / 4095.0) / REFERENCE_WHITE;
++        return 1;
++    }
++
++    return 0;
++}
+diff --git a/libavfilter/tonemap_peak.h b/libavfilter/tonemap_peak.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..85e4c32b6d54512f1f5f9eca11d11325cb7f440b
+--- /dev/null
++++ b/libavfilter/tonemap_peak.h
+@@ -0,0 +1,88 @@
++/*
++ * The dynamic peak detection follows libplacebo v7.360.1
++ * (src/shaders/colorspace.c: pl_shader_detect_peak, measure_peak,
++ * update_peak_buf), Copyright (C) Niklas Haas and the libplacebo
++ * contributors, licensed under the GNU Lesser General Public License
++ * version 2.1 or later.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_TONEMAP_PEAK_H
++#define AVFILTER_TONEMAP_PEAK_H
++
++#include <stdint.h>
++#include <math.h>
++
++#include "libavutil/common.h"
++#include "libavutil/frame.h"
++#include "colorspace.h"
++
++#define PQ_BITS     14
++#define PQ_MAX      ((1 << PQ_BITS) - 1)
++#define HIST_BITS   7
++#define HIST_BIAS   (1 << (HIST_BITS - 1))
++#define HIST_BINS   ((1 << HIST_BITS) - HIST_BIAS)
++#define HIST_PQ(bin) (((bin) + HIST_BIAS) << (PQ_BITS - HIST_BITS))
++
++#define PQ_M1 (2610.0f / 16384.0f)
++#define PQ_M2 (2523.0f * 128.0f / 4096.0f)
++#define PQ_C1 (3424.0f / 4096.0f)
++#define PQ_C2 (2413.0f * 32.0f / 4096.0f)
++#define PQ_C3 (2392.0f * 32.0f / 4096.0f)
++
++typedef struct FFTonemapPeak {
++    float avg_pq;
++    float max_pq;
++    double threshold;
++} FFTonemapPeak;
++
++typedef struct FFTonemapPeakStats {
++    uint64_t sum_pq;
++    uint32_t wg_count;
++    uint32_t wg_active;
++    uint32_t max_pq;
++    uint32_t hist[HIST_BINS];
++} FFTonemapPeakStats;
++
++static inline float ff_tonemap_peak_eotf(float y)
++{
++    float ym, num, den;
++
++    if (y <= 0.0f)
++        return 0.0f;
++    ym = powf(y, 1.0f / PQ_M2);
++    num = fmaxf(ym - PQ_C1, 0.0f);
++    den = fmaxf(PQ_C2 - PQ_C3 * ym, 1e-6f);
++
++    return powf(num / den, 1.0f / PQ_M1);
++}
++
++static inline float ff_tonemap_peak_smoothstep(float edge0, float edge1, float x)
++{
++    float t = av_clipf((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
++
++    return t * t * (3.0f - 2.0f * t);
++}
++
++float ff_tonemap_peak_measure(const uint32_t *hist, uint32_t frame_max_pq, float percentile);
++
++double ff_tonemap_peak_update(FFTonemapPeak *s, const FFTonemapPeakStats *stats);
++
++int ff_tonemap_peak_read_l1(const AVFrame *in, double *peak_out);
++
++#endif /* AVFILTER_TONEMAP_PEAK_H */
 diff --git a/libavfilter/vf_tonemap.c b/libavfilter/vf_tonemap.c
-index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc259d2639 100644
+index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..29f9c3d476b7b588a17beaff262547c779adb553 100644
 --- a/libavfilter/vf_tonemap.c
 +++ b/libavfilter/vf_tonemap.c
 @@ -1,6 +1,12 @@
@@ -427,36 +685,15 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
  #include "libavutil/opt.h"
  #include "libavutil/pixdesc.h"
  
-@@ -52,6 +63,28 @@ enum TonemapAlgorithm {
-     TONEMAP_MAX,
- };
+@@ -38,6 +49,7 @@
+ #include "bt2408_hable.h"
+ #include "colorspace.h"
+ #include "filters.h"
++#include "tonemap_peak.h"
+ #include "video.h"
  
-+/* Peak detection, see the libplacebo notice at the top of the file. */
-+#define PQ_BITS     14
-+#define PQ_MAX      ((1 << PQ_BITS) - 1)
-+#define HIST_BITS   7
-+#define HIST_BIAS   (1 << (HIST_BITS - 1))
-+#define HIST_BINS   ((1 << HIST_BITS) - HIST_BIAS)
-+#define HIST_PQ(bin) (((bin) + HIST_BIAS) << (PQ_BITS - HIST_BITS))
-+
-+#define PQ_M1 (2610.0f / 16384.0f)
-+#define PQ_M2 (2523.0f * 128.0f / 4096.0f)
-+#define PQ_C1 (3424.0f / 4096.0f)
-+#define PQ_C2 (2413.0f * 32.0f / 4096.0f)
-+#define PQ_C3 (2392.0f * 32.0f / 4096.0f)
-+
-+typedef struct DetectJobData {
-+    uint32_t wg_count;
-+    uint32_t wg_active;
-+    uint64_t sum_pq;
-+    uint32_t max_pq;
-+    uint32_t hist[HIST_BINS];
-+} DetectJobData;
-+
- typedef struct TonemapContext {
-     const AVClass *class;
- 
-@@ -60,12 +93,20 @@ typedef struct TonemapContext {
+ enum TonemapAlgorithm {
+@@ -60,12 +72,19 @@ typedef struct TonemapContext {
      double param;
      double desat;
      double peak;
@@ -470,14 +707,13 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
      enum AVColorPrimaries bt2408_prim;
 +
 +    /* Dynamic peak detection (libplacebo) */
-+    DetectJobData *jobs;
++    FFTonemapPeakStats *jobs;
 +    int nb_jobs;
-+    float avg_pq;
-+    float max_pq;
++    FFTonemapPeak peak_state;
  } TonemapContext;
  
  static av_cold int init(AVFilterContext *ctx)
-@@ -245,49 +286,395 @@ static int setup_bt2408(AVFilterContext *ctx, AVFrame *out, const AVFrame *in, d
+@@ -245,49 +264,277 @@ static int setup_bt2408(AVFilterContext *ctx, AVFrame *out, const AVFrame *in, d
      return 0;
  }
  
@@ -500,26 +736,6 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
 +    return powf(num / den, PQ_M2);
 +}
 +
-+static inline float pq_eotf(float y)
-+{
-+    float ym, num, den;
-+
-+    if (y <= 0.0f)
-+        return 0.0f;
-+    ym = powf(y, 1.0f / PQ_M2);
-+    num = fmaxf(ym - PQ_C1, 0.0f);
-+    den = fmaxf(PQ_C2 - PQ_C3 * ym, 1e-6f);
-+
-+    return powf(num / den, 1.0f / PQ_M1);
-+}
-+
-+static inline float smoothstep(float edge0, float edge1, float x)
-+{
-+    float t = av_clipf((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
-+
-+    return t * t * (3.0f - 2.0f * t);
-+}
-+
 +static inline uint32_t compute_pixel_pq(float r, float g, float b,
 +                                        float cr, float cg, float cb)
 +{
@@ -528,13 +744,13 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
 +    float x = av_clipf(nits / 10000.0f, 0.0f, 1.0f);
 +    float y = pq_oetf(x);
 +
-+    y *= smoothstep(0.0f, 0.01f, y);
++    y *= ff_tonemap_peak_smoothstep(0.0f, 0.01f, y);
 +    y = av_clipf(y, 0.0f, 1.0f);
 +    return (uint32_t)(PQ_MAX * y);
 +}
 +
 +static void process_tile(const AVFrame *in, const AVPixFmtDescriptor *desc,
-+                         const DetectThreadData *td, DetectJobData *job,
++                         const DetectThreadData *td, FFTonemapPeakStats *job,
 +                         int x0, int x1, int y0, int y1)
 +{
 +    const int r_plane = desc->comp[0].plane;
@@ -580,7 +796,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
 +{
 +    TonemapContext *s = ctx->priv;
 +    DetectThreadData *td = arg;
-+    DetectJobData *job = &s->jobs[jobnr];
++    FFTonemapPeakStats *job = &s->jobs[jobnr];
 +    const int ty_start = ff_slice_pos(td->nb_tiles_y, jobnr, nb_jobs);
 +    const int ty_end   = ff_slice_pos(td->nb_tiles_y, jobnr + 1, nb_jobs);
 +
@@ -597,92 +813,6 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
 +    }
 +
 +    return 0;
-+}
-+
-+static float measure_peak(const uint32_t *hist, uint32_t frame_max_pq, float percentile)
-+{
-+    const float frame_max = (float)frame_max_pq / PQ_MAX;
-+    uint32_t total_pixels = 0;
-+    uint32_t target_pixel;
-+    uint32_t sum = 0;
-+
-+    if (percentile <= 0.0f || percentile >= 100.0f)
-+        return frame_max;
-+
-+    for (int i = 0; i < HIST_BINS; i++)
-+        total_pixels += hist[i];
-+
-+    if (!total_pixels)
-+        return frame_max;
-+
-+    target_pixel = (uint32_t)ceilf(percentile / 100.0f * (float)total_pixels);
-+    if (target_pixel >= total_pixels)
-+        return frame_max;
-+
-+    for (int i = 0; i < HIST_BINS; i++) {
-+        uint32_t count_low, count_high;
-+        float pq_low, pq_high, ratio;
-+        uint32_t next = sum + hist[i];
-+
-+        if (next < target_pixel) {
-+            sum = next;
-+            continue;
-+        }
-+
-+        count_low  = sum;
-+        count_high = next + 1;
-+        pq_low  = (float)HIST_PQ(i) / PQ_MAX;
-+        pq_high = (float)HIST_PQ(i + 1) / PQ_MAX;
-+
-+        if (count_high > total_pixels)
-+            pq_high = frame_max;
-+
-+        ratio = (float)(target_pixel - count_low) / (float)(count_high - count_low);
-+        return pq_low * (1.0f - ratio) + pq_high * ratio;
-+    }
-+
-+    return frame_max;
-+}
-+
-+static double update_peak_buf(TonemapContext *s, uint64_t frame_sum_pq,
-+                              uint32_t frame_wg_count, uint32_t frame_wg_active,
-+                              uint32_t frame_max_pq, const uint32_t *hist)
-+{
-+    float avg_pq, max_pq;
-+    const float coeff = 1.0f - expf(-1.0f / 20.0f);
-+
-+    if (frame_wg_active) {
-+        avg_pq = (float)frame_sum_pq / (frame_wg_active * PQ_MAX);
-+        max_pq = measure_peak(hist, frame_max_pq, 99.995f);
-+    } else {
-+        avg_pq = max_pq = 1e-6f;
-+    }
-+
-+    if (!s->avg_pq) {
-+        s->avg_pq = avg_pq;
-+        s->max_pq = max_pq;
-+    } else {
-+        static const float epsilon = 1.0f / PQ_MAX;
-+        if (fabsf(avg_pq - s->avg_pq) < epsilon)
-+            avg_pq = s->avg_pq;
-+        if (fabsf(max_pq - s->max_pq) < epsilon)
-+            max_pq = s->max_pq;
-+    }
-+
-+    s->avg_pq += coeff * (avg_pq - s->avg_pq);
-+    s->max_pq += coeff * (max_pq - s->max_pq);
-+
-+    if (s->threshold > 0.0) {
-+        const float thresh_low = 5.0f * s->threshold * 1e-2f;
-+        const float thresh_high = 15.0f * s->threshold * 1e-2f;
-+        const float bias = frame_wg_count ? (float)frame_wg_active / (float)frame_wg_count : 0.0f;
-+        const float delta = bias * fabsf(avg_pq - s->avg_pq);
-+        const float mix_coeff = smoothstep(thresh_low, thresh_high, delta);
-+        s->avg_pq = s->avg_pq * (1.0f - mix_coeff) + avg_pq * mix_coeff;
-+        s->max_pq = s->max_pq * (1.0f - mix_coeff) + max_pq * mix_coeff;
-+    }
-+
-+    return FFMAX(1.0, (double)(pq_eotf(s->max_pq) * 10000.0f / REFERENCE_WHITE));
 +}
 +
 +static const AVLumaCoefficients *detect_coeffs(const AVFrame *in)
@@ -712,9 +842,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
 +    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(in->format);
 +    const AVLumaCoefficients *coeffs = detect_coeffs(in);
 +    DetectThreadData dtd;
-+    uint64_t frame_sum_pq = 0;
-+    uint32_t frame_wg_count = 0, frame_wg_active = 0, frame_max_pq = 0;
-+    uint32_t frame_hist[HIST_BINS] = {0};
++    FFTonemapPeakStats frame_stats = {0};
 +    int nb_threads;
 +
 +    dtd.in = in;
@@ -738,16 +866,16 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
 +    ff_filter_execute(ctx, detect_slice, &dtd, NULL, nb_threads);
 +
 +    for (int j = 0; j < nb_threads; j++) {
-+        frame_sum_pq += s->jobs[j].sum_pq;
-+        frame_wg_count += s->jobs[j].wg_count;
-+        frame_wg_active += s->jobs[j].wg_active;
-+        frame_max_pq = FFMAX(frame_max_pq, s->jobs[j].max_pq);
++        frame_stats.sum_pq += s->jobs[j].sum_pq;
++        frame_stats.wg_count += s->jobs[j].wg_count;
++        frame_stats.wg_active += s->jobs[j].wg_active;
++        frame_stats.max_pq = FFMAX(frame_stats.max_pq, s->jobs[j].max_pq);
 +        for (int i = 0; i < HIST_BINS; i++)
-+            frame_hist[i] += s->jobs[j].hist[i];
++            frame_stats.hist[i] += s->jobs[j].hist[i];
 +    }
 +
-+    *peak_out = update_peak_buf(s, frame_sum_pq, frame_wg_count,
-+                                frame_wg_active, frame_max_pq, frame_hist);
++    s->peak_state.threshold = s->threshold;
++    *peak_out = ff_tonemap_peak_update(&s->peak_state, &frame_stats);
 +    return 0;
 +}
 +
@@ -770,21 +898,11 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
 +static int get_signal_peak(AVFilterContext *ctx, AVFrame *in, double *peak_out)
 +{
 +    TonemapContext *s = ctx->priv;
-+    av_csp_trc_function pq_eotf;
-+    const AVDictionaryEntry *e;
-+    char *end = NULL;
-+    long max_pq = -1;
 +    double peak = s->peak;
 +    int ret;
 +
 +    if (s->peak_detect) {
-+        e = av_dict_get(in->metadata, "lavfi.dovi.l1_max_pq", NULL, 0);
-+        if (e && e->value && *e->value)
-+            max_pq = strtol(e->value, &end, 10);
-+
-+        if (e && e->value && end && !*end && end != e->value && max_pq >= 0 && max_pq <= 4095) {
-+            pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
-+            peak = pq_eotf(max_pq / 4095.0) / REFERENCE_WHITE;
++        if (ff_tonemap_peak_read_l1(in, &peak)) {
 +            av_log(ctx, AV_LOG_VERBOSE, "Dolby Vision L1 signal peak: %f\n", peak);
 +        } else {
 +            ret = detect_peak(ctx, in, &peak);
@@ -892,7 +1010,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
      if (s->tonemap == TONEMAP_BT2408_HABLE) {
          ret = setup_bt2408(ctx, out, in, peak);
          if (ret < 0) {
-@@ -297,19 +684,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+@@ -297,19 +544,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
          }
      }
  
@@ -913,7 +1031,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
      td.out = out;
      td.in = in;
      td.desc = desc;
-@@ -317,20 +693,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+@@ -317,20 +553,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
      ff_filter_execute(ctx, tonemap_slice, &td, NULL,
                        FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
  
@@ -935,7 +1053,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
      av_frame_free(&in);
  
      if (s->tonemap != TONEMAP_BT2408_HABLE)
-@@ -354,11 +717,21 @@ static const AVOption tonemap_options[] = {
+@@ -354,11 +577,21 @@ static const AVOption tonemap_options[] = {
      { "param",        "tonemap parameter", OFFSET(param), AV_OPT_TYPE_DOUBLE, {.dbl = NAN}, DBL_MIN, DBL_MAX, FLAGS },
      { "desat",        "desaturation strength", OFFSET(desat), AV_OPT_TYPE_DOUBLE, {.dbl = 2}, 0, DBL_MAX, FLAGS },
      { "peak",         "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },
@@ -957,7 +1075,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc
  static const AVFilterPad tonemap_inputs[] = {
      {
          .name         = "default",
-@@ -373,6 +746,7 @@ const FFFilter ff_vf_tonemap = {
+@@ -373,6 +606,7 @@ const FFFilter ff_vf_tonemap = {
      .p.priv_class    = &tonemap_class,
      .p.flags         = AVFILTER_FLAG_SLICE_THREADS,
      .init            = init,
