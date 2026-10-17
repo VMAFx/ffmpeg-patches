@@ -107,10 +107,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential nasm pkg-config libvulkan-dev spirv-headers libffmpeg-nvenc-dev \
-            libva-dev libdrm-dev libvpl-dev glslc clang-tidy cppcheck
+            libva-dev libdrm-dev libvpl-dev libzimg-dev glslc clang-tidy cppcheck
           gcc --version | head -1
           glslc --version | head -1
-          pkg-config --modversion vulkan ffnvcodec libva libdrm vpl
+          pkg-config --modversion vulkan ffnvcodec libva libdrm vpl zimg
       - name: Fetch and verify the pinned FFmpeg source
         if: github.event.pull_request.draft != true
         run: |
@@ -147,8 +147,9 @@ jobs:
           # eq and its checkasm test), which an LGPL build skips.
           # glslc provides spirv_compiler, without which configure drops the Vulkan
           # encoders and filters that compile shaders, such as ffv1enc_vulkan.c (0008).
+          # --enable-libzimg builds vf_zscale.c, which 0015 changes.
           ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl --enable-vulkan \
-            --enable-nvenc --enable-vaapi --enable-libdrm --enable-libvpl \
+            --enable-nvenc --enable-vaapi --enable-libdrm --enable-libvpl --enable-libzimg \
             || { tail -40 ffbuild/config.log; exit 1; }
       - name: Lint the C sources of this repository with clang-tidy and cppcheck
         # The list is the clang_tidy lane of .standards.yaml. The DV5 fixture
