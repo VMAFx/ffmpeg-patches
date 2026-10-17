@@ -1,0 +1,604 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 00:52:16 +0200
+Subject: [PATCH] avfilter/vf_tonemap_vulkan: add dynamic peak detection
+
+Add the peak_detect and threshold options of vf_tonemap to
+tonemap_vulkan. A compute shader measures the PQ luminance of the input
+frame in 16x16 tiles, as the CPU detector does, and accumulates the tile
+statistics and the luminance histogram in a host-visible buffer. The
+host reads them back and runs the shared percentile and smoothing code
+of tonemap_peak.c, then the tone map pass uses the resulting peak.
+
+A frame that carries the lavfi.dovi.l1_max_pq metadata is not measured;
+its Dolby Vision level 1 peak is used, as in vf_tonemap.
+
+The default output with peak_detect=0 is unchanged.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi                          |  16 ++
+ libavfilter/Makefile                      |   2 +-
+ libavfilter/vf_tonemap_vulkan.c           | 283 +++++++++++++++++++++-
+ libavfilter/vulkan/Makefile               |   3 +-
+ libavfilter/vulkan/tonemap_peak.comp.glsl | 149 ++++++++++++
+ 5 files changed, 448 insertions(+), 5 deletions(-)
+ create mode 100644 libavfilter/vulkan/tonemap_peak.comp.glsl
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 286c6b2992147c5c78756170b9aac79b0e3e4fe3..9706f6408b28e6a2fe841cb3747a02ccc0d9cedf 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -29643,6 +29643,22 @@ ITU-R BT.2408 tone mapping with Hable curve on IPT intensity.
+ Signal peak override, in units of 100 cd/m^2 (nits / 100). Default is @code{0},
+ which means the peak is determined from frame metadata.
+ 
++@item peak_detect
++Measure the signal peak from each frame instead of taking it from
++@option{peak} or the frame's side data. The luminance is measured in PQ over
++16x16 tiles, the frame peak is the 99.995th percentile, and the result is
++smoothed over about 20 frames, as libplacebo does. A frame that carries the
++@code{lavfi.dovi.l1_max_pq} metadata, which the @code{dovi_reshape} filter
++writes, is not measured: its Dolby Vision level 1 peak is used instead.
++Default is 0 (disabled).
++
++@item threshold
++Set the scene change window of @option{peak_detect}. A change of the
++frame's average PQ level below @code{5 * threshold} percent is smoothed, a
++change above @code{15 * threshold} percent resets the smoothing to the new
++frame, and a change in between blends the two. 0 disables scene change detection.
++Default is 0.2, a window of 1 to 3 percent.
++
+ @item format
+ Output software pixel format of the hardware frames. Can be @code{nv12} or
+ @code{p010}. Default is @code{nv12}.
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 8d072e272d6e5e1a50f856420202cb6f0084a47a..befe94a5566dcd8cfd4de33113486a710873745c 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -543,7 +543,7 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2
+                                                 opencl/tonemap.o opencl/bt2408_hable.o \
+                                                 opencl/colorspace_common.o
+ OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o bt2408_hable.o
+-OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER)         += vf_tonemap_vulkan.o vulkan.o vulkan_filter.o bt2408_hable.o
++OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER)         += vf_tonemap_vulkan.o vulkan.o vulkan_filter.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
+ OBJS-$(CONFIG_TRANSPOSE_FILTER)              += vf_transpose.o
+ OBJS-$(CONFIG_TRANSPOSE_CUDA_FILTER)         += vf_transpose_cuda.o vf_transpose_cuda.ptx.o \
+diff --git a/libavfilter/vf_tonemap_vulkan.c b/libavfilter/vf_tonemap_vulkan.c
+index 502afad6583087617f1d1079089abd4dc7a04aeb..6825285a239d334fbbb8e3542c8ab6c9d03d3068 100644
+--- a/libavfilter/vf_tonemap_vulkan.c
++++ b/libavfilter/vf_tonemap_vulkan.c
+@@ -27,10 +27,13 @@
+ #include "colorspace.h"
+ #include "filters.h"
+ #include "formats.h"
++#include "tonemap_peak.h"
+ #include "video.h"
+ 
+ extern const unsigned char ff_bt2408_hable_comp_spv_data[];
+ extern const unsigned int ff_bt2408_hable_comp_spv_len;
++extern const unsigned char ff_tonemap_peak_comp_spv_data[];
++extern const unsigned int ff_tonemap_peak_comp_spv_len;
+ 
+ enum TonemapAlgorithm {
+     TONEMAP_BT2408_HABLE,
+@@ -50,6 +53,8 @@ typedef struct TonemapVulkanContext {
+     int tonemap;
+     enum AVPixelFormat format;
+     double peak;
++    int peak_detect;
++    double threshold;
+ 
+     /* Storage buffer for tone map params */
+     FFVkBuffer params_buf;
+@@ -57,6 +62,11 @@ typedef struct TonemapVulkanContext {
+     double bt2408_peak;
+     enum AVColorPrimaries bt2408_prim;
+ 
++    /* Peak detection */
++    FFVulkanShader shd_peak;
++    FFVkBuffer peak_buf;
++    FFTonemapPeak peak_state;
++
+     /* Push constants */
+     struct {
+         int32_t out_p010;
+@@ -71,7 +81,9 @@ static av_cold void tonemap_vulkan_uninit(AVFilterContext *avctx)
+ 
+     ff_vk_exec_pool_free(vkctx, &s->e);
+     ff_vk_shader_free(vkctx, &s->shd);
++    ff_vk_shader_free(vkctx, &s->shd_peak);
+     ff_vk_free_buf(vkctx, &s->params_buf);
++    ff_vk_free_buf(vkctx, &s->peak_buf);
+ 
+     if (s->sampler)
+         vk->DestroySampler(vkctx->hwctx->act_dev, s->sampler,
+@@ -131,6 +143,41 @@ static int setup_bt2408(AVFilterContext *avctx, const AVFrame *input, double pea
+     return 0;
+ }
+ 
++static av_cold int init_peak_pipeline(AVFilterContext *ctx)
++{
++    TonemapVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    const FFVulkanDescriptorSetBinding desc_img[] = {
++        {
++            .type     = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++            .stages   = VK_SHADER_STAGE_COMPUTE_BIT,
++            .elems    = 2,
++            .samplers = DUP_SAMPLER(s->sampler),
++        },
++    };
++    const FFVulkanDescriptorSetBinding desc_buf[] = {
++        {
++            .type   = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++            .stages = VK_SHADER_STAGE_COMPUTE_BIT,
++        },
++    };
++    int err;
++
++    ff_vk_shader_load(&s->shd_peak, VK_SHADER_STAGE_COMPUTE_BIT, NULL,
++                      (uint32_t []) { 16, 16, 1 }, 0);
++
++    ff_vk_shader_add_descriptor_set(vkctx, &s->shd_peak, desc_img, 1, 0);
++    ff_vk_shader_add_descriptor_set(vkctx, &s->shd_peak, desc_buf, 1, 1);
++
++    err = ff_vk_shader_link(vkctx, &s->shd_peak,
++                            ff_tonemap_peak_comp_spv_data,
++                            ff_tonemap_peak_comp_spv_len, "main");
++    if (err < 0)
++        return err;
++
++    return ff_vk_shader_register_exec(vkctx, &s->e, &s->shd_peak);
++}
++
+ static av_cold int init_pipeline(AVFilterContext *ctx)
+ {
+     TonemapVulkanContext *s = ctx->priv;
+@@ -180,7 +227,31 @@ static av_cold int init_pipeline(AVFilterContext *ctx)
+     if (err < 0)
+         return err;
+ 
+-    return ff_vk_shader_register_exec(vkctx, &s->e, &s->shd);
++    err = ff_vk_shader_register_exec(vkctx, &s->e, &s->shd);
++    if (err < 0)
++        return err;
++
++    return s->peak_detect ? init_peak_pipeline(ctx) : 0;
++}
++
++static av_cold int init_peak_buf(AVFilterContext *ctx)
++{
++    TonemapVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    int err;
++
++    err = ff_vk_create_buf(vkctx, &s->peak_buf, sizeof(FFTonemapPeakStats), NULL, NULL,
++                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++    if (err < 0)
++        return err;
++
++    return ff_vk_shader_update_desc_buffer(vkctx, &s->e.contexts[0], &s->shd_peak,
++                                           1, 0, 0,
++                                           &s->peak_buf, 0, s->peak_buf.size,
++                                           VK_FORMAT_UNDEFINED);
+ }
+ 
+ static av_cold int init_filter(AVFilterContext *ctx)
+@@ -218,6 +289,14 @@ static av_cold int init_filter(AVFilterContext *ctx)
+         return err;
+     }
+ 
++    if (s->peak_detect) {
++        err = init_peak_buf(ctx);
++        if (err < 0) {
++            tonemap_vulkan_uninit(ctx);
++            return err;
++        }
++    }
++
+     s->shd.lg_size[0] <<= 1;
+     s->shd.lg_size[1] <<= 1;
+ 
+@@ -239,13 +318,207 @@ static void tonemap_vulkan_set_props(AVFrame *out)
+     av_frame_remove_side_data(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+ }
+ 
++static void barrier_zero_peak_buf(FFVulkanContext *vkctx, FFVkExecContext *exec,
++                                  FFVkBuffer *buf)
++{
++    FFVulkanFunctions *vk = &vkctx->vkfn;
++
++    vk->CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo) {
++        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++        .pBufferMemoryBarriers = &(VkBufferMemoryBarrier2) {
++            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
++            .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
++            .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
++            .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .buffer = buf->buf,
++            .size = buf->size,
++            .offset = 0,
++        },
++        .bufferMemoryBarrierCount = 1,
++    });
++    vk->CmdFillBuffer(exec->buf, buf->buf, 0, buf->size, 0);
++}
++
++static void barrier_host_read_peak_buf(FFVulkanContext *vkctx, FFVkExecContext *exec,
++                                       FFVkBuffer *buf)
++{
++    FFVulkanFunctions *vk = &vkctx->vkfn;
++
++    vk->CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo) {
++        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++        .pBufferMemoryBarriers = &(VkBufferMemoryBarrier2) {
++            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
++            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
++            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
++                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .buffer = buf->buf,
++            .size = buf->size,
++            .offset = 0,
++        },
++        .bufferMemoryBarrierCount = 1,
++    });
++}
++
++static void barrier_peak_input(FFVulkanContext *vkctx, FFVkExecContext *exec,
++                               AVFrame *in, FFVkBuffer *buf)
++{
++    FFVulkanFunctions *vk = &vkctx->vkfn;
++    VkImageMemoryBarrier2 img_bar[4];
++    int nb_img_bar = 0;
++
++    ff_vk_frame_barrier(vkctx, exec, in, img_bar, &nb_img_bar,
++                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++                        VK_ACCESS_SHADER_READ_BIT,
++                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                        VK_QUEUE_FAMILY_IGNORED);
++
++    vk->CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo) {
++        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++        .pImageMemoryBarriers = img_bar,
++        .imageMemoryBarrierCount = nb_img_bar,
++        .pBufferMemoryBarriers = &(VkBufferMemoryBarrier2) {
++            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
++            .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
++            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
++                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .buffer = buf->buf,
++            .size = buf->size,
++            .offset = 0,
++        },
++        .bufferMemoryBarrierCount = 1,
++    });
++}
++
++static int dispatch_peak_detection(AVFilterContext *ctx, AVFrame *in)
++{
++    TonemapVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    FFVulkanFunctions *vk = &vkctx->vkfn;
++    FFVkExecContext *exec = ff_vk_exec_get(vkctx, &s->e);
++    VkImageView in_views[AV_NUM_DATA_POINTERS];
++    int err;
++
++    ff_vk_exec_start(vkctx, exec);
++
++    err = ff_vk_exec_add_dep_frame(vkctx, exec, in,
++                                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
++    if (err < 0) {
++        ff_vk_exec_discard_deps(vkctx, exec);
++        return err;
++    }
++
++    err = ff_vk_create_imageviews(vkctx, exec, in_views, in, FF_VK_REP_FLOAT);
++    if (err < 0) {
++        ff_vk_exec_discard_deps(vkctx, exec);
++        return err;
++    }
++
++    ff_vk_shader_update_img_array(vkctx, exec, &s->shd_peak, in, in_views, 0, 0,
++                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                  s->sampler);
++
++    barrier_zero_peak_buf(vkctx, exec, &s->peak_buf);
++    barrier_peak_input(vkctx, exec, in, &s->peak_buf);
++
++    ff_vk_exec_bind_shader(vkctx, exec, &s->shd_peak);
++
++    vk->CmdDispatch(exec->buf,
++                    FFALIGN(in->width, 16) / 16,
++                    FFALIGN(in->height, 16) / 16,
++                    1);
++
++    barrier_host_read_peak_buf(vkctx, exec, &s->peak_buf);
++
++    err = ff_vk_exec_submit(vkctx, exec);
++    if (err < 0) {
++        ff_vk_exec_discard_deps(vkctx, exec);
++        return err;
++    }
++
++    ff_vk_exec_wait(vkctx, exec);
++    return 0;
++}
++
++static int read_peak_stats(AVFilterContext *ctx, FFTonemapPeakStats *stats)
++{
++    TonemapVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    uint8_t *mapped;
++    int err;
++
++    err = ff_vk_map_buffer(vkctx, &s->peak_buf, &mapped, 1);
++    if (err < 0)
++        return err;
++    memcpy(stats, mapped, sizeof(*stats));
++    err = ff_vk_unmap_buffer(vkctx, &s->peak_buf, 0);
++    if (err < 0)
++        return err;
++
++    return 0;
++}
++
++static int detect_signal_peak(AVFilterContext *ctx, AVFrame *in, double *peak_out)
++{
++    TonemapVulkanContext *s = ctx->priv;
++    FFTonemapPeakStats stats;
++    int err;
++
++    err = dispatch_peak_detection(ctx, in);
++    if (err < 0)
++        return err;
++
++    err = read_peak_stats(ctx, &stats);
++    if (err < 0)
++        return err;
++
++    s->peak_state.threshold = s->threshold;
++    *peak_out = ff_tonemap_peak_update(&s->peak_state, &stats);
++    return 0;
++}
++
++static int tonemap_vulkan_get_peak(AVFilterContext *ctx, AVFrame *in, double *peak_out)
++{
++    TonemapVulkanContext *s = ctx->priv;
++    double peak = s->peak;
++    int err;
++
++    if (s->peak_detect) {
++        if (ff_tonemap_peak_read_l1(in, &peak)) {
++            av_log(ctx, AV_LOG_VERBOSE, "Dolby Vision L1 signal peak: %f\n", peak);
++        } else {
++            err = detect_signal_peak(ctx, in, &peak);
++            if (err < 0)
++                return err;
++            av_log(ctx, AV_LOG_VERBOSE, "Detected signal peak: %f\n", peak);
++        }
++    } else if (!peak) {
++        peak = ff_determine_signal_peak(in);
++        av_log(ctx, AV_LOG_DEBUG, "Computed signal peak: %f\n", peak);
++    }
++
++    *peak_out = peak;
++    return 0;
++}
++
+ static int tonemap_vulkan_filter_frame(AVFilterLink *link, AVFrame *in)
+ {
+     AVFilterContext *ctx = link->dst;
+     TonemapVulkanContext *s = ctx->priv;
+     AVFilterLink *outlink = ctx->outputs[0];
+-    double peak = s->peak ? s->peak : ff_determine_signal_peak(in);
+     AVFrame *out;
++    double peak;
+     int err;
+ 
+     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+@@ -270,7 +543,9 @@ static int tonemap_vulkan_filter_frame(AVFilterLink *link, AVFrame *in)
+         }
+     }
+ 
+-    err = setup_bt2408(ctx, in, peak);
++    err = tonemap_vulkan_get_peak(ctx, in, &peak);
++    if (err >= 0)
++        err = setup_bt2408(ctx, in, peak);
+     if (err < 0) {
+         av_frame_free(&in);
+         av_frame_free(&out);
+@@ -339,6 +614,8 @@ static const AVOption tonemap_vulkan_options[] = {
+     { "tonemap", "tone map algorithm selection", OFFSET(tonemap), AV_OPT_TYPE_INT, { .i64 = TONEMAP_BT2408_HABLE }, 0, TONEMAP_NB - 1, FLAGS, .unit = "tonemap" },
+     {     "bt2408_hable", "ITU-R BT.2408 tone mapping with Hable curve on IPT", 0, AV_OPT_TYPE_CONST, { .i64 = TONEMAP_BT2408_HABLE }, 0, 0, FLAGS, .unit = "tonemap" },
+     { "peak", "signal peak override (units of 100 cd/m^2)", OFFSET(peak), AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { "peak_detect", "measure signal peak from frames", OFFSET(peak_detect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
++    { "threshold", "scene detection threshold", OFFSET(threshold), AV_OPT_TYPE_DOUBLE, { .dbl = 0.2 }, 0.0, DBL_MAX, FLAGS },
+     { "format", "output pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_NV12 }, AV_PIX_FMT_NONE, INT_MAX, FLAGS, .unit = "fmt" },
+     { NULL }
+ };
+diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
+index 48aa540cb4c147e8e48aafccb1b1014c36b36ba0..5b1003872357706d043695264a2964f2b8a8ca20 100644
+--- a/libavfilter/vulkan/Makefile
++++ b/libavfilter/vulkan/Makefile
+@@ -14,7 +14,8 @@ OBJS-$(CONFIG_SCDET_VULKAN_FILTER) += vulkan/scdet.comp.spv.o
+ OBJS-$(CONFIG_OVERLAY_VULKAN_FILTER) += vulkan/overlay.comp.spv.o
+ OBJS-$(CONFIG_FLIP_VULKAN_FILTER) += vulkan/flip.comp.spv.o
+ OBJS-$(CONFIG_TRANSPOSE_VULKAN_FILTER) += vulkan/transpose.comp.spv.o
+-OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o
++OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o \
++                                        vulkan/tonemap_peak.comp.spv.o
+ OBJS-$(CONFIG_V360_VULKAN_FILTER) += vulkan/v360.comp.spv.o
+ OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER) += vulkan/interlace.comp.spv.o
+ OBJS-$(CONFIG_XFADE_VULKAN_FILTER) += vulkan/xfade.comp.spv.o
+diff --git a/libavfilter/vulkan/tonemap_peak.comp.glsl b/libavfilter/vulkan/tonemap_peak.comp.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..eff58cbb3328528dfb4559d878ec12a7000c87ea
+--- /dev/null
++++ b/libavfilter/vulkan/tonemap_peak.comp.glsl
+@@ -0,0 +1,149 @@
++/*
++ * Peak detection compute shader for tonemap_vulkan
++ *
++ * The dynamic peak detection follows libplacebo v7.360.1
++ * (src/shaders/colorspace.c: pl_shader_detect_peak, measure_peak,
++ * update_peak_buf), Copyright (C) Niklas Haas and the libplacebo
++ * contributors, licensed under the GNU Lesser General Public License
++ * version 2.1 or later.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma shader_stage(compute)
++
++#extension GL_EXT_shader_image_load_formatted : require
++#extension GL_EXT_scalar_block_layout : require
++#extension GL_EXT_nonuniform_qualifier : require
++
++layout (local_size_x_id = 253, local_size_y_id = 254, local_size_z_id = 255) in;
++
++layout (set = 0, binding = 0) uniform sampler2D input_img[];
++
++layout (std430, set = 1, binding = 0) buffer StatsBuffer {
++    uint stats_sum_lo;
++    uint stats_sum_hi;
++    uint stats_wg_count;
++    uint stats_wg_active;
++    uint stats_max_pq;
++    uint stats_hist[64];
++};
++
++#define BT2408_IN_CODE (65535.0f / 64.0f)
++
++const float ST2084_M1 = 0.1593017578125f;
++const float ST2084_M2 = 78.84375f;
++const float ST2084_C1 = 0.8359375f;
++const float ST2084_C2 = 18.8515625f;
++const float ST2084_C3 = 18.6875f;
++const float ST2084_MAX_LUMINANCE = 10000.0f;
++const float REFERENCE_WHITE = 100.0f;
++
++const float rgb_matrix[9] = float[9](
++    1.00000000f,  0.00000000f,  1.47460000f,
++    1.00000000f, -0.16455313f, -0.57135313f,
++    1.00000000f,  1.88140000f,  0.00000000f
++);
++
++float eotf_st2084(float x) {
++    float p = pow(max(x, 0.0f), 1.0f / ST2084_M2);
++    float a = max(p - ST2084_C1, 0.0f);
++    float b = max(ST2084_C2 - ST2084_C3 * p, 1e-6f);
++    float c = pow(a / b, 1.0f / ST2084_M1);
++    return x > 0.0f ? c * ST2084_MAX_LUMINANCE / REFERENCE_WHITE : 0.0f;
++}
++
++vec3 bt2408_yuv2lrgb(vec3 yuv) {
++    vec3 c = yuv * BT2408_IN_CODE;
++    c = vec3((c.x - 64.0f) / 876.0f, (c.y - 512.0f) / 896.0f, (c.z - 512.0f) / 896.0f);
++    vec3 rgb = vec3(
++        rgb_matrix[0] * c.x + rgb_matrix[1] * c.y + rgb_matrix[2] * c.z,
++        rgb_matrix[3] * c.x + rgb_matrix[4] * c.y + rgb_matrix[5] * c.z,
++        rgb_matrix[6] * c.x + rgb_matrix[7] * c.y + rgb_matrix[8] * c.z
++    );
++    return vec3(eotf_st2084(rgb.x), eotf_st2084(rgb.y), eotf_st2084(rgb.z));
++}
++
++shared uint tile_sum;
++shared uint tile_max;
++shared uint tile_black;
++shared uint tile_valid;
++shared uint tile_hist[64];
++
++void main()
++{
++    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
++    ivec2 size_y = textureSize(input_img[0], 0);
++
++    if (gl_LocalInvocationIndex == 0u) {
++        tile_sum = 0u;
++        tile_max = 0u;
++        tile_black = 0u;
++        tile_valid = 0u;
++    }
++    if (gl_LocalInvocationIndex < 64u)
++        tile_hist[gl_LocalInvocationIndex] = 0u;
++
++    barrier();
++
++    if (pos.x < size_y.x && pos.y < size_y.y) {
++        atomicAdd(tile_valid, 1u);
++
++        float y_in = texelFetch(input_img[0], pos, 0).r;
++        vec2 uv_in = texelFetch(input_img[1], pos / 2, 0).rg;
++        vec3 lrgb = bt2408_yuv2lrgb(vec3(y_in, uv_in.x, uv_in.y));
++
++        float luma = 0.2627f * lrgb.x + 0.6780f * lrgb.y + 0.0593f * lrgb.z;
++        float nits = luma * 100.0f;
++        float x = clamp(nits / 10000.0f, 0.0f, 1.0f);
++        float xm = pow(max(x, 0.0f), ST2084_M1);
++        float y_pq_f = pow((ST2084_C1 + ST2084_C2 * xm) / (1.0f + ST2084_C3 * xm), ST2084_M2);
++        float t = clamp(y_pq_f / 0.01f, 0.0f, 1.0f);
++        y_pq_f *= t * t * (3.0f - 2.0f * t);
++        y_pq_f = clamp(y_pq_f, 0.0f, 1.0f);
++        uint y_pq = uint(16383.0f * y_pq_f);
++
++        atomicAdd(tile_sum, y_pq);
++        atomicMax(tile_max, y_pq);
++        if (y_pq == 0u)
++            atomicAdd(tile_black, 1u);
++        int bin = clamp((int(y_pq) >> 7) - 64, 0, 63);
++        atomicAdd(tile_hist[bin], 1u);
++    }
++
++    barrier();
++
++    if (gl_LocalInvocationIndex == 0u) {
++        if (tile_valid > 0u) {
++            tile_hist[0] -= tile_black;
++            uint num = tile_valid - tile_black;
++            atomicAdd(stats_wg_count, 1u);
++            if (num > 0u) {
++                atomicAdd(stats_wg_active, 1u);
++                uint tile_sum_avg = tile_sum / num;
++                uint prev = atomicAdd(stats_sum_lo, tile_sum_avg);
++                if (prev + tile_sum_avg < prev)
++                    atomicAdd(stats_sum_hi, 1u);
++                atomicMax(stats_max_pq, tile_max);
++            }
++            for (int i = 0; i < 64; i++) {
++                if (tile_hist[i] > 0u)
++                    atomicAdd(stats_hist[i], tile_hist[i]);
++            }
++        }
++    }
++}

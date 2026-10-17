@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patch 0019 (tonemap_vulkan).
+"""Regression tests for patches 0019 and 0021 (tonemap_vulkan).
 
 0019: the new tonemap_vulkan filter runs the CPU tonemap=bt2408_hable math in
 a compute shader. On flat frames the Vulkan path gives the same 8-bit code
@@ -11,6 +11,12 @@ other input; the test checks that refusal on an HLG frame.
 
 The planted wrong case is a run at four times the peak, which the
 comparison must refuse.
+
+0021: with peak_detect=1 the Vulkan path measures the peak of the frame in a
+compute shader and gives the same output as the CPU detector. The detected
+peak of a flat frame is far below the fixed peak of 1000 cd/m^2, so the test
+also checks that detection changes the output; the planted wrong case runs
+the Vulkan path at four times the peak against the CPU detector.
 
 The device cases need an FFmpeg built with the series and zimg, and a Vulkan
 device:
@@ -45,6 +51,7 @@ VULKAN = (
     "format=p010,hwupload,tonemap_vulkan=tonemap=bt2408_hable:peak={peak},"
     "hwdownload,format=nv12,format=yuv420p"
 )
+DETECT = "0:peak_detect=1"
 HLG_INPUT = "setparams=color_trc=arib-std-b67"
 PQ_ONLY = "Unsupported input color properties"
 
@@ -70,7 +77,7 @@ def output(frame: bytes, chain: str) -> bytes:
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")
 class Bt2408HableTest(unittest.TestCase):
-    """0019: the Vulkan bt2408_hable path must match the CPU path."""
+    """0019, 0021: the Vulkan bt2408_hable path must match the CPU path."""
 
     def test_vulkan_matches_cpu(self) -> None:
         for colour in COLOURS:
@@ -85,6 +92,32 @@ class Bt2408HableTest(unittest.TestCase):
         for colour in COLOURS:
             frame = flat_frame(*colour)
             cpu = centre_yuv(output(frame, CPU.format(peak=10)))
+            vulkan = centre_yuv(output(frame, VULKAN.format(peak=40)))
+            worst = max(worst, worst_difference(cpu, vulkan))
+        self.assertGreater(worst, 1)
+
+    def test_detected_peak_matches_cpu(self) -> None:
+        for colour in COLOURS:
+            with self.subTest(colour=colour):
+                frame = flat_frame(*colour)
+                cpu = centre_yuv(output(frame, CPU.format(peak=DETECT)))
+                vulkan = centre_yuv(output(frame, VULKAN.format(peak=DETECT)))
+                self.assertLessEqual(worst_difference(cpu, vulkan), 1, f"cpu {cpu} vulkan {vulkan}")
+
+    def test_detection_changes_the_output(self) -> None:
+        worst = 0
+        for colour in COLOURS:
+            frame = flat_frame(*colour)
+            fixed = centre_yuv(output(frame, VULKAN.format(peak=10)))
+            detected = centre_yuv(output(frame, VULKAN.format(peak=DETECT)))
+            worst = max(worst, worst_difference(fixed, detected))
+        self.assertGreater(worst, 1)
+
+    def test_planted_wrong_detected_peak_is_refused(self) -> None:
+        worst = 0
+        for colour in COLOURS:
+            frame = flat_frame(*colour)
+            cpu = centre_yuv(output(frame, CPU.format(peak=DETECT)))
             vulkan = centre_yuv(output(frame, VULKAN.format(peak=40)))
             worst = max(worst, worst_difference(cpu, vulkan))
         self.assertGreater(worst, 1)
