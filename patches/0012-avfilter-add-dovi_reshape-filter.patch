@@ -1,0 +1,731 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 18:19:31 +0200
+Subject: [PATCH] avfilter: add dovi_reshape filter
+
+Apply the Dolby Vision RPU of each frame on the CPU and output PQ
+BT.2020 RGB, so that profile 5 content can go through zscale and
+tonemap without libplacebo:
+
+  dovi_reshape,zscale=t=linear:npl=100,tonemap=hable,zscale=...
+
+The filter takes planar YUV at 8 to 12 bits, upsamples chroma
+bilinearly at the frame's chroma location (left when unspecified), and
+reshapes and decodes each pixel with the shared helper. Output is
+gbrpf32, full range. The Dolby Vision side data is removed; mastering
+display metadata is rebuilt from the RPU's source luminance range, as
+libplacebo does, and a level 1 block becomes the frame's content light
+level. Frames without an RPU, limited range frames and residual
+enhancement layers are refused.
+
+The reshaped output matches vf_libplacebo's own reshaping to within one
+10-bit PQ code value at the 95th percentile on a generated profile 5
+clip.
+
+The test runs the filter in a graph on a frame whose chroma is a ramp,
+so every expected pixel is exact, and checks the side data. Two planted
+cases, a wrong chroma siting and a wrong coefficient in the frame's RPU,
+must miss the expected colours; a limited range frame must be refused.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi                         |  31 ++
+ libavfilter/Makefile                     |   1 +
+ libavfilter/allfilters.c                 |   1 +
+ libavfilter/tests/dovi_reshape.c         | 200 ++++++++++++-
+ libavfilter/vf_dovi_reshape.c            | 361 +++++++++++++++++++++++
+ tests/fate/filter-video.mak              |   4 +
+ tests/ref/fate/filter-dovi-reshape-graph |   5 +
+ 7 files changed, 601 insertions(+), 2 deletions(-)
+ create mode 100644 libavfilter/vf_dovi_reshape.c
+ create mode 100644 tests/ref/fate/filter-dovi-reshape-graph
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 3534c87c9be9374db14189a28324cf95efc4b576..39b1d71386839ac9c3cc8d03d080aaf49d3fddef 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -12308,6 +12308,37 @@ please use tools/python/tf_sess_config.py to get the configs of TensorFlow backe
+ 
+ @end itemize
+ 
++@section dovi_reshape
++Apply the Dolby Vision reshaping signalled in each frame's RPU and decode the
++result to nonlinear (PQ) BT.2020 RGB.
++
++Single-layer Dolby Vision streams such as profile 5 carry their picture in a
++proprietary IPT colour space that only the RPU metadata turns into displayable
++colour. This filter performs that step on the CPU, so that @ref{zscale} and
++@ref{tonemap} can process the output like HDR10 content. The math follows the
++Dolby Vision support in libplacebo.
++
++The input is planar YUV with 8 to 12 bits per component, full range, with
++@code{AV_FRAME_DATA_DOVI_METADATA} side data on every frame, as the HEVC and AV1
++decoders export it. Chroma is upsampled bilinearly, honouring the frame's chroma
++location. The output is @code{gbrpf32} tagged as BT.2020 primaries, SMPTE ST 2084
++transfer and full range. The Dolby Vision side data is removed, and mastering
++display metadata built from the RPU's source luminance range replaces any the
++frame carried. When the RPU has a level 1 block, its maximum and average
++luminance of the shot become the frame's content light level (MaxCLL and
++MaxFALL); without one, content light level metadata is removed.
++
++Frames without Dolby Vision metadata, limited range frames, and streams whose RPU
++signals a residual enhancement layer (profile 7) are refused with an error.
++
++The filter has no options.
++
++@subsection Example
++Tone map a profile 5 file to SDR BT.709:
++@example
++ffmpeg -i dv5.mp4 -vf dovi_reshape,zscale=t=linear:npl=100,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p out.mp4
++@end example
++
+ @section drawbox
+ 
+ Draw a colored box on the input image.
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index c0731a5b0f31a6ed7059a47c6d6e06df1246d637..42e5e66e62fa739d5cf5a77e3078b936544dcbef 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -295,6 +295,7 @@ OBJS-$(CONFIG_DNN_CLASSIFY_FILTER)           += vf_dnn_classify.o
+ OBJS-$(CONFIG_DNN_DETECT_FILTER)             += vf_dnn_detect.o
+ OBJS-$(CONFIG_DNN_PROCESSING_FILTER)         += vf_dnn_processing.o
+ OBJS-$(CONFIG_DOUBLEWEAVE_FILTER)            += vf_weave.o
++OBJS-$(CONFIG_DOVI_RESHAPE_FILTER)           += vf_dovi_reshape.o dovi_reshape.o
+ OBJS-$(CONFIG_DRAWBOX_FILTER)                += vf_drawbox.o
+ OBJS-$(CONFIG_DRAWGRAPH_FILTER)              += f_drawgraph.o
+ OBJS-$(CONFIG_DRAWGRID_FILTER)               += vf_drawbox.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 402b843649b4f5369cf80714eef53755fad9ac9a..d6f1e832c44b94d19edaa3a989d0a3c1cfa6bf02 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -269,6 +269,7 @@ extern const FFFilter ff_vf_dnn_classify;
+ extern const FFFilter ff_vf_dnn_detect;
+ extern const FFFilter ff_vf_dnn_processing;
+ extern const FFFilter ff_vf_doubleweave;
++extern const FFFilter ff_vf_dovi_reshape;
+ extern const FFFilter ff_vf_drawbox;
+ extern const FFFilter ff_vf_drawgraph;
+ extern const FFFilter ff_vf_drawgrid;
+diff --git a/libavfilter/tests/dovi_reshape.c b/libavfilter/tests/dovi_reshape.c
+index 8285ca116ac47e7ea7025659f9b6381e907c753c..6092538793c1ad0a99cdb8a24944496a5bcbefaa 100644
+--- a/libavfilter/tests/dovi_reshape.c
++++ b/libavfilter/tests/dovi_reshape.c
+@@ -18,11 +18,20 @@
+ 
+ #include <math.h>
+ #include <stdio.h>
++#include <string.h>
+ 
++#include "libavutil/csp.h"
+ #include "libavutil/dovi_meta.h"
+ #include "libavutil/error.h"
++#include "libavutil/frame.h"
++#include "libavutil/log.h"
++#include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/mem.h"
+ 
++#include "libavfilter/avfilter.h"
++#include "libavfilter/buffersink.h"
++#include "libavfilter/buffersrc.h"
++
+ #include "libavfilter/dovi_reshape.c"
+ 
+ /*
+@@ -194,15 +203,202 @@ static int check_refusals(AVDOVIMetadata *md)
+     return fails;
+ }
+ 
+-int main(void)
++/*
++ * The filter, run in a graph on a 16x8 yuv420p10 frame. Chroma is a
++ * horizontal ramp that is constant down each column, so bilinear upsampling
++ * is exact and the expected colour of every pixel follows from the siting.
++ */
++#define FW 16
++#define FH 8
++#define L1_MAX_PQ 2081
++#define L1_AVG_PQ 1400
++#define FILTER_TOL 1e-4f
++
++static int luma_at(int x, int y)  { return 100 + 55 * x + 7 * y; }
++static float cb_at(float c)       { return 300 + 40 * c; }
++static float cr_at(float c)       { return 700 - 30 * c; }
++
++static AVFrame *make_frame(const AVDOVIMetadata *md, size_t md_size,
++                           enum AVChromaLocation loc, enum AVColorRange range)
++{
++    AVFrame *f = av_frame_alloc();
++    AVFrameSideData *sd = NULL;
++
++    if (!f)
++        return NULL;
++    f->format = AV_PIX_FMT_YUV420P10;
++    f->width  = FW;
++    f->height = FH;
++    f->color_range = range;
++    f->chroma_location = loc;
++    if (av_frame_get_buffer(f, 0) >= 0)
++        sd = av_frame_new_side_data(f, AV_FRAME_DATA_DOVI_METADATA, md_size);
++    if (!sd) {
++        av_frame_free(&f);
++        return NULL;
++    }
++    memcpy(sd->data, md, md_size);
++    for (int y = 0; y < FH; y++) {
++        uint16_t *row = (uint16_t *)(f->data[0] + y * f->linesize[0]);
++        for (int x = 0; x < FW; x++)
++            row[x] = luma_at(x, y);
++    }
++    for (int y = 0; y < FH / 2; y++) {
++        uint16_t *cb = (uint16_t *)(f->data[1] + y * f->linesize[1]);
++        uint16_t *cr = (uint16_t *)(f->data[2] + y * f->linesize[2]);
++        for (int c = 0; c < FW / 2; c++) {
++            cb[c] = cb_at(c);
++            cr[c] = cr_at(c);
++        }
++    }
++    return f;
++}
++
++/* Runs buffer -> dovi_reshape -> buffersink on one frame. */
++static int run_filter(AVFrame *in, AVFrame *out)
++{
++    AVFilterGraph *g = avfilter_graph_alloc();
++    AVFilterContext *src = NULL, *dr = NULL, *sink = NULL;
++    char args[128];
++    int ret;
++
++    if (!g)
++        return AVERROR(ENOMEM);
++    snprintf(args, sizeof(args), "video_size=%dx%d:pix_fmt=%d:time_base=1/25:range=%d",
++             in->width, in->height, in->format, in->color_range);
++    ret = avfilter_graph_create_filter(&src, avfilter_get_by_name("buffer"), "in", args, NULL, g);
++    if (ret >= 0)
++        ret = avfilter_graph_create_filter(&dr, avfilter_get_by_name("dovi_reshape"), "dr", NULL, NULL, g);
++    if (ret >= 0)
++        ret = avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", NULL, NULL, g);
++    if (ret >= 0)
++        ret = avfilter_link(src, 0, dr, 0);
++    if (ret >= 0)
++        ret = avfilter_link(dr, 0, sink, 0);
++    if (ret >= 0)
++        ret = avfilter_graph_config(g, NULL);
++    if (ret >= 0)
++        ret = av_buffersrc_add_frame_flags(src, in, AV_BUFFERSRC_FLAG_KEEP_REF);
++    if (ret >= 0)
++        ret = av_buffersrc_add_frame(src, NULL);
++    if (ret >= 0)
++        ret = av_buffersink_get_frame(sink, out);
++    avfilter_graph_free(&g);
++    return ret;
++}
++
++/* Expected output for left (co-sited) horizontal chroma siting. */
++static int pixels_match(const FFDoviReshape *s, const AVFrame *out)
++{
++    for (int y = 0; y < FH; y++) {
++        for (int x = 0; x < FW; x++) {
++            float c = FFMIN(x / 2.0f, FW / 2 - 1), ycc[3], rgb[3], got[3];
++            ycc[0] = luma_at(x, y) / 1023.0f;
++            ycc[1] = cb_at(c) / 1023.0f;
++            ycc[2] = cr_at(c) / 1023.0f;
++            ff_dovi_reshape_pixel(s, ycc, rgb);
++            got[0] = ((const float *)(out->data[2] + y * out->linesize[2]))[x];
++            got[1] = ((const float *)(out->data[0] + y * out->linesize[0]))[x];
++            got[2] = ((const float *)(out->data[1] + y * out->linesize[1]))[x];
++            if (!near(got, rgb, FILTER_TOL))
++                return 0;
++        }
++    }
++    return 1;
++}
++
++static int side_data_ok(const FFDoviReshape *s, const AVFrame *out)
++{
++    const av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
++    const AVFrameSideData *mdm_sd = av_frame_get_side_data(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    const AVFrameSideData *clm_sd = av_frame_get_side_data(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    const AVMasteringDisplayMetadata *mdm;
++    const AVContentLightMetadata *clm;
++
++    if (av_frame_get_side_data(out, AV_FRAME_DATA_DOVI_METADATA) || !mdm_sd || !clm_sd)
++        return 0;
++    mdm = (const AVMasteringDisplayMetadata *)mdm_sd->data;
++    clm = (const AVContentLightMetadata *)clm_sd->data;
++    return mdm->has_luminance &&
++           fabs(av_q2d(mdm->max_luminance) - pq_eotf(s->max_pq)) < 0.01 &&
++           fabs(av_q2d(mdm->min_luminance) - pq_eotf(s->min_pq)) < 0.01 &&
++           clm->MaxCLL  == lrint(pq_eotf(L1_MAX_PQ / 4095.0)) &&
++           clm->MaxFALL == lrint(pq_eotf(L1_AVG_PQ / 4095.0)) &&
++           out->format == AV_PIX_FMT_GBRPF32 && out->colorspace == AVCOL_SPC_RGB &&
++           out->color_trc == AVCOL_TRC_SMPTE2084 && out->color_primaries == AVCOL_PRI_BT2020 &&
++           out->color_range == AVCOL_RANGE_JPEG;
++}
++
++/* Returns 1 when the filter output matches the reference colours. */
++static int filter_matches(const FFDoviReshape *s, const AVDOVIMetadata *md, size_t md_size,
++                          enum AVChromaLocation loc, int *side_ok)
++{
++    AVFrame *in = make_frame(md, md_size, loc, AVCOL_RANGE_JPEG);
++    AVFrame *out = av_frame_alloc();
++    int ret = in && out ? run_filter(in, out) : AVERROR(ENOMEM);
++    int match = ret >= 0 && pixels_match(s, out);
++
++    if (side_ok)
++        *side_ok = ret >= 0 && side_data_ok(s, out);
++    av_frame_free(&in);
++    av_frame_free(&out);
++    return ret < 0 ? ret : match;
++}
++
++static int check_filter(AVDOVIMetadata *md, size_t md_size)
++{
++    AVDOVIDmData *l1 = av_dovi_get_ext(md, 0);
++    AVFrame *in, *out;
++    FFDoviReshape s;
++    int ret, side_ok = 0, fails = 0;
++
++    md->num_ext_blocks = 1;
++    l1->level = 1;
++    l1->l1.max_pq = L1_MAX_PQ;
++    l1->l1.avg_pq = L1_AVG_PQ;
++    ff_dovi_reshape_init(&s, md);
++
++    ret = filter_matches(&s, md, md_size, AVCHROMA_LOC_UNSPECIFIED, &side_ok);
++    printf("pixels, unspecified siting read as left: %s\n", ret == 1 ? "ok" : "WRONG");
++    printf("side data: %s\n", side_ok ? "ok" : "WRONG");
++    fails += (ret != 1) + !side_ok;
++
++    ret = filter_matches(&s, md, md_size, AVCHROMA_LOC_CENTER, NULL);
++    printf("planted wrong chroma siting: %s\n", ret == 0 ? "detected" : "MISSED");
++    fails += ret != 0;
++
++    av_dovi_get_mapping(md)->curves[1].mmr_coef[0][0][1] += 83886;
++    ret = filter_matches(&s, md, md_size, AVCHROMA_LOC_LEFT, NULL);
++    av_dovi_get_mapping(md)->curves[1].mmr_coef[0][0][1] -= 83886;
++    printf("planted wrong coefficient in the frame: %s\n", ret == 0 ? "detected" : "MISSED");
++    fails += ret != 0;
++
++    in  = make_frame(md, md_size, AVCHROMA_LOC_LEFT, AVCOL_RANGE_MPEG);
++    out = av_frame_alloc();
++    ret = in && out ? run_filter(in, out) : AVERROR(ENOMEM);
++    printf("limited range: %s\n", ret == AVERROR(ENOTSUP) ? "refused" : "ACCEPTED");
++    fails += ret != AVERROR(ENOTSUP);
++    av_frame_free(&in);
++    av_frame_free(&out);
++    return fails;
++}
++
++int main(int argc, char **argv)
+ {
+-    AVDOVIMetadata *md = av_dovi_metadata_alloc(NULL);
++    size_t md_size;
++    AVDOVIMetadata *md = av_dovi_metadata_alloc(&md_size);
+     FFDoviReshape s;
+     int ret, fails = 0;
+ 
+     if (!md)
+         return 1;
+     fill(md);
++    if (argc > 1 && !strcmp(argv[1], "filter")) {
++        av_log_set_level(AV_LOG_QUIET);
++        fails = check_filter(md, md_size);
++        av_free(md);
++        return fails != 0;
++    }
+ 
+     ret = ff_dovi_reshape_init(&s, md);
+     printf("init: %s\n", ret < 0 ? av_err2str(ret) : "ok");
+diff --git a/libavfilter/vf_dovi_reshape.c b/libavfilter/vf_dovi_reshape.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8ca43d2b026eb1b53bd17e9bb71cb5898b1c1dc
+--- /dev/null
++++ b/libavfilter/vf_dovi_reshape.c
+@@ -0,0 +1,361 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Apply the Dolby Vision RPU reshaping of each frame and decode the result to
++ * PQ BT.2020 RGB, so that zscale and tonemap can process profile 5 content.
++ */
++
++#include <math.h>
++
++#include "libavutil/csp.h"
++#include "libavutil/dovi_meta.h"
++#include "libavutil/frame.h"
++#include "libavutil/mastering_display_metadata.h"
++#include "libavutil/mem.h"
++#include "libavutil/pixdesc.h"
++
++#include "avfilter.h"
++#include "dovi_reshape.h"
++#include "filters.h"
++#include "formats.h"
++#include "video.h"
++
++/* Bilinear taps from the luma grid into one chroma plane, per axis. */
++typedef struct ChromaTaps {
++    int   *i0, *i1;
++    float *w;
++} ChromaTaps;
++
++typedef struct DoviReshapeContext {
++    const AVClass *class;
++    const AVPixFmtDescriptor *desc;
++    float norm;
++    int loc;                 ///< chroma location the taps were built for, or -1
++    ChromaTaps tx, ty;
++} DoviReshapeContext;
++
++typedef struct ThreadData {
++    const FFDoviReshape *rs;
++    const AVFrame *in;
++    AVFrame *out;
++} ThreadData;
++
++static const enum AVPixelFormat in_fmts[] = {
++    AV_PIX_FMT_YUV420P,   AV_PIX_FMT_YUV422P,   AV_PIX_FMT_YUV444P,
++    AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10,
++    AV_PIX_FMT_YUV420P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV444P12,
++    AV_PIX_FMT_NONE,
++};
++
++static int query_formats(const AVFilterContext *ctx,
++                         AVFilterFormatsConfig **cfg_in,
++                         AVFilterFormatsConfig **cfg_out)
++{
++    int ret;
++
++    ret = ff_formats_ref(ff_make_pixel_format_list(in_fmts), &cfg_in[0]->formats);
++    if (ret < 0)
++        return ret;
++    ret = ff_formats_ref(ff_make_formats_list_singleton(AV_PIX_FMT_GBRPF32),
++                         &cfg_out[0]->formats);
++    if (ret < 0)
++        return ret;
++    ret = ff_formats_ref(ff_all_color_spaces(), &cfg_in[0]->color_spaces);
++    if (ret < 0)
++        return ret;
++    ret = ff_formats_ref(ff_make_formats_list_singleton(AVCOL_SPC_RGB),
++                         &cfg_out[0]->color_spaces);
++    if (ret < 0)
++        return ret;
++    ret = ff_formats_ref(ff_all_color_ranges(), &cfg_in[0]->color_ranges);
++    if (ret < 0)
++        return ret;
++    return ff_formats_ref(ff_make_formats_list_singleton(AVCOL_RANGE_JPEG),
++                          &cfg_out[0]->color_ranges);
++}
++
++/* Chroma sample c sits at luma position (c << shift) + offset. */
++static int init_taps(ChromaTaps *t, int len, int shift, float offset, int clen)
++{
++    t->i0 = av_malloc_array(len, sizeof(*t->i0));
++    t->i1 = av_malloc_array(len, sizeof(*t->i1));
++    t->w  = av_malloc_array(len, sizeof(*t->w));
++    if (!t->i0 || !t->i1 || !t->w)
++        return AVERROR(ENOMEM);
++
++    for (int x = 0; x < len; x++) {
++        float pos = av_clipf((x - offset) / (1 << shift), 0.0f, clen - 1);
++        int i = FFMIN((int)pos, clen - 1);
++        t->i0[x] = i;
++        t->i1[x] = FFMIN(i + 1, clen - 1);
++        t->w[x]  = pos - i;
++    }
++    return 0;
++}
++
++static void free_taps(ChromaTaps *t)
++{
++    av_freep(&t->i0);
++    av_freep(&t->i1);
++    av_freep(&t->w);
++}
++
++static int config_input(AVFilterLink *inlink)
++{
++    DoviReshapeContext *s = inlink->dst->priv;
++
++    s->desc = av_pix_fmt_desc_get(inlink->format);
++    s->norm = 1.0f / ((1 << s->desc->comp[0].depth) - 1);
++    s->loc  = -1;
++    return 0;
++}
++
++/* Chroma siting is a frame property, so the taps follow the frame. */
++static int update_taps(DoviReshapeContext *s, const AVFrame *in)
++{
++    const AVPixFmtDescriptor *desc = s->desc;
++    enum AVChromaLocation loc = in->chroma_location;
++    int cw = AV_CEIL_RSHIFT(in->width,  desc->log2_chroma_w);
++    int ch = AV_CEIL_RSHIFT(in->height, desc->log2_chroma_h);
++    int xpos = 0, ypos = 0, ret;
++
++    if (loc == AVCHROMA_LOC_UNSPECIFIED)
++        loc = AVCHROMA_LOC_LEFT;
++    if ((int)loc == s->loc)
++        return 0;
++
++    if (desc->log2_chroma_w || desc->log2_chroma_h)
++        av_chroma_location_enum_to_pos(&xpos, &ypos, loc);
++    free_taps(&s->tx);
++    free_taps(&s->ty);
++    s->loc = -1;
++    ret = init_taps(&s->tx, in->width, desc->log2_chroma_w,
++                    desc->log2_chroma_w ? xpos / 256.0f : 0.0f, cw);
++    if (ret >= 0)
++        ret = init_taps(&s->ty, in->height, desc->log2_chroma_h,
++                        desc->log2_chroma_h ? ypos / 256.0f : 0.0f, ch);
++    if (ret >= 0)
++        s->loc = loc;
++    return ret;
++}
++
++static av_always_inline float sample(const uint8_t *row, int x, int hbd)
++{
++    return hbd ? ((const uint16_t *)row)[x] : row[x];
++}
++
++static float chroma(const AVFrame *in, int p, const DoviReshapeContext *s,
++                    int x, int y, int hbd)
++{
++    const ChromaTaps *tx = &s->tx, *ty = &s->ty;
++    const uint8_t *r0 = in->data[p] + ty->i0[y] * in->linesize[p];
++    const uint8_t *r1 = in->data[p] + ty->i1[y] * in->linesize[p];
++    float top = sample(r0, tx->i0[x], hbd) * (1.0f - tx->w[x]) +
++                sample(r0, tx->i1[x], hbd) * tx->w[x];
++    float bot = sample(r1, tx->i0[x], hbd) * (1.0f - tx->w[x]) +
++                sample(r1, tx->i1[x], hbd) * tx->w[x];
++
++    return (top + (bot - top) * ty->w[y]) * s->norm;
++}
++
++static int reshape_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
++{
++    const DoviReshapeContext *s = ctx->priv;
++    const ThreadData *td = arg;
++    const AVFrame *in = td->in;
++    AVFrame *out = td->out;
++    const int hbd = s->desc->comp[0].depth > 8;
++    const int y0 = in->height * jobnr / nb_jobs;
++    const int y1 = in->height * (jobnr + 1) / nb_jobs;
++
++    for (int y = y0; y < y1; y++) {
++        const uint8_t *luma = in->data[0] + y * in->linesize[0];
++        float *g = (float *)(out->data[0] + y * out->linesize[0]);
++        float *b = (float *)(out->data[1] + y * out->linesize[1]);
++        float *r = (float *)(out->data[2] + y * out->linesize[2]);
++
++        for (int x = 0; x < in->width; x++) {
++            float ycc[3], rgb[3];
++            ycc[0] = sample(luma, x, hbd) * s->norm;
++            ycc[1] = chroma(in, 1, s, x, y, hbd);
++            ycc[2] = chroma(in, 2, s, x, y, hbd);
++            ff_dovi_reshape_pixel(td->rs, ycc, rgb);
++            r[x] = rgb[0];
++            g[x] = rgb[1];
++            b[x] = rgb[2];
++        }
++    }
++    return 0;
++}
++
++/*
++ * The level 1 block carries the per-shot luminance range. Tone mappers that
++ * read only static metadata (ff_determine_signal_peak) see it as the content
++ * light level of the frame, as libplacebo does with max_pq_y and avg_pq_y.
++ */
++static int set_light_level(AVFrame *out, av_csp_trc_function pq_eotf)
++{
++    const AVFrameSideData *sd = av_frame_get_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
++    const AVDOVIDmData *l1 = av_dovi_find_level((const AVDOVIMetadata *)sd->data, 1);
++    AVContentLightMetadata *clm;
++
++    av_frame_remove_side_data(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    if (!l1)
++        return 0;
++    clm = av_content_light_metadata_create_side_data(out);
++    if (!clm)
++        return AVERROR(ENOMEM);
++    clm->MaxCLL  = lrint(pq_eotf(l1->l1.max_pq / 4095.0));
++    clm->MaxFALL = lrint(pq_eotf(l1->l1.avg_pq / 4095.0));
++    return 0;
++}
++
++/* The reshaped signal is described by the RPU, not by the base layer. */
++static int set_output_props(AVFrame *out, const FFDoviReshape *rs)
++{
++    const av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
++    const AVColorPrimariesDesc *bt2020 = av_csp_primaries_desc_from_id(AVCOL_PRI_BT2020);
++    AVMasteringDisplayMetadata *mdm;
++    int ret = set_light_level(out, pq_eotf);
++
++    if (ret < 0)
++        return ret;
++    av_frame_remove_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
++    av_frame_remove_side_data(out, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++    av_frame_remove_side_data(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++
++    out->color_primaries = AVCOL_PRI_BT2020;
++    out->color_trc       = AVCOL_TRC_SMPTE2084;
++    out->colorspace      = AVCOL_SPC_RGB;
++    out->color_range     = AVCOL_RANGE_JPEG;
++
++    mdm = av_mastering_display_metadata_create_side_data(out);
++    if (!mdm)
++        return AVERROR(ENOMEM);
++    mdm->display_primaries[0][0] = bt2020->prim.r.x;
++    mdm->display_primaries[0][1] = bt2020->prim.r.y;
++    mdm->display_primaries[1][0] = bt2020->prim.g.x;
++    mdm->display_primaries[1][1] = bt2020->prim.g.y;
++    mdm->display_primaries[2][0] = bt2020->prim.b.x;
++    mdm->display_primaries[2][1] = bt2020->prim.b.y;
++    mdm->white_point[0] = bt2020->wp.x;
++    mdm->white_point[1] = bt2020->wp.y;
++    mdm->min_luminance = av_d2q(pq_eotf(rs->min_pq), 1 << 16);
++    mdm->max_luminance = av_d2q(pq_eotf(rs->max_pq), 1 << 16);
++    mdm->has_primaries = 1;
++    mdm->has_luminance = 1;
++    return 0;
++}
++
++static int check_input(AVFilterContext *ctx, const AVFrame *in, FFDoviReshape *rs)
++{
++    const AVFrameSideData *sd = av_frame_get_side_data(in, AV_FRAME_DATA_DOVI_METADATA);
++    int ret;
++
++    if (!sd) {
++        av_log(ctx, AV_LOG_ERROR, "Frame carries no Dolby Vision metadata\n");
++        return AVERROR(EINVAL);
++    }
++    if (in->color_range == AVCOL_RANGE_MPEG) {
++        av_log(ctx, AV_LOG_ERROR, "Limited range base layers are not supported\n");
++        return AVERROR(ENOTSUP);
++    }
++    ret = ff_dovi_reshape_init(rs, (const AVDOVIMetadata *)sd->data);
++    if (ret == AVERROR(ENOTSUP))
++        av_log(ctx, AV_LOG_ERROR, "The RPU signals a residual enhancement "
++               "layer; only single-layer streams such as profile 5 are supported\n");
++    else if (ret < 0)
++        av_log(ctx, AV_LOG_ERROR, "Invalid Dolby Vision reshaping metadata\n");
++    return ret;
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *ctx  = inlink->dst;
++    AVFilterLink *outlink = ctx->outputs[0];
++    FFDoviReshape rs;
++    ThreadData td;
++    AVFrame *out;
++    int ret;
++
++    ret = check_input(ctx, in, &rs);
++    if (ret >= 0)
++        ret = update_taps(ctx->priv, in);
++    if (ret < 0) {
++        av_frame_free(&in);
++        return ret;
++    }
++
++    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!out) {
++        av_frame_free(&in);
++        return AVERROR(ENOMEM);
++    }
++    ret = av_frame_copy_props(out, in);
++    if (ret >= 0)
++        ret = set_output_props(out, &rs);
++    if (ret < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return ret;
++    }
++
++    td = (ThreadData) { .rs = &rs, .in = in, .out = out };
++    ff_filter_execute(ctx, reshape_slice, &td, NULL,
++                      FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
++    av_frame_free(&in);
++    return ff_filter_frame(outlink, out);
++}
++
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    DoviReshapeContext *s = ctx->priv;
++
++    free_taps(&s->tx);
++    free_taps(&s->ty);
++}
++
++static const AVClass dovi_reshape_class = {
++    .class_name = "dovi_reshape",
++    .item_name  = av_default_item_name,
++    .version    = LIBAVUTIL_VERSION_INT,
++    .category   = AV_CLASS_CATEGORY_FILTER,
++};
++
++static const AVFilterPad dovi_reshape_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = filter_frame,
++        .config_props = config_input,
++    },
++};
++
++const FFFilter ff_vf_dovi_reshape = {
++    .p.name        = "dovi_reshape",
++    .p.description = NULL_IF_CONFIG_SMALL("Apply Dolby Vision reshaping and output PQ BT.2020 RGB."),
++    .p.priv_class  = &dovi_reshape_class,
++    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
++    .priv_size     = sizeof(DoviReshapeContext),
++    .uninit        = uninit,
++    FILTER_INPUTS(dovi_reshape_inputs),
++    FILTER_OUTPUTS(ff_video_default_filterpad),
++    FILTER_QUERY_FUNC2(query_formats),
++};
+diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
+index f9413cd3b4158d6d3f22a8eff55ada479d283fca..e90e7f5ae6b97fbb016db395f5b97c0076350d46 100644
+--- a/tests/fate/filter-video.mak
++++ b/tests/fate/filter-video.mak
+@@ -485,6 +485,10 @@ FATE_FILTER-yes += fate-filter-dovi-reshape
+ fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
+ fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
+ 
++FATE_FILTER-$(CONFIG_DOVI_RESHAPE_FILTER) += fate-filter-dovi-reshape-graph
++fate-filter-dovi-reshape-graph: libavfilter/tests/dovi_reshape$(EXESUF)
++fate-filter-dovi-reshape-graph: CMD = run libavfilter/tests/dovi_reshape$(EXESUF) filter
++
+ DRAWVG_SCRIPT_ALL = $(SRC_PATH)/tests/ref/lavf/drawvg.all
+ 
+ FATE_FILTER-$(CONFIG_DRAWVG_FILTER) += fate-filter-drawvg-interpreter
+diff --git a/tests/ref/fate/filter-dovi-reshape-graph b/tests/ref/fate/filter-dovi-reshape-graph
+new file mode 100644
+index 0000000000000000000000000000000000000000..198820e102110768073d4293676d541019e3dba8
+--- /dev/null
++++ b/tests/ref/fate/filter-dovi-reshape-graph
+@@ -0,0 +1,5 @@
++pixels, unspecified siting read as left: ok
++side data: ok
++planted wrong chroma siting: detected
++planted wrong coefficient in the frame: detected
++limited range: refused
