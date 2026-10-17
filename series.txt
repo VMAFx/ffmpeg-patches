@@ -20,3 +20,5 @@
 0013-avfilter-bt2408_hable-add-a-Hable-tone-map-on-IPT-in.patch
 0014-avfilter-vf_tonemap-add-the-bt2408_hable-tone-map.patch
 0015-avfilter-vf_zscale-keep-the-light-levels-when-linear.patch
+0016-avfilter-vf_tonemap_opencl-declare-the-output-matrix.patch
+0017-avfilter-vf_tonemap_opencl-add-the-bt2408_hable-tone.patch
