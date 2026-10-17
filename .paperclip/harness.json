@@ -11,7 +11,7 @@
   ],
   "push_format": "git push origin HEAD:refs/heads/paperclip/\u003cissue-id\u003e",
   "invariants": [
-    "HISS-01: recursion prohibited; call graph = DAG",
+    "HISS-01: recursion prohibited; call graph = DAG; C/C++: zero `goto`",
     "HISS-02: scalar upper bound on every loop; explicit deadline on every I/O call",
     "HISS-04: McCabe cyclomatic \u003c= 10, cognitive \u003c= 12, statements \u003c= 40; func LOC \u003c= 60 (audit ceiling)",
     "HISS-07: every error handled or wrapped with context",
