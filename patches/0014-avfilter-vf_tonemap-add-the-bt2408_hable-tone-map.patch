@@ -1,0 +1,404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 19:01:24 +0200
+Subject: [PATCH] avfilter/vf_tonemap: add the bt2408_hable tone map
+
+The new value maps HDR input to SDR BT.709 with the shared bt2408_hable
+helper. The peak comes from the content light level or the mastering
+display side data, as for the other curves, and the helper is rebuilt
+only when the peak or the primaries change. The output is tagged
+BT.709 and drops the light level side data, since it no longer
+describes the frame. The existing curves are untouched.
+
+The test runs the filter in a graph on the helper's test colours and
+checks the peak from MaxCLL, the peak from the mastering display, the
+output tags and a planted wrong MaxCLL.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi                           |  18 +++
+ libavfilter/Makefile                       |   2 +-
+ libavfilter/tests/bt2408_hable.c           | 146 ++++++++++++++++++++-
+ libavfilter/vf_tonemap.c                   |  68 +++++++++-
+ tests/fate/filter-video.mak                |   4 +
+ tests/ref/fate/filter-tonemap-bt2408-hable |   4 +
+ 6 files changed, 236 insertions(+), 6 deletions(-)
+ create mode 100644 tests/ref/fate/filter-tonemap-bt2408-hable
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 39b1d71386839ac9c3cc8d03d080aaf49d3fddef..bec0ee99d8bf91684dbabea697d677e4f86740ac 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -24242,6 +24242,12 @@ data should be linearized beforehand (and possibly correctly tagged).
+ ffmpeg -i INPUT -vf zscale=transfer=linear,tonemap=clip,zscale=transfer=bt709,format=yuv420p OUTPUT
+ @end example
+ 
++Tone map a Dolby Vision profile 5 or an HDR10 input to SDR BT.709:
++@example
++ffmpeg -i INPUT -vf dovi_reshape,zscale=transfer=linear,format=gbrpf32le,tonemap=bt2408_hable,zscale=transfer=bt709:matrix=bt709:range=tv,format=yuv420p OUTPUT
++@end example
++For HDR10 input, leave out @code{dovi_reshape}.
++
+ @subsection Options
+ The filter accepts the following options.
+ 
+@@ -24277,6 +24283,18 @@ important than color and brightness accuracy.
+ Smoothly map out-of-range values, while retaining contrast and colors for
+ in-range material as much as possible. Use it when color accuracy is more
+ important than detail preservation.
++
++@item bt2408_hable
++Map HDR input to SDR BT.709 the way libplacebo does with its @code{hable}
++tone mapping and clipping gamut mapping: the Hable curve is applied to the
++intensity of IPT, with the SDR reference white at 203 cd/m^2 (ITU-R BT.2408),
++and chroma is reduced as the curve compresses intensity. The input must use
++D65 primaries, with 1.0 = 100 cd/m^2 as @ref{zscale} produces with its default
++@option{npl}. The output is in BT.709 primaries and tagged as such, still in
++linear light, so that a following @code{zscale=transfer=bt709} encodes it for
++a BT.1886 display with a 1000:1 contrast. The content light level and
++mastering display side data are dropped from the output. The options
++@option{param} and @option{desat} are ignored.
+ @end table
+ 
+ Default is none.
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index ccc2e5a38c9f44da471d3a1c4a064550d11396ec..7066597b2f5dbd532827536ca879850595cf16b9 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -538,7 +538,7 @@ OBJS-$(CONFIG_TLUT2_FILTER)                  += vf_lut2.o framesync.o
+ OBJS-$(CONFIG_TMEDIAN_FILTER)                += vf_xmedian.o framesync.o
+ OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
+ OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
+-OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o
++OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o bt2408_hable.o
+ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o \
+                                                 opencl/tonemap.o opencl/colorspace_common.o
+ OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o
+diff --git a/libavfilter/tests/bt2408_hable.c b/libavfilter/tests/bt2408_hable.c
+index 52edc725b8528815211f9cc24bae67eda8bf1d7b..f867ba2bfb7bb5d8bfb0f1c0a3a01d5496d026e2 100644
+--- a/libavfilter/tests/bt2408_hable.c
++++ b/libavfilter/tests/bt2408_hable.c
+@@ -18,9 +18,15 @@
+ 
+ #include <math.h>
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include "libavutil/error.h"
++#include "libavutil/frame.h"
++#include "libavutil/mastering_display_metadata.h"
+ 
++#include "libavfilter/avfilter.h"
++#include "libavfilter/buffersink.h"
++#include "libavfilter/buffersrc.h"
+ #include "libavfilter/bt2408_hable.c"
+ 
+ #define PEAK 1000.0
+@@ -107,11 +113,149 @@ static int expect_refusal(enum AVColorPrimaries prim, double peak, const char *w
+     return ret != want;
+ }
+ 
+-int main(void)
++/* Runs buffer -> tonemap=bt2408_hable -> buffersink on one frame. */
++static int run_filter(AVFrame *in, AVFrame *out)
++{
++    AVFilterGraph *g = avfilter_graph_alloc();
++    AVFilterContext *src = NULL, *tm = NULL, *sink = NULL;
++    char args[128];
++    int ret;
++
++    if (!g)
++        return AVERROR(ENOMEM);
++    snprintf(args, sizeof(args), "video_size=%dx%d:pix_fmt=%d:time_base=1/25",
++             in->width, in->height, in->format);
++    ret = avfilter_graph_create_filter(&src, avfilter_get_by_name("buffer"), "in", args, NULL, g);
++    if (ret >= 0)
++        ret = avfilter_graph_create_filter(&tm, avfilter_get_by_name("tonemap"), "tm",
++                                           "tonemap=bt2408_hable", NULL, g);
++    if (ret >= 0)
++        ret = avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", NULL, NULL, g);
++    if (ret >= 0)
++        ret = avfilter_link(src, 0, tm, 0);
++    if (ret >= 0)
++        ret = avfilter_link(tm, 0, sink, 0);
++    if (ret >= 0)
++        ret = avfilter_graph_config(g, NULL);
++    if (ret >= 0)
++        ret = av_buffersrc_add_frame_flags(src, in, AV_BUFFERSRC_FLAG_KEEP_REF);
++    if (ret >= 0)
++        ret = av_buffersrc_add_frame(src, NULL);
++    if (ret >= 0)
++        ret = av_buffersink_get_frame(sink, out);
++    avfilter_graph_free(&g);
++    return ret;
++}
++
++static int add_light_levels(AVFrame *f, unsigned max_cll, unsigned mastering_max)
++{
++    if (max_cll) {
++        AVContentLightMetadata *cll = av_content_light_metadata_create_side_data(f);
++        if (!cll)
++            return AVERROR(ENOMEM);
++        cll->MaxCLL = max_cll;
++    }
++    if (mastering_max) {
++        AVMasteringDisplayMetadata *md = av_mastering_display_metadata_create_side_data(f);
++        if (!md)
++            return AVERROR(ENOMEM);
++        md->max_luminance = av_make_q(mastering_max, 1);
++        md->min_luminance = av_make_q(1, 10000);
++        md->has_luminance = 1;
++    }
++    return 0;
++}
++
++/* One row of the test colours in linear BT.2020, with the given light levels. */
++static AVFrame *make_frame(unsigned max_cll, unsigned mastering_max)
++{
++    const int w = FF_ARRAY_ELEMS(cases);
++    AVFrame *f = av_frame_alloc();
++
++    if (!f)
++        return NULL;
++    f->format = AV_PIX_FMT_GBRPF32;
++    f->width  = w;
++    f->height = 1;
++    f->color_primaries = AVCOL_PRI_BT2020;
++    f->color_trc       = AVCOL_TRC_LINEAR;
++    f->colorspace      = AVCOL_SPC_RGB;
++    if (av_frame_get_buffer(f, 0) < 0 || add_light_levels(f, max_cll, mastering_max) < 0) {
++        av_frame_free(&f);
++        return NULL;
++    }
++    for (int x = 0; x < w; x++) {
++        ((float *)f->data[2])[x] = cases[x].in[0];
++        ((float *)f->data[0])[x] = cases[x].in[1];
++        ((float *)f->data[1])[x] = cases[x].in[2];
++    }
++    return f;
++}
++
++/* Returns 1 when every pixel matches its expected colour. */
++static int frame_matches(const AVFrame *out)
++{
++    for (int x = 0; x < out->width; x++) {
++        const float got[3] = {
++            ((const float *)out->data[2])[x],
++            ((const float *)out->data[0])[x],
++            ((const float *)out->data[1])[x],
++        };
++        if (!near(got, cases[x].out))
++            return 0;
++    }
++    return 1;
++}
++
++/* Returns 1 on a match, 0 on a mismatch, a negative error when the run failed. */
++static int filter_case(unsigned max_cll, unsigned mastering_max, int *tags_ok)
++{
++    AVFrame *in = make_frame(max_cll, mastering_max), *out = av_frame_alloc();
++    int ret = in && out ? run_filter(in, out) : AVERROR(ENOMEM);
++
++    if (ret >= 0) {
++        if (tags_ok)
++            *tags_ok = out->color_primaries == AVCOL_PRI_BT709 &&
++                       out->color_trc == AVCOL_TRC_LINEAR &&
++                       !av_frame_get_side_data(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL) &&
++                       !av_frame_get_side_data(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++        ret = frame_matches(out);
++    }
++    av_frame_free(&in);
++    av_frame_free(&out);
++    return ret;
++}
++
++static int check_filter(void)
++{
++    int fails = 0, tags_ok = 0, ret;
++
++    ret = filter_case(1000, 0, &tags_ok);
++    printf("peak from MaxCLL: %s\n", ret == 1 ? "ok" : "WRONG");
++    printf("output tagged BT.709, light levels dropped: %s\n", tags_ok ? "ok" : "WRONG");
++    fails += ret != 1 || !tags_ok;
++
++    ret = filter_case(0, 1000, NULL);
++    printf("peak from mastering display: %s\n", ret == 1 ? "ok" : "WRONG");
++    fails += ret != 1;
++
++    /* The planted error: a frame whose MaxCLL says 4000 cd/m^2 must map differently. */
++    ret = filter_case(4000, 0, NULL);
++    printf("planted wrong MaxCLL: %s\n", ret == 0 ? "detected" : "MISSED");
++    fails += ret != 0;
++    return fails;
++}
++
++int main(int argc, char **argv)
+ {
+     FFBT2408Hable s;
+     int fails = 0;
+ 
++    if (argc > 1 && !strcmp(argv[1], "filter")) {
++        av_log_set_level(AV_LOG_QUIET);
++        return check_filter() != 0;
++    }
++
+     if (ff_bt2408_hable_init(&s, AVCOL_PRI_BT2020, PEAK) < 0) {
+         printf("init failed\n");
+         return 1;
+diff --git a/libavfilter/vf_tonemap.c b/libavfilter/vf_tonemap.c
+index c5be4b151025ef6d72fca55eb18680e46d77fb2b..60e6f66645093ce5771b1fea526ca7c2a23ffe2b 100644
+--- a/libavfilter/vf_tonemap.c
++++ b/libavfilter/vf_tonemap.c
+@@ -35,6 +35,7 @@
+ #include "libavutil/pixdesc.h"
+ 
+ #include "avfilter.h"
++#include "bt2408_hable.h"
+ #include "colorspace.h"
+ #include "filters.h"
+ #include "video.h"
+@@ -47,6 +48,7 @@ enum TonemapAlgorithm {
+     TONEMAP_REINHARD,
+     TONEMAP_HABLE,
+     TONEMAP_MOBIUS,
++    TONEMAP_BT2408_HABLE,
+     TONEMAP_MAX,
+ };
+ 
+@@ -60,6 +62,10 @@ typedef struct TonemapContext {
+     double peak;
+ 
+     const AVLumaCoefficients *coeffs;
++
++    FFBT2408Hable bt2408;
++    double bt2408_peak;
++    enum AVColorPrimaries bt2408_prim;
+ } TonemapContext;
+ 
+ static av_cold int init(AVFilterContext *ctx)
+@@ -172,6 +178,22 @@ static void tonemap(TonemapContext *s, AVFrame *out, const AVFrame *in,
+     *b_out *= sig / sig_orig;
+ }
+ 
++static void tonemap_bt2408(const FFBT2408Hable *s, AVFrame *out, const AVFrame *in,
++                           const AVPixFmtDescriptor *desc, int x, int y)
++{
++    float rgb[3], res[3];
++
++    for (int c = 0; c < 3; c++) {
++        const AVComponentDescriptor *comp = &desc->comp[c];
++        rgb[c] = *(const float *)(in->data[comp->plane] + x * comp->step + y * in->linesize[comp->plane]);
++    }
++    ff_bt2408_hable_pixel(s, rgb, res);
++    for (int c = 0; c < 3; c++) {
++        const AVComponentDescriptor *comp = &desc->comp[c];
++        *(float *)(out->data[comp->plane] + x * comp->step + y * out->linesize[comp->plane]) = res[c];
++    }
++}
++
+ typedef struct ThreadData {
+     AVFrame *in, *out;
+     const AVPixFmtDescriptor *desc;
+@@ -189,13 +211,40 @@ static int tonemap_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs
+     const int slice_end = ff_slice_pos(in->height, jobnr + 1, nb_jobs);
+     double peak = td->peak;
+ 
+-    for (int y = slice_start; y < slice_end; y++)
+-        for (int x = 0; x < out->width; x++)
+-            tonemap(s, out, in, desc, x, y, peak);
++    for (int y = slice_start; y < slice_end; y++) {
++        for (int x = 0; x < out->width; x++) {
++            if (s->tonemap == TONEMAP_BT2408_HABLE)
++                tonemap_bt2408(&s->bt2408, out, in, desc, x, y);
++            else
++                tonemap(s, out, in, desc, x, y, peak);
++        }
++    }
+ 
+     return 0;
+ }
+ 
++/* The output is SDR BT.709: the HDR metadata of the input no longer applies. */
++static int setup_bt2408(AVFilterContext *ctx, AVFrame *out, const AVFrame *in, double peak)
++{
++    TonemapContext *s = ctx->priv;
++    int ret;
++
++    if (peak != s->bt2408_peak || in->color_primaries != s->bt2408_prim) {
++        ret = ff_bt2408_hable_init(&s->bt2408, in->color_primaries, peak * REFERENCE_WHITE);
++        if (ret < 0) {
++            av_log(ctx, AV_LOG_ERROR, "Unsupported primaries '%s' or peak %f\n",
++                   av_color_primaries_name(in->color_primaries), peak);
++            return ret;
++        }
++        s->bt2408_peak = peak;
++        s->bt2408_prim = in->color_primaries;
++    }
++    out->color_primaries = AVCOL_PRI_BT709;
++    av_frame_remove_side_data(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    av_frame_remove_side_data(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    return 0;
++}
++
+ static int filter_frame(AVFilterLink *link, AVFrame *in)
+ {
+     AVFilterContext *ctx = link->dst;
+@@ -239,6 +288,15 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+         av_log(ctx, AV_LOG_DEBUG, "Computed signal peak: %f\n", peak);
+     }
+ 
++    if (s->tonemap == TONEMAP_BT2408_HABLE) {
++        ret = setup_bt2408(ctx, out, in, peak);
++        if (ret < 0) {
++            av_frame_free(&in);
++            av_frame_free(&out);
++            return ret;
++        }
++    }
++
+     /* load original color space even if pixel format is RGB to compute overbrights */
+     s->coeffs = av_csp_luma_coeffs_from_avcsp(in->colorspace);
+     if (s->desat > 0 && (in->colorspace == AVCOL_SPC_UNSPECIFIED || !s->coeffs)) {
+@@ -275,7 +333,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+ 
+     av_frame_free(&in);
+ 
+-    ff_update_hdr_metadata(out, peak);
++    if (s->tonemap != TONEMAP_BT2408_HABLE)
++        ff_update_hdr_metadata(out, peak);
+ 
+     return ff_filter_frame(outlink, out);
+ }
+@@ -291,6 +350,7 @@ static const AVOption tonemap_options[] = {
+     {     "reinhard", 0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_REINHARD},          0, 0, FLAGS, .unit = "tonemap" },
+     {     "hable",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_HABLE},             0, 0, FLAGS, .unit = "tonemap" },
+     {     "mobius",   0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_MOBIUS},            0, 0, FLAGS, .unit = "tonemap" },
++    {     "bt2408_hable", 0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_BT2408_HABLE},  0, 0, FLAGS, .unit = "tonemap" },
+     { "param",        "tonemap parameter", OFFSET(param), AV_OPT_TYPE_DOUBLE, {.dbl = NAN}, DBL_MIN, DBL_MAX, FLAGS },
+     { "desat",        "desaturation strength", OFFSET(desat), AV_OPT_TYPE_DOUBLE, {.dbl = 2}, 0, DBL_MAX, FLAGS },
+     { "peak",         "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },
+diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
+index 6ec4e40adf814e8f8a968b7f400a0647a01cec0e..0d85be36af8cbcc06a455b9e0e84fb9b84074167 100644
+--- a/tests/fate/filter-video.mak
++++ b/tests/fate/filter-video.mak
+@@ -485,6 +485,10 @@ FATE_FILTER-yes += fate-filter-bt2408-hable
+ fate-filter-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
+ fate-filter-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF)
+ 
++FATE_FILTER-$(CONFIG_TONEMAP_FILTER) += fate-filter-tonemap-bt2408-hable
++fate-filter-tonemap-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
++fate-filter-tonemap-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF) filter
++
+ FATE_FILTER-yes += fate-filter-dovi-reshape
+ fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
+ fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
+diff --git a/tests/ref/fate/filter-tonemap-bt2408-hable b/tests/ref/fate/filter-tonemap-bt2408-hable
+new file mode 100644
+index 0000000000000000000000000000000000000000..173577053a7f942b1a64bfe3d580bfa4f5e52b9e
+--- /dev/null
++++ b/tests/ref/fate/filter-tonemap-bt2408-hable
+@@ -0,0 +1,4 @@
++peak from MaxCLL: ok
++output tagged BT.709, light levels dropped: ok
++peak from mastering display: ok
++planted wrong MaxCLL: detected

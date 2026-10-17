@@ -1,0 +1,6 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx", "pelorus"]
+origin = "part 2 of the Dolby Vision profile 5 tone-mapping series without libplacebo (ADR-0002): the shared tone stage"
+notes = """
+Helper shared by tonemap and, next, tonemap_opencl, tonemap_vaapi and a new tonemap_vulkan: the libplacebo v7.360.1 colour map with hable tone mapping and clipping gamut mapping (Hable on the PQ intensity of IPT, SDR white 203 cd/m^2, chroma scaled with the intensity compression, BT.1886 output with 1000:1 contrast), ported with the LGPL-2.1+ notice of libplacebo. The context struct holds only 32-bit members so GPU filters can upload it as is. make fate-filter-bt2408-hable passes on n9.0.2 plus 0001-0013: seven colours match a separate double precision model within 2e-4, a planted fourfold peak is detected, peaks below 100 cd/m^2 clamp, and a zero or NaN peak and non-D65 primaries are refused. With the chroma scaling removed, four of the seven colours fail. No version.h or Changelog bump."""

@@ -17,3 +17,6 @@
 0010-avcodec-qsvdec-discard-the-right-frames-on-MP4-edit-.patch
 0011-avfilter-dovi_reshape-add-a-Dolby-Vision-RPU-reshapi.patch
 0012-avfilter-add-dovi_reshape-filter.patch
+0013-avfilter-bt2408_hable-add-a-Hable-tone-map-on-IPT-in.patch
+0014-avfilter-vf_tonemap-add-the-bt2408_hable-tone-map.patch
+0015-avfilter-vf_zscale-keep-the-light-levels-when-linear.patch

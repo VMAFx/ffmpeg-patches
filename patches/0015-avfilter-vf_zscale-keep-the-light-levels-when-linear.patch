@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 19:02:24 +0200
+Subject: [PATCH] avfilter/vf_zscale: keep the light levels when linearising
+
+A transfer change drops all colour-dependent side data. When the output
+is linear light in the same primaries, the content light level and the
+mastering display still describe the frame, and a tone mapper further
+down the graph reads its peak from them; without them vf_tonemap falls
+back to a fixed peak. Keep those two in that case and drop the other
+colour-dependent side data as before.
+
+The test runs zscale on a PQ BT.2020 frame with light levels and an ICC
+profile, and checks which side data survive a change to linear, a
+change of primaries, a change to BT.709 and a plain resize.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavfilter/Makefile                      |   2 +-
+ libavfilter/tests/zscale_light_levels.c   | 138 ++++++++++++++++++++++
+ libavfilter/vf_zscale.c                   |  27 ++++-
+ tests/fate/filter-video.mak               |   4 +
+ tests/ref/fate/filter-zscale-light-levels |   4 +
+ 5 files changed, 173 insertions(+), 2 deletions(-)
+ create mode 100644 libavfilter/tests/zscale_light_levels.c
+ create mode 100644 tests/ref/fate/filter-zscale-light-levels
+
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 7066597b2f5dbd532827536ca879850595cf16b9..a2805605a15bbc934e6da2bb1ee780675c9d024d 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -683,7 +683,7 @@ SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
+ SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
+ 
+ TOOLS     = graph2dot
+-TESTPROGS = bt2408_hable dovi_reshape drawutils filtfmts formats integral
++TESTPROGS = bt2408_hable dovi_reshape drawutils filtfmts formats integral zscale_light_levels
+ 
+ TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
+ 
+diff --git a/libavfilter/tests/zscale_light_levels.c b/libavfilter/tests/zscale_light_levels.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..3eda0579424155209e1c8ea1af00813e09303210
+--- /dev/null
++++ b/libavfilter/tests/zscale_light_levels.c
+@@ -0,0 +1,138 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/* Which colour-dependent side data zscale keeps on a transfer change. */
++
++#include <stdio.h>
++
++#include "libavutil/frame.h"
++#include "libavutil/log.h"
++#include "libavutil/mastering_display_metadata.h"
++
++#include "libavfilter/avfilter.h"
++#include "libavfilter/buffersink.h"
++#include "libavfilter/buffersrc.h"
++
++#define FW 16
++#define FH 8
++
++/* Runs buffer -> zscale=<args> -> buffersink on one frame. */
++static int run_filter(AVFrame *in, AVFrame *out, const char *zargs)
++{
++    AVFilterGraph *g = avfilter_graph_alloc();
++    AVFilterContext *src = NULL, *zs = NULL, *sink = NULL;
++    char args[128];
++    int ret;
++
++    if (!g)
++        return AVERROR(ENOMEM);
++    snprintf(args, sizeof(args), "video_size=%dx%d:pix_fmt=%d:time_base=1/25:colorspace=%d",
++             in->width, in->height, in->format, in->colorspace);
++    ret = avfilter_graph_create_filter(&src, avfilter_get_by_name("buffer"), "in", args, NULL, g);
++    if (ret >= 0)
++        ret = avfilter_graph_create_filter(&zs, avfilter_get_by_name("zscale"), "zs", zargs, NULL, g);
++    if (ret >= 0)
++        ret = avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", NULL, NULL, g);
++    if (ret >= 0)
++        ret = avfilter_link(src, 0, zs, 0);
++    if (ret >= 0)
++        ret = avfilter_link(zs, 0, sink, 0);
++    if (ret >= 0)
++        ret = avfilter_graph_config(g, NULL);
++    if (ret >= 0)
++        ret = av_buffersrc_add_frame_flags(src, in, AV_BUFFERSRC_FLAG_KEEP_REF);
++    if (ret >= 0)
++        ret = av_buffersrc_add_frame(src, NULL);
++    if (ret >= 0)
++        ret = av_buffersink_get_frame(sink, out);
++    avfilter_graph_free(&g);
++    return ret;
++}
++
++static int add_side_data(AVFrame *f)
++{
++    AVContentLightMetadata *cll = av_content_light_metadata_create_side_data(f);
++    AVMasteringDisplayMetadata *md = av_mastering_display_metadata_create_side_data(f);
++
++    if (!cll || !md || !av_frame_new_side_data(f, AV_FRAME_DATA_ICC_PROFILE, 16))
++        return AVERROR(ENOMEM);
++    cll->MaxCLL = 1000;
++    md->max_luminance = av_make_q(1000, 1);
++    md->min_luminance = av_make_q(1, 10000);
++    md->has_luminance = 1;
++    return 0;
++}
++
++/* A PQ BT.2020 frame with light levels and an ICC profile. */
++static AVFrame *make_frame(void)
++{
++    AVFrame *f = av_frame_alloc();
++
++    if (!f)
++        return NULL;
++    f->format = AV_PIX_FMT_GBRPF32;
++    f->width  = FW;
++    f->height = FH;
++    f->color_primaries = AVCOL_PRI_BT2020;
++    f->color_trc       = AVCOL_TRC_SMPTE2084;
++    f->colorspace      = AVCOL_SPC_RGB;
++    if (av_frame_get_buffer(f, 0) < 0 || add_side_data(f) < 0) {
++        av_frame_free(&f);
++        return NULL;
++    }
++    for (int p = 0; p < 3; p++)
++        for (int y = 0; y < FH; y++)
++            for (int x = 0; x < FW; x++)
++                ((float *)(f->data[p] + y * f->linesize[p]))[x] = 0.5f;
++    return f;
++}
++
++static const char *has(const AVFrame *f, enum AVFrameSideDataType type)
++{
++    return av_frame_get_side_data(f, type) ? "kept" : "dropped";
++}
++
++/* Prints which side data survive zscale=<zargs>; returns 0 when the run worked. */
++static int report(const char *zargs)
++{
++    AVFrame *in = make_frame(), *out = av_frame_alloc();
++    int ret = in && out ? run_filter(in, out, zargs) : AVERROR(ENOMEM);
++
++    if (ret >= 0)
++        printf("%s: light level %s, mastering display %s, ICC profile %s\n", zargs,
++               has(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL),
++               has(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA),
++               has(out, AV_FRAME_DATA_ICC_PROFILE));
++    else
++        printf("%s: failed\n", zargs);
++    av_frame_free(&in);
++    av_frame_free(&out);
++    return ret < 0;
++}
++
++int main(void)
++{
++    int fails = 0;
++
++    av_log_set_level(AV_LOG_QUIET);
++    fails += report("t=linear");
++    fails += report("t=linear:p=bt709");
++    fails += report("t=bt709");
++    fails += report("w=8:h=4");
++    return fails != 0;
++}
+diff --git a/libavfilter/vf_zscale.c b/libavfilter/vf_zscale.c
+index b14d704663abe76de9f12124fa60d7a8a2eec4ee..15a05b99c138e2d7d14d8e43024b82f6fee0f82a 100644
+--- a/libavfilter/vf_zscale.c
++++ b/libavfilter/vf_zscale.c
+@@ -745,6 +745,28 @@ static int filter_slice(AVFilterContext *ctx, void *data, int job_nr, int n_jobs
+     return 0;
+ }
+ 
++/*
++ * Linear light in the same primaries keeps the light levels of its source, so
++ * a tone mapper further down can still read the peak from them.
++ */
++static void remove_color_dependent_keep_light(AVFrame *out)
++{
++    for (int i = out->nb_side_data - 1; i >= 0; i--) {
++        const AVSideDataDescriptor *desc;
++        enum AVFrameSideDataType type;
++
++        if (i >= out->nb_side_data)
++            continue;
++        type = out->side_data[i]->type;
++        desc = av_frame_side_data_desc(type);
++        if (type == AV_FRAME_DATA_CONTENT_LIGHT_LEVEL ||
++            type == AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)
++            continue;
++        if (desc && desc->props & AV_SIDE_DATA_PROP_COLOR_DEPENDENT)
++            av_frame_side_data_remove(&out->side_data, &out->nb_side_data, type);
++    }
++}
++
+ static int filter_frame(AVFilterLink *link, AVFrame *in)
+ {
+     AVFilterContext *ctx = link->dst;
+@@ -829,7 +851,10 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+ 
+         if (out->width != in->width || out->height != in->height)
+             changed |= AV_SIDE_DATA_PROP_SIZE_DEPENDENT;
+-        if (out->color_trc != in->color_trc || out->color_primaries != in->color_primaries)
++        if (out->color_trc != in->color_trc && out->color_trc == AVCOL_TRC_LINEAR &&
++            out->color_primaries == in->color_primaries)
++            remove_color_dependent_keep_light(out);
++        else if (out->color_trc != in->color_trc || out->color_primaries != in->color_primaries)
+             changed |= AV_SIDE_DATA_PROP_COLOR_DEPENDENT;
+         av_frame_side_data_remove_by_props(&out->side_data, &out->nb_side_data, changed);
+ 
+diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
+index 0d85be36af8cbcc06a455b9e0e84fb9b84074167..437fce8b4733748ed4b45f776d561738b6bf4773 100644
+--- a/tests/fate/filter-video.mak
++++ b/tests/fate/filter-video.mak
+@@ -485,6 +485,10 @@ FATE_FILTER-yes += fate-filter-bt2408-hable
+ fate-filter-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
+ fate-filter-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF)
+ 
++FATE_FILTER-$(CONFIG_ZSCALE_FILTER) += fate-filter-zscale-light-levels
++fate-filter-zscale-light-levels: libavfilter/tests/zscale_light_levels$(EXESUF)
++fate-filter-zscale-light-levels: CMD = run libavfilter/tests/zscale_light_levels$(EXESUF)
++
+ FATE_FILTER-$(CONFIG_TONEMAP_FILTER) += fate-filter-tonemap-bt2408-hable
+ fate-filter-tonemap-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
+ fate-filter-tonemap-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF) filter
+diff --git a/tests/ref/fate/filter-zscale-light-levels b/tests/ref/fate/filter-zscale-light-levels
+new file mode 100644
+index 0000000000000000000000000000000000000000..a58aa5c7961d825cdf748b7485ea50db4317befa
+--- /dev/null
++++ b/tests/ref/fate/filter-zscale-light-levels
+@@ -0,0 +1,4 @@
++t=linear: light level kept, mastering display kept, ICC profile dropped
++t=linear:p=bt709: light level dropped, mastering display dropped, ICC profile dropped
++t=bt709: light level dropped, mastering display dropped, ICC profile dropped
++w=8:h=4: light level kept, mastering display kept, ICC profile kept
