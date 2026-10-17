@@ -1,0 +1,994 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 23:43:09 +0200
+Subject: [PATCH] avfilter/vf_tonemap: add dynamic peak detection
+
+The new peak_detect option measures the signal peak of every frame
+instead of taking it from the peak option or the side data. The
+detector follows libplacebo v7.360.1: the luminance is PQ-encoded at
+14 bits over 16x16 tiles, the frame peak is the 99.995th percentile of
+the histogram, and the result is smoothed over about 20 frames. The
+threshold option sets the scene change window, which blends from
+smoothing to a reset between 5 and 15 times its value in percent of the
+average PQ level; the default 0.2 is libplacebo's window of 1 to 3
+percent.
+
+A frame that carries lavfi.dovi.l1_max_pq from dovi_reshape is not
+measured; its Dolby Vision level 1 peak is used instead, which is what
+libplacebo does with the RPU. With peak_detect left at 0 the output is
+unchanged.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi                          |  16 +
+ libavfilter/tests/bt2408_hable.c          | 282 ++++++++++++-
+ libavfilter/vf_tonemap.c                  | 464 +++++++++++++++++++---
+ tests/fate/filter-video.mak               |   4 +
+ tests/ref/fate/filter-tonemap-peak-detect |   6 +
+ 5 files changed, 716 insertions(+), 56 deletions(-)
+ create mode 100644 tests/ref/fate/filter-tonemap-peak-detect
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 285410a8ae7dd59c14beade76a77f6f01285d905..286c6b2992147c5c78756170b9aac79b0e3e4fe3 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -24357,6 +24357,22 @@ This option works only if the input frame has a supported color tag.
+ Override signal/nominal/reference peak with this value. Useful when the
+ embedded peak information in display metadata is not reliable or when tone
+ mapping from a lower range to a higher range.
++
++@item peak_detect
++Measure the signal peak from each frame instead of taking it from
++@option{peak} or the frame's side data. The luminance is measured in PQ over
++16x16 tiles, the frame peak is the 99.995th percentile, and the result is
++smoothed over about 20 frames, as libplacebo does. A frame that carries the
++@code{lavfi.dovi.l1_max_pq} metadata, which the @code{dovi_reshape} filter
++writes, is not measured: its Dolby Vision level 1 peak is used instead.
++Default is 0 (disabled).
++
++@item threshold
++Set the scene change window of @option{peak_detect}. A change of the
++frame's average PQ level below @code{5 * threshold} percent is smoothed, a
++change above @code{15 * threshold} percent resets the smoothing to the new
++frame, and a change in between blends the two. 0 disables scene change detection.
++Default is 0.2, a window of 1 to 3 percent.
+ @end table
+ 
+ @section tpad
+diff --git a/libavfilter/tests/bt2408_hable.c b/libavfilter/tests/bt2408_hable.c
+index f867ba2bfb7bb5d8bfb0f1c0a3a01d5496d026e2..2ba569564ad1c435e9a63ff31a2a2d3d39c4b3f4 100644
+--- a/libavfilter/tests/bt2408_hable.c
++++ b/libavfilter/tests/bt2408_hable.c
+@@ -20,6 +20,8 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include "libavutil/csp.h"
++#include "libavutil/dict.h"
+ #include "libavutil/error.h"
+ #include "libavutil/frame.h"
+ #include "libavutil/mastering_display_metadata.h"
+@@ -113,22 +115,23 @@ static int expect_refusal(enum AVColorPrimaries prim, double peak, const char *w
+     return ret != want;
+ }
+ 
+-/* Runs buffer -> tonemap=bt2408_hable -> buffersink on one frame. */
+-static int run_filter(AVFrame *in, AVFrame *out)
++static int run_filter_opts(AVFrame **in, int nb_frames, const char *opts, AVFrame *out)
+ {
+     AVFilterGraph *g = avfilter_graph_alloc();
+     AVFilterContext *src = NULL, *tm = NULL, *sink = NULL;
+-    char args[128];
++    char args[128], tm_opts[128];
+     int ret;
+ 
+     if (!g)
+         return AVERROR(ENOMEM);
+     snprintf(args, sizeof(args), "video_size=%dx%d:pix_fmt=%d:time_base=1/25",
+-             in->width, in->height, in->format);
++             in[0]->width, in[0]->height, in[0]->format);
++    snprintf(tm_opts, sizeof(tm_opts), "tonemap=bt2408_hable%s%s",
++             opts && *opts ? ":" : "", opts ? opts : "");
+     ret = avfilter_graph_create_filter(&src, avfilter_get_by_name("buffer"), "in", args, NULL, g);
+     if (ret >= 0)
+         ret = avfilter_graph_create_filter(&tm, avfilter_get_by_name("tonemap"), "tm",
+-                                           "tonemap=bt2408_hable", NULL, g);
++                                           tm_opts, NULL, g);
+     if (ret >= 0)
+         ret = avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", NULL, NULL, g);
+     if (ret >= 0)
+@@ -137,16 +140,29 @@ static int run_filter(AVFrame *in, AVFrame *out)
+         ret = avfilter_link(tm, 0, sink, 0);
+     if (ret >= 0)
+         ret = avfilter_graph_config(g, NULL);
+-    if (ret >= 0)
+-        ret = av_buffersrc_add_frame_flags(src, in, AV_BUFFERSRC_FLAG_KEEP_REF);
+-    if (ret >= 0)
+-        ret = av_buffersrc_add_frame(src, NULL);
+-    if (ret >= 0)
+-        ret = av_buffersink_get_frame(sink, out);
++    for (int i = 0; ret >= 0 && i < nb_frames; i++) {
++        AVFrame *cur = (i == nb_frames - 1) ? out : av_frame_alloc();
++        if (!cur) {
++            ret = AVERROR(ENOMEM);
++            break;
++        }
++        in[i]->pts = i;
++        ret = av_buffersrc_add_frame_flags(src, in[i], AV_BUFFERSRC_FLAG_KEEP_REF);
++        if (ret >= 0)
++            ret = av_buffersink_get_frame(sink, cur);
++        if (i < nb_frames - 1)
++            av_frame_free(&cur);
++    }
+     avfilter_graph_free(&g);
+     return ret;
+ }
+ 
++/* Runs buffer -> tonemap=bt2408_hable -> buffersink on one frame. */
++static int run_filter(AVFrame *in, AVFrame *out)
++{
++    return run_filter_opts(&in, 1, NULL, out);
++}
++
+ static int add_light_levels(AVFrame *f, unsigned max_cll, unsigned mastering_max)
+ {
+     if (max_cll) {
+@@ -246,6 +262,246 @@ static int check_filter(void)
+     return fails;
+ }
+ 
++/*
++ * 14-bit PQ quantization and histogram percentile introduce a measured worst
++ * abs float difference of 5.25e-6 on static peak detection and 6.48e-5 on
++ * scene reset. DETECT_TOL provides margin while cleanly rejecting the
++ * un-reset history in case 6 (diff ~0.03) and 4x peak in case 4 (diff ~0.44).
++ */
++#define DETECT_TOL 2e-4f
++
++static AVFrame *make_flat_frame(int w, int h, float r, float g, float b, const char *l1_max_pq)
++{
++    AVFrame *f = av_frame_alloc();
++
++    if (!f)
++        return NULL;
++    f->format = AV_PIX_FMT_GBRPF32;
++    f->width  = w;
++    f->height = h;
++    f->color_primaries = AVCOL_PRI_BT2020;
++    f->color_trc       = AVCOL_TRC_LINEAR;
++    f->colorspace      = AVCOL_SPC_RGB;
++    if (av_frame_get_buffer(f, 0) < 0) {
++        av_frame_free(&f);
++        return NULL;
++    }
++    if (l1_max_pq && av_dict_set(&f->metadata, "lavfi.dovi.l1_max_pq", l1_max_pq, 0) < 0) {
++        av_frame_free(&f);
++        return NULL;
++    }
++    for (int y = 0; y < h; y++) {
++        float *g_row = (float *)(f->data[0] + y * f->linesize[0]);
++        float *b_row = (float *)(f->data[1] + y * f->linesize[1]);
++        float *r_row = (float *)(f->data[2] + y * f->linesize[2]);
++        for (int x = 0; x < w; x++) {
++            g_row[x] = g;
++            b_row[x] = b;
++            r_row[x] = r;
++        }
++    }
++    return f;
++}
++
++static void free_frames(AVFrame **frames, int nb_frames)
++{
++    if (!frames)
++        return;
++    for (int i = 0; i < nb_frames; i++)
++        av_frame_free(&frames[i]);
++}
++
++static int make_flat_clip(AVFrame **frames, int nb_frames, int w, int h,
++                          float r, float g, float b, const char *l1_max_pq)
++{
++    for (int i = 0; i < nb_frames; i++) {
++        frames[i] = make_flat_frame(w, h, r, g, b, l1_max_pq);
++        if (!frames[i]) {
++            free_frames(frames, i);
++            return AVERROR(ENOMEM);
++        }
++    }
++    return 0;
++}
++
++static int compare_frames(const AVFrame *a, const AVFrame *b, float tol, float *max_diff_out)
++{
++    float max_diff = 0.0f;
++    int matches = 1;
++
++    if (!a || !b || a->width != b->width || a->height != b->height)
++        return -1;
++    for (int p = 0; p < 3; p++) {
++        for (int y = 0; y < a->height; y++) {
++            const float *ra = (const float *)(a->data[p] + y * a->linesize[p]);
++            const float *rb = (const float *)(b->data[p] + y * b->linesize[p]);
++            for (int x = 0; x < a->width; x++) {
++                float diff = fabsf(ra[x] - rb[x]);
++                if (diff > max_diff)
++                    max_diff = diff;
++                if (diff > tol)
++                    matches = 0;
++            }
++        }
++    }
++    if (max_diff_out)
++        *max_diff_out = max_diff;
++    return matches;
++}
++
++static int check_l1_cases(void)
++{
++    AVFrame *frame_l1 = make_flat_frame(32, 32, 3.0f, 2.0f, 1.5f, "2081");
++    AVFrame *frame_planted = make_flat_frame(32, 32, 3.0f, 2.0f, 1.5f, "3079");
++    AVFrame *out_l1 = av_frame_alloc();
++    AVFrame *out_planted = av_frame_alloc();
++    AVFrame *out_ref = av_frame_alloc();
++    av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
++    double p = pq_eotf(2081 / 4095.0) / 100.0;
++    char opt[64];
++    int ret, fails = 0, ok1, ok2;
++
++    snprintf(opt, sizeof(opt), "peak=%.6f", p);
++    if (!frame_l1 || !frame_planted || !out_l1 || !out_planted || !out_ref) {
++        av_frame_free(&frame_l1);
++        av_frame_free(&frame_planted);
++        av_frame_free(&out_l1);
++        av_frame_free(&out_planted);
++        av_frame_free(&out_ref);
++        return 1;
++    }
++
++    ret = run_filter_opts(&frame_l1, 1, "peak_detect=1", out_l1);
++    if (ret >= 0)
++        ret = run_filter_opts(&frame_l1, 1, opt, out_ref);
++    ok1 = (ret >= 0) && compare_frames(out_l1, out_ref, TOL, NULL) == 1;
++    printf("peak from Dolby Vision L1: %s\n", ok1 ? "ok" : "WRONG");
++    fails += !ok1;
++
++    if (ret >= 0)
++        ret = run_filter_opts(&frame_planted, 1, "peak_detect=1", out_planted);
++    ok2 = (ret >= 0) && compare_frames(out_planted, out_ref, TOL, NULL) == 0;
++    printf("planted wrong L1 peak: %s\n", ok2 ? "detected" : "MISSED");
++    fails += !ok2;
++
++    av_frame_free(&frame_l1);
++    av_frame_free(&frame_planted);
++    av_frame_free(&out_l1);
++    av_frame_free(&out_planted);
++    av_frame_free(&out_ref);
++    return fails;
++}
++
++static int check_detected_cases(void)
++{
++    const float r = 5.0f, g = 4.0f, b = 1.0f;
++    const double y = 0.2627 * r + 0.6780 * g + 0.0593 * b;
++    AVFrame *clip[20] = {0};
++    AVFrame *ref_frame = make_flat_frame(32, 32, r, g, b, NULL);
++    AVFrame *out_det = av_frame_alloc();
++    AVFrame *out_ref = av_frame_alloc();
++    AVFrame *out_ref_4x = av_frame_alloc();
++    char opt_ref[64], opt_4x[64];
++    int ret, fails = 0, ok3, ok4;
++
++    snprintf(opt_ref, sizeof(opt_ref), "peak=%.6f", y);
++    snprintf(opt_4x, sizeof(opt_4x), "peak=%.6f", 4.0 * y);
++    ret = make_flat_clip(clip, 20, 32, 32, r, g, b, NULL);
++    if (ret < 0 || !ref_frame || !out_det || !out_ref || !out_ref_4x) {
++        free_frames(clip, 20);
++        av_frame_free(&ref_frame);
++        av_frame_free(&out_det);
++        av_frame_free(&out_ref);
++        av_frame_free(&out_ref_4x);
++        return 1;
++    }
++
++    ret = run_filter_opts(clip, 20, "peak_detect=1", out_det);
++    if (ret >= 0)
++        ret = run_filter_opts(&ref_frame, 1, opt_ref, out_ref);
++    ok3 = (ret >= 0) && compare_frames(out_det, out_ref, DETECT_TOL, NULL) == 1;
++    printf("detected peak: %s\n", ok3 ? "ok" : "WRONG");
++    fails += !ok3;
++
++    if (ret >= 0)
++        ret = run_filter_opts(&ref_frame, 1, opt_4x, out_ref_4x);
++    ok4 = (ret >= 0) && compare_frames(out_det, out_ref_4x, DETECT_TOL, NULL) == 0;
++    printf("planted wrong detected peak: %s\n", ok4 ? "detected" : "MISSED");
++    fails += !ok4;
++
++    free_frames(clip, 20);
++    av_frame_free(&ref_frame);
++    av_frame_free(&out_det);
++    av_frame_free(&out_ref);
++    av_frame_free(&out_ref_4x);
++    return fails;
++}
++
++static int check_scene_cases(void)
++{
++    const float r_a = 5.0f, g_a = 4.0f, b_a = 1.0f;
++    const float r_b = 8.0f, g_b = 7.0f, b_b = 3.0f;
++    const double y_b = 0.2627 * r_b + 0.6780 * g_b + 0.0593 * b_b;
++    AVFrame *clip_scene[20] = {0};
++    AVFrame *clip_noscene[20] = {0};
++    AVFrame *ref_b = make_flat_frame(32, 32, r_b, g_b, b_b, NULL);
++    AVFrame *out_scene = av_frame_alloc();
++    AVFrame *out_noscene = av_frame_alloc();
++    AVFrame *out_ref_b = av_frame_alloc();
++    char opt_b[64];
++    int ret, fails = 0, ok5, ok6;
++
++    snprintf(opt_b, sizeof(opt_b), "peak=%.6f", y_b);
++    ret = make_flat_clip(clip_scene, 10, 32, 32, r_a, g_a, b_a, NULL);
++    if (ret >= 0)
++        ret = make_flat_clip(clip_scene + 10, 10, 32, 32, r_b, g_b, b_b, NULL);
++    if (ret >= 0)
++        ret = make_flat_clip(clip_noscene, 10, 32, 32, r_a, g_a, b_a, NULL);
++    if (ret >= 0)
++        ret = make_flat_clip(clip_noscene + 10, 10, 32, 32, r_b, g_b, b_b, NULL);
++
++    if (ret < 0 || !ref_b || !out_scene || !out_noscene || !out_ref_b) {
++        free_frames(clip_scene, 20);
++        free_frames(clip_noscene, 20);
++        av_frame_free(&ref_b);
++        av_frame_free(&out_scene);
++        av_frame_free(&out_noscene);
++        av_frame_free(&out_ref_b);
++        return 1;
++    }
++
++    ret = run_filter_opts(clip_scene, 20, "peak_detect=1:threshold=0.2", out_scene);
++    if (ret >= 0)
++        ret = run_filter_opts(&ref_b, 1, opt_b, out_ref_b);
++    ok5 = (ret >= 0) && compare_frames(out_scene, out_ref_b, DETECT_TOL, NULL) == 1;
++    printf("scene change resets the peak: %s\n", ok5 ? "ok" : "WRONG");
++    fails += !ok5;
++
++    if (ret >= 0)
++        ret = run_filter_opts(clip_noscene, 20, "peak_detect=1:threshold=0", out_noscene);
++    ok6 = (ret >= 0) && compare_frames(out_noscene, out_ref_b, DETECT_TOL, NULL) == 0;
++    printf("no scene detection keeps history: %s\n", ok6 ? "detected" : "MISSED");
++    fails += !ok6;
++
++    free_frames(clip_scene, 20);
++    free_frames(clip_noscene, 20);
++    av_frame_free(&ref_b);
++    av_frame_free(&out_scene);
++    av_frame_free(&out_noscene);
++    av_frame_free(&out_ref_b);
++    return fails;
++}
++
++static int check_peak(void)
++{
++    int fails = 0;
++
++    fails += check_l1_cases();
++    fails += check_detected_cases();
++    fails += check_scene_cases();
++    return fails;
++}
++
+ int main(int argc, char **argv)
+ {
+     FFBT2408Hable s;
+@@ -255,6 +511,10 @@ int main(int argc, char **argv)
+         av_log_set_level(AV_LOG_QUIET);
+         return check_filter() != 0;
+     }
++    if (argc > 1 && !strcmp(argv[1], "peak")) {
++        av_log_set_level(AV_LOG_QUIET);
++        return check_peak() != 0;
++    }
+ 
+     if (ff_bt2408_hable_init(&s, AVCOL_PRI_BT2020, PEAK) < 0) {
+         printf("init failed\n");
+diff --git a/libavfilter/vf_tonemap.c b/libavfilter/vf_tonemap.c
+index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..3ed0ce3f7948a7c79951bd810258d1cc259d2639 100644
+--- a/libavfilter/vf_tonemap.c
++++ b/libavfilter/vf_tonemap.c
+@@ -1,6 +1,12 @@
+ /*
+  * Copyright (c) 2017 Vittorio Giovara <vittorio.giovara@gmail.com>
+  *
++ * The dynamic peak detection follows libplacebo v7.360.1
++ * (src/shaders/colorspace.c: pl_shader_detect_peak, measure_peak,
++ * update_peak_buf), Copyright (C) Niklas Haas and the libplacebo
++ * contributors, licensed under the GNU Lesser General Public License
++ * version 2.1 or later.
++ *
+  * This file is part of FFmpeg.
+  *
+  * FFmpeg is free software; you can redistribute it and/or
+@@ -24,13 +30,18 @@
+  */
+ 
+ #include <float.h>
++#include <math.h>
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "libavutil/csp.h"
++#include "libavutil/dict.h"
+ #include "libavutil/imgutils.h"
+ #include "libavutil/internal.h"
+ #include "libavutil/intfloat.h"
+ #include "libavutil/intreadwrite.h"
++#include "libavutil/mem.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/pixdesc.h"
+ 
+@@ -52,6 +63,28 @@ enum TonemapAlgorithm {
+     TONEMAP_MAX,
+ };
+ 
++/* Peak detection, see the libplacebo notice at the top of the file. */
++#define PQ_BITS     14
++#define PQ_MAX      ((1 << PQ_BITS) - 1)
++#define HIST_BITS   7
++#define HIST_BIAS   (1 << (HIST_BITS - 1))
++#define HIST_BINS   ((1 << HIST_BITS) - HIST_BIAS)
++#define HIST_PQ(bin) (((bin) + HIST_BIAS) << (PQ_BITS - HIST_BITS))
++
++#define PQ_M1 (2610.0f / 16384.0f)
++#define PQ_M2 (2523.0f * 128.0f / 4096.0f)
++#define PQ_C1 (3424.0f / 4096.0f)
++#define PQ_C2 (2413.0f * 32.0f / 4096.0f)
++#define PQ_C3 (2392.0f * 32.0f / 4096.0f)
++
++typedef struct DetectJobData {
++    uint32_t wg_count;
++    uint32_t wg_active;
++    uint64_t sum_pq;
++    uint32_t max_pq;
++    uint32_t hist[HIST_BINS];
++} DetectJobData;
++
+ typedef struct TonemapContext {
+     const AVClass *class;
+ 
+@@ -60,12 +93,20 @@ typedef struct TonemapContext {
+     double param;
+     double desat;
+     double peak;
++    int peak_detect;
++    double threshold;
+ 
+     const AVLumaCoefficients *coeffs;
+ 
+     FFBT2408Hable bt2408;
+     double bt2408_peak;
+     enum AVColorPrimaries bt2408_prim;
++
++    /* Dynamic peak detection (libplacebo) */
++    DetectJobData *jobs;
++    int nb_jobs;
++    float avg_pq;
++    float max_pq;
+ } TonemapContext;
+ 
+ static av_cold int init(AVFilterContext *ctx)
+@@ -245,49 +286,395 @@ static int setup_bt2408(AVFilterContext *ctx, AVFrame *out, const AVFrame *in, d
+     return 0;
+ }
+ 
++typedef struct DetectThreadData {
++    const AVFrame *in;
++    const AVPixFmtDescriptor *desc;
++    int nb_tiles_x;
++    int nb_tiles_y;
++    float coeff_r;
++    float coeff_g;
++    float coeff_b;
++} DetectThreadData;
++
++static inline float pq_oetf(float x)
++{
++    float xm = powf(x, PQ_M1);
++    float num = PQ_C1 + PQ_C2 * xm;
++    float den = 1.0f + PQ_C3 * xm;
++
++    return powf(num / den, PQ_M2);
++}
++
++static inline float pq_eotf(float y)
++{
++    float ym, num, den;
++
++    if (y <= 0.0f)
++        return 0.0f;
++    ym = powf(y, 1.0f / PQ_M2);
++    num = fmaxf(ym - PQ_C1, 0.0f);
++    den = fmaxf(PQ_C2 - PQ_C3 * ym, 1e-6f);
++
++    return powf(num / den, 1.0f / PQ_M1);
++}
++
++static inline float smoothstep(float edge0, float edge1, float x)
++{
++    float t = av_clipf((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
++
++    return t * t * (3.0f - 2.0f * t);
++}
++
++static inline uint32_t compute_pixel_pq(float r, float g, float b,
++                                        float cr, float cg, float cb)
++{
++    float luma = cr * r + cg * g + cb * b;
++    float nits = luma * REFERENCE_WHITE;
++    float x = av_clipf(nits / 10000.0f, 0.0f, 1.0f);
++    float y = pq_oetf(x);
++
++    y *= smoothstep(0.0f, 0.01f, y);
++    y = av_clipf(y, 0.0f, 1.0f);
++    return (uint32_t)(PQ_MAX * y);
++}
++
++static void process_tile(const AVFrame *in, const AVPixFmtDescriptor *desc,
++                         const DetectThreadData *td, DetectJobData *job,
++                         int x0, int x1, int y0, int y1)
++{
++    const int r_plane = desc->comp[0].plane;
++    const int g_plane = desc->comp[1].plane;
++    const int b_plane = desc->comp[2].plane;
++    uint32_t tile_sum = 0, tile_max = 0, black = 0;
++    uint32_t tile_hist[HIST_BINS] = {0};
++    uint32_t wg_size = (x1 - x0) * (y1 - y0);
++    uint32_t num;
++
++    for (int y = y0; y < y1; y++) {
++        const float *r_row = (const float *)(in->data[r_plane] + y * in->linesize[r_plane]);
++        const float *g_row = (const float *)(in->data[g_plane] + y * in->linesize[g_plane]);
++        const float *b_row = (const float *)(in->data[b_plane] + y * in->linesize[b_plane]);
++
++        for (int x = x0; x < x1; x++) {
++            uint32_t y_pq = compute_pixel_pq(r_row[x], g_row[x], b_row[x],
++                                             td->coeff_r, td->coeff_g, td->coeff_b);
++            int bin = ((int)y_pq >> (PQ_BITS - HIST_BITS)) - HIST_BIAS;
++
++            tile_sum += y_pq;
++            tile_max = FFMAX(tile_max, y_pq);
++            bin = av_clip(bin, 0, HIST_BINS - 1);
++            tile_hist[bin]++;
++            if (!y_pq)
++                black++;
++        }
++    }
++
++    tile_hist[0] -= black;
++    num = wg_size - black;
++    job->wg_count += 1;
++    job->wg_active += (num > 0);
++    if (num > 0) {
++        job->sum_pq += tile_sum / num;
++        job->max_pq = FFMAX(job->max_pq, tile_max);
++    }
++    for (int i = 0; i < HIST_BINS; i++)
++        job->hist[i] += tile_hist[i];
++}
++
++static int detect_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
++{
++    TonemapContext *s = ctx->priv;
++    DetectThreadData *td = arg;
++    DetectJobData *job = &s->jobs[jobnr];
++    const int ty_start = ff_slice_pos(td->nb_tiles_y, jobnr, nb_jobs);
++    const int ty_end   = ff_slice_pos(td->nb_tiles_y, jobnr + 1, nb_jobs);
++
++    for (int ty = ty_start; ty < ty_end; ty++) {
++        const int y0 = ty * 16;
++        const int y1 = FFMIN(y0 + 16, td->in->height);
++
++        for (int tx = 0; tx < td->nb_tiles_x; tx++) {
++            const int x0 = tx * 16;
++            const int x1 = FFMIN(x0 + 16, td->in->width);
++
++            process_tile(td->in, td->desc, td, job, x0, x1, y0, y1);
++        }
++    }
++
++    return 0;
++}
++
++static float measure_peak(const uint32_t *hist, uint32_t frame_max_pq, float percentile)
++{
++    const float frame_max = (float)frame_max_pq / PQ_MAX;
++    uint32_t total_pixels = 0;
++    uint32_t target_pixel;
++    uint32_t sum = 0;
++
++    if (percentile <= 0.0f || percentile >= 100.0f)
++        return frame_max;
++
++    for (int i = 0; i < HIST_BINS; i++)
++        total_pixels += hist[i];
++
++    if (!total_pixels)
++        return frame_max;
++
++    target_pixel = (uint32_t)ceilf(percentile / 100.0f * (float)total_pixels);
++    if (target_pixel >= total_pixels)
++        return frame_max;
++
++    for (int i = 0; i < HIST_BINS; i++) {
++        uint32_t count_low, count_high;
++        float pq_low, pq_high, ratio;
++        uint32_t next = sum + hist[i];
++
++        if (next < target_pixel) {
++            sum = next;
++            continue;
++        }
++
++        count_low  = sum;
++        count_high = next + 1;
++        pq_low  = (float)HIST_PQ(i) / PQ_MAX;
++        pq_high = (float)HIST_PQ(i + 1) / PQ_MAX;
++
++        if (count_high > total_pixels)
++            pq_high = frame_max;
++
++        ratio = (float)(target_pixel - count_low) / (float)(count_high - count_low);
++        return pq_low * (1.0f - ratio) + pq_high * ratio;
++    }
++
++    return frame_max;
++}
++
++static double update_peak_buf(TonemapContext *s, uint64_t frame_sum_pq,
++                              uint32_t frame_wg_count, uint32_t frame_wg_active,
++                              uint32_t frame_max_pq, const uint32_t *hist)
++{
++    float avg_pq, max_pq;
++    const float coeff = 1.0f - expf(-1.0f / 20.0f);
++
++    if (frame_wg_active) {
++        avg_pq = (float)frame_sum_pq / (frame_wg_active * PQ_MAX);
++        max_pq = measure_peak(hist, frame_max_pq, 99.995f);
++    } else {
++        avg_pq = max_pq = 1e-6f;
++    }
++
++    if (!s->avg_pq) {
++        s->avg_pq = avg_pq;
++        s->max_pq = max_pq;
++    } else {
++        static const float epsilon = 1.0f / PQ_MAX;
++        if (fabsf(avg_pq - s->avg_pq) < epsilon)
++            avg_pq = s->avg_pq;
++        if (fabsf(max_pq - s->max_pq) < epsilon)
++            max_pq = s->max_pq;
++    }
++
++    s->avg_pq += coeff * (avg_pq - s->avg_pq);
++    s->max_pq += coeff * (max_pq - s->max_pq);
++
++    if (s->threshold > 0.0) {
++        const float thresh_low = 5.0f * s->threshold * 1e-2f;
++        const float thresh_high = 15.0f * s->threshold * 1e-2f;
++        const float bias = frame_wg_count ? (float)frame_wg_active / (float)frame_wg_count : 0.0f;
++        const float delta = bias * fabsf(avg_pq - s->avg_pq);
++        const float mix_coeff = smoothstep(thresh_low, thresh_high, delta);
++        s->avg_pq = s->avg_pq * (1.0f - mix_coeff) + avg_pq * mix_coeff;
++        s->max_pq = s->max_pq * (1.0f - mix_coeff) + max_pq * mix_coeff;
++    }
++
++    return FFMAX(1.0, (double)(pq_eotf(s->max_pq) * 10000.0f / REFERENCE_WHITE));
++}
++
++static const AVLumaCoefficients *detect_coeffs(const AVFrame *in)
++{
++    const AVLumaCoefficients *coeffs = av_csp_luma_coeffs_from_avcsp(in->colorspace);
++
++    if (!coeffs || in->colorspace == AVCOL_SPC_RGB) {
++        switch (in->color_primaries) {
++        case AVCOL_PRI_BT2020:
++            coeffs = av_csp_luma_coeffs_from_avcsp(AVCOL_SPC_BT2020_NCL);
++            break;
++        case AVCOL_PRI_SMPTE170M:
++        case AVCOL_PRI_BT470BG:
++            coeffs = av_csp_luma_coeffs_from_avcsp(AVCOL_SPC_SMPTE170M);
++            break;
++        default:
++            coeffs = av_csp_luma_coeffs_from_avcsp(AVCOL_SPC_BT709);
++            break;
++        }
++    }
++    return coeffs;
++}
++
++static int detect_peak(AVFilterContext *ctx, const AVFrame *in, double *peak_out)
++{
++    TonemapContext *s = ctx->priv;
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(in->format);
++    const AVLumaCoefficients *coeffs = detect_coeffs(in);
++    DetectThreadData dtd;
++    uint64_t frame_sum_pq = 0;
++    uint32_t frame_wg_count = 0, frame_wg_active = 0, frame_max_pq = 0;
++    uint32_t frame_hist[HIST_BINS] = {0};
++    int nb_threads;
++
++    dtd.in = in;
++    dtd.desc = desc;
++    dtd.nb_tiles_x = (in->width + 15) / 16;
++    dtd.nb_tiles_y = (in->height + 15) / 16;
++    dtd.coeff_r = av_q2d(coeffs->cr);
++    dtd.coeff_g = av_q2d(coeffs->cg);
++    dtd.coeff_b = av_q2d(coeffs->cb);
++
++    nb_threads = FFMAX(1, FFMIN(dtd.nb_tiles_y, ff_filter_get_nb_threads(ctx)));
++    if (!s->jobs || s->nb_jobs != nb_threads) {
++        av_freep(&s->jobs);
++        s->jobs = av_calloc(nb_threads, sizeof(*s->jobs));
++        if (!s->jobs)
++            return AVERROR(ENOMEM);
++        s->nb_jobs = nb_threads;
++    }
++    memset(s->jobs, 0, nb_threads * sizeof(*s->jobs));
++
++    ff_filter_execute(ctx, detect_slice, &dtd, NULL, nb_threads);
++
++    for (int j = 0; j < nb_threads; j++) {
++        frame_sum_pq += s->jobs[j].sum_pq;
++        frame_wg_count += s->jobs[j].wg_count;
++        frame_wg_active += s->jobs[j].wg_active;
++        frame_max_pq = FFMAX(frame_max_pq, s->jobs[j].max_pq);
++        for (int i = 0; i < HIST_BINS; i++)
++            frame_hist[i] += s->jobs[j].hist[i];
++    }
++
++    *peak_out = update_peak_buf(s, frame_sum_pq, frame_wg_count,
++                                frame_wg_active, frame_max_pq, frame_hist);
++    return 0;
++}
++
++static void setup_luma_coeffs(AVFilterContext *ctx, const AVFrame *in)
++{
++    TonemapContext *s = ctx->priv;
++
++    s->coeffs = av_csp_luma_coeffs_from_avcsp(in->colorspace);
++    if (s->desat > 0 && (in->colorspace == AVCOL_SPC_UNSPECIFIED || !s->coeffs)) {
++        if (in->colorspace == AVCOL_SPC_UNSPECIFIED)
++            av_log(ctx, AV_LOG_WARNING, "Missing color space information, ");
++        else if (!s->coeffs)
++            av_log(ctx, AV_LOG_WARNING, "Unsupported color space '%s', ",
++                   av_color_space_name(in->colorspace));
++        av_log(ctx, AV_LOG_WARNING, "desaturation is disabled\n");
++        s->desat = 0;
++    }
++}
++
++static int get_signal_peak(AVFilterContext *ctx, AVFrame *in, double *peak_out)
++{
++    TonemapContext *s = ctx->priv;
++    av_csp_trc_function pq_eotf;
++    const AVDictionaryEntry *e;
++    char *end = NULL;
++    long max_pq = -1;
++    double peak = s->peak;
++    int ret;
++
++    if (s->peak_detect) {
++        e = av_dict_get(in->metadata, "lavfi.dovi.l1_max_pq", NULL, 0);
++        if (e && e->value && *e->value)
++            max_pq = strtol(e->value, &end, 10);
++
++        if (e && e->value && end && !*end && end != e->value && max_pq >= 0 && max_pq <= 4095) {
++            pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
++            peak = pq_eotf(max_pq / 4095.0) / REFERENCE_WHITE;
++            av_log(ctx, AV_LOG_VERBOSE, "Dolby Vision L1 signal peak: %f\n", peak);
++        } else {
++            ret = detect_peak(ctx, in, &peak);
++            if (ret < 0)
++                return ret;
++            av_log(ctx, AV_LOG_VERBOSE, "Detected signal peak: %f\n", peak);
++        }
++    } else if (!peak) {
++        peak = ff_determine_signal_peak(in);
++        av_log(ctx, AV_LOG_DEBUG, "Computed signal peak: %f\n", peak);
++    }
++
++    *peak_out = peak;
++    return 0;
++}
++
++static void handle_alpha(AVFrame *out, const AVFrame *in,
++                         const AVPixFmtDescriptor *desc,
++                         const AVPixFmtDescriptor *odesc, int h)
++{
++    if (desc->flags & AV_PIX_FMT_FLAG_ALPHA && odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
++        av_image_copy_plane(out->data[3], out->linesize[3],
++                            in->data[3], in->linesize[3],
++                            out->linesize[3], h);
++    } else if (odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
++        for (int y = 0; y < out->height; y++) {
++            for (int x = 0; x < out->width; x++) {
++                AV_WN32(out->data[3] + x * odesc->comp[3].step + y * out->linesize[3],
++                        av_float2int(1.0f));
++            }
++        }
++    }
++}
++
++static AVFrame *alloc_output_frame(AVFilterContext *ctx, AVFilterLink *outlink, AVFrame *in)
++{
++    AVFrame *out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!out)
++        return NULL;
++
++    if (av_frame_copy_props(out, in) < 0) {
++        av_frame_free(&out);
++        return NULL;
++    }
++
++    if (in->color_trc == AVCOL_TRC_UNSPECIFIED) {
++        av_log(ctx, AV_LOG_WARNING, "Untagged transfer, assuming linear light\n");
++        out->color_trc = AVCOL_TRC_LINEAR;
++    } else if (in->color_trc != AVCOL_TRC_LINEAR) {
++        av_log(ctx, AV_LOG_WARNING, "Tonemapping works on linear light only\n");
++    }
++
++    return out;
++}
++
+ static int filter_frame(AVFilterLink *link, AVFrame *in)
+ {
+     AVFilterContext *ctx = link->dst;
+     TonemapContext *s = ctx->priv;
+     AVFilterLink *outlink = ctx->outputs[0];
+-    ThreadData td;
+-    AVFrame *out;
+     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
+     const AVPixFmtDescriptor *odesc = av_pix_fmt_desc_get(outlink->format);
+-    int ret, x, y;
+-    double peak = s->peak;
++    ThreadData td;
++    AVFrame *out;
++    double peak;
++    int ret;
+ 
+     if (!desc || !odesc) {
+         av_frame_free(&in);
+         return AVERROR_BUG;
+     }
+ 
+-    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    out = alloc_output_frame(ctx, outlink, in);
+     if (!out) {
+         av_frame_free(&in);
+         return AVERROR(ENOMEM);
+     }
+ 
+-    ret = av_frame_copy_props(out, in);
++    ret = get_signal_peak(ctx, in, &peak);
+     if (ret < 0) {
+         av_frame_free(&in);
+         av_frame_free(&out);
+         return ret;
+     }
+ 
+-    /* input and output transfer will be linear */
+-    if (in->color_trc == AVCOL_TRC_UNSPECIFIED) {
+-        av_log(ctx, AV_LOG_WARNING, "Untagged transfer, assuming linear light\n");
+-        out->color_trc = AVCOL_TRC_LINEAR;
+-    } else if (in->color_trc != AVCOL_TRC_LINEAR)
+-        av_log(ctx, AV_LOG_WARNING, "Tonemapping works on linear light only\n");
+-
+-    /* read peak from side data if not passed in */
+-    if (!peak) {
+-        peak = ff_determine_signal_peak(in);
+-        av_log(ctx, AV_LOG_DEBUG, "Computed signal peak: %f\n", peak);
+-    }
+-
+     if (s->tonemap == TONEMAP_BT2408_HABLE) {
+         ret = setup_bt2408(ctx, out, in, peak);
+         if (ret < 0) {
+@@ -297,19 +684,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+         }
+     }
+ 
+-    /* load original color space even if pixel format is RGB to compute overbrights */
+-    s->coeffs = av_csp_luma_coeffs_from_avcsp(in->colorspace);
+-    if (s->desat > 0 && (in->colorspace == AVCOL_SPC_UNSPECIFIED || !s->coeffs)) {
+-        if (in->colorspace == AVCOL_SPC_UNSPECIFIED)
+-            av_log(ctx, AV_LOG_WARNING, "Missing color space information, ");
+-        else if (!s->coeffs)
+-            av_log(ctx, AV_LOG_WARNING, "Unsupported color space '%s', ",
+-                   av_color_space_name(in->colorspace));
+-        av_log(ctx, AV_LOG_WARNING, "desaturation is disabled\n");
+-        s->desat = 0;
+-    }
++    setup_luma_coeffs(ctx, in);
+ 
+-    /* do the tone map */
+     td.out = out;
+     td.in = in;
+     td.desc = desc;
+@@ -317,20 +693,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+     ff_filter_execute(ctx, tonemap_slice, &td, NULL,
+                       FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
+ 
+-    /* copy/generate alpha if needed */
+-    if (desc->flags & AV_PIX_FMT_FLAG_ALPHA && odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
+-        av_image_copy_plane(out->data[3], out->linesize[3],
+-                            in->data[3], in->linesize[3],
+-                            out->linesize[3], outlink->h);
+-    } else if (odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
+-        for (y = 0; y < out->height; y++) {
+-            for (x = 0; x < out->width; x++) {
+-                AV_WN32(out->data[3] + x * odesc->comp[3].step + y * out->linesize[3],
+-                        av_float2int(1.0f));
+-            }
+-        }
+-    }
+-
++    handle_alpha(out, in, desc, odesc, outlink->h);
+     av_frame_free(&in);
+ 
+     if (s->tonemap != TONEMAP_BT2408_HABLE)
+@@ -354,11 +717,21 @@ static const AVOption tonemap_options[] = {
+     { "param",        "tonemap parameter", OFFSET(param), AV_OPT_TYPE_DOUBLE, {.dbl = NAN}, DBL_MIN, DBL_MAX, FLAGS },
+     { "desat",        "desaturation strength", OFFSET(desat), AV_OPT_TYPE_DOUBLE, {.dbl = 2}, 0, DBL_MAX, FLAGS },
+     { "peak",         "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },
++    { "peak_detect",  "measure signal peak from frames", OFFSET(peak_detect), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS },
++    { "threshold",    "scene detection threshold", OFFSET(threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 0.2}, 0, DBL_MAX, FLAGS },
+     { NULL }
+ };
+ 
+ AVFILTER_DEFINE_CLASS(tonemap);
+ 
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    TonemapContext *s = ctx->priv;
++
++    av_freep(&s->jobs);
++    s->nb_jobs = 0;
++}
++
+ static const AVFilterPad tonemap_inputs[] = {
+     {
+         .name         = "default",
+@@ -373,6 +746,7 @@ const FFFilter ff_vf_tonemap = {
+     .p.priv_class    = &tonemap_class,
+     .p.flags         = AVFILTER_FLAG_SLICE_THREADS,
+     .init            = init,
++    .uninit          = uninit,
+     .priv_size       = sizeof(TonemapContext),
+     FILTER_INPUTS(tonemap_inputs),
+     FILTER_OUTPUTS(ff_video_default_filterpad),
+diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
+index 437fce8b4733748ed4b45f776d561738b6bf4773..82ec4bbf783aebcbd2a7dbf22db1809c23743dfb 100644
+--- a/tests/fate/filter-video.mak
++++ b/tests/fate/filter-video.mak
+@@ -493,6 +493,10 @@ FATE_FILTER-$(CONFIG_TONEMAP_FILTER) += fate-filter-tonemap-bt2408-hable
+ fate-filter-tonemap-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
+ fate-filter-tonemap-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF) filter
+ 
++FATE_FILTER-$(CONFIG_TONEMAP_FILTER) += fate-filter-tonemap-peak-detect
++fate-filter-tonemap-peak-detect: libavfilter/tests/bt2408_hable$(EXESUF)
++fate-filter-tonemap-peak-detect: CMD = run libavfilter/tests/bt2408_hable$(EXESUF) peak
++
+ FATE_FILTER-yes += fate-filter-dovi-reshape
+ fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
+ fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
+diff --git a/tests/ref/fate/filter-tonemap-peak-detect b/tests/ref/fate/filter-tonemap-peak-detect
+new file mode 100644
+index 0000000000000000000000000000000000000000..01b0c65f3979956f3eafe45d71a4b4067f17f8dc
+--- /dev/null
++++ b/tests/ref/fate/filter-tonemap-peak-detect
+@@ -0,0 +1,6 @@
++peak from Dolby Vision L1: ok
++planted wrong L1 peak: detected
++detected peak: ok
++planted wrong detected peak: detected
++scene change resets the peak: ok
++no scene detection keeps history: detected

@@ -41,10 +41,10 @@ index 374bd5c1512943439480825f32e448e7871eb61c..b1656f0f803081cecc0f9ac7136c2d08
  transpose_vaapi_filter_deps="vaapi VAProcPipelineCaps_rotation_flags"
  transpose_vt_filter_deps="videotoolbox VTPixelRotationSessionCreate"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index c816216b375410fc0f4926f2fb164a152014d976..d398b36be623af5de221d512f45d09362fdd9e7e 100644
+index 88505736fe1ce8aea06bc0f88c54843d646bdfb9..285410a8ae7dd59c14beade76a77f6f01285d905 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -29601,6 +29601,41 @@ Preserve landscape geometry (when @var{width} >= @var{height}).
+@@ -29607,6 +29607,41 @@ Preserve landscape geometry (when @var{width} >= @var{height}).
  
  @end table
  

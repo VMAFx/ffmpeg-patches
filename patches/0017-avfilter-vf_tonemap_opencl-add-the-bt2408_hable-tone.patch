@@ -31,10 +31,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 libavfilter/opencl/bt2408_hable.cl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index bec0ee99d8bf91684dbabea697d677e4f86740ac..6c9d6f2175ee1668a11af6854560b16fb85bbb0d 100644
+index 06e09698a80ffd28c9c9b949c163976958604132..4ef76ab4ae0421a98fdeca15cb0e14c28d23d66b 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -28483,6 +28483,10 @@ It accepts the following parameters:
+@@ -28489,6 +28489,10 @@ It accepts the following parameters:
  @table @option
  @item tonemap
  Specify the tone-mapping operator to be used. Same as tonemap option in @ref{tonemap}.
@@ -45,7 +45,7 @@ index bec0ee99d8bf91684dbabea697d677e4f86740ac..6c9d6f2175ee1668a11af6854560b16f
  
  @item param
  Tune the tone mapping algorithm. same as param option in @ref{tonemap}.
-@@ -28567,6 +28571,11 @@ Convert HDR(PQ/HLG) video to bt2020-transfer-characteristic p010 format using li
+@@ -28573,6 +28577,11 @@ Convert HDR(PQ/HLG) video to bt2020-transfer-characteristic p010 format using li
  @example
  -i INPUT -vf "format=p010,hwupload,tonemap_opencl=t=bt2020:tonemap=linear:format=p010,hwdownload,format=p010" OUTPUT
  @end example
