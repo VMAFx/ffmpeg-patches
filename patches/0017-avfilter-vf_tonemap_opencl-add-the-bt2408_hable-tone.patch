@@ -1,0 +1,476 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 19:33:49 +0200
+Subject: [PATCH] avfilter/vf_tonemap_opencl: add the bt2408_hable tone map
+
+Run the bt2408_hable tone map of vf_tonemap on the GPU. The host fills
+the same FFBT2408Hable state as the CPU filter (the Hable lookup table
+on PQ intensity, the IPT matrices and the black lift) and uploads it as
+a constant buffer when the peak or the input primaries change. The
+kernel in opencl/bt2408_hable.cl is a line by line port of the per-pixel
+part of bt2408_hable.c and writes P010 or NV12 directly, with the chroma
+taken from the encoded values like a software scaler does.
+
+The output is always in BT.709 primaries and the light level and
+mastering display side data is removed, since the frames are SDR.
+
+On 10 frames of a 2160p HDR10 clip the GPU output differs from the CPU
+tonemap=bt2408_hable path by a mean CIEDE2000 of 0.18 (95th percentile
+0.98) and from vf_libplacebo with tonemapping=hable by 0.72. Four frames
+of a 720p Dolby Vision profile 5 clip through dovi_reshape give 1.01
+against vf_libplacebo.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi                   |   9 ++
+ libavfilter/Makefile               |   5 +-
+ libavfilter/opencl/bt2408_hable.cl | 195 +++++++++++++++++++++++++++++
+ libavfilter/opencl_source.h        |   1 +
+ libavfilter/vf_tonemap_opencl.c    |  73 ++++++++++-
+ 5 files changed, 276 insertions(+), 7 deletions(-)
+ create mode 100644 libavfilter/opencl/bt2408_hable.cl
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index bec0ee99d8bf91684dbabea697d677e4f86740ac..6c9d6f2175ee1668a11af6854560b16fb85bbb0d 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -28483,6 +28483,10 @@ It accepts the following parameters:
+ @table @option
+ @item tonemap
+ Specify the tone-mapping operator to be used. Same as tonemap option in @ref{tonemap}.
++With @code{bt2408_hable}, the output is in BT.709 primaries whatever
++@option{primaries} says, the options @option{param}, @option{desat} and
++@option{threshold} are ignored, and the peak comes from @option{peak} or the
++frame side data, without peak detection.
+ 
+ @item param
+ Tune the tone mapping algorithm. same as param option in @ref{tonemap}.
+@@ -28567,6 +28571,11 @@ Convert HDR(PQ/HLG) video to bt2020-transfer-characteristic p010 format using li
+ @example
+ -i INPUT -vf "format=p010,hwupload,tonemap_opencl=t=bt2020:tonemap=linear:format=p010,hwdownload,format=p010" OUTPUT
+ @end example
++@item
++Tone map HDR10 to SDR BT.709 NV12 the way libplacebo does with @code{hable}.
++@example
++-init_hw_device opencl=ocl -filter_hw_device ocl -i INPUT -vf "format=p010,hwupload,tonemap_opencl=tonemap=bt2408_hable:m=bt709:r=tv,hwdownload,format=nv12" OUTPUT
++@end example
+ @end itemize
+ 
+ @section unsharp_opencl
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index a2805605a15bbc934e6da2bb1ee780675c9d024d..047d0f1edb043efff9019ebe2f38f0aea4518558 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -539,8 +539,9 @@ OBJS-$(CONFIG_TMEDIAN_FILTER)                += vf_xmedian.o framesync.o
+ OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
+ OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
+ OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o bt2408_hable.o
+-OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o \
+-                                                opencl/tonemap.o opencl/colorspace_common.o
++OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2408_hable.o \
++                                                opencl/tonemap.o opencl/bt2408_hable.o \
++                                                opencl/colorspace_common.o
+ OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o
+ OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
+ OBJS-$(CONFIG_TRANSPOSE_FILTER)              += vf_transpose.o
+diff --git a/libavfilter/opencl/bt2408_hable.cl b/libavfilter/opencl/bt2408_hable.cl
+new file mode 100644
+index 0000000000000000000000000000000000000000..26b93afa99990a91653c835446a84b6895427537
+--- /dev/null
++++ b/libavfilter/opencl/bt2408_hable.cl
+@@ -0,0 +1,195 @@
++/*
++ * HDR to SDR tone mapping with the Hable curve on the intensity of IPT
++ *
++ * The per-pixel part of libavfilter/bt2408_hable.c, which follows libplacebo
++ * v7.360.1 (src/shaders/colorspace.c: pl_shader_color_map_ex), Copyright (C)
++ * Niklas Haas and the libplacebo contributors, licensed under the GNU Lesser
++ * General Public License version 2.1 or later.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define BT2408_LUT_SIZE 256
++#define BT2408_SDR_WHITE 203.0f
++
++extern float  eotf_st2084(float);
++extern float  inverse_oetf_hlg(float);
++extern float  inverse_eotf_bt1886(float);
++extern float3 ootf(float3 c, float peak);
++extern float3 get_chroma_sample(float3, float3, float3, float3);
++
++// Code values of the P010 input and the NV12 or P010 output, exact for the
++// bit depth rather than the 8-bit scaling in colorspace_common.cl.
++#define BT2408_IN_CODE (65535.0f / 64.0f)
++#ifdef BT2408_OUT_P010
++#define BT2408_OUT_CODE (65535.0f / 64.0f)
++#define BT2408_OUT_SHIFT 4.0f
++#define BT2408_OUT_MAX 1023.0f
++#else
++#define BT2408_OUT_CODE 255.0f
++#define BT2408_OUT_SHIFT 1.0f
++#define BT2408_OUT_MAX 255.0f
++#endif
++
++float3 bt2408_yuv2lrgb(float3 yuv) {
++    float3 c = yuv * BT2408_IN_CODE, rgb;
++#ifdef FULL_RANGE_IN
++    c = (float3)(c.x, c.y - 512.0f, c.z - 512.0f) / 1023.0f;
++#else
++    c = (float3)((c.x - 64.0f) / 876.0f, (c.y - 512.0f) / 896.0f, (c.z - 512.0f) / 896.0f);
++#endif
++    rgb = (float3)(rgb_matrix[0] * c.x + rgb_matrix[1] * c.y + rgb_matrix[2] * c.z,
++                   rgb_matrix[3] * c.x + rgb_matrix[4] * c.y + rgb_matrix[5] * c.z,
++                   rgb_matrix[6] * c.x + rgb_matrix[7] * c.y + rgb_matrix[8] * c.z);
++    return (float3)(linearize(rgb.x), linearize(rgb.y), linearize(rgb.z));
++}
++
++float3 bt2408_lrgb2yuv(float3 c) {
++    float3 yuv;
++
++    c = (float3)(delinearize(c.x), delinearize(c.y), delinearize(c.z));
++    yuv = (float3)(yuv_matrix[0] * c.x + yuv_matrix[1] * c.y + yuv_matrix[2] * c.z,
++                   yuv_matrix[3] * c.x + yuv_matrix[4] * c.y + yuv_matrix[5] * c.z,
++                   yuv_matrix[6] * c.x + yuv_matrix[7] * c.y + yuv_matrix[8] * c.z);
++#ifdef FULL_RANGE_OUT
++    yuv = (float3)(yuv.x * BT2408_OUT_MAX,
++                   yuv.y * BT2408_OUT_MAX + (BT2408_OUT_MAX + 1.0f) / 2.0f,
++                   yuv.z * BT2408_OUT_MAX + (BT2408_OUT_MAX + 1.0f) / 2.0f);
++#else
++    yuv = (float3)(yuv.x * 219.0f + 16.0f, yuv.y * 224.0f + 128.0f, yuv.z * 224.0f + 128.0f) * BT2408_OUT_SHIFT;
++#endif
++    return yuv / BT2408_OUT_CODE;
++}
++
++/* Same layout as FFBT2408Hable in libavfilter/bt2408_hable.h. */
++struct bt2408_hable {
++    float rgb_to_lms[3][3];
++    float lms_to_rgb[3][3];
++    float lut_min;
++    float lut_max;
++    float lut[BT2408_LUT_SIZE];
++    float black_scale;
++    float black_offset;
++};
++
++constant const float BT2408_M1 = 2610.0f / 4096.0f / 4.0f;
++constant const float BT2408_M2 = 2523.0f / 4096.0f * 128.0f;
++constant const float BT2408_C1 = 3424.0f / 4096.0f;
++constant const float BT2408_C2 = 2413.0f / 4096.0f * 32.0f;
++constant const float BT2408_C3 = 2392.0f / 4096.0f * 32.0f;
++
++float bt2408_pq_oetf(float nits) {
++    float y = powr(max(nits, 0.0f) / 10000.0f, BT2408_M1);
++    return powr((BT2408_C1 + BT2408_C2 * y) / (1.0f + BT2408_C3 * y), BT2408_M2);
++}
++
++float bt2408_pq_eotf(float x) {
++    float p = powr(max(x, 0.0f), 1.0f / BT2408_M2);
++    return powr(max(p - BT2408_C1, 0.0f) / (BT2408_C2 - BT2408_C3 * p),
++                1.0f / BT2408_M1) * 10000.0f;
++}
++
++float3 bt2408_mul3(constant const float m[3][3], float3 v) {
++    return (float3)(m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z,
++                    m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
++                    m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z);
++}
++
++float bt2408_lut(constant const struct bt2408_hable *s, float i) {
++    float pos = (i - s->lut_min) / (s->lut_max - s->lut_min) * (BT2408_LUT_SIZE - 1);
++    int idx;
++
++    pos = clamp(pos, 0.0f, (float)(BT2408_LUT_SIZE - 1));
++    idx = min((int)pos, BT2408_LUT_SIZE - 2);
++    return s->lut[idx] + (pos - idx) * (s->lut[idx + 1] - s->lut[idx]);
++}
++
++float bt2408_hull(float x) {
++    return ((x - 6.0f) * x + 9.0f) * x;
++}
++
++// linear RGB, 1.0 = 100 cd/m^2, to linear BT.709 RGB for a pure power 2.4 display
++float3 bt2408_hable_pixel(constant const struct bt2408_hable *s, float3 rgb) {
++    float3 lms = bt2408_mul3(s->rgb_to_lms, rgb);
++    float3 ipt, out;
++    float k;
++
++    lms = (float3)(bt2408_pq_oetf(lms.x * BT2408_SDR_WHITE),
++                   bt2408_pq_oetf(lms.y * BT2408_SDR_WHITE),
++                   bt2408_pq_oetf(lms.z * BT2408_SDR_WHITE));
++    ipt = (float3)(0.4000f * lms.x + 0.4000f * lms.y + 0.2000f * lms.z,
++                   4.4550f * lms.x - 4.8510f * lms.y + 0.3960f * lms.z,
++                   0.8056f * lms.x + 0.3572f * lms.y - 1.1628f * lms.z);
++
++    k = ipt.x;
++    ipt.x = bt2408_lut(s, k);
++    k = min(k / max(ipt.x, 1e-9f), bt2408_hull(ipt.x) / max(bt2408_hull(k), 1e-9f));
++    ipt.y *= k;
++    ipt.z *= k;
++
++    lms = (float3)(ipt.x + 0.0975689f * ipt.y + 0.205226f * ipt.z,
++                   ipt.x - 0.1138760f * ipt.y + 0.133217f * ipt.z,
++                   ipt.x + 0.0326151f * ipt.y - 0.676887f * ipt.z);
++    lms = (float3)(bt2408_pq_eotf(lms.x), bt2408_pq_eotf(lms.y),
++                   bt2408_pq_eotf(lms.z)) / BT2408_SDR_WHITE;
++    out = bt2408_mul3(s->lms_to_rgb, lms);
++
++    // Encode for BT.1886 with a raised black, then decode as pure power 2.4.
++    out = powr(clamp(out, 0.0f, 1.0f) * s->black_scale, 1.0f / 2.4f) - s->black_offset;
++    return powr(clamp(out, 0.0f, 1.0f), 2.4f);
++}
++
++__kernel void tonemap_bt2408(__write_only image2d_t dst1,
++                             __read_only  image2d_t src1,
++                             __write_only image2d_t dst2,
++                             __read_only  image2d_t src2,
++                             constant const struct bt2408_hable *s,
++                             float peak)
++{
++    const sampler_t sampler = (CLK_NORMALIZED_COORDS_FALSE |
++                               CLK_ADDRESS_CLAMP_TO_EDGE   |
++                               CLK_FILTER_NEAREST);
++    int xi = get_global_id(0);
++    int yi = get_global_id(1);
++    // each work item processes a 2x2 quad
++    int x = 2 * xi;
++    int y = 2 * yi;
++
++    float y0 = read_imagef(src1, sampler, (int2)(x,     y)).x;
++    float y1 = read_imagef(src1, sampler, (int2)(x + 1, y)).x;
++    float y2 = read_imagef(src1, sampler, (int2)(x,     y + 1)).x;
++    float y3 = read_imagef(src1, sampler, (int2)(x + 1, y + 1)).x;
++    float2 uv = read_imagef(src2, sampler, (int2)(xi,     yi)).xy;
++
++    float3 c0 = bt2408_hable_pixel(s, ootf(bt2408_yuv2lrgb((float3)(y0, uv.x, uv.y)), peak));
++    float3 c1 = bt2408_hable_pixel(s, ootf(bt2408_yuv2lrgb((float3)(y1, uv.x, uv.y)), peak));
++    float3 c2 = bt2408_hable_pixel(s, ootf(bt2408_yuv2lrgb((float3)(y2, uv.x, uv.y)), peak));
++    float3 c3 = bt2408_hable_pixel(s, ootf(bt2408_yuv2lrgb((float3)(y3, uv.x, uv.y)), peak));
++
++    // Subsample the encoded values, as a software scaler does.
++    float3 e0 = bt2408_lrgb2yuv(c0), e1 = bt2408_lrgb2yuv(c1);
++    float3 e2 = bt2408_lrgb2yuv(c2), e3 = bt2408_lrgb2yuv(c3);
++    float3 chroma = get_chroma_sample(e0, e1, e2, e3);
++
++    if (xi < get_image_width(dst2) && yi < get_image_height(dst2)) {
++        write_imagef(dst1, (int2)(x,     y),     (float4)(e0.x, 0.0f, 0.0f, 1.0f));
++        write_imagef(dst1, (int2)(x + 1, y),     (float4)(e1.x, 0.0f, 0.0f, 1.0f));
++        write_imagef(dst1, (int2)(x,     y + 1), (float4)(e2.x, 0.0f, 0.0f, 1.0f));
++        write_imagef(dst1, (int2)(x + 1, y + 1), (float4)(e3.x, 0.0f, 0.0f, 1.0f));
++        write_imagef(dst2, (int2)(xi, yi), (float4)(chroma.y, chroma.z, 0.0f, 1.0f));
++    }
++}
+diff --git a/libavfilter/opencl_source.h b/libavfilter/opencl_source.h
+index b6930fb686da948f60ca13934e746c1c5694c7d3..4a7b945e029fbff9a5795481d455dc5afd90d90b 100644
+--- a/libavfilter/opencl_source.h
++++ b/libavfilter/opencl_source.h
+@@ -20,6 +20,7 @@
+ #define AVFILTER_OPENCL_SOURCE_H
+ 
+ extern const char *ff_source_avgblur_cl;
++extern const char *ff_source_bt2408_hable_cl;
+ extern const char *ff_source_colorkey_cl;
+ extern const char *ff_source_colorspace_common_cl;
+ extern const char *ff_source_convolution_cl;
+diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
+index c98c50bc87879c66441b5493308fac1208206993..855999b3b4ca18c2691f97eb5b62b422abc88852 100644
+--- a/libavfilter/vf_tonemap_opencl.c
++++ b/libavfilter/vf_tonemap_opencl.c
+@@ -24,6 +24,7 @@
+ #include "libavutil/pixdesc.h"
+ 
+ #include "avfilter.h"
++#include "bt2408_hable.h"
+ #include "filters.h"
+ #include "formats.h"
+ #include "opencl.h"
+@@ -46,6 +47,7 @@ enum TonemapAlgorithm {
+     TONEMAP_REINHARD,
+     TONEMAP_HABLE,
+     TONEMAP_MOBIUS,
++    TONEMAP_BT2408_HABLE,
+     TONEMAP_MAX,
+ };
+ 
+@@ -70,6 +72,10 @@ typedef struct TonemapOpenCLContext {
+     cl_kernel             kernel;
+     cl_command_queue      command_queue;
+     cl_mem                util_mem;
++    FFBT2408Hable         bt2408;
++    double                bt2408_peak;
++    enum AVColorPrimaries bt2408_prim;
++    cl_mem                bt2408_mem;
+ } TonemapOpenCLContext;
+ 
+ static const char *const linearize_funcs[] = {
+@@ -90,6 +96,8 @@ static const char *const tonemap_func[TONEMAP_MAX] = {
+     [TONEMAP_REINHARD] = "reinhard",
+     [TONEMAP_HABLE]    = "hable",
+     [TONEMAP_MOBIUS]   = "mobius",
++    // tonemap_bt2408 does not use TONE_FUNC
++    [TONEMAP_BT2408_HABLE] = "direct",
+ };
+ 
+ static int get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries out,
+@@ -110,7 +118,7 @@ static int get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries ou
+     return 0;
+ }
+ 
+-#define OPENCL_SOURCE_NB 3
++#define OPENCL_SOURCE_NB 4
+ // Average light level for SDR signals. This is equal to a signal level of 0.5
+ // under a typical presentation gamma of about 2.0.
+ static const float sdr_avg = 0.25f;
+@@ -194,6 +202,9 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+     if (ctx->range_out == AVCOL_RANGE_JPEG)
+         av_bprintf(&header, "#define FULL_RANGE_OUT\n");
+ 
++    if (ctx->ocf.output_format == AV_PIX_FMT_P010)
++        av_bprintf(&header, "#define BT2408_OUT_P010\n");
++
+     av_bprintf(&header, "#define chroma_loc %d\n", (int)ctx->chroma_loc);
+ 
+     if (rgb2rgb_passthrough)
+@@ -243,7 +254,8 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+     av_log(avctx, AV_LOG_DEBUG, "Generated OpenCL header:\n%s\n", header.str);
+     opencl_sources[0] = header.str;
+     opencl_sources[1] = ff_source_tonemap_cl;
+-    opencl_sources[2] = ff_source_colorspace_common_cl;
++    opencl_sources[2] = ff_source_bt2408_hable_cl;
++    opencl_sources[3] = ff_source_colorspace_common_cl;
+     err = ff_opencl_filter_load_program(avctx, opencl_sources, OPENCL_SOURCE_NB);
+ 
+     av_bprint_finalize(&header, NULL);
+@@ -256,9 +268,15 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL "
+                      "command queue %d.\n", cle);
+ 
+-    ctx->kernel = clCreateKernel(ctx->ocf.program, "tonemap", &cle);
++    ctx->kernel = clCreateKernel(ctx->ocf.program,
++                                 ctx->tonemap == TONEMAP_BT2408_HABLE ?
++                                 "tonemap_bt2408" : "tonemap", &cle);
+     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel %d.\n", cle);
+ 
++    ctx->bt2408_mem = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_ONLY,
++                                     sizeof(ctx->bt2408), NULL, &cle);
++    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create bt2408 buffer: %d.\n", cle);
++
+     ctx->util_mem =
+         clCreateBuffer(ctx->ocf.hwctx->context, 0,
+                        (2 * DETECTION_FRAMES + 7) * sizeof(unsigned),
+@@ -272,6 +290,8 @@ fail:
+     av_bprint_finalize(&header, NULL);
+     if (ctx->util_mem)
+         clReleaseMemObject(ctx->util_mem);
++    if (ctx->bt2408_mem)
++        clReleaseMemObject(ctx->bt2408_mem);
+     if (ctx->command_queue)
+         clReleaseCommandQueue(ctx->command_queue);
+     if (ctx->kernel)
+@@ -331,6 +351,31 @@ static int tonemap_opencl_query_formats(const AVFilterContext *avctx,
+     return 0;
+ }
+ 
++static int setup_bt2408(AVFilterContext *avctx, const AVFrame *input, double peak)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    cl_int cle;
++    int err;
++
++    if (peak == ctx->bt2408_peak && input->color_primaries == ctx->bt2408_prim)
++        return 0;
++    err = ff_bt2408_hable_init(&ctx->bt2408, input->color_primaries, peak * REFERENCE_WHITE);
++    if (err < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Unsupported primaries '%s' or peak %f\n",
++               av_color_primaries_name(input->color_primaries), peak);
++        return err;
++    }
++    cle = clEnqueueWriteBuffer(ctx->command_queue, ctx->bt2408_mem, CL_TRUE, 0,
++                               sizeof(ctx->bt2408), &ctx->bt2408, 0, NULL, NULL);
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to write bt2408 buffer: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++    ctx->bt2408_peak = peak;
++    ctx->bt2408_prim = input->color_primaries;
++    return 0;
++}
++
+ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+                          AVFrame *output, AVFrame *input, float peak) {
+     TonemapOpenCLContext *ctx = avctx->priv;
+@@ -339,11 +384,18 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+     size_t local_work[2];
+     cl_int cle;
+ 
++    if (ctx->tonemap == TONEMAP_BT2408_HABLE) {
++        err = setup_bt2408(avctx, input, peak);
++        if (err < 0)
++            return err;
++    }
++
+     CL_SET_KERNEL_ARG(kernel, 0, cl_mem, &output->data[0]);
+     CL_SET_KERNEL_ARG(kernel, 1, cl_mem, &input->data[0]);
+     CL_SET_KERNEL_ARG(kernel, 2, cl_mem, &output->data[1]);
+     CL_SET_KERNEL_ARG(kernel, 3, cl_mem, &input->data[1]);
+-    CL_SET_KERNEL_ARG(kernel, 4, cl_mem, &ctx->util_mem);
++    CL_SET_KERNEL_ARG(kernel, 4, cl_mem, ctx->tonemap == TONEMAP_BT2408_HABLE ?
++                      &ctx->bt2408_mem : &ctx->util_mem);
+     CL_SET_KERNEL_ARG(kernel, 5, cl_float, &peak);
+ 
+     local_work[0]  = 16;
+@@ -404,6 +456,9 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+         output->colorspace = ctx->colorspace;
+     if (ctx->range != -1)
+         output->color_range = ctx->range;
++    // bt2408_hable maps into BT.709 itself
++    if (ctx->tonemap == TONEMAP_BT2408_HABLE)
++        output->color_primaries = AVCOL_PRI_BT709;
+ 
+     ctx->trc_in = input->color_trc;
+     ctx->trc_out = output->color_trc;
+@@ -449,7 +504,12 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+ 
+     av_frame_free(&input);
+ 
+-    ff_update_hdr_metadata(output, ctx->target_peak);
++    if (ctx->tonemap == TONEMAP_BT2408_HABLE) {
++        av_frame_remove_side_data(output, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++        av_frame_remove_side_data(output, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    } else {
++        ff_update_hdr_metadata(output, ctx->target_peak);
++    }
+ 
+     av_log(ctx, AV_LOG_DEBUG, "Tone-mapping output: %s, %ux%u (%"PRId64").\n",
+            av_get_pix_fmt_name(output->format),
+@@ -493,6 +553,8 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
+ 
+     if (ctx->util_mem)
+         clReleaseMemObject(ctx->util_mem);
++    if (ctx->bt2408_mem)
++        clReleaseMemObject(ctx->bt2408_mem);
+     if (ctx->kernel) {
+         cle = clReleaseKernel(ctx->kernel);
+         if (cle != CL_SUCCESS)
+@@ -521,6 +583,7 @@ static const AVOption tonemap_opencl_options[] = {
+     {     "reinhard", 0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_REINHARD},          0, 0, FLAGS, .unit = "tonemap" },
+     {     "hable",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_HABLE},             0, 0, FLAGS, .unit = "tonemap" },
+     {     "mobius",   0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_MOBIUS},            0, 0, FLAGS, .unit = "tonemap" },
++    {     "bt2408_hable", 0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_BT2408_HABLE},  0, 0, FLAGS, .unit = "tonemap" },
+     { "transfer", "set transfer characteristic", OFFSET(trc), AV_OPT_TYPE_INT, {.i64 = AVCOL_TRC_BT709}, -1, INT_MAX, FLAGS, .unit = "transfer" },
+     { "t",        "set transfer characteristic", OFFSET(trc), AV_OPT_TYPE_INT, {.i64 = AVCOL_TRC_BT709}, -1, INT_MAX, FLAGS, .unit = "transfer" },
+     {     "bt709",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_BT709},         0, 0, FLAGS, .unit = "transfer" },

@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 19:27:05 +0200
+Subject: [PATCH] avfilter/vf_tonemap_opencl: declare the output matrix and
+ range on the link
+
+The filter writes the matrix and range from its matrix and range options
+into the output frames, but the output link kept the ones negotiated for
+the input. A software conversion after hwdownload then took the frames
+as the input's matrix (for example BT.2020) and converted them again:
+a pure red HDR10 frame mapped to BT.709 came out of
+hwdownload,format=nv12,format=yuv420p with Y 73 instead of 63.
+
+Set the output colour space and range on the link from the options when
+they are given, as vf_libplacebo and vf_colorspace do. Without the
+options both links still share one list, as before.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavfilter/vf_tonemap_opencl.c | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
+index 2f47cfd49f4817f488bed60270ab825b009b2021..c98c50bc87879c66441b5493308fac1208206993 100644
+--- a/libavfilter/vf_tonemap_opencl.c
++++ b/libavfilter/vf_tonemap_opencl.c
+@@ -25,6 +25,7 @@
+ 
+ #include "avfilter.h"
+ #include "filters.h"
++#include "formats.h"
+ #include "opencl.h"
+ #include "opencl_source.h"
+ #include "video.h"
+@@ -302,6 +303,34 @@ static int tonemap_opencl_config_output(AVFilterLink *outlink)
+     return 0;
+ }
+ 
++static int tonemap_opencl_query_formats(const AVFilterContext *avctx,
++                                        AVFilterFormatsConfig **cfg_in,
++                                        AVFilterFormatsConfig **cfg_out)
++{
++    static const enum AVPixelFormat pix_fmts[] = {
++        AV_PIX_FMT_OPENCL, AV_PIX_FMT_NONE,
++    };
++    const TonemapOpenCLContext *ctx = avctx->priv;
++    int err;
++
++    err = ff_set_common_formats_from_list2(avctx, cfg_in, cfg_out, pix_fmts);
++    if (err < 0)
++        return err;
++
++    /* Declare the matrix and range of the output frames on the link, so that
++     * a later conversion does not treat them as the input's. */
++    if (ctx->colorspace != -1) {
++        err = ff_formats_ref(ff_make_formats_list_singleton(ctx->colorspace),
++                             &cfg_out[0]->color_spaces);
++        if (err < 0)
++            return err;
++    }
++    if (ctx->range != -1)
++        return ff_formats_ref(ff_make_formats_list_singleton(ctx->range),
++                              &cfg_out[0]->color_ranges);
++    return 0;
++}
++
+ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+                          AVFrame *output, AVFrame *input, float peak) {
+     TonemapOpenCLContext *ctx = avctx->priv;
+@@ -547,6 +576,6 @@ const FFFilter ff_vf_tonemap_opencl = {
+     .uninit         = &tonemap_opencl_uninit,
+     FILTER_INPUTS(tonemap_opencl_inputs),
+     FILTER_OUTPUTS(tonemap_opencl_outputs),
+-    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
++    FILTER_QUERY_FUNC2(&tonemap_opencl_query_formats),
+     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
+ };
