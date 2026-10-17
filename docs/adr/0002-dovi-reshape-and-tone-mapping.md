@@ -1,6 +1,6 @@
 # ADR-0002: Dolby Vision reshape and peak detection in FFmpeg's own tone-map filters
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-10-17
 - **Authors**: Lusoris
 
