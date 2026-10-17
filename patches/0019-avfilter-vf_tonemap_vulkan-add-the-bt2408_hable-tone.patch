@@ -1,0 +1,756 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sat, 17 Oct 2026 21:37:58 +0200
+Subject: [PATCH] avfilter/vf_tonemap_vulkan: add the bt2408_hable tone map
+
+Add a Vulkan compute filter that runs the bt2408_hable tone map of the
+CPU tonemap filter. The host fills the shared FFBT2408Hable state and
+uploads it as a storage buffer when the peak or the primaries change,
+after the queued work has finished. The shader in
+vulkan/bt2408_hable.comp.glsl ports the per-pixel part of
+opencl/bt2408_hable.cl.
+
+The filter takes P010 frames with PQ transfer and BT.2020 limited range,
+refuses other input with an error, and writes BT.709 limited range NV12
+or P010. Light-level and mastering-display side data are removed from
+the output.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ configure                                 |   1 +
+ doc/filters.texi                          |  35 ++
+ libavfilter/Makefile                      |   1 +
+ libavfilter/allfilters.c                  |   1 +
+ libavfilter/vf_tonemap_vulkan.c           | 399 ++++++++++++++++++++++
+ libavfilter/vulkan/Makefile               |   1 +
+ libavfilter/vulkan/bt2408_hable.comp.glsl | 221 ++++++++++++
+ 7 files changed, 659 insertions(+)
+ create mode 100644 libavfilter/vf_tonemap_vulkan.c
+ create mode 100644 libavfilter/vulkan/bt2408_hable.comp.glsl
+
+diff --git a/configure b/configure
+index 374bd5c1512943439480825f32e448e7871eb61c..b1656f0f803081cecc0f9ac7136c2d08d0494ca1 100755
+--- a/configure
++++ b/configure
+@@ -4283,6 +4283,7 @@ tinterlace_pad_test_deps="tinterlace_filter"
+ tonemap_filter_deps="const_nan"
+ tonemap_vaapi_filter_deps="vaapi VAProcFilterParameterBufferHDRToneMapping"
+ tonemap_opencl_filter_deps="opencl const_nan"
++tonemap_vulkan_filter_deps="vulkan spirv_compiler"
+ transpose_opencl_filter_deps="opencl"
+ transpose_vaapi_filter_deps="vaapi VAProcPipelineCaps_rotation_flags"
+ transpose_vt_filter_deps="videotoolbox VTPixelRotationSessionCreate"
+diff --git a/doc/filters.texi b/doc/filters.texi
+index c816216b375410fc0f4926f2fb164a152014d976..d398b36be623af5de221d512f45d09362fdd9e7e 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -29601,6 +29601,41 @@ Preserve landscape geometry (when @var{width} >= @var{height}).
+ 
+ @end table
+ 
++@section tonemap_vulkan
++
++Tone map HDR video to SDR using Vulkan.
++
++It accepts the following parameters:
++
++@table @option
++@item tonemap
++Specify the tone mapping algorithm to use.
++Only @code{bt2408_hable} is currently supported (default).
++
++@table @samp
++@item bt2408_hable
++ITU-R BT.2408 tone mapping with Hable curve on IPT intensity.
++@end table
++
++@item peak
++Signal peak override, in units of 100 cd/m^2 (nits / 100). Default is @code{0},
++which means the peak is determined from frame metadata.
++
++@item format
++Output software pixel format of the hardware frames. Can be @code{nv12} or
++@code{p010}. Default is @code{nv12}.
++@end table
++
++@subsection Example
++
++@itemize
++@item
++Tone map an HDR10 video to SDR NV12:
++@example
++ffmpeg -init_hw_device vulkan -filter_hw_device vulkan0 -i hdr10.mkv -vf "format=p010,hwupload,tonemap_vulkan,hwdownload,format=nv12" out
++@end example
++@end itemize
++
+ @c man end VULKAN VIDEO FILTERS
+ 
+ @chapter QSV Video Filters
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index a29004c0418e9f9d55d96d11ec7b365e26e84eca..2d10cdb28f1221d17f3b808cda486af4a1adf856 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -543,6 +543,7 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2
+                                                 opencl/tonemap.o opencl/bt2408_hable.o \
+                                                 opencl/colorspace_common.o
+ OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o bt2408_hable.o
++OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER)         += vf_tonemap_vulkan.o vulkan.o vulkan_filter.o bt2408_hable.o
+ OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
+ OBJS-$(CONFIG_TRANSPOSE_FILTER)              += vf_transpose.o
+ OBJS-$(CONFIG_TRANSPOSE_CUDA_FILTER)         += vf_transpose_cuda.o vf_transpose_cuda.ptx.o \
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index d6f1e832c44b94d19edaa3a989d0a3c1cfa6bf02..c98adbeee9576cf80dd46848b17bfe6ec90a469e 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -510,6 +510,7 @@ extern const FFFilter ff_vf_tmix;
+ extern const FFFilter ff_vf_tonemap;
+ extern const FFFilter ff_vf_tonemap_opencl;
+ extern const FFFilter ff_vf_tonemap_vaapi;
++extern const FFFilter ff_vf_tonemap_vulkan;
+ extern const FFFilter ff_vf_tpad;
+ extern const FFFilter ff_vf_transpose;
+ extern const FFFilter ff_vf_transpose_cuda;
+diff --git a/libavfilter/vf_tonemap_vulkan.c b/libavfilter/vf_tonemap_vulkan.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..502afad6583087617f1d1079089abd4dc7a04aeb
+--- /dev/null
++++ b/libavfilter/vf_tonemap_vulkan.c
+@@ -0,0 +1,399 @@
++/*
++ * HDR to SDR tone mapping with the Hable curve on the intensity of IPT
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <float.h>
++
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "vulkan_filter.h"
++#include "bt2408_hable.h"
++#include "colorspace.h"
++#include "filters.h"
++#include "formats.h"
++#include "video.h"
++
++extern const unsigned char ff_bt2408_hable_comp_spv_data[];
++extern const unsigned int ff_bt2408_hable_comp_spv_len;
++
++enum TonemapAlgorithm {
++    TONEMAP_BT2408_HABLE,
++    TONEMAP_NB,
++};
++
++typedef struct TonemapVulkanContext {
++    FFVulkanContext vkctx;
++
++    int initialized;
++    FFVkExecPool e;
++    AVVulkanDeviceQueueFamily *qf;
++    FFVulkanShader shd;
++    VkSampler sampler;
++
++    /* Options */
++    int tonemap;
++    enum AVPixelFormat format;
++    double peak;
++
++    /* Storage buffer for tone map params */
++    FFVkBuffer params_buf;
++    FFBT2408Hable bt2408;
++    double bt2408_peak;
++    enum AVColorPrimaries bt2408_prim;
++
++    /* Push constants */
++    struct {
++        int32_t out_p010;
++    } opts;
++} TonemapVulkanContext;
++
++static av_cold void tonemap_vulkan_uninit(AVFilterContext *avctx)
++{
++    TonemapVulkanContext *s = avctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    FFVulkanFunctions *vk = &vkctx->vkfn;
++
++    ff_vk_exec_pool_free(vkctx, &s->e);
++    ff_vk_shader_free(vkctx, &s->shd);
++    ff_vk_free_buf(vkctx, &s->params_buf);
++
++    if (s->sampler)
++        vk->DestroySampler(vkctx->hwctx->act_dev, s->sampler,
++                           vkctx->hwctx->alloc);
++
++    ff_vk_uninit(&s->vkctx);
++
++    s->initialized = 0;
++}
++
++static int tonemap_vulkan_check_input(AVFilterContext *ctx, const AVFrame *in)
++{
++    if (in->color_trc != AVCOL_TRC_SMPTE2084 ||
++        in->colorspace != AVCOL_SPC_BT2020_NCL ||
++        in->color_range == AVCOL_RANGE_JPEG) {
++        av_log(ctx, AV_LOG_ERROR,
++               "Unsupported input color properties: trc '%s', colorspace '%s', range '%s' "
++               "(expected smpte2084, bt2020nc, and limited range)\n",
++               av_color_transfer_name(in->color_trc),
++               av_color_space_name(in->colorspace),
++               av_color_range_name(in->color_range));
++        return AVERROR(EINVAL);
++    }
++
++    return 0;
++}
++
++static int setup_bt2408(AVFilterContext *avctx, const AVFrame *input, double peak)
++{
++    TonemapVulkanContext *s = avctx->priv;
++    uint8_t *mapped;
++    int err, i;
++
++    if (peak == s->bt2408_peak && input->color_primaries == s->bt2408_prim)
++        return 0;
++
++    err = ff_bt2408_hable_init(&s->bt2408, input->color_primaries, peak * REFERENCE_WHITE);
++    if (err < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Unsupported primaries '%s' or peak %f\n",
++               av_color_primaries_name(input->color_primaries), peak);
++        return err;
++    }
++
++    for (i = 0; i < s->e.pool_size; i++)
++        ff_vk_exec_wait(&s->vkctx, &s->e.contexts[i]);
++
++    err = ff_vk_map_buffer(&s->vkctx, &s->params_buf, &mapped, 0);
++    if (err < 0)
++        return err;
++    memcpy(mapped, &s->bt2408, sizeof(s->bt2408));
++    err = ff_vk_unmap_buffer(&s->vkctx, &s->params_buf, 1);
++    if (err < 0)
++        return err;
++
++    s->bt2408_peak = peak;
++    s->bt2408_prim = input->color_primaries;
++    return 0;
++}
++
++static av_cold int init_pipeline(AVFilterContext *ctx)
++{
++    TonemapVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    int err;
++
++    err = ff_vk_exec_pool_init(vkctx, s->qf, &s->e, s->qf->num * 4, 0, 0, 0, NULL);
++    if (err < 0)
++        return err;
++
++    err = ff_vk_init_sampler(vkctx, &s->sampler, 0, VK_FILTER_NEAREST);
++    if (err < 0)
++        return err;
++
++    const FFVulkanDescriptorSetBinding desc_img[] = {
++        {
++            .type     = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++            .stages   = VK_SHADER_STAGE_COMPUTE_BIT,
++            .elems    = 2,
++            .samplers = DUP_SAMPLER(s->sampler),
++        },
++        {
++            .type   = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++            .stages = VK_SHADER_STAGE_COMPUTE_BIT,
++            .elems  = 2,
++        },
++    };
++    const FFVulkanDescriptorSetBinding desc_buf[] = {
++        {
++            .type   = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++            .stages = VK_SHADER_STAGE_COMPUTE_BIT,
++        },
++    };
++
++    ff_vk_shader_load(&s->shd, VK_SHADER_STAGE_COMPUTE_BIT, NULL,
++                      (uint32_t []) { 16, 16, 1 }, 0);
++
++    ff_vk_shader_add_push_const(&s->shd, 0, sizeof(s->opts),
++                                VK_SHADER_STAGE_COMPUTE_BIT);
++
++    ff_vk_shader_add_descriptor_set(vkctx, &s->shd, desc_img, 2, 0);
++    ff_vk_shader_add_descriptor_set(vkctx, &s->shd, desc_buf, 1, 1);
++
++    err = ff_vk_shader_link(vkctx, &s->shd,
++                            ff_bt2408_hable_comp_spv_data,
++                            ff_bt2408_hable_comp_spv_len, "main");
++    if (err < 0)
++        return err;
++
++    return ff_vk_shader_register_exec(vkctx, &s->e, &s->shd);
++}
++
++static av_cold int init_filter(AVFilterContext *ctx)
++{
++    TonemapVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    int err;
++
++    s->qf = ff_vk_qf_find(vkctx, VK_QUEUE_COMPUTE_BIT, 0);
++    if (!s->qf) {
++        av_log(ctx, AV_LOG_ERROR, "Device has no compute queues\n");
++        return AVERROR(ENOTSUP);
++    }
++
++    err = init_pipeline(ctx);
++    if (err < 0) {
++        tonemap_vulkan_uninit(ctx);
++        return err;
++    }
++
++    err = ff_vk_create_buf(vkctx, &s->params_buf, sizeof(FFBT2408Hable), NULL, NULL,
++                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
++    if (err < 0) {
++        tonemap_vulkan_uninit(ctx);
++        return err;
++    }
++
++    err = ff_vk_shader_update_desc_buffer(vkctx, &s->e.contexts[0], &s->shd,
++                                          1, 0, 0,
++                                          &s->params_buf, 0, s->params_buf.size,
++                                          VK_FORMAT_UNDEFINED);
++    if (err < 0) {
++        tonemap_vulkan_uninit(ctx);
++        return err;
++    }
++
++    s->shd.lg_size[0] <<= 1;
++    s->shd.lg_size[1] <<= 1;
++
++    s->opts.out_p010 = s->vkctx.output_format == AV_PIX_FMT_P010;
++    s->bt2408_peak = -1.0;
++    s->bt2408_prim = AVCOL_PRI_UNSPECIFIED;
++    s->initialized = 1;
++
++    return 0;
++}
++
++static void tonemap_vulkan_set_props(AVFrame *out)
++{
++    out->color_primaries = AVCOL_PRI_BT709;
++    out->color_trc       = AVCOL_TRC_BT709;
++    out->colorspace      = AVCOL_SPC_BT709;
++    out->color_range     = AVCOL_RANGE_MPEG;
++    av_frame_remove_side_data(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    av_frame_remove_side_data(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++}
++
++static int tonemap_vulkan_filter_frame(AVFilterLink *link, AVFrame *in)
++{
++    AVFilterContext *ctx = link->dst;
++    TonemapVulkanContext *s = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++    double peak = s->peak ? s->peak : ff_determine_signal_peak(in);
++    AVFrame *out;
++    int err;
++
++    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!out) {
++        av_frame_free(&in);
++        return AVERROR(ENOMEM);
++    }
++
++    err = tonemap_vulkan_check_input(ctx, in);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return err;
++    }
++
++    if (!s->initialized) {
++        err = init_filter(ctx);
++        if (err < 0) {
++            av_frame_free(&in);
++            av_frame_free(&out);
++            return err;
++        }
++    }
++
++    err = setup_bt2408(ctx, in, peak);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return err;
++    }
++
++    err = ff_vk_filter_process_simple(&s->vkctx, &s->e, &s->shd, out, in,
++                                      s->sampler, 1, &s->opts, sizeof(s->opts));
++    if (err < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return err;
++    }
++
++    err = av_frame_copy_props(out, in);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return err;
++    }
++
++    tonemap_vulkan_set_props(out);
++    av_frame_free(&in);
++
++    return ff_filter_frame(outlink, out);
++}
++
++static int tonemap_vulkan_config_input(AVFilterLink *inlink)
++{
++    AVFilterContext *avctx = inlink->dst;
++    TonemapVulkanContext *s = avctx->priv;
++    int err = ff_vk_filter_config_input(inlink);
++
++    if (err < 0)
++        return err;
++
++    if (s->vkctx.input_format != AV_PIX_FMT_P010) {
++        av_log(avctx, AV_LOG_ERROR, "Unsupported input format %s, only p010 supported\n",
++               av_get_pix_fmt_name(s->vkctx.input_format));
++        return AVERROR(EINVAL);
++    }
++
++    return 0;
++}
++
++static int tonemap_vulkan_config_output(AVFilterLink *outlink)
++{
++    AVFilterContext *avctx = outlink->src;
++    TonemapVulkanContext *s = avctx->priv;
++
++    if (s->format != AV_PIX_FMT_NONE &&
++        s->format != AV_PIX_FMT_NV12 &&
++        s->format != AV_PIX_FMT_P010) {
++        av_log(avctx, AV_LOG_ERROR, "Unsupported output format, only nv12 and p010 supported\n");
++        return AVERROR(EINVAL);
++    }
++
++    s->vkctx.output_format = (s->format == AV_PIX_FMT_NONE) ? AV_PIX_FMT_NV12 : s->format;
++
++    return ff_vk_filter_config_output(outlink);
++}
++
++#define OFFSET(x) offsetof(TonemapVulkanContext, x)
++#define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
++static const AVOption tonemap_vulkan_options[] = {
++    { "tonemap", "tone map algorithm selection", OFFSET(tonemap), AV_OPT_TYPE_INT, { .i64 = TONEMAP_BT2408_HABLE }, 0, TONEMAP_NB - 1, FLAGS, .unit = "tonemap" },
++    {     "bt2408_hable", "ITU-R BT.2408 tone mapping with Hable curve on IPT", 0, AV_OPT_TYPE_CONST, { .i64 = TONEMAP_BT2408_HABLE }, 0, 0, FLAGS, .unit = "tonemap" },
++    { "peak", "signal peak override (units of 100 cd/m^2)", OFFSET(peak), AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { "format", "output pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_NV12 }, AV_PIX_FMT_NONE, INT_MAX, FLAGS, .unit = "fmt" },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(tonemap_vulkan);
++
++static const AVFilterPad tonemap_vulkan_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = &tonemap_vulkan_filter_frame,
++        .config_props = &tonemap_vulkan_config_input,
++    },
++};
++
++static const AVFilterPad tonemap_vulkan_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = &tonemap_vulkan_config_output,
++    },
++};
++
++static int tonemap_vulkan_query_formats(const AVFilterContext *avctx,
++                                        AVFilterFormatsConfig **cfg_in,
++                                        AVFilterFormatsConfig **cfg_out)
++{
++    static const enum AVPixelFormat pix_fmts[] = {
++        AV_PIX_FMT_VULKAN, AV_PIX_FMT_NONE,
++    };
++    int err;
++
++    err = ff_set_common_formats_from_list2(avctx, cfg_in, cfg_out, pix_fmts);
++    if (err < 0)
++        return err;
++
++    err = ff_formats_ref(ff_make_formats_list_singleton(AVCOL_SPC_BT709),
++                         &cfg_out[0]->color_spaces);
++    if (err < 0)
++        return err;
++
++    return ff_formats_ref(ff_make_formats_list_singleton(AVCOL_RANGE_MPEG),
++                          &cfg_out[0]->color_ranges);
++}
++
++const FFFilter ff_vf_tonemap_vulkan = {
++    .p.name         = "tonemap_vulkan",
++    .p.description  = NULL_IF_CONFIG_SMALL("Tone map HDR video to SDR with Vulkan"),
++    .p.priv_class   = &tonemap_vulkan_class,
++    .p.flags        = AVFILTER_FLAG_HWDEVICE,
++    .priv_size      = sizeof(TonemapVulkanContext),
++    .init           = &ff_vk_filter_init,
++    .uninit         = &tonemap_vulkan_uninit,
++    FILTER_INPUTS(tonemap_vulkan_inputs),
++    FILTER_OUTPUTS(tonemap_vulkan_outputs),
++    FILTER_QUERY_FUNC2(&tonemap_vulkan_query_formats),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};
+diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
+index 8a0912b4dfc4969cb7b4eb06c7565e93ba6b8cf7..48aa540cb4c147e8e48aafccb1b1014c36b36ba0 100644
+--- a/libavfilter/vulkan/Makefile
++++ b/libavfilter/vulkan/Makefile
+@@ -14,6 +14,7 @@ OBJS-$(CONFIG_SCDET_VULKAN_FILTER) += vulkan/scdet.comp.spv.o
+ OBJS-$(CONFIG_OVERLAY_VULKAN_FILTER) += vulkan/overlay.comp.spv.o
+ OBJS-$(CONFIG_FLIP_VULKAN_FILTER) += vulkan/flip.comp.spv.o
+ OBJS-$(CONFIG_TRANSPOSE_VULKAN_FILTER) += vulkan/transpose.comp.spv.o
++OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o
+ OBJS-$(CONFIG_V360_VULKAN_FILTER) += vulkan/v360.comp.spv.o
+ OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER) += vulkan/interlace.comp.spv.o
+ OBJS-$(CONFIG_XFADE_VULKAN_FILTER) += vulkan/xfade.comp.spv.o
+diff --git a/libavfilter/vulkan/bt2408_hable.comp.glsl b/libavfilter/vulkan/bt2408_hable.comp.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3c5ddab4503e8fefe7253d909f5973d9a92860a
+--- /dev/null
++++ b/libavfilter/vulkan/bt2408_hable.comp.glsl
+@@ -0,0 +1,221 @@
++/*
++ * HDR to SDR tone mapping with the Hable curve on the intensity of IPT
++ *
++ * The per-pixel part of libavfilter/bt2408_hable.c, which follows libplacebo
++ * v7.360.1 (src/shaders/colorspace.c: pl_shader_color_map_ex), Copyright (C)
++ * Niklas Haas and the libplacebo contributors, licensed under the GNU Lesser
++ * General Public License version 2.1 or later.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma shader_stage(compute)
++
++#extension GL_EXT_shader_image_load_formatted : require
++#extension GL_EXT_scalar_block_layout : require
++#extension GL_EXT_nonuniform_qualifier : require
++
++layout (local_size_x_id = 253, local_size_y_id = 254, local_size_z_id = 255) in;
++
++layout (set = 0, binding = 0) uniform sampler2D input_img[];
++layout (set = 0, binding = 1) uniform writeonly image2D output_img[];
++
++#define BT2408_LUT_SIZE 256
++#define BT2408_SDR_WHITE 203.0f
++
++struct bt2408_hable {
++    float rgb_to_lms[3][3];
++    float lms_to_rgb[3][3];
++    float lut_min;
++    float lut_max;
++    float lut[BT2408_LUT_SIZE];
++    float black_scale;
++    float black_offset;
++};
++
++layout (std430, set = 1, binding = 0) readonly buffer BT2408Buffer {
++    bt2408_hable s;
++};
++
++layout (push_constant, std430) uniform pushConstants {
++    int out_p010;
++};
++
++#define BT2408_IN_CODE (65535.0f / 64.0f)
++
++const float ST2084_M1 = 0.1593017578125f;
++const float ST2084_M2 = 78.84375f;
++const float ST2084_C1 = 0.8359375f;
++const float ST2084_C2 = 18.8515625f;
++const float ST2084_C3 = 18.6875f;
++const float ST2084_MAX_LUMINANCE = 10000.0f;
++const float REFERENCE_WHITE = 100.0f;
++
++const float rgb_matrix[9] = float[9](
++    1.00000000f,  0.00000000f,  1.47460000f,
++    1.00000000f, -0.16455313f, -0.57135313f,
++    1.00000000f,  1.88140000f,  0.00000000f
++);
++
++const float yuv_matrix[9] = float[9](
++     0.21260000f,  0.71520000f,  0.07220000f,
++    -0.11457211f, -0.38542789f,  0.50000000f,
++     0.50000000f, -0.45415291f, -0.04584709f
++);
++
++float eotf_st2084(float x) {
++    float p = pow(max(x, 0.0f), 1.0f / ST2084_M2);
++    float a = max(p - ST2084_C1, 0.0f);
++    float b = max(ST2084_C2 - ST2084_C3 * p, 1e-6f);
++    float c = pow(a / b, 1.0f / ST2084_M1);
++    return x > 0.0f ? c * ST2084_MAX_LUMINANCE / REFERENCE_WHITE : 0.0f;
++}
++
++vec3 bt2408_yuv2lrgb(vec3 yuv) {
++    vec3 c = yuv * BT2408_IN_CODE;
++    c = vec3((c.x - 64.0f) / 876.0f, (c.y - 512.0f) / 896.0f, (c.z - 512.0f) / 896.0f);
++    vec3 rgb = vec3(
++        rgb_matrix[0] * c.x + rgb_matrix[1] * c.y + rgb_matrix[2] * c.z,
++        rgb_matrix[3] * c.x + rgb_matrix[4] * c.y + rgb_matrix[5] * c.z,
++        rgb_matrix[6] * c.x + rgb_matrix[7] * c.y + rgb_matrix[8] * c.z
++    );
++    return vec3(eotf_st2084(rgb.x), eotf_st2084(rgb.y), eotf_st2084(rgb.z));
++}
++
++float delinearize(float c) {
++    return c <= 0.0f ? 0.0f : pow(c, 1.0f / 2.4f);
++}
++
++vec3 bt2408_lrgb2yuv(vec3 c) {
++    vec3 rgb = vec3(delinearize(c.x), delinearize(c.y), delinearize(c.z));
++    vec3 yuv = vec3(
++        yuv_matrix[0] * rgb.x + yuv_matrix[1] * rgb.y + yuv_matrix[2] * rgb.z,
++        yuv_matrix[3] * rgb.x + yuv_matrix[4] * rgb.y + yuv_matrix[5] * rgb.z,
++        yuv_matrix[6] * rgb.x + yuv_matrix[7] * rgb.y + yuv_matrix[8] * rgb.z
++    );
++    float out_shift = out_p010 != 0 ? 4.0f : 1.0f;
++    float out_code  = out_p010 != 0 ? (65535.0f / 64.0f) : 255.0f;
++    yuv = vec3(yuv.x * 219.0f + 16.0f, yuv.y * 224.0f + 128.0f, yuv.z * 224.0f + 128.0f) * out_shift;
++    return yuv / out_code;
++}
++
++float bt2408_pq_oetf(float nits) {
++    float y = pow(max(nits, 0.0f) / 10000.0f, ST2084_M1);
++    return pow((ST2084_C1 + ST2084_C2 * y) / (1.0f + ST2084_C3 * y), ST2084_M2);
++}
++
++float bt2408_pq_eotf(float x) {
++    float p = pow(max(x, 0.0f), 1.0f / ST2084_M2);
++    return pow(max(p - ST2084_C1, 0.0f) / (ST2084_C2 - ST2084_C3 * p),
++               1.0f / ST2084_M1) * 10000.0f;
++}
++
++vec3 bt2408_mul_rgb_to_lms(vec3 v) {
++    return vec3(s.rgb_to_lms[0][0] * v.x + s.rgb_to_lms[0][1] * v.y + s.rgb_to_lms[0][2] * v.z,
++                s.rgb_to_lms[1][0] * v.x + s.rgb_to_lms[1][1] * v.y + s.rgb_to_lms[1][2] * v.z,
++                s.rgb_to_lms[2][0] * v.x + s.rgb_to_lms[2][1] * v.y + s.rgb_to_lms[2][2] * v.z);
++}
++
++vec3 bt2408_mul_lms_to_rgb(vec3 v) {
++    return vec3(s.lms_to_rgb[0][0] * v.x + s.lms_to_rgb[0][1] * v.y + s.lms_to_rgb[0][2] * v.z,
++                s.lms_to_rgb[1][0] * v.x + s.lms_to_rgb[1][1] * v.y + s.lms_to_rgb[1][2] * v.z,
++                s.lms_to_rgb[2][0] * v.x + s.lms_to_rgb[2][1] * v.y + s.lms_to_rgb[2][2] * v.z);
++}
++
++float bt2408_lut(float i) {
++    float pos = (i - s.lut_min) / (s.lut_max - s.lut_min) * float(BT2408_LUT_SIZE - 1);
++    pos = clamp(pos, 0.0f, float(BT2408_LUT_SIZE - 1));
++    int idx = min(int(pos), BT2408_LUT_SIZE - 2);
++    return s.lut[idx] + (pos - float(idx)) * (s.lut[idx + 1] - s.lut[idx]);
++}
++
++float bt2408_hull(float x) {
++    return ((x - 6.0f) * x + 9.0f) * x;
++}
++
++vec3 bt2408_hable_pixel(vec3 rgb) {
++    vec3 lms = bt2408_mul_rgb_to_lms(rgb);
++    vec3 ipt;
++
++    lms = vec3(bt2408_pq_oetf(lms.x * BT2408_SDR_WHITE),
++               bt2408_pq_oetf(lms.y * BT2408_SDR_WHITE),
++               bt2408_pq_oetf(lms.z * BT2408_SDR_WHITE));
++    ipt = vec3(0.4000f * lms.x + 0.4000f * lms.y + 0.2000f * lms.z,
++               4.4550f * lms.x - 4.8510f * lms.y + 0.3960f * lms.z,
++               0.8056f * lms.x + 0.3572f * lms.y - 1.1628f * lms.z);
++
++    float k = ipt.x;
++    ipt.x = bt2408_lut(k);
++    k = min(k / max(ipt.x, 1e-9f), bt2408_hull(ipt.x) / max(bt2408_hull(k), 1e-9f));
++    ipt.y *= k;
++    ipt.z *= k;
++
++    lms = vec3(ipt.x + 0.0975689f * ipt.y + 0.205226f * ipt.z,
++               ipt.x - 0.1138760f * ipt.y + 0.133217f * ipt.z,
++               ipt.x + 0.0326151f * ipt.y - 0.676887f * ipt.z);
++    lms = vec3(bt2408_pq_eotf(lms.x),
++               bt2408_pq_eotf(lms.y),
++               bt2408_pq_eotf(lms.z)) / BT2408_SDR_WHITE;
++    vec3 out_col = bt2408_mul_lms_to_rgb(lms);
++
++    out_col = pow(clamp(out_col, 0.0f, 1.0f) * s.black_scale, vec3(1.0f / 2.4f)) - vec3(s.black_offset);
++    return pow(clamp(out_col, 0.0f, 1.0f), vec3(2.4f));
++}
++
++vec3 get_chroma_sample(vec3 a, vec3 b, vec3 c, vec3 d) {
++    return (a + b + c + d) * 0.25f;
++}
++
++void main()
++{
++    ivec2 size_uv = imageSize(output_img[1]);
++    int xi = int(gl_GlobalInvocationID.x);
++    int yi = int(gl_GlobalInvocationID.y);
++
++    if (xi >= size_uv.x || yi >= size_uv.y)
++        return;
++
++    int x = 2 * xi;
++    int y = 2 * yi;
++    ivec2 size_y = imageSize(output_img[0]);
++
++    float y0 = texelFetch(input_img[0], ivec2(x,     y),     0).r;
++    float y1 = texelFetch(input_img[0], ivec2(min(x + 1, size_y.x - 1), y),     0).r;
++    float y2 = texelFetch(input_img[0], ivec2(x,     min(y + 1, size_y.y - 1)), 0).r;
++    float y3 = texelFetch(input_img[0], ivec2(min(x + 1, size_y.x - 1), min(y + 1, size_y.y - 1)), 0).r;
++    vec2 uv = texelFetch(input_img[1], ivec2(xi, yi), 0).rg;
++
++    vec3 c0 = bt2408_hable_pixel(bt2408_yuv2lrgb(vec3(y0, uv.x, uv.y)));
++    vec3 c1 = bt2408_hable_pixel(bt2408_yuv2lrgb(vec3(y1, uv.x, uv.y)));
++    vec3 c2 = bt2408_hable_pixel(bt2408_yuv2lrgb(vec3(y2, uv.x, uv.y)));
++    vec3 c3 = bt2408_hable_pixel(bt2408_yuv2lrgb(vec3(y3, uv.x, uv.y)));
++
++    vec3 e0 = bt2408_lrgb2yuv(c0);
++    vec3 e1 = bt2408_lrgb2yuv(c1);
++    vec3 e2 = bt2408_lrgb2yuv(c2);
++    vec3 e3 = bt2408_lrgb2yuv(c3);
++    vec3 chroma = get_chroma_sample(e0, e1, e2, e3);
++
++    imageStore(output_img[0], ivec2(x, y), vec4(e0.x, 0.0, 0.0, 1.0));
++    if (x + 1 < size_y.x)
++        imageStore(output_img[0], ivec2(x + 1, y), vec4(e1.x, 0.0, 0.0, 1.0));
++    if (y + 1 < size_y.y)
++        imageStore(output_img[0], ivec2(x, y + 1), vec4(e2.x, 0.0, 0.0, 1.0));
++    if (x + 1 < size_y.x && y + 1 < size_y.y)
++        imageStore(output_img[0], ivec2(x + 1, y + 1), vec4(e3.x, 0.0, 0.0, 1.0));
++    imageStore(output_img[1], ivec2(xi, yi), vec4(chroma.y, chroma.z, 0.0, 1.0));
++}
