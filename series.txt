@@ -26,3 +26,4 @@
 0019-avfilter-vf_tonemap_vulkan-add-the-bt2408_hable-tone.patch
 0020-avfilter-vf_tonemap-add-dynamic-peak-detection.patch
 0021-avfilter-vf_tonemap_vulkan-add-dynamic-peak-detectio.patch
+0022-avfilter-vf_dovi_reshape-add-a-profile-8.1-RPU-outpu.patch

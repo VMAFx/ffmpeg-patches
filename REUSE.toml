@@ -25,6 +25,14 @@ precedence = "override"
 SPDX-FileCopyrightText = ["2000-2026 the FFmpeg developers", "2026 Lusoris"]
 SPDX-License-Identifier = "LGPL-2.1-or-later"
 
+# 0022 ports p5_to_p81 from dovi_tool 2.3.4, whose MIT notice the patch
+# carries next to the ported code in libavfilter/dovi_reshape.c.
+[[annotations]]
+path = ["patches/0022-avfilter-vf_dovi_reshape-add-a-profile-8.1-RPU-outpu.patch"]
+precedence = "override"
+SPDX-FileCopyrightText = ["2000-2026 the FFmpeg developers", "2026 Lusoris", "2026 quietvoid"]
+SPDX-License-Identifier = "LGPL-2.1-or-later AND MIT"
+
 # The register skills' LICENSE files are the MIT texts of their upstreams,
 # installed byte for byte by Praetor. REUSE does not lint files named LICENSE,
 # so they need no table here.
