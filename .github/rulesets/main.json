@@ -72,6 +72,9 @@
           },
           {
             "context": "series (check · lint · unit tests)"
+          },
+          {
+            "context": "series (apply · build · warnings) on macOS with Metal"
           }
         ],
         "strict_required_status_checks_policy": true
