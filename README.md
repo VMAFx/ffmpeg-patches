@@ -237,6 +237,29 @@ the same RPUs, so no inverse is needed. `tests/test_tonemap_parity.py` checks
 the colour difference against the published CIEDE2000 test pairs and the
 gate's pass and fail decisions without FFmpeg.
 
+## GPU parity in CI
+
+The hosted runners have no GPU. The pinned-base job of `series.yml` runs the
+GPU filters on Mesa software devices instead: lavapipe for Vulkan and rusticl
+on llvmpipe for OpenCL. The step fails when FFmpeg opens another device, when
+a device case is skipped, or when a GPU filter leaves the CPU filter's output:
+
+| Tests | Filters | Bound |
+| --- | --- | --- |
+| `tests/test_hqdn3d_vulkan.py`, `tests/test_hqdn3d_opencl.py` | `hqdn3d_vulkan`, `hqdn3d_opencl` | the samples of `hqdn3d` ([ADR-0004](docs/adr/0004-hqdn3d-on-the-gpu.md)) |
+| `tests/test_tonemap_vulkan.py`, `tests/test_tonemap_opencl.py` | `tonemap_vulkan`, `tonemap_opencl` (0016, 0017, 0019, 0021, 0035) | one 8-bit code value of `tonemap=bt2408_hable`, with and without peak detection; a software conversion after `tonemap_opencl` keeps its output matrix (0016) |
+
+Each test file also holds a planted wrong case that the comparison must refuse.
+
+Two gaps remain:
+
+- `hqdn3d_cuda` (`tests/test_hqdn3d_cuda.py`) needs an NVIDIA device, and
+  CUDA has no software device, so CI does not run it. It runs where an NVIDIA
+  GPU is present, with `CUDA_FFMPEG` and `CUDA_DEVICE` set.
+- The Metal (VideoToolbox) filters are built and checked for warnings on the
+  macOS job, but their output is not compared with the CPU filters until an
+  Apple host can run the parity tests.
+
 ## Releases
 
 A tag `vX.Y.Z` publishes a release; `vX.Y.Z-rc.N` publishes a prerelease.

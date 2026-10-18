@@ -185,8 +185,10 @@ jobs:
           fi
           echo "FATE targets: ${#targets[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           make -j"$(nproc)" -k "${targets[@]}" 2>&1 | tee -a build.log
-      - name: Compare hqdn3d_vulkan and hqdn3d_opencl with the CPU filter on software devices
-        # ADR-0004: the GPU filters must give the CPU filter's samples. The
+      - name: Compare the hqdn3d and tonemap GPU filters with the CPU filters on software devices
+        # ADR-0004: the GPU hqdn3d filters must give the CPU filter's samples;
+        # tonemap_opencl and tonemap_vulkan must stay within one code value of
+        # tonemap=bt2408_hable (0016, 0017, 0019, 0021, 0035). The
         # hosted runner has no GPU, so Mesa lavapipe (Vulkan) and rusticl on
         # llvmpipe (OpenCL) run the same shaders and kernels on the CPU. PoCL
         # is not used: it offers FFmpeg no planar or semi-planar image format.
@@ -223,12 +225,18 @@ jobs:
           python3 -m unittest -v -k matches_cpu -k temporal_only -k graph_rebuild \
             -k unsupported_format -k planted -k MismatchRule \
             tests.test_hqdn3d_vulkan tests.test_hqdn3d_opencl 2>&1 | tee parity.log
-          status=${PIPESTATUS[0]}
+          hqdn3d=${PIPESTATUS[0]}
+          python3 -m unittest -v tests.test_tonemap_vulkan tests.test_tonemap_opencl 2>&1 \
+            | tee -a parity.log
+          tonemap=${PIPESTATUS[0]}
           if grep -E "skipped 'set (VK|OCL)_" parity.log; then
             echo "::error::a device case was skipped instead of run"
             exit 1
           fi
-          exit "$status"
+          if [ "$hqdn3d" -ne 0 ] || [ "$tonemap" -ne 0 ]; then
+            echo "::error::hqdn3d tests exited $hqdn3d, tonemap tests exited $tonemap"
+            exit 1
+          fi
       - name: Refuse a build that skipped a C file the series changes
         # A file in a component this configuration leaves out would pass the
         # warning gate unseen, so every changed C file needs a CC line.
