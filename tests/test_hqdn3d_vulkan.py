@@ -12,10 +12,18 @@ must give the format maximum and every other sample must match.
 
 Temporal state must reset where the CPU filter resets it: on a graph rebuild
 (a resolution switch in the input) and on an in-graph frame size change,
-which the tools/hqdn3d_reset_test driver of the patch exercises.
+which the tools/hqdn3d_reset_test driver of the patch exercises. The rebuild
+source joins a 320x184 and a 160x96 part with the concat demuxer. The parts
+are MJPEG, whose frame header carries the frame size: concat keeps the stream
+parameters of the first part, so a codec without an in-band size (FFV1)
+would decode the second part at 320x184, no rebuild would happen, and the
+output would depend on decoder threading. -noautoscale keeps the CLI from
+scaling the second part back to 320x184 for the encoder, so the output length
+proves the rebuild.
 
-The planted wrong case is a luma strength of 4.5 against the CPU default of
-4, which the comparison must refuse.
+The planted wrong cases are a luma strength of 4.5 against the CPU default of
+4, which the comparison must refuse, and an FFV1 rebuild source, whose output
+length the rebuild check must refuse.
 
 The device cases need an FFmpeg built with the series and a Vulkan device:
 
@@ -53,6 +61,9 @@ FORMATS = {
 }
 OPTIONS = ("", "=254:254:254:254", "=0.5:0.5:0.5:0.5", "=luma_spatial=60:luma_tmp=0:chroma_tmp=200")
 TEMPORAL_ONLY = "sendcmd=c='0.12 {f} luma_spatial 0; 0.12 {f} chroma_spatial 0',"
+REBUILD_SIZES = ((320, 184), (160, 96))
+# eight frames of each part as yuv420p
+REBUILD_BYTES = sum(8 * w * h * 3 // 2 for w, h in REBUILD_SIZES)
 
 
 def run(source: list[str], chain: str) -> bytes:
@@ -60,7 +71,7 @@ def run(source: list[str], chain: str) -> bytes:
     cmd = [
         FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error",
         "-init_hw_device", f"vulkan=vk:{DEVICE}", "-filter_hw_device", "vk",
-        *source, "-vf", chain, "-f", "rawvideo", "pipe:1",
+        *source, "-vf", chain, "-noautoscale", "-f", "rawvideo", "pipe:1",
     ]  # fmt: skip
     done = subprocess.run(cmd, capture_output=True, timeout=300, check=False)
     if done.returncode != 0:
@@ -97,6 +108,23 @@ def lavfi() -> list[str]:
     return ["-f", "lavfi", "-i", SOURCE]
 
 
+def rebuild_source(ffmpeg: str, tmp: str, codec: str) -> list[str]:
+    """Write the two parts of the rebuild source in codec and return the input options."""
+    parts = []
+    for index, (width, height) in enumerate(REBUILD_SIZES):
+        part = Path(tmp) / f"{index}.nut"
+        encode = [
+            ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
+            f"testsrc2=s={width}x{height}:d=0.32,noise=alls=20:allf=t",
+            "-c:v", codec, str(part),
+        ]  # fmt: skip
+        subprocess.run(encode, capture_output=True, timeout=120, check=True)
+        parts.append(f"file '{part}'\n")
+    listing = Path(tmp) / "list.txt"
+    listing.write_text("".join(parts), encoding="utf-8")
+    return ["-f", "concat", "-safe", "0", "-i", str(listing)]
+
+
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")
 class Hqdn3dVulkanTest(unittest.TestCase):
     """0023: the Vulkan hqdn3d path must match the CPU path."""
@@ -118,21 +146,18 @@ class Hqdn3dVulkanTest(unittest.TestCase):
                 self.assertEqual(self.compare(lavfi(), fmt, "", TEMPORAL_ONLY), 0)
 
     def test_state_resets_on_graph_rebuild(self) -> None:
+        cpu_chain, vulkan_chain = chains("yuv420p", "")
         with tempfile.TemporaryDirectory() as tmp:
-            parts = []
-            for index, size in enumerate(("320x184", "160x96")):
-                part = Path(tmp) / f"{index}.nut"
-                encode = [
-                    FFMPEG, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
-                    f"testsrc2=s={size}:d=0.32,noise=alls=20:allf=t,format=yuv420p",
-                    "-c:v", "ffv1", str(part),
-                ]  # fmt: skip
-                subprocess.run(encode, capture_output=True, timeout=120, check=True)
-                parts.append(f"file '{part}'\n")
-            listing = Path(tmp) / "list.txt"
-            listing.write_text("".join(parts), encoding="utf-8")
-            source = ["-f", "concat", "-safe", "0", "-i", str(listing)]
-            self.assertEqual(self.compare(source, "yuv420p", ""), 0)
+            source = rebuild_source(FFMPEG, tmp, "mjpeg")
+            cpu = run(source, cpu_chain)
+            self.assertEqual(len(cpu), REBUILD_BYTES)
+            self.assertEqual(mismatches(cpu, run(source, vulkan_chain), 8, False), 0)
+
+    def test_planted_sizeless_rebuild_source_is_refused(self) -> None:
+        cpu_chain, _ = chains("yuv420p", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = rebuild_source(FFMPEG, tmp, "ffv1")
+            self.assertNotEqual(len(run(source, cpu_chain)), REBUILD_BYTES)
 
     @unittest.skipUnless(RESET_TOOL, "set HQDN3D_RESET_TOOL")
     def test_state_resets_on_in_graph_resize(self) -> None:
