@@ -28,3 +28,4 @@
 0021-avfilter-vf_tonemap_vulkan-add-dynamic-peak-detectio.patch
 0022-avfilter-vf_dovi_reshape-add-a-profile-8.1-RPU-outpu.patch
 0023-avfilter-vf_hqdn3d_vulkan-add-a-Vulkan-hqdn3d-filter.patch
+0024-avfilter-vf_hqdn3d_cuda-add-a-CUDA-hqdn3d-filter.patch
