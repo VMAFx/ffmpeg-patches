@@ -34,7 +34,7 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 libavfilter/opencl/dovi_reshape.cl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 09d5110b54c0f14a18ee73b8bef68fa2c9550973..d4095d66d010a7f4bd70b75154b3520bbe4aec81 100644
+index e214440837b7de9c586a35d579a59f5ebd088a92..ec73d8b914e271c28b8fcc57ae0a1e39777a862a 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -28666,6 +28666,8 @@ With @code{bt2408_hable}, the output is in BT.709 primaries whatever

@@ -481,20 +481,20 @@ index 0000000000000000000000000000000000000000..52edc725b8528815211f9cc24bae67ed
 +    return fails != 0;
 +}
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index e90e7f5ae6b97fbb016db395f5b97c0076350d46..6ec4e40adf814e8f8a968b7f400a0647a01cec0e 100644
+index e90e7f5ae6b97fbb016db395f5b97c0076350d46..8202144c0a4b242c548d80d87d8b1a8c0d69b8ff 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
-@@ -481,6 +481,10 @@ fate-filter-fps-down-eof-pass: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:eo
- fate-filter-fps-start-drop: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:start_time=1.5
- fate-filter-fps-start-fill: CMD = framecrc -lavfi testsrc2=r=7:d=1.5,setpts=PTS+14,fps=3:start_time=1.5
+@@ -489,6 +489,10 @@ FATE_FILTER-$(CONFIG_DOVI_RESHAPE_FILTER) += fate-filter-dovi-reshape-graph
+ fate-filter-dovi-reshape-graph: libavfilter/tests/dovi_reshape$(EXESUF)
+ fate-filter-dovi-reshape-graph: CMD = run libavfilter/tests/dovi_reshape$(EXESUF) filter
  
 +FATE_FILTER-yes += fate-filter-bt2408-hable
 +fate-filter-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
 +fate-filter-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF)
 +
- FATE_FILTER-yes += fate-filter-dovi-reshape
- fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
- fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
+ DRAWVG_SCRIPT_ALL = $(SRC_PATH)/tests/ref/lavf/drawvg.all
+ 
+ FATE_FILTER-$(CONFIG_DRAWVG_FILTER) += fate-filter-drawvg-interpreter
 diff --git a/tests/ref/fate/filter-bt2408-hable b/tests/ref/fate/filter-bt2408-hable
 new file mode 100644
 index 0000000000000000000000000000000000000000..e8613d010c5bc9ddfdafa7ec0d55597d86c2a41c

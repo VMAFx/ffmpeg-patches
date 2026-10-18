@@ -47,7 +47,7 @@ index 231c6b67c5dd7564633dc0801adc81cf676ea575..c8c4e002e95f06aac7a5e2caccd0d2a9
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 0ae86d47e741ed0e852f04b66359db6d67260efa..588f61084b8da6bbe91b0de86dad2f015cd8cf5d 100644
+index 6fc2a91fd538858ccbcc73650ef61e820417a2fb..cc502dca5c1cef042a5a9588e77dec0bd168db3d 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15792,6 +15792,38 @@ The command accepts the same syntax of the corresponding option.
@@ -1371,18 +1371,17 @@ index 0000000000000000000000000000000000000000..5807ecd41dc418828192ce644fd1358e
 +
 +}
 diff --git a/tools/Makefile b/tools/Makefile
-index feb4d9d3b9fdebf5324bd01498336f55be669074..3f332e6435b9424063755df3f4ef3c4c9c7560f6 100644
+index 7803174689408946cf14662f10fce5f6fcc0d98b..d49d458ad8ea26d1492e96de23ccab8983c39685 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
-@@ -2,6 +2,8 @@ TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher
- TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
- TOOLS-$(CONFIG_ZLIB) += cws2fws
+@@ -1,5 +1,7 @@
+ TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher uncoded_frame
  TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
 +TOOLS-$(CONFIG_HQDN3D_CUDA_FILTER)   += hqdn3d_reset_test
 +TOOLS-yes := $(sort $(TOOLS-yes))
+ TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
+ TOOLS-$(CONFIG_ZLIB) += cws2fws
  
- tools/target_dec_%_fuzzer.o: tools/target_dec_fuzzer.c
- 	$(COMPILE_C) -DFFMPEG_DECODER=$*
 diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
 index 725e7a6a5329443de6a0ccbb440a0c30bf46b3a8..f190a36388631bd2a8591a4682a1f7afc2b6912c 100644
 --- a/tools/hqdn3d_reset_test.c

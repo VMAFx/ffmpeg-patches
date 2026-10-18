@@ -41,10 +41,10 @@ index 374bd5c1512943439480825f32e448e7871eb61c..b1656f0f803081cecc0f9ac7136c2d08
  transpose_vaapi_filter_deps="vaapi VAProcPipelineCaps_rotation_flags"
  transpose_vt_filter_deps="videotoolbox VTPixelRotationSessionCreate"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 88505736fe1ce8aea06bc0f88c54843d646bdfb9..285410a8ae7dd59c14beade76a77f6f01285d905 100644
+index 88505736fe1ce8aea06bc0f88c54843d646bdfb9..a9241fab5cf2af6ca2d11557e92c570dcfc294e1 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -29607,6 +29607,41 @@ Preserve landscape geometry (when @var{width} >= @var{height}).
+@@ -29566,6 +29566,41 @@ Default value is @code{0}.
  
  @end table
  
@@ -83,9 +83,9 @@ index 88505736fe1ce8aea06bc0f88c54843d646bdfb9..285410a8ae7dd59c14beade76a77f6f0
 +@end example
 +@end itemize
 +
- @c man end VULKAN VIDEO FILTERS
+ @section transpose_vulkan
  
- @chapter QSV Video Filters
+ Transpose rows with columns in the input video and optionally flip it.
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
 index a29004c0418e9f9d55d96d11ec7b365e26e84eca..2d10cdb28f1221d17f3b808cda486af4a1adf856 100644
 --- a/libavfilter/Makefile
@@ -516,17 +516,17 @@ index 0000000000000000000000000000000000000000..502afad6583087617f1d1079089abd4d
 +    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 +};
 diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
-index 8a0912b4dfc4969cb7b4eb06c7565e93ba6b8cf7..48aa540cb4c147e8e48aafccb1b1014c36b36ba0 100644
+index 8a0912b4dfc4969cb7b4eb06c7565e93ba6b8cf7..23b254a550c9d5a003826b2eee09b254d4ee91d6 100644
 --- a/libavfilter/vulkan/Makefile
 +++ b/libavfilter/vulkan/Makefile
-@@ -14,6 +14,7 @@ OBJS-$(CONFIG_SCDET_VULKAN_FILTER) += vulkan/scdet.comp.spv.o
- OBJS-$(CONFIG_OVERLAY_VULKAN_FILTER) += vulkan/overlay.comp.spv.o
- OBJS-$(CONFIG_FLIP_VULKAN_FILTER) += vulkan/flip.comp.spv.o
- OBJS-$(CONFIG_TRANSPOSE_VULKAN_FILTER) += vulkan/transpose.comp.spv.o
-+OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o
+@@ -17,6 +17,7 @@ OBJS-$(CONFIG_TRANSPOSE_VULKAN_FILTER) += vulkan/transpose.comp.spv.o
  OBJS-$(CONFIG_V360_VULKAN_FILTER) += vulkan/v360.comp.spv.o
  OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER) += vulkan/interlace.comp.spv.o
  OBJS-$(CONFIG_XFADE_VULKAN_FILTER) += vulkan/xfade.comp.spv.o
++OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o
+ OBJS-$(CONFIG_NLMEANS_VULKAN_FILTER) += vulkan/nlmeans_horizontal.comp.spv.o \
+                                         vulkan/nlmeans_vertical.comp.spv.o \
+                                         vulkan/nlmeans_weights.comp.spv.o \
 diff --git a/libavfilter/vulkan/bt2408_hable.comp.glsl b/libavfilter/vulkan/bt2408_hable.comp.glsl
 new file mode 100644
 index 0000000000000000000000000000000000000000..c3c5ddab4503e8fefe7253d909f5973d9a92860a
