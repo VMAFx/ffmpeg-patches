@@ -20,8 +20,9 @@ the CPU filter are unknown.
 - Decoding of the AV1 streams uses an FFmpeg with libdav1d, so that film
   grain synthesis can be switched off (`-export_side_data film_grain`).
 - VMAF scores come from the VMAFx `vmaf` tool with the `vmaf_v0.6.1` model,
-  CPU only (`--no_cuda --no_sycl`), so that scoring takes no GPU memory.
-  The run records its version.
+  CPU only (`--backend cpu`), so that scoring takes no GPU memory. The run
+  records its version and refuses a score whose `backend_used` is not the
+  CPU.
 
 ### Content
 
@@ -79,7 +80,8 @@ the CPU filter are unknown.
 - Devices: RTX 4090 (Vulkan 0, CUDA 0, OpenCL 2.0), Arc A380 (Vulkan 1,
   OpenCL 1.0), the Radeon iGPU of the Ryzen 9 9950X3D (Vulkan 2).
 - A device is used only when it reports enough free memory (1 GiB) before
-  the run; a device that does not is skipped and the table names it. The
+  the run, read as the device-local heap budget of `VK_EXT_memory_budget`
+  (`vulkaninfo`) for every API on that device; a device that does not is skipped and the table names it. The
   run never stops or evicts a model that holds a device.
 - Before each run the host must have a load average below 40, 12 GiB
   available memory and 15 GiB free swap; every run is in a
