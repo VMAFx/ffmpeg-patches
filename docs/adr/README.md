@@ -11,3 +11,4 @@ record that supersedes it.
 | [0001](0001-shared-fix-series.md) | 2026-10-09 | One shared FFmpeg fix series for every consumer | Accepted |
 | [0002](0002-dovi-reshape-and-tone-mapping.md) | 2026-10-17 | Dolby Vision reshape and peak detection in FFmpeg's own tone-map filters | Accepted |
 | [0003](0003-peak-detection-follows-libplacebo.md) | 2026-10-17 | Peak detection follows libplacebo and the Dolby Vision level 1 peak | Accepted |
+| [0004](0004-hqdn3d-on-the-gpu.md) | 2026-10-18 | hqdn3d on the GPU, bit-exact to the CPU filter | Accepted |
