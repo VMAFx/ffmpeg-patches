@@ -29,3 +29,4 @@
 0022-avfilter-vf_dovi_reshape-add-a-profile-8.1-RPU-outpu.patch
 0023-avfilter-vf_hqdn3d_vulkan-add-a-Vulkan-hqdn3d-filter.patch
 0024-avfilter-vf_hqdn3d_cuda-add-a-CUDA-hqdn3d-filter.patch
+0025-avfilter-vf_hqdn3d_opencl-add-an-OpenCL-hqdn3d-filte.patch
