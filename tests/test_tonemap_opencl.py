@@ -45,14 +45,15 @@ PQ_INPUT = (
     "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv"
 )  # fmt: skip
 CPU = (
-    "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=bt2408_hable:peak={peak}{detect},"
+    "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=bt2408_hable:peak={peak},"
     "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
 )
 GPU = (
     "format=p010,hwupload,tonemap_opencl=tonemap={curve}:m=bt709:r=tv:p=bt709:t=bt709:"
-    "peak={peak}{detect},hwdownload,format=nv12"
+    "peak={peak},hwdownload,format=nv12"
 )
-DETECT = ":peak_detect=1"
+CPU_DETECT = CPU.replace("peak={peak},", "peak={peak}:peak_detect=1,")
+GPU_DETECT = GPU.replace("peak={peak},", "peak={peak}:peak_detect=1,")
 
 
 def flat_frame(y: int, u: int, v: int) -> bytes:
@@ -107,6 +108,11 @@ class HelperTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             centre_yuv(bytes(SIZE * SIZE))
 
+    def test_detect_chains_add_the_option(self) -> None:
+        for plain, detect in ((CPU, CPU_DETECT), (GPU, GPU_DETECT)):
+            self.assertNotIn("peak_detect", plain)
+            self.assertIn("peak={peak}:peak_detect=1,", detect)
+
     def test_worst_difference(self) -> None:
         self.assertEqual(worst_difference((63, 102, 240), (63, 102, 240)), 0)
         self.assertEqual(worst_difference((63, 102, 240), (73, 100, 241)), 10)
@@ -120,14 +126,14 @@ class OutputLinkTest(unittest.TestCase):
         frame = flat_frame(*COLOURS[0])
         for curve in ("hable", "bt2408_hable"):
             with self.subTest(curve=curve):
-                chain = GPU.format(curve=curve, peak=10, detect="")
+                chain = GPU.format(curve=curve, peak=10)
                 nv12 = run(frame, f"{chain},format=nv12")
                 via_sws = run(frame, f"{chain},format=yuv420p,format=nv12")
                 self.assertEqual(nv12, via_sws)
 
     def test_planted_wrong_matrix_is_refused(self) -> None:
         frame = flat_frame(*COLOURS[0])
-        chain = GPU.format(curve="bt2408_hable", peak=10, detect="")
+        chain = GPU.format(curve="bt2408_hable", peak=10)
         right = run(frame, f"{chain},format=yuv420p")
         wrong = run(frame, f"{chain},setparams=colorspace=bt2020nc,"
                            "scale=out_color_matrix=bt709,format=yuv420p")  # fmt: skip
@@ -142,8 +148,8 @@ class Bt2408HableTest(unittest.TestCase):
         for colour in COLOURS:
             with self.subTest(colour=colour):
                 frame = flat_frame(*colour)
-                cpu = centre_yuv(run(frame, CPU.format(peak=10, detect="")))
-                gpu = centre_yuv(run(frame, GPU.format(curve="bt2408_hable", peak=10, detect="")
+                cpu = centre_yuv(run(frame, CPU.format(peak=10)))
+                gpu = centre_yuv(run(frame, GPU.format(curve="bt2408_hable", peak=10)
                                      + ",format=yuv420p"))  # fmt: skip
                 self.assertLessEqual(worst_difference(cpu, gpu), 1, f"cpu {cpu} gpu {gpu}")
 
@@ -151,8 +157,8 @@ class Bt2408HableTest(unittest.TestCase):
         worst = 0
         for colour in COLOURS:
             frame = flat_frame(*colour)
-            cpu = centre_yuv(run(frame, CPU.format(peak=10, detect="")))
-            gpu = centre_yuv(run(frame, GPU.format(curve="bt2408_hable", peak=40, detect="")
+            cpu = centre_yuv(run(frame, CPU.format(peak=10)))
+            gpu = centre_yuv(run(frame, GPU.format(curve="bt2408_hable", peak=40)
                                  + ",format=yuv420p"))  # fmt: skip
             worst = max(worst, worst_difference(cpu, gpu))
         self.assertGreater(worst, 1)
@@ -162,21 +168,21 @@ class Bt2408HableTest(unittest.TestCase):
 class PeakDetectTest(unittest.TestCase):
     """0035: GPU peak detection must match CPU peak detection."""
 
-    def worst_against_cpu_detection(self, detect: str) -> int:
+    def worst_against_cpu_detection(self, gpu_chain: str) -> int:
         worst = 0
         for colour in COLOURS:
             frame = flat_frame(*colour)
-            cpu = centre_yuv(run(frame, CPU.format(peak=0, detect=DETECT)))
-            gpu = centre_yuv(run(frame, GPU.format(curve="bt2408_hable", peak=0, detect=detect)
+            cpu = centre_yuv(run(frame, CPU_DETECT.format(peak=0)))
+            gpu = centre_yuv(run(frame, gpu_chain.format(curve="bt2408_hable", peak=0)
                                  + ",format=yuv420p"))  # fmt: skip
             worst = max(worst, worst_difference(cpu, gpu))
         return worst
 
     def test_gpu_detection_matches_cpu_detection(self) -> None:
-        self.assertLessEqual(self.worst_against_cpu_detection(DETECT), 1)
+        self.assertLessEqual(self.worst_against_cpu_detection(GPU_DETECT), 1)
 
     def test_planted_static_peak_is_refused(self) -> None:
-        self.assertGreater(self.worst_against_cpu_detection(""), 1)
+        self.assertGreater(self.worst_against_cpu_detection(GPU), 1)
 
 
 if __name__ == "__main__":
