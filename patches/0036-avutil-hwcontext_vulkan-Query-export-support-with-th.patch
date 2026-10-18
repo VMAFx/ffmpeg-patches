@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: softworkz <softworkz@hotmail.com>
+Date: Thu, 6 Aug 2026 00:38:45 +0000
+Subject: [PATCH] avutil/hwcontext_vulkan: Query export support with the real
+ image flags
+
+Query with the flags the images are actually created with. The
+DRM-modifier path is unchanged.
+
+Signed-off-by: softworkz <softworkz@hotmail.com>
+(cherry picked from commit 63d0237033cca9782932b809f960378d34ee4869)
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavutil/hwcontext_vulkan.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavutil/hwcontext_vulkan.c b/libavutil/hwcontext_vulkan.c
+index c136677750ae7ad634e16e6a810088275fd979b4..6997d0fce8b374edf0cd31b45d0405f49cd045b3 100644
+--- a/libavutil/hwcontext_vulkan.c
++++ b/libavutil/hwcontext_vulkan.c
+@@ -2831,7 +2831,7 @@ static void try_export_flags(AVHWFramesContext *hwfc,
+         .tiling = hwctx->tiling,
+         .usage  = hwctx->usage,
+         .flags  = (hwctx->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && has_mods) ?
+-                  (hwctx->img_flags) : (VkImageCreateFlags)(VK_IMAGE_CREATE_ALIAS_BIT),
++                  (hwctx->img_flags) : hwctx->img_flags ? hwctx->img_flags : (VkImageCreateFlags)(VK_IMAGE_CREATE_ALIAS_BIT),
+     };
+ 
+     /* The query must describe the image as it will be created: a

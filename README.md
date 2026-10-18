@@ -41,12 +41,13 @@ A fix lives here once. A consumer does not carry its own copy.
 ## Upstream contributions
 
 Pull requests on the FFmpeg forge that came out of this series and its
-consumers. A row without a series patch is a change the series does not
-carry.
+consumers, and those of other authors that the series backports. A row
+without a series patch is a change the series does not carry.
 
 <!-- upstream-contributions:start -->
 | Pull request | Target | State | Change | Series patch |
 | --- | --- | --- | --- | --- |
+| [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0036 |
 | [24970](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970) | `master` | open | avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED | 0001 |
 | [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | none |
 | [24974](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974) | `master` | open | avcodec/av1dec: remove the coding bias from exported chroma grain params | none |
