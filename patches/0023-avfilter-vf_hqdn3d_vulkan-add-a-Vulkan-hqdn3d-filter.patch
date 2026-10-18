@@ -1257,7 +1257,7 @@ index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478
 +}
 diff --git a/libavfilter/vulkan/hqdn3d_vertical.comp.glsl b/libavfilter/vulkan/hqdn3d_vertical.comp.glsl
 new file mode 100644
-index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4f0e179f3
+index 0000000000000000000000000000000000000000..299350b6bacb84f00570a6df196a354244bde3fd
 --- /dev/null
 +++ b/libavfilter/vulkan/hqdn3d_vertical.comp.glsl
 @@ -0,0 +1,203 @@
@@ -1348,7 +1348,7 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +    int center = 256 << int(l_bits);
 +    int idx = int(t_offset) + center + d;
 +    int coef = int(coef_tables[idx]);
-+    return cur_val + coef;
++    return cur_val + coef + 256;
 +}
 +
 +void process_planar_temporal(uint x)
