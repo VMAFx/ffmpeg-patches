@@ -229,7 +229,7 @@ jobs:
         # configure turns Metal off instead of failing.
         if: github.event.pull_request.draft != true
         run: |
-          xcodebuild -version | head -1
+          xcodebuild -version
           if ! xcrun -sdk macosx metal -v; then
             xcodebuild -downloadComponent MetalToolchain
             xcrun -sdk macosx metal -v
@@ -272,5 +272,5 @@ jobs:
       - name: Refuse compiler warnings in the files the series changes
         if: github.event.pull_request.draft != true
         run: |
-          clang --version | head -1 >> "$GITHUB_STEP_SUMMARY"
+          clang --version >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/series.py warnings ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"
