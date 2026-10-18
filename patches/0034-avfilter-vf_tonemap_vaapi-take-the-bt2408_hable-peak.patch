@@ -45,7 +45,7 @@ index 502ea389a44d3e3582281b626c9ce0f6ce9ec065..30dceefb667cabc558c39dba6869862b
  OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
  OBJS-$(CONFIG_TRANSPOSE_FILTER)              += vf_transpose.o
 diff --git a/libavfilter/vf_tonemap_vaapi.c b/libavfilter/vf_tonemap_vaapi.c
-index f06a90125ca7d3bcec2e52b739b3a36ace8cf7ac..6ca345544e215a191009d45753f241ab1252a2a8 100644
+index da74b0b207169612951caea78447f2eb8c10f747..308a9c500a18fae9188f7b21711c88f504220b5e 100644
 --- a/libavfilter/vf_tonemap_vaapi.c
 +++ b/libavfilter/vf_tonemap_vaapi.c
 @@ -28,6 +28,7 @@

@@ -25,10 +25,10 @@ dovi_reshape and 0.75 on ten frames of a 2160p HDR10 clip.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- doc/filters.texi               |  24 +++
+ doc/filters.texi               |  24 ++
  libavfilter/Makefile           |   2 +-
- libavfilter/vf_tonemap_vaapi.c | 270 ++++++++++++++++++++++++++++++++-
- 3 files changed, 289 insertions(+), 7 deletions(-)
+ libavfilter/vf_tonemap_vaapi.c | 440 +++++++++++++++++++++++++++------
+ 3 files changed, 390 insertions(+), 76 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
 index 4ef76ab4ae0421a98fdeca15cb0e14c28d23d66b..88505736fe1ce8aea06bc0f88c54843d646bdfb9 100644
@@ -85,7 +85,7 @@ index 047d0f1edb043efff9019ebe2f38f0aea4518558..a29004c0418e9f9d55d96d11ec7b365e
  OBJS-$(CONFIG_TRANSPOSE_FILTER)              += vf_transpose.o
  OBJS-$(CONFIG_TRANSPOSE_CUDA_FILTER)         += vf_transpose_cuda.o vf_transpose_cuda.ptx.o \
 diff --git a/libavfilter/vf_tonemap_vaapi.c b/libavfilter/vf_tonemap_vaapi.c
-index 9fe82cbb1b6c54d588829f6173c63e44fcaf9753..f06a90125ca7d3bcec2e52b739b3a36ace8cf7ac 100644
+index 9fe82cbb1b6c54d588829f6173c63e44fcaf9753..da74b0b207169612951caea78447f2eb8c10f747 100644
 --- a/libavfilter/vf_tonemap_vaapi.c
 +++ b/libavfilter/vf_tonemap_vaapi.c
 @@ -15,17 +15,27 @@
@@ -133,7 +133,7 @@ index 9fe82cbb1b6c54d588829f6173c63e44fcaf9753..f06a90125ca7d3bcec2e52b739b3a36a
  } HDRVAAPIContext;
  
  static int tonemap_vaapi_save_metadata(AVFilterContext *avctx, AVFrame *input_frame)
-@@ -259,6 +279,204 @@ static int tonemap_vaapi_set_filter_params(AVFilterContext *avctx, AVFrame *inpu
+@@ -259,6 +279,237 @@ static int tonemap_vaapi_set_filter_params(AVFilterContext *avctx, AVFrame *inpu
      return 0;
  }
  
@@ -335,20 +335,133 @@ index 9fe82cbb1b6c54d588829f6173c63e44fcaf9753..f06a90125ca7d3bcec2e52b739b3a36a
 +    ff_vaapi_vpp_pipeline_uninit(avctx);
 +}
 +
++static int tonemap_vaapi_check_caps(AVFilterContext *avctx,
++                                    const VAProcFilterCapHighDynamicRange *hdr_cap,
++                                    int num_query_caps)
++{
++    HDRVAAPIContext *ctx = avctx->priv;
++    unsigned int required_flag = ctx->mastering_display ?
++        VA_TONE_MAPPING_HDR_TO_HDR : VA_TONE_MAPPING_HDR_TO_SDR;
++    int i;
++
++    for (i = 0; i < num_query_caps; i++) {
++        if (hdr_cap[i].metadata_type != VAProcHighDynamicRangeMetadataNone)
++            break;
++    }
++
++    if (i >= num_query_caps) {
++        av_log(avctx, AV_LOG_ERROR, "VAAPI driver doesn't support HDR\n");
++        return AVERROR(EINVAL);
++    }
++
++    for (i = 0; i < num_query_caps; i++) {
++        if (required_flag & hdr_cap[i].caps_flag)
++            break;
++    }
++    if (i >= num_query_caps) {
++        av_log(avctx, AV_LOG_ERROR,
++               ctx->mastering_display ? "VAAPI driver doesn't support HDR to HDR\n" :
++                                        "VAAPI driver doesn't support HDR to SDR\n");
++        return AVERROR(EINVAL);
++    }
++
++    return 0;
++}
++
  static int tonemap_vaapi_build_filter_params(AVFilterContext *avctx)
  {
      VAAPIVPPContext *vpp_ctx   = avctx->priv;
-@@ -269,6 +487,9 @@ static int tonemap_vaapi_build_filter_params(AVFilterContext *avctx)
+@@ -267,7 +518,10 @@ static int tonemap_vaapi_build_filter_params(AVFilterContext *avctx)
+     VAProcFilterParameterBufferHDRToneMapping hdrtm_param;
+     VAProcFilterCapHighDynamicRange hdr_cap[VAProcHighDynamicRangeMetadataTypeCount];
      int num_query_caps;
-     int i;
- 
+-    int i;
++    int err;
++
 +    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE)
 +        return tonemap_vaapi_build_lut_params(avctx);
-+
+ 
      memset(&hdrtm_param, 0, sizeof(hdrtm_param));
      memset(&ctx->in_metadata, 0, sizeof(ctx->in_metadata));
+@@ -283,37 +537,9 @@ static int tonemap_vaapi_build_filter_params(AVFilterContext *avctx)
+         return AVERROR(EIO);
+     }
  
-@@ -348,11 +569,13 @@ static int tonemap_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame
+-    for (i = 0; i < num_query_caps; i++) {
+-        if (hdr_cap[i].metadata_type != VAProcHighDynamicRangeMetadataNone)
+-            break;
+-    }
+-
+-    if (i >= num_query_caps) {
+-        av_log(avctx, AV_LOG_ERROR, "VAAPI driver doesn't support HDR\n");
+-        return AVERROR(EINVAL);
+-    }
+-
+-    if (ctx->mastering_display) {
+-        for (i = 0; i < num_query_caps; i++) {
+-            if (VA_TONE_MAPPING_HDR_TO_HDR & hdr_cap[i].caps_flag)
+-                break;
+-        }
+-        if (i >= num_query_caps) {
+-            av_log(avctx, AV_LOG_ERROR,
+-                   "VAAPI driver doesn't support HDR to HDR\n");
+-            return AVERROR(EINVAL);
+-        }
+-    } else {
+-        for (i = 0; i < num_query_caps; i++) {
+-            if (VA_TONE_MAPPING_HDR_TO_SDR & hdr_cap[i].caps_flag)
+-                break;
+-        }
+-        if (i >= num_query_caps) {
+-            av_log(avctx, AV_LOG_ERROR,
+-                   "VAAPI driver doesn't support HDR to SDR\n");
+-            return AVERROR(EINVAL);
+-        }
+-    }
++    err = tonemap_vaapi_check_caps(avctx, hdr_cap, num_query_caps);
++    if (err < 0)
++        return err;
+ 
+     hdrtm_param.type = VAProcFilterHighDynamicRangeToneMapping;
+     hdrtm_param.data.metadata_type = VAProcHighDynamicRangeMetadataHDR10;
+@@ -325,6 +551,36 @@ static int tonemap_vaapi_build_filter_params(AVFilterContext *avctx)
+                                            &hdrtm_param, sizeof(hdrtm_param), 1);
+ }
+ 
++static void tonemap_vaapi_set_color_properties(AVFilterContext *avctx, AVFrame *output_frame)
++{
++    HDRVAAPIContext *ctx = avctx->priv;
++
++    av_frame_remove_side_data(output_frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    av_frame_remove_side_data(output_frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++
++    if (!ctx->mastering_display) {
++        /* Use BT709 by default for HDR to SDR output frame */
++        output_frame->color_primaries = AVCOL_PRI_BT709;
++        output_frame->color_trc = AVCOL_TRC_BT709;
++        output_frame->colorspace = AVCOL_SPC_BT709;
++    }
++
++    if (ctx->color_primaries != AVCOL_PRI_UNSPECIFIED)
++        output_frame->color_primaries = ctx->color_primaries;
++
++    if (ctx->color_transfer != AVCOL_TRC_UNSPECIFIED)
++        output_frame->color_trc = ctx->color_transfer;
++
++    if (ctx->color_matrix != AVCOL_SPC_UNSPECIFIED)
++        output_frame->colorspace = ctx->color_matrix;
++
++    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE) {
++        /* The 3D LUT writes full range RGB. */
++        output_frame->colorspace  = AVCOL_SPC_RGB;
++        output_frame->color_range = AVCOL_RANGE_JPEG;
++    }
++}
++
+ static int tonemap_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
+ {
+     AVFilterContext *avctx     = inlink->dst;
+@@ -348,11 +604,13 @@ static int tonemap_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame
          return AVERROR(EINVAL);
      }
  
@@ -367,33 +480,46 @@ index 9fe82cbb1b6c54d588829f6173c63e44fcaf9753..f06a90125ca7d3bcec2e52b739b3a36a
      if (err < 0)
          goto fail;
  
-@@ -395,6 +618,12 @@ static int tonemap_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame
-     if (ctx->color_matrix != AVCOL_SPC_UNSPECIFIED)
-         output_frame->colorspace = ctx->color_matrix;
+@@ -376,24 +634,7 @@ static int tonemap_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame
+     if (err < 0)
+         goto fail;
  
-+    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE) {
-+        /* The 3D LUT writes full range RGB. */
-+        output_frame->colorspace  = AVCOL_SPC_RGB;
-+        output_frame->color_range = AVCOL_RANGE_JPEG;
-+    }
-+
+-    av_frame_remove_side_data(output_frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+-    av_frame_remove_side_data(output_frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+-
+-    if (!ctx->mastering_display) {
+-        /* Use BT709 by default for HDR to SDR output frame */
+-        output_frame->color_primaries = AVCOL_PRI_BT709;
+-        output_frame->color_trc = AVCOL_TRC_BT709;
+-        output_frame->colorspace = AVCOL_SPC_BT709;
+-    }
+-
+-    if (ctx->color_primaries != AVCOL_PRI_UNSPECIFIED)
+-        output_frame->color_primaries = ctx->color_primaries;
+-
+-    if (ctx->color_transfer != AVCOL_TRC_UNSPECIFIED)
+-        output_frame->color_trc = ctx->color_transfer;
+-
+-    if (ctx->color_matrix != AVCOL_SPC_UNSPECIFIED)
+-        output_frame->colorspace = ctx->color_matrix;
++    tonemap_vaapi_set_color_properties(avctx, output_frame);
+ 
      if (ctx->mastering_display) {
          err = tonemap_vaapi_update_sidedata(avctx, output_frame);
-         if (err < 0)
-@@ -443,10 +672,20 @@ static av_cold int tonemap_vaapi_init(AVFilterContext *avctx)
+@@ -436,17 +677,16 @@ fail:
+     return err;
+ }
  
-     ff_vaapi_vpp_ctx_init(avctx);
-     vpp_ctx->build_filter_params = tonemap_vaapi_build_filter_params;
+-static av_cold int tonemap_vaapi_init(AVFilterContext *avctx)
++static int tonemap_vaapi_init_output_format(AVFilterContext *avctx)
+ {
+     VAAPIVPPContext *vpp_ctx = avctx->priv;
+     HDRVAAPIContext *ctx     = avctx->priv;
+ 
+-    ff_vaapi_vpp_ctx_init(avctx);
+-    vpp_ctx->build_filter_params = tonemap_vaapi_build_filter_params;
 -    vpp_ctx->pipeline_uninit = ff_vaapi_vpp_pipeline_uninit;
-+    vpp_ctx->pipeline_uninit = tonemap_vaapi_pipeline_uninit;
-+    ctx->lut_surface = VA_INVALID_ID;
-+
-+    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE && ctx->mastering_display) {
-+        av_log(avctx, AV_LOG_ERROR, "tonemap=bt2408_hable maps to SDR and "
-+               "cannot be combined with the display option.\n");
-+        return AVERROR(EINVAL);
-+    }
- 
+-
      if (ctx->output_format_string) {
          vpp_ctx->output_format = av_get_pix_fmt(ctx->output_format_string);
 +    } else if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE) {
@@ -402,10 +528,22 @@ index 9fe82cbb1b6c54d588829f6173c63e44fcaf9753..f06a90125ca7d3bcec2e52b739b3a36a
      } else {
          if (ctx->mastering_display) {
              vpp_ctx->output_format = AV_PIX_FMT_P010;
-@@ -457,6 +696,16 @@ static av_cold int tonemap_vaapi_init(AVFilterContext *avctx)
+@@ -457,22 +697,22 @@ static av_cold int tonemap_vaapi_init(AVFilterContext *avctx)
          }
      }
  
+-#define STRING_OPTION(var_name, func_name, default_value) do { \
+-        if (ctx->var_name ## _string) { \
+-            int var = av_ ## func_name ## _from_name(ctx->var_name ## _string); \
+-            if (var < 0) { \
+-                av_log(avctx, AV_LOG_ERROR, "Invalid %s.\n", #var_name); \
+-                return AVERROR(EINVAL); \
+-            } \
+-            ctx->var_name = var; \
+-        } else { \
+-            ctx->var_name = default_value; \
+-        } \
+-    } while (0)
 +    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE) {
 +        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(vpp_ctx->output_format);
 +        if (!desc || !(desc->flags & AV_PIX_FMT_FLAG_RGB) ||
@@ -415,11 +553,68 @@ index 9fe82cbb1b6c54d588829f6173c63e44fcaf9753..f06a90125ca7d3bcec2e52b739b3a36a
 +            return AVERROR(EINVAL);
 +        }
 +    }
+ 
+-    STRING_OPTION(color_primaries, color_primaries, AVCOL_PRI_UNSPECIFIED);
+-    STRING_OPTION(color_transfer,  color_transfer,  AVCOL_TRC_UNSPECIFIED);
+-    STRING_OPTION(color_matrix,    color_space,     AVCOL_SPC_UNSPECIFIED);
++    return 0;
++}
 +
- #define STRING_OPTION(var_name, func_name, default_value) do { \
-         if (ctx->var_name ## _string) { \
-             int var = av_ ## func_name ## _from_name(ctx->var_name ## _string); \
-@@ -536,6 +785,15 @@ static const AVOption tonemap_vaapi_options[] = {
++static int tonemap_vaapi_init_metadata(AVFilterContext *avctx)
++{
++    HDRVAAPIContext *ctx = avctx->priv;
+ 
+     if (ctx->mastering_display) {
+         if (10 != sscanf(ctx->mastering_display,
+@@ -508,6 +748,47 @@ static av_cold int tonemap_vaapi_init(AVFilterContext *avctx)
+     return 0;
+ }
+ 
++static av_cold int tonemap_vaapi_init(AVFilterContext *avctx)
++{
++    VAAPIVPPContext *vpp_ctx = avctx->priv;
++    HDRVAAPIContext *ctx     = avctx->priv;
++    int err;
++
++    ff_vaapi_vpp_ctx_init(avctx);
++    vpp_ctx->build_filter_params = tonemap_vaapi_build_filter_params;
++    vpp_ctx->pipeline_uninit = tonemap_vaapi_pipeline_uninit;
++    ctx->lut_surface = VA_INVALID_ID;
++
++    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE && ctx->mastering_display) {
++        av_log(avctx, AV_LOG_ERROR, "tonemap=bt2408_hable maps to SDR and "
++               "cannot be combined with the display option.\n");
++        return AVERROR(EINVAL);
++    }
++
++    err = tonemap_vaapi_init_output_format(avctx);
++    if (err < 0)
++        return err;
++
++#define STRING_OPTION(var_name, func_name, default_value) do { \
++        if (ctx->var_name ## _string) { \
++            int var = av_ ## func_name ## _from_name(ctx->var_name ## _string); \
++            if (var < 0) { \
++                av_log(avctx, AV_LOG_ERROR, "Invalid %s.\n", #var_name); \
++                return AVERROR(EINVAL); \
++            } \
++            ctx->var_name = var; \
++        } else { \
++            ctx->var_name = default_value; \
++        } \
++    } while (0)
++
++    STRING_OPTION(color_primaries, color_primaries, AVCOL_PRI_UNSPECIFIED);
++    STRING_OPTION(color_transfer,  color_transfer,  AVCOL_TRC_UNSPECIFIED);
++    STRING_OPTION(color_matrix,    color_space,     AVCOL_SPC_UNSPECIFIED);
++
++    return tonemap_vaapi_init_metadata(avctx);
++}
++
+ #define OFFSET(x) offsetof(HDRVAAPIContext, x)
+ #define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
+ static const AVOption tonemap_vaapi_options[] = {
+@@ -536,6 +817,15 @@ static const AVOption tonemap_vaapi_options[] = {
      { "light",    "set content light level information",
        OFFSET(content_light),          AV_OPT_TYPE_STRING,
        { .str = NULL }, .flags = FLAGS },
