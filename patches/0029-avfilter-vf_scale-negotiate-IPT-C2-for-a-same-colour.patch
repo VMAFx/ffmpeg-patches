@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 11:06:13 +0200
+Subject: [PATCH] avfilter/vf_scale: negotiate IPT-C2 for a same-colour repack
+
+query_formats() drops every colour space sws_test_colorspace() rejects,
+so a Dolby Vision profile 5 base layer (IPT-C2) cannot pass through
+scale or an auto-inserted scaler at all, not even to change the pixel
+layout, and format=p010 before hwupload fails to negotiate.
+
+Admit IPT-C2 in the negotiated colour space lists. swscale accepts it
+only for a YUV to YUV repack that keeps every colour property and
+refuses every other conversion of it at frame setup. The
+in_color_matrix and out_color_matrix options still reject it.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavfilter/vf_scale.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/libavfilter/vf_scale.c b/libavfilter/vf_scale.c
+index f2d3021080c6601ec4bbbfa18a8794c42ff2f483..064d580a56c88ad34c2de3dcf5a76c9e92fb5a3c 100644
+--- a/libavfilter/vf_scale.c
++++ b/libavfilter/vf_scale.c
+@@ -448,6 +448,15 @@ static av_cold void uninit(AVFilterContext *ctx)
+     sws_free_context(&scale->sws);
+ }
+ 
++/*
++ * IPT-C2 is admitted to query_formats so that a same-colour YUV repack can
++ * negotiate; swscale refuses every other conversion of it at frame setup.
++ */
++static int scale_test_colorspace(enum AVColorSpace csp, int output)
++{
++    return sws_test_colorspace(csp, output) || csp == AVCOL_SPC_IPT_C2;
++}
++
+ static int query_formats(const AVFilterContext *ctx,
+                          AVFilterFormatsConfig **cfg_in,
+                          AVFilterFormatsConfig **cfg_out)
+@@ -485,7 +494,7 @@ static int query_formats(const AVFilterContext *ctx,
+     /* accept all supported inputs, even if user overrides their properties */
+     formats = ff_all_color_spaces();
+     for (int i = 0; i < formats->nb_formats; i++) {
+-        if (!sws_test_colorspace(formats->formats[i], 0)) {
++        if (!scale_test_colorspace(formats->formats[i], 0)) {
+             for (int j = i--; j + 1 < formats->nb_formats; j++)
+                 formats->formats[j] = formats->formats[j + 1];
+             formats->nb_formats--;
+@@ -504,7 +513,7 @@ static int query_formats(const AVFilterContext *ctx,
+     } else {
+         formats = ff_all_color_spaces();
+         for (int i = 0; i < formats->nb_formats; i++) {
+-            if (!sws_test_colorspace(formats->formats[i], 1)) {
++            if (!scale_test_colorspace(formats->formats[i], 1)) {
+                 for (int j = i--; j + 1 < formats->nb_formats; j++)
+                     formats->formats[j] = formats->formats[j + 1];
+                 formats->nb_formats--;

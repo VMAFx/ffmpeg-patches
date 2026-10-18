@@ -32,3 +32,7 @@
 0025-avfilter-vf_hqdn3d_opencl-add-an-OpenCL-hqdn3d-filte.patch
 0026-avfilter-vf_hqdn3d_videotoolbox-add-a-Metal-hqdn3d-f.patch
 0027-avcodec-nvenc-move-the-SEI-size-rules-into-nvenc_sei.patch
+0028-swscale-allow-a-same-colour-YUV-repack-of-an-unconve.patch
+0029-avfilter-vf_scale-negotiate-IPT-C2-for-a-same-colour.patch
+0030-avfilter-dovi_reshape-share-the-HDR10-output-propert.patch
+0031-avfilter-vf_tonemap_opencl-reshape-Dolby-Vision-prof.patch
