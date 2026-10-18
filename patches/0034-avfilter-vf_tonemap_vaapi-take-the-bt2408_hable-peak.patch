@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 11:50:33 +0200
+Subject: [PATCH] avfilter/vf_tonemap_vaapi: take the bt2408_hable peak from
+ Dolby Vision level 1
+
+With tonemap=bt2408_hable and no peak option, the per-frame level 1
+max_pq sets the signal peak of the lookup table when the frame
+carries it; the static light level and mastering metadata stay the
+fallback. Frames without level 1 metadata are unchanged.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi               |  4 +++-
+ libavfilter/Makefile           |  2 +-
+ libavfilter/vf_tonemap_vaapi.c | 20 +++++++++++++++++++-
+ 3 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 186b2a755b6ff1599bd1737c458626b3b016cb11..fcb7ff78377ce4ac8532e2b524e68aa8fb0f916e 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -29070,7 +29070,9 @@ and @option{matrix} say; @option{format} must be an 8-bit RGB format such as
+ 
+ @item peak
+ Override the signal peak for @code{tonemap=bt2408_hable}, in units of
+-100 nits. Default is 0, which takes the peak from the frame side data.
++100 nits. Default is 0, which uses Dolby Vision level 1 max_pq (frame
++metadata @code{lavfi.dovi.l1_max_pq} or DOVI side data) when present,
++else static side data; no dynamic peak detection.
+ 
+ @end table
+ 
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 502ea389a44d3e3582281b626c9ce0f6ce9ec065..30dceefb667cabc558c39dba6869862b3ca37230 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -551,7 +551,7 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2
+                                                 opencl/tonemap.o opencl/bt2408_hable.o \
+                                                 opencl/colorspace_common.o \
+                                                 opencl/dovi_reshape.o
+-OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o bt2408_hable.o
++OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER)         += vf_tonemap_vulkan.o vulkan.o vulkan_filter.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
+ OBJS-$(CONFIG_TRANSPOSE_FILTER)              += vf_transpose.o
+diff --git a/libavfilter/vf_tonemap_vaapi.c b/libavfilter/vf_tonemap_vaapi.c
+index f06a90125ca7d3bcec2e52b739b3a36ace8cf7ac..6ca345544e215a191009d45753f241ab1252a2a8 100644
+--- a/libavfilter/vf_tonemap_vaapi.c
++++ b/libavfilter/vf_tonemap_vaapi.c
+@@ -28,6 +28,7 @@
+ #include "bt2408_hable.h"
+ #include "colorspace.h"
+ #include "filters.h"
++#include "tonemap_peak.h"
+ #include "vaapi_vpp.h"
+ #include "video.h"
+ 
+@@ -441,10 +442,27 @@ static int tonemap_vaapi_upload_lut(AVFilterContext *avctx)
+     return err;
+ }
+ 
++static double get_signal_peak(AVFilterContext *avctx, const AVFrame *input)
++{
++    HDRVAAPIContext *ctx = avctx->priv;
++    double peak = ctx->peak;
++
++    if (peak)
++        return peak;
++
++    if (ctx->tonemap == TONEMAP_VAAPI_BT2408_HABLE &&
++        ff_tonemap_peak_read_dovi_l1(input, &peak)) {
++        av_log(avctx, AV_LOG_VERBOSE, "Dolby Vision L1 signal peak: %f\n", peak);
++        return peak;
++    }
++
++    return ff_determine_signal_peak((AVFrame *)input);
++}
++
+ static int tonemap_vaapi_setup_lut(AVFilterContext *avctx, const AVFrame *input)
+ {
+     HDRVAAPIContext *ctx = avctx->priv;
+-    double peak = ctx->peak ? ctx->peak : ff_determine_signal_peak((AVFrame *)input);
++    double peak = get_signal_peak(avctx, input);
+     int err;
+ 
+     if (peak == ctx->bt2408_peak && input->color_primaries == ctx->bt2408_prim)
