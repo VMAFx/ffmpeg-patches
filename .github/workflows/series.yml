@@ -192,3 +192,85 @@ jobs:
         run: |
           gcc --version | head -1 >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/series.py warnings ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"
+
+  macos-build:
+    # ADR-0004: the Metal (VideoToolbox) filters of the series are built on
+    # macOS; their GPU output is not compared with the CPU filter until an
+    # Apple host can run the parity tests.
+    name: series (apply · build · warnings) on macOS with Metal
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.draft != true
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: github.event.pull_request.draft != true
+        with:
+          python-version-file: .python-version
+      - name: Load the pinned base
+        if: github.event.pull_request.draft != true
+        run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
+      - name: Install the Metal toolchain
+        # Xcode ships the Metal compiler as a separate component; without it
+        # configure turns Metal off instead of failing.
+        if: github.event.pull_request.draft != true
+        run: |
+          xcodebuild -version | head -1
+          if ! xcrun -sdk macosx metal -v; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun -sdk macosx metal -v
+          fi
+      - name: Fetch and verify the pinned FFmpeg source
+        if: github.event.pull_request.draft != true
+        run: |
+          git init -q ffmpeg
+          git -C ffmpeg remote add origin "$FFMPEG_REMOTE"
+          git -C ffmpeg fetch -q --depth=1 origin \
+            "refs/tags/${FFMPEG_TAG}:refs/tags/${FFMPEG_TAG}"
+          actual=$(git -C ffmpeg rev-parse --verify "refs/tags/${FFMPEG_TAG}^{commit}")
+          if [ "$actual" != "$FFMPEG_COMMIT" ]; then
+            echo "::error::${FFMPEG_TAG} peels to ${actual}, base.env pins ${FFMPEG_COMMIT}"
+            exit 1
+          fi
+          git -C ffmpeg checkout -q --detach "$FFMPEG_COMMIT"
+      - name: Apply the series
+        if: github.event.pull_request.draft != true
+        run: python3 scripts/series.py apply --expect-base ffmpeg --report "$GITHUB_STEP_SUMMARY"
+      - name: Configure FFmpeg with Metal and VideoToolbox
+        if: github.event.pull_request.draft != true
+        run: |
+          mkdir build
+          cd build
+          ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl \
+            --enable-videotoolbox --enable-metal \
+            || { tail -40 ffbuild/config.log; exit 1; }
+          # configure disables Metal when the compiler check fails; the
+          # VideoToolbox filters must be in the build.
+          if ! grep -q '^#define CONFIG_YADIF_VIDEOTOOLBOX_FILTER 1' config_components.h; then
+            echo "::error::configure left out Metal: yadif_videotoolbox is not enabled"
+            grep -h -E 'HAVE_METAL|VIDEOTOOLBOX' config.h config_components.h
+            exit 1
+          fi
+      - name: Build FFmpeg, its tools and test programs
+        if: github.event.pull_request.draft != true
+        working-directory: build
+        run: make -j"$(sysctl -n hw.ncpu)" build 2>&1 | tee build.log
+      - name: Refuse compiler warnings in the files the series changes
+        if: github.event.pull_request.draft != true
+        run: |
+          clang --version | head -1 >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/series.py warnings ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"
