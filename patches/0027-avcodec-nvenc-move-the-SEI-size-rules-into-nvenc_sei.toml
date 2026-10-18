@@ -1,0 +1,17 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["pelorus"]
+origin = "code-health sweep #50, row 0003/0004: Pelorus 0022 mirrors the 0003 budget and the 0004 escape-byte counter in pelorus_sei_fit.h"
+notes = """
+Moves the hevc_nvenc non-VCL limit (1024), the reserve (256, now \
+NVENC_HEVC_SEI_RESERVE), the SEI budget, nvenc_sei_epb_count(), \
+nvenc_sei_nal_size() and nvenc_udu_sei_truncated() of 0003 and 0004 into \
+libavcodec/nvenc_sei.h: plain C on stddef.h and stdint.h, no libav* or \
+NVENC header, so Pelorus can include it instead of mirroring the numbers. \
+No change in behavior: the old and the new functions agree on 1000000 \
+random payloads (a planted change of the escape rule gives 1639143 \
+mismatches). 0003 and 0004 stay as sent upstream (FFmpeg PRs 24993 and \
+24994); this patch is series-only and is redone on top of their merged \
+form. tests/test_nvenc_sei.py compiles the header alone and checks it \
+against a Python model. Not run on NVENC hardware: the RTX 4090 had \
+906 MiB free on 2026-10-18."""
