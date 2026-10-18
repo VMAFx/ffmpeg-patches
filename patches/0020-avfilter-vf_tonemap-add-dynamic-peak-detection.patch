@@ -26,13 +26,13 @@ Signed-off-by: lusoris <lusoris@proton.me>
 ---
  doc/filters.texi                          |  16 ++
  libavfilter/Makefile                      |   2 +-
- libavfilter/tests/bt2408_hable.c          | 282 ++++++++++++++++++-
- libavfilter/tonemap_peak.c                | 136 +++++++++
- libavfilter/tonemap_peak.h                |  88 ++++++
- libavfilter/vf_tonemap.c                  | 324 +++++++++++++++++++---
+ libavfilter/tests/bt2408_hable.c          | 282 ++++++++++++++++++++-
+ libavfilter/tonemap_peak.c                | 136 ++++++++++
+ libavfilter/tonemap_peak.h                |  88 +++++++
+ libavfilter/vf_tonemap.c                  | 290 +++++++++++++++++++---
  tests/fate/filter-video.mak               |   4 +
  tests/ref/fate/filter-tonemap-peak-detect |   6 +
- 8 files changed, 801 insertions(+), 57 deletions(-)
+ 8 files changed, 781 insertions(+), 43 deletions(-)
  create mode 100644 libavfilter/tonemap_peak.c
  create mode 100644 libavfilter/tonemap_peak.h
  create mode 100644 tests/ref/fate/filter-tonemap-peak-detect
@@ -650,7 +650,7 @@ index 0000000000000000000000000000000000000000..85e4c32b6d54512f1f5f9eca11d11325
 +
 +#endif /* AVFILTER_TONEMAP_PEAK_H */
 diff --git a/libavfilter/vf_tonemap.c b/libavfilter/vf_tonemap.c
-index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..29f9c3d476b7b588a17beaff262547c779adb553 100644
+index deeb1f01574e4912a19ec159f106f3d2cc837611..29f9c3d476b7b588a17beaff262547c779adb553 100644
 --- a/libavfilter/vf_tonemap.c
 +++ b/libavfilter/vf_tonemap.c
 @@ -1,6 +1,12 @@
@@ -713,7 +713,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..29f9c3d476b7b588a17beaff262547c7
  } TonemapContext;
  
  static av_cold int init(AVFilterContext *ctx)
-@@ -245,49 +264,277 @@ static int setup_bt2408(AVFilterContext *ctx, AVFrame *out, const AVFrame *in, d
+@@ -245,6 +264,208 @@ static int setup_bt2408(AVFilterContext *ctx, AVFrame *out, const AVFrame *in, d
      return 0;
  }
  
@@ -919,24 +919,13 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..29f9c3d476b7b588a17beaff262547c7
 +    return 0;
 +}
 +
-+static void handle_alpha(AVFrame *out, const AVFrame *in,
-+                         const AVPixFmtDescriptor *desc,
-+                         const AVPixFmtDescriptor *odesc, int h)
-+{
-+    if (desc->flags & AV_PIX_FMT_FLAG_ALPHA && odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
-+        av_image_copy_plane(out->data[3], out->linesize[3],
-+                            in->data[3], in->linesize[3],
-+                            out->linesize[3], h);
-+    } else if (odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
-+        for (int y = 0; y < out->height; y++) {
-+            for (int x = 0; x < out->width; x++) {
-+                AV_WN32(out->data[3] + x * odesc->comp[3].step + y * out->linesize[3],
-+                        av_float2int(1.0f));
-+            }
-+        }
-+    }
-+}
-+
+ static void handle_alpha(AVFrame *out, const AVFrame *in,
+                          const AVPixFmtDescriptor *desc,
+                          const AVPixFmtDescriptor *odesc, int h)
+@@ -263,49 +484,57 @@ static void handle_alpha(AVFrame *out, const AVFrame *in,
+     }
+ }
+ 
 +static AVFrame *alloc_output_frame(AVFilterContext *ctx, AVFilterLink *outlink, AVFrame *in)
 +{
 +    AVFrame *out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
@@ -967,12 +956,11 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..29f9c3d476b7b588a17beaff262547c7
 -    AVFrame *out;
      const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
      const AVPixFmtDescriptor *odesc = av_pix_fmt_desc_get(outlink->format);
--    int ret, x, y;
--    double peak = s->peak;
 +    ThreadData td;
 +    AVFrame *out;
 +    double peak;
-+    int ret;
+     int ret;
+-    double peak = s->peak;
  
      if (!desc || !odesc) {
          av_frame_free(&in);
@@ -1010,7 +998,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..29f9c3d476b7b588a17beaff262547c7
      if (s->tonemap == TONEMAP_BT2408_HABLE) {
          ret = setup_bt2408(ctx, out, in, peak);
          if (ret < 0) {
-@@ -297,19 +544,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+@@ -315,19 +544,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
          }
      }
  
@@ -1031,29 +1019,15 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..29f9c3d476b7b588a17beaff262547c7
      td.out = out;
      td.in = in;
      td.desc = desc;
-@@ -317,20 +553,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
-     ff_filter_execute(ctx, tonemap_slice, &td, NULL,
+@@ -336,7 +554,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
                        FFMIN(in->height, ff_filter_get_nb_threads(ctx)));
  
--    /* copy/generate alpha if needed */
--    if (desc->flags & AV_PIX_FMT_FLAG_ALPHA && odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
--        av_image_copy_plane(out->data[3], out->linesize[3],
--                            in->data[3], in->linesize[3],
--                            out->linesize[3], outlink->h);
--    } else if (odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
--        for (y = 0; y < out->height; y++) {
--            for (x = 0; x < out->width; x++) {
--                AV_WN32(out->data[3] + x * odesc->comp[3].step + y * out->linesize[3],
--                        av_float2int(1.0f));
--            }
--        }
--    }
+     handle_alpha(out, in, desc, odesc, outlink->h);
 -
-+    handle_alpha(out, in, desc, odesc, outlink->h);
      av_frame_free(&in);
  
      if (s->tonemap != TONEMAP_BT2408_HABLE)
-@@ -354,11 +577,21 @@ static const AVOption tonemap_options[] = {
+@@ -360,11 +577,21 @@ static const AVOption tonemap_options[] = {
      { "param",        "tonemap parameter", OFFSET(param), AV_OPT_TYPE_DOUBLE, {.dbl = NAN}, DBL_MIN, DBL_MAX, FLAGS },
      { "desat",        "desaturation strength", OFFSET(desat), AV_OPT_TYPE_DOUBLE, {.dbl = 2}, 0, DBL_MAX, FLAGS },
      { "peak",         "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },
@@ -1075,7 +1049,7 @@ index 60e6f66645093ce5771b1fea526ca7c2a23ffe2b..29f9c3d476b7b588a17beaff262547c7
  static const AVFilterPad tonemap_inputs[] = {
      {
          .name         = "default",
-@@ -373,6 +606,7 @@ const FFFilter ff_vf_tonemap = {
+@@ -379,6 +606,7 @@ const FFFilter ff_vf_tonemap = {
      .p.priv_class    = &tonemap_class,
      .p.flags         = AVFILTER_FLAG_SLICE_THREADS,
      .init            = init,

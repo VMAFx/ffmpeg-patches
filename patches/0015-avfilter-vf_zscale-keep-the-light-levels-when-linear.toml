@@ -4,13 +4,3 @@ consumers = ["vmafx", "pelorus"]
 origin = "part 2 of the Dolby Vision profile 5 tone-mapping series without libplacebo (ADR-0002): light levels survive zscale=t=linear"
 notes = """
 zscale drops all colour-dependent side data on a transfer change, so tonemap after zscale=t=linear saw no MaxCLL or mastering display and fell back to a fixed peak (cause 1 of the 0012 parity gap). Keep those two when the output is linear in the same primaries; other colour-dependent side data (ICC, dynamic HDR, Dolby Vision) is dropped as before. make fate-filter-zscale-light-levels passes on n9.0.2 plus 0001-0015 and fails on unpatched vf_zscale.c (light levels dropped on t=linear). No version.h or Changelog bump."""
-
-[[exceptions]]
-rule = "HISS-04"
-path = "libavfilter/vf_zscale.c"
-function = "filter_frame"
-lines = 152
-category = "D"
-entered = "2026-10-18"
-expires = "2027-02-15"
-reason = "upstream function, already 149 lines before the patch; moving the patch's addition into a helper is tracked in VMAFx/ffmpeg-patches#84"

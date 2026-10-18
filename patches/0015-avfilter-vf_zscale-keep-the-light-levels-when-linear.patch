@@ -18,10 +18,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
 ---
  libavfilter/Makefile                      |   2 +-
  libavfilter/tests/zscale_light_levels.c   | 138 ++++++++++++++++++++++
- libavfilter/vf_zscale.c                   |  27 ++++-
+ libavfilter/vf_zscale.c                   |  44 ++++++-
  tests/fate/filter-video.mak               |   4 +
  tests/ref/fate/filter-zscale-light-levels |   4 +
- 5 files changed, 173 insertions(+), 2 deletions(-)
+ 5 files changed, 185 insertions(+), 7 deletions(-)
  create mode 100644 libavfilter/tests/zscale_light_levels.c
  create mode 100644 tests/ref/fate/filter-zscale-light-levels
 
@@ -183,10 +183,10 @@ index 0000000000000000000000000000000000000000..3eda0579424155209e1c8ea1af00813e
 +    return fails != 0;
 +}
 diff --git a/libavfilter/vf_zscale.c b/libavfilter/vf_zscale.c
-index b14d704663abe76de9f12124fa60d7a8a2eec4ee..15a05b99c138e2d7d14d8e43024b82f6fee0f82a 100644
+index b14d704663abe76de9f12124fa60d7a8a2eec4ee..80216c0f1925d67eab4ed747847bf159d5c68230 100644
 --- a/libavfilter/vf_zscale.c
 +++ b/libavfilter/vf_zscale.c
-@@ -745,6 +745,28 @@ static int filter_slice(AVFilterContext *ctx, void *data, int job_nr, int n_jobs
+@@ -745,6 +745,42 @@ static int filter_slice(AVFilterContext *ctx, void *data, int job_nr, int n_jobs
      return 0;
  }
  
@@ -212,21 +212,45 @@ index b14d704663abe76de9f12124fa60d7a8a2eec4ee..15a05b99c138e2d7d14d8e43024b82f6
 +    }
 +}
 +
++static void prune_side_data(AVFrame *out, const AVFrame *in)
++{
++    int changed = 0;
++
++    if (out->width != in->width || out->height != in->height)
++        changed |= AV_SIDE_DATA_PROP_SIZE_DEPENDENT;
++    if (out->color_trc != in->color_trc && out->color_trc == AVCOL_TRC_LINEAR &&
++        out->color_primaries == in->color_primaries)
++        remove_color_dependent_keep_light(out);
++    else if (out->color_trc != in->color_trc || out->color_primaries != in->color_primaries)
++        changed |= AV_SIDE_DATA_PROP_COLOR_DEPENDENT;
++    av_frame_side_data_remove_by_props(&out->side_data, &out->nb_side_data, changed);
++}
++
  static int filter_frame(AVFilterLink *link, AVFrame *in)
  {
      AVFilterContext *ctx = link->dst;
-@@ -829,7 +851,10 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+@@ -753,7 +789,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
+     const AVPixFmtDescriptor *odesc = av_pix_fmt_desc_get(outlink->format);
+     char buf[32];
+-    int ret = 0, changed = 0;
++    int ret = 0;
+     AVFrame *out = NULL;
+     ThreadData td;
  
-         if (out->width != in->width || out->height != in->height)
-             changed |= AV_SIDE_DATA_PROP_SIZE_DEPENDENT;
+@@ -827,11 +863,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+                   (int64_t)in->sample_aspect_ratio.den * outlink->w * link->h,
+                   INT_MAX);
+ 
+-        if (out->width != in->width || out->height != in->height)
+-            changed |= AV_SIDE_DATA_PROP_SIZE_DEPENDENT;
 -        if (out->color_trc != in->color_trc || out->color_primaries != in->color_primaries)
-+        if (out->color_trc != in->color_trc && out->color_trc == AVCOL_TRC_LINEAR &&
-+            out->color_primaries == in->color_primaries)
-+            remove_color_dependent_keep_light(out);
-+        else if (out->color_trc != in->color_trc || out->color_primaries != in->color_primaries)
-             changed |= AV_SIDE_DATA_PROP_COLOR_DEPENDENT;
-         av_frame_side_data_remove_by_props(&out->side_data, &out->nb_side_data, changed);
+-            changed |= AV_SIDE_DATA_PROP_COLOR_DEPENDENT;
+-        av_frame_side_data_remove_by_props(&out->side_data, &out->nb_side_data, changed);
++        prune_side_data(out, in);
  
+         td.in = in;
+         td.out = out;
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
 index 0d85be36af8cbcc06a455b9e0e84fb9b84074167..437fce8b4733748ed4b45f776d561738b6bf4773 100644
 --- a/tests/fate/filter-video.mak
