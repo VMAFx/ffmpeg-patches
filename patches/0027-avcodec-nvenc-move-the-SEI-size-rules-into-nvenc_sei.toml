@@ -14,4 +14,6 @@ mismatches). 0003 and 0004 stay as sent upstream (FFmpeg PRs 24993 and \
 24994); this patch is series-only and is redone on top of their merged \
 form. tests/test_nvenc_sei.py compiles the header alone and checks it \
 against a Python model. Not run on NVENC hardware: the RTX 4090 had \
-906 MiB free on 2026-10-18."""
+906 MiB free on 2026-10-18. Adopted: Pelorus 0ef64d5 (series v0.3.0) \
+includes nvenc_sei.h from pelorus_sei_fit.h and keeps no copy of the \
+budget or the size formula (code-health sweep #50, 2026-10-18)."""
