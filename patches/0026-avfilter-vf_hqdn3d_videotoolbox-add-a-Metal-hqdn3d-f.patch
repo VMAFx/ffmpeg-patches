@@ -1,0 +1,1639 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 06:25:07 +0200
+Subject: [PATCH] avfilter/vf_hqdn3d_videotoolbox: add a Metal hqdn3d filter
+
+Add hqdn3d_videotoolbox, a Metal port of the integer hqdn3d filter
+for VideoToolbox frames. It follows the OpenCL port step for step,
+takes the options and commands of hqdn3d and uses the shared tables
+in hqdn3d_coefs.c.
+
+A horizontal kernel filters each row into an intermediate buffer; a
+vertical kernel filters each column and applies the temporal lowpass
+against the previous output. The temporal state is dropped where
+hqdn3d drops it, and after a frame size change inside a running graph
+the output frames come from a frames context of the new size.
+
+The accepted formats are those of the VideoToolbox frames context
+that the planar and two-plane 4:2:0 layouts cover: yuv420p, nv12 and
+p010.
+
+tools/hqdn3d_reset_test now also runs the Metal filter with a vt
+argument.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ configure                                     |    1 +
+ doc/filters.texi                              |   27 +
+ libavfilter/Makefile                          |    4 +
+ libavfilter/allfilters.c                      |    1 +
+ .../metal/vf_hqdn3d_videotoolbox.metal        |  325 +++++
+ libavfilter/vf_hqdn3d_videotoolbox.m          | 1065 +++++++++++++++++
+ tools/Makefile                                |    1 +
+ tools/hqdn3d_reset_test.c                     |   63 +-
+ 8 files changed, 1471 insertions(+), 16 deletions(-)
+ create mode 100644 libavfilter/metal/vf_hqdn3d_videotoolbox.metal
+ create mode 100644 libavfilter/vf_hqdn3d_videotoolbox.m
+
+diff --git a/configure b/configure
+index d386cc831d5e7265f8f73f42692a91ea57bdf4cb..0ebe83a5ae70d894b284b8715cc9862870e2c909 100755
+--- a/configure
++++ b/configure
+@@ -4203,6 +4203,7 @@ hqdn3d_filter_deps="gpl"
+ hqdn3d_cuda_filter_deps="gpl ffnvcodec"
+ hqdn3d_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+ hqdn3d_opencl_filter_deps="gpl opencl"
++hqdn3d_videotoolbox_filter_deps="gpl metal corevideo videotoolbox"
+ hqdn3d_vulkan_filter_deps="gpl vulkan spirv_compiler"
+ iccdetect_filter_deps="lcms2"
+ iccgen_filter_deps="lcms2"
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 34c895248d82780750b13bfa66bb072699208ec9..88acc06e58fbdc382e2126e07c49a225a94cd0f5 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -15857,6 +15857,33 @@ The filter accepts the same options as @ref{hqdn3d}:
+ @subsection Commands
+ This filter supports the same @ref{commands} as options.
+ 
++@anchor{hqdn3d_videotoolbox}
++@section hqdn3d_videotoolbox
++
++Apply a High Quality 3D Denoiser to VideoToolbox frames using Metal compute.
++The output is bit-exact by construction to the CPU @ref{hqdn3d} filter (GPU parity not yet measured on Apple hardware). The one exception is
++@samp{p010}: where the CPU filter writes a value above the
++format maximum, which this format cannot store, this filter writes the
++format maximum.
++
++Supported input hardware frame software formats:
++@itemize
++@item @samp{yuv420p}
++@item @samp{nv12}
++@item @samp{p010}
++@end itemize
++
++The filter accepts the same options as @ref{hqdn3d}:
++@table @option
++@item luma_spatial
++@item chroma_spatial
++@item luma_tmp
++@item chroma_tmp
++@end table
++
++@subsection Commands
++This filter supports the same @ref{commands} as options.
++
+ @anchor{hqdn3d_vulkan}
+ @section hqdn3d_vulkan
+ 
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 2b91412c57deb59c1f69eaac68f797e1cf662bbd..9ea29b9f645a3ab08e1a130d6b392c29e65da7c7 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -349,6 +349,10 @@ OBJS-$(CONFIG_HISTOGRAM_FILTER)              += vf_histogram.o
+ OBJS-$(CONFIG_HQDN3D_FILTER)                 += vf_hqdn3d.o hqdn3d_coefs.o
+ OBJS-$(CONFIG_HQDN3D_CUDA_FILTER)            += vf_hqdn3d_cuda.o vf_hqdn3d_cuda.ptx.o hqdn3d_coefs.o cuda/load_helper.o
+ OBJS-$(CONFIG_HQDN3D_OPENCL_FILTER)          += vf_hqdn3d_opencl.o opencl.o opencl/hqdn3d.o hqdn3d_coefs.o
++OBJS-$(CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER)    += vf_hqdn3d_videotoolbox.o \
++                                                metal/vf_hqdn3d_videotoolbox.metallib.o \
++                                                metal/utils.o \
++                                                hqdn3d_coefs.o
+ OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER)          += vf_hqdn3d_vulkan.o hqdn3d_coefs.o vulkan.o vulkan_filter.o
+ OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
+ OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 81c1f2c8a8d38e38b40a2b6bfb3e8f05fbbbc627..5ecf9a8698318dd84d5d3723df2053a2c9f20304 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -323,6 +323,7 @@ extern const FFFilter ff_vf_histogram;
+ extern const FFFilter ff_vf_hqdn3d;
+ extern const FFFilter ff_vf_hqdn3d_cuda;
+ extern const FFFilter ff_vf_hqdn3d_opencl;
++extern const FFFilter ff_vf_hqdn3d_videotoolbox;
+ extern const FFFilter ff_vf_hqdn3d_vulkan;
+ extern const FFFilter ff_vf_hqx;
+ extern const FFFilter ff_vf_hstack;
+diff --git a/libavfilter/metal/vf_hqdn3d_videotoolbox.metal b/libavfilter/metal/vf_hqdn3d_videotoolbox.metal
+new file mode 100644
+index 0000000000000000000000000000000000000000..30f3e40acfd806be2a861a553a721ebdfeca2d8b
+--- /dev/null
++++ b/libavfilter/metal/vf_hqdn3d_videotoolbox.metal
+@@ -0,0 +1,325 @@
++/*
++ * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
++ * Copyright (c) 2010 Baptiste Coudurier
++ * Copyright (c) 2012 Loren Merritt
++ * Copyright (c) 2026 Lusoris
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifdef __METAL_VERSION__
++#include <metal_stdlib>
++#include <metal_integer>
++#include <metal_texture>
++using namespace metal;
++#elif defined(METAL_SHIM)
++#include "metal_shim.h"
++using namespace metal;
++#endif
++
++struct Hqdn3dParams {
++    int h_offset;
++    int h_offset_v;
++    int fa_offset;
++    int fa_offset_v;
++    int spatial_offset;
++    int temporal_offset;
++    int width;
++    int height;
++    int depth;
++    int lut_bits;
++    int is_msb;
++    int first_frame;
++    int spatial_enabled;
++};
++
++static inline uint load_sample(uint raw, uint s_depth, uint s_msb)
++{
++    uint shift = 16u - s_depth;
++    uint sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    uint rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
++    return (sample_val << shift) + rounding;
++}
++
++static inline uint store_sample(uint val, uint s_depth, uint s_msb)
++{
++    uint shift = 16u - s_depth;
++    uint stored = val >> shift;
++    if (s_msb != 0u) {
++        uint max_val = (1u << s_depth) - 1u;
++        if (stored > max_val)
++            stored = max_val;
++        return stored << shift;
++    }
++    return stored;
++}
++
++static inline int lowpass(int prev_val, int cur_val,
++                          device const short *coef_tables,
++                          int t_offset,
++                          int l_bits)
++{
++    int d = (prev_val - cur_val) >> (8 - l_bits);
++    int center = 256 << l_bits;
++    int idx = t_offset + center + d;
++    int coef = (int)coef_tables[idx];
++    return cur_val + coef;
++}
++
++kernel void hqdn3d_horizontal_planar(
++    texture2d<float, access::read> in_img [[texture(0)]],
++    device ushort *h_data [[buffer(0)]],
++    device const short *coef_tables [[buffer(1)]],
++    constant Hqdn3dParams &params [[buffer(2)]],
++    uint2 pos [[thread_position_in_grid]])
++{
++    uint y = pos.x;
++    if (pos.y > 0 || y >= (uint)params.height)
++        return;
++
++    float max_norm = (params.depth <= 8) ? 255.0f : 65535.0f;
++    int h_row_start = params.h_offset + (int)y * params.width;
++    uint raw0 = (uint)rint(in_img.read(uint2(0, y)).x * max_norm);
++    uint pixel_ant = load_sample(raw0, params.depth, params.is_msb);
++
++    if (y == 0) {
++        for (int x = 0; x < params.width; x++) {
++            uint raw = (uint)rint(in_img.read(uint2(x, 0)).x * max_norm);
++            uint cur = load_sample(raw, params.depth, params.is_msb);
++            pixel_ant = (uint)lowpass((int)pixel_ant, (int)cur, coef_tables, params.spatial_offset, params.lut_bits);
++            h_data[h_row_start + x] = (ushort)pixel_ant;
++        }
++    } else {
++        h_data[h_row_start + 0] = (ushort)pixel_ant;
++        for (int x = 0; x + 1 < params.width; x++) {
++            uint raw = (uint)rint(in_img.read(uint2(x + 1, y)).x * max_norm);
++            uint cur = load_sample(raw, params.depth, params.is_msb);
++            pixel_ant = (uint)lowpass((int)pixel_ant, (int)cur, coef_tables, params.spatial_offset, params.lut_bits);
++            h_data[h_row_start + x + 1] = (ushort)pixel_ant;
++        }
++    }
++}
++
++kernel void hqdn3d_horizontal_semiplanar(
++    texture2d<float, access::read> in_img [[texture(0)]],
++    device ushort *h_data [[buffer(0)]],
++    device const short *coef_tables [[buffer(1)]],
++    constant Hqdn3dParams &params [[buffer(2)]],
++    uint2 pos [[thread_position_in_grid]])
++{
++    uint y = pos.x;
++    if (pos.y > 0 || y >= (uint)params.height)
++        return;
++
++    float max_norm = (params.depth <= 8) ? 255.0f : 65535.0f;
++    int h_row_u = params.h_offset + (int)y * params.width;
++    int h_row_v = params.h_offset_v + (int)y * params.width;
++    float4 raw0 = in_img.read(uint2(0, y));
++    uint pixel_ant_u = load_sample((uint)rint(raw0.x * max_norm), params.depth, params.is_msb);
++    uint pixel_ant_v = load_sample((uint)rint(raw0.y * max_norm), params.depth, params.is_msb);
++
++    if (y == 0) {
++        for (int x = 0; x < params.width; x++) {
++            float4 raw = in_img.read(uint2(x, 0));
++            uint cur_u = load_sample((uint)rint(raw.x * max_norm), params.depth, params.is_msb);
++            uint cur_v = load_sample((uint)rint(raw.y * max_norm), params.depth, params.is_msb);
++            pixel_ant_u = (uint)lowpass((int)pixel_ant_u, (int)cur_u, coef_tables, params.spatial_offset, params.lut_bits);
++            pixel_ant_v = (uint)lowpass((int)pixel_ant_v, (int)cur_v, coef_tables, params.spatial_offset, params.lut_bits);
++            h_data[h_row_u + x] = (ushort)pixel_ant_u;
++            h_data[h_row_v + x] = (ushort)pixel_ant_v;
++        }
++    } else {
++        h_data[h_row_u + 0] = (ushort)pixel_ant_u;
++        h_data[h_row_v + 0] = (ushort)pixel_ant_v;
++        for (int x = 0; x + 1 < params.width; x++) {
++            float4 raw = in_img.read(uint2(x + 1, y));
++            uint cur_u = load_sample((uint)rint(raw.x * max_norm), params.depth, params.is_msb);
++            uint cur_v = load_sample((uint)rint(raw.y * max_norm), params.depth, params.is_msb);
++            pixel_ant_u = (uint)lowpass((int)pixel_ant_u, (int)cur_u, coef_tables, params.spatial_offset, params.lut_bits);
++            pixel_ant_v = (uint)lowpass((int)pixel_ant_v, (int)cur_v, coef_tables, params.spatial_offset, params.lut_bits);
++            h_data[h_row_u + x + 1] = (ushort)pixel_ant_u;
++            h_data[h_row_v + x + 1] = (ushort)pixel_ant_v;
++        }
++    }
++}
++
++static void vertical_planar_temporal(
++    texture2d<float, access::read> in_img,
++    texture2d<float, access::write> out_img,
++    device ushort *frame_ant_data,
++    device const short *coef_tables,
++    constant Hqdn3dParams &params,
++    int x, float max_norm)
++{
++    for (int y = 0; y < params.height; y++) {
++        uint raw = (uint)rint(in_img.read(uint2(x, y)).x * max_norm);
++        int cur = (int)load_sample(raw, params.depth, params.is_msb);
++        int fa_idx = params.fa_offset + y * params.width + x;
++        int prev_ant = params.first_frame ? cur : (int)frame_ant_data[fa_idx];
++        int tmp = lowpass(prev_ant, cur, coef_tables, params.temporal_offset, params.lut_bits);
++        uint out_val = store_sample((uint)tmp, params.depth, params.is_msb);
++        frame_ant_data[fa_idx] = (ushort)tmp;
++        out_img.write(float4((float)out_val / max_norm, 0.0f, 0.0f, 0.0f), uint2(x, y));
++    }
++}
++
++static void vertical_planar_spatial(
++    texture2d<float, access::read> in_img,
++    texture2d<float, access::write> out_img,
++    device const ushort *h_data,
++    device ushort *frame_ant_data,
++    device const short *coef_tables,
++    constant Hqdn3dParams &params,
++    int x, float max_norm)
++{
++    int line_ant = (int)h_data[params.h_offset + x];
++    for (int y = 0; y < params.height; y++) {
++        int spat_tmp = line_ant;
++        int fa_idx = params.fa_offset + y * params.width + x;
++        int prev_ant;
++        if (y > 0) {
++            int h_val = (int)h_data[params.h_offset + y * params.width + x];
++            spat_tmp = lowpass(line_ant, h_val, coef_tables, params.spatial_offset, params.lut_bits);
++            line_ant = (int)(ushort)spat_tmp;
++        }
++        if (params.first_frame) {
++            uint raw = (uint)rint(in_img.read(uint2(x, y)).x * max_norm);
++            prev_ant = (int)load_sample(raw, params.depth, params.is_msb);
++        } else {
++            prev_ant = (int)frame_ant_data[fa_idx];
++        }
++        int temp_tmp = lowpass(prev_ant, spat_tmp, coef_tables, params.temporal_offset, params.lut_bits);
++        uint out_val = store_sample((uint)temp_tmp, params.depth, params.is_msb);
++        frame_ant_data[fa_idx] = (ushort)temp_tmp;
++        out_img.write(float4((float)out_val / max_norm, 0.0f, 0.0f, 0.0f), uint2(x, y));
++    }
++}
++
++kernel void hqdn3d_vertical_planar(
++    texture2d<float, access::read> in_img [[texture(0)]],
++    texture2d<float, access::write> out_img [[texture(1)]],
++    device const ushort *h_data [[buffer(0)]],
++    device ushort *frame_ant_data [[buffer(1)]],
++    device const short *coef_tables [[buffer(2)]],
++    constant Hqdn3dParams &params [[buffer(3)]],
++    uint2 pos [[thread_position_in_grid]])
++{
++    uint x = pos.x;
++    if (pos.y > 0 || x >= (uint)params.width)
++        return;
++
++    float max_norm = (params.depth <= 8) ? 255.0f : 65535.0f;
++    if (params.spatial_enabled == 0) {
++        vertical_planar_temporal(in_img, out_img, frame_ant_data,
++                                 coef_tables, params, (int)x, max_norm);
++    } else {
++        vertical_planar_spatial(in_img, out_img, h_data, frame_ant_data,
++                                coef_tables, params, (int)x, max_norm);
++    }
++}
++
++static void vertical_semiplanar_temporal(
++    texture2d<float, access::read> in_img,
++    texture2d<float, access::write> out_img,
++    device ushort *frame_ant_data,
++    device const short *coef_tables,
++    constant Hqdn3dParams &params,
++    int x, float max_norm)
++{
++    for (int y = 0; y < params.height; y++) {
++        float4 raw = in_img.read(uint2(x, y));
++        int cur_u = (int)load_sample((uint)rint(raw.x * max_norm), params.depth, params.is_msb);
++        int cur_v = (int)load_sample((uint)rint(raw.y * max_norm), params.depth, params.is_msb);
++        int fa_u = params.fa_offset + y * params.width + x;
++        int fa_v = params.fa_offset_v + y * params.width + x;
++        int prev_u = params.first_frame ? cur_u : (int)frame_ant_data[fa_u];
++        int prev_v = params.first_frame ? cur_v : (int)frame_ant_data[fa_v];
++        int tmp_u = lowpass(prev_u, cur_u, coef_tables, params.temporal_offset, params.lut_bits);
++        int tmp_v = lowpass(prev_v, cur_v, coef_tables, params.temporal_offset, params.lut_bits);
++        uint out_u = store_sample((uint)tmp_u, params.depth, params.is_msb);
++        uint out_v = store_sample((uint)tmp_v, params.depth, params.is_msb);
++        frame_ant_data[fa_u] = (ushort)tmp_u;
++        frame_ant_data[fa_v] = (ushort)tmp_v;
++        out_img.write(float4((float)out_u / max_norm, (float)out_v / max_norm, 0.0f, 0.0f), uint2(x, y));
++    }
++}
++
++static void vertical_semiplanar_spatial(
++    texture2d<float, access::read> in_img,
++    texture2d<float, access::write> out_img,
++    device const ushort *h_data,
++    device ushort *frame_ant_data,
++    device const short *coef_tables,
++    constant Hqdn3dParams &params,
++    int x, float max_norm)
++{
++    int line_ant_u = (int)h_data[params.h_offset + x];
++    int line_ant_v = (int)h_data[params.h_offset_v + x];
++    for (int y = 0; y < params.height; y++) {
++        int spat_tmp_u = line_ant_u;
++        int spat_tmp_v = line_ant_v;
++        int fa_u = params.fa_offset + y * params.width + x;
++        int fa_v = params.fa_offset_v + y * params.width + x;
++        int prev_u, prev_v;
++        if (y > 0) {
++            int h_u = (int)h_data[params.h_offset + y * params.width + x];
++            int h_v = (int)h_data[params.h_offset_v + y * params.width + x];
++            spat_tmp_u = lowpass(line_ant_u, h_u, coef_tables, params.spatial_offset, params.lut_bits);
++            spat_tmp_v = lowpass(line_ant_v, h_v, coef_tables, params.spatial_offset, params.lut_bits);
++            line_ant_u = (int)(ushort)spat_tmp_u;
++            line_ant_v = (int)(ushort)spat_tmp_v;
++        }
++        if (params.first_frame) {
++            float4 raw = in_img.read(uint2(x, y));
++            prev_u = (int)load_sample((uint)rint(raw.x * max_norm), params.depth, params.is_msb);
++            prev_v = (int)load_sample((uint)rint(raw.y * max_norm), params.depth, params.is_msb);
++        } else {
++            prev_u = (int)frame_ant_data[fa_u];
++            prev_v = (int)frame_ant_data[fa_v];
++        }
++        int temp_tmp_u = lowpass(prev_u, spat_tmp_u, coef_tables, params.temporal_offset, params.lut_bits);
++        int temp_tmp_v = lowpass(prev_v, spat_tmp_v, coef_tables, params.temporal_offset, params.lut_bits);
++        uint out_u = store_sample((uint)temp_tmp_u, params.depth, params.is_msb);
++        uint out_v = store_sample((uint)temp_tmp_v, params.depth, params.is_msb);
++        frame_ant_data[fa_u] = (ushort)temp_tmp_u;
++        frame_ant_data[fa_v] = (ushort)temp_tmp_v;
++        out_img.write(float4((float)out_u / max_norm, (float)out_v / max_norm, 0.0f, 0.0f), uint2(x, y));
++    }
++}
++
++kernel void hqdn3d_vertical_semiplanar(
++    texture2d<float, access::read> in_img [[texture(0)]],
++    texture2d<float, access::write> out_img [[texture(1)]],
++    device const ushort *h_data [[buffer(0)]],
++    device ushort *frame_ant_data [[buffer(1)]],
++    device const short *coef_tables [[buffer(2)]],
++    constant Hqdn3dParams &params [[buffer(3)]],
++    uint2 pos [[thread_position_in_grid]])
++{
++    uint x = pos.x;
++    if (pos.y > 0 || x >= (uint)params.width)
++        return;
++
++    float max_norm = (params.depth <= 8) ? 255.0f : 65535.0f;
++    if (params.spatial_enabled == 0) {
++        vertical_semiplanar_temporal(in_img, out_img, frame_ant_data,
++                                     coef_tables, params, (int)x, max_norm);
++    } else {
++        vertical_semiplanar_spatial(in_img, out_img, h_data, frame_ant_data,
++                                    coef_tables, params, (int)x, max_norm);
++    }
++}
+diff --git a/libavfilter/vf_hqdn3d_videotoolbox.m b/libavfilter/vf_hqdn3d_videotoolbox.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..038da14c8b81ca68077328d07df317aa65f6ed21
+--- /dev/null
++++ b/libavfilter/vf_hqdn3d_videotoolbox.m
+@@ -0,0 +1,1065 @@
++/*
++ * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
++ * Copyright (c) 2010 Baptiste Coudurier
++ * Copyright (c) 2012 Loren Merritt
++ * Copyright (c) 2026 Lusoris
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <float.h>
++#include <stdint.h>
++#include <assert.h>
++
++#include "filters.h"
++#include "video.h"
++#include "metal/utils.h"
++#include "libavutil/avassert.h"
++#include "libavutil/common.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_videotoolbox.h"
++#include "libavutil/mem.h"
++#include "libavutil/objc.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++
++#include "vf_hqdn3d.h"
++#include "hqdn3d_coefs.h"
++
++extern char ff_vf_hqdn3d_videotoolbox_metallib_data[];
++extern unsigned int ff_vf_hqdn3d_videotoolbox_metallib_len;
++
++struct mtlHqdn3dParams {
++    int32_t h_offset;
++    int32_t h_offset_v;
++    int32_t fa_offset;
++    int32_t fa_offset_v;
++    int32_t spatial_offset;
++    int32_t temporal_offset;
++    int32_t width;
++    int32_t height;
++    int32_t depth;
++    int32_t lut_bits;
++    int32_t is_msb;
++    int32_t first_frame;
++    int32_t spatial_enabled;
++};
++
++typedef struct API_AVAILABLE(macos(10.11), ios(8.0)) HQDN3DVTContext {
++    const AVClass *class;
++
++    AVBufferRef *device_ref;
++    AVBufferRef *input_frames_ref;
++    AVHWFramesContext *input_frames;
++
++    id<MTLDevice> mtlDevice;
++    id<MTLLibrary> mtlLibrary;
++    id<MTLCommandQueue> mtlQueue;
++
++    id<MTLFunction> mtlFuncHorizPlanar;
++    id<MTLFunction> mtlFuncHorizSemiplanar;
++    id<MTLFunction> mtlFuncVertPlanar;
++    id<MTLFunction> mtlFuncVertSemiplanar;
++
++    id<MTLComputePipelineState> mtlPipelineHorizPlanar;
++    id<MTLComputePipelineState> mtlPipelineHorizSemiplanar;
++    id<MTLComputePipelineState> mtlPipelineVertPlanar;
++    id<MTLComputePipelineState> mtlPipelineVertSemiplanar;
++
++    id<MTLBuffer> mtlParamsHorizLuma;
++    id<MTLBuffer> mtlParamsHorizChroma;
++    id<MTLBuffer> mtlParamsVertLuma;
++    id<MTLBuffer> mtlParamsVertChroma;
++
++    id<MTLBuffer> mtlTablesBuffer;
++    id<MTLBuffer> mtlHBuffer;
++    id<MTLBuffer> mtlFrameAntBuffer;
++
++    CVMetalTextureCacheRef textureCache;
++
++    double strength[4];
++
++    int hsub, vsub;
++    int depth;
++    int is_msb;
++    int is_semiplanar;
++    int width, height;
++    enum AVPixelFormat sw_format;
++
++    int spatial_enabled[2];
++    int first_frame;
++    int pad;
++
++    AVBufferRef *out_frames_ref;
++} HQDN3DVTContext API_AVAILABLE(macos(10.11), ios(8.0));
++
++#define HQDN3D_VT_CTX_SIZE (sizeof(void*) * 24 + sizeof(double) * 4 + sizeof(int) * 12)
++
++typedef struct HQDN3DTextures {
++    CVMetalTextureRef in_y;
++    CVMetalTextureRef out_y;
++    CVMetalTextureRef in_c1;
++    CVMetalTextureRef out_c1;
++    CVMetalTextureRef in_c2;
++    CVMetalTextureRef out_c2;
++    id<MTLTexture> mtl_in_y;
++    id<MTLTexture> mtl_out_y;
++    id<MTLTexture> mtl_in_c1;
++    id<MTLTexture> mtl_out_c1;
++    id<MTLTexture> mtl_in_c2;
++    id<MTLTexture> mtl_out_c2;
++} HQDN3DTextures;
++
++static void free_buffers(HQDN3DVTContext *s)
++{
++    ff_objc_release(&s->mtlTablesBuffer);
++    ff_objc_release(&s->mtlHBuffer);
++    ff_objc_release(&s->mtlFrameAntBuffer);
++}
++
++static av_cold void do_uninit(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    HQDN3DVTContext *s = ctx->priv;
++
++    free_buffers(s);
++    av_buffer_unref(&s->device_ref);
++    av_buffer_unref(&s->input_frames_ref);
++    av_buffer_unref(&s->out_frames_ref);
++    s->input_frames = NULL;
++
++    ff_objc_release(&s->mtlParamsHorizLuma);
++    ff_objc_release(&s->mtlParamsHorizChroma);
++    ff_objc_release(&s->mtlParamsVertLuma);
++    ff_objc_release(&s->mtlParamsVertChroma);
++
++    ff_objc_release(&s->mtlFuncHorizPlanar);
++    ff_objc_release(&s->mtlFuncHorizSemiplanar);
++    ff_objc_release(&s->mtlFuncVertPlanar);
++    ff_objc_release(&s->mtlFuncVertSemiplanar);
++
++    ff_objc_release(&s->mtlPipelineHorizPlanar);
++    ff_objc_release(&s->mtlPipelineHorizSemiplanar);
++    ff_objc_release(&s->mtlPipelineVertPlanar);
++    ff_objc_release(&s->mtlPipelineVertSemiplanar);
++
++    ff_objc_release(&s->mtlQueue);
++    ff_objc_release(&s->mtlLibrary);
++    ff_objc_release(&s->mtlDevice);
++
++    if (s->textureCache) {
++        CFRelease(s->textureCache);
++        s->textureCache = NULL;
++    }
++}
++
++static av_cold void hqdn3d_videotoolbox_uninit(AVFilterContext *ctx)
++{
++    if (@available(macOS 10.11, iOS 8.0, *))
++        do_uninit(ctx);
++}
++
++static int create_pipeline(AVFilterContext *ctx, id<MTLDevice> device,
++                           id<MTLLibrary> library, NSString *name,
++                           id<MTLFunction> *func_out,
++                           id<MTLComputePipelineState> *pipe_out) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    NSError *err = nil;
++    *func_out = [library newFunctionWithName:name];
++    if (!*func_out) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to find Metal function %s\n", name.UTF8String);
++        return AVERROR_EXTERNAL;
++    }
++    *pipe_out = [device newComputePipelineStateWithFunction:*func_out error:&err];
++    if (err || !*pipe_out) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create Metal compute pipeline for %s: %s\n",
++               name.UTF8String, err ? err.description.UTF8String : "unknown error");
++        return AVERROR_EXTERNAL;
++    }
++    return 0;
++}
++
++static int create_param_buffers(AVFilterContext *ctx, HQDN3DVTContext *s) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    s->mtlParamsHorizLuma = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
++                                                      options:MTLResourceStorageModeShared];
++    s->mtlParamsHorizChroma = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
++                                                        options:MTLResourceStorageModeShared];
++    s->mtlParamsVertLuma = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
++                                                    options:MTLResourceStorageModeShared];
++    s->mtlParamsVertChroma = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
++                                                      options:MTLResourceStorageModeShared];
++    if (!s->mtlParamsHorizLuma || !s->mtlParamsHorizChroma ||
++        !s->mtlParamsVertLuma || !s->mtlParamsVertChroma) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to allocate Metal parameter buffers\n");
++        return AVERROR(ENOMEM);
++    }
++    return 0;
++}
++
++static int init_pipelines(AVFilterContext *ctx, HQDN3DVTContext *s) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    int r;
++    r = create_pipeline(ctx, s->mtlDevice, s->mtlLibrary, @"hqdn3d_horizontal_planar",
++                        &s->mtlFuncHorizPlanar, &s->mtlPipelineHorizPlanar);
++    if (r < 0)
++        return r;
++    r = create_pipeline(ctx, s->mtlDevice, s->mtlLibrary, @"hqdn3d_horizontal_semiplanar",
++                        &s->mtlFuncHorizSemiplanar, &s->mtlPipelineHorizSemiplanar);
++    if (r < 0)
++        return r;
++    r = create_pipeline(ctx, s->mtlDevice, s->mtlLibrary, @"hqdn3d_vertical_planar",
++                        &s->mtlFuncVertPlanar, &s->mtlPipelineVertPlanar);
++    if (r < 0)
++        return r;
++    return create_pipeline(ctx, s->mtlDevice, s->mtlLibrary, @"hqdn3d_vertical_semiplanar",
++                           &s->mtlFuncVertSemiplanar, &s->mtlPipelineVertSemiplanar);
++}
++
++static int init_metal_device(AVFilterContext *ctx, HQDN3DVTContext *s) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    NSError *err = nil;
++    dispatch_data_t libData;
++
++    s->mtlDevice = MTLCreateSystemDefaultDevice();
++    if (!s->mtlDevice) {
++        av_log(ctx, AV_LOG_ERROR, "Unable to find Metal device\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    av_log(ctx, AV_LOG_INFO, "Using Metal device: %s\n", s->mtlDevice.name.UTF8String);
++
++    libData = dispatch_data_create(
++        ff_vf_hqdn3d_videotoolbox_metallib_data,
++        ff_vf_hqdn3d_videotoolbox_metallib_len,
++        nil,
++        nil);
++    s->mtlLibrary = [s->mtlDevice newLibraryWithData:libData error:&err];
++    dispatch_release(libData);
++    libData = nil;
++    if (err || !s->mtlLibrary) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to load Metal library: %s\n",
++               err ? err.description.UTF8String : "unknown error");
++        return AVERROR_EXTERNAL;
++    }
++
++    s->mtlQueue = s->mtlDevice.newCommandQueue;
++    if (!s->mtlQueue) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create Metal command queue\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    return 0;
++}
++
++static av_cold int do_init(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    HQDN3DVTContext *s = ctx->priv;
++    CVReturn ret;
++    int r;
++
++    r = init_metal_device(ctx, s);
++    if (r < 0) {
++        do_uninit(ctx);
++        return r;
++    }
++
++    r = init_pipelines(ctx, s);
++    if (r < 0) {
++        do_uninit(ctx);
++        return r;
++    }
++
++    r = create_param_buffers(ctx, s);
++    if (r < 0) {
++        do_uninit(ctx);
++        return r;
++    }
++
++    ret = CVMetalTextureCacheCreate(
++        NULL,
++        NULL,
++        s->mtlDevice,
++        NULL,
++        &s->textureCache
++    );
++    if (ret != kCVReturnSuccess) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create CVMetalTextureCache: %d\n", ret);
++        do_uninit(ctx);
++        return AVERROR_EXTERNAL;
++    }
++
++    ff_hqdn3d_default_strengths(s->strength);
++    return 0;
++}
++
++static av_cold int hqdn3d_videotoolbox_init(AVFilterContext *ctx)
++{
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        static_assert(HQDN3D_VT_CTX_SIZE == sizeof(HQDN3DVTContext),
++                      "Incorrect HQDN3D_VT_CTX_SIZE value!");
++        return do_init(ctx);
++    } else {
++        av_log(ctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int validate_format(AVFilterContext *ctx, enum AVPixelFormat sw_format,
++                           int *depth, int *is_msb, int *is_semiplanar)
++{
++    switch (sw_format) {
++    case AV_PIX_FMT_YUV420P:
++        *depth = 8;
++        *is_msb = 0;
++        *is_semiplanar = 0;
++        return 0;
++    case AV_PIX_FMT_NV12:
++        *depth = 8;
++        *is_msb = 0;
++        *is_semiplanar = 1;
++        return 0;
++    case AV_PIX_FMT_P010:
++        *depth = 10;
++        *is_msb = 1;
++        *is_semiplanar = 1;
++        return 0;
++    default:
++        av_log(ctx, AV_LOG_ERROR, "Unsupported sw_format: %s\n",
++               av_get_pix_fmt_name(sw_format));
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int init_buffers(AVFilterContext *ctx, int w, int h) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    HQDN3DVTContext *s = ctx->priv;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    size_t tables_sz = (size_t)4 * (512 << lut_bits) * sizeof(int16_t);
++    int cw = AV_CEIL_RSHIFT(w, s->hsub);
++    int ch = AV_CEIL_RSHIFT(h, s->vsub);
++    size_t samples = (size_t)w * h + (size_t)2 * cw * ch;
++    size_t data_sz = samples * sizeof(uint16_t);
++
++    s->mtlTablesBuffer = [s->mtlDevice newBufferWithLength:tables_sz
++                                                   options:MTLResourceStorageModeShared];
++    if (!s->mtlTablesBuffer)
++        return AVERROR(ENOMEM);
++
++    s->mtlHBuffer = [s->mtlDevice newBufferWithLength:data_sz
++                                              options:MTLResourceStorageModePrivate];
++    if (!s->mtlHBuffer) {
++        free_buffers(s);
++        return AVERROR(ENOMEM);
++    }
++
++    s->mtlFrameAntBuffer = [s->mtlDevice newBufferWithLength:data_sz
++                                                     options:MTLResourceStorageModePrivate];
++    if (!s->mtlFrameAntBuffer) {
++        free_buffers(s);
++        return AVERROR(ENOMEM);
++    }
++
++    return 0;
++}
++
++static int calc_coefs(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    HQDN3DVTContext *s = ctx->priv;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    int table_entries = 512 << lut_bits;
++    size_t tables_sz = (size_t)4 * table_entries * sizeof(int16_t);
++    int16_t *tables = av_malloc(tables_sz);
++
++    if (!tables)
++        return AVERROR(ENOMEM);
++
++    for (int i = 0; i < 4; i++) {
++        int16_t *ct = tables + i * table_entries;
++        ff_hqdn3d_precalc_coefs(s->strength[i], s->depth, ct);
++    }
++
++    s->spatial_enabled[0] = s->strength[LUMA_SPATIAL] != 0.0;
++    s->spatial_enabled[1] = s->strength[CHROMA_SPATIAL] != 0.0;
++
++    memcpy(s->mtlTablesBuffer.contents, tables, tables_sz);
++    av_free(tables);
++    return 0;
++}
++
++static int do_config_input(AVFilterLink *inlink) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FilterLink *l = ff_filter_link(inlink);
++    AVFilterContext *ctx = inlink->dst;
++    HQDN3DVTContext *s = ctx->priv;
++
++    if (!l->hw_frames_ctx) {
++        av_log(ctx, AV_LOG_ERROR, "A hardware frames reference is "
++               "required to associate the processing device.\n");
++        return AVERROR(EINVAL);
++    }
++
++    av_buffer_unref(&s->input_frames_ref);
++    s->input_frames_ref = av_buffer_ref(l->hw_frames_ctx);
++    if (!s->input_frames_ref) {
++        av_log(ctx, AV_LOG_ERROR, "A input frames reference create failed.\n");
++        return AVERROR(ENOMEM);
++    }
++    s->input_frames = (AVHWFramesContext*)s->input_frames_ref->data;
++
++    free_buffers(s);
++    av_buffer_unref(&s->out_frames_ref);
++    s->width = 0;
++    s->height = 0;
++    s->sw_format = AV_PIX_FMT_NONE;
++    s->first_frame = 1;
++
++    return 0;
++}
++
++static int config_input(AVFilterLink *inlink)
++{
++    AVFilterContext *ctx = inlink->dst;
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        return do_config_input(inlink);
++    } else {
++        av_log(ctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int do_config_output(AVFilterLink *link) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FilterLink *l = ff_filter_link(link);
++    FilterLink *il = ff_filter_link(link->src->inputs[0]);
++    AVHWFramesContext *output_frames, *input_frames;
++    AVFilterContext *ctx = link->src;
++    HQDN3DVTContext *s = ctx->priv;
++    int ret;
++
++    av_assert0(s->input_frames);
++    av_buffer_unref(&s->device_ref);
++    s->device_ref = av_buffer_ref(s->input_frames->device_ref);
++    if (!s->device_ref) {
++        av_log(ctx, AV_LOG_ERROR, "A device reference create failed.\n");
++        return AVERROR(ENOMEM);
++    }
++
++    l->hw_frames_ctx = av_hwframe_ctx_alloc(s->device_ref);
++    if (!l->hw_frames_ctx) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create HW frame context for output.\n");
++        return AVERROR(ENOMEM);
++    }
++
++    input_frames = (AVHWFramesContext*)il->hw_frames_ctx->data;
++    output_frames = (AVHWFramesContext*)l->hw_frames_ctx->data;
++
++    output_frames->format    = AV_PIX_FMT_VIDEOTOOLBOX;
++    output_frames->sw_format = s->input_frames->sw_format;
++    output_frames->width     = ctx->inputs[0]->w;
++    output_frames->height    = ctx->inputs[0]->h;
++    if (input_frames->hwctx && output_frames->hwctx) {
++        ((AVVTFramesContext *)output_frames->hwctx)->color_range =
++            ((AVVTFramesContext *)input_frames->hwctx)->color_range;
++    }
++
++    ret = ff_filter_init_hw_frames(ctx, link, 10);
++    if (ret < 0)
++        return ret;
++
++    ret = av_hwframe_ctx_init(l->hw_frames_ctx);
++    if (ret < 0) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to initialise VideoToolbox frame context for output: %d\n", ret);
++        return ret;
++    }
++
++    return 0;
++}
++
++static int config_output(AVFilterLink *link)
++{
++    AVFilterContext *ctx = link->src;
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        return do_config_output(link);
++    } else {
++        av_log(ctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int create_out_frames_ctx(AVFilterContext *ctx, AVFrame *in) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    HQDN3DVTContext *s = ctx->priv;
++    AVHWFramesContext *in_hwfc = (AVHWFramesContext *)in->hw_frames_ctx->data;
++    AVHWFramesContext *frames_ctx;
++    AVBufferRef *device_ref = in_hwfc->device_ref ? in_hwfc->device_ref : s->device_ref;
++    int err;
++
++    if (!device_ref)
++        return AVERROR(EINVAL);
++
++    av_buffer_unref(&s->out_frames_ref);
++
++    s->out_frames_ref = av_hwframe_ctx_alloc(device_ref);
++    if (!s->out_frames_ref)
++        return AVERROR(ENOMEM);
++
++    frames_ctx = (AVHWFramesContext *)s->out_frames_ref->data;
++    frames_ctx->format    = AV_PIX_FMT_VIDEOTOOLBOX;
++    frames_ctx->sw_format = in_hwfc->sw_format;
++    frames_ctx->width     = in->width;
++    frames_ctx->height    = in->height;
++    if (in_hwfc->hwctx && frames_ctx->hwctx) {
++        ((AVVTFramesContext *)frames_ctx->hwctx)->color_range =
++            ((AVVTFramesContext *)in_hwfc->hwctx)->color_range;
++    }
++
++    err = av_hwframe_ctx_init(s->out_frames_ref);
++    if (err < 0) {
++        av_buffer_unref(&s->out_frames_ref);
++        return err;
++    }
++
++    ctx->outputs[0]->w = in->width;
++    ctx->outputs[0]->h = in->height;
++    return 0;
++}
++
++static AVFrame *alloc_output_frame(HQDN3DVTContext *s, AVFilterLink *outlink, AVFrame *in)
++{
++    AVFrame *out = NULL;
++    int err;
++
++    if (s->out_frames_ref) {
++        out = av_frame_alloc();
++        if (!out)
++            return NULL;
++        err = av_hwframe_get_buffer(s->out_frames_ref, out, 0);
++        if (err < 0) {
++            av_frame_free(&out);
++            return NULL;
++        }
++    } else {
++        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++        if (!out)
++            return NULL;
++    }
++
++    if (av_frame_copy_props(out, in) < 0) {
++        av_frame_free(&out);
++        return NULL;
++    }
++    return out;
++}
++
++static int check_format_and_size(AVFilterContext *ctx, AVFrame *in) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    HQDN3DVTContext *s = ctx->priv;
++    AVHWFramesContext *hwfc = (AVHWFramesContext *)in->hw_frames_ctx->data;
++    int err;
++
++    err = validate_format(ctx, hwfc->sw_format, &s->depth, &s->is_msb, &s->is_semiplanar);
++    if (err < 0)
++        return err;
++
++    if (in->width != s->width || in->height != s->height || hwfc->sw_format != s->sw_format) {
++        s->hsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_w;
++        s->vsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_h;
++        if (s->width != 0) {
++            free_buffers(s);
++            err = init_buffers(ctx, in->width, in->height);
++            if (err < 0)
++                return err;
++            err = calc_coefs(ctx);
++            if (err < 0)
++                return err;
++            err = create_out_frames_ctx(ctx, in);
++            if (err < 0)
++                return err;
++            s->first_frame = 1;
++        }
++        s->sw_format = hwfc->sw_format;
++        s->width = in->width;
++        s->height = in->height;
++    }
++    return 0;
++}
++
++static int init_filter(AVFilterContext *ctx, AVFrame *in) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    HQDN3DVTContext *s = ctx->priv;
++    int err;
++
++    err = init_buffers(ctx, in->width, in->height);
++    if (err < 0)
++        return err;
++
++    err = calc_coefs(ctx);
++    if (err < 0) {
++        free_buffers(s);
++        return err;
++    }
++
++    s->first_frame = 1;
++    return 0;
++}
++
++static void release_all_textures(HQDN3DTextures *tex)
++{
++    if (tex->in_y) {
++        CFRelease(tex->in_y);
++        tex->in_y = NULL;
++    }
++    if (tex->out_y) {
++        CFRelease(tex->out_y);
++        tex->out_y = NULL;
++    }
++    if (tex->in_c1) {
++        CFRelease(tex->in_c1);
++        tex->in_c1 = NULL;
++    }
++    if (tex->out_c1) {
++        CFRelease(tex->out_c1);
++        tex->out_c1 = NULL;
++    }
++    if (tex->in_c2) {
++        CFRelease(tex->in_c2);
++        tex->in_c2 = NULL;
++    }
++    if (tex->out_c2) {
++        CFRelease(tex->out_c2);
++        tex->out_c2 = NULL;
++    }
++}
++
++static int acquire_textures(AVFilterContext *ctx, HQDN3DVTContext *s,
++                            AVFrame *in, AVFrame *out,
++                            HQDN3DTextures *tex) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    MTLPixelFormat fmt_y = (s->depth <= 8) ? MTLPixelFormatR8Unorm : MTLPixelFormatR16Unorm;
++    MTLPixelFormat fmt_c;
++    memset(tex, 0, sizeof(*tex));
++
++    tex->in_y = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)in->data[3], 0, fmt_y);
++    tex->out_y = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)out->data[3], 0, fmt_y);
++    if (!tex->in_y || !tex->out_y) {
++        release_all_textures(tex);
++        return AVERROR_EXTERNAL;
++    }
++
++    if (s->is_semiplanar) {
++        fmt_c = (s->depth <= 8) ? MTLPixelFormatRG8Unorm : MTLPixelFormatRG16Unorm;
++        tex->in_c1 = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)in->data[3], 1, fmt_c);
++        tex->out_c1 = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)out->data[3], 1, fmt_c);
++        if (!tex->in_c1 || !tex->out_c1) {
++            release_all_textures(tex);
++            return AVERROR_EXTERNAL;
++        }
++    } else {
++        fmt_c = fmt_y;
++        tex->in_c1 = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)in->data[3], 1, fmt_c);
++        tex->out_c1 = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)out->data[3], 1, fmt_c);
++        tex->in_c2 = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)in->data[3], 2, fmt_c);
++        tex->out_c2 = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)out->data[3], 2, fmt_c);
++        if (!tex->in_c1 || !tex->out_c1 || !tex->in_c2 || !tex->out_c2) {
++            release_all_textures(tex);
++            return AVERROR_EXTERNAL;
++        }
++    }
++
++    tex->mtl_in_y = CVMetalTextureGetTexture(tex->in_y);
++    tex->mtl_out_y = CVMetalTextureGetTexture(tex->out_y);
++    tex->mtl_in_c1 = CVMetalTextureGetTexture(tex->in_c1);
++    tex->mtl_out_c1 = CVMetalTextureGetTexture(tex->out_c1);
++    if (!s->is_semiplanar) {
++        tex->mtl_in_c2 = CVMetalTextureGetTexture(tex->in_c2);
++        tex->mtl_out_c2 = CVMetalTextureGetTexture(tex->out_c2);
++    }
++    return 0;
++}
++
++static void encode_horizontal_luma(HQDN3DVTContext *s,
++                                   id<MTLComputeCommandEncoder> encoder,
++                                   id<MTLTexture> in_tex,
++                                   int lut_bits) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)s->mtlParamsHorizLuma.contents;
++    *p = (struct mtlHqdn3dParams){
++        .h_offset = 0,
++        .spatial_offset = 0,
++        .width = s->width,
++        .height = s->height,
++        .depth = s->depth,
++        .lut_bits = lut_bits,
++        .is_msb = s->is_msb,
++    };
++    [encoder setTexture:in_tex atIndex:0];
++    [encoder setBuffer:s->mtlHBuffer offset:0 atIndex:0];
++    [encoder setBuffer:s->mtlTablesBuffer offset:0 atIndex:1];
++    [encoder setBuffer:s->mtlParamsHorizLuma offset:0 atIndex:2];
++    ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipelineHorizPlanar, encoder, s->height, 1);
++}
++
++static void encode_horizontal_chroma_semi(HQDN3DVTContext *s,
++                                          id<MTLComputeCommandEncoder> encoder,
++                                          id<MTLTexture> in_c1,
++                                          int cw, int ch, int off_u, int off_v,
++                                          int lut_bits, int spatial_offset) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)s->mtlParamsHorizChroma.contents;
++    *p = (struct mtlHqdn3dParams){
++        .h_offset = off_u,
++        .h_offset_v = off_v,
++        .spatial_offset = spatial_offset,
++        .width = cw,
++        .height = ch,
++        .depth = s->depth,
++        .lut_bits = lut_bits,
++        .is_msb = s->is_msb,
++    };
++    [encoder setTexture:in_c1 atIndex:0];
++    [encoder setBuffer:s->mtlHBuffer offset:0 atIndex:0];
++    [encoder setBuffer:s->mtlTablesBuffer offset:0 atIndex:1];
++    [encoder setBuffer:s->mtlParamsHorizChroma offset:0 atIndex:2];
++    ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipelineHorizSemiplanar, encoder, ch, 1);
++}
++
++static void encode_horizontal_chroma_planar(HQDN3DVTContext *s,
++                                            id<MTLComputeCommandEncoder> encoder,
++                                            const HQDN3DTextures *tex,
++                                            int cw, int ch, int off_u, int off_v,
++                                            int lut_bits, int spatial_offset) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    id<MTLTexture> in_planes[2] = { tex->mtl_in_c1, tex->mtl_in_c2 };
++    int offs[2] = { off_u, off_v };
++    for (int i = 0; i < 2; i++) {
++        struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)s->mtlParamsHorizChroma.contents;
++        *p = (struct mtlHqdn3dParams){
++            .h_offset = offs[i],
++            .spatial_offset = spatial_offset,
++            .width = cw,
++            .height = ch,
++            .depth = s->depth,
++            .lut_bits = lut_bits,
++            .is_msb = s->is_msb,
++        };
++        [encoder setTexture:in_planes[i] atIndex:0];
++        [encoder setBuffer:s->mtlHBuffer offset:0 atIndex:0];
++        [encoder setBuffer:s->mtlTablesBuffer offset:0 atIndex:1];
++        [encoder setBuffer:s->mtlParamsHorizChroma offset:0 atIndex:2];
++        ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipelineHorizPlanar, encoder, ch, 1);
++    }
++}
++
++static void encode_horizontal_chroma(HQDN3DVTContext *s,
++                                     id<MTLComputeCommandEncoder> encoder,
++                                     const HQDN3DTextures *tex,
++                                     int cw, int ch, int off_u, int off_v,
++                                     int lut_bits, int spatial_offset) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    if (s->is_semiplanar) {
++        encode_horizontal_chroma_semi(s, encoder, tex->mtl_in_c1, cw, ch,
++                                      off_u, off_v, lut_bits, spatial_offset);
++    } else {
++        encode_horizontal_chroma_planar(s, encoder, tex, cw, ch,
++                                        off_u, off_v, lut_bits, spatial_offset);
++    }
++}
++
++static void encode_vertical_luma(HQDN3DVTContext *s,
++                                 id<MTLComputeCommandEncoder> encoder,
++                                 id<MTLTexture> in_tex,
++                                 id<MTLTexture> out_tex,
++                                 int lut_bits, int table_entries) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)s->mtlParamsVertLuma.contents;
++    *p = (struct mtlHqdn3dParams){
++        .h_offset = 0,
++        .fa_offset = 0,
++        .spatial_offset = LUMA_SPATIAL * table_entries,
++        .temporal_offset = LUMA_TMP * table_entries,
++        .width = s->width,
++        .height = s->height,
++        .depth = s->depth,
++        .lut_bits = lut_bits,
++        .is_msb = s->is_msb,
++        .first_frame = s->first_frame,
++        .spatial_enabled = s->spatial_enabled[0],
++    };
++    [encoder setTexture:in_tex atIndex:0];
++    [encoder setTexture:out_tex atIndex:1];
++    [encoder setBuffer:s->mtlHBuffer offset:0 atIndex:0];
++    [encoder setBuffer:s->mtlFrameAntBuffer offset:0 atIndex:1];
++    [encoder setBuffer:s->mtlTablesBuffer offset:0 atIndex:2];
++    [encoder setBuffer:s->mtlParamsVertLuma offset:0 atIndex:3];
++    ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipelineVertPlanar, encoder, s->width, 1);
++}
++
++static void encode_vertical_chroma_semi(HQDN3DVTContext *s,
++                                        id<MTLComputeCommandEncoder> encoder,
++                                        const HQDN3DTextures *tex,
++                                        int cw, int ch, int off_u, int off_v,
++                                        int lut_bits, int spatial_offset,
++                                        int temporal_offset) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)s->mtlParamsVertChroma.contents;
++    *p = (struct mtlHqdn3dParams){
++        .h_offset = off_u,
++        .h_offset_v = off_v,
++        .fa_offset = off_u,
++        .fa_offset_v = off_v,
++        .spatial_offset = spatial_offset,
++        .temporal_offset = temporal_offset,
++        .width = cw,
++        .height = ch,
++        .depth = s->depth,
++        .lut_bits = lut_bits,
++        .is_msb = s->is_msb,
++        .first_frame = s->first_frame,
++        .spatial_enabled = s->spatial_enabled[1],
++    };
++    [encoder setTexture:tex->mtl_in_c1 atIndex:0];
++    [encoder setTexture:tex->mtl_out_c1 atIndex:1];
++    [encoder setBuffer:s->mtlHBuffer offset:0 atIndex:0];
++    [encoder setBuffer:s->mtlFrameAntBuffer offset:0 atIndex:1];
++    [encoder setBuffer:s->mtlTablesBuffer offset:0 atIndex:2];
++    [encoder setBuffer:s->mtlParamsVertChroma offset:0 atIndex:3];
++    ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipelineVertSemiplanar, encoder, cw, 1);
++}
++
++static void encode_vertical_chroma_planar(HQDN3DVTContext *s,
++                                          id<MTLComputeCommandEncoder> encoder,
++                                          const HQDN3DTextures *tex,
++                                          int cw, int ch, int off_u, int off_v,
++                                          int lut_bits, int spatial_offset,
++                                          int temporal_offset) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    id<MTLTexture> in_planes[2] = { tex->mtl_in_c1, tex->mtl_in_c2 };
++    id<MTLTexture> out_planes[2] = { tex->mtl_out_c1, tex->mtl_out_c2 };
++    int offs[2] = { off_u, off_v };
++    for (int i = 0; i < 2; i++) {
++        struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)s->mtlParamsVertChroma.contents;
++        *p = (struct mtlHqdn3dParams){
++            .h_offset = offs[i],
++            .fa_offset = offs[i],
++            .spatial_offset = spatial_offset,
++            .temporal_offset = temporal_offset,
++            .width = cw,
++            .height = ch,
++            .depth = s->depth,
++            .lut_bits = lut_bits,
++            .is_msb = s->is_msb,
++            .first_frame = s->first_frame,
++            .spatial_enabled = s->spatial_enabled[1],
++        };
++        [encoder setTexture:in_planes[i] atIndex:0];
++        [encoder setTexture:out_planes[i] atIndex:1];
++        [encoder setBuffer:s->mtlHBuffer offset:0 atIndex:0];
++        [encoder setBuffer:s->mtlFrameAntBuffer offset:0 atIndex:1];
++        [encoder setBuffer:s->mtlTablesBuffer offset:0 atIndex:2];
++        [encoder setBuffer:s->mtlParamsVertChroma offset:0 atIndex:3];
++        ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipelineVertPlanar, encoder, cw, 1);
++    }
++}
++
++static void encode_vertical_chroma(HQDN3DVTContext *s,
++                                   id<MTLComputeCommandEncoder> encoder,
++                                   const HQDN3DTextures *tex,
++                                   int cw, int ch, int off_u, int off_v,
++                                   int lut_bits, int spatial_offset,
++                                   int temporal_offset) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    if (s->is_semiplanar) {
++        encode_vertical_chroma_semi(s, encoder, tex, cw, ch, off_u, off_v,
++                                    lut_bits, spatial_offset, temporal_offset);
++    } else {
++        encode_vertical_chroma_planar(s, encoder, tex, cw, ch, off_u, off_v,
++                                      lut_bits, spatial_offset, temporal_offset);
++    }
++}
++
++static int dispatch_passes(HQDN3DVTContext *s, const HQDN3DTextures *tex) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    id<MTLCommandBuffer> buffer = s->mtlQueue.commandBuffer;
++    id<MTLComputeCommandEncoder> encoder;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    int table_entries = 512 << lut_bits;
++    int cw = AV_CEIL_RSHIFT(s->width, s->hsub);
++    int ch = AV_CEIL_RSHIFT(s->height, s->vsub);
++    int off_u = s->width * s->height;
++    int off_v = off_u + cw * ch;
++
++    if (!buffer)
++        return AVERROR_EXTERNAL;
++
++    if (s->spatial_enabled[0] || s->spatial_enabled[1]) {
++        encoder = buffer.computeCommandEncoder;
++        if (!encoder) {
++            ff_objc_release(&buffer);
++            return AVERROR_EXTERNAL;
++        }
++        if (s->spatial_enabled[0])
++            encode_horizontal_luma(s, encoder, tex->mtl_in_y, lut_bits);
++        if (s->spatial_enabled[1])
++            encode_horizontal_chroma(s, encoder, tex, cw, ch, off_u, off_v,
++                                     lut_bits, CHROMA_SPATIAL * table_entries);
++        [encoder endEncoding];
++        ff_objc_release(&encoder);
++    }
++
++    encoder = buffer.computeCommandEncoder;
++    if (!encoder) {
++        ff_objc_release(&buffer);
++        return AVERROR_EXTERNAL;
++    }
++    encode_vertical_luma(s, encoder, tex->mtl_in_y, tex->mtl_out_y, lut_bits, table_entries);
++    encode_vertical_chroma(s, encoder, tex, cw, ch, off_u, off_v,
++                           lut_bits, CHROMA_SPATIAL * table_entries,
++                           CHROMA_TMP * table_entries);
++    [encoder endEncoding];
++    ff_objc_release(&encoder);
++
++    [buffer commit];
++    [buffer waitUntilCompleted];
++    ff_objc_release(&buffer);
++
++    return 0;
++}
++
++static int do_filter_frame(AVFilterLink *inlink, AVFrame *in) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    AVFilterContext *ctx = inlink->dst;
++    HQDN3DVTContext *s = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++    HQDN3DTextures tex;
++    AVFrame *out = NULL;
++    int err;
++
++    err = check_format_and_size(ctx, in);
++    if (err < 0) {
++        av_frame_free(&in);
++        return err;
++    }
++
++    if (!s->mtlTablesBuffer) {
++        err = init_filter(ctx, in);
++        if (err < 0) {
++            av_frame_free(&in);
++            return err;
++        }
++    }
++
++    out = alloc_output_frame(s, outlink, in);
++    if (!out) {
++        av_frame_free(&in);
++        return AVERROR(ENOMEM);
++    }
++
++    err = acquire_textures(ctx, s, in, out, &tex);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return err;
++    }
++
++    err = dispatch_passes(s, &tex);
++    release_all_textures(&tex);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return err;
++    }
++
++    CVBufferPropagateAttachments((CVPixelBufferRef)in->data[3], (CVPixelBufferRef)out->data[3]);
++    s->first_frame = 0;
++    av_frame_free(&in);
++    return ff_filter_frame(outlink, out);
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *ctx = inlink->dst;
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        return do_filter_frame(inlink, in);
++    } else {
++        av_frame_free(&in);
++        av_log(ctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
++                           char *res, int res_len, int flags)
++{
++    HQDN3DVTContext *s = ctx->priv;
++    int ret;
++
++    ret = ff_filter_process_command(ctx, cmd, args, res, res_len, flags);
++    if (ret < 0)
++        return ret;
++
++    if (s->mtlTablesBuffer) {
++        if (@available(macOS 10.11, iOS 8.0, *))
++            return calc_coefs(ctx);
++    }
++
++    return 0;
++}
++
++#define OFFSET(x) offsetof(HQDN3DVTContext, x)
++#define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_RUNTIME_PARAM
++
++static const AVOption hqdn3d_videotoolbox_options[] = {
++    { "luma_spatial",   "spatial luma strength",    OFFSET(strength[LUMA_SPATIAL]),   AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { "chroma_spatial", "spatial chroma strength",  OFFSET(strength[CHROMA_SPATIAL]), AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { "luma_tmp",       "temporal luma strength",   OFFSET(strength[LUMA_TMP]),       AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { "chroma_tmp",     "temporal chroma strength", OFFSET(strength[CHROMA_TMP]),     AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(hqdn3d_videotoolbox);
++
++static const AVFilterPad hqdn3d_videotoolbox_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = filter_frame,
++        .config_props = config_input,
++    },
++};
++
++static const AVFilterPad hqdn3d_videotoolbox_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = config_output,
++    },
++};
++
++const FFFilter ff_vf_hqdn3d_videotoolbox = {
++    .p.name          = "hqdn3d_videotoolbox",
++    .p.description   = NULL_IF_CONFIG_SMALL("Apply high quality 3d denoise filter using Metal compute"),
++    .p.priv_class    = &hqdn3d_videotoolbox_class,
++    .p.flags         = AVFILTER_FLAG_HWDEVICE,
++    .priv_size       = HQDN3D_VT_CTX_SIZE,
++    .init            = hqdn3d_videotoolbox_init,
++    .uninit          = hqdn3d_videotoolbox_uninit,
++    FILTER_INPUTS(hqdn3d_videotoolbox_inputs),
++    FILTER_OUTPUTS(hqdn3d_videotoolbox_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VIDEOTOOLBOX),
++    .flags_internal  = FF_FILTER_FLAG_HWFRAME_AWARE,
++    .process_command = process_command,
++};
+diff --git a/tools/Makefile b/tools/Makefile
+index 046fde055f1b2392e5be5de95cb8b37f34e75f69..7be9f19913f796faf5e96c56643b6d9b192e7029 100644
+--- a/tools/Makefile
++++ b/tools/Makefile
+@@ -4,6 +4,7 @@ TOOLS-$(CONFIG_ZLIB) += cws2fws
+ TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
+ TOOLS-$(CONFIG_HQDN3D_CUDA_FILTER)   += hqdn3d_reset_test
+ TOOLS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_reset_test
++TOOLS-$(CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER) += hqdn3d_reset_test
+ TOOLS-yes := $(sort $(TOOLS-yes))
+ 
+ tools/target_dec_%_fuzzer.o: tools/target_dec_fuzzer.c
+diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
+index 413fd848807edf68c4ff17d40a8804659b98babb..88cfbd76fca2e093b14bb543a3728c41b5ef868e 100644
+--- a/tools/hqdn3d_reset_test.c
++++ b/tools/hqdn3d_reset_test.c
+@@ -118,6 +118,10 @@ static int create_gpu_frames_ctx(AVBufferRef *device_ref, int w, int h,
+ #if CONFIG_HQDN3D_OPENCL_FILTER
+     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
+         hwfc->format = AV_PIX_FMT_OPENCL;
++#endif
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
++        hwfc->format = AV_PIX_FMT_VIDEOTOOLBOX;
+ #endif
+     hwfc->sw_format = sw_format;
+     hwfc->width     = w;
+@@ -303,6 +307,10 @@ static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
+ #if CONFIG_HQDN3D_OPENCL_FILTER
+     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
+         par->format = AV_PIX_FMT_OPENCL;
++#endif
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
++        par->format = AV_PIX_FMT_VIDEOTOOLBOX;
+ #endif
+     par->width         = 128;
+     par->height        = 72;
+@@ -336,6 +344,10 @@ static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
+ #if CONFIG_HQDN3D_OPENCL_FILTER
+     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
+         return "hqdn3d_opencl";
++#endif
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
++        return "hqdn3d_videotoolbox";
+ #endif
+     return NULL;
+ }
+@@ -552,6 +564,30 @@ static int setup_all(const char *dev_idx,
+     return 0;
+ }
+ 
++static int parse_default_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const char **dev_idx)
++{
++#if CONFIG_HQDN3D_VULKAN_FILTER
++    *hw_type = AV_HWDEVICE_TYPE_VULKAN;
++    *dev_idx = arg;
++    return 0;
++#elif CONFIG_HQDN3D_CUDA_FILTER
++    *hw_type = AV_HWDEVICE_TYPE_CUDA;
++    *dev_idx = arg;
++    return 0;
++#elif CONFIG_HQDN3D_OPENCL_FILTER
++    *hw_type = AV_HWDEVICE_TYPE_OPENCL;
++    *dev_idx = arg;
++    return 0;
++#elif CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    *hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
++    *dev_idx = arg;
++    return 0;
++#else
++    av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
++    return AVERROR(ENOSYS);
++#endif
++}
++
+ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const char **dev_idx)
+ {
+     if (strncmp(arg, "cuda:", 5) == 0) {
+@@ -584,23 +620,18 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+         return AVERROR(ENOSYS);
+ #endif
+     }
+-
+-#if CONFIG_HQDN3D_VULKAN_FILTER
+-    *hw_type = AV_HWDEVICE_TYPE_VULKAN;
+-    *dev_idx = arg;
+-    return 0;
+-#elif CONFIG_HQDN3D_CUDA_FILTER
+-    *hw_type = AV_HWDEVICE_TYPE_CUDA;
+-    *dev_idx = arg;
+-    return 0;
+-#elif CONFIG_HQDN3D_OPENCL_FILTER
+-    *hw_type = AV_HWDEVICE_TYPE_OPENCL;
+-    *dev_idx = arg;
+-    return 0;
++    if (strcmp(arg, "vt") == 0 || strncmp(arg, "vt:", 3) == 0) {
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++        *hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
++        *dev_idx = (arg[2] == ':') ? arg + 3 : NULL;
++        return 0;
+ #else
+-    av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
+-    return AVERROR(ENOSYS);
++        av_log(NULL, AV_LOG_ERROR, "VideoToolbox backend not built\n");
++        return AVERROR(ENOSYS);
+ #endif
++    }
++
++    return parse_default_device_arg(arg, hw_type, dev_idx);
+ }
+ 
+ int main(int argc, char **argv)
+@@ -616,7 +647,7 @@ int main(int argc, char **argv)
+     int err, any_diff = 0, frames_ok = 0;
+ 
+     if (argc < 2) {
+-        fprintf(stderr, "Usage: %s <[cuda:|vk:|ocl:]device index>\n", argv[0]);
++        fprintf(stderr, "Usage: %s <[cuda:|vk:|ocl:|vt]device index>\n", argv[0]);
+         return 1;
+     }
+ 

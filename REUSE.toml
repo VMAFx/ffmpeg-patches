@@ -35,10 +35,10 @@ SPDX-License-Identifier = "LGPL-2.1-or-later AND MIT"
 
 # 0023 moves code of the GPL-2.0-or-later vf_hqdn3d.c into hqdn3d_coefs.c and
 # ports its algorithm to new GPL-2.0-or-later files; the build glue it touches
-# stays LGPL-2.1-or-later. 0024 and 0025 port the same algorithm to CUDA and
-# OpenCL the same way.
+# stays LGPL-2.1-or-later. 0024, 0025 and 0026 port the same algorithm to
+# CUDA, OpenCL and Metal the same way.
 [[annotations]]
-path = ["patches/0023-avfilter-vf_hqdn3d_vulkan-add-a-Vulkan-hqdn3d-filter.patch", "patches/0024-avfilter-vf_hqdn3d_cuda-add-a-CUDA-hqdn3d-filter.patch", "patches/0025-avfilter-vf_hqdn3d_opencl-add-an-OpenCL-hqdn3d-filte.patch"]
+path = ["patches/0023-avfilter-vf_hqdn3d_vulkan-add-a-Vulkan-hqdn3d-filter.patch", "patches/0024-avfilter-vf_hqdn3d_cuda-add-a-CUDA-hqdn3d-filter.patch", "patches/0025-avfilter-vf_hqdn3d_opencl-add-an-OpenCL-hqdn3d-filte.patch", "patches/0026-avfilter-vf_hqdn3d_videotoolbox-add-a-Metal-hqdn3d-f.patch"]
 precedence = "override"
 SPDX-FileCopyrightText = ["2000-2026 the FFmpeg developers", "2003 Daniel Moreno", "2010 Baptiste Coudurier", "2012 Loren Merritt", "2026 Lusoris"]
 SPDX-License-Identifier = "LGPL-2.1-or-later AND GPL-2.0-or-later"
