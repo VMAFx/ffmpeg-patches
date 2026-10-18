@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-16",
+  "checked": "2026-10-18",
   "contributions": [
     {
       "number": 24970,
@@ -182,6 +182,19 @@
       "patch": "",
       "project": "vmafx",
       "note": "Found while building the split of 0002: make build and make check name a devprogs target that no rule defines."
+    },
+    {
+      "number": 25189,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25189",
+      "title": "avfilter/Makefile: link cuda/load_helper.o into three CUDA filters",
+      "base": "master",
+      "state": "merged",
+      "merged_at": "2026-10-18T14:56:12Z",
+      "merged_commit": "ffb15c94c286c9d1af911991b3ad08724427372a",
+      "in_release": "",
+      "patch": "",
+      "project": "vmafx",
+      "note": "Found while building hqdn3d_cuda: bilateral_cuda, bwdif_cuda and chromakey_cuda fail to link when one of them is the only CUDA filter. The series carries no form of it."
     }
   ]
 }
