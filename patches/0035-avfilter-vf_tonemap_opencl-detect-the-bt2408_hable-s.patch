@@ -17,8 +17,9 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/Makefile               |   3 +-
  libavfilter/opencl/tonemap_peak.cl | 124 ++++++++++++++++
  libavfilter/opencl_source.h        |   1 +
- libavfilter/vf_tonemap_opencl.c    | 218 +++++++++++++++++++++++++----
- 5 files changed, 330 insertions(+), 36 deletions(-)
+ libavfilter/vf_tonemap_opencl.c    | 220 ++++++++++++++++++++++++-----
+ libavfilter/vf_tonemap_vulkan.c    |   2 +-
+ 6 files changed, 332 insertions(+), 38 deletions(-)
  create mode 100644 libavfilter/opencl/tonemap_peak.cl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
@@ -220,7 +221,7 @@ index 186303eeed8bec14485e2698fe7837d8a4e26e3f..7d860c9c0a0368bf63645de6daf7a95e
  extern const char *ff_source_unsharp_cl;
  extern const char *ff_source_xfade_cl;
 diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
-index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696ce3cdaa3a 100644
+index f917af6a90104a32c5d6e3e8a329101975c03f87..0d52599ca1c66025ab112d223036838dac23c2fe 100644
 --- a/libavfilter/vf_tonemap_opencl.c
 +++ b/libavfilter/vf_tonemap_opencl.c
 @@ -82,6 +82,10 @@ typedef struct TonemapOpenCLContext {
@@ -348,6 +349,15 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
      if (err < 0)
          return err;
  
+@@ -392,7 +434,7 @@ static int setup_bt2408(AVFilterContext *avctx, const AVFrame *input, double pea
+ 
+     if (peak == ctx->bt2408_peak && input->color_primaries == ctx->bt2408_prim)
+         return 0;
+-    err = ff_bt2408_hable_init(&ctx->bt2408, input->color_primaries, peak * REFERENCE_WHITE);
++    err = ff_bt2408_hable_init(&ctx->bt2408, input->color_primaries, peak * REFERENCE_WHITE * 4);
+     if (err < 0) {
+         av_log(avctx, AV_LOG_ERROR, "Unsupported primaries '%s' or peak %f\n",
+                av_color_primaries_name(input->color_primaries), peak);
 @@ -616,21 +658,131 @@ static int check_init(AVFilterContext *avctx, const AVFrame *input,
      return tonemap_opencl_init(avctx);
  }
@@ -523,3 +533,16 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
      { "param",     "tonemap parameter",   OFFSET(param), AV_OPT_TYPE_DOUBLE, {.dbl = NAN}, DBL_MIN, DBL_MAX, FLAGS },
      { "desat",     "desaturation parameter",   OFFSET(desat_param), AV_OPT_TYPE_DOUBLE, {.dbl = 0.5}, 0, DBL_MAX, FLAGS },
      { "threshold", "scene detection threshold",   OFFSET(scene_threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 0.2}, 0, DBL_MAX, FLAGS },
+diff --git a/libavfilter/vf_tonemap_vulkan.c b/libavfilter/vf_tonemap_vulkan.c
+index 6825285a239d334fbbb8e3542c8ab6c9d03d3068..d369d6c3d9cc42aed4b1617483c66ef93dab81fe 100644
+--- a/libavfilter/vf_tonemap_vulkan.c
++++ b/libavfilter/vf_tonemap_vulkan.c
+@@ -120,7 +120,7 @@ static int setup_bt2408(AVFilterContext *avctx, const AVFrame *input, double pea
+     if (peak == s->bt2408_peak && input->color_primaries == s->bt2408_prim)
+         return 0;
+ 
+-    err = ff_bt2408_hable_init(&s->bt2408, input->color_primaries, peak * REFERENCE_WHITE);
++    err = ff_bt2408_hable_init(&s->bt2408, input->color_primaries, peak * REFERENCE_WHITE * 4);
+     if (err < 0) {
+         av_log(avctx, AV_LOG_ERROR, "Unsupported primaries '%s' or peak %f\n",
+                av_color_primaries_name(input->color_primaries), peak);
