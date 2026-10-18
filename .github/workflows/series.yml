@@ -185,6 +185,46 @@ jobs:
           fi
           echo "FATE targets: ${#targets[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           make -j"$(nproc)" -k "${targets[@]}" 2>&1 | tee -a build.log
+      - name: Compare hqdn3d_vulkan and hqdn3d_opencl with the CPU filter on software devices
+        # ADR-0004: the GPU filters must give the CPU filter's samples. The
+        # hosted runner has no GPU, so Mesa lavapipe (Vulkan) and PoCL
+        # (OpenCL) run the same shaders and kernels on the CPU. The loaders
+        # see only those drivers; the step fails when FFmpeg opens another
+        # device or when a device case is skipped instead of run.
+        if: github.event.pull_request.draft != true
+        run: |
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers pocl-opencl-icd
+          lvp=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' | head -1)
+          if [ -z "$lvp" ] || [ ! -f /etc/OpenCL/vendors/pocl.icd ]; then
+            echo "::error::lavapipe or PoCL is not installed"
+            exit 1
+          fi
+          export VK_DRIVER_FILES="$lvp" OCL_ICD_VENDORS=/etc/OpenCL/vendors/pocl.icd
+          export VK_FFMPEG="$PWD/build/ffmpeg" VK_DEVICE=0
+          export OCL_FFMPEG="$PWD/build/ffmpeg" OCL_DEVICE=0.0
+          probe() {
+            if ! build/ffmpeg -hide_banner -nostdin -v verbose -init_hw_device "$1" \
+              -f lavfi -i nullsrc=d=0.04 -f null - > probe.log 2>&1; then
+              cat probe.log
+              echo "::error::$1 could not be opened"
+              exit 1
+            fi
+            if ! grep -qi "$2" probe.log; then
+              cat probe.log
+              echo "::error::$1 did not open $2"
+              exit 1
+            fi
+            grep -i "$2" probe.log | head -2
+          }
+          probe vulkan=vk:0 llvmpipe
+          probe opencl=ocl:0.0 'portable computing language'
+          python3 -m unittest -v tests.test_hqdn3d_vulkan tests.test_hqdn3d_opencl 2>&1 | tee parity.log
+          status=${PIPESTATUS[0]}
+          if grep -E "skipped 'set (VK|OCL)_" parity.log; then
+            echo "::error::a device case was skipped instead of run"
+            exit 1
+          fi
+          exit "$status"
       - name: Refuse a build that skipped a C file the series changes
         # A file in a component this configuration leaves out would pass the
         # warning gate unseen, so every changed C file needs a CC line.
