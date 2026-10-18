@@ -5,8 +5,11 @@
 0026: the new hqdn3d_videotoolbox filter runs the integer hqdn3d filter in
 two Metal kernels and must give the same output samples as the CPU hqdn3d
 filter (ADR-0004), by the comparison rule of tests/test_hqdn3d_vulkan.py.
-The filter takes yuv420p, nv12 and p010; a format the filter does not take
-(rgba) must be refused. No Apple host has run these cases yet.
+The filter takes yuv420p and the two-plane nv12, nv16, nv24, p010, p210,
+p410, p216 and p416; a format the filter does not take (rgba) must be
+refused. No Apple host has run these cases yet. The format list in the
+patch (validate_format and doc/filters.texi) must equal FORMATS; that case
+runs on every host, and a patch text with one format dropped must fail it.
 
 Temporal state must reset where the CPU filter resets it: on a graph rebuild
 and on an in-graph frame size change, which tools/hqdn3d_reset_test checks
@@ -26,6 +29,7 @@ Without the variables the cases are skipped.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,8 +45,30 @@ RESET_TOOL = os.environ.get("HQDN3D_RESET_TOOL", "")
 FORMATS = {
     "yuv420p": ("yuv420p", 8, False),
     "nv12": ("yuv420p", 8, False),
+    "nv16": ("yuv422p", 8, False),
+    "nv24": ("yuv444p", 8, False),
     "p010le": ("yuv420p10le", 10, True),
+    "p210le": ("yuv422p10le", 10, True),
+    "p410le": ("yuv444p10le", 10, True),
+    "p216le": ("yuv422p16le", 16, False),
+    "p416le": ("yuv444p16le", 16, False),
 }
+PATCH = next((Path(__file__).resolve().parent.parent / "patches").glob("0026-*.patch"))
+
+
+def patch_formats(text: str) -> tuple[set[str], set[str]]:
+    """Return the formats validate_format and the filter doc accept in a patch."""
+    code = text.split("+static int validate_format(", 1)[1].split("\n+}\n", 1)[0]
+    doc = text.split("+Supported input hardware frame software formats:", 1)[1]
+    doc = doc.split("+@end itemize", 1)[0]
+    return (
+        {name.lower() for name in re.findall(r"case AV_PIX_FMT_(\w+):", code)},
+        set(re.findall(r"@item @samp\{(\w+)\}", doc)),
+    )
+
+
+def expected_formats() -> set[str]:
+    return {fmt.removesuffix("le") for fmt in FORMATS}
 
 
 def ffmpeg(source: list[str], chain: str) -> subprocess.CompletedProcess[bytes]:
@@ -76,6 +102,20 @@ def chains(fmt: str, options: str, prefix: str = "") -> tuple[str, str]:
 
 def lavfi() -> list[str]:
     return ["-f", "lavfi", "-i", SOURCE]
+
+
+class FormatListTest(unittest.TestCase):
+    """0026: the patch accepts and documents exactly the formats under test."""
+
+    def test_patch_formats_match(self) -> None:
+        code, doc = patch_formats(PATCH.read_text(encoding="utf-8"))
+        self.assertEqual(code, expected_formats())
+        self.assertEqual(doc, expected_formats())
+
+    def test_planted_dropped_format_is_refused(self) -> None:
+        text = PATCH.read_text(encoding="utf-8").replace("+    case AV_PIX_FMT_P416:\n", "", 1)
+        code, _ = patch_formats(text)
+        self.assertNotEqual(code, expected_formats())
 
 
 @unittest.skipUnless(FFMPEG, "set VT_FFMPEG")

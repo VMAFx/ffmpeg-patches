@@ -14,9 +14,9 @@ against the previous output. The temporal state is dropped where
 hqdn3d drops it, and after a frame size change inside a running graph
 the output frames come from a frames context of the new size.
 
-The accepted formats are those of the VideoToolbox frames context
-that the planar and two-plane 4:2:0 layouts cover: yuv420p, nv12 and
-p010.
+The accepted formats are the planar 4:2:0 yuv420p and the two-plane
+formats of the VideoToolbox frames context: nv12, nv16 and nv24 at 8
+bits, p010, p210 and p410 at 10 bits, p216 and p416 at 16 bits.
 
 tools/hqdn3d_reset_test now also runs the Metal filter with a vt
 argument.
@@ -24,14 +24,14 @@ argument.
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
  configure                                     |    1 +
- doc/filters.texi                              |   27 +
+ doc/filters.texi                              |   33 +
  libavfilter/Makefile                          |    4 +
  libavfilter/allfilters.c                      |    1 +
  .../metal/vf_hqdn3d_videotoolbox.metal        |  325 +++++
- libavfilter/vf_hqdn3d_videotoolbox.m          | 1065 +++++++++++++++++
+ libavfilter/vf_hqdn3d_videotoolbox.m          | 1075 +++++++++++++++++
  tools/Makefile                                |    1 +
  tools/hqdn3d_reset_test.c                     |   63 +-
- 8 files changed, 1471 insertions(+), 16 deletions(-)
+ 8 files changed, 1487 insertions(+), 16 deletions(-)
  create mode 100644 libavfilter/metal/vf_hqdn3d_videotoolbox.metal
  create mode 100644 libavfilter/vf_hqdn3d_videotoolbox.m
 
@@ -48,10 +48,10 @@ index d386cc831d5e7265f8f73f42692a91ea57bdf4cb..0ebe83a5ae70d894b284b8715cc98628
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 34c895248d82780750b13bfa66bb072699208ec9..88acc06e58fbdc382e2126e07c49a225a94cd0f5 100644
+index 34c895248d82780750b13bfa66bb072699208ec9..09d5110b54c0f14a18ee73b8bef68fa2c9550973 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -15857,6 +15857,33 @@ The filter accepts the same options as @ref{hqdn3d}:
+@@ -15857,6 +15857,39 @@ The filter accepts the same options as @ref{hqdn3d}:
  @subsection Commands
  This filter supports the same @ref{commands} as options.
  
@@ -59,16 +59,22 @@ index 34c895248d82780750b13bfa66bb072699208ec9..88acc06e58fbdc382e2126e07c49a225
 +@section hqdn3d_videotoolbox
 +
 +Apply a High Quality 3D Denoiser to VideoToolbox frames using Metal compute.
-+The output is bit-exact by construction to the CPU @ref{hqdn3d} filter (GPU parity not yet measured on Apple hardware). The one exception is
-+@samp{p010}: where the CPU filter writes a value above the
-+format maximum, which this format cannot store, this filter writes the
-+format maximum.
++The output is bit-exact by construction to the CPU @ref{hqdn3d} filter (GPU parity not yet measured on Apple hardware). The exception is
++the 10-bit formats @samp{p010}, @samp{p210} and @samp{p410}: where the CPU
++filter writes a value above the format maximum, which these formats cannot
++store, this filter writes the format maximum.
 +
 +Supported input hardware frame software formats:
 +@itemize
 +@item @samp{yuv420p}
 +@item @samp{nv12}
++@item @samp{nv16}
++@item @samp{nv24}
 +@item @samp{p010}
++@item @samp{p210}
++@item @samp{p410}
++@item @samp{p216}
++@item @samp{p416}
 +@end itemize
 +
 +The filter accepts the same options as @ref{hqdn3d}:
@@ -445,10 +451,10 @@ index 0000000000000000000000000000000000000000..30f3e40acfd806be2a861a553a721ebd
 +}
 diff --git a/libavfilter/vf_hqdn3d_videotoolbox.m b/libavfilter/vf_hqdn3d_videotoolbox.m
 new file mode 100644
-index 0000000000000000000000000000000000000000..038da14c8b81ca68077328d07df317aa65f6ed21
+index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e7679273cc0ff1
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_videotoolbox.m
-@@ -0,0 +1,1065 @@
+@@ -0,0 +1,1075 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -779,13 +785,23 @@ index 0000000000000000000000000000000000000000..038da14c8b81ca68077328d07df317aa
 +        *is_semiplanar = 0;
 +        return 0;
 +    case AV_PIX_FMT_NV12:
++    case AV_PIX_FMT_NV16:
++    case AV_PIX_FMT_NV24:
 +        *depth = 8;
 +        *is_msb = 0;
 +        *is_semiplanar = 1;
 +        return 0;
 +    case AV_PIX_FMT_P010:
++    case AV_PIX_FMT_P210:
++    case AV_PIX_FMT_P410:
 +        *depth = 10;
 +        *is_msb = 1;
++        *is_semiplanar = 1;
++        return 0;
++    case AV_PIX_FMT_P216:
++    case AV_PIX_FMT_P416:
++        *depth = 16;
++        *is_msb = 0;
 +        *is_semiplanar = 1;
 +        return 0;
 +    default:
