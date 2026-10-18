@@ -1,0 +1,525 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 12:23:54 +0200
+Subject: [PATCH] avfilter/vf_tonemap_opencl: detect the bt2408_hable signal
+ peak on the GPU
+
+Static mastering metadata often overstates the real peak (MaxCLL 4000
+or 10000 on content that peaks far lower), which leaves bt2408_hable
+output too dark. Add peak_detect, as in tonemap and tonemap_vulkan:
+a 16x16 tile kernel measures each frame in PQ, and the shared
+tonemap_peak code smooths the result with the threshold option as
+the scene-change threshold. Off by default; output is unchanged.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi                   |  20 ++-
+ libavfilter/Makefile               |   3 +-
+ libavfilter/opencl/tonemap_peak.cl | 124 ++++++++++++++++
+ libavfilter/opencl_source.h        |   1 +
+ libavfilter/vf_tonemap_opencl.c    | 218 +++++++++++++++++++++++++----
+ 5 files changed, 330 insertions(+), 36 deletions(-)
+ create mode 100644 libavfilter/opencl/tonemap_peak.cl
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index fcb7ff78377ce4ac8532e2b524e68aa8fb0f916e..597cf655917c4bee21e8fe30ad257f9acdac8904 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -28657,14 +28657,22 @@ It accepts the following parameters:
+ @item tonemap
+ Specify the tone-mapping operator to be used. Same as tonemap option in @ref{tonemap}.
+ With @code{bt2408_hable}, the output is in BT.709 primaries whatever
+-@option{primaries} says, the options @option{param}, @option{desat} and
+-@option{threshold} are ignored, and the peak comes from @option{peak},
++@option{primaries} says, the options @option{param} and @option{desat}
++are ignored, and the peak comes from @option{peak},
+ Dolby Vision level 1 max_pq (frame metadata @code{lavfi.dovi.l1_max_pq} or
+-DOVI side data) when present, else static side data; no dynamic peak
+-detection.
++DOVI side data) when present, dynamic peak detection when @option{peak_detect}
++is enabled, else static side data.
+ It also accepts a Dolby Vision profile 5 base layer (full range P010,
+ colorspace @code{ipt-c2}) directly and applies the RPU reshape in the kernel.
+ 
++@item peak_detect
++Measure the signal peak dynamically from each frame on the GPU. Supported only
++with @code{tonemap=bt2408_hable}; other curves use their own average peak
++detection logic and ignore this option. For @code{bt2408_hable}, the peak order
++of precedence per frame is: @option{peak} option if non-zero, Dolby Vision level 1
++metadata if present, dynamic peak detection, and finally static side data.
++Default is 0 (disabled).
++
+ @item param
+ Tune the tone mapping algorithm. same as param option in @ref{tonemap}.
+ 
+@@ -28683,6 +28691,10 @@ The tonemapping algorithm parameters is fine-tuned per each scene. And a thresho
+ is used to detect whether the scene has changed or not. If the distance between
+ the current frame average brightness and the current running average exceeds
+ a threshold value, we would re-calculate scene average and peak brightness.
++For @code{bt2408_hable} with @option{peak_detect}, it sets the scene change
++window: changes below @code{5 * threshold} percent are smoothed, changes above
++@code{15 * threshold} percent reset smoothing to the new frame, and changes in
++between blend the two. 0 disables scene change detection.
+ The default value is 0.2.
+ 
+ @item format
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 30dceefb667cabc558c39dba6869862b3ca37230..1903562118e9dbd966aa03e81c0e11609ec89aa0 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -550,7 +550,8 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2
+                                                 dovi_reshape.o tonemap_peak.o \
+                                                 opencl/tonemap.o opencl/bt2408_hable.o \
+                                                 opencl/colorspace_common.o \
+-                                                opencl/dovi_reshape.o
++                                                opencl/dovi_reshape.o \
++                                                opencl/tonemap_peak.o
+ OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER)         += vf_tonemap_vulkan.o vulkan.o vulkan_filter.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
+diff --git a/libavfilter/opencl/tonemap_peak.cl b/libavfilter/opencl/tonemap_peak.cl
+new file mode 100644
+index 0000000000000000000000000000000000000000..7312ac6e27aa765447fbc961447ce09f10907fd4
+--- /dev/null
++++ b/libavfilter/opencl/tonemap_peak.cl
+@@ -0,0 +1,124 @@
++/*
++ * Peak detection compute kernel for tonemap_opencl
++ *
++ * The dynamic peak detection follows libplacebo v7.360.1
++ * (src/shaders/colorspace.c: pl_shader_detect_peak, measure_peak,
++ * update_peak_buf), Copyright (C) Niklas Haas and the libplacebo
++ * contributors, licensed under the GNU Lesser General Public License
++ * version 2.1 or later.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef REFERENCE_WHITE
++#define REFERENCE_WHITE 100.0f
++#endif
++#ifndef ST2084_MAX_LUMINANCE
++#define ST2084_MAX_LUMINANCE 10000.0f
++#endif
++
++#define PQ_MAX 16383.0f
++
++#define STATS_SUM_LO    0
++#define STATS_SUM_HI    1
++#define STATS_WG_COUNT  2
++#define STATS_WG_ACTIVE 3
++#define STATS_MAX_PQ    4
++#define STATS_HIST      5
++
++extern float3 bt2408_yuv2lrgb(float3 yuv);
++
++__kernel void tonemap_peak(__read_only image2d_t src1,
++                           __read_only image2d_t src2,
++                           __global    uint        *stats)
++{
++    const sampler_t sampler = (CLK_NORMALIZED_COORDS_FALSE |
++                               CLK_ADDRESS_CLAMP_TO_EDGE   |
++                               CLK_FILTER_NEAREST);
++    __local uint tile_sum;
++    __local uint tile_max;
++    __local uint tile_black;
++    __local uint tile_valid;
++    __local uint tile_hist[64];
++
++    size_t lx = get_local_id(0);
++    size_t ly = get_local_id(1);
++    size_t lid = ly * 16 + lx;
++
++    int x = get_global_id(0);
++    int y = get_global_id(1);
++    int width = get_image_width(src1);
++    int height = get_image_height(src1);
++
++    if (lid == 0) {
++        tile_sum = 0;
++        tile_max = 0;
++        tile_black = 0;
++        tile_valid = 0;
++    }
++    if (lid < 64)
++        tile_hist[lid] = 0;
++
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++    if (x < width && y < height) {
++        atomic_inc(&tile_valid);
++
++        float y_in = read_imagef(src1, sampler, (int2)(x, y)).x;
++        float2 uv_in = read_imagef(src2, sampler, (int2)(x / 2, y / 2)).xy;
++        float3 lrgb = bt2408_yuv2lrgb((float3)(y_in, uv_in.x, uv_in.y));
++
++        float luma = 0.2627f * lrgb.x + 0.6780f * lrgb.y + 0.0593f * lrgb.z;
++        float nits = luma * REFERENCE_WHITE;
++        float nx = clamp(nits / ST2084_MAX_LUMINANCE, 0.0f, 1.0f);
++        float xm = powr(max(nx, 0.0f), ST2084_M1);
++        float y_pq_f = powr((ST2084_C1 + ST2084_C2 * xm) / (1.0f + ST2084_C3 * xm), ST2084_M2);
++        float t = clamp(y_pq_f / 0.01f, 0.0f, 1.0f);
++        y_pq_f *= t * t * (3.0f - 2.0f * t);
++        y_pq_f = clamp(y_pq_f, 0.0f, 1.0f);
++        uint y_pq = (uint)(PQ_MAX * y_pq_f);
++
++        atomic_add(&tile_sum, y_pq);
++        atomic_max(&tile_max, y_pq);
++        if (y_pq == 0)
++            atomic_inc(&tile_black);
++        int bin = clamp(((int)y_pq >> 7) - 64, 0, 63);
++        atomic_inc(&tile_hist[bin]);
++    }
++
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++    if (lid == 0) {
++        if (tile_valid > 0) {
++            tile_hist[0] -= tile_black;
++            uint num = tile_valid - tile_black;
++            atomic_add(&stats[STATS_WG_COUNT], 1);
++            if (num > 0) {
++                atomic_add(&stats[STATS_WG_ACTIVE], 1);
++                uint tile_sum_avg = tile_sum / num;
++                uint prev = atomic_add(&stats[STATS_SUM_LO], tile_sum_avg);
++                if (prev + tile_sum_avg < prev)
++                    atomic_add(&stats[STATS_SUM_HI], 1);
++                atomic_max(&stats[STATS_MAX_PQ], tile_max);
++            }
++            for (int i = 0; i < 64; i++) {
++                if (tile_hist[i] > 0)
++                    atomic_add(&stats[STATS_HIST + i], tile_hist[i]);
++            }
++        }
++    }
++}
+diff --git a/libavfilter/opencl_source.h b/libavfilter/opencl_source.h
+index 186303eeed8bec14485e2698fe7837d8a4e26e3f..7d860c9c0a0368bf63645de6daf7a95ee774c70a 100644
+--- a/libavfilter/opencl_source.h
++++ b/libavfilter/opencl_source.h
+@@ -33,6 +33,7 @@ extern const char *ff_source_overlay_cl;
+ extern const char *ff_source_pad_cl;
+ extern const char *ff_source_remap_cl;
+ extern const char *ff_source_tonemap_cl;
++extern const char *ff_source_tonemap_peak_cl;
+ extern const char *ff_source_transpose_cl;
+ extern const char *ff_source_unsharp_cl;
+ extern const char *ff_source_xfade_cl;
+diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
+index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696ce3cdaa3a 100644
+--- a/libavfilter/vf_tonemap_opencl.c
++++ b/libavfilter/vf_tonemap_opencl.c
+@@ -82,6 +82,10 @@ typedef struct TonemapOpenCLContext {
+     FFDoviReshape         dovi_reshape;
+     int                   dovi_uploaded;
+     cl_mem                dovi_mem;
++    int                   peak_detect;
++    cl_kernel             peak_kernel;
++    cl_mem                peak_stats_mem;
++    FFTonemapPeak         peak_state;
+ } TonemapOpenCLContext;
+ 
+ static const char *const linearize_funcs[] = {
+@@ -124,7 +128,7 @@ static int get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries ou
+     return 0;
+ }
+ 
+-#define OPENCL_SOURCE_NB 5
++#define OPENCL_SOURCE_NB 6
+ // Average light level for SDR signals. This is equal to a signal level of 0.5
+ // under a typical presentation gamma of about 2.0.
+ static const float sdr_avg = 0.25f;
+@@ -210,10 +214,35 @@ static int build_opencl_header(AVFilterContext *avctx, AVBPrint *header)
+     return print_transfer_and_luma(avctx, header);
+ }
+ 
++static int create_peak_objects(AVFilterContext *avctx)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    cl_int cle;
++
++    if (!ctx->peak_detect || ctx->tonemap != TONEMAP_BT2408_HABLE)
++        return 0;
++
++    ctx->peak_kernel = clCreateKernel(ctx->ocf.program, "tonemap_peak", &cle);
++    if (!ctx->peak_kernel || cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create peak kernel: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++
++    ctx->peak_stats_mem = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_WRITE,
++                                         sizeof(FFTonemapPeakStats), NULL, &cle);
++    if (!ctx->peak_stats_mem || cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create peak stats buffer: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++
++    return 0;
++}
++
+ static int create_opencl_objects(AVFilterContext *avctx)
+ {
+     TonemapOpenCLContext *ctx = avctx->priv;
+     cl_int cle;
++    int err;
+ 
+     ctx->command_queue = clCreateCommandQueue(ctx->ocf.hwctx->context,
+                                               ctx->ocf.hwctx->device_id,
+@@ -255,16 +284,43 @@ static int create_opencl_objects(AVFilterContext *avctx)
+         }
+     }
+ 
++    err = create_peak_objects(avctx);
++    if (err < 0)
++        return err;
++
+     return 0;
+ }
+ 
+-static int tonemap_opencl_init(AVFilterContext *avctx)
++static int load_tonemap_program(AVFilterContext *avctx)
+ {
+-    TonemapOpenCLContext *ctx = avctx->priv;
+     AVBPrint header;
+     const char *opencl_sources[OPENCL_SOURCE_NB];
+     int err;
+ 
++    av_bprint_init(&header, 1024, AV_BPRINT_SIZE_AUTOMATIC);
++    err = build_opencl_header(avctx, &header);
++    if (err < 0) {
++        av_bprint_finalize(&header, NULL);
++        return err;
++    }
++
++    av_log(avctx, AV_LOG_DEBUG, "Generated OpenCL header:\n%s\n", header.str);
++    opencl_sources[0] = header.str;
++    opencl_sources[1] = ff_source_colorspace_common_cl;
++    opencl_sources[2] = ff_source_dovi_reshape_cl;
++    opencl_sources[3] = ff_source_tonemap_cl;
++    opencl_sources[4] = ff_source_bt2408_hable_cl;
++    opencl_sources[5] = ff_source_tonemap_peak_cl;
++    err = ff_opencl_filter_load_program(avctx, opencl_sources, OPENCL_SOURCE_NB);
++    av_bprint_finalize(&header, NULL);
++    return err;
++}
++
++static int tonemap_opencl_init(AVFilterContext *avctx)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    int err;
++
+     switch(ctx->tonemap) {
+     case TONEMAP_GAMMA:
+         if (isnan(ctx->param))
+@@ -306,21 +362,7 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+     av_assert0(ctx->primaries_in == AVCOL_PRI_BT2020 ||
+                ctx->primaries_in == AVCOL_PRI_BT709);
+ 
+-    av_bprint_init(&header, 1024, AV_BPRINT_SIZE_AUTOMATIC);
+-    err = build_opencl_header(avctx, &header);
+-    if (err < 0) {
+-        av_bprint_finalize(&header, NULL);
+-        return err;
+-    }
+-
+-    av_log(avctx, AV_LOG_DEBUG, "Generated OpenCL header:\n%s\n", header.str);
+-    opencl_sources[0] = header.str;
+-    opencl_sources[1] = ff_source_colorspace_common_cl;
+-    opencl_sources[2] = ff_source_dovi_reshape_cl;
+-    opencl_sources[3] = ff_source_tonemap_cl;
+-    opencl_sources[4] = ff_source_bt2408_hable_cl;
+-    err = ff_opencl_filter_load_program(avctx, opencl_sources, OPENCL_SOURCE_NB);
+-    av_bprint_finalize(&header, NULL);
++    err = load_tonemap_program(avctx);
+     if (err < 0)
+         return err;
+ 
+@@ -616,21 +658,131 @@ static int check_init(AVFilterContext *avctx, const AVFrame *input,
+     return tonemap_opencl_init(avctx);
+ }
+ 
+-static double get_signal_peak(AVFilterContext *avctx, AVFrame *input)
++
++static int zero_peak_stats_buffer(AVFilterContext *avctx)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    cl_uint zero = 0;
++    cl_int cle;
++
++    cle = clEnqueueFillBuffer(ctx->command_queue, ctx->peak_stats_mem,
++                              &zero, sizeof(zero), 0, sizeof(FFTonemapPeakStats),
++                              0, NULL, NULL);
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to clear peak stats buffer: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++    return 0;
++}
++
++static int enqueue_peak_kernel(AVFilterContext *avctx, AVFrame *input)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    size_t global_work[2];
++    size_t local_work[2] = { 16, 16 };
++    cl_int cle;
++
++    cle  = clSetKernelArg(ctx->peak_kernel, 0, sizeof(cl_mem), &input->data[0]);
++    cle |= clSetKernelArg(ctx->peak_kernel, 1, sizeof(cl_mem), &input->data[1]);
++    cle |= clSetKernelArg(ctx->peak_kernel, 2, sizeof(cl_mem), &ctx->peak_stats_mem);
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to set peak kernel arguments: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++
++    global_work[0] = FFALIGN(input->width, 16);
++    global_work[1] = FFALIGN(input->height, 16);
++
++    cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->peak_kernel, 2, NULL,
++                                 global_work, local_work, 0, NULL, NULL);
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to enqueue peak kernel: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++    return 0;
++}
++
++static int read_peak_stats(AVFilterContext *avctx, FFTonemapPeakStats *stats)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    cl_int cle;
++
++    cle = clEnqueueReadBuffer(ctx->command_queue, ctx->peak_stats_mem, CL_TRUE,
++                              0, sizeof(*stats), stats, 0, NULL, NULL);
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to read peak stats buffer: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++    return 0;
++}
++
++static int detect_signal_peak(AVFilterContext *avctx, AVFrame *input, double *peak_out)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    FFTonemapPeakStats stats;
++    int err;
++
++    err = zero_peak_stats_buffer(avctx);
++    if (err < 0)
++        return err;
++
++    err = enqueue_peak_kernel(avctx, input);
++    if (err < 0)
++        return err;
++
++    err = read_peak_stats(avctx, &stats);
++    if (err < 0)
++        return err;
++
++    ctx->peak_state.threshold = ctx->scene_threshold;
++    *peak_out = ff_tonemap_peak_update(&ctx->peak_state, &stats);
++    return 0;
++}
++
++static int get_signal_peak(AVFilterContext *avctx, AVFrame *input, double *peak_out)
+ {
+     TonemapOpenCLContext *ctx = avctx->priv;
+     double peak = ctx->peak;
++    int err;
+ 
+-    if (peak)
+-        return peak;
++    if (peak) {
++        *peak_out = peak;
++        return 0;
++    }
+ 
+-    if (ctx->tonemap == TONEMAP_BT2408_HABLE &&
+-        ff_tonemap_peak_read_dovi_l1(input, &peak)) {
+-        av_log(avctx, AV_LOG_VERBOSE, "Dolby Vision L1 signal peak: %f\n", peak);
+-        return peak;
++    if (ctx->tonemap == TONEMAP_BT2408_HABLE) {
++        if (ff_tonemap_peak_read_dovi_l1(input, &peak)) {
++            av_log(avctx, AV_LOG_VERBOSE, "Dolby Vision L1 signal peak: %f\n", peak);
++            *peak_out = peak;
++            return 0;
++        }
++        if (ctx->peak_detect) {
++            err = detect_signal_peak(avctx, input, &peak);
++            if (err < 0)
++                return err;
++            av_log(avctx, AV_LOG_VERBOSE, "Detected signal peak: %f\n", peak);
++            *peak_out = peak;
++            return 0;
++        }
+     }
+ 
+-    return ff_determine_signal_peak(input);
++    *peak_out = ff_determine_signal_peak(input);
++    return 0;
++}
++
++static int prepare_frame(AVFilterContext *avctx, AVFrame *output, AVFrame *input,
++                         enum AVPixelFormat sw_format, double *peak)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    int err;
++
++    set_color_properties(ctx, output, input);
++
++    err = check_init(avctx, input, sw_format);
++    if (err < 0)
++        return err;
++
++    return get_signal_peak(avctx, input, peak);
+ }
+ 
+ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+@@ -670,11 +822,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+     if (err < 0)
+         goto fail;
+ 
+-    peak = get_signal_peak(avctx, input);
+-
+-    set_color_properties(ctx, output, input);
+-
+-    err = check_init(avctx, input, input_frames_ctx->sw_format);
++    err = prepare_frame(avctx, output, input, input_frames_ctx->sw_format, &peak);
+     if (err < 0)
+         goto fail;
+ 
+@@ -730,6 +878,13 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
+         clReleaseMemObject(ctx->bt2408_mem);
+     if (ctx->dovi_mem)
+         clReleaseMemObject(ctx->dovi_mem);
++    if (ctx->peak_stats_mem)
++        clReleaseMemObject(ctx->peak_stats_mem);
++    if (ctx->peak_kernel) {
++        cle = clReleaseKernel(ctx->peak_kernel);
++        if (cle != CL_SUCCESS)
++            av_log(avctx, AV_LOG_ERROR, "Failed to release peak kernel: %d.\n", cle);
++    }
+     if (ctx->kernel) {
+         cle = clReleaseKernel(ctx->kernel);
+         if (cle != CL_SUCCESS)
+@@ -779,6 +934,7 @@ static const AVOption tonemap_opencl_options[] = {
+     {     "full",          0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},         0, 0, FLAGS, .unit = "range" },
+     { "format",    "output pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, {.i64 = AV_PIX_FMT_NONE}, AV_PIX_FMT_NONE, INT_MAX, FLAGS, .unit = "fmt" },
+     { "peak",      "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },
++    { "peak_detect", "measure signal peak from frames", OFFSET(peak_detect), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS },
+     { "param",     "tonemap parameter",   OFFSET(param), AV_OPT_TYPE_DOUBLE, {.dbl = NAN}, DBL_MIN, DBL_MAX, FLAGS },
+     { "desat",     "desaturation parameter",   OFFSET(desat_param), AV_OPT_TYPE_DOUBLE, {.dbl = 0.5}, 0, DBL_MAX, FLAGS },
+     { "threshold", "scene detection threshold",   OFFSET(scene_threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 0.2}, 0, DBL_MAX, FLAGS },

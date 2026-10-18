@@ -39,3 +39,4 @@
 0032-avfilter-tonemap_peak-read-the-Dolby-Vision-level-1-.patch
 0033-avfilter-vf_tonemap_opencl-take-the-bt2408_hable-pea.patch
 0034-avfilter-vf_tonemap_vaapi-take-the-bt2408_hable-peak.patch
+0035-avfilter-vf_tonemap_opencl-detect-the-bt2408_hable-s.patch

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patches 0016 and 0017 (tonemap_opencl).
+"""Regression tests for patches 0016, 0017 and 0035 (tonemap_opencl).
 
 0016: tonemap_opencl declares the matrix and range of its output on the
 link. Without it, a software conversion after hwdownload took BT.709 frames
@@ -11,9 +11,14 @@ frame came out with Y 73 instead of 63 after format=yuv420p.
 math on the GPU. On flat frames both paths give the same 8-bit code values;
 the test allows one code value of difference.
 
+0035: tonemap_opencl=tonemap=bt2408_hable:peak_detect=1 measures the peak
+on the GPU like tonemap=bt2408_hable:peak_detect=1 does on the CPU. A raw
+frame carries no light level side data, so its static peak is the PQ
+maximum of 10000 cd/m^2, far above the flat test colours.
+
 Each check has a planted wrong case that the comparison must refuse: a
-frame mislabelled as BT.2020 before the conversion, and a GPU run at four
-times the peak.
+frame mislabelled as BT.2020 before the conversion, a GPU run at four
+times the peak, and a GPU run without detection on the static peak.
 
 The device cases need an FFmpeg built with the series, OpenCL and zimg, and
 an OpenCL device:
@@ -47,6 +52,8 @@ GPU = (
     "format=p010,hwupload,tonemap_opencl=tonemap={curve}:m=bt709:r=tv:p=bt709:t=bt709:"
     "peak={peak},hwdownload,format=nv12"
 )
+CPU_DETECT = CPU.replace("peak={peak},", "peak={peak}:peak_detect=1,")
+GPU_DETECT = GPU.replace("peak={peak},", "peak={peak}:peak_detect=1,")
 
 
 def flat_frame(y: int, u: int, v: int) -> bytes:
@@ -101,6 +108,11 @@ class HelperTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             centre_yuv(bytes(SIZE * SIZE))
 
+    def test_detect_chains_add_the_option(self) -> None:
+        for plain, detect in ((CPU, CPU_DETECT), (GPU, GPU_DETECT)):
+            self.assertNotIn("peak_detect", plain)
+            self.assertIn("peak={peak}:peak_detect=1,", detect)
+
     def test_worst_difference(self) -> None:
         self.assertEqual(worst_difference((63, 102, 240), (63, 102, 240)), 0)
         self.assertEqual(worst_difference((63, 102, 240), (73, 100, 241)), 10)
@@ -150,6 +162,27 @@ class Bt2408HableTest(unittest.TestCase):
                                  + ",format=yuv420p"))  # fmt: skip
             worst = max(worst, worst_difference(cpu, gpu))
         self.assertGreater(worst, 1)
+
+
+@unittest.skipUnless(FFMPEG and DEVICE, "set OCL_FFMPEG and OCL_DEVICE")
+class PeakDetectTest(unittest.TestCase):
+    """0035: GPU peak detection must match CPU peak detection."""
+
+    def worst_against_cpu_detection(self, gpu_chain: str) -> int:
+        worst = 0
+        for colour in COLOURS:
+            frame = flat_frame(*colour)
+            cpu = centre_yuv(run(frame, CPU_DETECT.format(peak=0)))
+            gpu = centre_yuv(run(frame, gpu_chain.format(curve="bt2408_hable", peak=0)
+                                 + ",format=yuv420p"))  # fmt: skip
+            worst = max(worst, worst_difference(cpu, gpu))
+        return worst
+
+    def test_gpu_detection_matches_cpu_detection(self) -> None:
+        self.assertLessEqual(self.worst_against_cpu_detection(GPU_DETECT), 1)
+
+    def test_planted_static_peak_is_refused(self) -> None:
+        self.assertGreater(self.worst_against_cpu_detection(GPU), 1)
 
 
 if __name__ == "__main__":
