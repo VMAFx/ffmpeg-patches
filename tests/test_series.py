@@ -206,6 +206,64 @@ class CheckTest(SeriesTestCase):
         self.assertEqual(series.check(self.fx.root).errors, [])
 
 
+class UpstreamCreditTest(SeriesTestCase):
+    # Split so REUSE does not read the fixture text as a notice on this file.
+    MARK = "Copy" + "right (C) Niklas Haas and the libplacebo"
+    NOTICE = f"+ * {MARK} contributors, licensed under\n"
+    WRAPPED = f"+ * peak_buf), {MARK}\n+ * contributors, licensed under\n"
+    HOLDER = "Niklas Haas and the libplacebo contributors"
+
+    def add_notice(self, number: int, notice: str) -> None:
+        with self.fx.patch(number).open("a", encoding="utf-8") as stream:
+            stream.write(notice)
+
+    def credit(self, *numbers: int) -> None:
+        paths = ", ".join(f'"patches/{self.fx.names[n - 1]}"' for n in numbers)
+        (self.fx.root / "REUSE.toml").write_text(
+            'version = 1\n\n[[annotations]]\npath = "patches/*.patch"\nprecedence = "override"\n'
+            'SPDX-FileCopyrightText = "2026 Lusoris"\n'
+            'SPDX-License-Identifier = "LGPL-2.1-or-later"\n\n'
+            f'[[annotations]]\npath = [{paths}]\nprecedence = "override"\n'
+            f'SPDX-FileCopyrightText = ["2026 Lusoris", "{self.HOLDER}"]\n'
+            'SPDX-License-Identifier = "LGPL-2.1-or-later"\n'
+        )
+
+    def test_credited_notice_passes(self) -> None:
+        self.add_notice(1, self.NOTICE)
+        self.credit(1)
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_wrapped_notice_counts(self) -> None:
+        self.add_notice(1, self.WRAPPED)
+        self.assert_error(series.check(self.fx.root), "no REUSE.toml override names it")
+        self.credit(1)
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_planted_patch_outside_the_entry_fails(self) -> None:
+        self.add_notice(1, self.NOTICE)
+        self.add_notice(2, self.NOTICE)
+        self.credit(1)
+        findings = series.check(self.fx.root)
+        self.assert_error(findings, f"{self.fx.names[1]}: adds the notice of {self.HOLDER}")
+        self.assertEqual(len(findings.errors), 1)
+
+    def test_credit_without_notice_fails(self) -> None:
+        self.add_notice(1, self.NOTICE)
+        self.credit(1, 2)
+        self.assert_error(
+            series.check(self.fx.root), f"{self.fx.names[1]}: REUSE.toml credits {self.HOLDER}"
+        )
+
+    def test_glob_entry_credits_no_single_patch(self) -> None:
+        self.add_notice(1, self.NOTICE)
+        (self.fx.root / "REUSE.toml").write_text(
+            'version = 1\n\n[[annotations]]\npath = "patches/*.patch"\nprecedence = "override"\n'
+            f'SPDX-FileCopyrightText = "{self.HOLDER}"\n'
+            'SPDX-License-Identifier = "LGPL-2.1-or-later"\n'
+        )
+        self.assert_error(series.check(self.fx.root), "no REUSE.toml override names it")
+
+
 class CoveredByTest(SeriesTestCase):
     def metadata(self, value: str, status: str = "unsubmitted") -> None:
         """Set the first patch's covering URL without changing its contribution record."""
