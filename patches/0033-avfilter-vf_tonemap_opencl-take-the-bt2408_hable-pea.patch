@@ -18,10 +18,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  3 files changed, 25 insertions(+), 6 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index d10d45670652252d74d179c0fb401370e8586a16..186b2a755b6ff1599bd1737c458626b3b016cb11 100644
+index d4095d66d010a7f4bd70b75154b3520bbe4aec81..1f6dfa4d7543c7af6e262bed6d24e02affe9c223 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -28658,8 +28658,10 @@ It accepts the following parameters:
+@@ -28664,8 +28664,10 @@ It accepts the following parameters:
  Specify the tone-mapping operator to be used. Same as tonemap option in @ref{tonemap}.
  With @code{bt2408_hable}, the output is in BT.709 primaries whatever
  @option{primaries} says, the options @option{param}, @option{desat} and

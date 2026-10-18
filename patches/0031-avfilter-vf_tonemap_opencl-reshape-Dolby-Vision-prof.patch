@@ -34,10 +34,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 libavfilter/opencl/dovi_reshape.cl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 88acc06e58fbdc382e2126e07c49a225a94cd0f5..d10d45670652252d74d179c0fb401370e8586a16 100644
+index 09d5110b54c0f14a18ee73b8bef68fa2c9550973..d4095d66d010a7f4bd70b75154b3520bbe4aec81 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -28660,6 +28660,8 @@ With @code{bt2408_hable}, the output is in BT.709 primaries whatever
+@@ -28666,6 +28666,8 @@ With @code{bt2408_hable}, the output is in BT.709 primaries whatever
  @option{primaries} says, the options @option{param}, @option{desat} and
  @option{threshold} are ignored, and the peak comes from @option{peak} or the
  frame side data, without peak detection.
@@ -46,7 +46,7 @@ index 88acc06e58fbdc382e2126e07c49a225a94cd0f5..d10d45670652252d74d179c0fb401370
  
  @item param
  Tune the tone mapping algorithm. same as param option in @ref{tonemap}.
-@@ -28749,6 +28751,11 @@ Tone map HDR10 to SDR BT.709 NV12 the way libplacebo does with @code{hable}.
+@@ -28755,6 +28757,11 @@ Tone map HDR10 to SDR BT.709 NV12 the way libplacebo does with @code{hable}.
  @example
  -init_hw_device opencl=ocl -filter_hw_device ocl -i INPUT -vf "format=p010,hwupload,tonemap_opencl=tonemap=bt2408_hable:m=bt709:r=tv,hwdownload,format=nv12" OUTPUT
  @end example
