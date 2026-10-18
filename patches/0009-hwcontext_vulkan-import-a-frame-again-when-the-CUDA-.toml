@@ -15,3 +15,13 @@ runs exit 187 with that error and no frame; with it 3 of 3 runs write \
 The upstream pull request has the same diff (equal patch-id) on FFmpeg \
 master ebfc9497f7; this patch is its n9.0.2 form. Fixes FFmpeg issue \
 25052."""
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavutil/hwcontext_vulkan.c"
+function = "vulkan_export_to_cuda"
+lines = 143
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 115 lines before the patch; the change inside it is part of FFmpeg PR 25053 under review, and splitting the function would change that form"

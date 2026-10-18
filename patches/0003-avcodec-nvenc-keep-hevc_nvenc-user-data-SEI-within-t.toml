@@ -11,3 +11,23 @@ Checked on an RTX 4090, driver 615.78.08, by the Pelorus GPU lane. \
 Fixes FFmpeg issue #24972. Upstream form: FFmpeg PR #24993 on master \
 ba987fe24d, also checked there on the RTX 4090. The truncation of \
 zero-heavy payloads is handled by 0004."""
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/nvenc.c"
+function = "ff_nvenc_encode_close"
+lines = 90
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 84 lines before the patch; the change inside it is part of FFmpeg PR 24993 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/nvenc.c"
+function = "prepare_sei_data_array"
+lines = 126
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 113 lines before the patch; the change inside it is part of FFmpeg PR 24993 under review, and splitting the function would change that form"

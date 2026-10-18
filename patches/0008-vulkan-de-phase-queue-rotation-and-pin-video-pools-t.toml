@@ -16,3 +16,23 @@ hevc_vulkan encoder): Vulkan decode into hevc_vulkan with \
 patch. Bisect between the release/9.0 branch point and master (60 \
 runs per step) named \
 d0d7d81317 as the first good commit."""
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/ffv1enc_vulkan.c"
+function = "vulkan_encode_ffv1_init"
+lines = 300
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 298 lines before the patch; the change inside it is the form FFmpeg merged in PR 25060; the patch drops once the pinned base contains it, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavutil/vulkan.c"
+function = "ff_vk_exec_pool_init"
+lines = 191
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 182 lines before the patch; the change inside it is the form FFmpeg merged in PR 25060; the patch drops once the pinned base contains it, and splitting the function would change that form"
