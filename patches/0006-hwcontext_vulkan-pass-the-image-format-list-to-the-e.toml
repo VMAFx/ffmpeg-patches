@@ -18,9 +18,14 @@ ba987fe24d has the same query and takes the patch with a 3-way merge.
 Not sent upstream: open FFmpeg PR 24368 by another author carries the \
 same fix (retest on ANV and RADV posted there on 2026-10-15, the VUID \
 gone in 3 of 3 runs). Drop this patch once 24368 is in the base the \
-series targets.
+series targets."""
 
-Exception: rule HISS-04; function try_export_flags \
-(libavutil/hwcontext_vulkan.c); 71 -> 86 lines; reason: upstream \
-function, splitting it would bloat the upstream diff; review \
-2027-01-08."""
+[[exceptions]]
+rule = "HISS-04"
+path = "libavutil/hwcontext_vulkan.c"
+function = "try_export_flags"
+lines = 86
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 71 lines before the patch; the change inside it carries FFmpeg PR 24368 of another author unchanged, so the patch drops cleanly once 24368 lands, and splitting the function would change that form"

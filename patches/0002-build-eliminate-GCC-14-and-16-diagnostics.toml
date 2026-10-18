@@ -6,3 +6,333 @@ origin = "VMAFx/vmafx c61115a0723e ffmpeg-patches/0019-ffmpeg-eliminate-gcc-14-b
 notes = """
 Touches 50 files in libavcodec, libavfilter, libavformat, libswresample, \
 tests and tools; an upstream submission needs one patch per area."""
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/a64multienc.c"
+function = "render_charset"
+lines = 109
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 94 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/aacenc.c"
+function = "aac_encode_frame"
+lines = 313
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 307 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/aacsbr_template.c"
+function = "read_sbr_grid"
+lines = 146
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 145 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/ffv1enc.c"
+function = "encode_init_internal"
+lines = 105
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 100 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/ffv1enc.c"
+function = "encode_float32_remap"
+lines = 100
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 97 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/rv60dec.c"
+function = "pred_angle"
+lines = 112
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 99 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/svq1enc.c"
+function = "encode_block"
+lines = 159
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 152 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/tests/apv.c"
+function = "test_apv_read_vlc"
+lines = 61
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 54 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/tests/apv.c"
+function = "test_apv_entropy_decode_block"
+lines = 149
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 133 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/wmadec.c"
+function = "wma_decode_block"
+lines = 347
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 344 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavfilter/median_template.c"
+function = "fn"
+lines = 112
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 109 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/dashenc.c"
+function = "output_segment_list"
+lines = 77
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 74 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/dashenc.c"
+function = "write_adaptation_set"
+lines = 89
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 88 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/dashenc.c"
+function = "dash_flush"
+lines = 139
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 133 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/dashenc.c"
+function = "dash_write_packet"
+lines = 232
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 228 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/jvdec.c"
+function = "read_packet"
+lines = 62
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 60 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/matroskaenc.c"
+function = "mkv_write_trailer"
+lines = 217
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 202 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/nspdec.c"
+function = "nsp_read_header"
+lines = 63
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 62 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/nuv.c"
+function = "nuv_packet"
+lines = 73
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 72 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/rtsp.c"
+function = "ff_rtsp_make_setup_request"
+lines = 273
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 262 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/smoothstreamingenc.c"
+function = "ism_flush"
+lines = 90
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 83 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/sw_gbrp.c"
+function = "check_output_yuv2gbrp"
+lines = 140
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 123 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/sw_rgb.c"
+function = "check_yuv2packedX"
+lines = 114
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 102 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/sw_rgb.c"
+function = "checkasm_check_sw_rgb"
+lines = 208
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 193 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/sw_xyz2rgb.c"
+function = "check_xyz12Torgb48le"
+lines = 63
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 58 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/sw_yuv2rgb.c"
+function = "check_yuv2rgb"
+lines = 166
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 138 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/vf_convolution.c"
+function = "check_sobel"
+lines = 66
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 60 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/vvc_alf.c"
+function = "check_alf_filter"
+lines = 63
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 56 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/vvc_mc.c"
+function = "check_avg"
+lines = 67
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 58 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tests/checkasm/vvc_mc.c"
+function = "check_dmvr"
+lines = 63
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 56 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tools/ismindex.c"
+function = "write_fragments"
+lines = 70
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 52 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tools/ismindex.c"
+function = "output_client_manifest"
+lines = 95
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 82 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "tools/ismindex.c"
+function = "main"
+lines = 73
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 53 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"

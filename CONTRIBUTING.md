@@ -21,7 +21,10 @@ make verify-all
 3. **Deterministic Memory (HISS-03)**: Zero dynamic heap allocations
    (`malloc` / `free`) in hot simulation or rendering loops.
 4. **Function Length Cap (HISS-04)**: No function may exceed
-   **60 lines of code** ($\le 60$ LOC).
+   **60 lines of code** ($\le 60$ LOC). When a patch makes a C function exceed
+   60 lines, declare an exception in its sidecar TOML (e.g. `[[exceptions]]`
+   with `rule = "HISS-04"`, `path`, `function`, `lines`, `category`, `entered`,
+   `expires`, and `reason`). `scripts/series.py lengths` enforces this in CI.
 5. **Assertion Density (HISS-15)**: Functions must assert preconditions, state
    invariants, and postconditions.
 6. **Data Scope**: Variables must be declared at the smallest possible scope.

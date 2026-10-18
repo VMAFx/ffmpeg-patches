@@ -127,6 +127,11 @@ jobs:
       - name: Apply the series
         if: github.event.pull_request.draft != true
         run: python3 scripts/series.py apply --expect-base ffmpeg --report "$GITHUB_STEP_SUMMARY"
+      - name: Refuse functions the series grows past 60 lines without an exception
+        # Rule HISS-04: functions grown past 60 lines need a live exception in
+        # the patch's metadata TOML; unexcused or stale entries fail the gate.
+        if: github.event.pull_request.draft != true
+        run: python3 scripts/series.py lengths ffmpeg --report "$GITHUB_STEP_SUMMARY"
       - name: Patches match deterministic regeneration
         if: github.event.pull_request.draft != true
         run: |

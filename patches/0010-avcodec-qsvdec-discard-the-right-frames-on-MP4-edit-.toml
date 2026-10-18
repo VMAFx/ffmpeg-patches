@@ -18,3 +18,13 @@ without an edit list (7137 frames). tests/test_qsv_editlist.py fails \
 without the patch and passes with it (QSV_FFMPEG, QSV_DEVICE). Does not \
 apply to FFmpeg master e9b3c55fe0 as is; the master form is not done \
 yet."""
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/qsvdec.c"
+function = "qsv_decode"
+lines = 181
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, already 175 lines before the patch; moving the patch's addition into a helper is tracked in VMAFx/ffmpeg-patches#84"

@@ -18,3 +18,23 @@ fixes the driver and the fixed driver is the minimum FFmpeg supports. \
 Upstream form: FFmpeg PR #24994 (depends on #24993), checked on master \
 ba987fe24d on the RTX 4090; noted on FFmpeg issue #24972. NVIDIA report \
 not yet filed."""
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/nvenc.c"
+function = "ff_nvenc_encode_close"
+lines = 95
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 90 lines before the patch; the change inside it is part of FFmpeg PR 24994 under review, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/nvenc.c"
+function = "prepare_sei_data_array"
+lines = 127
+category = "D"
+entered = "2026-10-18"
+expires = "2027-02-15"
+reason = "upstream function, 126 lines before the patch; the change inside it is part of FFmpeg PR 24994 under review, and splitting the function would change that form"
