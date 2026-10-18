@@ -29,7 +29,7 @@ Signed-off-by: lusoris <lusoris@proton.me>
  4 files changed, 184 insertions(+), 10 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 9706f6408b28e6a2fe841cb3747a02ccc0d9cedf..ac6160951c44d2f78f11df4234f0bce6d120d153 100644
+index 5dcee2e40e205aad7526c74409e8f71fc9aa913f..dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -12337,7 +12337,29 @@ frame metadata.

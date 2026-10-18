@@ -48,7 +48,7 @@ index c8c4e002e95f06aac7a5e2caccd0d2a93dee366d..d386cc831d5e7265f8f73f42692a91ea
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 588f61084b8da6bbe91b0de86dad2f015cd8cf5d..34c895248d82780750b13bfa66bb072699208ec9 100644
+index cc502dca5c1cef042a5a9588e77dec0bd168db3d..863863b8fbce453eacf4da88bf5ea9881eb12fd0 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15824,6 +15824,39 @@ The filter accepts the same options as @ref{hqdn3d}:
@@ -1265,17 +1265,17 @@ index 0000000000000000000000000000000000000000..4ba48b78055d4b087a1a583c91711b6c
 +    .process_command = &process_command,
 +};
 diff --git a/tools/Makefile b/tools/Makefile
-index 3f332e6435b9424063755df3f4ef3c4c9c7560f6..046fde055f1b2392e5be5de95cb8b37f34e75f69 100644
+index d49d458ad8ea26d1492e96de23ccab8983c39685..4929128fdaf11dc7b09d5bff4b7c71ba315e2131 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
-@@ -3,6 +3,7 @@ TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
- TOOLS-$(CONFIG_ZLIB) += cws2fws
+@@ -1,6 +1,7 @@
+ TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher uncoded_frame
  TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
  TOOLS-$(CONFIG_HQDN3D_CUDA_FILTER)   += hqdn3d_reset_test
 +TOOLS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_reset_test
  TOOLS-yes := $(sort $(TOOLS-yes))
- 
- tools/target_dec_%_fuzzer.o: tools/target_dec_fuzzer.c
+ TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
+ TOOLS-$(CONFIG_ZLIB) += cws2fws
 diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
 index f190a36388631bd2a8591a4682a1f7afc2b6912c..413fd848807edf68c4ff17d40a8804659b98babb 100644
 --- a/tools/hqdn3d_reset_test.c

@@ -422,10 +422,10 @@ index c5be4b151025ef6d72fca55eb18680e46d77fb2b..deeb1f01574e4912a19ec159f106f3d2
      { "desat",        "desaturation strength", OFFSET(desat), AV_OPT_TYPE_DOUBLE, {.dbl = 2}, 0, DBL_MAX, FLAGS },
      { "peak",         "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index 6ec4e40adf814e8f8a968b7f400a0647a01cec0e..0d85be36af8cbcc06a455b9e0e84fb9b84074167 100644
+index 8202144c0a4b242c548d80d87d8b1a8c0d69b8ff..044c3f86a005ae222ed853cacec1c6b85183ae36 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
-@@ -485,6 +485,10 @@ FATE_FILTER-yes += fate-filter-bt2408-hable
+@@ -493,6 +493,10 @@ FATE_FILTER-yes += fate-filter-bt2408-hable
  fate-filter-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
  fate-filter-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF)
  
@@ -433,9 +433,9 @@ index 6ec4e40adf814e8f8a968b7f400a0647a01cec0e..0d85be36af8cbcc06a455b9e0e84fb9b
 +fate-filter-tonemap-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
 +fate-filter-tonemap-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF) filter
 +
- FATE_FILTER-yes += fate-filter-dovi-reshape
- fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
- fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
+ DRAWVG_SCRIPT_ALL = $(SRC_PATH)/tests/ref/lavf/drawvg.all
+ 
+ FATE_FILTER-$(CONFIG_DRAWVG_FILTER) += fate-filter-drawvg-interpreter
 diff --git a/tests/ref/fate/filter-tonemap-bt2408-hable b/tests/ref/fate/filter-tonemap-bt2408-hable
 new file mode 100644
 index 0000000000000000000000000000000000000000..173577053a7f942b1a64bfe3d580bfa4f5e52b9e

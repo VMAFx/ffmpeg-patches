@@ -26,10 +26,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 libavfilter/vulkan/tonemap_peak.comp.glsl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 286c6b2992147c5c78756170b9aac79b0e3e4fe3..9706f6408b28e6a2fe841cb3747a02ccc0d9cedf 100644
+index 0f8ed156bbc8b1a91ed0e6c3cd6cb300e3d63509..5dcee2e40e205aad7526c74409e8f71fc9aa913f 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -29643,6 +29643,22 @@ ITU-R BT.2408 tone mapping with Hable curve on IPT intensity.
+@@ -29602,6 +29602,22 @@ ITU-R BT.2408 tone mapping with Hable curve on IPT intensity.
  Signal peak override, in units of 100 cd/m^2 (nits / 100). Default is @code{0},
  which means the peak is determined from frame metadata.
  
@@ -434,19 +434,19 @@ index 502afad6583087617f1d1079089abd4dc7a04aeb..6825285a239d334fbbb8e3542c8ab6c9
      { NULL }
  };
 diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
-index 48aa540cb4c147e8e48aafccb1b1014c36b36ba0..5b1003872357706d043695264a2964f2b8a8ca20 100644
+index 23b254a550c9d5a003826b2eee09b254d4ee91d6..f81542dcb9d8e40debcb11dd5eddb8ff34e4fa3e 100644
 --- a/libavfilter/vulkan/Makefile
 +++ b/libavfilter/vulkan/Makefile
-@@ -14,7 +14,8 @@ OBJS-$(CONFIG_SCDET_VULKAN_FILTER) += vulkan/scdet.comp.spv.o
- OBJS-$(CONFIG_OVERLAY_VULKAN_FILTER) += vulkan/overlay.comp.spv.o
- OBJS-$(CONFIG_FLIP_VULKAN_FILTER) += vulkan/flip.comp.spv.o
- OBJS-$(CONFIG_TRANSPOSE_VULKAN_FILTER) += vulkan/transpose.comp.spv.o
--OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o
-+OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o \
-+                                        vulkan/tonemap_peak.comp.spv.o
+@@ -17,7 +17,8 @@ OBJS-$(CONFIG_TRANSPOSE_VULKAN_FILTER) += vulkan/transpose.comp.spv.o
  OBJS-$(CONFIG_V360_VULKAN_FILTER) += vulkan/v360.comp.spv.o
  OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER) += vulkan/interlace.comp.spv.o
  OBJS-$(CONFIG_XFADE_VULKAN_FILTER) += vulkan/xfade.comp.spv.o
+-OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o
++OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o \
++                                        vulkan/tonemap_peak.comp.spv.o
+ OBJS-$(CONFIG_NLMEANS_VULKAN_FILTER) += vulkan/nlmeans_horizontal.comp.spv.o \
+                                         vulkan/nlmeans_vertical.comp.spv.o \
+                                         vulkan/nlmeans_weights.comp.spv.o \
 diff --git a/libavfilter/vulkan/tonemap_peak.comp.glsl b/libavfilter/vulkan/tonemap_peak.comp.glsl
 new file mode 100644
 index 0000000000000000000000000000000000000000..eff58cbb3328528dfb4559d878ec12a7000c87ea

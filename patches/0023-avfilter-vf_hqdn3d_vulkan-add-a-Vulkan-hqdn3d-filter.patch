@@ -78,7 +78,7 @@ index b1656f0f803081cecc0f9ac7136c2d08d0494ca1..231c6b67c5dd7564633dc0801adc81cf
  iccgen_filter_deps="lcms2"
  identity_filter_select="scene_sad"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index ac6160951c44d2f78f11df4234f0bce6d120d153..0ae86d47e741ed0e852f04b66359db6d67260efa 100644
+index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..6fc2a91fd538858ccbcc73650ef61e820417a2fb 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15792,6 +15792,43 @@ The command accepts the same syntax of the corresponding option.
@@ -1087,13 +1087,13 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 +};
 diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
-index 5b1003872357706d043695264a2964f2b8a8ca20..524ec8cf065c1e1745d3dd7ad7b3d2267bb019fd 100644
+index f81542dcb9d8e40debcb11dd5eddb8ff34e4fa3e..5fe5056d9bc32425c0d4d1edf37a43b4da4da986 100644
 --- a/libavfilter/vulkan/Makefile
 +++ b/libavfilter/vulkan/Makefile
-@@ -19,6 +19,8 @@ OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o \
- OBJS-$(CONFIG_V360_VULKAN_FILTER) += vulkan/v360.comp.spv.o
- OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER) += vulkan/interlace.comp.spv.o
+@@ -19,6 +19,8 @@ OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER) += vulkan/interlace.comp.spv.o
  OBJS-$(CONFIG_XFADE_VULKAN_FILTER) += vulkan/xfade.comp.spv.o
+ OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o \
+                                         vulkan/tonemap_peak.comp.spv.o
 +OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER)  += vulkan/hqdn3d_horizontal.comp.spv.o \
 +                                        vulkan/hqdn3d_vertical.comp.spv.o
  OBJS-$(CONFIG_NLMEANS_VULKAN_FILTER) += vulkan/nlmeans_horizontal.comp.spv.o \
@@ -1465,17 +1465,15 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +    }
 +}
 diff --git a/tools/Makefile b/tools/Makefile
-index 7ae6e3cb75ddc662576808f41e0bc103c82d992c..feb4d9d3b9fdebf5324bd01498336f55be669074 100644
+index 7ae6e3cb75ddc662576808f41e0bc103c82d992c..7803174689408946cf14662f10fce5f6fcc0d98b 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
-@@ -1,6 +1,7 @@
+@@ -1,4 +1,5 @@
  TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher uncoded_frame
++TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
  TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
  TOOLS-$(CONFIG_ZLIB) += cws2fws
-+TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
  
- tools/target_dec_%_fuzzer.o: tools/target_dec_fuzzer.c
- 	$(COMPILE_C) -DFFMPEG_DECODER=$*
 diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..725e7a6a5329443de6a0ccbb440a0c30bf46b3a8

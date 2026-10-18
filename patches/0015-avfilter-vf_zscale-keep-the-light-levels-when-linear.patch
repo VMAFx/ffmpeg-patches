@@ -252,10 +252,10 @@ index b14d704663abe76de9f12124fa60d7a8a2eec4ee..80216c0f1925d67eab4ed747847bf159
          td.in = in;
          td.out = out;
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index 0d85be36af8cbcc06a455b9e0e84fb9b84074167..437fce8b4733748ed4b45f776d561738b6bf4773 100644
+index 044c3f86a005ae222ed853cacec1c6b85183ae36..0cbe6fc8aab682fd4618ee85c89d0b758e0de4cb 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
-@@ -485,6 +485,10 @@ FATE_FILTER-yes += fate-filter-bt2408-hable
+@@ -493,6 +493,10 @@ FATE_FILTER-yes += fate-filter-bt2408-hable
  fate-filter-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
  fate-filter-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF)
  

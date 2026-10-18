@@ -22,7 +22,7 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 libavfilter/opencl/tonemap_peak.cl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 67a7ab2c73d07343888fb9d5dc8087ad1973f677..738380a58a36d1b9d21c8309e9c6bdaa809f579f 100644
+index 1cdb7f2265851c5d7f5d4eb3126e72a42605c330..9ebe763b81e117e042d557ce723a8a2e837eb9b6 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -28663,14 +28663,22 @@ It accepts the following parameters:

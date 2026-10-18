@@ -38,7 +38,7 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 tests/ref/fate/filter-tonemap-peak-detect
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 285410a8ae7dd59c14beade76a77f6f01285d905..286c6b2992147c5c78756170b9aac79b0e3e4fe3 100644
+index a9241fab5cf2af6ca2d11557e92c570dcfc294e1..0f8ed156bbc8b1a91ed0e6c3cd6cb300e3d63509 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -24357,6 +24357,22 @@ This option works only if the input frame has a supported color tag.
@@ -1058,10 +1058,10 @@ index deeb1f01574e4912a19ec159f106f3d2cc837611..29f9c3d476b7b588a17beaff262547c7
      FILTER_INPUTS(tonemap_inputs),
      FILTER_OUTPUTS(ff_video_default_filterpad),
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index 437fce8b4733748ed4b45f776d561738b6bf4773..82ec4bbf783aebcbd2a7dbf22db1809c23743dfb 100644
+index 0cbe6fc8aab682fd4618ee85c89d0b758e0de4cb..1e044fb0d4b94cb4f4f0fe3aaafc608a6dd184cc 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
-@@ -493,6 +493,10 @@ FATE_FILTER-$(CONFIG_TONEMAP_FILTER) += fate-filter-tonemap-bt2408-hable
+@@ -501,6 +501,10 @@ FATE_FILTER-$(CONFIG_TONEMAP_FILTER) += fate-filter-tonemap-bt2408-hable
  fate-filter-tonemap-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)
  fate-filter-tonemap-bt2408-hable: CMD = run libavfilter/tests/bt2408_hable$(EXESUF) filter
  
@@ -1069,9 +1069,9 @@ index 437fce8b4733748ed4b45f776d561738b6bf4773..82ec4bbf783aebcbd2a7dbf22db1809c
 +fate-filter-tonemap-peak-detect: libavfilter/tests/bt2408_hable$(EXESUF)
 +fate-filter-tonemap-peak-detect: CMD = run libavfilter/tests/bt2408_hable$(EXESUF) peak
 +
- FATE_FILTER-yes += fate-filter-dovi-reshape
- fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
- fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
+ DRAWVG_SCRIPT_ALL = $(SRC_PATH)/tests/ref/lavf/drawvg.all
+ 
+ FATE_FILTER-$(CONFIG_DRAWVG_FILTER) += fate-filter-drawvg-interpreter
 diff --git a/tests/ref/fate/filter-tonemap-peak-detect b/tests/ref/fate/filter-tonemap-peak-detect
 new file mode 100644
 index 0000000000000000000000000000000000000000..01b0c65f3979956f3eafe45d71a4b4067f17f8dc

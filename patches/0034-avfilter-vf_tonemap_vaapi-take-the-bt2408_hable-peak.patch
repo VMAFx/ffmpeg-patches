@@ -17,7 +17,7 @@ Signed-off-by: lusoris <lusoris@proton.me>
  3 files changed, 23 insertions(+), 3 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 1f6dfa4d7543c7af6e262bed6d24e02affe9c223..67a7ab2c73d07343888fb9d5dc8087ad1973f677 100644
+index 3ae400e5be3cd6df875c514c4644768059a1109c..1cdb7f2265851c5d7f5d4eb3126e72a42605c330 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -29076,7 +29076,9 @@ and @option{matrix} say; @option{format} must be an 8-bit RGB format such as
