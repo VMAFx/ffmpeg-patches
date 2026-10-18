@@ -220,8 +220,12 @@ jobs:
           probe opencl=ocl:0.0 'portable computing language'
           if ! PYTHONPATH=. python3 .github/diag/diag.py > diag.log 2>&1; then echo diag-failed; fi
           tail -60 diag.log
-          if ! build/ffmpeg -hide_banner -nostdin -v debug -init_hw_device opencl=ocl:0.0 -filter_hw_device ocl -f lavfi -i testsrc2=s=64x64:d=0.04 -vf format=yuv420p,hwupload,hwdownload,format=yuv420p -f null - > ocl.log 2>&1; then echo ocl-chain-failed; fi
-          grep -iE "supported|hwupload|hwdownload|sw_format|scale|image|error|fail" ocl.log | head -120
+          sudo apt-get install -y --no-install-recommends mesa-opencl-icd > /dev/null
+          ls /etc/OpenCL/vendors/
+          if ! RUSTICL_ENABLE=llvmpipe OCL_ICD_VENDORS=/etc/OpenCL/vendors/rusticl.icd build/ffmpeg -hide_banner -nostdin -v debug -init_hw_device opencl=ocl:0.0 -filter_hw_device ocl -f lavfi -i testsrc2=s=64x64:d=0.04 -vf format=yuv420p,hwupload,hwdownload,format=yuv420p -f null - > ocl.log 2>&1; then echo ocl-chain-failed; fi
+          grep -iE "supported|0.0:|surface|error|fail" ocl.log | head -60
+          if ! RUSTICL_ENABLE=llvmpipe OCL_ICD_VENDORS=/etc/OpenCL/vendors/rusticl.icd python3 -m unittest tests.test_hqdn3d_opencl > rusticl.log 2>&1; then echo rusticl-tests-failed; fi
+          grep -E "^(FAIL|ERROR|OK|Ran)|AssertionError" rusticl.log | sort | uniq -c | head -40
           python3 -m unittest -v tests.test_hqdn3d_vulkan tests.test_hqdn3d_opencl 2>&1 | tee parity.log
           status=${PIPESTATUS[0]}
           if grep -E "skipped 'set (VK|OCL)_" parity.log; then
