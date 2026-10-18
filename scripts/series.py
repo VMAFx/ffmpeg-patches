@@ -22,6 +22,9 @@
         Fail unless LOG shows a CC line for every C file those commits
         change (included *_template.c files excepted), so a file in a
         component the build left out cannot pass the warning gate unseen.
+    series.py lengths TREE [--base REF] [--report FILE] [--today YYYY-MM-DD]
+        Fail when a patch makes a C function longer than 60 lines without
+        a live exception in that patch's metadata TOML.
     series.py notes VERSION REPOSITORY
         Print release notes: the pinned base, every patch with its status
         and upstream link, and how to verify and apply the release.
@@ -41,6 +44,7 @@ is applied or exported.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -49,6 +53,7 @@ import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -63,7 +68,21 @@ METADATA_KEYS = {
     "master_form",
     "upstream_commit",
     "covered_by",
+    "exceptions",
 }
+REQUIRED_EXCEPTION_KEYS = {
+    "rule",
+    "path",
+    "function",
+    "lines",
+    "category",
+    "entered",
+    "expires",
+    "reason",
+}
+VALID_CATEGORIES = {"A", "B", "C", "D"}
+CATEGORY_INTERVALS = {"B": 3, "C": 10, "D": 120}
+DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 PULL_URL = re.compile(r"(https://code\.ffmpeg\.org)/([^/]+)/([^/]+)/pulls/(\d+)")
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
@@ -215,8 +234,119 @@ def check_patch_form(path: Path, findings: Findings) -> None:
         findings.error(name, "no diff --git section")
 
 
-def check_metadata(path: Path, findings: Findings) -> None:
+def check_exception_dates(entry: dict, name: str, findings: Findings, today: date) -> None:
+    cat = entry.get("category")
+    ent_raw = entry.get("entered")
+    exp_raw = entry.get("expires")
+    ent_date: date | None = None
+    exp_date: date | None = None
+    if isinstance(ent_raw, str) and DAY.fullmatch(ent_raw):
+        try:
+            ent_date = date.fromisoformat(ent_raw)
+        except ValueError:
+            findings.error(name, f"'entered' date {ent_raw!r} is invalid")
+    else:
+        findings.error(name, "'entered' must be a YYYY-MM-DD date")
+    if isinstance(exp_raw, str) and DAY.fullmatch(exp_raw):
+        try:
+            exp_date = date.fromisoformat(exp_raw)
+        except ValueError:
+            findings.error(name, f"'expires' date {exp_raw!r} is invalid")
+    else:
+        findings.error(name, "'expires' must be a YYYY-MM-DD date")
+
+    if ent_date is not None and exp_date is not None and isinstance(cat, str):
+        delta = (exp_date - ent_date).days
+        if cat in CATEGORY_INTERVALS:
+            exp_delta = CATEGORY_INTERVALS[cat]
+            if delta != exp_delta:
+                findings.error(
+                    name,
+                    f"interval mismatch: category {cat} expires must be entered + {exp_delta} days",
+                )
+        elif cat == "A" and not (1 <= delta <= 90):
+            findings.error(
+                name,
+                "interval mismatch: category A expires must be between entered + 1 and + 90 days",
+            )
+    if exp_date is not None and exp_date < today:
+        findings.error(name, f"exception for {entry.get('function')} expired on {exp_date}")
+
+
+def check_exception_fields(entry: dict, name: str, findings: Findings) -> tuple[str, str] | None:
+    rule = entry.get("rule")
+    if not isinstance(rule, str) or rule != "HISS-04":
+        findings.error(name, "rule must be 'HISS-04'")
+
+    path = entry.get("path")
+    if not isinstance(path, str) or not path or path.startswith("/") or "\n" in path:
+        findings.error(name, "path must be a repo-relative file path")
+
+    func = entry.get("function")
+    if not isinstance(func, str) or not func.isascii() or not func.isidentifier():
+        findings.error(name, "function must be a C identifier")
+
+    lines = entry.get("lines")
+    if type(lines) is not int:
+        findings.error(name, "'lines' must be an integer > 60")
+    elif lines <= 60:
+        findings.error(name, "'lines' must be > 60")
+
+    cat = entry.get("category")
+    if not isinstance(cat, str) or cat not in VALID_CATEGORIES:
+        findings.error(name, "category must be one of 'A', 'B', 'C', 'D'")
+
+    reason = entry.get("reason")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or "\n" in reason
+        or "\r" in reason
+        or len(reason.encode("utf-8")) > 1024
+    ):
+        findings.error(name, "'reason' must be a single non-empty line of <= 1024 bytes")
+
+    if isinstance(path, str) and isinstance(func, str):
+        return (path, func)
+    return None
+
+
+def check_exception_entry(
+    entry: object, name: str, findings: Findings, today: date
+) -> tuple[str, str] | None:
+    if not isinstance(entry, dict):
+        findings.error(name, "each exception must be a table")
+        return None
+    for k in sorted(set(entry) - REQUIRED_EXCEPTION_KEYS):
+        findings.error(name, f"unknown key {k!r} in exception")
+    for k in sorted(REQUIRED_EXCEPTION_KEYS - set(entry)):
+        findings.error(name, f"missing key {k!r} in exception")
+
+    pair = check_exception_fields(entry, name, findings)
+    check_exception_dates(entry, name, findings, today)
+    return pair
+
+
+def check_exceptions_metadata(data: dict, name: str, findings: Findings, today: date) -> None:
+    if "exceptions" not in data:
+        return
+    exceptions = data["exceptions"]
+    if not isinstance(exceptions, list):
+        findings.error(name, "'exceptions' must be an array of tables")
+        return
+    seen_pairs: set[tuple[str, str]] = set()
+    for entry in exceptions:
+        pair = check_exception_entry(entry, name, findings, today)
+        if pair is not None:
+            if pair in seen_pairs:
+                findings.error(name, f"duplicate exception for ({pair[0]}, {pair[1]})")
+            seen_pairs.add(pair)
+
+
+def check_metadata(path: Path, findings: Findings, today: date | None = None) -> None:
     name = path.name
+    if today is None:
+        today = date.today()
     try:
         data = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as exc:
@@ -241,6 +371,7 @@ def check_metadata(path: Path, findings: Findings) -> None:
         findings.warn(name, "merged upstream: drop it once the pinned base contains it")
     check_master_metadata(data, name, findings)
     check_covered_by(data, name, findings)
+    check_exceptions_metadata(data, name, findings, today)
 
 
 def check_covered_by(data: dict, name: str, findings: Findings) -> None:
@@ -274,7 +405,7 @@ def check_master_metadata(data: dict, name: str, findings: Findings) -> None:
             findings.error(name, "upstream_commit must be a full 40-hex commit")
 
 
-def check_tree(root: Path, names: list[str], findings: Findings) -> None:
+def check_tree(root: Path, names: list[str], findings: Findings, today: date | None = None) -> None:
     """Every listed patch exists with metadata, and nothing unlisted lies around."""
     patches = root / "patches"
     listed = set(names)
@@ -287,7 +418,7 @@ def check_tree(root: Path, names: list[str], findings: Findings) -> None:
         check_patch_form(path, findings)
         sidecar = path.with_suffix(".toml")
         if sidecar.is_file():
-            check_metadata(sidecar, findings)
+            check_metadata(sidecar, findings, today=today)
         else:
             findings.error(name, f"no metadata file patches/{sidecar.name}")
     for path in sorted(patches.glob("*.patch")) if patches.is_dir() else []:
@@ -504,13 +635,13 @@ def contributions(root: Path, write: bool) -> int:
     return 0
 
 
-def check(root: Path) -> Findings:
+def check(root: Path, today: date | None = None) -> Findings:
     findings = Findings()
     read_base(root, findings)
     names = read_series(root, findings)
     if not names and not findings.errors:
         findings.error("series.txt", "lists no patch")
-    check_tree(root, names, findings)
+    check_tree(root, names, findings, today=today)
     check_contributions(root, names, findings)
     return findings
 
@@ -923,6 +1054,344 @@ def release_notes(root: Path, version: str, repository: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+@dataclass
+class FunctionSpan:
+    name: str
+    start: int
+    end: int
+    length: int
+
+
+@dataclass
+class LengthFinding:
+    patch: str
+    commit: str
+    path: str
+    function: str
+    old_length: int
+    new_length: int
+
+
+def is_signature_line(line: str) -> bool:
+    if not line or not (line[0].isalpha() or line[0] == "_"):
+        return False
+    if line.startswith("#") or line.startswith("typedef"):
+        return False
+    if line.rstrip().endswith(";"):
+        return False
+    return "(" in line
+
+
+def signature_name(line: str) -> str | None:
+    before = line.split("(", 1)[0].rstrip()
+    match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", before)
+    return match.group(1) if match else None
+
+
+def update_signature_state(
+    line: str,
+    lineno: int,
+    state: tuple[int | None, int | None, str | None],
+) -> tuple[int | None, int | None, str | None]:
+    first_sig, last_sig, sig_name = state
+    if line.rstrip().endswith(";"):
+        return None, None, None
+    if is_signature_line(line):
+        name = signature_name(line)
+        if name is not None:
+            if last_sig is not None and (lineno - last_sig) <= 8:
+                return first_sig, lineno, sig_name
+            return lineno, lineno, name
+    return state
+
+
+def parse_function_spans(
+    text: str,
+) -> tuple[dict[str, FunctionSpan], dict[str, list[FunctionSpan]]]:
+    longest: dict[str, FunctionSpan] = {}
+    all_spans: dict[str, list[FunctionSpan]] = {}
+    in_body = False
+    first_sig: int | None = None
+    last_sig: int | None = None
+    sig_name: str | None = None
+
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if in_body:
+            if line.startswith("}"):
+                if first_sig is not None and sig_name is not None:
+                    length = lineno - first_sig + 1
+                    span = FunctionSpan(sig_name, first_sig, lineno, length)
+                    all_spans.setdefault(sig_name, []).append(span)
+                    if sig_name not in longest or length > longest[sig_name].length:
+                        longest[sig_name] = span
+                in_body = False
+                first_sig, last_sig, sig_name = None, None, None
+        elif line.startswith("{"):
+            if last_sig is not None and (lineno - last_sig) <= 8:
+                in_body = True
+            else:
+                first_sig, last_sig, sig_name = None, None, None
+        else:
+            first_sig, last_sig, sig_name = update_signature_state(
+                line, lineno, (first_sig, last_sig, sig_name)
+            )
+
+    return longest, all_spans
+
+
+def commit_added_lines(tree: Path, commit: str) -> dict[str, set[int]]:
+    result = git(
+        tree,
+        "diff",
+        "-U0",
+        f"{commit}^",
+        commit,
+        "--",
+        "*.c",
+        "*.h",
+        "*.m",
+    )
+    added: dict[str, set[int]] = {}
+    current_path: str | None = None
+
+    for line in result.stdout.splitlines():
+        if line.startswith("+++ "):
+            if line == "+++ /dev/null" or line.startswith("+++ /dev/null"):
+                current_path = None
+            elif line.startswith("+++ b/"):
+                current_path = line[6:].strip()
+                added.setdefault(current_path, set())
+            else:
+                current_path = None
+        elif line.startswith("@@ ") and current_path is not None:
+            m = DIFF_HUNK.match(line)
+            if m:
+                start = int(m.group(1))
+                count = int(m.group(2)) if m.group(2) is not None else 1
+                if count > 0:
+                    added[current_path].update(range(start, start + count))
+
+    return {p: lines for p, lines in added.items() if lines}
+
+
+def commit_length_findings(tree: Path, commit: str, patch_name: str) -> list[LengthFinding]:
+    added_lines = commit_added_lines(tree, commit)
+    findings: list[LengthFinding] = []
+
+    for path, lines in added_lines.items():
+        post_res = git(tree, "show", f"{commit}:{path}", check=False)
+        if post_res.returncode:
+            continue
+        post_funcs, post_all = parse_function_spans(post_res.stdout)
+
+        parent_res = git(tree, "show", f"{commit}^:{path}", check=False)
+        parent_funcs, _ = (
+            parse_function_spans(parent_res.stdout) if parent_res.returncode == 0 else ({}, {})
+        )
+
+        for func_name, span in post_funcs.items():
+            spans = post_all.get(func_name, [span])
+            if not any(s.start <= line_no <= s.end for s in spans for line_no in lines):
+                continue
+            if span.length <= 60:
+                continue
+            parent_len = parent_funcs[func_name].length if func_name in parent_funcs else 0
+            if span.length <= parent_len:
+                continue
+            findings.append(
+                LengthFinding(patch_name, commit, path, func_name, parent_len, span.length)
+            )
+
+    return findings
+
+
+def triage_single_finding(
+    f: LengthFinding,
+    patch_name: str,
+    exceptions: list[dict],
+    today: date,
+) -> tuple[bool, bool, int | None]:
+    exc_match = None
+    exc_idx = None
+    for idx, exc in enumerate(exceptions):
+        if exc.get("path") == f.path and exc.get("function") == f.function:
+            exc_match = exc
+            exc_idx = idx
+            break
+
+    if exc_match is None:
+        print(
+            f"{patch_name}: {f.path} {f.function} {f.old_length} -> {f.new_length} lines, "
+            "over the 60-line cap (HISS-04) without a live exception"
+        )
+        return False, False, None
+
+    exc_lines = exc_match.get("lines")
+    exp_raw = exc_match.get("expires")
+    exp_date: date | None = None
+    if isinstance(exp_raw, str) and DAY.fullmatch(exp_raw):
+        with contextlib.suppress(ValueError):
+            exp_date = date.fromisoformat(exp_raw)
+
+    if exp_date is None or exp_date < today:
+        print(
+            f"{patch_name}: {f.path} {f.function} {f.old_length} -> {f.new_length} lines, "
+            "over the 60-line cap (HISS-04) without a live exception"
+        )
+        return False, False, exc_idx
+
+    if isinstance(exc_lines, int) and exc_lines > f.new_length:
+        print(
+            f"error: {patch_name}: exception for {f.path} {f.function} "
+            f"lines={exc_lines} > measured {f.new_length}",
+            file=sys.stderr,
+        )
+        print(
+            f"{patch_name}: {f.path} {f.function} {f.old_length} -> {f.new_length} lines, "
+            "over the 60-line cap (HISS-04) without a live exception"
+        )
+        return False, True, exc_idx
+
+    if not isinstance(exc_lines, int) or exc_lines < f.new_length:
+        print(
+            f"{patch_name}: {f.path} {f.function} {f.old_length} -> {f.new_length} lines, "
+            "over the 60-line cap (HISS-04) without a live exception"
+        )
+        return False, False, exc_idx
+
+    print(f"{patch_name}: {f.path} {f.function} {f.old_length} -> {f.new_length} lines (excused)")
+    return True, False, exc_idx
+
+
+def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]:
+    if not sidecar.is_file():
+        return [], False
+    meta_findings = Findings()
+    check_metadata(sidecar, meta_findings, today=today)
+    had_errors = False
+    if meta_findings.errors:
+        had_errors = True
+        for err in meta_findings.errors:
+            print(f"error: {err}", file=sys.stderr)
+    try:
+        data = tomllib.loads(sidecar.read_text())
+        raw_exc = data.get("exceptions", [])
+        if isinstance(raw_exc, list):
+            return [e for e in raw_exc if isinstance(e, dict)], had_errors
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+    return [], had_errors
+
+
+def check_patch_findings(
+    root: Path,
+    patch_name: str,
+    findings: list[LengthFinding],
+    today: date,
+) -> tuple[int, int, bool]:
+    sidecar = (root / "patches" / patch_name).with_suffix(".toml")
+    exceptions, meta_errors = load_patch_exceptions(sidecar, today)
+
+    excused = 0
+    failing = 0
+    matched_indices: set[int] = set()
+
+    for f in findings:
+        is_excused, is_err, exc_idx = triage_single_finding(f, patch_name, exceptions, today)
+        if exc_idx is not None:
+            matched_indices.add(exc_idx)
+        if is_excused:
+            excused += 1
+        else:
+            failing += 1
+        if is_err:
+            meta_errors = True
+
+    for idx, exc in enumerate(exceptions):
+        if idx not in matched_indices:
+            meta_errors = True
+            p = exc.get("path", "")
+            fn = exc.get("function", "")
+            print(f"error: {patch_name}: stale exception for {p} {fn}", file=sys.stderr)
+
+    return excused, failing, meta_errors
+
+
+def parse_today(today_str: str | None) -> date:
+    if today_str is None:
+        return date.today()
+    if not DAY.fullmatch(today_str):
+        raise SeriesError(f"--today {today_str!r} is not a YYYY-MM-DD date")
+    try:
+        return date.fromisoformat(today_str)
+    except ValueError as exc:
+        raise SeriesError(f"--today date {today_str!r} is invalid: {exc}") from exc
+
+
+def resolve_lengths_commits(
+    root: Path, tree: Path, base: str | None
+) -> tuple[list[str], list[str]]:
+    if base is None:
+        base = pinned_commit(root)
+    resolved = git(tree, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+    if resolved.returncode:
+        raise SeriesError(f"{tree}: base {base!r} is not a commit")
+    commit = resolved.stdout.strip()
+    require_descendant(
+        tree,
+        commit,
+        f"base {base!r} is not an ancestor of HEAD; "
+        "pass --base with the upstream commit the series was applied to",
+    )
+    findings = Findings()
+    names = read_series(root, findings)
+    if findings.errors:
+        raise SeriesError("\n".join(findings.errors))
+    rev_list = git(tree, "rev-list", "--reverse", f"{commit}..HEAD").stdout.splitlines()
+    commits = [c.strip() for c in rev_list if c.strip()]
+    if len(commits) != len(names):
+        raise SeriesError(
+            f"{tree}: commit count {len(commits)} differs from series length {len(names)}"
+        )
+    return commits, names
+
+
+def lengths_gate(
+    root: Path,
+    tree: Path,
+    report: Path | None,
+    base: str | None = None,
+    today_str: str | None = None,
+) -> int:
+    today = parse_today(today_str)
+    commits, names = resolve_lengths_commits(root, tree, base)
+
+    total_findings = 0
+    total_excused = 0
+    total_failing = 0
+    had_errors = False
+
+    for c, patch_name in zip(commits, names, strict=True):
+        patch_findings = commit_length_findings(tree, c, patch_name)
+        total_findings += len(patch_findings)
+        excused, failing, meta_err = check_patch_findings(root, patch_name, patch_findings, today)
+        total_excused += excused
+        total_failing += failing
+        if meta_err:
+            had_errors = True
+
+    summary = (
+        f"{total_findings} function(s) over 60 lines, "
+        f"{total_excused} excused, {total_failing} failing"
+    )
+    print(summary)
+    if report is not None:
+        with report.open("a") as out:
+            out.write(summary + "\n")
+
+    return 1 if (total_failing > 0 or had_errors) else 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="series repository root")
@@ -950,6 +1419,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     cover.add_argument("log", type=Path)
     cover.add_argument("--report", type=Path, help="append the summary to this file")
     cover.add_argument("--base", help="upstream commit under the series (default: FFMPEG_COMMIT)")
+    lengths = sub.add_parser("lengths", help="gate function lengths grown over 60 lines")
+    lengths.add_argument("tree", type=Path)
+    lengths.add_argument("--base", help="upstream commit under the series (default: FFMPEG_COMMIT)")
+    lengths.add_argument("--report", type=Path, help="append the summary to this file")
+    lengths.add_argument("--today", help="check date as YYYY-MM-DD (default: current day)")
     notes = sub.add_parser("notes", help="print release notes for a tag")
     notes.add_argument("version")
     notes.add_argument("repository", help="owner/name on GitHub")
@@ -993,10 +1467,13 @@ def run(args: argparse.Namespace) -> int:
         return 1 if apply_failed(results, args.expect_base) else 0
     if args.command in ("notes", "contributions"):
         return run_text(args)
-    if args.command == "warnings":
-        return warnings_gate(args.root, args.tree, args.log, args.report, args.base)
-    if args.command == "coverage":
-        return coverage_gate(args.root, args.tree, args.log, args.report, args.base)
+    gates = {
+        "warnings": lambda: warnings_gate(args.root, args.tree, args.log, args.report, args.base),
+        "coverage": lambda: coverage_gate(args.root, args.tree, args.log, args.report, args.base),
+        "lengths": lambda: lengths_gate(args.root, args.tree, args.report, args.base, args.today),
+    }
+    if args.command in gates:
+        return gates[args.command]()
     for name in export_series(args.root, args.tree):
         print(name)
     return 0
