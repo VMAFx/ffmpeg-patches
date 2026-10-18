@@ -1,0 +1,6 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx", "pelorus"]
+origin = "#63 Dolby Vision profile 5 reshape (ADR-0002), part 3: the HDR10 properties of vf_dovi_reshape shared with the tonemap_opencl reshape of 0031"
+notes = """
+Moves set_light_level() and the mastering display part of set_output_props() of vf_dovi_reshape into ff_dovi_reshape_set_hdr10_props() in dovi_reshape.c. No change in behavior: the pixel, side data and level 1 key hashes of vf_dovi_reshape on the profile 5 clip of #63 are identical before and after."""

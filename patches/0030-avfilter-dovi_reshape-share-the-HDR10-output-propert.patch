@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 11:06:22 +0200
+Subject: [PATCH] avfilter/dovi_reshape: share the HDR10 output properties
+
+vf_dovi_reshape describes its output as BT.2020 PQ with mastering
+display metadata from the reshaped range and the level 1 block as
+content light level. A GPU filter that reshapes in its kernel has to
+describe its input the same way to pick the tone-map parameters.
+
+Move that code into ff_dovi_reshape_set_hdr10_props(). No change in
+behavior: the output frames and their side data of vf_dovi_reshape
+are identical before and after.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavfilter/dovi_reshape.c    | 55 ++++++++++++++++++++++++++++++++++
+ libavfilter/dovi_reshape.h    | 14 +++++++++
+ libavfilter/vf_dovi_reshape.c | 56 ++---------------------------------
+ 3 files changed, 72 insertions(+), 53 deletions(-)
+
+diff --git a/libavfilter/dovi_reshape.c b/libavfilter/dovi_reshape.c
+index 772dd818614e33daa360a72ecbb204c4084b193e..8406a38f667cc4e9c8e86b2aae702b88984e5504 100644
+--- a/libavfilter/dovi_reshape.c
++++ b/libavfilter/dovi_reshape.c
+@@ -29,7 +29,10 @@
+ 
+ #include "libavutil/common.h"
+ #include "libavutil/csp.h"
++#include "libavutil/dict.h"
+ #include "libavutil/error.h"
++#include "libavutil/frame.h"
++#include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/rational.h"
+ 
+ #include "dovi_reshape.h"
+@@ -316,3 +319,55 @@ int ff_dovi_reshape_to_p81(AVDOVIMetadata *md)
+ 
+     return 0;
+ }
++
++int ff_dovi_reshape_set_hdr10_props(AVFrame *frame, const FFDoviReshape *rs,
++                                    const AVDOVIMetadata *md)
++{
++    const av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
++    const AVColorPrimariesDesc *bt2020 = av_csp_primaries_desc_from_id(AVCOL_PRI_BT2020);
++    const AVDOVIDmData *l1 = md ? av_dovi_find_level(md, 1) : NULL;
++    AVMasteringDisplayMetadata *mdm;
++    AVContentLightMetadata *clm;
++    int ret;
++
++    av_frame_remove_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    if (!l1) {
++        av_dict_set(&frame->metadata, "lavfi.dovi.l1_max_pq", NULL, 0);
++        av_dict_set(&frame->metadata, "lavfi.dovi.l1_avg_pq", NULL, 0);
++    } else {
++        clm = av_content_light_metadata_create_side_data(frame);
++        if (!clm)
++            return AVERROR(ENOMEM);
++        clm->MaxCLL  = lrint(pq_eotf(l1->l1.max_pq / 4095.0));
++        clm->MaxFALL = lrint(pq_eotf(l1->l1.avg_pq / 4095.0));
++
++        ret = av_dict_set_int(&frame->metadata, "lavfi.dovi.l1_max_pq", l1->l1.max_pq, 0);
++        if (ret < 0)
++            return ret;
++        ret = av_dict_set_int(&frame->metadata, "lavfi.dovi.l1_avg_pq", l1->l1.avg_pq, 0);
++        if (ret < 0)
++            return ret;
++    }
++
++    av_frame_remove_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    frame->color_primaries = AVCOL_PRI_BT2020;
++    frame->color_trc       = AVCOL_TRC_SMPTE2084;
++
++    mdm = av_mastering_display_metadata_create_side_data(frame);
++    if (!mdm)
++        return AVERROR(ENOMEM);
++    mdm->display_primaries[0][0] = bt2020->prim.r.x;
++    mdm->display_primaries[0][1] = bt2020->prim.r.y;
++    mdm->display_primaries[1][0] = bt2020->prim.g.x;
++    mdm->display_primaries[1][1] = bt2020->prim.g.y;
++    mdm->display_primaries[2][0] = bt2020->prim.b.x;
++    mdm->display_primaries[2][1] = bt2020->prim.b.y;
++    mdm->white_point[0] = bt2020->wp.x;
++    mdm->white_point[1] = bt2020->wp.y;
++    mdm->min_luminance = av_d2q(pq_eotf(rs->min_pq), 1 << 16);
++    mdm->max_luminance = av_d2q(pq_eotf(rs->max_pq), 1 << 16);
++    mdm->has_primaries = 1;
++    mdm->has_luminance = 1;
++
++    return 0;
++}
+diff --git a/libavfilter/dovi_reshape.h b/libavfilter/dovi_reshape.h
+index fe69158a74d07e4e286b6a5ab43dcc210525978d..fad6397e236accce577b80f76b906e14397b2716 100644
+--- a/libavfilter/dovi_reshape.h
++++ b/libavfilter/dovi_reshape.h
+@@ -86,4 +86,18 @@ void ff_dovi_reshape_pixel(const FFDoviReshape *s, const float ycc[3], float rgb
+  */
+ int ff_dovi_reshape_to_p81(AVDOVIMetadata *md);
+ 
++struct AVFrame;
++
++/**
++ * Set HDR10 properties (light level, mastering display metadata, BT.2020
++ * primaries and SMPTE2084 TRC) on a frame from FFDoviReshape and AVDOVIMetadata.
++ *
++ * @param frame destination frame to receive HDR10 metadata and color props
++ * @param rs    reshaping data with min_pq and max_pq
++ * @param md    Dolby Vision metadata (may be NULL if none)
++ * @return 0 on success, negative AVERROR on failure
++ */
++int ff_dovi_reshape_set_hdr10_props(struct AVFrame *frame, const FFDoviReshape *rs,
++                                    const AVDOVIMetadata *md);
++
+ #endif /* AVFILTER_DOVI_RESHAPE_H */
+diff --git a/libavfilter/vf_dovi_reshape.c b/libavfilter/vf_dovi_reshape.c
+index c218366ed253fa8d601eac7fca33a00a5e20c6da..5f0dd48fcde20393ddc2021d5fc8648758f3c86e 100644
+--- a/libavfilter/vf_dovi_reshape.c
++++ b/libavfilter/vf_dovi_reshape.c
+@@ -213,49 +213,17 @@ static int reshape_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs
+     return 0;
+ }
+ 
+-/*
+- * The level 1 block carries the per-shot luminance range. Tone mappers that
+- * read only static metadata (ff_determine_signal_peak) see it as the content
+- * light level of the frame, as libplacebo does with max_pq_y and avg_pq_y.
+- */
+-static int set_light_level(AVFrame *out, av_csp_trc_function pq_eotf)
+-{
+-    const AVFrameSideData *sd = av_frame_get_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
+-    const AVDOVIDmData *l1 = sd ? av_dovi_find_level((const AVDOVIMetadata *)sd->data, 1) : NULL;
+-    AVContentLightMetadata *clm;
+-    int ret;
+-
+-    av_frame_remove_side_data(out, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+-    if (!l1) {
+-        av_dict_set(&out->metadata, "lavfi.dovi.l1_max_pq", NULL, 0);
+-        av_dict_set(&out->metadata, "lavfi.dovi.l1_avg_pq", NULL, 0);
+-        return 0;
+-    }
+-    clm = av_content_light_metadata_create_side_data(out);
+-    if (!clm)
+-        return AVERROR(ENOMEM);
+-    clm->MaxCLL  = lrint(pq_eotf(l1->l1.max_pq / 4095.0));
+-    clm->MaxFALL = lrint(pq_eotf(l1->l1.avg_pq / 4095.0));
+-
+-    ret = av_dict_set_int(&out->metadata, "lavfi.dovi.l1_max_pq", l1->l1.max_pq, 0);
+-    if (ret < 0)
+-        return ret;
+-    return av_dict_set_int(&out->metadata, "lavfi.dovi.l1_avg_pq", l1->l1.avg_pq, 0);
+-}
+-
+ /* The reshaped signal is described by the RPU, not by the base layer. */
+ static int set_output_props(AVFrame *out, const FFDoviReshape *rs, int rpu)
+ {
+-    const av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
+-    const AVColorPrimariesDesc *bt2020 = av_csp_primaries_desc_from_id(AVCOL_PRI_BT2020);
+-    AVMasteringDisplayMetadata *mdm;
+-    int ret = set_light_level(out, pq_eotf);
++    AVFrameSideData *sd = av_frame_get_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
++    const AVDOVIMetadata *md = sd ? (const AVDOVIMetadata *)sd->data : NULL;
++    int ret = ff_dovi_reshape_set_hdr10_props(out, rs, md);
+ 
+     if (ret < 0)
+         return ret;
+ 
+     if (rpu == RPU_P81) {
+-        AVFrameSideData *sd = av_frame_get_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
+         if (!sd)
+             return AVERROR(EINVAL);
+         ret = av_buffer_make_writable(&sd->buf);
+@@ -269,28 +237,10 @@ static int set_output_props(AVFrame *out, const FFDoviReshape *rs, int rpu)
+         av_frame_remove_side_data(out, AV_FRAME_DATA_DOVI_METADATA);
+     }
+     av_frame_remove_side_data(out, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+-    av_frame_remove_side_data(out, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+ 
+-    out->color_primaries = AVCOL_PRI_BT2020;
+-    out->color_trc       = AVCOL_TRC_SMPTE2084;
+     out->colorspace      = AVCOL_SPC_RGB;
+     out->color_range     = AVCOL_RANGE_JPEG;
+ 
+-    mdm = av_mastering_display_metadata_create_side_data(out);
+-    if (!mdm)
+-        return AVERROR(ENOMEM);
+-    mdm->display_primaries[0][0] = bt2020->prim.r.x;
+-    mdm->display_primaries[0][1] = bt2020->prim.r.y;
+-    mdm->display_primaries[1][0] = bt2020->prim.g.x;
+-    mdm->display_primaries[1][1] = bt2020->prim.g.y;
+-    mdm->display_primaries[2][0] = bt2020->prim.b.x;
+-    mdm->display_primaries[2][1] = bt2020->prim.b.y;
+-    mdm->white_point[0] = bt2020->wp.x;
+-    mdm->white_point[1] = bt2020->wp.y;
+-    mdm->min_luminance = av_d2q(pq_eotf(rs->min_pq), 1 << 16);
+-    mdm->max_luminance = av_d2q(pq_eotf(rs->max_pq), 1 << 16);
+-    mdm->has_primaries = 1;
+-    mdm->has_luminance = 1;
+     return 0;
+ }
+ 

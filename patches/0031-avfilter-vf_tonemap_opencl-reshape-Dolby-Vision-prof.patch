@@ -1,0 +1,915 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 11:06:35 +0200
+Subject: [PATCH] avfilter/vf_tonemap_opencl: reshape Dolby Vision profile 5 in
+ the kernel
+
+A Dolby Vision profile 5 base layer is IPT-PQ-C2, not BT.2020 YCbCr.
+tonemap_opencl took it as BT.2020 and produced wrong colours, and the
+only way around it was vf_dovi_reshape on the CPU before hwupload.
+
+With tonemap=bt2408_hable and a full range IPT-C2 input, build the
+kernel with DOVI_RESHAPE: it applies the RPU polynomial and MMR
+reshape and the IPT to RGB matrices per pixel from a constant buffer
+filled by ff_dovi_reshape_init(), and interpolates chroma from the
+frame's chroma location. The per-pixel math follows libplacebo
+v7.360.1 (LGPL-2.1-or-later). Other curves, limited range input and a
+frame without DOVI metadata are refused.
+
+Against vf_dovi_reshape followed by tonemap_opencl, the direct chain
+differs by a mean CIEDE2000 of 0.40 (p99 1.57) on four frames of a
+1280x720 profile 5 clip. HDR10 output of all three curves at both
+ranges is bit-identical to before. init and filter_frame are split
+into helpers; neither grows.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi                   |   7 +
+ libavfilter/Makefile               |   4 +-
+ libavfilter/opencl/bt2408_hable.cl |  58 +++-
+ libavfilter/opencl/dovi_reshape.cl | 139 +++++++++
+ libavfilter/opencl_source.h        |   1 +
+ libavfilter/vf_tonemap_opencl.c    | 460 +++++++++++++++++++----------
+ 6 files changed, 510 insertions(+), 159 deletions(-)
+ create mode 100644 libavfilter/opencl/dovi_reshape.cl
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 88acc06e58fbdc382e2126e07c49a225a94cd0f5..d10d45670652252d74d179c0fb401370e8586a16 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -28660,6 +28660,8 @@ With @code{bt2408_hable}, the output is in BT.709 primaries whatever
+ @option{primaries} says, the options @option{param}, @option{desat} and
+ @option{threshold} are ignored, and the peak comes from @option{peak} or the
+ frame side data, without peak detection.
++It also accepts a Dolby Vision profile 5 base layer (full range P010,
++colorspace @code{ipt-c2}) directly and applies the RPU reshape in the kernel.
+ 
+ @item param
+ Tune the tone mapping algorithm. same as param option in @ref{tonemap}.
+@@ -28749,6 +28751,11 @@ Tone map HDR10 to SDR BT.709 NV12 the way libplacebo does with @code{hable}.
+ @example
+ -init_hw_device opencl=ocl -filter_hw_device ocl -i INPUT -vf "format=p010,hwupload,tonemap_opencl=tonemap=bt2408_hable:m=bt709:r=tv,hwdownload,format=nv12" OUTPUT
+ @end example
++@item
++Tone map a Dolby Vision profile 5 base layer directly with kernel reshaping:
++@example
++format=p010,hwupload,tonemap_opencl=tonemap=bt2408_hable:m=bt709:r=tv,hwdownload,format=nv12
++@end example
+ @end itemize
+ 
+ @section unsharp_opencl
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 9ea29b9f645a3ab08e1a130d6b392c29e65da7c7..6d9a9edb2c5d118892b3d04c6c7aef3d4373de79 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -547,8 +547,10 @@ OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
+ OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
+ OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2408_hable.o \
++                                                dovi_reshape.o \
+                                                 opencl/tonemap.o opencl/bt2408_hable.o \
+-                                                opencl/colorspace_common.o
++                                                opencl/colorspace_common.o \
++                                                opencl/dovi_reshape.o
+ OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o bt2408_hable.o
+ OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER)         += vf_tonemap_vulkan.o vulkan.o vulkan_filter.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
+diff --git a/libavfilter/opencl/bt2408_hable.cl b/libavfilter/opencl/bt2408_hable.cl
+index 26b93afa99990a91653c835446a84b6895427537..ced0a49ddf572639355fc94fe7b1bef349f3112b 100644
+--- a/libavfilter/opencl/bt2408_hable.cl
++++ b/libavfilter/opencl/bt2408_hable.cl
+@@ -153,12 +153,53 @@ float3 bt2408_hable_pixel(constant const struct bt2408_hable *s, float3 rgb) {
+     return powr(clamp(out, 0.0f, 1.0f), 2.4f);
+ }
+ 
++#ifdef DOVI_RESHAPE
++// Bilinear chroma interpolation matching vf_dovi_reshape.c (update_taps/chroma).
++// For 4:2:0 subsampled input, the continuous chroma position for sample (x, y) is:
++//   pos_x = (x - CHROMA_OFFSET_X) / 2.0
++//   pos_y = (y - CHROMA_OFFSET_Y) / 2.0
++// clamped to [0, cw - 1] and [0, ch - 1]. The two nearest chroma samples per axis
++// (i0, i1) and (j0, j1) are blended with weights wx = pos_x - i0, wy = pos_y - j0.
++static float2 get_interpolated_chroma(__read_only image2d_t src2, sampler_t sampler,
++                                      int x, int y, int cw, int ch)
++{
++    float pos_x = clamp(((float)x - CHROMA_OFFSET_X) * 0.5f, 0.0f, (float)(cw - 1));
++    float pos_y = clamp(((float)y - CHROMA_OFFSET_Y) * 0.5f, 0.0f, (float)(ch - 1));
++    int i0 = min((int)pos_x, cw - 1);
++    int i1 = min(i0 + 1, cw - 1);
++    int j0 = min((int)pos_y, ch - 1);
++    int j1 = min(j0 + 1, ch - 1);
++    float wx = pos_x - (float)i0;
++    float wy = pos_y - (float)j0;
++
++    float2 r00 = read_imagef(src2, sampler, (int2)(i0, j0)).xy;
++    float2 r10 = read_imagef(src2, sampler, (int2)(i1, j0)).xy;
++    float2 r01 = read_imagef(src2, sampler, (int2)(i0, j1)).xy;
++    float2 r11 = read_imagef(src2, sampler, (int2)(i1, j1)).xy;
++
++    float2 top = r00 * (1.0f - wx) + r10 * wx;
++    float2 bot = r01 * (1.0f - wx) + r11 * wx;
++    return top + (bot - top) * wy;
++}
++
++static float3 dovi_ycc2lrgb(constant const struct dovi_reshape *rs, float3 ycc)
++{
++    float3 norm = (ycc * BT2408_IN_CODE) / 1023.0f;
++    float3 rgb = dovi_reshape_pixel(rs, norm);
++    return (float3)(linearize(rgb.x), linearize(rgb.y), linearize(rgb.z));
++}
++#endif
++
+ __kernel void tonemap_bt2408(__write_only image2d_t dst1,
+                              __read_only  image2d_t src1,
+                              __write_only image2d_t dst2,
+                              __read_only  image2d_t src2,
+                              constant const struct bt2408_hable *s,
+-                             float peak)
++                             float peak
++#ifdef DOVI_RESHAPE
++                           , constant const struct dovi_reshape *rs
++#endif
++)
+ {
+     const sampler_t sampler = (CLK_NORMALIZED_COORDS_FALSE |
+                                CLK_ADDRESS_CLAMP_TO_EDGE   |
+@@ -173,12 +214,27 @@ __kernel void tonemap_bt2408(__write_only image2d_t dst1,
+     float y1 = read_imagef(src1, sampler, (int2)(x + 1, y)).x;
+     float y2 = read_imagef(src1, sampler, (int2)(x,     y + 1)).x;
+     float y3 = read_imagef(src1, sampler, (int2)(x + 1, y + 1)).x;
++
++#ifdef DOVI_RESHAPE
++    int cw = get_image_width(src2);
++    int ch = get_image_height(src2);
++    float2 uv0 = get_interpolated_chroma(src2, sampler, x,     y,     cw, ch);
++    float2 uv1 = get_interpolated_chroma(src2, sampler, x + 1, y,     cw, ch);
++    float2 uv2 = get_interpolated_chroma(src2, sampler, x,     y + 1, cw, ch);
++    float2 uv3 = get_interpolated_chroma(src2, sampler, x + 1, y + 1, cw, ch);
++
++    float3 c0 = bt2408_hable_pixel(s, ootf(dovi_ycc2lrgb(rs, (float3)(y0, uv0.x, uv0.y)), peak));
++    float3 c1 = bt2408_hable_pixel(s, ootf(dovi_ycc2lrgb(rs, (float3)(y1, uv1.x, uv1.y)), peak));
++    float3 c2 = bt2408_hable_pixel(s, ootf(dovi_ycc2lrgb(rs, (float3)(y2, uv2.x, uv2.y)), peak));
++    float3 c3 = bt2408_hable_pixel(s, ootf(dovi_ycc2lrgb(rs, (float3)(y3, uv3.x, uv3.y)), peak));
++#else
+     float2 uv = read_imagef(src2, sampler, (int2)(xi,     yi)).xy;
+ 
+     float3 c0 = bt2408_hable_pixel(s, ootf(bt2408_yuv2lrgb((float3)(y0, uv.x, uv.y)), peak));
+     float3 c1 = bt2408_hable_pixel(s, ootf(bt2408_yuv2lrgb((float3)(y1, uv.x, uv.y)), peak));
+     float3 c2 = bt2408_hable_pixel(s, ootf(bt2408_yuv2lrgb((float3)(y2, uv.x, uv.y)), peak));
+     float3 c3 = bt2408_hable_pixel(s, ootf(bt2408_yuv2lrgb((float3)(y3, uv.x, uv.y)), peak));
++#endif
+ 
+     // Subsample the encoded values, as a software scaler does.
+     float3 e0 = bt2408_lrgb2yuv(c0), e1 = bt2408_lrgb2yuv(c1);
+diff --git a/libavfilter/opencl/dovi_reshape.cl b/libavfilter/opencl/dovi_reshape.cl
+new file mode 100644
+index 0000000000000000000000000000000000000000..015bb69e3745b3e81bbfd4b63070ae09f8d6172d
+--- /dev/null
++++ b/libavfilter/opencl/dovi_reshape.cl
+@@ -0,0 +1,139 @@
++/*
++ * Dolby Vision profile 5 reshaping and IPT-PQ-C2 decoding
++ *
++ * The per-pixel reshaping and decoding follow libplacebo v7.360.1
++ * (src/shaders/colorspace.c: pl_shader_dovi_reshape, pl_shader_decode_color),
++ * Copyright (C) Niklas Haas and the libplacebo contributors, licensed under
++ * the GNU Lesser General Public License version 2.1 or later.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define DOVI_MAX_PIECES 8
++
++struct dovi_curve {
++    int   num_pivots;
++    float pivots[DOVI_MAX_PIECES + 1];
++    int   method[DOVI_MAX_PIECES];
++    float poly[DOVI_MAX_PIECES][3];
++    int   mmr_order[DOVI_MAX_PIECES];
++    float mmr_constant[DOVI_MAX_PIECES];
++    float mmr[DOVI_MAX_PIECES][3][7];
++};
++
++struct dovi_reshape {
++    struct dovi_curve curve[3];
++    float ycc_to_rgb[3][3];
++    float ycc_offset[3];
++    float lms_to_rgb[3][3];
++    float min_pq;
++    float max_pq;
++};
++
++constant const float DOVI_M1 = 2610.0f / 4096.0f / 4.0f;
++constant const float DOVI_M2 = 2523.0f / 4096.0f * 128.0f;
++constant const float DOVI_C1 = 3424.0f / 4096.0f;
++constant const float DOVI_C2 = 2413.0f / 4096.0f * 32.0f;
++constant const float DOVI_C3 = 2392.0f / 4096.0f * 32.0f;
++
++static float dovi_pq_eotf(float x)
++{
++    float p = powr(max(x, 0.0f), 1.0f / DOVI_M2);
++    return powr(max(p - DOVI_C1, 0.0f) / (DOVI_C2 - DOVI_C3 * p),
++                1.0f / DOVI_M1) * 10000.0f;
++}
++
++static float dovi_pq_oetf(float nits)
++{
++    float y = powr(max(nits, 0.0f) / 10000.0f, DOVI_M1);
++    return powr((DOVI_C1 + DOVI_C2 * y) / (1.0f + DOVI_C3 * y), DOVI_M2);
++}
++
++static float dovi_reshape_mmr(constant const struct dovi_curve *curve, int i, float3 sig)
++{
++    const float x[7] = {
++        sig.x, sig.y, sig.z,
++        sig.x * sig.y, sig.x * sig.z, sig.y * sig.z,
++        sig.x * sig.y * sig.z,
++    };
++    float pow_x[7];
++    float s = curve->mmr_constant[i];
++
++    for (int k = 0; k < 7; k++)
++        pow_x[k] = x[k];
++
++    int order = clamp(curve->mmr_order[i], 1, 3);
++    for (int j = 0; j < order; j++) {
++        for (int k = 0; k < 7; k++)
++            s += curve->mmr[i][j][k] * pow_x[k];
++        for (int k = 0; k < 7; k++)
++            pow_x[k] *= x[k];
++    }
++    return s;
++}
++
++static float dovi_reshape_comp(constant const struct dovi_curve *curve, float3 sig, int c)
++{
++    float s = (c == 0) ? sig.x : ((c == 1) ? sig.y : sig.z);
++    int i = 0;
++
++    if (!curve->num_pivots)
++        return s;
++
++    int num_pivots = clamp(curve->num_pivots, 2, DOVI_MAX_PIECES + 1);
++    int max_i = num_pivots - 2;
++    for (int piece = 0; piece < DOVI_MAX_PIECES - 1; piece++) {
++        if (i < max_i && s >= curve->pivots[i + 1])
++            i++;
++        else
++            break;
++    }
++
++    if (curve->method[i] == 0) { /* AV_DOVI_MAPPING_POLYNOMIAL */
++        constant const float *k = curve->poly[i];
++        s = (k[2] * s + k[1]) * s + k[0];
++    } else {
++        s = dovi_reshape_mmr(curve, i, sig);
++    }
++    return clamp(s, curve->pivots[0], curve->pivots[num_pivots - 1]);
++}
++
++static float3 dovi_mul3(constant const float m[3][3], float3 in)
++{
++    return (float3)(m[0][0] * in.x + m[0][1] * in.y + m[0][2] * in.z,
++                    m[1][0] * in.x + m[1][1] * in.y + m[1][2] * in.z,
++                    m[2][0] * in.x + m[2][1] * in.y + m[2][2] * in.z);
++}
++
++float3 dovi_reshape_pixel(constant const struct dovi_reshape *s, float3 ycc)
++{
++    float3 sig = clamp(ycc, 0.0f, 1.0f);
++    float3 ipt, lms, rgb;
++
++    ipt.x = dovi_reshape_comp(&s->curve[0], sig, 0) - s->ycc_offset[0];
++    ipt.y = dovi_reshape_comp(&s->curve[1], sig, 1) - s->ycc_offset[1];
++    ipt.z = dovi_reshape_comp(&s->curve[2], sig, 2) - s->ycc_offset[2];
++
++    lms = dovi_mul3(s->ycc_to_rgb, ipt);
++    lms = (float3)(dovi_pq_eotf(max(lms.x, 0.0f)),
++                   dovi_pq_eotf(max(lms.y, 0.0f)),
++                   dovi_pq_eotf(max(lms.z, 0.0f)));
++    rgb = dovi_mul3(s->lms_to_rgb, lms);
++    return (float3)(dovi_pq_oetf(rgb.x),
++                    dovi_pq_oetf(rgb.y),
++                    dovi_pq_oetf(rgb.z));
++}
+diff --git a/libavfilter/opencl_source.h b/libavfilter/opencl_source.h
+index 65546425d65f6c3ffc71e9ffe7ad88c5a8e72453..186303eeed8bec14485e2698fe7837d8a4e26e3f 100644
+--- a/libavfilter/opencl_source.h
++++ b/libavfilter/opencl_source.h
+@@ -25,6 +25,7 @@ extern const char *ff_source_colorkey_cl;
+ extern const char *ff_source_colorspace_common_cl;
+ extern const char *ff_source_convolution_cl;
+ extern const char *ff_source_deshake_cl;
++extern const char *ff_source_dovi_reshape_cl;
+ extern const char *ff_source_hqdn3d_cl;
+ extern const char *ff_source_neighbor_cl;
+ extern const char *ff_source_nlmeans_cl;
+diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
+index 855999b3b4ca18c2691f97eb5b62b422abc88852..e754fb5f9f3e6f90a7b9dc1c1bcde85a6c5d9d67 100644
+--- a/libavfilter/vf_tonemap_opencl.c
++++ b/libavfilter/vf_tonemap_opencl.c
+@@ -25,6 +25,7 @@
+ 
+ #include "avfilter.h"
+ #include "bt2408_hable.h"
++#include "dovi_reshape.h"
+ #include "filters.h"
+ #include "formats.h"
+ #include "opencl.h"
+@@ -76,6 +77,10 @@ typedef struct TonemapOpenCLContext {
+     double                bt2408_peak;
+     enum AVColorPrimaries bt2408_prim;
+     cl_mem                bt2408_mem;
++    int                   dovi_mode;
++    FFDoviReshape         dovi_reshape;
++    int                   dovi_uploaded;
++    cl_mem                dovi_mem;
+ } TonemapOpenCLContext;
+ 
+ static const char *const linearize_funcs[] = {
+@@ -118,23 +123,146 @@ static int get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries ou
+     return 0;
+ }
+ 
+-#define OPENCL_SOURCE_NB 4
++#define OPENCL_SOURCE_NB 5
+ // Average light level for SDR signals. This is equal to a signal level of 0.5
+ // under a typical presentation gamma of about 2.0.
+ static const float sdr_avg = 0.25f;
+ 
+-static int tonemap_opencl_init(AVFilterContext *avctx)
++static int print_transfer_and_luma(AVFilterContext *avctx, AVBPrint *header)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    double rgb2yuv[3][3], yuv2rgb[3][3];
++    const AVLumaCoefficients *luma_src = av_csp_luma_coeffs_from_avcsp(ctx->colorspace_in);
++    const AVLumaCoefficients *luma_dst = av_csp_luma_coeffs_from_avcsp(ctx->colorspace_out);
++
++    if (!luma_src || !luma_dst)
++        return AVERROR(EINVAL);
++
++    ff_fill_rgb2yuv_table(luma_dst, rgb2yuv);
++    ff_opencl_print_const_matrix_3x3(header, "yuv_matrix", rgb2yuv);
++
++    ff_fill_rgb2yuv_table(luma_src, rgb2yuv);
++    ff_matrix_invert_3x3(rgb2yuv, yuv2rgb);
++    ff_opencl_print_const_matrix_3x3(header, "rgb_matrix", yuv2rgb);
++
++    av_bprintf(header, "constant float3 luma_src = {%.4ff, %.4ff, %.4ff};\n",
++               av_q2d(luma_src->cr), av_q2d(luma_src->cg), av_q2d(luma_src->cb));
++    av_bprintf(header, "constant float3 luma_dst = {%.4ff, %.4ff, %.4ff};\n",
++               av_q2d(luma_dst->cr), av_q2d(luma_dst->cg), av_q2d(luma_dst->cb));
++
++    av_bprintf(header, "#define linearize %s\n", linearize_funcs[ctx->trc_in]);
++    av_bprintf(header, "#define delinearize %s\n", delinearize_funcs[ctx->trc_out]);
++
++    if (ctx->trc_in == AVCOL_TRC_ARIB_STD_B67)
++        av_bprintf(header, "#define ootf_impl ootf_hlg\n");
++    if (ctx->trc_out == AVCOL_TRC_ARIB_STD_B67)
++        av_bprintf(header, "#define inverse_ootf_impl inverse_ootf_hlg\n");
++
++    return 0;
++}
++
++static int build_opencl_header(AVFilterContext *avctx, AVBPrint *header)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    int rgb2rgb_passthrough = 1, err;
++    double rgb2rgb[3][3];
++
++    av_bprintf(header, "__constant const float tone_param = %.4ff;\n", ctx->param);
++    av_bprintf(header, "__constant const float desat_param = %.4ff;\n", ctx->desat_param);
++    av_bprintf(header, "__constant const float target_peak = %.4ff;\n", ctx->target_peak);
++    av_bprintf(header, "__constant const float sdr_avg = %.4ff;\n", sdr_avg);
++    av_bprintf(header, "__constant const float scene_threshold = %.4ff;\n", ctx->scene_threshold);
++    av_bprintf(header, "#define TONE_FUNC %s\n", tonemap_func[ctx->tonemap]);
++    av_bprintf(header, "#define DETECTION_FRAMES %d\n", DETECTION_FRAMES);
++
++    if (ctx->primaries_out != ctx->primaries_in) {
++        err = get_rgb2rgb_matrix(ctx->primaries_in, ctx->primaries_out, rgb2rgb);
++        if (err < 0)
++            return err;
++        rgb2rgb_passthrough = 0;
++    }
++    if (ctx->range_in == AVCOL_RANGE_JPEG)
++        av_bprintf(header, "#define FULL_RANGE_IN\n");
++    if (ctx->range_out == AVCOL_RANGE_JPEG)
++        av_bprintf(header, "#define FULL_RANGE_OUT\n");
++    if (ctx->ocf.output_format == AV_PIX_FMT_P010)
++        av_bprintf(header, "#define BT2408_OUT_P010\n");
++
++    av_bprintf(header, "#define chroma_loc %d\n", (int)ctx->chroma_loc);
++
++    if (ctx->dovi_mode) {
++        int xpos = 0, ypos = 0;
++        enum AVChromaLocation loc = ctx->chroma_loc;
++        if (loc == AVCHROMA_LOC_UNSPECIFIED)
++            loc = AVCHROMA_LOC_LEFT;
++        av_chroma_location_enum_to_pos(&xpos, &ypos, loc);
++        av_bprintf(header, "#define DOVI_RESHAPE 1\n");
++        av_bprintf(header, "#define CHROMA_OFFSET_X %.4ff\n", xpos / 256.0f);
++        av_bprintf(header, "#define CHROMA_OFFSET_Y %.4ff\n", ypos / 256.0f);
++    }
++
++    if (rgb2rgb_passthrough)
++        av_bprintf(header, "#define RGB2RGB_PASSTHROUGH\n");
++    else
++        ff_opencl_print_const_matrix_3x3(header, "rgb2rgb", rgb2rgb);
++
++    return print_transfer_and_luma(avctx, header);
++}
++
++static int create_opencl_objects(AVFilterContext *avctx)
+ {
+     TonemapOpenCLContext *ctx = avctx->priv;
+-    int rgb2rgb_passthrough = 1;
+-    double rgb2rgb[3][3], rgb2yuv[3][3], yuv2rgb[3][3];
+-    const AVLumaCoefficients *luma_src, *luma_dst;
+     cl_int cle;
+-    int err;
++
++    ctx->command_queue = clCreateCommandQueue(ctx->ocf.hwctx->context,
++                                              ctx->ocf.hwctx->device_id,
++                                              0, &cle);
++    if (!ctx->command_queue || cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create OpenCL command queue: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++
++    ctx->kernel = clCreateKernel(ctx->ocf.program,
++                                 ctx->tonemap == TONEMAP_BT2408_HABLE ?
++                                 "tonemap_bt2408" : "tonemap", &cle);
++    if (!ctx->kernel || cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create kernel: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++
++    ctx->bt2408_mem = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_ONLY,
++                                     sizeof(ctx->bt2408), NULL, &cle);
++    if (!ctx->bt2408_mem || cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create bt2408 buffer: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++
++    ctx->util_mem = clCreateBuffer(ctx->ocf.hwctx->context, 0,
++                                   (2 * DETECTION_FRAMES + 7) * sizeof(unsigned),
++                                   NULL, &cle);
++    if (!ctx->util_mem || cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create util buffer: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++
++    if (ctx->dovi_mode) {
++        ctx->dovi_mem = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_ONLY,
++                                       sizeof(FFDoviReshape), NULL, &cle);
++        if (!ctx->dovi_mem || cle != CL_SUCCESS) {
++            av_log(avctx, AV_LOG_ERROR, "Failed to create dovi reshape buffer: %d.\n", cle);
++            return AVERROR(EIO);
++        }
++    }
++
++    return 0;
++}
++
++static int tonemap_opencl_init(AVFilterContext *avctx)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
+     AVBPrint header;
+     const char *opencl_sources[OPENCL_SOURCE_NB];
+-
+-    av_bprint_init(&header, 1024, AV_BPRINT_SIZE_AUTOMATIC);
++    int err;
+ 
+     switch(ctx->tonemap) {
+     case TONEMAP_GAMMA:
+@@ -154,7 +282,6 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+     if (isnan(ctx->param))
+         ctx->param = 1.0f;
+ 
+-    // SDR peak is 1.0f
+     ctx->target_peak = 1.0f;
+     av_log(ctx, AV_LOG_DEBUG, "tone mapping transfer from %s to %s\n",
+            av_color_transfer_name(ctx->trc_in),
+@@ -168,135 +295,40 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+     av_log(ctx, AV_LOG_DEBUG, "mapping range from %s to %s\n",
+            av_color_range_name(ctx->range_in),
+            av_color_range_name(ctx->range_out));
+-    // checking valid value just because of limited implementation
+-    // please remove when more functionalities are implemented
++
+     av_assert0(ctx->trc_out == AVCOL_TRC_BT709 ||
+                ctx->trc_out == AVCOL_TRC_BT2020_10);
+-    av_assert0(ctx->trc_in == AVCOL_TRC_SMPTE2084||
++    av_assert0(ctx->trc_in == AVCOL_TRC_SMPTE2084 ||
+                ctx->trc_in == AVCOL_TRC_ARIB_STD_B67);
+     av_assert0(ctx->colorspace_in == AVCOL_SPC_BT2020_NCL ||
+                ctx->colorspace_in == AVCOL_SPC_BT709);
+     av_assert0(ctx->primaries_in == AVCOL_PRI_BT2020 ||
+                ctx->primaries_in == AVCOL_PRI_BT709);
+ 
+-    av_bprintf(&header, "__constant const float tone_param = %.4ff;\n",
+-               ctx->param);
+-    av_bprintf(&header, "__constant const float desat_param = %.4ff;\n",
+-               ctx->desat_param);
+-    av_bprintf(&header, "__constant const float target_peak = %.4ff;\n",
+-               ctx->target_peak);
+-    av_bprintf(&header, "__constant const float sdr_avg = %.4ff;\n", sdr_avg);
+-    av_bprintf(&header, "__constant const float scene_threshold = %.4ff;\n",
+-               ctx->scene_threshold);
+-    av_bprintf(&header, "#define TONE_FUNC %s\n", tonemap_func[ctx->tonemap]);
+-    av_bprintf(&header, "#define DETECTION_FRAMES %d\n", DETECTION_FRAMES);
+-
+-    if (ctx->primaries_out != ctx->primaries_in) {
+-        if ((err = get_rgb2rgb_matrix(ctx->primaries_in, ctx->primaries_out, rgb2rgb)) < 0)
+-            goto fail;
+-        rgb2rgb_passthrough = 0;
+-    }
+-    if (ctx->range_in == AVCOL_RANGE_JPEG)
+-        av_bprintf(&header, "#define FULL_RANGE_IN\n");
+-
+-    if (ctx->range_out == AVCOL_RANGE_JPEG)
+-        av_bprintf(&header, "#define FULL_RANGE_OUT\n");
+-
+-    if (ctx->ocf.output_format == AV_PIX_FMT_P010)
+-        av_bprintf(&header, "#define BT2408_OUT_P010\n");
+-
+-    av_bprintf(&header, "#define chroma_loc %d\n", (int)ctx->chroma_loc);
+-
+-    if (rgb2rgb_passthrough)
+-        av_bprintf(&header, "#define RGB2RGB_PASSTHROUGH\n");
+-    else
+-        ff_opencl_print_const_matrix_3x3(&header, "rgb2rgb", rgb2rgb);
+-
+-
+-    luma_src = av_csp_luma_coeffs_from_avcsp(ctx->colorspace_in);
+-    if (!luma_src) {
+-        err = AVERROR(EINVAL);
+-        av_log(avctx, AV_LOG_ERROR, "unsupported input colorspace %d (%s)\n",
+-               ctx->colorspace_in, av_color_space_name(ctx->colorspace_in));
+-        goto fail;
+-    }
+-
+-    luma_dst = av_csp_luma_coeffs_from_avcsp(ctx->colorspace_out);
+-    if (!luma_dst) {
+-        err = AVERROR(EINVAL);
+-        av_log(avctx, AV_LOG_ERROR, "unsupported output colorspace %d (%s)\n",
+-               ctx->colorspace_out, av_color_space_name(ctx->colorspace_out));
+-        goto fail;
++    av_bprint_init(&header, 1024, AV_BPRINT_SIZE_AUTOMATIC);
++    err = build_opencl_header(avctx, &header);
++    if (err < 0) {
++        av_bprint_finalize(&header, NULL);
++        return err;
+     }
+ 
+-    ff_fill_rgb2yuv_table(luma_dst, rgb2yuv);
+-    ff_opencl_print_const_matrix_3x3(&header, "yuv_matrix", rgb2yuv);
+-
+-    ff_fill_rgb2yuv_table(luma_src, rgb2yuv);
+-    ff_matrix_invert_3x3(rgb2yuv, yuv2rgb);
+-    ff_opencl_print_const_matrix_3x3(&header, "rgb_matrix", yuv2rgb);
+-
+-    av_bprintf(&header, "constant float3 luma_src = {%.4ff, %.4ff, %.4ff};\n",
+-               av_q2d(luma_src->cr), av_q2d(luma_src->cg), av_q2d(luma_src->cb));
+-    av_bprintf(&header, "constant float3 luma_dst = {%.4ff, %.4ff, %.4ff};\n",
+-               av_q2d(luma_dst->cr), av_q2d(luma_dst->cg), av_q2d(luma_dst->cb));
+-
+-    av_bprintf(&header, "#define linearize %s\n", linearize_funcs[ctx->trc_in]);
+-    av_bprintf(&header, "#define delinearize %s\n",
+-               delinearize_funcs[ctx->trc_out]);
+-
+-    if (ctx->trc_in == AVCOL_TRC_ARIB_STD_B67)
+-        av_bprintf(&header, "#define ootf_impl ootf_hlg\n");
+-
+-    if (ctx->trc_out == AVCOL_TRC_ARIB_STD_B67)
+-        av_bprintf(&header, "#define inverse_ootf_impl inverse_ootf_hlg\n");
+-
+     av_log(avctx, AV_LOG_DEBUG, "Generated OpenCL header:\n%s\n", header.str);
+     opencl_sources[0] = header.str;
+-    opencl_sources[1] = ff_source_tonemap_cl;
+-    opencl_sources[2] = ff_source_bt2408_hable_cl;
+-    opencl_sources[3] = ff_source_colorspace_common_cl;
++    opencl_sources[1] = ff_source_colorspace_common_cl;
++    opencl_sources[2] = ff_source_dovi_reshape_cl;
++    opencl_sources[3] = ff_source_tonemap_cl;
++    opencl_sources[4] = ff_source_bt2408_hable_cl;
+     err = ff_opencl_filter_load_program(avctx, opencl_sources, OPENCL_SOURCE_NB);
+-
+     av_bprint_finalize(&header, NULL);
+     if (err < 0)
+-        goto fail;
+-
+-    ctx->command_queue = clCreateCommandQueue(ctx->ocf.hwctx->context,
+-                                              ctx->ocf.hwctx->device_id,
+-                                              0, &cle);
+-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL "
+-                     "command queue %d.\n", cle);
+-
+-    ctx->kernel = clCreateKernel(ctx->ocf.program,
+-                                 ctx->tonemap == TONEMAP_BT2408_HABLE ?
+-                                 "tonemap_bt2408" : "tonemap", &cle);
+-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel %d.\n", cle);
+-
+-    ctx->bt2408_mem = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_ONLY,
+-                                     sizeof(ctx->bt2408), NULL, &cle);
+-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create bt2408 buffer: %d.\n", cle);
++        return err;
+ 
+-    ctx->util_mem =
+-        clCreateBuffer(ctx->ocf.hwctx->context, 0,
+-                       (2 * DETECTION_FRAMES + 7) * sizeof(unsigned),
+-                       NULL, &cle);
+-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create util buffer: %d.\n", cle);
++    err = create_opencl_objects(avctx);
++    if (err < 0)
++        return err;
+ 
+     ctx->initialised = 1;
+     return 0;
+-
+-fail:
+-    av_bprint_finalize(&header, NULL);
+-    if (ctx->util_mem)
+-        clReleaseMemObject(ctx->util_mem);
+-    if (ctx->bt2408_mem)
+-        clReleaseMemObject(ctx->bt2408_mem);
+-    if (ctx->command_queue)
+-        clReleaseCommandQueue(ctx->command_queue);
+-    if (ctx->kernel)
+-        clReleaseKernel(ctx->kernel);
+-    return err;
+ }
+ 
+ static int tonemap_opencl_config_output(AVFilterLink *outlink)
+@@ -376,13 +408,37 @@ static int setup_bt2408(AVFilterContext *avctx, const AVFrame *input, double pea
+     return 0;
+ }
+ 
++static int set_kernel_args(AVFilterContext *avctx, cl_kernel kernel,
++                           AVFrame *output, AVFrame *input, float peak)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    cl_mem buf = ctx->tonemap == TONEMAP_BT2408_HABLE ? ctx->bt2408_mem : ctx->util_mem;
++    cl_int cle;
++
++    cle  = clSetKernelArg(kernel, 0, sizeof(cl_mem), &output->data[0]);
++    cle |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &input->data[0]);
++    cle |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &output->data[1]);
++    cle |= clSetKernelArg(kernel, 3, sizeof(cl_mem), &input->data[1]);
++    cle |= clSetKernelArg(kernel, 4, sizeof(cl_mem), &buf);
++    cle |= clSetKernelArg(kernel, 5, sizeof(cl_float), &peak);
++    if (ctx->dovi_mode)
++        cle |= clSetKernelArg(kernel, 6, sizeof(cl_mem), &ctx->dovi_mem);
++
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to set kernel arguments: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++    return 0;
++}
++
+ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+-                         AVFrame *output, AVFrame *input, float peak) {
++                         AVFrame *output, AVFrame *input, float peak)
++{
+     TonemapOpenCLContext *ctx = avctx->priv;
+-    int err = AVERROR(ENOSYS);
+     size_t global_work[2];
+     size_t local_work[2];
+     cl_int cle;
++    int err;
+ 
+     if (ctx->tonemap == TONEMAP_BT2408_HABLE) {
+         err = setup_bt2408(avctx, input, peak);
+@@ -390,13 +446,9 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+             return err;
+     }
+ 
+-    CL_SET_KERNEL_ARG(kernel, 0, cl_mem, &output->data[0]);
+-    CL_SET_KERNEL_ARG(kernel, 1, cl_mem, &input->data[0]);
+-    CL_SET_KERNEL_ARG(kernel, 2, cl_mem, &output->data[1]);
+-    CL_SET_KERNEL_ARG(kernel, 3, cl_mem, &input->data[1]);
+-    CL_SET_KERNEL_ARG(kernel, 4, cl_mem, ctx->tonemap == TONEMAP_BT2408_HABLE ?
+-                      &ctx->bt2408_mem : &ctx->util_mem);
+-    CL_SET_KERNEL_ARG(kernel, 5, cl_float, &peak);
++    err = set_kernel_args(avctx, kernel, output, input, peak);
++    if (err < 0)
++        return err;
+ 
+     local_work[0]  = 16;
+     local_work[1]  = 16;
+@@ -409,18 +461,120 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+     cle = clEnqueueNDRangeKernel(ctx->command_queue, kernel, 2, NULL,
+                                  global_work, local_work,
+                                  0, NULL, NULL);
+-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue kernel: %d.\n", cle);
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to enqueue kernel: %d.\n", cle);
++        return AVERROR(EIO);
++    }
+     return 0;
+-fail:
+-    return err;
+ }
+ 
++static int check_and_prepare_dovi(AVFilterContext *avctx, AVFrame *input, FFDoviReshape *rs)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    AVFrameSideData *sd;
++    int err;
++
++    static_assert(sizeof(FFDoviReshape) == 2804, "FFDoviReshape layout mismatch");
++
++    if (input->colorspace == AVCOL_SPC_IPT_C2) {
++        if (ctx->tonemap != TONEMAP_BT2408_HABLE) {
++            av_log(avctx, AV_LOG_ERROR, "Dolby Vision IPT-C2 input is only supported with "
++                   "tonemap=bt2408_hable; use dovi_reshape for other curves\n");
++            return AVERROR(ENOSYS);
++        }
++        ctx->dovi_mode = 1;
++    }
++    if (!ctx->dovi_mode)
++        return 0;
++
++    sd = av_frame_get_side_data(input, AV_FRAME_DATA_DOVI_METADATA);
++    if (!sd) {
++        av_log(avctx, AV_LOG_ERROR, "Dolby Vision frame carries no DOVI metadata\n");
++        return AVERROR(EINVAL);
++    }
++    if (input->color_range == AVCOL_RANGE_MPEG) {
++        av_log(avctx, AV_LOG_ERROR, "Limited range base layers are not supported\n");
++        return AVERROR(ENOSYS);
++    }
++    err = ff_dovi_reshape_init(rs, (const AVDOVIMetadata *)sd->data);
++    if (err < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Invalid Dolby Vision metadata: %d\n", err);
++        return err;
++    }
++    err = ff_dovi_reshape_set_hdr10_props(input, rs, (const AVDOVIMetadata *)sd->data);
++    if (err < 0)
++        return err;
++    input->colorspace = AVCOL_SPC_BT2020_NCL;
++    return 0;
++}
++
++static int update_dovi_buffer(AVFilterContext *avctx, const FFDoviReshape *rs)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    cl_int cle;
++
++    if (!ctx->dovi_mode)
++        return 0;
++    if (ctx->dovi_uploaded && !memcmp(&ctx->dovi_reshape, rs, sizeof(*rs)))
++        return 0;
++
++    cle = clEnqueueWriteBuffer(ctx->command_queue, ctx->dovi_mem, CL_TRUE, 0,
++                               sizeof(*rs), rs, 0, NULL, NULL);
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to write dovi reshape buffer: %d.\n", cle);
++        return AVERROR(EIO);
++    }
++    memcpy(&ctx->dovi_reshape, rs, sizeof(*rs));
++    ctx->dovi_uploaded = 1;
++    return 0;
++}
++
++static void cleanup_output_metadata(TonemapOpenCLContext *ctx, AVFrame *output)
++{
++    if (ctx->tonemap == TONEMAP_BT2408_HABLE) {
++        av_frame_remove_side_data(output, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++        av_frame_remove_side_data(output, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    } else {
++        ff_update_hdr_metadata(output, ctx->target_peak);
++    }
++    if (ctx->dovi_mode) {
++        av_frame_remove_side_data(output, AV_FRAME_DATA_DOVI_METADATA);
++        av_frame_remove_side_data(output, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++    }
++}
++
++#ifndef NDEBUG
++static void log_detected_peak(TonemapOpenCLContext *ctx)
++{
++    uint32_t *ptr, *max_total_p, *avg_total_p, *frame_number_p;
++    float peak_detected, avg_detected;
++    unsigned map_size = (2 * DETECTION_FRAMES  + 7) * sizeof(unsigned);
++    cl_int cle;
++
++    ptr = (void *)clEnqueueMapBuffer(ctx->command_queue, ctx->util_mem,
++                                     CL_TRUE, CL_MAP_READ, 0, map_size,
++                                     0, NULL, NULL, &cle);
++    if (ptr) {
++        max_total_p = ptr + 2 * (DETECTION_FRAMES + 1) + 1;
++        avg_total_p = max_total_p + 1;
++        frame_number_p = avg_total_p + 2;
++        peak_detected = (float)*max_total_p / (REFERENCE_WHITE * (*frame_number_p));
++        avg_detected = (float)*avg_total_p / (REFERENCE_WHITE * (*frame_number_p));
++        av_log(ctx, AV_LOG_DEBUG, "peak %f, avg %f will be used for next frame\n",
++               peak_detected, avg_detected);
++        clEnqueueUnmapMemObject(ctx->command_queue, ctx->util_mem, ptr, 0,
++                                NULL, NULL);
++    }
++}
++#endif
++
+ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+ {
+     AVFilterContext    *avctx = inlink->dst;
+     AVFilterLink     *outlink = avctx->outputs[0];
+     TonemapOpenCLContext *ctx = avctx->priv;
+     AVFrame *output = NULL;
++    FFDoviReshape rs;
+     cl_int cle;
+     int err;
+     double peak = ctx->peak;
+@@ -435,6 +589,12 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+         return AVERROR(EINVAL);
+     input_frames_ctx = (AVHWFramesContext*)input->hw_frames_ctx->data;
+ 
++    err = check_and_prepare_dovi(avctx, input, &rs);
++    if (err < 0) {
++        av_frame_free(&input);
++        return err;
++    }
++
+     output = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+     if (!output) {
+         err = AVERROR(ENOMEM);
+@@ -489,6 +649,14 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+             goto fail;
+     }
+ 
++    err = update_dovi_buffer(avctx, &rs);
++    if (err < 0) {
++        clFinish(ctx->command_queue);
++        av_frame_free(&input);
++        av_frame_free(&output);
++        return err;
++    }
++
+     switch(input_frames_ctx->sw_format) {
+     case AV_PIX_FMT_P010:
+         err = launch_kernel(avctx, ctx->kernel, output, input, peak);
+@@ -504,37 +672,13 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+ 
+     av_frame_free(&input);
+ 
+-    if (ctx->tonemap == TONEMAP_BT2408_HABLE) {
+-        av_frame_remove_side_data(output, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+-        av_frame_remove_side_data(output, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+-    } else {
+-        ff_update_hdr_metadata(output, ctx->target_peak);
+-    }
++    cleanup_output_metadata(ctx, output);
+ 
+     av_log(ctx, AV_LOG_DEBUG, "Tone-mapping output: %s, %ux%u (%"PRId64").\n",
+            av_get_pix_fmt_name(output->format),
+            output->width, output->height, output->pts);
+ #ifndef NDEBUG
+-    {
+-        uint32_t *ptr, *max_total_p, *avg_total_p, *frame_number_p;
+-        float peak_detected, avg_detected;
+-        unsigned map_size = (2 * DETECTION_FRAMES  + 7) * sizeof(unsigned);
+-        ptr = (void *)clEnqueueMapBuffer(ctx->command_queue, ctx->util_mem,
+-                                         CL_TRUE, CL_MAP_READ, 0, map_size,
+-                                         0, NULL, NULL, &cle);
+-        // For the layout of the util buffer, refer tonemap.cl
+-        if (ptr) {
+-            max_total_p = ptr + 2 * (DETECTION_FRAMES + 1) + 1;
+-            avg_total_p = max_total_p + 1;
+-            frame_number_p = avg_total_p + 2;
+-            peak_detected = (float)*max_total_p / (REFERENCE_WHITE * (*frame_number_p));
+-            avg_detected = (float)*avg_total_p / (REFERENCE_WHITE * (*frame_number_p));
+-            av_log(ctx, AV_LOG_DEBUG, "peak %f, avg %f will be used for next frame\n",
+-                   peak_detected, avg_detected);
+-            clEnqueueUnmapMemObject(ctx->command_queue, ctx->util_mem, ptr, 0,
+-                                    NULL, NULL);
+-        }
+-    }
++    log_detected_peak(ctx);
+ #endif
+ 
+     return ff_filter_frame(outlink, output);
+@@ -555,6 +699,8 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
+         clReleaseMemObject(ctx->util_mem);
+     if (ctx->bt2408_mem)
+         clReleaseMemObject(ctx->bt2408_mem);
++    if (ctx->dovi_mem)
++        clReleaseMemObject(ctx->dovi_mem);
+     if (ctx->kernel) {
+         cle = clReleaseKernel(ctx->kernel);
+         if (cle != CL_SUCCESS)

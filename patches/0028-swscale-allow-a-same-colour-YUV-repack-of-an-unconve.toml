@@ -1,0 +1,6 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx", "pelorus"]
+origin = "#63 Dolby Vision profile 5 reshape (ADR-0002), part 1 of the tonemap_opencl reshape: the P010 repack of an IPT-C2 base layer before hwupload"
+notes = """
+sws_frame_setup() accepts a frame whose colour space it cannot convert when both sides are YUV and agree in colour space, range, chroma location, primaries and transfer (ff_fmt_same_color() in format.h); the colour space test is repeated with BT.2020 NCL as a stand-in so every other check still runs. sws_test_colorspace() stays as in FFmpeg. Measured on the 1280x720 profile 5 clip of #63 with a minimal n9.0.2 build: format=gbrp10, format=rgb48le, scale=out_color_matrix=bt709 and scale=out_range=tv are refused (rc 161, Unsupported input) where the build without this series refuses them in negotiation (rc 218); format=p010 and format=yuv420p pass; format=p010,format=yuv420p10le is framemd5-identical to the plain decode on all 96 frames. testsrc2 through (yuv420p,nv12), (yuv420p10le,p010le), (yuv420p,rgb24) and (rgb24,yuv420p) is hash-identical to the build without this series. FATE was not run: the minimal build has no FATE targets."""

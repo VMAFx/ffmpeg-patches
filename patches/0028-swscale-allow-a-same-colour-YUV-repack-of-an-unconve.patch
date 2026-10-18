@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 11:05:59 +0200
+Subject: [PATCH] swscale: allow a same-colour YUV repack of an unconvertible
+ colour space
+
+sws_frame_setup() refuses a frame whose colour space swscale cannot
+convert, unless source and destination are equal in every property.
+That also refuses conversions that apply no colour matrix at all, such
+as repacking a Dolby Vision profile 5 base layer (IPT-C2) from
+yuv420p10le to p010 for hwupload.
+
+Accept such a frame when both sides are YUV and agree in colour space,
+range, chroma location, primaries and transfer; only the pixel layout,
+depth or size differ, and the colour space test is repeated with a
+convertible stand-in so every other check still applies. Conversions to
+RGB, to another matrix or to another range stay refused.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libswscale/format.h  | 23 +++++++++++++++++++++++
+ libswscale/swscale.c | 20 +++++++++++++++++---
+ 2 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/libswscale/format.h b/libswscale/format.h
+index ea2ab7dc41a0796f25f316b92b8798b6ddd1a3ef..27f1d889077654e1206325c0d606c8930c125825 100644
+--- a/libswscale/format.h
++++ b/libswscale/format.h
+@@ -135,6 +135,29 @@ static inline int ff_fmt_equal(const SwsFormat *fmt1, const SwsFormat *fmt2)
+            ff_color_equal(&fmt1->color, &fmt2->color);
+ }
+ 
++/**
++ * A repack/rescale between two YUV layouts of the same colour applies no
++ * matrix, so a colour space swscale cannot convert may pass through.
++ */
++static inline int ff_fmt_same_color(const SwsFormat *a, const SwsFormat *b)
++{
++    const AVPixFmtDescriptor *desc_a = a->desc ? a->desc : av_pix_fmt_desc_get(a->format);
++    const AVPixFmtDescriptor *desc_b = b->desc ? b->desc : av_pix_fmt_desc_get(b->format);
++
++    if (!desc_a || !desc_b)
++        return 0;
++
++    if (desc_a->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_XYZ | AV_PIX_FMT_FLAG_PAL))
++        return 0;
++    if (desc_b->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_XYZ | AV_PIX_FMT_FLAG_PAL))
++        return 0;
++
++    return a->csp   == b->csp   &&
++           a->range == b->range &&
++           a->loc   == b->loc   &&
++           ff_color_equal(&a->color, &b->color);
++}
++
+ static inline int ff_fmt_align(enum AVPixelFormat fmt)
+ {
+     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
+diff --git a/libswscale/swscale.c b/libswscale/swscale.c
+index 969456efcce030a7a7df16bd26b608b4de4e42ea..8e328b81499f1d277f79d89249dd6733d5a4103e 100644
+--- a/libswscale/swscale.c
++++ b/libswscale/swscale.c
+@@ -1457,6 +1457,22 @@ static int validate_params(SwsContext *ctx)
+     return 0;
+ }
+ 
++static int test_frame_fmt(const SwsBackend backends, const SwsFormat *src,
++                          const SwsFormat *dst, int *src_ok, int *dst_ok)
++{
++    *src_ok = ff_test_fmt(backends, src, 0);
++    *dst_ok = ff_test_fmt(backends, dst, 1);
++    if ((!*src_ok || !*dst_ok) && ff_fmt_same_color(src, dst)) {
++        SwsFormat s_test = *src;
++        SwsFormat d_test = *dst;
++        s_test.csp = AVCOL_SPC_BT2020_NCL;
++        d_test.csp = AVCOL_SPC_BT2020_NCL;
++        *src_ok = ff_test_fmt(backends, &s_test, 0);
++        *dst_ok = ff_test_fmt(backends, &d_test, 1);
++    }
++    return (*src_ok && *dst_ok) || ff_fmt_equal(src, dst);
++}
++
+ int sws_frame_setup(SwsContext *ctx, const AVFrame *dst, const AVFrame *src)
+ {
+     SwsInternal *s = sws_internal(ctx);
+@@ -1510,9 +1526,7 @@ int sws_frame_setup(SwsContext *ctx, const AVFrame *dst, const AVFrame *src)
+             goto fail;
+         }
+ 
+-        src_ok = ff_test_fmt(backends, &src_fmt, 0);
+-        dst_ok = ff_test_fmt(backends, &dst_fmt, 1);
+-        if ((!src_ok || !dst_ok) && !ff_fmt_equal(&src_fmt, &dst_fmt)) {
++        if (!test_frame_fmt(backends, &src_fmt, &dst_fmt, &src_ok, &dst_ok)) {
+             err_msg = src_ok ? "Unsupported output" : "Unsupported input";
+             ret = AVERROR(ENOTSUP);
+             goto fail;
