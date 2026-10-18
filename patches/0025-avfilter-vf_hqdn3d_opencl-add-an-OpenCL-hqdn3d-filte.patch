@@ -1,0 +1,1352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 05:43:57 +0200
+Subject: [PATCH] avfilter/vf_hqdn3d_opencl: add an OpenCL hqdn3d filter
+
+Add hqdn3d_opencl, an OpenCL port of the integer hqdn3d filter whose
+output is identical to the CPU filter. It takes the options and
+commands of hqdn3d and uses the shared tables in hqdn3d_coefs.c.
+
+A horizontal kernel filters each row into an intermediate buffer; a
+vertical kernel filters each column and applies the temporal lowpass
+against the previous output. The temporal state is dropped where
+hqdn3d drops it, and after a frame size change inside a running graph
+the output frames come from a frames context of the new size.
+
+The OpenCL frames context has no LSB-aligned 10- or 12-bit planar
+format, so the high-depth planar formats are the 16-bit ones; p010,
+p012 and p016 are accepted.
+
+tools/hqdn3d_reset_test now also runs the OpenCL filter with an
+ocl:<platform>.<device> argument.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ configure                      |   1 +
+ doc/filters.texi               |  33 ++
+ libavfilter/Makefile           |   1 +
+ libavfilter/allfilters.c       |   1 +
+ libavfilter/opencl/hqdn3d.cl   | 315 +++++++++++++
+ libavfilter/opencl_source.h    |   1 +
+ libavfilter/vf_hqdn3d_opencl.c | 810 +++++++++++++++++++++++++++++++++
+ tools/Makefile                 |   1 +
+ tools/hqdn3d_reset_test.c      |  28 +-
+ 9 files changed, 1190 insertions(+), 1 deletion(-)
+ create mode 100644 libavfilter/opencl/hqdn3d.cl
+ create mode 100644 libavfilter/vf_hqdn3d_opencl.c
+
+diff --git a/configure b/configure
+index c8c4e002e95f06aac7a5e2caccd0d2a93dee366d..d386cc831d5e7265f8f73f42692a91ea57bdf4cb 100755
+--- a/configure
++++ b/configure
+@@ -4202,6 +4202,7 @@ histeq_filter_deps="gpl"
+ hqdn3d_filter_deps="gpl"
+ hqdn3d_cuda_filter_deps="gpl ffnvcodec"
+ hqdn3d_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
++hqdn3d_opencl_filter_deps="gpl opencl"
+ hqdn3d_vulkan_filter_deps="gpl vulkan spirv_compiler"
+ iccdetect_filter_deps="lcms2"
+ iccgen_filter_deps="lcms2"
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 588f61084b8da6bbe91b0de86dad2f015cd8cf5d..34c895248d82780750b13bfa66bb072699208ec9 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -15824,6 +15824,39 @@ The filter accepts the same options as @ref{hqdn3d}:
+ @subsection Commands
+ This filter supports the same @ref{commands} as options.
+ 
++@anchor{hqdn3d_opencl}
++@section hqdn3d_opencl
++
++Apply a High Quality 3D Denoiser using OpenCL.
++The output is bit-exact to the CPU @ref{hqdn3d} filter. The one exception is
++@samp{p010} and @samp{p012}: where the CPU filter writes a value above the
++format maximum, which these formats cannot store, this filter writes the
++format maximum.
++
++Supported input hardware frame software formats:
++@itemize
++@item @samp{yuv420p}
++@item @samp{yuv422p}
++@item @samp{yuv444p}
++@item @samp{yuv420p16}
++@item @samp{yuv444p16}
++@item @samp{nv12}
++@item @samp{p010}
++@item @samp{p012}
++@item @samp{p016}
++@end itemize
++
++The filter accepts the same options as @ref{hqdn3d}:
++@table @option
++@item luma_spatial
++@item chroma_spatial
++@item luma_tmp
++@item chroma_tmp
++@end table
++
++@subsection Commands
++This filter supports the same @ref{commands} as options.
++
+ @anchor{hqdn3d_vulkan}
+ @section hqdn3d_vulkan
+ 
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 77c6000da756f68228723db7adc54c71cac8ffda..2b91412c57deb59c1f69eaac68f797e1cf662bbd 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -348,6 +348,7 @@ OBJS-$(CONFIG_HISTEQ_FILTER)                 += vf_histeq.o
+ OBJS-$(CONFIG_HISTOGRAM_FILTER)              += vf_histogram.o
+ OBJS-$(CONFIG_HQDN3D_FILTER)                 += vf_hqdn3d.o hqdn3d_coefs.o
+ OBJS-$(CONFIG_HQDN3D_CUDA_FILTER)            += vf_hqdn3d_cuda.o vf_hqdn3d_cuda.ptx.o hqdn3d_coefs.o cuda/load_helper.o
++OBJS-$(CONFIG_HQDN3D_OPENCL_FILTER)          += vf_hqdn3d_opencl.o opencl.o opencl/hqdn3d.o hqdn3d_coefs.o
+ OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER)          += vf_hqdn3d_vulkan.o hqdn3d_coefs.o vulkan.o vulkan_filter.o
+ OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
+ OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 3cacb97a8fbfc2e5e0880aa1048f2459f9200884..81c1f2c8a8d38e38b40a2b6bfb3e8f05fbbbc627 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -322,6 +322,7 @@ extern const FFFilter ff_vf_histeq;
+ extern const FFFilter ff_vf_histogram;
+ extern const FFFilter ff_vf_hqdn3d;
+ extern const FFFilter ff_vf_hqdn3d_cuda;
++extern const FFFilter ff_vf_hqdn3d_opencl;
+ extern const FFFilter ff_vf_hqdn3d_vulkan;
+ extern const FFFilter ff_vf_hqx;
+ extern const FFFilter ff_vf_hstack;
+diff --git a/libavfilter/opencl/hqdn3d.cl b/libavfilter/opencl/hqdn3d.cl
+new file mode 100644
+index 0000000000000000000000000000000000000000..480d7300b17669168bde3ae67efd3b05de1e9ce2
+--- /dev/null
++++ b/libavfilter/opencl/hqdn3d.cl
+@@ -0,0 +1,315 @@
++/*
++ * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
++ * Copyright (c) 2010 Baptiste Coudurier
++ * Copyright (c) 2012 Loren Merritt
++ * Copyright (c) 2026 Lusoris
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++const sampler_t sampler = (CLK_NORMALIZED_COORDS_FALSE |
++                           CLK_ADDRESS_CLAMP_TO_EDGE   |
++                           CLK_FILTER_NEAREST);
++
++static inline uint load_sample(uint raw, uint s_depth, uint s_msb)
++{
++    uint shift = 16u - s_depth;
++    uint sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    uint rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
++    return (sample_val << shift) + rounding;
++}
++
++static inline uint store_sample(uint val, uint s_depth, uint s_msb)
++{
++    uint shift = 16u - s_depth;
++    uint stored = val >> shift;
++    if (s_msb != 0u) {
++        uint max_val = (1u << s_depth) - 1u;
++        if (stored > max_val)
++            stored = max_val;
++        return stored << shift;
++    }
++    return stored;
++}
++
++static inline int lowpass(int prev_val, int cur_val,
++                          __global const short *coef_tables,
++                          int t_offset,
++                          int l_bits)
++{
++    int d = (prev_val - cur_val) >> (8 - l_bits);
++    int center = 256 << l_bits;
++    int idx = t_offset + center + d;
++    int coef = (int)coef_tables[idx];
++    return cur_val + coef;
++}
++
++__kernel void hqdn3d_horizontal_planar(
++    __read_only image2d_t in_img,
++    __global ushort *h_data, int h_offset,
++    __global const short *coef_tables, int spatial_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb)
++{
++    int y = get_global_id(0);
++    float max_norm = (depth <= 8) ? 255.0f : 65535.0f;
++    int h_row_start = h_offset + y * width;
++    uint raw0, pixel_ant;
++
++    if (y >= height)
++        return;
++
++    raw0 = (uint)convert_int_rte(read_imagef(in_img, sampler, (int2)(0, y)).x * max_norm);
++    pixel_ant = load_sample(raw0, depth, is_msb);
++
++    if (y == 0) {
++        for (int x = 0; x < width; x++) {
++            uint raw = (uint)convert_int_rte(read_imagef(in_img, sampler, (int2)(x, 0)).x * max_norm);
++            uint cur = load_sample(raw, depth, is_msb);
++            pixel_ant = (uint)lowpass((int)pixel_ant, (int)cur, coef_tables, spatial_offset, lut_bits);
++            h_data[h_row_start + x] = (ushort)pixel_ant;
++        }
++    } else {
++        h_data[h_row_start + 0] = (ushort)pixel_ant;
++        for (int x = 0; x + 1 < width; x++) {
++            uint raw = (uint)convert_int_rte(read_imagef(in_img, sampler, (int2)(x + 1, y)).x * max_norm);
++            uint cur = load_sample(raw, depth, is_msb);
++            pixel_ant = (uint)lowpass((int)pixel_ant, (int)cur, coef_tables, spatial_offset, lut_bits);
++            h_data[h_row_start + x + 1] = (ushort)pixel_ant;
++        }
++    }
++}
++
++__kernel void hqdn3d_horizontal_semiplanar(
++    __read_only image2d_t in_img,
++    __global ushort *h_data, int h_offset_u, int h_offset_v,
++    __global const short *coef_tables, int spatial_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb)
++{
++    int y = get_global_id(0);
++    float max_norm = (depth <= 8) ? 255.0f : 65535.0f;
++    int h_row_u = h_offset_u + y * width;
++    int h_row_v = h_offset_v + y * width;
++    float4 raw0;
++    uint pixel_ant_u, pixel_ant_v;
++
++    if (y >= height)
++        return;
++
++    raw0 = read_imagef(in_img, sampler, (int2)(0, y));
++    pixel_ant_u = load_sample((uint)convert_int_rte(raw0.x * max_norm), depth, is_msb);
++    pixel_ant_v = load_sample((uint)convert_int_rte(raw0.y * max_norm), depth, is_msb);
++
++    if (y == 0) {
++        for (int x = 0; x < width; x++) {
++            float4 raw = read_imagef(in_img, sampler, (int2)(x, 0));
++            uint cur_u = load_sample((uint)convert_int_rte(raw.x * max_norm), depth, is_msb);
++            uint cur_v = load_sample((uint)convert_int_rte(raw.y * max_norm), depth, is_msb);
++            pixel_ant_u = (uint)lowpass((int)pixel_ant_u, (int)cur_u, coef_tables, spatial_offset, lut_bits);
++            pixel_ant_v = (uint)lowpass((int)pixel_ant_v, (int)cur_v, coef_tables, spatial_offset, lut_bits);
++            h_data[h_row_u + x] = (ushort)pixel_ant_u;
++            h_data[h_row_v + x] = (ushort)pixel_ant_v;
++        }
++    } else {
++        h_data[h_row_u + 0] = (ushort)pixel_ant_u;
++        h_data[h_row_v + 0] = (ushort)pixel_ant_v;
++        for (int x = 0; x + 1 < width; x++) {
++            float4 raw = read_imagef(in_img, sampler, (int2)(x + 1, y));
++            uint cur_u = load_sample((uint)convert_int_rte(raw.x * max_norm), depth, is_msb);
++            uint cur_v = load_sample((uint)convert_int_rte(raw.y * max_norm), depth, is_msb);
++            pixel_ant_u = (uint)lowpass((int)pixel_ant_u, (int)cur_u, coef_tables, spatial_offset, lut_bits);
++            pixel_ant_v = (uint)lowpass((int)pixel_ant_v, (int)cur_v, coef_tables, spatial_offset, lut_bits);
++            h_data[h_row_u + x + 1] = (ushort)pixel_ant_u;
++            h_data[h_row_v + x + 1] = (ushort)pixel_ant_v;
++        }
++    }
++}
++
++static void vertical_planar_temporal(
++    __read_only image2d_t in_img,
++    __write_only image2d_t out_img,
++    __global ushort *frame_ant_data, int fa_offset,
++    __global const short *coef_tables, int temporal_offset,
++    int width, int height, int x,
++    int depth, int lut_bits, int is_msb, int first_frame, float max_norm)
++{
++    for (int y = 0; y < height; y++) {
++        uint raw = (uint)convert_int_rte(read_imagef(in_img, sampler, (int2)(x, y)).x * max_norm);
++        int cur = (int)load_sample(raw, depth, is_msb);
++        int fa_idx = fa_offset + y * width + x;
++        int prev_ant = first_frame ? cur : (int)frame_ant_data[fa_idx];
++        int tmp = lowpass(prev_ant, cur, coef_tables, temporal_offset, lut_bits);
++        uint out_val = store_sample((uint)tmp, depth, is_msb);
++        frame_ant_data[fa_idx] = (ushort)tmp;
++        write_imagef(out_img, (int2)(x, y), (float4)((float)out_val / max_norm, 0.0f, 0.0f, 0.0f));
++    }
++}
++
++static void vertical_planar_spatial(
++    __read_only image2d_t in_img,
++    __write_only image2d_t out_img,
++    __global const ushort *h_data, int h_offset,
++    __global ushort *frame_ant_data, int fa_offset,
++    __global const short *coef_tables, int spatial_offset, int temporal_offset,
++    int width, int height, int x,
++    int depth, int lut_bits, int is_msb, int first_frame, float max_norm)
++{
++    int line_ant = (int)h_data[h_offset + x];
++    for (int y = 0; y < height; y++) {
++        int spat_tmp = line_ant;
++        int fa_idx = fa_offset + y * width + x;
++        int prev_ant;
++        if (y > 0) {
++            int h_val = (int)h_data[h_offset + y * width + x];
++            spat_tmp = lowpass(line_ant, h_val, coef_tables, spatial_offset, lut_bits);
++            line_ant = (int)(ushort)spat_tmp;
++        }
++        if (first_frame) {
++            uint raw = (uint)convert_int_rte(read_imagef(in_img, sampler, (int2)(x, y)).x * max_norm);
++            prev_ant = (int)load_sample(raw, depth, is_msb);
++        } else {
++            prev_ant = (int)frame_ant_data[fa_idx];
++        }
++        int temp_tmp = lowpass(prev_ant, spat_tmp, coef_tables, temporal_offset, lut_bits);
++        uint out_val = store_sample((uint)temp_tmp, depth, is_msb);
++        frame_ant_data[fa_idx] = (ushort)temp_tmp;
++        write_imagef(out_img, (int2)(x, y), (float4)((float)out_val / max_norm, 0.0f, 0.0f, 0.0f));
++    }
++}
++
++__kernel void hqdn3d_vertical_planar(
++    __read_only image2d_t in_img,
++    __write_only image2d_t out_img,
++    __global const ushort *h_data, int h_offset,
++    __global ushort *frame_ant_data, int fa_offset,
++    __global const short *coef_tables, int spatial_offset, int temporal_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb, int first_frame, int spatial_enabled)
++{
++    int x = get_global_id(0);
++    float max_norm = (depth <= 8) ? 255.0f : 65535.0f;
++
++    if (x >= width)
++        return;
++
++    if (spatial_enabled == 0) {
++        vertical_planar_temporal(in_img, out_img, frame_ant_data, fa_offset,
++                                 coef_tables, temporal_offset, width, height, x,
++                                 depth, lut_bits, is_msb, first_frame, max_norm);
++    } else {
++        vertical_planar_spatial(in_img, out_img, h_data, h_offset, frame_ant_data, fa_offset,
++                                coef_tables, spatial_offset, temporal_offset, width, height, x,
++                                depth, lut_bits, is_msb, first_frame, max_norm);
++    }
++}
++
++static void vertical_semiplanar_temporal(
++    __read_only image2d_t in_img,
++    __write_only image2d_t out_img,
++    __global ushort *frame_ant_data, int fa_offset_u, int fa_offset_v,
++    __global const short *coef_tables, int temporal_offset,
++    int width, int height, int x,
++    int depth, int lut_bits, int is_msb, int first_frame, float max_norm)
++{
++    for (int y = 0; y < height; y++) {
++        float4 raw = read_imagef(in_img, sampler, (int2)(x, y));
++        int cur_u = (int)load_sample((uint)convert_int_rte(raw.x * max_norm), depth, is_msb);
++        int cur_v = (int)load_sample((uint)convert_int_rte(raw.y * max_norm), depth, is_msb);
++        int fa_u = fa_offset_u + y * width + x;
++        int fa_v = fa_offset_v + y * width + x;
++        int prev_u = first_frame ? cur_u : (int)frame_ant_data[fa_u];
++        int prev_v = first_frame ? cur_v : (int)frame_ant_data[fa_v];
++        int tmp_u = lowpass(prev_u, cur_u, coef_tables, temporal_offset, lut_bits);
++        int tmp_v = lowpass(prev_v, cur_v, coef_tables, temporal_offset, lut_bits);
++        uint out_u = store_sample((uint)tmp_u, depth, is_msb);
++        uint out_v = store_sample((uint)tmp_v, depth, is_msb);
++        frame_ant_data[fa_u] = (ushort)tmp_u;
++        frame_ant_data[fa_v] = (ushort)tmp_v;
++        write_imagef(out_img, (int2)(x, y), (float4)((float)out_u / max_norm, (float)out_v / max_norm, 0.0f, 0.0f));
++    }
++}
++
++static void vertical_semiplanar_spatial(
++    __read_only image2d_t in_img,
++    __write_only image2d_t out_img,
++    __global const ushort *h_data, int h_offset_u, int h_offset_v,
++    __global ushort *frame_ant_data, int fa_offset_u, int fa_offset_v,
++    __global const short *coef_tables, int spatial_offset, int temporal_offset,
++    int width, int height, int x,
++    int depth, int lut_bits, int is_msb, int first_frame, float max_norm)
++{
++    int line_ant_u = (int)h_data[h_offset_u + x];
++    int line_ant_v = (int)h_data[h_offset_v + x];
++    for (int y = 0; y < height; y++) {
++        int spat_tmp_u = line_ant_u;
++        int spat_tmp_v = line_ant_v;
++        int fa_u = fa_offset_u + y * width + x;
++        int fa_v = fa_offset_v + y * width + x;
++        int prev_u, prev_v;
++        if (y > 0) {
++            int h_u = (int)h_data[h_offset_u + y * width + x];
++            int h_v = (int)h_data[h_offset_v + y * width + x];
++            spat_tmp_u = lowpass(line_ant_u, h_u, coef_tables, spatial_offset, lut_bits);
++            spat_tmp_v = lowpass(line_ant_v, h_v, coef_tables, spatial_offset, lut_bits);
++            line_ant_u = (int)(ushort)spat_tmp_u;
++            line_ant_v = (int)(ushort)spat_tmp_v;
++        }
++        if (first_frame) {
++            float4 raw = read_imagef(in_img, sampler, (int2)(x, y));
++            prev_u = (int)load_sample((uint)convert_int_rte(raw.x * max_norm), depth, is_msb);
++            prev_v = (int)load_sample((uint)convert_int_rte(raw.y * max_norm), depth, is_msb);
++        } else {
++            prev_u = (int)frame_ant_data[fa_u];
++            prev_v = (int)frame_ant_data[fa_v];
++        }
++        int temp_tmp_u = lowpass(prev_u, spat_tmp_u, coef_tables, temporal_offset, lut_bits);
++        int temp_tmp_v = lowpass(prev_v, spat_tmp_v, coef_tables, temporal_offset, lut_bits);
++        uint out_u = store_sample((uint)temp_tmp_u, depth, is_msb);
++        uint out_v = store_sample((uint)temp_tmp_v, depth, is_msb);
++        frame_ant_data[fa_u] = (ushort)temp_tmp_u;
++        frame_ant_data[fa_v] = (ushort)temp_tmp_v;
++        write_imagef(out_img, (int2)(x, y), (float4)((float)out_u / max_norm, (float)out_v / max_norm, 0.0f, 0.0f));
++    }
++}
++
++__kernel void hqdn3d_vertical_semiplanar(
++    __read_only image2d_t in_img,
++    __write_only image2d_t out_img,
++    __global const ushort *h_data, int h_offset_u, int h_offset_v,
++    __global ushort *frame_ant_data, int fa_offset_u, int fa_offset_v,
++    __global const short *coef_tables, int spatial_offset, int temporal_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb, int first_frame, int spatial_enabled)
++{
++    int x = get_global_id(0);
++    float max_norm = (depth <= 8) ? 255.0f : 65535.0f;
++
++    if (x >= width)
++        return;
++
++    if (spatial_enabled == 0) {
++        vertical_semiplanar_temporal(in_img, out_img, frame_ant_data, fa_offset_u, fa_offset_v,
++                                     coef_tables, temporal_offset, width, height, x,
++                                     depth, lut_bits, is_msb, first_frame, max_norm);
++    } else {
++        vertical_semiplanar_spatial(in_img, out_img, h_data, h_offset_u, h_offset_v,
++                                    frame_ant_data, fa_offset_u, fa_offset_v,
++                                    coef_tables, spatial_offset, temporal_offset, width, height, x,
++                                    depth, lut_bits, is_msb, first_frame, max_norm);
++    }
++}
+diff --git a/libavfilter/opencl_source.h b/libavfilter/opencl_source.h
+index 4a7b945e029fbff9a5795481d455dc5afd90d90b..65546425d65f6c3ffc71e9ffe7ad88c5a8e72453 100644
+--- a/libavfilter/opencl_source.h
++++ b/libavfilter/opencl_source.h
+@@ -25,6 +25,7 @@ extern const char *ff_source_colorkey_cl;
+ extern const char *ff_source_colorspace_common_cl;
+ extern const char *ff_source_convolution_cl;
+ extern const char *ff_source_deshake_cl;
++extern const char *ff_source_hqdn3d_cl;
+ extern const char *ff_source_neighbor_cl;
+ extern const char *ff_source_nlmeans_cl;
+ extern const char *ff_source_overlay_cl;
+diff --git a/libavfilter/vf_hqdn3d_opencl.c b/libavfilter/vf_hqdn3d_opencl.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ba48b78055d4b087a1a583c91711b6c748d146a
+--- /dev/null
++++ b/libavfilter/vf_hqdn3d_opencl.c
+@@ -0,0 +1,810 @@
++/*
++ * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
++ * Copyright (c) 2010 Baptiste Coudurier
++ * Copyright (c) 2012 Loren Merritt
++ * Copyright (c) 2026 Lusoris
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#define CL_TARGET_OPENCL_VERSION 120
++#include "opencl.h"
++#include "opencl_source.h"
++
++#include <float.h>
++#include <stdint.h>
++#include "libavutil/avassert.h"
++#include "libavutil/common.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "video.h"
++#include "vf_hqdn3d.h"
++#include "hqdn3d_coefs.h"
++
++typedef struct HQDN3DOpenCLContext {
++    OpenCLFilterContext ocf;
++
++    int initialised;
++    cl_kernel kernel_horiz_planar;
++    cl_kernel kernel_horiz_semiplanar;
++    cl_kernel kernel_vert_planar;
++    cl_kernel kernel_vert_semiplanar;
++    cl_command_queue command_queue;
++
++    cl_mem tables_buf;
++    cl_mem h_buf;
++    cl_mem frame_ant_buf;
++
++    double strength[4];
++
++    int hsub, vsub;
++    int depth;
++    int is_msb;
++    int is_semiplanar;
++    int width, height;
++    enum AVPixelFormat sw_format;
++
++    int spatial_enabled[2];
++    int first_frame;
++
++    AVBufferRef *out_frames_ref;
++} HQDN3DOpenCLContext;
++
++static int validate_format(AVFilterContext *ctx, enum AVPixelFormat sw_format,
++                           int *depth, int *is_msb, int *is_semiplanar)
++{
++    switch (sw_format) {
++    case AV_PIX_FMT_YUV420P:
++    case AV_PIX_FMT_YUV422P:
++    case AV_PIX_FMT_YUV444P:
++        *depth = 8;
++        *is_msb = 0;
++        *is_semiplanar = 0;
++        return 0;
++    case AV_PIX_FMT_YUV420P16:
++    case AV_PIX_FMT_YUV444P16:
++        *depth = 16;
++        *is_msb = 0;
++        *is_semiplanar = 0;
++        return 0;
++    case AV_PIX_FMT_NV12:
++        *depth = 8;
++        *is_msb = 0;
++        *is_semiplanar = 1;
++        return 0;
++    case AV_PIX_FMT_P010:
++        *depth = 10;
++        *is_msb = 1;
++        *is_semiplanar = 1;
++        return 0;
++    case AV_PIX_FMT_P012:
++        *depth = 12;
++        *is_msb = 1;
++        *is_semiplanar = 1;
++        return 0;
++    case AV_PIX_FMT_P016:
++        *depth = 16;
++        *is_msb = 1;
++        *is_semiplanar = 1;
++        return 0;
++    default:
++        av_log(ctx, AV_LOG_ERROR, "Unsupported sw_format: %s\n",
++               av_get_pix_fmt_name(sw_format));
++        return AVERROR(ENOSYS);
++    }
++}
++
++#define OFFSET(x) offsetof(HQDN3DOpenCLContext, x)
++#define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_RUNTIME_PARAM
++
++static const AVOption hqdn3d_opencl_options[] = {
++    { "luma_spatial",   "spatial luma strength",    OFFSET(strength[LUMA_SPATIAL]),   AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { "chroma_spatial", "spatial chroma strength",  OFFSET(strength[CHROMA_SPATIAL]), AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { "luma_tmp",       "temporal luma strength",   OFFSET(strength[LUMA_TMP]),       AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { "chroma_tmp",     "temporal chroma strength", OFFSET(strength[CHROMA_TMP]),     AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0.0, DBL_MAX, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(hqdn3d_opencl);
++
++static av_cold int hqdn3d_opencl_init(AVFilterContext *ctx)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++
++    ff_opencl_filter_init(ctx);
++    s->out_frames_ref = NULL;
++    ff_hqdn3d_default_strengths(s->strength);
++
++    av_log(ctx, AV_LOG_VERBOSE, "ls:%f cs:%f lt:%f ct:%f\n",
++           s->strength[LUMA_SPATIAL], s->strength[CHROMA_SPATIAL],
++           s->strength[LUMA_TMP], s->strength[CHROMA_TMP]);
++
++    return 0;
++}
++
++static void free_buffers(AVFilterContext *ctx)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++
++    if (s->tables_buf) {
++        clReleaseMemObject(s->tables_buf);
++        s->tables_buf = NULL;
++    }
++    if (s->h_buf) {
++        clReleaseMemObject(s->h_buf);
++        s->h_buf = NULL;
++    }
++    if (s->frame_ant_buf) {
++        clReleaseMemObject(s->frame_ant_buf);
++        s->frame_ant_buf = NULL;
++    }
++}
++
++static void release_kernels(HQDN3DOpenCLContext *s)
++{
++    if (s->kernel_horiz_planar) {
++        clReleaseKernel(s->kernel_horiz_planar);
++        s->kernel_horiz_planar = NULL;
++    }
++    if (s->kernel_horiz_semiplanar) {
++        clReleaseKernel(s->kernel_horiz_semiplanar);
++        s->kernel_horiz_semiplanar = NULL;
++    }
++    if (s->kernel_vert_planar) {
++        clReleaseKernel(s->kernel_vert_planar);
++        s->kernel_vert_planar = NULL;
++    }
++    if (s->kernel_vert_semiplanar) {
++        clReleaseKernel(s->kernel_vert_semiplanar);
++        s->kernel_vert_semiplanar = NULL;
++    }
++}
++
++static av_cold void hqdn3d_opencl_uninit(AVFilterContext *ctx)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++
++    release_kernels(s);
++    if (s->command_queue) {
++        clReleaseCommandQueue(s->command_queue);
++        s->command_queue = NULL;
++    }
++    free_buffers(ctx);
++    av_buffer_unref(&s->out_frames_ref);
++    ff_opencl_filter_uninit(ctx);
++    s->initialised = 0;
++}
++
++static int init_buffers(AVFilterContext *ctx, int w, int h)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    cl_context clctx = s->ocf.hwctx->context;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    size_t tables_sz = (size_t)4 * (512 << lut_bits) * sizeof(int16_t);
++    int cw = AV_CEIL_RSHIFT(w, s->hsub);
++    int ch = AV_CEIL_RSHIFT(h, s->vsub);
++    size_t samples = (size_t)w * h + (size_t)2 * cw * ch;
++    size_t data_sz = samples * sizeof(uint16_t);
++    cl_int cle;
++
++    s->tables_buf = clCreateBuffer(clctx, CL_MEM_READ_ONLY, tables_sz, NULL, &cle);
++    if (cle != CL_SUCCESS)
++        return AVERROR(EIO);
++
++    s->h_buf = clCreateBuffer(clctx, CL_MEM_READ_WRITE, data_sz, NULL, &cle);
++    if (cle != CL_SUCCESS) {
++        free_buffers(ctx);
++        return AVERROR(EIO);
++    }
++
++    s->frame_ant_buf = clCreateBuffer(clctx, CL_MEM_READ_WRITE, data_sz, NULL, &cle);
++    if (cle != CL_SUCCESS) {
++        free_buffers(ctx);
++        return AVERROR(EIO);
++    }
++
++    return 0;
++}
++
++static int calc_coefs(AVFilterContext *ctx)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    int table_entries = 512 << lut_bits;
++    size_t tables_sz = (size_t)4 * table_entries * sizeof(int16_t);
++    int16_t *tables = av_malloc(tables_sz);
++    cl_int cle;
++
++    if (!tables)
++        return AVERROR(ENOMEM);
++
++    for (int i = 0; i < 4; i++) {
++        int16_t *ct = tables + i * table_entries;
++        ff_hqdn3d_precalc_coefs(s->strength[i], s->depth, ct);
++    }
++
++    s->spatial_enabled[0] = s->strength[LUMA_SPATIAL] != 0.0;
++    s->spatial_enabled[1] = s->strength[CHROMA_SPATIAL] != 0.0;
++
++    cle = clEnqueueWriteBuffer(s->command_queue, s->tables_buf, CL_TRUE,
++                               0, tables_sz, tables, 0, NULL, NULL);
++    av_free(tables);
++    if (cle != CL_SUCCESS) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to write tables buffer: %d\n", cle);
++        return AVERROR(EIO);
++    }
++    return 0;
++}
++
++static int create_out_frames_ctx(AVFilterContext *ctx, AVFrame *in)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    AVHWFramesContext *in_hwfc = (AVHWFramesContext *)in->hw_frames_ctx->data;
++    AVHWFramesContext *frames_ctx;
++    AVBufferRef *device_ref = in_hwfc->device_ref ? in_hwfc->device_ref : s->ocf.device_ref;
++    int err;
++
++    if (!device_ref)
++        return AVERROR(EINVAL);
++
++    av_buffer_unref(&s->out_frames_ref);
++
++    s->out_frames_ref = av_hwframe_ctx_alloc(device_ref);
++    if (!s->out_frames_ref)
++        return AVERROR(ENOMEM);
++
++    frames_ctx = (AVHWFramesContext *)s->out_frames_ref->data;
++    frames_ctx->format    = AV_PIX_FMT_OPENCL;
++    frames_ctx->sw_format = in_hwfc->sw_format;
++    frames_ctx->width     = in->width;
++    frames_ctx->height    = in->height;
++
++    err = av_hwframe_ctx_init(s->out_frames_ref);
++    if (err < 0) {
++        av_buffer_unref(&s->out_frames_ref);
++        return err;
++    }
++
++    ctx->outputs[0]->w = in->width;
++    ctx->outputs[0]->h = in->height;
++    return 0;
++}
++
++static AVFrame *alloc_output_frame(HQDN3DOpenCLContext *s, AVFilterLink *outlink, AVFrame *in)
++{
++    AVFrame *out;
++    int err;
++
++    if (s->out_frames_ref) {
++        out = av_frame_alloc();
++        if (!out)
++            return NULL;
++        err = av_hwframe_get_buffer(s->out_frames_ref, out, 0);
++        if (err < 0) {
++            av_frame_free(&out);
++            return NULL;
++        }
++    } else {
++        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++        if (!out)
++            return NULL;
++    }
++
++    if (av_frame_copy_props(out, in) < 0) {
++        av_frame_free(&out);
++        return NULL;
++    }
++    return out;
++}
++
++static int init_opencl_program(AVFilterContext *ctx)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    cl_int cle;
++    int err;
++
++    err = ff_opencl_filter_load_program(ctx, &ff_source_hqdn3d_cl, 1);
++    if (err < 0)
++        return err;
++
++    s->command_queue = clCreateCommandQueue(s->ocf.hwctx->context,
++                                            s->ocf.hwctx->device_id,
++                                            0, &cle);
++    if (cle != CL_SUCCESS) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create command queue: %d\n", cle);
++        return AVERROR(EIO);
++    }
++    return 0;
++}
++
++static int create_opencl_kernels(AVFilterContext *ctx)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    cl_program prog = s->ocf.program;
++    cl_int cle;
++
++    s->kernel_horiz_planar = clCreateKernel(prog, "hqdn3d_horizontal_planar", &cle);
++    if (cle != CL_SUCCESS)
++        return AVERROR(EIO);
++
++    s->kernel_horiz_semiplanar = clCreateKernel(prog, "hqdn3d_horizontal_semiplanar", &cle);
++    if (cle != CL_SUCCESS)
++        return AVERROR(EIO);
++
++    s->kernel_vert_planar = clCreateKernel(prog, "hqdn3d_vertical_planar", &cle);
++    if (cle != CL_SUCCESS)
++        return AVERROR(EIO);
++
++    s->kernel_vert_semiplanar = clCreateKernel(prog, "hqdn3d_vertical_semiplanar", &cle);
++    if (cle != CL_SUCCESS)
++        return AVERROR(EIO);
++
++    return 0;
++}
++
++static int check_format_and_size(AVFilterContext *ctx, AVFrame *in)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    AVHWFramesContext *hwfc = (AVHWFramesContext *)in->hw_frames_ctx->data;
++    int err;
++
++    err = validate_format(ctx, hwfc->sw_format, &s->depth, &s->is_msb, &s->is_semiplanar);
++    if (err < 0)
++        return err;
++
++    if (in->width != s->width || in->height != s->height || hwfc->sw_format != s->sw_format) {
++        s->hsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_w;
++        s->vsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_h;
++        if (s->width != 0) {
++            free_buffers(ctx);
++            err = init_buffers(ctx, in->width, in->height);
++            if (err < 0)
++                return err;
++            err = calc_coefs(ctx);
++            if (err < 0)
++                return err;
++            err = create_out_frames_ctx(ctx, in);
++            if (err < 0)
++                return err;
++            s->first_frame = 1;
++        }
++        s->sw_format = hwfc->sw_format;
++        s->width = in->width;
++        s->height = in->height;
++    }
++    return 0;
++}
++
++static int init_filter(AVFilterContext *ctx, AVFrame *in)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    int err;
++
++    err = init_buffers(ctx, in->width, in->height);
++    if (err < 0)
++        return err;
++
++    err = calc_coefs(ctx);
++    if (err < 0) {
++        free_buffers(ctx);
++        return err;
++    }
++
++    s->first_frame = 1;
++    return 0;
++}
++
++static int set_arg(cl_kernel k, cl_uint idx, size_t sz, const void *ptr)
++{
++    cl_int cle = clSetKernelArg(k, idx, sz, ptr);
++    if (cle != CL_SUCCESS)
++        return AVERROR(EIO);
++    return 0;
++}
++
++static int dispatch_horizontal_luma(AVFilterContext *ctx, AVFrame *in,
++                                    int lut_bits)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    cl_mem img = (cl_mem)in->data[0];
++    int h_offset = 0, spatial_offset = 0;
++    size_t gws[1];
++    int err;
++
++    gws[0] = s->height;
++    err = set_arg(s->kernel_horiz_planar, 0, sizeof(cl_mem), &img);
++    err |= set_arg(s->kernel_horiz_planar, 1, sizeof(cl_mem), &s->h_buf);
++    err |= set_arg(s->kernel_horiz_planar, 2, sizeof(int), &h_offset);
++    err |= set_arg(s->kernel_horiz_planar, 3, sizeof(cl_mem), &s->tables_buf);
++    err |= set_arg(s->kernel_horiz_planar, 4, sizeof(int), &spatial_offset);
++    err |= set_arg(s->kernel_horiz_planar, 5, sizeof(int), &s->width);
++    err |= set_arg(s->kernel_horiz_planar, 6, sizeof(int), &s->height);
++    err |= set_arg(s->kernel_horiz_planar, 7, sizeof(int), &s->depth);
++    err |= set_arg(s->kernel_horiz_planar, 8, sizeof(int), &lut_bits);
++    err |= set_arg(s->kernel_horiz_planar, 9, sizeof(int), &s->is_msb);
++    if (err < 0)
++        return AVERROR(EIO);
++
++    if (clEnqueueNDRangeKernel(s->command_queue, s->kernel_horiz_planar,
++                               1, NULL, gws, NULL, 0, NULL, NULL) != CL_SUCCESS)
++        return AVERROR(EIO);
++    return 0;
++}
++
++static int dispatch_horizontal_chroma_semi(AVFilterContext *ctx, AVFrame *in,
++                                           int cw, int ch, int off_u, int off_v,
++                                           int lut_bits, int spatial_offset)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    cl_mem img = (cl_mem)in->data[1];
++    size_t gws[1];
++    int err;
++
++    gws[0] = ch;
++    err = set_arg(s->kernel_horiz_semiplanar, 0, sizeof(cl_mem), &img);
++    err |= set_arg(s->kernel_horiz_semiplanar, 1, sizeof(cl_mem), &s->h_buf);
++    err |= set_arg(s->kernel_horiz_semiplanar, 2, sizeof(int), &off_u);
++    err |= set_arg(s->kernel_horiz_semiplanar, 3, sizeof(int), &off_v);
++    err |= set_arg(s->kernel_horiz_semiplanar, 4, sizeof(cl_mem), &s->tables_buf);
++    err |= set_arg(s->kernel_horiz_semiplanar, 5, sizeof(int), &spatial_offset);
++    err |= set_arg(s->kernel_horiz_semiplanar, 6, sizeof(int), &cw);
++    err |= set_arg(s->kernel_horiz_semiplanar, 7, sizeof(int), &ch);
++    err |= set_arg(s->kernel_horiz_semiplanar, 8, sizeof(int), &s->depth);
++    err |= set_arg(s->kernel_horiz_semiplanar, 9, sizeof(int), &lut_bits);
++    err |= set_arg(s->kernel_horiz_semiplanar, 10, sizeof(int), &s->is_msb);
++    if (err < 0)
++        return AVERROR(EIO);
++
++    if (clEnqueueNDRangeKernel(s->command_queue, s->kernel_horiz_semiplanar,
++                               1, NULL, gws, NULL, 0, NULL, NULL) != CL_SUCCESS)
++        return AVERROR(EIO);
++    return 0;
++}
++
++static int dispatch_horizontal_chroma_planar(AVFilterContext *ctx, AVFrame *in,
++                                             int cw, int ch, int off_u, int off_v,
++                                             int lut_bits, int spatial_offset)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    size_t gws[1];
++    int offs[2];
++
++    gws[0] = ch;
++    offs[0] = off_u;
++    offs[1] = off_v;
++    for (int p = 1; p <= 2; p++) {
++        cl_mem img = (cl_mem)in->data[p];
++        int err = set_arg(s->kernel_horiz_planar, 0, sizeof(cl_mem), &img);
++        err |= set_arg(s->kernel_horiz_planar, 1, sizeof(cl_mem), &s->h_buf);
++        err |= set_arg(s->kernel_horiz_planar, 2, sizeof(int), &offs[p - 1]);
++        err |= set_arg(s->kernel_horiz_planar, 3, sizeof(cl_mem), &s->tables_buf);
++        err |= set_arg(s->kernel_horiz_planar, 4, sizeof(int), &spatial_offset);
++        err |= set_arg(s->kernel_horiz_planar, 5, sizeof(int), &cw);
++        err |= set_arg(s->kernel_horiz_planar, 6, sizeof(int), &ch);
++        err |= set_arg(s->kernel_horiz_planar, 7, sizeof(int), &s->depth);
++        err |= set_arg(s->kernel_horiz_planar, 8, sizeof(int), &lut_bits);
++        err |= set_arg(s->kernel_horiz_planar, 9, sizeof(int), &s->is_msb);
++        if (err < 0)
++            return AVERROR(EIO);
++
++        if (clEnqueueNDRangeKernel(s->command_queue, s->kernel_horiz_planar,
++                                   1, NULL, gws, NULL, 0, NULL, NULL) != CL_SUCCESS)
++            return AVERROR(EIO);
++    }
++    return 0;
++}
++
++static int dispatch_horizontal(AVFilterContext *ctx, AVFrame *in)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    int table_entries = 512 << lut_bits;
++    int cw = AV_CEIL_RSHIFT(s->width, s->hsub);
++    int ch = AV_CEIL_RSHIFT(s->height, s->vsub);
++    int off_u = s->width * s->height;
++    int off_v = off_u + cw * ch;
++    int spatial_offset = CHROMA_SPATIAL * table_entries;
++    int err;
++
++    if (s->spatial_enabled[0]) {
++        err = dispatch_horizontal_luma(ctx, in, lut_bits);
++        if (err < 0)
++            return err;
++    }
++    if (s->spatial_enabled[1]) {
++        if (s->is_semiplanar)
++            return dispatch_horizontal_chroma_semi(ctx, in, cw, ch, off_u, off_v,
++                                                   lut_bits, spatial_offset);
++        return dispatch_horizontal_chroma_planar(ctx, in, cw, ch, off_u, off_v,
++                                                 lut_bits, spatial_offset);
++    }
++    return 0;
++}
++
++static int dispatch_vertical_luma(AVFilterContext *ctx, AVFrame *in, AVFrame *out,
++                                  int lut_bits, int table_entries)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    cl_mem src = (cl_mem)in->data[0];
++    cl_mem dst = (cl_mem)out->data[0];
++    int h_offset = 0, fa_offset = 0;
++    int spatial_offset = LUMA_SPATIAL * table_entries;
++    int temporal_offset = LUMA_TMP * table_entries;
++    size_t gws[1];
++    int err;
++
++    gws[0] = s->width;
++    err = set_arg(s->kernel_vert_planar, 0, sizeof(cl_mem), &src);
++    err |= set_arg(s->kernel_vert_planar, 1, sizeof(cl_mem), &dst);
++    err |= set_arg(s->kernel_vert_planar, 2, sizeof(cl_mem), &s->h_buf);
++    err |= set_arg(s->kernel_vert_planar, 3, sizeof(int), &h_offset);
++    err |= set_arg(s->kernel_vert_planar, 4, sizeof(cl_mem), &s->frame_ant_buf);
++    err |= set_arg(s->kernel_vert_planar, 5, sizeof(int), &fa_offset);
++    err |= set_arg(s->kernel_vert_planar, 6, sizeof(cl_mem), &s->tables_buf);
++    err |= set_arg(s->kernel_vert_planar, 7, sizeof(int), &spatial_offset);
++    err |= set_arg(s->kernel_vert_planar, 8, sizeof(int), &temporal_offset);
++    err |= set_arg(s->kernel_vert_planar, 9, sizeof(int), &s->width);
++    err |= set_arg(s->kernel_vert_planar, 10, sizeof(int), &s->height);
++    err |= set_arg(s->kernel_vert_planar, 11, sizeof(int), &s->depth);
++    err |= set_arg(s->kernel_vert_planar, 12, sizeof(int), &lut_bits);
++    err |= set_arg(s->kernel_vert_planar, 13, sizeof(int), &s->is_msb);
++    err |= set_arg(s->kernel_vert_planar, 14, sizeof(int), &s->first_frame);
++    err |= set_arg(s->kernel_vert_planar, 15, sizeof(int), &s->spatial_enabled[0]);
++    if (err < 0)
++        return AVERROR(EIO);
++
++    if (clEnqueueNDRangeKernel(s->command_queue, s->kernel_vert_planar,
++                               1, NULL, gws, NULL, 0, NULL, NULL) != CL_SUCCESS)
++        return AVERROR(EIO);
++    return 0;
++}
++
++static int dispatch_vertical_chroma_semi(AVFilterContext *ctx, AVFrame *in, AVFrame *out,
++                                         int cw, int ch, int off_u, int off_v,
++                                         int lut_bits, int spatial_offset, int temporal_offset)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    cl_mem src = (cl_mem)in->data[1];
++    cl_mem dst = (cl_mem)out->data[1];
++    size_t gws[1];
++    int err;
++
++    gws[0] = cw;
++    err = set_arg(s->kernel_vert_semiplanar, 0, sizeof(cl_mem), &src);
++    err |= set_arg(s->kernel_vert_semiplanar, 1, sizeof(cl_mem), &dst);
++    err |= set_arg(s->kernel_vert_semiplanar, 2, sizeof(cl_mem), &s->h_buf);
++    err |= set_arg(s->kernel_vert_semiplanar, 3, sizeof(int), &off_u);
++    err |= set_arg(s->kernel_vert_semiplanar, 4, sizeof(int), &off_v);
++    err |= set_arg(s->kernel_vert_semiplanar, 5, sizeof(cl_mem), &s->frame_ant_buf);
++    err |= set_arg(s->kernel_vert_semiplanar, 6, sizeof(int), &off_u);
++    err |= set_arg(s->kernel_vert_semiplanar, 7, sizeof(int), &off_v);
++    err |= set_arg(s->kernel_vert_semiplanar, 8, sizeof(cl_mem), &s->tables_buf);
++    err |= set_arg(s->kernel_vert_semiplanar, 9, sizeof(int), &spatial_offset);
++    err |= set_arg(s->kernel_vert_semiplanar, 10, sizeof(int), &temporal_offset);
++    err |= set_arg(s->kernel_vert_semiplanar, 11, sizeof(int), &cw);
++    err |= set_arg(s->kernel_vert_semiplanar, 12, sizeof(int), &ch);
++    err |= set_arg(s->kernel_vert_semiplanar, 13, sizeof(int), &s->depth);
++    err |= set_arg(s->kernel_vert_semiplanar, 14, sizeof(int), &lut_bits);
++    err |= set_arg(s->kernel_vert_semiplanar, 15, sizeof(int), &s->is_msb);
++    err |= set_arg(s->kernel_vert_semiplanar, 16, sizeof(int), &s->first_frame);
++    err |= set_arg(s->kernel_vert_semiplanar, 17, sizeof(int), &s->spatial_enabled[1]);
++    if (err < 0)
++        return AVERROR(EIO);
++
++    if (clEnqueueNDRangeKernel(s->command_queue, s->kernel_vert_semiplanar,
++                               1, NULL, gws, NULL, 0, NULL, NULL) != CL_SUCCESS)
++        return AVERROR(EIO);
++    return 0;
++}
++
++static int dispatch_vertical_chroma_planar(AVFilterContext *ctx, AVFrame *in, AVFrame *out,
++                                           int cw, int ch, int off_u, int off_v,
++                                           int lut_bits, int spatial_offset, int temporal_offset)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    size_t gws[1];
++    int offs[2];
++
++    gws[0] = cw;
++    offs[0] = off_u;
++    offs[1] = off_v;
++    for (int p = 1; p <= 2; p++) {
++        cl_mem src = (cl_mem)in->data[p];
++        cl_mem dst = (cl_mem)out->data[p];
++        int err = set_arg(s->kernel_vert_planar, 0, sizeof(cl_mem), &src);
++        err |= set_arg(s->kernel_vert_planar, 1, sizeof(cl_mem), &dst);
++        err |= set_arg(s->kernel_vert_planar, 2, sizeof(cl_mem), &s->h_buf);
++        err |= set_arg(s->kernel_vert_planar, 3, sizeof(int), &offs[p - 1]);
++        err |= set_arg(s->kernel_vert_planar, 4, sizeof(cl_mem), &s->frame_ant_buf);
++        err |= set_arg(s->kernel_vert_planar, 5, sizeof(int), &offs[p - 1]);
++        err |= set_arg(s->kernel_vert_planar, 6, sizeof(cl_mem), &s->tables_buf);
++        err |= set_arg(s->kernel_vert_planar, 7, sizeof(int), &spatial_offset);
++        err |= set_arg(s->kernel_vert_planar, 8, sizeof(int), &temporal_offset);
++        err |= set_arg(s->kernel_vert_planar, 9, sizeof(int), &cw);
++        err |= set_arg(s->kernel_vert_planar, 10, sizeof(int), &ch);
++        err |= set_arg(s->kernel_vert_planar, 11, sizeof(int), &s->depth);
++        err |= set_arg(s->kernel_vert_planar, 12, sizeof(int), &lut_bits);
++        err |= set_arg(s->kernel_vert_planar, 13, sizeof(int), &s->is_msb);
++        err |= set_arg(s->kernel_vert_planar, 14, sizeof(int), &s->first_frame);
++        err |= set_arg(s->kernel_vert_planar, 15, sizeof(int), &s->spatial_enabled[1]);
++        if (err < 0)
++            return AVERROR(EIO);
++
++        if (clEnqueueNDRangeKernel(s->command_queue, s->kernel_vert_planar,
++                                   1, NULL, gws, NULL, 0, NULL, NULL) != CL_SUCCESS)
++            return AVERROR(EIO);
++    }
++    return 0;
++}
++
++static int dispatch_vertical(AVFilterContext *ctx, AVFrame *in, AVFrame *out)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    int table_entries = 512 << lut_bits;
++    int cw = AV_CEIL_RSHIFT(s->width, s->hsub);
++    int ch = AV_CEIL_RSHIFT(s->height, s->vsub);
++    int off_u = s->width * s->height;
++    int off_v = off_u + cw * ch;
++    int spatial_offset = CHROMA_SPATIAL * table_entries;
++    int temporal_offset = CHROMA_TMP * table_entries;
++    int err;
++
++    err = dispatch_vertical_luma(ctx, in, out, lut_bits, table_entries);
++    if (err < 0)
++        return err;
++
++    if (s->is_semiplanar)
++        return dispatch_vertical_chroma_semi(ctx, in, out, cw, ch, off_u, off_v,
++                                             lut_bits, spatial_offset, temporal_offset);
++    return dispatch_vertical_chroma_planar(ctx, in, out, cw, ch, off_u, off_v,
++                                           lut_bits, spatial_offset, temporal_offset);
++}
++
++static int hqdn3d_opencl_filter_frame(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *ctx = inlink->dst;
++    HQDN3DOpenCLContext *s = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++    AVFrame *out = NULL;
++    int err;
++
++    err = check_format_and_size(ctx, in);
++    if (err < 0) {
++        av_frame_free(&in);
++        return err;
++    }
++
++    if (!s->tables_buf) {
++        err = init_filter(ctx, in);
++        if (err < 0) {
++            av_frame_free(&in);
++            return err;
++        }
++    }
++
++    out = alloc_output_frame(s, outlink, in);
++    if (!out) {
++        av_frame_free(&in);
++        return AVERROR(ENOMEM);
++    }
++
++    err = dispatch_horizontal(ctx, in);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return err;
++    }
++
++    err = dispatch_vertical(ctx, in, out);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return err;
++    }
++
++    if (clFinish(s->command_queue) != CL_SUCCESS) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return AVERROR(EIO);
++    }
++    s->first_frame = 0;
++    av_frame_free(&in);
++    return ff_filter_frame(outlink, out);
++}
++
++static int hqdn3d_opencl_config_props(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    HQDN3DOpenCLContext *s = ctx->priv;
++    int err;
++
++    err = ff_opencl_filter_config_output(outlink);
++    if (err < 0)
++        return err;
++
++    if (!s->initialised) {
++        err = init_opencl_program(ctx);
++        if (err < 0)
++            return err;
++        err = create_opencl_kernels(ctx);
++        if (err < 0)
++            return err;
++        s->initialised = 1;
++    }
++
++    free_buffers(ctx);
++    av_buffer_unref(&s->out_frames_ref);
++    s->width = 0;
++    s->height = 0;
++    s->sw_format = AV_PIX_FMT_NONE;
++    s->first_frame = 1;
++
++    return 0;
++}
++
++static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
++                           char *res, int res_len, int flags)
++{
++    HQDN3DOpenCLContext *s = ctx->priv;
++    int ret;
++
++    ret = ff_filter_process_command(ctx, cmd, args, res, res_len, flags);
++    if (ret < 0)
++        return ret;
++
++    if (s->tables_buf)
++        return calc_coefs(ctx);
++
++    return 0;
++}
++
++static const AVFilterPad hqdn3d_opencl_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = &hqdn3d_opencl_filter_frame,
++        .config_props = &ff_opencl_filter_config_input,
++    },
++};
++
++static const AVFilterPad hqdn3d_opencl_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = &hqdn3d_opencl_config_props,
++    },
++};
++
++const FFFilter ff_vf_hqdn3d_opencl = {
++    .p.name         = "hqdn3d_opencl",
++    .p.description  = NULL_IF_CONFIG_SMALL("Apply high quality 3d denoise filter using OpenCL"),
++    .p.priv_class   = &hqdn3d_opencl_class,
++    .p.flags        = AVFILTER_FLAG_HWDEVICE,
++    .priv_size      = sizeof(HQDN3DOpenCLContext),
++    .init           = &hqdn3d_opencl_init,
++    .uninit         = &hqdn3d_opencl_uninit,
++    FILTER_INPUTS(hqdn3d_opencl_inputs),
++    FILTER_OUTPUTS(hqdn3d_opencl_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++    .process_command = &process_command,
++};
+diff --git a/tools/Makefile b/tools/Makefile
+index 3f332e6435b9424063755df3f4ef3c4c9c7560f6..046fde055f1b2392e5be5de95cb8b37f34e75f69 100644
+--- a/tools/Makefile
++++ b/tools/Makefile
+@@ -3,6 +3,7 @@ TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
+ TOOLS-$(CONFIG_ZLIB) += cws2fws
+ TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
+ TOOLS-$(CONFIG_HQDN3D_CUDA_FILTER)   += hqdn3d_reset_test
++TOOLS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_reset_test
+ TOOLS-yes := $(sort $(TOOLS-yes))
+ 
+ tools/target_dec_%_fuzzer.o: tools/target_dec_fuzzer.c
+diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
+index f190a36388631bd2a8591a4682a1f7afc2b6912c..413fd848807edf68c4ff17d40a8804659b98babb 100644
+--- a/tools/hqdn3d_reset_test.c
++++ b/tools/hqdn3d_reset_test.c
+@@ -114,6 +114,10 @@ static int create_gpu_frames_ctx(AVBufferRef *device_ref, int w, int h,
+ #if CONFIG_HQDN3D_VULKAN_FILTER
+     if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
+         hwfc->format = AV_PIX_FMT_VULKAN;
++#endif
++#if CONFIG_HQDN3D_OPENCL_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
++        hwfc->format = AV_PIX_FMT_OPENCL;
+ #endif
+     hwfc->sw_format = sw_format;
+     hwfc->width     = w;
+@@ -295,6 +299,10 @@ static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
+ #if CONFIG_HQDN3D_VULKAN_FILTER
+     if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
+         par->format = AV_PIX_FMT_VULKAN;
++#endif
++#if CONFIG_HQDN3D_OPENCL_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
++        par->format = AV_PIX_FMT_OPENCL;
+ #endif
+     par->width         = 128;
+     par->height        = 72;
+@@ -324,6 +332,10 @@ static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
+ #if CONFIG_HQDN3D_VULKAN_FILTER
+     if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
+         return "hqdn3d_vulkan";
++#endif
++#if CONFIG_HQDN3D_OPENCL_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
++        return "hqdn3d_opencl";
+ #endif
+     return NULL;
+ }
+@@ -560,6 +572,16 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+ #else
+         av_log(NULL, AV_LOG_ERROR, "Vulkan backend not built\n");
+         return AVERROR(ENOSYS);
++#endif
++    }
++    if (strncmp(arg, "ocl:", 4) == 0) {
++#if CONFIG_HQDN3D_OPENCL_FILTER
++        *hw_type = AV_HWDEVICE_TYPE_OPENCL;
++        *dev_idx = arg + 4;
++        return 0;
++#else
++        av_log(NULL, AV_LOG_ERROR, "OpenCL backend not built\n");
++        return AVERROR(ENOSYS);
+ #endif
+     }
+ 
+@@ -571,6 +593,10 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+     *hw_type = AV_HWDEVICE_TYPE_CUDA;
+     *dev_idx = arg;
+     return 0;
++#elif CONFIG_HQDN3D_OPENCL_FILTER
++    *hw_type = AV_HWDEVICE_TYPE_OPENCL;
++    *dev_idx = arg;
++    return 0;
+ #else
+     av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
+     return AVERROR(ENOSYS);
+@@ -590,7 +616,7 @@ int main(int argc, char **argv)
+     int err, any_diff = 0, frames_ok = 0;
+ 
+     if (argc < 2) {
+-        fprintf(stderr, "Usage: %s <[cuda:|vk:]device index>\n", argv[0]);
++        fprintf(stderr, "Usage: %s <[cuda:|vk:|ocl:]device index>\n", argv[0]);
+         return 1;
+     }
+ 
