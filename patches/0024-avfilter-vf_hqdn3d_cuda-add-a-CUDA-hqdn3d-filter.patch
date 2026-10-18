@@ -1,0 +1,1801 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 04:37:41 +0200
+Subject: [PATCH] avfilter/vf_hqdn3d_cuda: add a CUDA hqdn3d filter
+
+Add hqdn3d_cuda, a CUDA port of the integer hqdn3d filter whose output
+is identical to the CPU filter. It takes the options and commands of
+hqdn3d and uses the shared tables in hqdn3d_coefs.c.
+
+A horizontal kernel filters each row into an intermediate buffer; a
+vertical kernel filters each column and applies the temporal lowpass
+against the previous output. The temporal state is dropped where
+hqdn3d drops it, and after a frame size change inside a running graph
+the output frames come from a frames context of the new size.
+
+p012 is not accepted: hwupload_cuda converts it to p016, so that path
+cannot be exercised.
+
+tools/hqdn3d_reset_test now also runs the CUDA filter, and builds when
+only one of the two GPU filters is enabled.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ configure                     |   2 +
+ doc/filters.texi              |  32 ++
+ libavfilter/Makefile          |   1 +
+ libavfilter/allfilters.c      |   1 +
+ libavfilter/vf_hqdn3d_cuda.c  | 787 ++++++++++++++++++++++++++++++++++
+ libavfilter/vf_hqdn3d_cuda.cu | 458 ++++++++++++++++++++
+ tools/Makefile                |   2 +
+ tools/hqdn3d_reset_test.c     | 202 ++++++---
+ 8 files changed, 1427 insertions(+), 58 deletions(-)
+ create mode 100644 libavfilter/vf_hqdn3d_cuda.c
+ create mode 100644 libavfilter/vf_hqdn3d_cuda.cu
+
+diff --git a/configure b/configure
+index 231c6b67c5dd7564633dc0801adc81cf676ea575..c8c4e002e95f06aac7a5e2caccd0d2a93dee366d 100755
+--- a/configure
++++ b/configure
+@@ -4200,6 +4200,8 @@ gblur_vulkan_filter_deps="vulkan spirv_compiler"
+ hflip_vulkan_filter_deps="vulkan spirv_compiler"
+ histeq_filter_deps="gpl"
+ hqdn3d_filter_deps="gpl"
++hqdn3d_cuda_filter_deps="gpl ffnvcodec"
++hqdn3d_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+ hqdn3d_vulkan_filter_deps="gpl vulkan spirv_compiler"
+ iccdetect_filter_deps="lcms2"
+ iccgen_filter_deps="lcms2"
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 0ae86d47e741ed0e852f04b66359db6d67260efa..588f61084b8da6bbe91b0de86dad2f015cd8cf5d 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -15792,6 +15792,38 @@ The command accepts the same syntax of the corresponding option.
+ If the specified expression is not valid, it is kept at its current
+ value.
+ 
++@anchor{hqdn3d_cuda}
++@section hqdn3d_cuda
++
++Apply a High Quality 3D Denoiser using CUDA.
++The output is bit-exact to the CPU @ref{hqdn3d} filter. The one exception is
++@samp{p010}: where the CPU filter writes a value above the format maximum,
++which this format cannot store, this filter writes the format maximum.
++
++Supported input hardware frame software formats:
++@itemize
++@item @samp{yuv420p}
++@item @samp{yuv422p}
++@item @samp{yuv444p}
++@item @samp{yuv420p10}
++@item @samp{yuv444p10}
++@item @samp{yuv444p16}
++@item @samp{nv12}
++@item @samp{p010}
++@item @samp{p016}
++@end itemize
++
++The filter accepts the same options as @ref{hqdn3d}:
++@table @option
++@item luma_spatial
++@item chroma_spatial
++@item luma_tmp
++@item chroma_tmp
++@end table
++
++@subsection Commands
++This filter supports the same @ref{commands} as options.
++
+ @anchor{hqdn3d_vulkan}
+ @section hqdn3d_vulkan
+ 
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 47de46104fb95e1ae3fbf10933c3013a0b5a9df9..77c6000da756f68228723db7adc54c71cac8ffda 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -347,6 +347,7 @@ OBJS-$(CONFIG_HFLIP_VULKAN_FILTER)           += vf_flip_vulkan.o vulkan.o
+ OBJS-$(CONFIG_HISTEQ_FILTER)                 += vf_histeq.o
+ OBJS-$(CONFIG_HISTOGRAM_FILTER)              += vf_histogram.o
+ OBJS-$(CONFIG_HQDN3D_FILTER)                 += vf_hqdn3d.o hqdn3d_coefs.o
++OBJS-$(CONFIG_HQDN3D_CUDA_FILTER)            += vf_hqdn3d_cuda.o vf_hqdn3d_cuda.ptx.o hqdn3d_coefs.o cuda/load_helper.o
+ OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER)          += vf_hqdn3d_vulkan.o hqdn3d_coefs.o vulkan.o vulkan_filter.o
+ OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
+ OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 3211fc02153db11796ab388a28faa82e1c465f53..3cacb97a8fbfc2e5e0880aa1048f2459f9200884 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -321,6 +321,7 @@ extern const FFFilter ff_vf_hflip_vulkan;
+ extern const FFFilter ff_vf_histeq;
+ extern const FFFilter ff_vf_histogram;
+ extern const FFFilter ff_vf_hqdn3d;
++extern const FFFilter ff_vf_hqdn3d_cuda;
+ extern const FFFilter ff_vf_hqdn3d_vulkan;
+ extern const FFFilter ff_vf_hqx;
+ extern const FFFilter ff_vf_hstack;
+diff --git a/libavfilter/vf_hqdn3d_cuda.c b/libavfilter/vf_hqdn3d_cuda.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..1eda9aabfa2706a68469de33bad2d46265ed34d0
+--- /dev/null
++++ b/libavfilter/vf_hqdn3d_cuda.c
+@@ -0,0 +1,787 @@
++/*
++ * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
++ * Copyright (c) 2010 Baptiste Coudurier
++ * Copyright (c) 2012 Loren Merritt
++ * Copyright (c) 2026 Lusoris
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <float.h>
++#include <stdint.h>
++#include "libavutil/avassert.h"
++#include "libavutil/common.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_cuda_internal.h"
++#include "libavutil/cuda_check.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "video.h"
++#include "vf_hqdn3d.h"
++#include "hqdn3d_coefs.h"
++
++#include "cuda/load_helper.h"
++
++#define DIV_UP(a, b) ( ((a) + (b) - 1) / (b) )
++#define BLOCK_SIZE 128
++#define CHECK_CU(x) FF_CUDA_CHECK_DL(ctx, s->hwctx->internal->cuda_dl, x)
++
++typedef struct HQDN3DCUDAContext {
++    const AVClass *class;
++    AVCUDADeviceContext *hwctx;
++
++    CUmodule    cu_module;
++    CUfunction  cu_func_horiz_planar_8;
++    CUfunction  cu_func_horiz_planar_16;
++    CUfunction  cu_func_horiz_semiplanar_8;
++    CUfunction  cu_func_horiz_semiplanar_16;
++    CUfunction  cu_func_vert_planar_8;
++    CUfunction  cu_func_vert_planar_16;
++    CUfunction  cu_func_vert_semiplanar_8;
++    CUfunction  cu_func_vert_semiplanar_16;
++    CUstream    cu_stream;
++
++    CUdeviceptr tables_buf;
++    CUdeviceptr h_buf;
++    CUdeviceptr frame_ant_buf;
++
++    double strength[4];
++
++    int hsub, vsub;
++    int depth;
++    int is_msb;
++    int is_semiplanar;
++    int width, height;
++    enum AVPixelFormat sw_format;
++
++    int spatial_enabled[2];
++    int first_frame;
++    int initialized;
++
++    AVBufferRef *out_frames_ref;
++} HQDN3DCUDAContext;
++
++static int validate_format(AVFilterContext *ctx, enum AVPixelFormat sw_format,
++                           int *depth, int *is_msb, int *is_semiplanar)
++{
++    switch (sw_format) {
++    case AV_PIX_FMT_YUV420P:
++    case AV_PIX_FMT_YUV422P:
++    case AV_PIX_FMT_YUV444P:
++        *depth = 8;
++        *is_msb = 0;
++        *is_semiplanar = 0;
++        return 0;
++    case AV_PIX_FMT_YUV420P10:
++    case AV_PIX_FMT_YUV444P10:
++        *depth = 10;
++        *is_msb = 0;
++        *is_semiplanar = 0;
++        return 0;
++    case AV_PIX_FMT_YUV444P16:
++        *depth = 16;
++        *is_msb = 0;
++        *is_semiplanar = 0;
++        return 0;
++    case AV_PIX_FMT_NV12:
++        *depth = 8;
++        *is_msb = 0;
++        *is_semiplanar = 1;
++        return 0;
++    case AV_PIX_FMT_P010:
++        *depth = 10;
++        *is_msb = 1;
++        *is_semiplanar = 1;
++        return 0;
++    case AV_PIX_FMT_P016:
++        *depth = 16;
++        *is_msb = 1;
++        *is_semiplanar = 1;
++        return 0;
++    default:
++        av_log(ctx, AV_LOG_ERROR, "Unsupported sw_format: %s\n",
++               av_get_pix_fmt_name(sw_format));
++        return AVERROR(ENOSYS);
++    }
++}
++
++static av_cold int hqdn3d_cuda_init(AVFilterContext *ctx)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++
++    s->out_frames_ref = NULL;
++    ff_hqdn3d_default_strengths(s->strength);
++
++    av_log(ctx, AV_LOG_VERBOSE, "ls:%f cs:%f lt:%f ct:%f\n",
++           s->strength[LUMA_SPATIAL], s->strength[CHROMA_SPATIAL],
++           s->strength[LUMA_TMP], s->strength[CHROMA_TMP]);
++
++    return 0;
++}
++
++static void free_buffers(AVFilterContext *ctx)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++
++    if (s->tables_buf) {
++        cu->cuMemFree(s->tables_buf);
++        s->tables_buf = 0;
++    }
++    if (s->h_buf) {
++        cu->cuMemFree(s->h_buf);
++        s->h_buf = 0;
++    }
++    if (s->frame_ant_buf) {
++        cu->cuMemFree(s->frame_ant_buf);
++        s->frame_ant_buf = 0;
++    }
++}
++
++static int init_buffers(AVFilterContext *ctx, int w, int h)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    size_t tables_sz = (size_t)4 * (512 << lut_bits) * sizeof(int16_t);
++    int cw = AV_CEIL_RSHIFT(w, s->hsub);
++    int ch = AV_CEIL_RSHIFT(h, s->vsub);
++    size_t samples = (size_t)w * h + (size_t)2 * cw * ch;
++    size_t data_sz = samples * sizeof(uint16_t);
++    int ret;
++
++    ret = CHECK_CU(cu->cuMemAlloc(&s->tables_buf, tables_sz));
++    if (ret < 0)
++        return ret;
++
++    ret = CHECK_CU(cu->cuMemAlloc(&s->h_buf, data_sz));
++    if (ret < 0) {
++        free_buffers(ctx);
++        return ret;
++    }
++
++    ret = CHECK_CU(cu->cuMemAlloc(&s->frame_ant_buf, data_sz));
++    if (ret < 0) {
++        free_buffers(ctx);
++        return ret;
++    }
++
++    return 0;
++}
++
++static int calc_coefs(AVFilterContext *ctx)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    int table_entries = 512 << lut_bits;
++    size_t tables_sz = (size_t)4 * table_entries * sizeof(int16_t);
++    int16_t *tables = av_malloc(tables_sz);
++    int ret;
++
++    if (!tables)
++        return AVERROR(ENOMEM);
++
++    for (int i = 0; i < 4; i++) {
++        int16_t *ct = tables + i * table_entries;
++        ff_hqdn3d_precalc_coefs(s->strength[i], s->depth, ct);
++    }
++
++    s->spatial_enabled[0] = s->strength[LUMA_SPATIAL] != 0.0;
++    s->spatial_enabled[1] = s->strength[CHROMA_SPATIAL] != 0.0;
++
++    ret = CHECK_CU(cu->cuMemcpyHtoD(s->tables_buf, tables, tables_sz));
++    av_free(tables);
++    return ret;
++}
++
++static int create_out_frames_ctx(AVFilterContext *ctx, AVFrame *in)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    AVHWFramesContext *in_hwfc = (AVHWFramesContext *)in->hw_frames_ctx->data;
++    AVHWFramesContext *frames_ctx;
++    AVBufferRef *device_ref = in_hwfc->device_ref ? in_hwfc->device_ref : ctx->hw_device_ctx;
++    int err;
++
++    if (!device_ref)
++        return AVERROR(EINVAL);
++
++    av_buffer_unref(&s->out_frames_ref);
++
++    s->out_frames_ref = av_hwframe_ctx_alloc(device_ref);
++    if (!s->out_frames_ref)
++        return AVERROR(ENOMEM);
++
++    frames_ctx = (AVHWFramesContext *)s->out_frames_ref->data;
++    frames_ctx->format    = AV_PIX_FMT_CUDA;
++    frames_ctx->sw_format = in_hwfc->sw_format;
++    frames_ctx->width     = in->width;
++    frames_ctx->height    = in->height;
++
++    err = av_hwframe_ctx_init(s->out_frames_ref);
++    if (err < 0) {
++        av_buffer_unref(&s->out_frames_ref);
++        return err;
++    }
++
++    ctx->outputs[0]->w = in->width;
++    ctx->outputs[0]->h = in->height;
++    return 0;
++}
++
++static AVFrame *alloc_output_frame(HQDN3DCUDAContext *s, AVFilterLink *outlink, AVFrame *in)
++{
++    AVFrame *out;
++    int err;
++
++    if (s->out_frames_ref) {
++        out = av_frame_alloc();
++        if (!out)
++            return NULL;
++        err = av_hwframe_get_buffer(s->out_frames_ref, out, 0);
++        if (err < 0) {
++            av_frame_free(&out);
++            return NULL;
++        }
++    } else {
++        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++        if (!out)
++            return NULL;
++    }
++
++    if (av_frame_copy_props(out, in) < 0) {
++        av_frame_free(&out);
++        return NULL;
++    }
++    return out;
++}
++
++static av_cold int cuda_hqdn3d_load_functions(AVFilterContext *ctx)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CUcontext dummy, cuda_ctx = s->hwctx->cuda_ctx;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    int ret;
++
++    extern const unsigned char ff_vf_hqdn3d_cuda_ptx_data[];
++    extern const unsigned int ff_vf_hqdn3d_cuda_ptx_len;
++
++    ret = CHECK_CU(cu->cuCtxPushCurrent(cuda_ctx));
++    if (ret < 0)
++        return ret;
++
++    ret = ff_cuda_load_module(ctx, s->hwctx, &s->cu_module,
++                              ff_vf_hqdn3d_cuda_ptx_data, ff_vf_hqdn3d_cuda_ptx_len);
++    if (ret < 0) {
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++        return ret;
++    }
++
++    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_horiz_planar_8, s->cu_module, "hqdn3d_horizontal_planar_8"));
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_horiz_planar_16, s->cu_module, "hqdn3d_horizontal_planar_16"));
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_horiz_semiplanar_8, s->cu_module, "hqdn3d_horizontal_semiplanar_8"));
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_horiz_semiplanar_16, s->cu_module, "hqdn3d_horizontal_semiplanar_16"));
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_vert_planar_8, s->cu_module, "hqdn3d_vertical_planar_8"));
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_vert_planar_16, s->cu_module, "hqdn3d_vertical_planar_16"));
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_vert_semiplanar_8, s->cu_module, "hqdn3d_vertical_semiplanar_8"));
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_vert_semiplanar_16, s->cu_module, "hqdn3d_vertical_semiplanar_16"));
++
++    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    return ret;
++}
++
++static int check_format_and_size(AVFilterContext *ctx, AVFrame *in)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    AVHWFramesContext *hwfc = (AVHWFramesContext *)in->hw_frames_ctx->data;
++    int err;
++
++    err = validate_format(ctx, hwfc->sw_format, &s->depth, &s->is_msb, &s->is_semiplanar);
++    if (err < 0)
++        return err;
++
++    if (in->width != s->width || in->height != s->height || hwfc->sw_format != s->sw_format) {
++        if (s->initialized) {
++            free_buffers(ctx);
++            err = init_buffers(ctx, in->width, in->height);
++            if (err < 0)
++                return err;
++            err = calc_coefs(ctx);
++            if (err < 0)
++                return err;
++            err = create_out_frames_ctx(ctx, in);
++            if (err < 0)
++                return err;
++            s->first_frame = 1;
++        }
++        s->sw_format = hwfc->sw_format;
++        s->width = in->width;
++        s->height = in->height;
++        s->hsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_w;
++        s->vsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_h;
++    }
++    return 0;
++}
++
++static int init_filter(AVFilterContext *ctx, AVFrame *in)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    int err;
++
++    err = init_buffers(ctx, in->width, in->height);
++    if (err < 0)
++        return err;
++
++    err = calc_coefs(ctx);
++    if (err < 0) {
++        free_buffers(ctx);
++        return err;
++    }
++
++    s->initialized = 1;
++    s->first_frame = 1;
++    return 0;
++}
++
++static int dispatch_horizontal_chroma(AVFilterContext *ctx, AVFrame *in,
++                                      int cw, int ch, int off_u, int off_v,
++                                      int lut_bits, int table_entries)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    int spatial_offset = 2 * table_entries;
++    int ret;
++
++    if (s->is_semiplanar) {
++        CUdeviceptr src_ptr = (CUdeviceptr)in->data[1];
++        int src_pitch = in->linesize[1];
++        void *args[] = {
++            &src_ptr, &src_pitch,
++            &s->h_buf, &off_u, &off_v,
++            &s->tables_buf, &spatial_offset,
++            &cw, &ch,
++            &s->depth, &lut_bits, &s->is_msb
++        };
++        CUfunction func = (s->depth == 8) ? s->cu_func_horiz_semiplanar_8 : s->cu_func_horiz_semiplanar_16;
++        return CHECK_CU(cu->cuLaunchKernel(func,
++                                           DIV_UP(ch, BLOCK_SIZE), 1, 1,
++                                           BLOCK_SIZE, 1, 1,
++                                           0, s->cu_stream, args, NULL));
++    }
++
++    CUfunction func = (s->depth == 8) ? s->cu_func_horiz_planar_8 : s->cu_func_horiz_planar_16;
++    for (int p = 1; p <= 2; p++) {
++        CUdeviceptr src_ptr = (CUdeviceptr)in->data[p];
++        int src_pitch = in->linesize[p];
++        int h_offset = (p == 1) ? off_u : off_v;
++        void *args[] = {
++            &src_ptr, &src_pitch,
++            &s->h_buf, &h_offset,
++            &s->tables_buf, &spatial_offset,
++            &cw, &ch,
++            &s->depth, &lut_bits, &s->is_msb
++        };
++        ret = CHECK_CU(cu->cuLaunchKernel(func,
++                                          DIV_UP(ch, BLOCK_SIZE), 1, 1,
++                                          BLOCK_SIZE, 1, 1,
++                                          0, s->cu_stream, args, NULL));
++        if (ret < 0)
++            return ret;
++    }
++    return 0;
++}
++
++static int dispatch_horizontal(AVFilterContext *ctx, AVFrame *in)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    int table_entries = 512 << lut_bits;
++    int cw = AV_CEIL_RSHIFT(s->width, s->hsub);
++    int ch = AV_CEIL_RSHIFT(s->height, s->vsub);
++    int off_u = s->width * s->height;
++    int off_v = s->width * s->height + cw * ch;
++
++    if (s->spatial_enabled[0]) {
++        CUdeviceptr src_ptr = (CUdeviceptr)in->data[0];
++        int src_pitch = in->linesize[0];
++        int h_offset = 0;
++        int spatial_offset = 0 * table_entries;
++        void *args[] = {
++            &src_ptr, &src_pitch,
++            &s->h_buf, &h_offset,
++            &s->tables_buf, &spatial_offset,
++            &s->width, &s->height,
++            &s->depth, &lut_bits, &s->is_msb
++        };
++        CUfunction func = (s->depth == 8) ? s->cu_func_horiz_planar_8 : s->cu_func_horiz_planar_16;
++        int ret = CHECK_CU(cu->cuLaunchKernel(func,
++                                              DIV_UP(s->height, BLOCK_SIZE), 1, 1,
++                                              BLOCK_SIZE, 1, 1,
++                                              0, s->cu_stream, args, NULL));
++        if (ret < 0)
++            return ret;
++    }
++
++    if (!s->spatial_enabled[1])
++        return 0;
++
++    return dispatch_horizontal_chroma(ctx, in, cw, ch, off_u, off_v, lut_bits, table_entries);
++}
++
++static int dispatch_vertical_semiplanar(AVFilterContext *ctx, AVFrame *in, AVFrame *out,
++                                        int cw, int ch, int off_u, int off_v,
++                                        int lut_bits, int table_entries)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    int spatial_offset = 2 * table_entries;
++    int temporal_offset = 3 * table_entries;
++    int spatial_enabled = s->spatial_enabled[1];
++    CUdeviceptr src_ptr = (CUdeviceptr)in->data[1];
++    int src_pitch = in->linesize[1];
++    CUdeviceptr dst_ptr = (CUdeviceptr)out->data[1];
++    int dst_pitch = out->linesize[1];
++    void *args[] = {
++        &src_ptr, &src_pitch,
++        &dst_ptr, &dst_pitch,
++        &s->h_buf, &off_u, &off_v,
++        &s->frame_ant_buf, &off_u, &off_v,
++        &s->tables_buf,
++        &spatial_offset, &temporal_offset,
++        &cw, &ch,
++        &s->depth, &lut_bits, &s->is_msb,
++        &s->first_frame, &spatial_enabled
++    };
++    CUfunction func = (s->depth == 8) ? s->cu_func_vert_semiplanar_8 : s->cu_func_vert_semiplanar_16;
++    return CHECK_CU(cu->cuLaunchKernel(func,
++                                       DIV_UP(cw, BLOCK_SIZE), 1, 1,
++                                       BLOCK_SIZE, 1, 1,
++                                       0, s->cu_stream, args, NULL));
++}
++
++static int dispatch_vertical_planar(AVFilterContext *ctx, AVFrame *in, AVFrame *out,
++                                    int cw, int ch, int off_u, int off_v,
++                                    int lut_bits, int table_entries)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    int spatial_offset = 2 * table_entries;
++    int temporal_offset = 3 * table_entries;
++    int spatial_enabled = s->spatial_enabled[1];
++    CUfunction func = (s->depth == 8) ? s->cu_func_vert_planar_8 : s->cu_func_vert_planar_16;
++    int ret;
++
++    for (int p = 1; p <= 2; p++) {
++        CUdeviceptr src_ptr = (CUdeviceptr)in->data[p];
++        int src_pitch = in->linesize[p];
++        CUdeviceptr dst_ptr = (CUdeviceptr)out->data[p];
++        int dst_pitch = out->linesize[p];
++        int h_offset = (p == 1) ? off_u : off_v;
++        int fa_offset = (p == 1) ? off_u : off_v;
++        void *args[] = {
++            &src_ptr, &src_pitch,
++            &dst_ptr, &dst_pitch,
++            &s->h_buf, &h_offset,
++            &s->frame_ant_buf, &fa_offset,
++            &s->tables_buf,
++            &spatial_offset, &temporal_offset,
++            &cw, &ch,
++            &s->depth, &lut_bits, &s->is_msb,
++            &s->first_frame, &spatial_enabled
++        };
++        ret = CHECK_CU(cu->cuLaunchKernel(func,
++                                          DIV_UP(cw, BLOCK_SIZE), 1, 1,
++                                          BLOCK_SIZE, 1, 1,
++                                          0, s->cu_stream, args, NULL));
++        if (ret < 0)
++            return ret;
++    }
++    return 0;
++}
++
++static int dispatch_vertical(AVFilterContext *ctx, AVFrame *in, AVFrame *out)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    int lut_bits = HQDN3D_LUT_BITS(s->depth);
++    int table_entries = 512 << lut_bits;
++    int cw = AV_CEIL_RSHIFT(s->width, s->hsub);
++    int ch = AV_CEIL_RSHIFT(s->height, s->vsub);
++    int off_u = s->width * s->height;
++    int off_v = s->width * s->height + cw * ch;
++    int ret;
++
++    {
++        CUdeviceptr src_ptr = (CUdeviceptr)in->data[0];
++        int src_pitch = in->linesize[0];
++        CUdeviceptr dst_ptr = (CUdeviceptr)out->data[0];
++        int dst_pitch = out->linesize[0];
++        int h_offset = 0;
++        int fa_offset = 0;
++        int spatial_offset = 0 * table_entries;
++        int temporal_offset = 1 * table_entries;
++        int spatial_enabled = s->spatial_enabled[0];
++        void *args[] = {
++            &src_ptr, &src_pitch,
++            &dst_ptr, &dst_pitch,
++            &s->h_buf, &h_offset,
++            &s->frame_ant_buf, &fa_offset,
++            &s->tables_buf,
++            &spatial_offset, &temporal_offset,
++            &s->width, &s->height,
++            &s->depth, &lut_bits, &s->is_msb,
++            &s->first_frame, &spatial_enabled
++        };
++        CUfunction func = (s->depth == 8) ? s->cu_func_vert_planar_8 : s->cu_func_vert_planar_16;
++        ret = CHECK_CU(cu->cuLaunchKernel(func,
++                                          DIV_UP(s->width, BLOCK_SIZE), 1, 1,
++                                          BLOCK_SIZE, 1, 1,
++                                          0, s->cu_stream, args, NULL));
++        if (ret < 0)
++            return ret;
++    }
++
++    if (s->is_semiplanar)
++        return dispatch_vertical_semiplanar(ctx, in, out, cw, ch, off_u, off_v, lut_bits, table_entries);
++    return dispatch_vertical_planar(ctx, in, out, cw, ch, off_u, off_v, lut_bits, table_entries);
++}
++
++static int exec_filter(AVFilterContext *ctx, AVFrame *in, AVFrame *out)
++{
++    int ret;
++
++    ret = dispatch_horizontal(ctx, in);
++    if (ret < 0)
++        return ret;
++
++    return dispatch_vertical(ctx, in, out);
++}
++
++static int cuda_hqdn3d_filter_frame(AVFilterLink *link, AVFrame *in)
++{
++    AVFilterContext *ctx = link->dst;
++    HQDN3DCUDAContext *s = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    CUcontext dummy;
++    AVFrame *out = NULL;
++    int ret;
++
++    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++    if (ret < 0) {
++        av_frame_free(&in);
++        return ret;
++    }
++
++    ret = check_format_and_size(ctx, in);
++    if (ret < 0) {
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++        av_frame_free(&in);
++        return ret;
++    }
++
++    if (!s->initialized) {
++        ret = init_filter(ctx, in);
++        if (ret < 0) {
++            CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++            av_frame_free(&in);
++            return ret;
++        }
++    }
++
++    out = alloc_output_frame(s, outlink, in);
++    if (!out) {
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++        av_frame_free(&in);
++        return AVERROR(ENOMEM);
++    }
++
++    ret = exec_filter(ctx, in, out);
++    if (ret < 0) {
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return ret;
++    }
++
++    ret = CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    if (ret < 0) {
++        av_frame_free(&in);
++        av_frame_free(&out);
++        return ret;
++    }
++
++    s->first_frame = 0;
++    av_frame_free(&in);
++    return ff_filter_frame(outlink, out);
++}
++
++static int cuda_hqdn3d_config_props(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    HQDN3DCUDAContext *s = ctx->priv;
++    AVFilterLink *inlink = ctx->inputs[0];
++    FilterLink *inl = ff_filter_link(inlink);
++    FilterLink *outl = ff_filter_link(outlink);
++    AVHWFramesContext *in_frames_ctx;
++    CUcontext dummy;
++    int err;
++
++    if (!inl->hw_frames_ctx) {
++        av_log(ctx, AV_LOG_ERROR, "No hw context provided on input\n");
++        return AVERROR(EINVAL);
++    }
++    in_frames_ctx = (AVHWFramesContext *)inl->hw_frames_ctx->data;
++
++    err = validate_format(ctx, in_frames_ctx->sw_format, &s->depth, &s->is_msb, &s->is_semiplanar);
++    if (err < 0)
++        return err;
++
++    s->hwctx = in_frames_ctx->device_ctx->hwctx;
++    s->cu_stream = s->hwctx->stream;
++
++    av_buffer_unref(&outl->hw_frames_ctx);
++    outl->hw_frames_ctx = av_buffer_ref(inl->hw_frames_ctx);
++    if (!outl->hw_frames_ctx)
++        return AVERROR(ENOMEM);
++
++    outlink->w = inlink->w;
++    outlink->h = inlink->h;
++    outlink->time_base = inlink->time_base;
++    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
++
++    if (!s->cu_module) {
++        err = cuda_hqdn3d_load_functions(ctx);
++        if (err < 0)
++            return err;
++    }
++
++    if (s->initialized) {
++        CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++        err = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++        if (err < 0)
++            return err;
++        free_buffers(ctx);
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++        s->initialized = 0;
++    }
++    av_buffer_unref(&s->out_frames_ref);
++    s->width = 0;
++    s->height = 0;
++    s->sw_format = AV_PIX_FMT_NONE;
++    s->first_frame = 1;
++
++    return 0;
++}
++
++static av_cold void hqdn3d_cuda_uninit(AVFilterContext *ctx)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    CUcontext dummy;
++
++    if (s->hwctx) {
++        CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++        CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++        free_buffers(ctx);
++        if (s->cu_module) {
++            CHECK_CU(cu->cuModuleUnload(s->cu_module));
++            s->cu_module = NULL;
++        }
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    }
++    av_buffer_unref(&s->out_frames_ref);
++    s->initialized = 0;
++}
++
++static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
++                           char *res, int res_len, int flags)
++{
++    HQDN3DCUDAContext *s = ctx->priv;
++    int ret;
++
++    ret = ff_filter_process_command(ctx, cmd, args, res, res_len, flags);
++    if (ret < 0)
++        return ret;
++
++    if (s->initialized) {
++        CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++        CUcontext dummy;
++        ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++        if (ret < 0)
++            return ret;
++        ret = calc_coefs(ctx);
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++        return ret;
++    }
++
++    return 0;
++}
++
++#define OFFSET(x) offsetof(HQDN3DCUDAContext, x)
++#define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_RUNTIME_PARAM)
++static const AVOption hqdn3d_cuda_options[] = {
++    { "luma_spatial",   "spatial luma strength",    OFFSET(strength[LUMA_SPATIAL]),   AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0, DBL_MAX, FLAGS },
++    { "chroma_spatial", "spatial chroma strength",  OFFSET(strength[CHROMA_SPATIAL]), AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0, DBL_MAX, FLAGS },
++    { "luma_tmp",       "temporal luma strength",   OFFSET(strength[LUMA_TMP]),       AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0, DBL_MAX, FLAGS },
++    { "chroma_tmp",     "temporal chroma strength", OFFSET(strength[CHROMA_TMP]),     AV_OPT_TYPE_DOUBLE, { .dbl = 0.0 }, 0, DBL_MAX, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(hqdn3d_cuda);
++
++static const AVFilterPad hqdn3d_cuda_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = &cuda_hqdn3d_filter_frame,
++    }
++};
++
++static const AVFilterPad hqdn3d_cuda_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = &cuda_hqdn3d_config_props,
++    }
++};
++
++const FFFilter ff_vf_hqdn3d_cuda = {
++    .p.name         = "hqdn3d_cuda",
++    .p.description  = NULL_IF_CONFIG_SMALL("Apply a High Quality 3D Denoiser using CUDA"),
++    .p.priv_class   = &hqdn3d_cuda_class,
++    .p.flags        = AVFILTER_FLAG_HWDEVICE,
++    .priv_size      = sizeof(HQDN3DCUDAContext),
++    .init           = &hqdn3d_cuda_init,
++    .uninit         = &hqdn3d_cuda_uninit,
++    .process_command = &process_command,
++    FILTER_INPUTS(hqdn3d_cuda_inputs),
++    FILTER_OUTPUTS(hqdn3d_cuda_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_CUDA),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};
+diff --git a/libavfilter/vf_hqdn3d_cuda.cu b/libavfilter/vf_hqdn3d_cuda.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..5807ecd41dc418828192ce644fd1358e0cc2b5d2
+--- /dev/null
++++ b/libavfilter/vf_hqdn3d_cuda.cu
+@@ -0,0 +1,458 @@
++/*
++ * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
++ * Copyright (c) 2010 Baptiste Coudurier
++ * Copyright (c) 2012 Loren Merritt
++ * Copyright (c) 2026 Lusoris
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++__device__ static inline unsigned int load_sample(unsigned int raw,
++                                                  unsigned int s_depth,
++                                                  unsigned int s_msb)
++{
++    unsigned int shift = 16u - s_depth;
++    unsigned int sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    unsigned int rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
++    return (sample_val << shift) + rounding;
++}
++
++__device__ static inline unsigned int store_sample(unsigned int val,
++                                                   unsigned int s_depth,
++                                                   unsigned int s_msb)
++{
++    unsigned int shift = 16u - s_depth;
++    unsigned int stored = val >> shift;
++    if (s_msb != 0u) {
++        unsigned int max_val = (1u << s_depth) - 1u;
++        if (stored > max_val)
++            stored = max_val;
++        return stored << shift;
++    }
++    return stored;
++}
++
++__device__ static inline int lowpass(int prev_val, int cur_val,
++                                     const short *coef_tables,
++                                     unsigned int t_offset,
++                                     unsigned int l_bits)
++{
++    int d = (prev_val - cur_val) >> (8 - (int)l_bits);
++    int center = 256 << (int)l_bits;
++    int idx = (int)t_offset + center + d;
++    int coef = (int)coef_tables[idx];
++    return cur_val + coef;
++}
++
++template <typename T2>
++__device__ static inline T2 make_vec2(unsigned int u, unsigned int v);
++
++template <>
++__device__ inline uchar2 make_vec2<uchar2>(unsigned int u, unsigned int v)
++{
++    return make_uchar2((unsigned char)u, (unsigned char)v);
++}
++
++template <>
++__device__ inline ushort2 make_vec2<ushort2>(unsigned int u, unsigned int v)
++{
++    return make_ushort2((unsigned short)u, (unsigned short)v);
++}
++
++template <typename T>
++__device__ static void horizontal_planar_row(
++    const unsigned char *src, int src_pitch,
++    unsigned short *h_data, int h_offset,
++    const short *coef_tables, int spatial_offset,
++    int width, int y,
++    int depth, int lut_bits, int is_msb)
++{
++    const T *row = (const T *)(src + y * src_pitch);
++    int h_row_start = h_offset + y * width;
++    unsigned int raw0 = (unsigned int)row[0];
++    unsigned int pixel_ant = load_sample(raw0, depth, is_msb);
++
++    if (y == 0) {
++        for (int x = 0; x < width; x++) {
++            unsigned int raw = (unsigned int)row[x];
++            unsigned int cur = load_sample(raw, depth, is_msb);
++            pixel_ant = (unsigned int)lowpass((int)pixel_ant, (int)cur,
++                                              coef_tables, spatial_offset, lut_bits);
++            h_data[h_row_start + x] = (unsigned short)pixel_ant;
++        }
++    } else {
++        h_data[h_row_start + 0] = (unsigned short)pixel_ant;
++        for (int x = 0; x + 1 < width; x++) {
++            unsigned int raw = (unsigned int)row[x + 1];
++            unsigned int cur = load_sample(raw, depth, is_msb);
++            pixel_ant = (unsigned int)lowpass((int)pixel_ant, (int)cur,
++                                              coef_tables, spatial_offset, lut_bits);
++            h_data[h_row_start + x + 1] = (unsigned short)pixel_ant;
++        }
++    }
++}
++
++template <typename T2>
++__device__ static void horizontal_semiplanar_row(
++    const unsigned char *src, int src_pitch,
++    unsigned short *h_data, int h_offset_u, int h_offset_v,
++    const short *coef_tables, int spatial_offset,
++    int width, int y,
++    int depth, int lut_bits, int is_msb)
++{
++    const T2 *row = (const T2 *)(src + y * src_pitch);
++    int h_row_u = h_offset_u + y * width;
++    int h_row_v = h_offset_v + y * width;
++    T2 raw0 = row[0];
++    unsigned int pixel_ant_u = load_sample((unsigned int)raw0.x, depth, is_msb);
++    unsigned int pixel_ant_v = load_sample((unsigned int)raw0.y, depth, is_msb);
++
++    if (y == 0) {
++        for (int x = 0; x < width; x++) {
++            T2 raw = row[x];
++            unsigned int cur_u = load_sample((unsigned int)raw.x, depth, is_msb);
++            unsigned int cur_v = load_sample((unsigned int)raw.y, depth, is_msb);
++            pixel_ant_u = (unsigned int)lowpass((int)pixel_ant_u, (int)cur_u,
++                                                coef_tables, spatial_offset, lut_bits);
++            pixel_ant_v = (unsigned int)lowpass((int)pixel_ant_v, (int)cur_v,
++                                                coef_tables, spatial_offset, lut_bits);
++            h_data[h_row_u + x] = (unsigned short)pixel_ant_u;
++            h_data[h_row_v + x] = (unsigned short)pixel_ant_v;
++        }
++    } else {
++        h_data[h_row_u + 0] = (unsigned short)pixel_ant_u;
++        h_data[h_row_v + 0] = (unsigned short)pixel_ant_v;
++        for (int x = 0; x + 1 < width; x++) {
++            T2 raw = row[x + 1];
++            unsigned int cur_u = load_sample((unsigned int)raw.x, depth, is_msb);
++            unsigned int cur_v = load_sample((unsigned int)raw.y, depth, is_msb);
++            pixel_ant_u = (unsigned int)lowpass((int)pixel_ant_u, (int)cur_u,
++                                                coef_tables, spatial_offset, lut_bits);
++            pixel_ant_v = (unsigned int)lowpass((int)pixel_ant_v, (int)cur_v,
++                                                coef_tables, spatial_offset, lut_bits);
++            h_data[h_row_u + x + 1] = (unsigned short)pixel_ant_u;
++            h_data[h_row_v + x + 1] = (unsigned short)pixel_ant_v;
++        }
++    }
++}
++
++template <typename T>
++__device__ static void vertical_planar_temporal_col(
++    const unsigned char *src, int src_pitch,
++    unsigned char *dst, int dst_pitch,
++    unsigned short *frame_ant_data, int fa_offset,
++    const short *coef_tables, int temporal_offset,
++    int width, int height, int x,
++    int depth, int lut_bits, int is_msb, int first_frame)
++{
++    for (int y = 0; y < height; y++) {
++        const T *src_row = (const T *)(src + y * src_pitch);
++        unsigned int raw = (unsigned int)src_row[x];
++        int cur = (int)load_sample(raw, depth, is_msb);
++        int fa_idx = fa_offset + y * width + x;
++        int prev_ant = first_frame ? cur : (int)frame_ant_data[fa_idx];
++        int tmp = lowpass(prev_ant, cur, coef_tables, temporal_offset, lut_bits);
++        frame_ant_data[fa_idx] = (unsigned short)tmp;
++        unsigned int out_val = store_sample((unsigned int)tmp, depth, is_msb);
++        T *dst_row = (T *)(dst + y * dst_pitch);
++        dst_row[x] = (T)out_val;
++    }
++}
++
++template <typename T>
++__device__ static void vertical_planar_spatial_col(
++    const unsigned char *src, int src_pitch,
++    unsigned char *dst, int dst_pitch,
++    const unsigned short *h_data, int h_offset,
++    unsigned short *frame_ant_data, int fa_offset,
++    const short *coef_tables, int spatial_offset, int temporal_offset,
++    int width, int height, int x,
++    int depth, int lut_bits, int is_msb, int first_frame)
++{
++    int line_ant = (int)h_data[h_offset + x];
++    for (int y = 0; y < height; y++) {
++        int spat_tmp = line_ant;
++        if (y > 0) {
++            int h_val = (int)h_data[h_offset + y * width + x];
++            spat_tmp = lowpass(line_ant, h_val, coef_tables, spatial_offset, lut_bits);
++            line_ant = (int)(unsigned short)spat_tmp;
++        }
++        int fa_idx = fa_offset + y * width + x;
++        int prev_ant;
++        if (first_frame) {
++            const T *src_row = (const T *)(src + y * src_pitch);
++            unsigned int raw = (unsigned int)src_row[x];
++            prev_ant = (int)load_sample(raw, depth, is_msb);
++        } else {
++            prev_ant = (int)frame_ant_data[fa_idx];
++        }
++        int temp_tmp = lowpass(prev_ant, spat_tmp, coef_tables, temporal_offset, lut_bits);
++        frame_ant_data[fa_idx] = (unsigned short)temp_tmp;
++        unsigned int out_val = store_sample((unsigned int)temp_tmp, depth, is_msb);
++        T *dst_row = (T *)(dst + y * dst_pitch);
++        dst_row[x] = (T)out_val;
++    }
++}
++
++template <typename T2>
++__device__ static void vertical_semiplanar_temporal_col(
++    const unsigned char *src, int src_pitch,
++    unsigned char *dst, int dst_pitch,
++    unsigned short *frame_ant_data, int fa_offset_u, int fa_offset_v,
++    const short *coef_tables, int temporal_offset,
++    int width, int height, int x,
++    int depth, int lut_bits, int is_msb, int first_frame)
++{
++    for (int y = 0; y < height; y++) {
++        const T2 *src_row = (const T2 *)(src + y * src_pitch);
++        T2 raw = src_row[x];
++        int cur_u = (int)load_sample((unsigned int)raw.x, depth, is_msb);
++        int cur_v = (int)load_sample((unsigned int)raw.y, depth, is_msb);
++        int fa_u = fa_offset_u + y * width + x;
++        int fa_v = fa_offset_v + y * width + x;
++        int prev_u = first_frame ? cur_u : (int)frame_ant_data[fa_u];
++        int prev_v = first_frame ? cur_v : (int)frame_ant_data[fa_v];
++        int tmp_u = lowpass(prev_u, cur_u, coef_tables, temporal_offset, lut_bits);
++        int tmp_v = lowpass(prev_v, cur_v, coef_tables, temporal_offset, lut_bits);
++        frame_ant_data[fa_u] = (unsigned short)tmp_u;
++        frame_ant_data[fa_v] = (unsigned short)tmp_v;
++        unsigned int out_u = store_sample((unsigned int)tmp_u, depth, is_msb);
++        unsigned int out_v = store_sample((unsigned int)tmp_v, depth, is_msb);
++        T2 *dst_row = (T2 *)(dst + y * dst_pitch);
++        dst_row[x] = make_vec2<T2>(out_u, out_v);
++    }
++}
++
++template <typename T2>
++__device__ static void vertical_semiplanar_spatial_col(
++    const unsigned char *src, int src_pitch,
++    unsigned char *dst, int dst_pitch,
++    const unsigned short *h_data, int h_offset_u, int h_offset_v,
++    unsigned short *frame_ant_data, int fa_offset_u, int fa_offset_v,
++    const short *coef_tables, int spatial_offset, int temporal_offset,
++    int width, int height, int x,
++    int depth, int lut_bits, int is_msb, int first_frame)
++{
++    int line_ant_u = (int)h_data[h_offset_u + x];
++    int line_ant_v = (int)h_data[h_offset_v + x];
++    for (int y = 0; y < height; y++) {
++        int spat_tmp_u = line_ant_u;
++        int spat_tmp_v = line_ant_v;
++        if (y > 0) {
++            int h_u = (int)h_data[h_offset_u + y * width + x];
++            int h_v = (int)h_data[h_offset_v + y * width + x];
++            spat_tmp_u = lowpass(line_ant_u, h_u, coef_tables, spatial_offset, lut_bits);
++            spat_tmp_v = lowpass(line_ant_v, h_v, coef_tables, spatial_offset, lut_bits);
++            line_ant_u = (int)(unsigned short)spat_tmp_u;
++            line_ant_v = (int)(unsigned short)spat_tmp_v;
++        }
++        int fa_u = fa_offset_u + y * width + x;
++        int fa_v = fa_offset_v + y * width + x;
++        int prev_u, prev_v;
++        if (first_frame) {
++            const T2 *src_row = (const T2 *)(src + y * src_pitch);
++            T2 raw = src_row[x];
++            prev_u = (int)load_sample((unsigned int)raw.x, depth, is_msb);
++            prev_v = (int)load_sample((unsigned int)raw.y, depth, is_msb);
++        } else {
++            prev_u = (int)frame_ant_data[fa_u];
++            prev_v = (int)frame_ant_data[fa_v];
++        }
++        int temp_tmp_u = lowpass(prev_u, spat_tmp_u, coef_tables, temporal_offset, lut_bits);
++        int temp_tmp_v = lowpass(prev_v, spat_tmp_v, coef_tables, temporal_offset, lut_bits);
++        frame_ant_data[fa_u] = (unsigned short)temp_tmp_u;
++        frame_ant_data[fa_v] = (unsigned short)temp_tmp_v;
++        unsigned int out_u = store_sample((unsigned int)temp_tmp_u, depth, is_msb);
++        unsigned int out_v = store_sample((unsigned int)temp_tmp_v, depth, is_msb);
++        T2 *dst_row = (T2 *)(dst + y * dst_pitch);
++        dst_row[x] = make_vec2<T2>(out_u, out_v);
++    }
++}
++
++extern "C" {
++
++__global__ void hqdn3d_horizontal_planar_8(
++    const unsigned char *src, int src_pitch,
++    unsigned short *h_data, int h_offset,
++    const short *coef_tables, int spatial_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb)
++{
++    int y = blockIdx.x * blockDim.x + threadIdx.x;
++    if (y < height)
++        horizontal_planar_row<unsigned char>(src, src_pitch, h_data, h_offset,
++                                             coef_tables, spatial_offset,
++                                             width, y, depth, lut_bits, is_msb);
++}
++
++__global__ void hqdn3d_horizontal_planar_16(
++    const unsigned char *src, int src_pitch,
++    unsigned short *h_data, int h_offset,
++    const short *coef_tables, int spatial_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb)
++{
++    int y = blockIdx.x * blockDim.x + threadIdx.x;
++    if (y < height)
++        horizontal_planar_row<unsigned short>(src, src_pitch, h_data, h_offset,
++                                              coef_tables, spatial_offset,
++                                              width, y, depth, lut_bits, is_msb);
++}
++
++__global__ void hqdn3d_horizontal_semiplanar_8(
++    const unsigned char *src, int src_pitch,
++    unsigned short *h_data, int h_offset_u, int h_offset_v,
++    const short *coef_tables, int spatial_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb)
++{
++    int y = blockIdx.x * blockDim.x + threadIdx.x;
++    if (y < height)
++        horizontal_semiplanar_row<uchar2>(src, src_pitch, h_data,
++                                          h_offset_u, h_offset_v,
++                                          coef_tables, spatial_offset,
++                                          width, y, depth, lut_bits, is_msb);
++}
++
++__global__ void hqdn3d_horizontal_semiplanar_16(
++    const unsigned char *src, int src_pitch,
++    unsigned short *h_data, int h_offset_u, int h_offset_v,
++    const short *coef_tables, int spatial_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb)
++{
++    int y = blockIdx.x * blockDim.x + threadIdx.x;
++    if (y < height)
++        horizontal_semiplanar_row<ushort2>(src, src_pitch, h_data,
++                                           h_offset_u, h_offset_v,
++                                           coef_tables, spatial_offset,
++                                           width, y, depth, lut_bits, is_msb);
++}
++
++__global__ void hqdn3d_vertical_planar_8(
++    const unsigned char *src, int src_pitch,
++    unsigned char *dst, int dst_pitch,
++    const unsigned short *h_data, int h_offset,
++    unsigned short *frame_ant_data, int fa_offset,
++    const short *coef_tables,
++    int spatial_offset, int temporal_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb,
++    int first_frame, int spatial_enabled)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    if (x >= width)
++        return;
++    if (spatial_enabled == 0)
++        vertical_planar_temporal_col<unsigned char>(
++            src, src_pitch, dst, dst_pitch,
++            frame_ant_data, fa_offset, coef_tables, temporal_offset,
++            width, height, x, depth, lut_bits, is_msb, first_frame);
++    else
++        vertical_planar_spatial_col<unsigned char>(
++            src, src_pitch, dst, dst_pitch,
++            h_data, h_offset, frame_ant_data, fa_offset,
++            coef_tables, spatial_offset, temporal_offset,
++            width, height, x, depth, lut_bits, is_msb, first_frame);
++}
++
++__global__ void hqdn3d_vertical_planar_16(
++    const unsigned char *src, int src_pitch,
++    unsigned char *dst, int dst_pitch,
++    const unsigned short *h_data, int h_offset,
++    unsigned short *frame_ant_data, int fa_offset,
++    const short *coef_tables,
++    int spatial_offset, int temporal_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb,
++    int first_frame, int spatial_enabled)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    if (x >= width)
++        return;
++    if (spatial_enabled == 0)
++        vertical_planar_temporal_col<unsigned short>(
++            src, src_pitch, dst, dst_pitch,
++            frame_ant_data, fa_offset, coef_tables, temporal_offset,
++            width, height, x, depth, lut_bits, is_msb, first_frame);
++    else
++        vertical_planar_spatial_col<unsigned short>(
++            src, src_pitch, dst, dst_pitch,
++            h_data, h_offset, frame_ant_data, fa_offset,
++            coef_tables, spatial_offset, temporal_offset,
++            width, height, x, depth, lut_bits, is_msb, first_frame);
++}
++
++__global__ void hqdn3d_vertical_semiplanar_8(
++    const unsigned char *src, int src_pitch,
++    unsigned char *dst, int dst_pitch,
++    const unsigned short *h_data, int h_offset_u, int h_offset_v,
++    unsigned short *frame_ant_data, int fa_offset_u, int fa_offset_v,
++    const short *coef_tables,
++    int spatial_offset, int temporal_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb,
++    int first_frame, int spatial_enabled)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    if (x >= width)
++        return;
++    if (spatial_enabled == 0)
++        vertical_semiplanar_temporal_col<uchar2>(
++            src, src_pitch, dst, dst_pitch,
++            frame_ant_data, fa_offset_u, fa_offset_v,
++            coef_tables, temporal_offset,
++            width, height, x, depth, lut_bits, is_msb, first_frame);
++    else
++        vertical_semiplanar_spatial_col<uchar2>(
++            src, src_pitch, dst, dst_pitch,
++            h_data, h_offset_u, h_offset_v,
++            frame_ant_data, fa_offset_u, fa_offset_v,
++            coef_tables, spatial_offset, temporal_offset,
++            width, height, x, depth, lut_bits, is_msb, first_frame);
++}
++
++__global__ void hqdn3d_vertical_semiplanar_16(
++    const unsigned char *src, int src_pitch,
++    unsigned char *dst, int dst_pitch,
++    const unsigned short *h_data, int h_offset_u, int h_offset_v,
++    unsigned short *frame_ant_data, int fa_offset_u, int fa_offset_v,
++    const short *coef_tables,
++    int spatial_offset, int temporal_offset,
++    int width, int height,
++    int depth, int lut_bits, int is_msb,
++    int first_frame, int spatial_enabled)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    if (x >= width)
++        return;
++    if (spatial_enabled == 0)
++        vertical_semiplanar_temporal_col<ushort2>(
++            src, src_pitch, dst, dst_pitch,
++            frame_ant_data, fa_offset_u, fa_offset_v,
++            coef_tables, temporal_offset,
++            width, height, x, depth, lut_bits, is_msb, first_frame);
++    else
++        vertical_semiplanar_spatial_col<ushort2>(
++            src, src_pitch, dst, dst_pitch,
++            h_data, h_offset_u, h_offset_v,
++            frame_ant_data, fa_offset_u, fa_offset_v,
++            coef_tables, spatial_offset, temporal_offset,
++            width, height, x, depth, lut_bits, is_msb, first_frame);
++}
++
++}
+diff --git a/tools/Makefile b/tools/Makefile
+index feb4d9d3b9fdebf5324bd01498336f55be669074..3f332e6435b9424063755df3f4ef3c4c9c7560f6 100644
+--- a/tools/Makefile
++++ b/tools/Makefile
+@@ -2,6 +2,8 @@ TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher
+ TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
+ TOOLS-$(CONFIG_ZLIB) += cws2fws
+ TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
++TOOLS-$(CONFIG_HQDN3D_CUDA_FILTER)   += hqdn3d_reset_test
++TOOLS-yes := $(sort $(TOOLS-yes))
+ 
+ tools/target_dec_%_fuzzer.o: tools/target_dec_fuzzer.c
+ 	$(COMPILE_C) -DFFMPEG_DECODER=$*
+diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
+index 725e7a6a5329443de6a0ccbb440a0c30bf46b3a8..f190a36388631bd2a8591a4682a1f7afc2b6912c 100644
+--- a/tools/hqdn3d_reset_test.c
++++ b/tools/hqdn3d_reset_test.c
+@@ -18,6 +18,8 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "config.h"
++#include "config_components.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -26,7 +28,9 @@
+ #include "libavutil/channel_layout.h"
+ #include "libavutil/common.h"
+ #include "libavutil/hwcontext.h"
++#if CONFIG_HQDN3D_VULKAN_FILTER
+ #include "libavutil/hwcontext_vulkan.h"
++#endif
+ #include "libavutil/imgutils.h"
+ #include "libavutil/log.h"
+ #include "libavutil/mem.h"
+@@ -89,29 +93,42 @@ static int create_input_frame(int n, uint32_t *seed, AVFrame **out_frame)
+     return 0;
+ }
+ 
+-static int create_vk_frames_ctx(AVBufferRef *device_ref, int w, int h,
+-                                enum AVPixelFormat sw_format, AVBufferRef **frames_out)
++static int create_gpu_frames_ctx(AVBufferRef *device_ref, int w, int h,
++                                 enum AVPixelFormat sw_format,
++                                 enum AVHWDeviceType hw_type,
++                                 AVBufferRef **frames_out)
+ {
+     AVBufferRef *frames_ref = av_hwframe_ctx_alloc(device_ref);
+     AVHWFramesContext *hwfc;
+-    AVVulkanFramesContext *vk_hwfc;
+     int err;
+ 
+     if (!frames_ref)
+         return AVERROR(ENOMEM);
+ 
+     hwfc = (AVHWFramesContext *)frames_ref->data;
+-    hwfc->format    = AV_PIX_FMT_VULKAN;
++    hwfc->format    = AV_PIX_FMT_NONE;
++#if CONFIG_HQDN3D_CUDA_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_CUDA)
++        hwfc->format = AV_PIX_FMT_CUDA;
++#endif
++#if CONFIG_HQDN3D_VULKAN_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
++        hwfc->format = AV_PIX_FMT_VULKAN;
++#endif
+     hwfc->sw_format = sw_format;
+     hwfc->width     = w;
+     hwfc->height    = h;
+ 
+-    vk_hwfc = hwfc->hwctx;
+-    vk_hwfc->tiling = VK_IMAGE_TILING_OPTIMAL;
+-    vk_hwfc->usage  = VK_IMAGE_USAGE_SAMPLED_BIT |
+-                      VK_IMAGE_USAGE_STORAGE_BIT |
+-                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+-                      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++#if CONFIG_HQDN3D_VULKAN_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_VULKAN) {
++        AVVulkanFramesContext *vk_hwfc = hwfc->hwctx;
++        vk_hwfc->tiling = VK_IMAGE_TILING_OPTIMAL;
++        vk_hwfc->usage  = VK_IMAGE_USAGE_SAMPLED_BIT |
++                          VK_IMAGE_USAGE_STORAGE_BIT |
++                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                          VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    }
++#endif
+ 
+     err = av_hwframe_ctx_init(frames_ref);
+     if (err < 0) {
+@@ -123,37 +140,37 @@ static int create_vk_frames_ctx(AVBufferRef *device_ref, int w, int h,
+     return 0;
+ }
+ 
+-static int upload_vk_frame(AVBufferRef *frames_ref, AVFrame *sw_in, AVFrame **vk_out)
++static int upload_gpu_frame(AVBufferRef *frames_ref, AVFrame *sw_in, AVFrame **gpu_out)
+ {
+-    AVFrame *vk_f = av_frame_alloc();
++    AVFrame *gpu_f = av_frame_alloc();
+     int err;
+ 
+-    if (!vk_f)
++    if (!gpu_f)
+         return AVERROR(ENOMEM);
+ 
+-    err = av_hwframe_get_buffer(frames_ref, vk_f, 0);
++    err = av_hwframe_get_buffer(frames_ref, gpu_f, 0);
+     if (err < 0) {
+-        av_frame_free(&vk_f);
++        av_frame_free(&gpu_f);
+         return err;
+     }
+ 
+-    err = av_hwframe_transfer_data(vk_f, sw_in, 0);
++    err = av_hwframe_transfer_data(gpu_f, sw_in, 0);
+     if (err < 0) {
+-        av_frame_free(&vk_f);
++        av_frame_free(&gpu_f);
+         return err;
+     }
+ 
+-    err = av_frame_copy_props(vk_f, sw_in);
++    err = av_frame_copy_props(gpu_f, sw_in);
+     if (err < 0) {
+-        av_frame_free(&vk_f);
++        av_frame_free(&gpu_f);
+         return err;
+     }
+ 
+-    *vk_out = vk_f;
++    *gpu_out = gpu_f;
+     return 0;
+ }
+ 
+-static int download_vk_frame(AVFrame *vk_in, AVFrame **sw_out)
++static int download_gpu_frame(AVFrame *gpu_in, AVFrame **sw_out)
+ {
+     AVFrame *sw_f = av_frame_alloc();
+     int err;
+@@ -162,13 +179,13 @@ static int download_vk_frame(AVFrame *vk_in, AVFrame **sw_out)
+         return AVERROR(ENOMEM);
+ 
+     sw_f->format = AV_PIX_FMT_YUV420P;
+-    err = av_hwframe_transfer_data(sw_f, vk_in, 0);
++    err = av_hwframe_transfer_data(sw_f, gpu_in, 0);
+     if (err < 0) {
+         av_frame_free(&sw_f);
+         return err;
+     }
+ 
+-    err = av_frame_copy_props(sw_f, vk_in);
++    err = av_frame_copy_props(sw_f, gpu_in);
+     if (err < 0) {
+         av_frame_free(&sw_f);
+         return err;
+@@ -258,7 +275,9 @@ static int init_cpu_graph(AVFilterGraph **graph_out,
+ }
+ 
+ static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
+-                              AVBufferRef *initial_frames_ref, AVFilterContext **src_out)
++                              AVBufferRef *initial_frames_ref,
++                              enum AVHWDeviceType hw_type,
++                              AVFilterContext **src_out)
+ {
+     AVFilterContext *src_ctx = avfilter_graph_alloc_filter(graph, buf_filt, "in");
+     AVBufferSrcParameters *par = av_buffersrc_parameters_alloc();
+@@ -268,7 +287,15 @@ static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
+         av_free(par);
+         return AVERROR(ENOMEM);
+     }
+-    par->format        = AV_PIX_FMT_VULKAN;
++    par->format = AV_PIX_FMT_NONE;
++#if CONFIG_HQDN3D_CUDA_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_CUDA)
++        par->format = AV_PIX_FMT_CUDA;
++#endif
++#if CONFIG_HQDN3D_VULKAN_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
++        par->format = AV_PIX_FMT_VULKAN;
++#endif
+     par->width         = 128;
+     par->height        = 72;
+     par->time_base     = (AVRational){ 1, 25 };
+@@ -288,34 +315,51 @@ static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
+     return 0;
+ }
+ 
++static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
++{
++#if CONFIG_HQDN3D_CUDA_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_CUDA)
++        return "hqdn3d_cuda";
++#endif
++#if CONFIG_HQDN3D_VULKAN_FILTER
++    if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
++        return "hqdn3d_vulkan";
++#endif
++    return NULL;
++}
++
+ static int init_gpu_graph(AVFilterGraph **graph_out,
+                           AVFilterContext **src_out,
+                           AVFilterContext **sink_out,
+-                          AVBufferRef *vk_device_ref,
+-                          AVBufferRef *initial_frames_ref)
++                          AVBufferRef *gpu_device_ref,
++                          AVBufferRef *initial_frames_ref,
++                          enum AVHWDeviceType hw_type)
+ {
+     AVFilterGraph *graph = avfilter_graph_alloc();
+     const AVFilter *buf_filt = avfilter_get_by_name("buffer");
+-    const AVFilter *hq_filt = avfilter_get_by_name("hqdn3d_vulkan");
+     const AVFilter *sink_filt = avfilter_get_by_name("buffersink");
++    const char *filt_name = get_gpu_filter_name(hw_type);
++    const AVFilter *hq_filt = filt_name ? avfilter_get_by_name(filt_name) : NULL;
+     AVFilterContext *src_ctx = NULL, *hq_ctx = NULL, *sink_ctx = NULL;
+     int err;
+ 
+-    if (!graph || !buf_filt || !hq_filt || !sink_filt)
++    if (!graph || !buf_filt || !hq_filt || !sink_filt) {
++        avfilter_graph_free(&graph);
+         return AVERROR(ENOMEM);
++    }
+ 
+-    err = init_gpu_buffersrc(graph, buf_filt, initial_frames_ref, &src_ctx);
++    err = init_gpu_buffersrc(graph, buf_filt, initial_frames_ref, hw_type, &src_ctx);
+     if (err < 0) {
+         avfilter_graph_free(&graph);
+         return err;
+     }
+ 
+-    hq_ctx = avfilter_graph_alloc_filter(graph, hq_filt, "hqdn3d_vulkan");
++    hq_ctx = avfilter_graph_alloc_filter(graph, hq_filt, filt_name);
+     if (!hq_ctx) {
+         avfilter_graph_free(&graph);
+         return AVERROR(ENOMEM);
+     }
+-    hq_ctx->hw_device_ctx = av_buffer_ref(vk_device_ref);
++    hq_ctx->hw_device_ctx = av_buffer_ref(gpu_device_ref);
+     err = avfilter_init_dict(hq_ctx, NULL);
+     if (err < 0) {
+         avfilter_graph_free(&graph);
+@@ -374,34 +418,34 @@ static int run_gpu_step(AVFilterContext *gpu_src, AVFilterContext *gpu_sink,
+                         AVBufferRef *upload_ctx, AVFrame *sw_frame,
+                         AVFrame **gpu_out_sw)
+ {
+-    AVFrame *gpu_in_vk = NULL;
+-    AVFrame *gpu_out_vk = av_frame_alloc();
++    AVFrame *gpu_in = NULL;
++    AVFrame *gpu_out = av_frame_alloc();
+     int err;
+ 
+-    if (!gpu_out_vk)
++    if (!gpu_out)
+         return AVERROR(ENOMEM);
+ 
+-    err = upload_vk_frame(upload_ctx, sw_frame, &gpu_in_vk);
++    err = upload_gpu_frame(upload_ctx, sw_frame, &gpu_in);
+     if (err < 0) {
+-        av_frame_free(&gpu_out_vk);
++        av_frame_free(&gpu_out);
+         return err;
+     }
+ 
+-    err = av_buffersrc_add_frame(gpu_src, gpu_in_vk);
+-    av_frame_free(&gpu_in_vk);
++    err = av_buffersrc_add_frame(gpu_src, gpu_in);
++    av_frame_free(&gpu_in);
+     if (err < 0) {
+-        av_frame_free(&gpu_out_vk);
++        av_frame_free(&gpu_out);
+         return err;
+     }
+ 
+-    err = av_buffersink_get_frame(gpu_sink, gpu_out_vk);
++    err = av_buffersink_get_frame(gpu_sink, gpu_out);
+     if (err < 0) {
+-        av_frame_free(&gpu_out_vk);
++        av_frame_free(&gpu_out);
+         return err;
+     }
+ 
+-    err = download_vk_frame(gpu_out_vk, gpu_out_sw);
+-    av_frame_free(&gpu_out_vk);
++    err = download_gpu_frame(gpu_out, gpu_out_sw);
++    av_frame_free(&gpu_out);
+     if (err < 0)
+         return err;
+ 
+@@ -444,7 +488,7 @@ static int process_one_frame(AVFilterContext *cpu_src, AVFilterContext *cpu_sink
+     return 0;
+ }
+ 
+-static void cleanup_all(AVBufferRef **vk_device_ref,
++static void cleanup_all(AVBufferRef **gpu_device_ref,
+                         AVBufferRef **upload_ctxs,
+                         AVFilterGraph **cpu_graph,
+                         AVFilterGraph **gpu_graph)
+@@ -453,11 +497,12 @@ static void cleanup_all(AVBufferRef **vk_device_ref,
+         av_buffer_unref(&upload_ctxs[i]);
+     avfilter_graph_free(cpu_graph);
+     avfilter_graph_free(gpu_graph);
+-    av_buffer_unref(vk_device_ref);
++    av_buffer_unref(gpu_device_ref);
+ }
+ 
+ static int setup_all(const char *dev_idx,
+-                     AVBufferRef **vk_device_ref,
++                     enum AVHWDeviceType hw_type,
++                     AVBufferRef **gpu_device_ref,
+                      AVBufferRef **upload_ctxs,
+                      AVFilterGraph **cpu_graph,
+                      AVFilterContext **cpu_src,
+@@ -468,19 +513,19 @@ static int setup_all(const char *dev_idx,
+ {
+     int err;
+ 
+-    err = av_hwdevice_ctx_create(vk_device_ref, AV_HWDEVICE_TYPE_VULKAN, dev_idx, NULL, 0);
++    err = av_hwdevice_ctx_create(gpu_device_ref, hw_type, dev_idx, NULL, 0);
+     if (err < 0)
+         return err;
+ 
+-    err = create_vk_frames_ctx(*vk_device_ref, 128, 72, AV_PIX_FMT_YUV420P, &upload_ctxs[0]);
++    err = create_gpu_frames_ctx(*gpu_device_ref, 128, 72, AV_PIX_FMT_YUV420P, hw_type, &upload_ctxs[0]);
+     if (err < 0)
+         return err;
+ 
+-    err = create_vk_frames_ctx(*vk_device_ref, 96, 56, AV_PIX_FMT_YUV420P, &upload_ctxs[1]);
++    err = create_gpu_frames_ctx(*gpu_device_ref, 96, 56, AV_PIX_FMT_YUV420P, hw_type, &upload_ctxs[1]);
+     if (err < 0)
+         return err;
+ 
+-    err = create_vk_frames_ctx(*vk_device_ref, 160, 96, AV_PIX_FMT_YUV420P, &upload_ctxs[2]);
++    err = create_gpu_frames_ctx(*gpu_device_ref, 160, 96, AV_PIX_FMT_YUV420P, hw_type, &upload_ctxs[2]);
+     if (err < 0)
+         return err;
+ 
+@@ -488,37 +533,78 @@ static int setup_all(const char *dev_idx,
+     if (err < 0)
+         return err;
+ 
+-    err = init_gpu_graph(gpu_graph, gpu_src, gpu_sink, *vk_device_ref, upload_ctxs[0]);
++    err = init_gpu_graph(gpu_graph, gpu_src, gpu_sink, *gpu_device_ref, upload_ctxs[0], hw_type);
+     if (err < 0)
+         return err;
+ 
+     return 0;
+ }
+ 
++static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const char **dev_idx)
++{
++    if (strncmp(arg, "cuda:", 5) == 0) {
++#if CONFIG_HQDN3D_CUDA_FILTER
++        *hw_type = AV_HWDEVICE_TYPE_CUDA;
++        *dev_idx = arg + 5;
++        return 0;
++#else
++        av_log(NULL, AV_LOG_ERROR, "CUDA backend not built\n");
++        return AVERROR(ENOSYS);
++#endif
++    }
++    if (strncmp(arg, "vk:", 3) == 0) {
++#if CONFIG_HQDN3D_VULKAN_FILTER
++        *hw_type = AV_HWDEVICE_TYPE_VULKAN;
++        *dev_idx = arg + 3;
++        return 0;
++#else
++        av_log(NULL, AV_LOG_ERROR, "Vulkan backend not built\n");
++        return AVERROR(ENOSYS);
++#endif
++    }
++
++#if CONFIG_HQDN3D_VULKAN_FILTER
++    *hw_type = AV_HWDEVICE_TYPE_VULKAN;
++    *dev_idx = arg;
++    return 0;
++#elif CONFIG_HQDN3D_CUDA_FILTER
++    *hw_type = AV_HWDEVICE_TYPE_CUDA;
++    *dev_idx = arg;
++    return 0;
++#else
++    av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
++    return AVERROR(ENOSYS);
++#endif
++}
++
+ int main(int argc, char **argv)
+ {
+-    AVBufferRef *vk_device_ref = NULL;
++    AVBufferRef *gpu_device_ref = NULL;
+     AVBufferRef *upload_ctxs[3] = { NULL, NULL, NULL };
+     AVFilterGraph *cpu_graph = NULL, *gpu_graph = NULL;
+     AVFilterContext *cpu_src = NULL, *cpu_sink = NULL;
+     AVFilterContext *gpu_src = NULL, *gpu_sink = NULL;
++    enum AVHWDeviceType hw_type;
+     const char *dev_idx;
+     uint32_t seed = 0x12345678;
+     int err, any_diff = 0, frames_ok = 0;
+ 
+     if (argc < 2) {
+-        fprintf(stderr, "Usage: %s <vulkan device index>\n", argv[0]);
++        fprintf(stderr, "Usage: %s <[cuda:|vk:]device index>\n", argv[0]);
+         return 1;
+     }
+-    dev_idx = (strncmp(argv[1], "vk:", 3) == 0) ? argv[1] + 3 : argv[1];
+ 
+     av_log_set_level(AV_LOG_ERROR);
+ 
+-    err = setup_all(dev_idx, &vk_device_ref, upload_ctxs,
++    err = parse_device_arg(argv[1], &hw_type, &dev_idx);
++    if (err < 0)
++        return 1;
++
++    err = setup_all(dev_idx, hw_type, &gpu_device_ref, upload_ctxs,
+                     &cpu_graph, &cpu_src, &cpu_sink,
+                     &gpu_graph, &gpu_src, &gpu_sink);
+     if (err < 0) {
+-        cleanup_all(&vk_device_ref, upload_ctxs, &cpu_graph, &gpu_graph);
++        cleanup_all(&gpu_device_ref, upload_ctxs, &cpu_graph, &gpu_graph);
+         return 1;
+     }
+ 
+@@ -535,6 +621,6 @@ int main(int argc, char **argv)
+             any_diff = 1;
+     }
+ 
+-    cleanup_all(&vk_device_ref, upload_ctxs, &cpu_graph, &gpu_graph);
++    cleanup_all(&gpu_device_ref, upload_ctxs, &cpu_graph, &gpu_graph);
+     return (frames_ok == 12 && !any_diff) ? 0 : 1;
+ }
