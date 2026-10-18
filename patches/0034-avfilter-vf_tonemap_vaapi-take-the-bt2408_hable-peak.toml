@@ -1,0 +1,6 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx", "pelorus"]
+origin = "#63 Dolby Vision peak on the GPU tone maps (ADR-0002 filters table), part 3: tonemap_vaapi bt2408_hable"
+notes = """
+With tonemap=bt2408_hable and peak=0, the level 1 max_pq of the frame sets the peak of the lookup table; peak= still overrides it, and frames without level 1 keep the static peak. The table is rebuilt only when the peak or the primaries change. Measured on an Arc A380 (iHD, renderD129), framemd5 over four frames against the build without 0032-0034: HDR10 output identical; profile 5 via dovi_reshape differs (exact peak instead of MaxCLL in whole nits); an injected lavfi.dovi.l1_max_pq of 2081 moves the output, deleting the key or setting it to 0 restores the old digest, peak=10 matches the old digest. Against vf_libplacebo hable with peak_detect=1, the lookup table followed by swscale to BT.709 tv: mean CIEDE2000 1.145 on profile 5 via dovi_reshape and 0.752 on the 2160p HDR10 clip, under the 2.3 bar of ADR-0002. Gap: no dynamic peak detection; tonemap_vaapi cannot run a measurement kernel. Not run on the RTX 4090."""

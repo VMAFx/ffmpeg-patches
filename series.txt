@@ -36,3 +36,6 @@
 0029-avfilter-vf_scale-negotiate-IPT-C2-for-a-same-colour.patch
 0030-avfilter-dovi_reshape-share-the-HDR10-output-propert.patch
 0031-avfilter-vf_tonemap_opencl-reshape-Dolby-Vision-prof.patch
+0032-avfilter-tonemap_peak-read-the-Dolby-Vision-level-1-.patch
+0033-avfilter-vf_tonemap_opencl-take-the-bt2408_hable-pea.patch
+0034-avfilter-vf_tonemap_vaapi-take-the-bt2408_hable-peak.patch

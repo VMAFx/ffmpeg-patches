@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 11:50:33 +0200
+Subject: [PATCH] avfilter/tonemap_peak: read the Dolby Vision level 1 peak
+ from side data
+
+ff_tonemap_peak_read_dovi_l1() returns the signal peak of the level 1
+max_pq, taken from the lavfi.dovi.l1_max_pq frame metadata that
+dovi_reshape sets or, without it, from the DOVI metadata side data.
+A max_pq of zero carries no peak, as a zero MaxCLL does. The PQ to
+peak conversion is shared with ff_tonemap_peak_read_l1().
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavfilter/tonemap_peak.c | 31 +++++++++++++++++++++++++++++--
+ libavfilter/tonemap_peak.h |  2 ++
+ 2 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/libavfilter/tonemap_peak.c b/libavfilter/tonemap_peak.c
+index 1f08d06b522c8af733395ecd5dc5f9d2ea8df94d..d7e7947de78ecd87686808c0c34e8b0f98d18014 100644
+--- a/libavfilter/tonemap_peak.c
++++ b/libavfilter/tonemap_peak.c
+@@ -29,6 +29,7 @@
+ #include "libavutil/common.h"
+ #include "libavutil/csp.h"
+ #include "libavutil/dict.h"
++#include "libavutil/dovi_meta.h"
+ #include "colorspace.h"
+ #include "tonemap_peak.h"
+ 
+@@ -116,6 +117,13 @@ double ff_tonemap_peak_update(FFTonemapPeak *s, const FFTonemapPeakStats *stats)
+     return FFMAX(1.0, (double)(ff_tonemap_peak_eotf(s->max_pq) * 10000.0f / REFERENCE_WHITE));
+ }
+ 
++static double pq_to_peak(int max_pq)
++{
++    av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
++
++    return pq_eotf(max_pq / 4095.0) / REFERENCE_WHITE;
++}
++
+ int ff_tonemap_peak_read_l1(const AVFrame *in, double *peak_out)
+ {
+     const AVDictionaryEntry *e;
+@@ -127,10 +135,29 @@ int ff_tonemap_peak_read_l1(const AVFrame *in, double *peak_out)
+         max_pq = strtol(e->value, &end, 10);
+ 
+     if (e && e->value && end && !*end && end != e->value && max_pq >= 0 && max_pq <= 4095) {
+-        av_csp_trc_function pq_eotf = av_csp_trc_func_inv_from_id(AVCOL_TRC_SMPTE2084);
+-        *peak_out = pq_eotf(max_pq / 4095.0) / REFERENCE_WHITE;
++        *peak_out = pq_to_peak(max_pq);
+         return 1;
+     }
+ 
+     return 0;
+ }
++
++int ff_tonemap_peak_read_dovi_l1(const AVFrame *in, double *peak_out)
++{
++    const AVFrameSideData *sd;
++    const AVDOVIDmData *dm = NULL;
++    double peak = 0.0;
++
++    if (!ff_tonemap_peak_read_l1(in, &peak)) {
++        sd = av_frame_get_side_data(in, AV_FRAME_DATA_DOVI_METADATA);
++        dm = sd ? av_dovi_find_level((const AVDOVIMetadata *)sd->data, 1) : NULL;
++        if (dm && dm->l1.max_pq <= 4095)
++            peak = pq_to_peak(dm->l1.max_pq);
++    }
++
++    /* a zero max_pq carries no peak, as a zero MaxCLL does */
++    if (!(peak > 0.0))
++        return 0;
++    *peak_out = peak;
++    return 1;
++}
+diff --git a/libavfilter/tonemap_peak.h b/libavfilter/tonemap_peak.h
+index 85e4c32b6d54512f1f5f9eca11d11325cb7f440b..e68503420d4b62bce56412a40b60861e7aacdcbc 100644
+--- a/libavfilter/tonemap_peak.h
++++ b/libavfilter/tonemap_peak.h
+@@ -85,4 +85,6 @@ double ff_tonemap_peak_update(FFTonemapPeak *s, const FFTonemapPeakStats *stats)
+ 
+ int ff_tonemap_peak_read_l1(const AVFrame *in, double *peak_out);
+ 
++int ff_tonemap_peak_read_dovi_l1(const AVFrame *in, double *peak_out);
++
+ #endif /* AVFILTER_TONEMAP_PEAK_H */

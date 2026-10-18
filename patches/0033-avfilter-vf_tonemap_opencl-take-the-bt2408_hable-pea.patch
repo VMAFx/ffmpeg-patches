@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Sun, 18 Oct 2026 11:50:33 +0200
+Subject: [PATCH] avfilter/vf_tonemap_opencl: take the bt2408_hable peak from
+ Dolby Vision level 1
+
+With tonemap=bt2408_hable and no peak option, the per-frame level 1
+max_pq sets the signal peak when the frame carries it; the static
+light level and mastering metadata stay the fallback. Before, the
+peak came from MaxCLL rounded to whole nits. Other curves and frames
+without level 1 metadata are unchanged.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ doc/filters.texi                |  6 ++++--
+ libavfilter/Makefile            |  2 +-
+ libavfilter/vf_tonemap_opencl.c | 23 ++++++++++++++++++++---
+ 3 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/doc/filters.texi b/doc/filters.texi
+index d10d45670652252d74d179c0fb401370e8586a16..186b2a755b6ff1599bd1737c458626b3b016cb11 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -28658,8 +28658,10 @@ It accepts the following parameters:
+ Specify the tone-mapping operator to be used. Same as tonemap option in @ref{tonemap}.
+ With @code{bt2408_hable}, the output is in BT.709 primaries whatever
+ @option{primaries} says, the options @option{param}, @option{desat} and
+-@option{threshold} are ignored, and the peak comes from @option{peak} or the
+-frame side data, without peak detection.
++@option{threshold} are ignored, and the peak comes from @option{peak},
++Dolby Vision level 1 max_pq (frame metadata @code{lavfi.dovi.l1_max_pq} or
++DOVI side data) when present, else static side data; no dynamic peak
++detection.
+ It also accepts a Dolby Vision profile 5 base layer (full range P010,
+ colorspace @code{ipt-c2}) directly and applies the RPU reshape in the kernel.
+ 
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 6d9a9edb2c5d118892b3d04c6c7aef3d4373de79..502ea389a44d3e3582281b626c9ce0f6ce9ec065 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -547,7 +547,7 @@ OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
+ OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
+ OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o bt2408_hable.o tonemap_peak.o
+ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2408_hable.o \
+-                                                dovi_reshape.o \
++                                                dovi_reshape.o tonemap_peak.o \
+                                                 opencl/tonemap.o opencl/bt2408_hable.o \
+                                                 opencl/colorspace_common.o \
+                                                 opencl/dovi_reshape.o
+diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
+index e754fb5f9f3e6f90a7b9dc1c1bcde85a6c5d9d67..3b367651576bc40e25201c0df55e1abb5c7fc2a6 100644
+--- a/libavfilter/vf_tonemap_opencl.c
++++ b/libavfilter/vf_tonemap_opencl.c
+@@ -30,6 +30,7 @@
+ #include "formats.h"
+ #include "opencl.h"
+ #include "opencl_source.h"
++#include "tonemap_peak.h"
+ #include "video.h"
+ #include "colorspace.h"
+ 
+@@ -568,6 +569,23 @@ static void log_detected_peak(TonemapOpenCLContext *ctx)
+ }
+ #endif
+ 
++static double get_signal_peak(AVFilterContext *avctx, AVFrame *input)
++{
++    TonemapOpenCLContext *ctx = avctx->priv;
++    double peak = ctx->peak;
++
++    if (peak)
++        return peak;
++
++    if (ctx->tonemap == TONEMAP_BT2408_HABLE &&
++        ff_tonemap_peak_read_dovi_l1(input, &peak)) {
++        av_log(avctx, AV_LOG_VERBOSE, "Dolby Vision L1 signal peak: %f\n", peak);
++        return peak;
++    }
++
++    return ff_determine_signal_peak(input);
++}
++
+ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+ {
+     AVFilterContext    *avctx = inlink->dst;
+@@ -577,7 +595,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+     FFDoviReshape rs;
+     cl_int cle;
+     int err;
+-    double peak = ctx->peak;
++    double peak;
+ 
+     AVHWFramesContext *input_frames_ctx;
+ 
+@@ -605,8 +623,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+     if (err < 0)
+         goto fail;
+ 
+-    if (!peak)
+-        peak = ff_determine_signal_peak(input);
++    peak = get_signal_peak(avctx, input);
+ 
+     if (ctx->trc != -1)
+         output->color_trc = ctx->trc;
