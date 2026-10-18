@@ -178,6 +178,17 @@ class TestFunctionLengths(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("without a live exception", out)
 
+    def test_unreadable_metadata_fails(self) -> None:
+        self.fx.commit_file("lib.c", build_c_function("f", 59), "grow f to 59")
+        names = self.fx.export()
+        sidecar = (self.fx.root / "patches" / names[0]).with_suffix(".toml")
+        sidecar.write_text("[[exceptions]\n")
+        rc, _, err = run_series_cli(
+            self.fx.root, "lengths", str(self.fx.tree), "--today", "2026-10-18"
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn(sidecar.name, err)
+
     def test_stale_exception_fails(self) -> None:
         lines = build_c_function("f", 58)
         lines[1] = "    /* touched without growing */"

@@ -1275,11 +1275,13 @@ def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]
             print(f"error: {err}", file=sys.stderr)
     try:
         data = tomllib.loads(sidecar.read_text())
-        raw_exc = data.get("exceptions", [])
-        if isinstance(raw_exc, list):
-            return [e for e in raw_exc if isinstance(e, dict)], had_errors
-    except (OSError, tomllib.TOMLDecodeError):
-        pass
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        # An unreadable sidecar excuses nothing and fails the gate.
+        print(f"error: {sidecar.name}: {exc}", file=sys.stderr)
+        return [], True
+    raw_exc = data.get("exceptions", [])
+    if isinstance(raw_exc, list):
+        return [e for e in raw_exc if isinstance(e, dict)], had_errors
     return [], had_errors
 
 
