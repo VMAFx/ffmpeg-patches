@@ -3,7 +3,8 @@
 Measurement of the GPU `hqdn3d` filters of patches 0023 to 0026 against
 the CPU `hqdn3d`, `nlmeans_vulkan` and the AV1 encoders' own denoisers, as
 [ADR-0004](../adr/0004-hqdn3d-on-the-gpu.md) plans it. The plan comes first,
-the results of the run on 2026-10-18 follow it.
+the results of the main run on 2026-10-18 follow it, and then a second run
+the same day on the RTX 4090, which the main run had to skip.
 
 `hqdn3d_videotoolbox` (0026) is not measured: no Apple host is available.
 It compiles on the macOS job of `series.yml`; its speed and its parity with
@@ -110,11 +111,11 @@ at commit `011c329` of this branch:
 
 ### What was not measured
 
-- **RTX 4090** (Vulkan 0, CUDA 0, OpenCL 2.0): its device-local budget was
-  920 MiB, under the 1 GiB bound, for the whole run, because other work held
-  the device. The run skipped it (48 parity cases, 3 speed series) and
-  evicted nothing. `hqdn3d_cuda` therefore has no hardware result here, and
-  the Vulkan and OpenCL filters have none on that device.
+- **RTX 4090** (Vulkan 0, CUDA 0, OpenCL 2.0) in this run: its
+  device-local budget was 920 MiB, under the 1 GiB bound, for the whole run,
+  because other work held the device. The run skipped it (48 parity cases,
+  3 speed series) and evicted nothing. The [RTX 4090 run](#rtx-4090-run)
+  below measures those cases.
 - **`hqdn3d_videotoolbox`**: no Apple host, as stated above.
 
 ### Measure 1: parity bound
@@ -443,6 +444,61 @@ series stops at the first run over 120 s and the table prints the bound.
   denoiser; libaom at `cpu-used=6` drops from 11.7 to 2.7 fps with
   `denoise-noise-level=10`.
 
+### RTX 4090 run
+
+Run of 2026-10-18, 13:33 to 13:38 UTC, with `scripts/measure_hqdn3d.py` at
+commit `117822d` of this repository, the parity and speed stages only, on
+the three RTX 4090 backends and the CPU. The FFmpeg binary is the one of the
+main run (same sha256). The run started once the device-local budget of the
+card had stayed at 1 GiB or more for four reads 30 s apart (9 000 MiB at
+the start). Host gate readings: load average 5.8 and 5.1, 26.3 to 26.7 GiB
+available memory, 94 GiB free swap.
+
+Parity: every backend gave output identical to the CPU filter, 0 differing
+samples and largest difference 0, in all 48 cases (2 clips, 2 grain levels,
+2 settings, 2 formats on each backend).
+
+| Backend | Device | yuv420p cases | p010le cases | Differing samples | Largest difference |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| `hqdn3d_vulkan`, Vulkan 0 | RTX 4090 | 8 | 8 | 0 | 0 |
+| `hqdn3d_cuda`, CUDA 0 | RTX 4090 | 8 | 8 | 0 | 0 |
+| `hqdn3d_opencl`, OpenCL 2.0 | RTX 4090 | 8 | 8 | 0 | 0 |
+
+Speed, measured as in Measure 4:
+
+| Task                         | Device     | Median FPS | Run 1 | Run 2 | Run 3 |
+| ---------------------------- | ---------- | ---------- | ----- | ----- | ----- |
+| hqdn3d_defaults              | cpu        | 257.5      | 263.4 | 257.5 | 256.7 |
+| hqdn3d_luma_spatial=8        | cpu        | 261.3      | 260.3 | 264.4 | 261.3 |
+| transfer_baseline            | vulkan:0   | 257.6      | 232.3 | 257.6 | 275.9 |
+| hqdn3d_vulkan_defaults       | vulkan:0   | 153.5      | 150.7 | 157.2 | 153.5 |
+| hqdn3d_vulkan_luma_spatial=8 | vulkan:0   | 298.5      | 288.8 | 301.0 | 298.5 |
+| nlmeans_vulkan_s1            | vulkan:0   | 37.9       | 37.9  | 37.8  | 37.9  |
+| nlmeans_vulkan_s3            | vulkan:0   | 37.6       | 37.6  | 37.8  | 37.0  |
+| transfer_baseline            | cuda:0     | 640.5      | 624.5 | 640.5 | 689.6 |
+| hqdn3d_cuda_defaults         | cuda:0     | 322.0      | 322.0 | 320.2 | 322.0 |
+| hqdn3d_cuda_luma_spatial=8   | cuda:0     | 321.6      | 322.7 | 321.6 | 318.5 |
+| transfer_baseline            | opencl:2.0 | 624.7      | 595.3 | 640.5 | 624.7 |
+| hqdn3d_opencl_defaults       | opencl:2.0 | 289.3      | 289.3 | 299.7 | 277.6 |
+| hqdn3d_opencl_luma_spatial=8 | opencl:2.0 | 298.9      | 291.9 | 300.5 | 298.9 |
+| encoder_svt_plain_1200k      | cpu        | 248.2      | 255.3 | 141.9 | 248.2 |
+| encoder_svt_denoise_1200k    | cpu        | 102.6      | 102.6 | 103.2 | 100.3 |
+| encoder_aom_plain_1200k      | cpu        | 23.3       | 23.3  | 23.5  | 23.0  |
+| encoder_aom_denoise_1200k    | cpu        | 5.4        | 5.4   | 5.6   | 5.4   |
+
+- With the frames starting and ending in system memory, `hqdn3d_cuda`
+  reaches 322 fps and `hqdn3d_opencl` 289 fps, above the CPU `hqdn3d` of
+  this run (257.5 fps); the CUDA and OpenCL upload and download alone reach
+  640 and 625 fps.
+- `hqdn3d_vulkan` reaches 153.5 fps with the defaults but 298.5 fps with
+  `luma_spatial=8`, against a Vulkan transfer baseline of 257.6 fps. The run
+  does not explain the gap between the two settings; the three runs of each of
+  the two series agree within 10 %.
+- `nlmeans_vulkan` reaches 37.9 fps on the card.
+- The host load was about a fifth of the main run's, so the CPU and encoder
+  rows here are faster than in Measure 4 (CPU `hqdn3d` 257.5 against 215.7
+  fps); compare GPU and CPU figures within one run only.
+
 ### Evidence
 
 [`hqdn3d-gpu-results.json`](hqdn3d-gpu-results.json), sha256
@@ -454,3 +510,10 @@ reasons and the host gate readings. Host paths in it are replaced by
 `python3 scripts/measure_hqdn3d.py --json
 docs/measurements/hqdn3d-gpu-results.json table` renders the tables above
 from it.
+
+[`hqdn3d-gpu-results-4090.json`](hqdn3d-gpu-results-4090.json), sha256
+`4de8529c7ce6d2cfe08599f8870ecf8f54f9f7220469486ecaa04073db175452`, holds
+the RTX 4090 run in the same form, and `python3 scripts/measure_hqdn3d.py
+--json docs/measurements/hqdn3d-gpu-results-4090.json table` renders its
+tables. `tests/test_measure_hqdn3d.py` checks both sha256 values and that
+every parity and speed row the two files render appears in this document.

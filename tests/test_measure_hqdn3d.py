@@ -15,9 +15,13 @@ Verifies:
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import re
 import unittest
 from array import array
+from pathlib import Path
 
 from scripts.measure_hqdn3d import (
     build_filter_chains,
@@ -35,8 +39,39 @@ from scripts.measure_hqdn3d import (
     parse_vulkan_device_budget,
     quality_overlap,
     render_all_tables,
+    render_speed_table,
     rises_with_rate,
 )
+
+MEASUREMENTS = Path(__file__).resolve().parent.parent / "docs" / "measurements"
+API_NAMES = {"vulkan": "Vulkan", "cuda": "CUDA", "opencl": "OpenCL"}
+
+
+def parity_rows(data: dict) -> list[str]:
+    """Return the summary rows the document must hold for each parity backend."""
+    cases: dict[str, list[dict]] = {}
+    for result in data["results"]:
+        if result["stage"] == "parity":
+            cases.setdefault(result["backend"], []).append(result)
+    rows = []
+    for backend, results in cases.items():
+        api, index = backend.split(":", 1)
+        counts = [sum(r["format"] == f for r in results) for f in ("yuv420p", "p010le")]
+        wrong = sum(r["mismatches"] for r in results)
+        largest = max(r["max_diff"] for r in results)
+        rows.append(
+            rf"\| `hqdn3d_{api}`, {API_NAMES[api]} {re.escape(index)} \| [^|]+ "
+            rf"\| {counts[0]} \| {counts[1]} \| {wrong} \| {largest} \|"
+        )
+    return rows
+
+
+def missing_rows(doc: str, data: dict) -> list[str]:
+    """Return the parity patterns and speed rows of data the document lacks."""
+    missing = [row for row in parity_rows(data) if not re.search(row, doc)]
+    speed = render_speed_table(data["results"]).splitlines()[2:]
+    return missing + [row for row in speed if row not in doc]
+
 
 FIXTURE_3_GPUS_VULKANINFO = """
 GPU0:
@@ -427,6 +462,36 @@ class TestCliAndFormatting(unittest.TestCase):
         self.assertIn("## Measure 4: Speed", rendered)
         self.assertIn("vulkan:0", rendered)
         self.assertIn("145.2", rendered)
+
+
+class TestPublishedEvidence(unittest.TestCase):
+    """docs/measurements/hqdn3d-gpu.md must match the evidence files it cites."""
+
+    DOC = MEASUREMENTS / "hqdn3d-gpu.md"
+    FILES = ("hqdn3d-gpu-results.json", "hqdn3d-gpu-results-4090.json")
+
+    def load(self, name: str) -> dict:
+        return json.loads((MEASUREMENTS / name).read_text(encoding="utf-8"))
+
+    def test_cited_sha256_matches(self) -> None:
+        doc = self.DOC.read_text(encoding="utf-8")
+        for name in self.FILES:
+            with self.subTest(name=name):
+                digest = hashlib.sha256((MEASUREMENTS / name).read_bytes()).hexdigest()
+                self.assertIn(f"[`{name}`]({name}), sha256\n`{digest}`", doc)
+
+    def test_document_holds_every_row(self) -> None:
+        doc = self.DOC.read_text(encoding="utf-8")
+        for name in self.FILES:
+            with self.subTest(name=name):
+                self.assertEqual(missing_rows(doc, self.load(name)), [])
+
+    def test_planted_changed_result_is_refused(self) -> None:
+        doc = self.DOC.read_text(encoding="utf-8")
+        data = copy.deepcopy(self.load("hqdn3d-gpu-results-4090.json"))
+        next(r for r in data["results"] if r["stage"] == "parity")["mismatches"] = 1
+        next(r for r in data["results"] if r["stage"] == "speed")["median_fps"] += 1.0
+        self.assertEqual(len(missing_rows(doc, data)), 2)
 
 
 if __name__ == "__main__":
