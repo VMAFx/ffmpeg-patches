@@ -116,7 +116,7 @@ class Hqdn3dOpenCLTest(unittest.TestCase):
     def test_state_resets_on_graph_rebuild(self) -> None:
         cpu_chain, opencl_chain = chains("yuv420p", "")
         with tempfile.TemporaryDirectory() as tmp:
-            source = rebuild_source(FFMPEG, tmp, "mjpeg")
+            source = rebuild_source(FFMPEG, tmp, "ffv1")
             cpu = run(source, cpu_chain)
             self.assertEqual(len(cpu), REBUILD_BYTES)
             self.assertEqual(mismatches(cpu, run(source, opencl_chain), 8, False), 0)

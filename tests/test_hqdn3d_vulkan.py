@@ -148,7 +148,7 @@ class Hqdn3dVulkanTest(unittest.TestCase):
     def test_state_resets_on_graph_rebuild(self) -> None:
         cpu_chain, vulkan_chain = chains("yuv420p", "")
         with tempfile.TemporaryDirectory() as tmp:
-            source = rebuild_source(FFMPEG, tmp, "mjpeg")
+            source = rebuild_source(FFMPEG, tmp, "ffv1")
             cpu = run(source, cpu_chain)
             self.assertEqual(len(cpu), REBUILD_BYTES)
             self.assertEqual(mismatches(cpu, run(source, vulkan_chain), 8, False), 0)
