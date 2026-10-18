@@ -429,6 +429,60 @@ def check_tree(root: Path, names: list[str], findings: Findings, today: date | N
             findings.error(path.name, "metadata without a listed patch")
 
 
+# Upstream code a patch ports carries that project's notice on an added line;
+# REUSE.toml then names the holder in an override entry for exactly that patch.
+UPSTREAM_NOTICES = {
+    "Niklas Haas and the libplacebo contributors": re.compile(
+        r"^\+.*Copyright \(C\) Niklas Haas\b"
+    ),
+}
+
+
+def reuse_holders(root: Path, findings: Findings) -> dict[str, list[str]]:
+    """Copyright holders of REUSE.toml override entries that name single files, by path."""
+    path = root / "REUSE.toml"
+    if not path.is_file():
+        return {}
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        findings.error("REUSE.toml", f"unreadable: {exc}")
+        return {}
+    holders: dict[str, list[str]] = {}
+    for entry in data.get("annotations", []):
+        if entry.get("precedence") != "override":
+            continue
+        paths = entry.get("path", [])
+        texts = entry.get("SPDX-FileCopyrightText", [])
+        texts = [texts] if isinstance(texts, str) else texts
+        for name in [paths] if isinstance(paths, str) else paths:
+            if "*" not in name:
+                holders.setdefault(name, []).extend(texts)
+    return holders
+
+
+def check_upstream_credits(root: Path, names: list[str], findings: Findings) -> None:
+    """A patch adds an upstream notice exactly when REUSE.toml credits that holder for it."""
+    holders = reuse_holders(root, findings)
+    for name in names:
+        path = root / "patches" / name
+        if not path.is_file():
+            continue
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        credited = holders.get(f"patches/{name}", [])
+        for holder, notice in UPSTREAM_NOTICES.items():
+            carries = any(notice.match(line) for line in lines)
+            named = any(holder in text for text in credited)
+            if carries and not named:
+                findings.error(
+                    name, f"adds the notice of {holder}, but no REUSE.toml override names it"
+                )
+            elif named and not carries:
+                findings.error(
+                    name, f"REUSE.toml credits {holder}, but the patch adds no such notice"
+                )
+
+
 def refuse_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     """JSON object hook: a key written twice is an error, not the last value."""
     keys = [key for key, _ in pairs]
@@ -642,6 +696,7 @@ def check(root: Path, today: date | None = None) -> Findings:
     if not names and not findings.errors:
         findings.error("series.txt", "lists no patch")
     check_tree(root, names, findings, today=today)
+    check_upstream_credits(root, names, findings)
     check_contributions(root, names, findings)
     return findings
 
