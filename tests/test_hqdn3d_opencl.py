@@ -34,7 +34,14 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tests.test_hqdn3d_vulkan import OPTIONS, SOURCE, TEMPORAL_ONLY, mismatches  # noqa: E402
+from tests.test_hqdn3d_vulkan import (  # noqa: E402
+    OPTIONS,
+    REBUILD_BYTES,
+    SOURCE,
+    TEMPORAL_ONLY,
+    mismatches,
+    rebuild_source,
+)
 
 FFMPEG = os.environ.get("OCL_FFMPEG", "")
 DEVICE = os.environ.get("OCL_DEVICE", "")
@@ -58,7 +65,7 @@ def ffmpeg(source: list[str], chain: str) -> subprocess.CompletedProcess[bytes]:
     cmd = [
         FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error",
         "-init_hw_device", f"opencl=ocl:{DEVICE}", "-filter_hw_device", "ocl",
-        *source, "-vf", chain, "-f", "rawvideo", "pipe:1",
+        *source, "-vf", chain, "-noautoscale", "-f", "rawvideo", "pipe:1",
     ]  # fmt: skip
     return subprocess.run(cmd, capture_output=True, timeout=300, check=False)
 
@@ -107,21 +114,18 @@ class Hqdn3dOpenCLTest(unittest.TestCase):
                 self.assertEqual(self.compare(lavfi(), fmt, "", TEMPORAL_ONLY), 0)
 
     def test_state_resets_on_graph_rebuild(self) -> None:
+        cpu_chain, opencl_chain = chains("yuv420p", "")
         with tempfile.TemporaryDirectory() as tmp:
-            parts = []
-            for index, size in enumerate(("320x184", "160x96")):
-                part = Path(tmp) / f"{index}.nut"
-                encode = [
-                    FFMPEG, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
-                    f"testsrc2=s={size}:d=0.32,noise=alls=20:allf=t,format=yuv420p",
-                    "-c:v", "ffv1", str(part),
-                ]  # fmt: skip
-                subprocess.run(encode, capture_output=True, timeout=120, check=True)
-                parts.append(f"file '{part}'\n")
-            listing = Path(tmp) / "list.txt"
-            listing.write_text("".join(parts), encoding="utf-8")
-            source = ["-f", "concat", "-safe", "0", "-i", str(listing)]
-            self.assertEqual(self.compare(source, "yuv420p", ""), 0)
+            source = rebuild_source(FFMPEG, tmp, "mjpeg")
+            cpu = run(source, cpu_chain)
+            self.assertEqual(len(cpu), REBUILD_BYTES)
+            self.assertEqual(mismatches(cpu, run(source, opencl_chain), 8, False), 0)
+
+    def test_planted_sizeless_rebuild_source_is_refused(self) -> None:
+        cpu_chain, _ = chains("yuv420p", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = rebuild_source(FFMPEG, tmp, "ffv1")
+            self.assertNotEqual(len(run(source, cpu_chain)), REBUILD_BYTES)
 
     @unittest.skipUnless(RESET_TOOL, "set HQDN3D_RESET_TOOL")
     def test_state_resets_on_in_graph_resize(self) -> None:

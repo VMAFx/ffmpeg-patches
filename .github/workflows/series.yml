@@ -192,11 +192,6 @@ jobs:
         # is not used: it offers FFmpeg no planar or semi-planar image format.
         # The loaders see only those drivers; the step fails when FFmpeg opens
         # another device or when a device case is skipped instead of run.
-        # test_state_resets_on_graph_rebuild is left out here: on both
-        # software drivers a bare hwupload,hwdownload round trip with no
-        # hqdn3d already returns wrong frames after the concat size change,
-        # so that case cannot tell a filter defect from a driver one. It still
-        # runs wherever these tests run against a GPU.
         if: github.event.pull_request.draft != true
         run: |
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers mesa-opencl-icd
@@ -225,7 +220,7 @@ jobs:
           }
           probe vulkan=vk:0 llvmpipe
           probe opencl=ocl:0.0 rusticl
-          python3 -m unittest -v -k matches_cpu -k temporal_only \
+          python3 -m unittest -v -k matches_cpu -k temporal_only -k graph_rebuild \
             -k unsupported_format -k planted -k MismatchRule \
             tests.test_hqdn3d_vulkan tests.test_hqdn3d_opencl 2>&1 | tee parity.log
           status=${PIPESTATUS[0]}
