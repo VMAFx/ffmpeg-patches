@@ -2,6 +2,19 @@
   "checked": "2026-10-18",
   "contributions": [
     {
+      "number": 24045,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045",
+      "title": "avutil/hwcontext_vulkan: Query export support with the real image flags",
+      "base": "master",
+      "state": "merged",
+      "merged_at": "2026-08-07T19:14:03Z",
+      "merged_commit": "63d0237033cca9782932b809f960378d34ee4869",
+      "in_release": "",
+      "patch": "0036-avutil-hwcontext_vulkan-Query-export-support-with-th.patch",
+      "project": "pelorus",
+      "note": "By softworkz, not from this series; the series carries it as a backport onto the pinned release."
+    },
+    {
       "number": 24970,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970",
       "title": "avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED",

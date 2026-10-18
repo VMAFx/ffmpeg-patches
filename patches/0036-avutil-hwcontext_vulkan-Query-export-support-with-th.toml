@@ -1,0 +1,22 @@
+status = "merged"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045"
+upstream_commit = "63d0237033cca9782932b809f960378d34ee4869"
+consumers = ["pelorus"]
+origin = "backport of FFmpeg master 63d0237033cca9782932b809f960378d34ee4869 (softworkz, 2026-08-06), found by the Pelorus Vulkan export contract probe"
+notes = """
+Already on FFmpeg master; release/9.0 does not carry it (checked \
+2026-10-18 against release/9.0 7e93014c5b). Drop the patch once the \
+pinned base contains the commit. The one-line change applies to the \
+series unchanged, after 0006 in try_export_flags(). \
+On n9.0.2 an NV12 frames pool with OPTIMAL tiling asks for OPAQUE_FD \
+export support with VK_IMAGE_CREATE_ALIAS_BIT only; for the \
+G8_B8R8_2PLANE_420 storage image that query fails, so the pool memory \
+carries no export handle type. The patch asks with the pool's real \
+image create flags (MUTABLE_FORMAT, ALIAS, EXTENDED_USAGE). \
+Measured on 2026-10-18 with a libavutil-only build of the series and a \
+probe that allocates a 1920x1080 frame and calls vkGetMemoryFdKHR on \
+its memory under the validation layer: without the patch the export \
+fails validation (handle type not in VkExportMemoryAllocateInfo) on an \
+RTX 4090 (NVIDIA), an Arc A380 (ANV) and a Ryzen 9 9950X3D iGPU \
+(RADV); with the patch it returns an fd and no validation error on all \
+three."""
