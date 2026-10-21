@@ -27,16 +27,33 @@ that alternates between two contexts is imported again on each switch;
 deriving the Vulkan device from the CUDA device keeps one context and
 avoids that cost.
 
+The old CUDA frames context can hold the last reference to its device,
+so it is released only after its context has been popped; the pop
+result is returned. A failed import now releases only the partial CUDA
+import and keeps the rest of the frame's internal state, which the
+frame still uses.
+
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- libavutil/hwcontext_vulkan.c | 97 ++++++++++++++++++++++++++----------
- 1 file changed, 72 insertions(+), 25 deletions(-)
+ libavutil/hwcontext_vulkan.c | 112 ++++++++++++++++++++++++++---------
+ 1 file changed, 84 insertions(+), 28 deletions(-)
 
 diff --git a/libavutil/hwcontext_vulkan.c b/libavutil/hwcontext_vulkan.c
-index d92a6a586208bd68c4849eead1e980f51164e9b3..c136677750ae7ad634e16e6a810088275fd979b4 100644
+index d92a6a586208bd68c4849eead1e980f51164e9b3..940a35e583a5fd86e8b43b1c03af4ff72949fc6f 100644
 --- a/libavutil/hwcontext_vulkan.c
 +++ b/libavutil/hwcontext_vulkan.c
-@@ -2309,6 +2309,49 @@ static int alloc_mem(AVHWDeviceContext *ctx, VkMemoryRequirements *req,
+@@ -207,8 +207,8 @@ typedef struct AVVkFrameInternal {
+     VkSemaphore drm_sync_sem;
+ 
+ #if CONFIG_CUDA
+-    /* Importing external memory into cuda is really expensive so we keep the
+-     * memory imported all the time */
++    /* Importing external memory into CUDA is expensive, so cache the import
++     * until the CUDA context changes. */
+     AVBufferRef *cuda_fc_ref; /* Need to keep it around for uninit */
+     CUexternalMemory ext_mem[AV_NUM_DATA_POINTERS];
+     CUmipmappedArray cu_mma[AV_NUM_DATA_POINTERS];
+@@ -2309,6 +2309,47 @@ static int alloc_mem(AVHWDeviceContext *ctx, VkMemoryRequirements *req,
      return 0;
  }
  
@@ -78,15 +95,13 @@ index d92a6a586208bd68c4849eead1e980f51164e9b3..c136677750ae7ad634e16e6a81008827
 +        internal->ext_mem_handle[i] = NULL;
 +#endif
 +    }
-+
-+    av_buffer_unref(&internal->cuda_fc_ref);
 +}
 +#endif
 +
  static void vulkan_free_internal(VulkanDevicePriv *p, AVVkFrame *f)
  {
      av_unused AVVkFrameInternal *internal = f->internal;
-@@ -2318,31 +2361,7 @@ static void vulkan_free_internal(VulkanDevicePriv *p, AVVkFrame *f)
+@@ -2318,31 +2359,8 @@ static void vulkan_free_internal(VulkanDevicePriv *p, AVVkFrame *f)
          return;
  
  #if CONFIG_CUDA
@@ -116,10 +131,11 @@ index d92a6a586208bd68c4849eead1e980f51164e9b3..c136677750ae7ad634e16e6a81008827
 -        av_buffer_unref(&internal->cuda_fc_ref);
 -    }
 +    vulkan_free_cuda_import(internal);
++    av_buffer_unref(&internal->cuda_fc_ref);
  #endif
  
      if (internal->drm_sync_sem != VK_NULL_HANDLE)
-@@ -3899,6 +3918,34 @@ static int vulkan_export_to_cuda(AVHWFramesContext *hwfc,
+@@ -3899,6 +3917,43 @@ static int vulkan_export_to_cuda(AVHWFramesContext *hwfc,
      dst_f = (AVVkFrame *)frame->data[0];
      dst_int = dst_f->internal;
  
@@ -134,6 +150,7 @@ index d92a6a586208bd68c4849eead1e980f51164e9b3..c136677750ae7ad634e16e6a81008827
 +        if (old_dev->cuda_ctx != cuda_dev->cuda_ctx) {
 +            CudaFunctions *old_dl = old_dev->internal->cuda_dl;
 +            CUcontext dummy;
++            int pop_err;
 +
 +            err = FF_CUDA_CHECK_DL(old_cu, old_dl,
 +                                   old_dl->cuCtxPushCurrent(old_dev->cuda_ctx));
@@ -145,7 +162,15 @@ index d92a6a586208bd68c4849eead1e980f51164e9b3..c136677750ae7ad634e16e6a81008827
 +            if (err >= 0)
 +                vulkan_free_cuda_import(dst_int);
 +
-+            FF_CUDA_CHECK_DL(old_cu, old_dl, old_dl->cuCtxPopCurrent(&dummy));
++            pop_err = FF_CUDA_CHECK_DL(old_cu, old_dl,
++                                       old_dl->cuCtxPopCurrent(&dummy));
++
++            /* Release the old frames context only after the pop: it may hold
++             * the last reference to the CUDA device and its function table. */
++            if (err >= 0) {
++                av_buffer_unref(&dst_int->cuda_fc_ref);
++                err = pop_err;
++            }
 +            if (err < 0)
 +                return err;
 +        }
@@ -153,4 +178,14 @@ index d92a6a586208bd68c4849eead1e980f51164e9b3..c136677750ae7ad634e16e6a81008827
 +
      if (!dst_int->cuda_fc_ref) {
          size_t offsets[3] = { 0 };
+ 
+@@ -3983,7 +4038,8 @@ static int vulkan_export_to_cuda(AVHWFramesContext *hwfc,
+     return 0;
+ 
+ fail:
+-    vulkan_free_internal(p, dst_f);
++    vulkan_free_cuda_import(dst_int);
++    av_buffer_unref(&dst_int->cuda_fc_ref);
+     return err;
+ }
  

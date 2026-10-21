@@ -14,13 +14,19 @@ runs exit 187 with that error and no frame; with it 3 of 3 runs write \
 120 frames whose framemd5 equals the same pipeline without the GPU hop. \
 The upstream pull request has the same diff (equal patch-id) on FFmpeg \
 master ebfc9497f7; this patch is its n9.0.2 form. Fixes FFmpeg issue \
-25052."""
+25052. Revised after the 2026-10-21 review of the pull request: the old \
+CUDA frames context is released only after its context pop (it can hold \
+the last reference to the device and its function table), the pop \
+result is returned, and a failed import releases only the partial CUDA \
+import instead of the frame's whole internal state. The upstream head \
+and this patch have equal patch-id; measurements of the revision are in \
+the pull request."""
 
 [[exceptions]]
 rule = "HISS-04"
 path = "libavutil/hwcontext_vulkan.c"
 function = "vulkan_export_to_cuda"
-lines = 143
+lines = 153
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
