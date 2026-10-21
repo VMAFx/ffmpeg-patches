@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-18",
+  "checked": "2026-10-21",
   "contributions": [
     {
       "number": 24045,
@@ -45,9 +45,9 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974",
       "title": "avcodec/av1dec: remove the coding bias from exported chroma grain params",
       "base": "master",
-      "state": "open",
-      "merged_at": "",
-      "merged_commit": "",
+      "state": "merged",
+      "merged_at": "2026-10-20T01:28:55Z",
+      "merged_commit": "2a8c6d30b934f9bd8429f96f605e5fc7c5751679",
       "in_release": "",
       "patch": "",
       "project": "pelorus",
