@@ -26,8 +26,8 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/Makefile               |   5 +-
  libavfilter/opencl/bt2408_hable.cl | 195 +++++++++++++++++++++++++++++
  libavfilter/opencl_source.h        |   1 +
- libavfilter/vf_tonemap_opencl.c    | 174 +++++++++++++++++++------
- 5 files changed, 343 insertions(+), 41 deletions(-)
+ libavfilter/vf_tonemap_opencl.c    | 180 +++++++++++++++++++-------
+ 5 files changed, 346 insertions(+), 44 deletions(-)
  create mode 100644 libavfilter/opencl/bt2408_hable.cl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
@@ -287,7 +287,7 @@ index b6930fb686da948f60ca13934e746c1c5694c7d3..4a7b945e029fbff9a5795481d455dc5a
  extern const char *ff_source_colorspace_common_cl;
  extern const char *ff_source_convolution_cl;
 diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
-index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f5372443544cef 100644
+index aecf0701bf4d6e8a1e9579d7cea8ebd9c7c93725..f721828527a0a3f6fb78755d689f65d3a3495bfb 100644
 --- a/libavfilter/vf_tonemap_opencl.c
 +++ b/libavfilter/vf_tonemap_opencl.c
 @@ -24,6 +24,7 @@
@@ -326,7 +326,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
  };
  
  static int get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries out,
-@@ -110,18 +118,56 @@ static int get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries ou
+@@ -110,19 +118,59 @@ static int get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries ou
      return 0;
  }
  
@@ -336,8 +336,10 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
  // under a typical presentation gamma of about 2.0.
  static const float sdr_avg = 0.25f;
  
+-static int tonemap_opencl_init(AVFilterContext *avctx)
 +static int create_opencl_objects(AVFilterContext *avctx)
-+{
+ {
+     unsigned util_init[2 * DETECTION_FRAMES + 7] = { 0 };
 +    TonemapOpenCLContext *ctx = avctx->priv;
 +    cl_int cle;
 +
@@ -364,9 +366,11 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
 +        return AVERROR(EIO);
 +    }
 +
-+    ctx->util_mem = clCreateBuffer(ctx->ocf.hwctx->context, 0,
-+                                   (2 * DETECTION_FRAMES + 7) * sizeof(unsigned),
-+                                   NULL, &cle);
++    // The kernel keeps its peak detection state here and expects it to
++    // start at zero, but a buffer created without a host pointer has
++    // undefined contents.
++    ctx->util_mem = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_COPY_HOST_PTR,
++                                   sizeof(util_init), util_init, &cle);
 +    if (!ctx->util_mem || cle != CL_SUCCESS) {
 +        av_log(avctx, AV_LOG_ERROR, "Failed to create util buffer: %d.\n", cle);
 +        return AVERROR(EIO);
@@ -375,8 +379,8 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
 +    return 0;
 +}
 +
- static int tonemap_opencl_init(AVFilterContext *avctx)
- {
++static int tonemap_opencl_init(AVFilterContext *avctx)
++{
      TonemapOpenCLContext *ctx = avctx->priv;
      int rgb2rgb_passthrough = 1;
      double rgb2rgb[3][3], rgb2yuv[3][3], yuv2rgb[3][3];
@@ -385,7 +389,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
      int err;
      AVBPrint header;
      const char *opencl_sources[OPENCL_SOURCE_NB];
-@@ -194,6 +240,9 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+@@ -195,6 +243,9 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
      if (ctx->range_out == AVCOL_RANGE_JPEG)
          av_bprintf(&header, "#define FULL_RANGE_OUT\n");
  
@@ -395,7 +399,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
      av_bprintf(&header, "#define chroma_loc %d\n", (int)ctx->chroma_loc);
  
      if (rgb2rgb_passthrough)
-@@ -243,27 +292,17 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+@@ -244,29 +295,17 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
      av_log(avctx, AV_LOG_DEBUG, "Generated OpenCL header:\n%s\n", header.str);
      opencl_sources[0] = header.str;
      opencl_sources[1] = ff_source_tonemap_cl;
@@ -417,10 +421,12 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
 -    ctx->kernel = clCreateKernel(ctx->ocf.program, "tonemap", &cle);
 -    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel %d.\n", cle);
 -
+-    // The kernel keeps its peak detection state here and expects it to
+-    // start at zero, but a buffer created without a host pointer has
+-    // undefined contents.
 -    ctx->util_mem =
--        clCreateBuffer(ctx->ocf.hwctx->context, 0,
--                       (2 * DETECTION_FRAMES + 7) * sizeof(unsigned),
--                       NULL, &cle);
+-        clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_COPY_HOST_PTR,
+-                       sizeof(util_init), util_init, &cle);
 -    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create util buffer: %d.\n", cle);
 +    err = create_opencl_objects(avctx);
 +    if (err < 0)
@@ -428,7 +434,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
  
      ctx->initialised = 1;
      return 0;
-@@ -272,6 +311,8 @@ fail:
+@@ -275,6 +314,8 @@ fail:
      av_bprint_finalize(&header, NULL);
      if (ctx->util_mem)
          clReleaseMemObject(ctx->util_mem);
@@ -437,7 +443,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
      if (ctx->command_queue)
          clReleaseCommandQueue(ctx->command_queue);
      if (ctx->kernel)
-@@ -331,6 +372,31 @@ static int tonemap_opencl_query_formats(const AVFilterContext *avctx,
+@@ -334,6 +375,31 @@ static int tonemap_opencl_query_formats(const AVFilterContext *avctx,
      return 0;
  }
  
@@ -469,7 +475,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
  static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
                           AVFrame *output, AVFrame *input, float peak) {
      TonemapOpenCLContext *ctx = avctx->priv;
-@@ -339,11 +405,18 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+@@ -342,11 +408,18 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
      size_t local_work[2];
      cl_int cle;
  
@@ -489,7 +495,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
      CL_SET_KERNEL_ARG(kernel, 5, cl_float, &peak);
  
      local_work[0]  = 16;
-@@ -363,6 +436,42 @@ fail:
+@@ -366,6 +439,42 @@ fail:
      return err;
  }
  
@@ -532,7 +538,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
  static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
  {
      AVFilterContext    *avctx = inlink->dst;
-@@ -404,6 +513,9 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+@@ -407,6 +516,9 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
          output->colorspace = ctx->colorspace;
      if (ctx->range != -1)
          output->color_range = ctx->range;
@@ -542,7 +548,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
  
      ctx->trc_in = input->color_trc;
      ctx->trc_out = output->color_trc;
-@@ -449,32 +561,13 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+@@ -452,32 +564,13 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
  
      av_frame_free(&input);
  
@@ -577,7 +583,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
  #endif
  
      return ff_filter_frame(outlink, output);
-@@ -493,6 +586,8 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
+@@ -496,6 +589,8 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
  
      if (ctx->util_mem)
          clReleaseMemObject(ctx->util_mem);
@@ -586,7 +592,7 @@ index c98c50bc87879c66441b5493308fac1208206993..03c8912927b1b3418c6c10f1a1f53724
      if (ctx->kernel) {
          cle = clReleaseKernel(ctx->kernel);
          if (cle != CL_SUCCESS)
-@@ -521,6 +616,7 @@ static const AVOption tonemap_opencl_options[] = {
+@@ -524,6 +619,7 @@ static const AVOption tonemap_opencl_options[] = {
      {     "reinhard", 0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_REINHARD},          0, 0, FLAGS, .unit = "tonemap" },
      {     "hable",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_HABLE},             0, 0, FLAGS, .unit = "tonemap" },
      {     "mobius",   0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_MOBIUS},            0, 0, FLAGS, .unit = "tonemap" },

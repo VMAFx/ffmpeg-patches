@@ -153,7 +153,7 @@ jobs:
           # glslc provides spirv_compiler, without which configure drops the Vulkan
           # encoders and filters that compile shaders, such as ffv1enc_vulkan.c (0008).
           # --enable-libzimg builds vf_zscale.c, which 0015 changes; --enable-opencl
-          # builds vf_tonemap_opencl.c and its kernels, which 0016 and 0017 change.
+          # builds vf_tonemap_opencl.c and its kernels, which 0016 and 0018 change.
           ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl --enable-vulkan \
             --enable-nvenc --enable-vaapi --enable-libdrm --enable-libvpl --enable-libzimg \
             --enable-opencl \
@@ -188,7 +188,7 @@ jobs:
       - name: Compare the hqdn3d and tonemap GPU filters with the CPU filters on software devices
         # ADR-0004: the GPU hqdn3d filters must give the CPU filter's samples;
         # tonemap_opencl and tonemap_vulkan must stay within one code value of
-        # tonemap=bt2408_hable (0016, 0017, 0019, 0021, 0035). The
+        # tonemap=bt2408_hable (0016, 0018, 0020, 0022, 0036). The
         # hosted runner has no GPU, so Mesa lavapipe (Vulkan) and rusticl on
         # llvmpipe (OpenCL) run the same shaders and kernels on the CPU. PoCL
         # is not used: it offers FFmpeg no planar or semi-planar image format.

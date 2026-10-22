@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patch 0023 (hqdn3d_vulkan).
+"""Regression tests for patch 0024 (hqdn3d_vulkan).
 
-0023: the new hqdn3d_vulkan filter runs the integer hqdn3d filter in two
+0024: the new hqdn3d_vulkan filter runs the integer hqdn3d filter in two
 compute shaders and must give the same output samples as the CPU hqdn3d
 filter (ADR-0004). Planar formats must match bit for bit. The semi-planar
 P010, P012 and P016 formats keep samples in the high bits, so a 12-bit CPU
@@ -127,7 +127,7 @@ def rebuild_source(ffmpeg: str, tmp: str, codec: str) -> list[str]:
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")
 class Hqdn3dVulkanTest(unittest.TestCase):
-    """0023: the Vulkan hqdn3d path must match the CPU path."""
+    """0024: the Vulkan hqdn3d path must match the CPU path."""
 
     def compare(self, source: list[str], fmt: str, options: str, prefix: str = "") -> int:
         cpu_chain, vulkan_chain = chains(fmt, options, prefix)

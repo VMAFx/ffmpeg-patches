@@ -1,0 +1,15 @@
+status = "merged"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835"
+upstream_commit = "fd9a8f25a07bbec3e6b25339177ef1e2d49cbf05"
+consumers = ["vmafx", "pelorus"]
+origin = "backport of FFmpeg master fd9a8f25a07bbec3e6b25339177ef1e2d49cbf05 (dhalsimax, 2026-10-01), found when the series stopped applying to FFmpeg master"
+notes = """
+Already on FFmpeg master; release/9.0 does not carry it (checked \
+2026-10-22 against release/9.0 4cf298e66a). Drop the patch once the \
+pinned base contains the commit. It applies to n9.0.2 unchanged. \
+0018 moves the util buffer into create_opencl_objects(); before this \
+backport it created the buffer without a host pointer there, so the \
+series kept the undefined peak detection state that the upstream fix \
+removes and conflicted with it on FFmpeg master. 0018 now creates the \
+buffer from the zeroed array as this patch does; the tree after the \
+whole series differs from the earlier series only in that buffer."""

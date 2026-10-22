@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patch 0018 (tonemap_vaapi).
+"""Regression tests for patch 0019 (tonemap_vaapi).
 
-0018: tonemap_vaapi with tonemap=bt2408_hable fills a VAProcFilter3DLUT table
+0019: tonemap_vaapi with tonemap=bt2408_hable fills a VAProcFilter3DLUT table
 from the CPU tonemap=bt2408_hable math. On flat frames the VAAPI path gives
 the same 8-bit code values as the CPU path; the test allows one code value
 of difference.
@@ -72,7 +72,7 @@ def output(frame: bytes, chain: str) -> bytes:
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VA_FFMPEG and VA_DEVICE")
 class Bt2408HableTest(unittest.TestCase):
-    """0018: the VAAPI bt2408_hable path must match the CPU path."""
+    """0019: the VAAPI bt2408_hable path must match the CPU path."""
 
     def test_vaapi_matches_cpu(self) -> None:
         for colour in COLOURS:

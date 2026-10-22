@@ -220,7 +220,7 @@ index 186303eeed8bec14485e2698fe7837d8a4e26e3f..7d860c9c0a0368bf63645de6daf7a95e
  extern const char *ff_source_unsharp_cl;
  extern const char *ff_source_xfade_cl;
 diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
-index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696ce3cdaa3a 100644
+index 7b88c894aaa01a19c85cd3d3a875987198e8a259..99ffd5c7bd08a8777cd5d4fa549970b1b56a15bf 100644
 --- a/libavfilter/vf_tonemap_opencl.c
 +++ b/libavfilter/vf_tonemap_opencl.c
 @@ -82,6 +82,10 @@ typedef struct TonemapOpenCLContext {
@@ -243,7 +243,7 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
  // Average light level for SDR signals. This is equal to a signal level of 0.5
  // under a typical presentation gamma of about 2.0.
  static const float sdr_avg = 0.25f;
-@@ -210,10 +214,35 @@ static int build_opencl_header(AVFilterContext *avctx, AVBPrint *header)
+@@ -210,11 +214,36 @@ static int build_opencl_header(AVFilterContext *avctx, AVBPrint *header)
      return print_transfer_and_luma(avctx, header);
  }
  
@@ -273,13 +273,14 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
 +
  static int create_opencl_objects(AVFilterContext *avctx)
  {
+     unsigned util_init[2 * DETECTION_FRAMES + 7] = { 0 };
      TonemapOpenCLContext *ctx = avctx->priv;
      cl_int cle;
 +    int err;
  
      ctx->command_queue = clCreateCommandQueue(ctx->ocf.hwctx->context,
                                                ctx->ocf.hwctx->device_id,
-@@ -255,16 +284,43 @@ static int create_opencl_objects(AVFilterContext *avctx)
+@@ -258,16 +287,43 @@ static int create_opencl_objects(AVFilterContext *avctx)
          }
      }
  
@@ -325,7 +326,7 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
      switch(ctx->tonemap) {
      case TONEMAP_GAMMA:
          if (isnan(ctx->param))
-@@ -306,21 +362,7 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+@@ -309,21 +365,7 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
      av_assert0(ctx->primaries_in == AVCOL_PRI_BT2020 ||
                 ctx->primaries_in == AVCOL_PRI_BT709);
  
@@ -348,7 +349,7 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
      if (err < 0)
          return err;
  
-@@ -616,21 +658,131 @@ static int check_init(AVFilterContext *avctx, const AVFrame *input,
+@@ -619,21 +661,131 @@ static int check_init(AVFilterContext *avctx, const AVFrame *input,
      return tonemap_opencl_init(avctx);
  }
  
@@ -488,7 +489,7 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
  }
  
  static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
-@@ -670,11 +822,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+@@ -673,11 +825,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
      if (err < 0)
          goto fail;
  
@@ -501,7 +502,7 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
      if (err < 0)
          goto fail;
  
-@@ -730,6 +878,13 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
+@@ -733,6 +881,13 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
          clReleaseMemObject(ctx->bt2408_mem);
      if (ctx->dovi_mem)
          clReleaseMemObject(ctx->dovi_mem);
@@ -515,7 +516,7 @@ index f917af6a90104a32c5d6e3e8a329101975c03f87..47008c6e5ebdf9e7d02e57111639696c
      if (ctx->kernel) {
          cle = clReleaseKernel(ctx->kernel);
          if (cle != CL_SUCCESS)
-@@ -779,6 +934,7 @@ static const AVOption tonemap_opencl_options[] = {
+@@ -782,6 +937,7 @@ static const AVOption tonemap_opencl_options[] = {
      {     "full",          0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},         0, 0, FLAGS, .unit = "range" },
      { "format",    "output pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, {.i64 = AV_PIX_FMT_NONE}, AV_PIX_FMT_NONE, INT_MAX, FLAGS, .unit = "fmt" },
      { "peak",      "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },

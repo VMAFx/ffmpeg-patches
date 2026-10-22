@@ -1,6 +1,0 @@
-status = "unsubmitted"
-upstream = ""
-consumers = ["vmafx", "pelorus"]
-origin = "#63 Dolby Vision profile 5 reshape (ADR-0002), part 2: let format negotiation pass IPT-C2 to the swscale check of 0028"
-notes = """
-query_formats() admits AVCOL_SPC_IPT_C2 in both negotiated colour space lists through scale_test_colorspace(); swscale (0028) refuses every conversion of it that is not a same-colour YUV repack. in_color_matrix=15 and out_color_matrix=15 (IPT-C2) are still refused with rc 234. Without this patch format=p010 on a profile 5 base layer fails to negotiate (rc 218). Mid-stream colour space changes stay refused: concat of HDR10 and IPT-C2 input fails with rc 161 in both orders."""

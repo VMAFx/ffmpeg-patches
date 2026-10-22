@@ -47,7 +47,8 @@ without a series patch is a change the series does not carry.
 <!-- upstream-contributions:start -->
 | Pull request | Target | State | Change | Series patch |
 | --- | --- | --- | --- | --- |
-| [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0036 |
+| [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0037 |
+| [24835](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835) | `master` | merged 2026-10-19 (`fd9a8f25a07b`), in no release yet | avfilter/vf_tonemap_opencl: zero the peak detection buffer | 0017 |
 | [24970](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970) | `master` | open | avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED | 0001 |
 | [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | none |
 | [24974](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974) | `master` | merged 2026-10-20 (`2a8c6d30b934`), in no release yet | avcodec/av1dec: remove the coding bias from exported chroma grain params | none |
@@ -248,7 +249,7 @@ a device case is skipped, or when a GPU filter leaves the CPU filter's output:
 | Tests | Filters | Bound |
 | --- | --- | --- |
 | `tests/test_hqdn3d_vulkan.py`, `tests/test_hqdn3d_opencl.py` | `hqdn3d_vulkan`, `hqdn3d_opencl` | the samples of `hqdn3d` ([ADR-0004](docs/adr/0004-hqdn3d-on-the-gpu.md)) |
-| `tests/test_tonemap_vulkan.py`, `tests/test_tonemap_opencl.py` | `tonemap_vulkan`, `tonemap_opencl` (0016, 0017, 0019, 0021, 0035) | one 8-bit code value of `tonemap=bt2408_hable`, with and without peak detection; a software conversion after `tonemap_opencl` keeps its output matrix (0016) |
+| `tests/test_tonemap_vulkan.py`, `tests/test_tonemap_opencl.py` | `tonemap_vulkan`, `tonemap_opencl` (0016, 0018, 0020, 0022, 0036) | one 8-bit code value of `tonemap=bt2408_hable`, with and without peak detection; a software conversion after `tonemap_opencl` keeps its output matrix (0016) |
 
 Each test file also holds a planted wrong case that the comparison must refuse.
 

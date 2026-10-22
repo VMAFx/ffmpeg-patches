@@ -48,7 +48,7 @@ index 6d9a9edb2c5d118892b3d04c6c7aef3d4373de79..502ea389a44d3e3582281b626c9ce0f6
                                                  opencl/colorspace_common.o \
                                                  opencl/dovi_reshape.o
 diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
-index 42f613cbb56e99be2a85b534407652f479548daa..f917af6a90104a32c5d6e3e8a329101975c03f87 100644
+index 237aca0a7554be89be5c3a23900405921d9ddde2..7b88c894aaa01a19c85cd3d3a875987198e8a259 100644
 --- a/libavfilter/vf_tonemap_opencl.c
 +++ b/libavfilter/vf_tonemap_opencl.c
 @@ -30,6 +30,7 @@
@@ -59,7 +59,7 @@ index 42f613cbb56e99be2a85b534407652f479548daa..f917af6a90104a32c5d6e3e8a3291019
  #include "video.h"
  #include "colorspace.h"
  
-@@ -615,6 +616,23 @@ static int check_init(AVFilterContext *avctx, const AVFrame *input,
+@@ -618,6 +619,23 @@ static int check_init(AVFilterContext *avctx, const AVFrame *input,
      return tonemap_opencl_init(avctx);
  }
  
@@ -83,7 +83,7 @@ index 42f613cbb56e99be2a85b534407652f479548daa..f917af6a90104a32c5d6e3e8a3291019
  static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
  {
      AVFilterContext    *avctx = inlink->dst;
-@@ -624,7 +642,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+@@ -627,7 +645,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
      FFDoviReshape rs;
      cl_int cle;
      int err;
@@ -92,7 +92,7 @@ index 42f613cbb56e99be2a85b534407652f479548daa..f917af6a90104a32c5d6e3e8a3291019
  
      AVHWFramesContext *input_frames_ctx;
  
-@@ -652,8 +670,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+@@ -655,8 +673,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
      if (err < 0)
          goto fail;
  
