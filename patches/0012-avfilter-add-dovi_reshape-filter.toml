@@ -20,5 +20,5 @@ planted wrong chroma siting and a planted wrong RPU coefficient detected \
 and limited range refused. The L1 block is also exported as the frame \
 metadata lavfi.dovi.l1_max_pq and lavfi.dovi.l1_avg_pq (12-bit PQ code \
 values, removed when a frame has none; key names fixed by ADR-0003), \
-which 0020 reads; the unit test checks both keys and fails when either \
+which 0021 reads; the unit test checks both keys and fails when either \
 is missing. No version.h or Changelog bump."""

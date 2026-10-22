@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Unit test for libavcodec/nvenc_sei.h of patch 0027.
+"""Unit test for libavcodec/nvenc_sei.h of patch 0028.
 
 The header holds the hevc_nvenc SEI budget of 0003 and the emulation
 prevention and truncation rules of 0004 as plain C, so that Pelorus can
@@ -26,7 +26,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PATCH = next((ROOT / "patches").glob("0027-*.patch"))
+PATCH = next((ROOT / "patches").glob("0028-*.patch"))
 HEADER = "libavcodec/nvenc_sei.h"
 CC = os.environ.get("CC", "cc")
 # hevc_nvenc non-VCL limit, reserve and SEI budget of 0003, as the driver prints them.
@@ -65,7 +65,7 @@ int main(void)
 
 
 def header_from_patch(text: str) -> str:
-    """Return the new file HEADER as patch 0027 adds it."""
+    """Return the new file HEADER as patch 0028 adds it."""
     start = text.index(f"diff --git a/{HEADER} b/{HEADER}")
     end = text.find("\ndiff --git ", start + 1)
     section = text[start : end if end >= 0 else len(text)]

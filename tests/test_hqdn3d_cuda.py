@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patch 0024 (hqdn3d_cuda).
+"""Regression tests for patch 0025 (hqdn3d_cuda).
 
-0024: the new hqdn3d_cuda filter runs the integer hqdn3d filter in two CUDA
+0025: the new hqdn3d_cuda filter runs the integer hqdn3d filter in two CUDA
 kernels and must give the same output samples as the CPU hqdn3d filter
 (ADR-0004), by the comparison rule of tests/test_hqdn3d_vulkan.py. P012 is
 not accepted, because hwupload_cuda converts it to P016; the refusal is a
@@ -87,7 +87,7 @@ def lavfi() -> list[str]:
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set CUDA_FFMPEG and CUDA_DEVICE")
 class Hqdn3dCudaTest(unittest.TestCase):
-    """0024: the CUDA hqdn3d path must match the CPU path."""
+    """0025: the CUDA hqdn3d path must match the CPU path."""
 
     def compare(self, source: list[str], fmt: str, options: str, prefix: str = "") -> int:
         cpu_chain, cuda_chain = chains(fmt, options, prefix)

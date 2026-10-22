@@ -1,12 +1,12 @@
 # hqdn3d on the GPU: speed and quality
 
-Measurement of the GPU `hqdn3d` filters of patches 0023 to 0026 against
+Measurement of the GPU `hqdn3d` filters of patches 0024 to 0027 against
 the CPU `hqdn3d`, `nlmeans_vulkan` and the AV1 encoders' own denoisers, as
 [ADR-0004](../adr/0004-hqdn3d-on-the-gpu.md) plans it. The plan comes first,
 the results of the main run on 2026-10-18 follow it, and then a second run
 the same day on the RTX 4090, which the main run had to skip.
 
-`hqdn3d_videotoolbox` (0026) is not measured: no Apple host is available.
+`hqdn3d_videotoolbox` (0027) is not measured: no Apple host is available.
 It compiles on the macOS job of `series.yml`; its speed and its parity with
 the CPU filter are unknown.
 

@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patches 0019 and 0021 (tonemap_vulkan).
+"""Regression tests for patches 0020 and 0022 (tonemap_vulkan).
 
-0019: the new tonemap_vulkan filter runs the CPU tonemap=bt2408_hable math in
+0020: the new tonemap_vulkan filter runs the CPU tonemap=bt2408_hable math in
 a compute shader. On flat frames the Vulkan path gives the same 8-bit code
 values as the CPU path; the test allows one code value of difference.
 
@@ -12,7 +12,7 @@ other input; the test checks that refusal on an HLG frame.
 The planted wrong case is a run at four times the peak, which the
 comparison must refuse.
 
-0021: with peak_detect=1 the Vulkan path measures the peak of the frame in a
+0022: with peak_detect=1 the Vulkan path measures the peak of the frame in a
 compute shader and gives the same output as the CPU detector. The detected
 peak of a flat frame is far below the fixed peak of 1000 cd/m^2, so the test
 also checks that detection changes the output; the planted wrong case runs
@@ -77,7 +77,7 @@ def output(frame: bytes, chain: str) -> bytes:
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")
 class Bt2408HableTest(unittest.TestCase):
-    """0019, 0021: the Vulkan bt2408_hable path must match the CPU path."""
+    """0020, 0022: the Vulkan bt2408_hable path must match the CPU path."""
 
     def test_vulkan_matches_cpu(self) -> None:
         for colour in COLOURS:

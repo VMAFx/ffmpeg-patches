@@ -10,9 +10,22 @@
       "merged_at": "2026-08-07T19:14:03Z",
       "merged_commit": "63d0237033cca9782932b809f960378d34ee4869",
       "in_release": "",
-      "patch": "0036-avutil-hwcontext_vulkan-Query-export-support-with-th.patch",
+      "patch": "0037-avutil-hwcontext_vulkan-Query-export-support-with-th.patch",
       "project": "pelorus",
       "note": "By softworkz, not from this series; the series carries it as a backport onto the pinned release."
+    },
+    {
+      "number": 24835,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835",
+      "title": "avfilter/vf_tonemap_opencl: zero the peak detection buffer",
+      "base": "master",
+      "state": "merged",
+      "merged_at": "2026-10-19T14:58:27Z",
+      "merged_commit": "fd9a8f25a07bbec3e6b25339177ef1e2d49cbf05",
+      "in_release": "",
+      "patch": "0017-avfilter-vf_tonemap_opencl-zero-the-peak-detection-b.patch",
+      "project": "vmafx, pelorus",
+      "note": "By dhalsimax, not from this series; the series carries it as a backport onto the pinned release, and 0018 keeps the zeroed buffer."
     },
     {
       "number": 24970,

@@ -319,7 +319,7 @@ index 65546425d65f6c3ffc71e9ffe7ad88c5a8e72453..186303eeed8bec14485e2698fe7837d8
  extern const char *ff_source_neighbor_cl;
  extern const char *ff_source_nlmeans_cl;
 diff --git a/libavfilter/vf_tonemap_opencl.c b/libavfilter/vf_tonemap_opencl.c
-index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f479548daa 100644
+index f721828527a0a3f6fb78755d689f65d3a3495bfb..237aca0a7554be89be5c3a23900405921d9ddde2 100644
 --- a/libavfilter/vf_tonemap_opencl.c
 +++ b/libavfilter/vf_tonemap_opencl.c
 @@ -25,6 +25,7 @@
@@ -434,8 +434,8 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
 +
  static int create_opencl_objects(AVFilterContext *avctx)
  {
-     TonemapOpenCLContext *ctx = avctx->priv;
-@@ -159,20 +245,24 @@ static int create_opencl_objects(AVFilterContext *avctx)
+     unsigned util_init[2 * DETECTION_FRAMES + 7] = { 0 };
+@@ -162,20 +248,24 @@ static int create_opencl_objects(AVFilterContext *avctx)
          return AVERROR(EIO);
      }
  
@@ -466,7 +466,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
  
      switch(ctx->tonemap) {
      case TONEMAP_GAMMA:
-@@ -192,7 +282,6 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+@@ -195,7 +285,6 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
      if (isnan(ctx->param))
          ctx->param = 1.0f;
  
@@ -474,7 +474,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
      ctx->target_peak = 1.0f;
      av_log(ctx, AV_LOG_DEBUG, "tone mapping transfer from %s to %s\n",
             av_color_transfer_name(ctx->trc_in),
-@@ -206,118 +295,40 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+@@ -209,118 +298,40 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
      av_log(ctx, AV_LOG_DEBUG, "mapping range from %s to %s\n",
             av_color_range_name(ctx->range_in),
             av_color_range_name(ctx->range_out));
@@ -606,7 +606,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
  }
  
  static int tonemap_opencl_config_output(AVFilterLink *outlink)
-@@ -397,13 +408,37 @@ static int setup_bt2408(AVFilterContext *avctx, const AVFrame *input, double pea
+@@ -400,13 +411,37 @@ static int setup_bt2408(AVFilterContext *avctx, const AVFrame *input, double pea
      return 0;
  }
  
@@ -646,7 +646,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
  
      if (ctx->tonemap == TONEMAP_BT2408_HABLE) {
          err = setup_bt2408(avctx, input, peak);
-@@ -411,13 +446,9 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+@@ -414,13 +449,9 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
              return err;
      }
  
@@ -663,7 +663,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
  
      local_work[0]  = 16;
      local_work[1]  = 16;
-@@ -430,10 +461,72 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
+@@ -433,10 +464,72 @@ static int launch_kernel(AVFilterContext *avctx, cl_kernel kernel,
      cle = clEnqueueNDRangeKernel(ctx->command_queue, kernel, 2, NULL,
                                   global_work, local_work,
                                   0, NULL, NULL);
@@ -739,7 +739,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
  }
  
  static void cleanup_output_metadata(TonemapOpenCLContext *ctx, AVFrame *output)
-@@ -444,6 +537,10 @@ static void cleanup_output_metadata(TonemapOpenCLContext *ctx, AVFrame *output)
+@@ -447,6 +540,10 @@ static void cleanup_output_metadata(TonemapOpenCLContext *ctx, AVFrame *output)
      } else {
          ff_update_hdr_metadata(output, ctx->target_peak);
      }
@@ -750,7 +750,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
  }
  
  #ifndef NDEBUG
-@@ -457,7 +554,6 @@ static void log_detected_peak(TonemapOpenCLContext *ctx)
+@@ -460,7 +557,6 @@ static void log_detected_peak(TonemapOpenCLContext *ctx)
      ptr = (void *)clEnqueueMapBuffer(ctx->command_queue, ctx->util_mem,
                                       CL_TRUE, CL_MAP_READ, 0, map_size,
                                       0, NULL, NULL, &cle);
@@ -758,7 +758,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
      if (ptr) {
          max_total_p = ptr + 2 * (DETECTION_FRAMES + 1) + 1;
          avg_total_p = max_total_p + 1;
-@@ -472,12 +568,60 @@ static void log_detected_peak(TonemapOpenCLContext *ctx)
+@@ -475,12 +571,60 @@ static void log_detected_peak(TonemapOpenCLContext *ctx)
  }
  #endif
  
@@ -819,7 +819,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
      cl_int cle;
      int err;
      double peak = ctx->peak;
-@@ -492,6 +636,12 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+@@ -495,6 +639,12 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
          return AVERROR(EINVAL);
      input_frames_ctx = (AVHWFramesContext*)input->hw_frames_ctx->data;
  
@@ -832,7 +832,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
      output = ff_get_video_buffer(outlink, outlink->w, outlink->h);
      if (!output) {
          err = AVERROR(ENOMEM);
-@@ -505,45 +655,18 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
+@@ -508,45 +658,18 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
      if (!peak)
          peak = ff_determine_signal_peak(input);
  
@@ -888,7 +888,7 @@ index 03c8912927b1b3418c6c10f1a1f5372443544cef..42f613cbb56e99be2a85b534407652f4
      }
  
      switch(input_frames_ctx->sw_format) {
-@@ -588,6 +711,8 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
+@@ -591,6 +714,8 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
          clReleaseMemObject(ctx->util_mem);
      if (ctx->bt2408_mem)
          clReleaseMemObject(ctx->bt2408_mem);
