@@ -181,7 +181,7 @@
       "in_release": "",
       "patch": "0002-build-eliminate-GCC-14-and-16-diagnostics.patch",
       "project": "vmafx",
-      "note": "26 commits, one per warning class; the series carries them as one patch."
+      "note": "26 commits, one per warning class; the series carries them as one patch. pross commented on 2026-10-22 that the rv60dec changes look good (a comment, not an approving review)."
     },
     {
       "number": 25112,
