@@ -1,6 +1,6 @@
 status = "submitted"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111"
-master_form = { base = "af25036ac09146b5187adfc247a643b3f993545c", head = "19525d3926fe29dc6ad0470df34f1e0d56fb294a" }
+master_form = { base = "713d9fa4b794d6df513ae742d3180732a54e0b66", head = "434b46354314010cb346548f1f333bd59d6d8dee" }
 consumers = ["vmafx"]
 origin = "VMAFx/vmafx c61115a0723e ffmpeg-patches/0019-ffmpeg-eliminate-gcc-14-build-diagnostics.patch"
 notes = """
