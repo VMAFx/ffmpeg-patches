@@ -12,7 +12,9 @@ Fixes FFmpeg issue #24972. Upstream form: FFmpeg PR #24993 on master \
 ba987fe24d, also checked there on the RTX 4090. PR #24993 was closed \
 unmerged by its author on 2026-10-22 in favour of the smaller \
 fixed-size check now in PR #24994. The truncation of \
-zero-heavy payloads is handled by 0004."""
+zero-heavy payloads is handled by 0004. The series keeps 0003 as a \
+series-only patch; when PR #24994 merges, compare 0003 with the merged \
+form and decide whether to keep or drop it."""
 
 [[exceptions]]
 rule = "HISS-04"
