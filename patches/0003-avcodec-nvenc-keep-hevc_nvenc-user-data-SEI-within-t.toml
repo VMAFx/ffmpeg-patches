@@ -1,4 +1,4 @@
-status = "submitted"
+status = "rejected"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993"
 consumers = ["pelorus"]
 origin = "VMAFx/pelorus 7a496107c9a2 ffmpeg-patches/0022-nvenc-pelorus-udu-sei.patch, generic part"
@@ -9,8 +9,12 @@ matches Pelorus pel_sei_nal_bytes() on 200000 random payloads and models \
 what the NVENC cap counts (Annex B, emulation prevention included). \
 Checked on an RTX 4090, driver 615.78.08, by the Pelorus GPU lane. \
 Fixes FFmpeg issue #24972. Upstream form: FFmpeg PR #24993 on master \
-ba987fe24d, also checked there on the RTX 4090. The truncation of \
-zero-heavy payloads is handled by 0004."""
+ba987fe24d, also checked there on the RTX 4090. PR #24993 was closed \
+unmerged by its author on 2026-10-22 in favour of the smaller \
+fixed-size check now in PR #24994. The truncation of \
+zero-heavy payloads is handled by 0004. The series keeps 0003 as a \
+series-only patch; when PR #24994 merges, compare 0003 with the merged \
+form and decide whether to keep or drop it."""
 
 [[exceptions]]
 rule = "HISS-04"
@@ -20,7 +24,7 @@ lines = 90
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 84 lines before the patch; the change inside it is part of FFmpeg PR 24993 under review, and splitting the function would change that form"
+reason = "upstream function, 84 lines before the patch; the change inside it was part of FFmpeg PR 24993 (closed unmerged), and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -30,4 +34,4 @@ lines = 126
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 113 lines before the patch; the change inside it is part of FFmpeg PR 24993 under review, and splitting the function would change that form"
+reason = "upstream function, 113 lines before the patch; the change inside it was part of FFmpeg PR 24993 (closed unmerged), and splitting the function would change that form"

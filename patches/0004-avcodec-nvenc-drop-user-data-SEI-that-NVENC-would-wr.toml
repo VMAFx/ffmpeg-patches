@@ -15,9 +15,12 @@ decodable, A/53 unaffected, untouched output byte-identical to stock. \
 Refactors the 0003 escape-byte loop into nvenc_sei_epb_count() without \
 changing 0003's result. Drop once NVIDIA \
 fixes the driver and the fixed driver is the minimum FFmpeg supports. \
-Upstream form: FFmpeg PR #24994 (depends on #24993), checked on master \
-ba987fe24d on the RTX 4090; noted on FFmpeg issue #24972. NVIDIA report \
-not yet filed."""
+Upstream form: FFmpeg PR #24994, first checked on master ba987fe24d on \
+the RTX 4090 and noted on FFmpeg issue #24972. On 2026-10-22 the PR was \
+reduced to a standalone check that drops hevc user data SEI above 512 \
+bytes; this patch is the earlier form, which builds on 0003. NVIDIA report \
+not yet filed. Drop trigger: NVIDIA reports a driver fix for the \
+truncation; when PR #24994 merges, compare this patch with the merged form."""
 
 [[exceptions]]
 rule = "HISS-04"

@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-21",
+  "checked": "2026-10-23",
   "contributions": [
     {
       "number": 24045,
@@ -110,18 +110,18 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993",
       "title": "avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit",
       "base": "master",
-      "state": "open",
+      "state": "closed",
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
       "patch": "0003-avcodec-nvenc-keep-hevc_nvenc-user-data-SEI-within-t.patch",
       "project": "pelorus",
-      "note": ""
+      "note": "Closed unmerged by its author on 2026-10-22 in favour of the smaller fixed-size check in 24994."
     },
     {
       "number": 24994,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994",
-      "title": "avcodec/nvenc: drop user data SEI that NVENC would write truncated",
+      "title": "avcodec/nvenc: drop hevc_nvenc SEI above a fixed size",
       "base": "master",
       "state": "open",
       "merged_at": "",
@@ -129,7 +129,7 @@
       "in_release": "",
       "patch": "0004-avcodec-nvenc-drop-user-data-SEI-that-NVENC-would-wr.patch",
       "project": "pelorus",
-      "note": ""
+      "note": "Reduced on 2026-10-22 to a standalone check that drops hevc user data SEI above 512 bytes; the series still carries the earlier form in 0004."
     },
     {
       "number": 25053,
