@@ -62,7 +62,7 @@ class Stub:
 def serve(stub: Stub) -> http.server.HTTPServer:
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-            del format, args
+            """Keep request logging out of the test output."""
 
         def reply(self, code: int, obj: object) -> None:
             data = json.dumps(obj).encode()
@@ -75,15 +75,17 @@ def serve(stub: Stub) -> http.server.HTTPServer:
         def do_GET(self) -> None:
             url = urllib.parse.urlsplit(self.path)
             stub.requests.append(("GET", self.path, ""))
-            if url.path.endswith("/pulls/1"):
-                return self.reply(200, {"head": {"sha": stub.head()}, "html_url": "stub/pulls/1"})
             parts = url.path.split("/")
-            if len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status":
-                if stub.fail_status:
-                    return self.reply(500, {"message": "boom"})
+            is_status = len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status"
+            if url.path.endswith("/pulls/1"):
+                self.reply(200, {"head": {"sha": stub.head()}, "html_url": "stub/pulls/1"})
+            elif is_status and stub.fail_status:
+                self.reply(500, {"message": "boom"})
+            elif is_status:
                 st = stub.statuses(parts[-2], urllib.parse.parse_qs(url.query))
-                return self.reply(200, {"statuses": st, "total_count": len(st)})
-            self.reply(404, {})
+                self.reply(200, {"statuses": st, "total_count": len(st)})
+            else:
+                self.reply(404, {})
 
         def do_PATCH(self) -> None:
             data = self.rfile.read(int(self.headers["Content-Length"])).decode()
