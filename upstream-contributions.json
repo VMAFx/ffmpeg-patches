@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-23",
+  "checked": "2026-10-25",
   "contributions": [
     {
       "number": 24045,
@@ -123,13 +123,13 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994",
       "title": "avcodec/nvenc: drop hevc_nvenc SEI above a fixed size",
       "base": "master",
-      "state": "open",
-      "merged_at": "",
-      "merged_commit": "",
+      "state": "merged",
+      "merged_at": "2026-10-24T21:22:41Z",
+      "merged_commit": "96b7f8281a5f971ef1b061024d50b971c85d4a95",
       "in_release": "",
       "patch": "0004-avcodec-nvenc-drop-user-data-SEI-that-NVENC-would-wr.patch",
       "project": "pelorus",
-      "note": "Reduced on 2026-10-22 to a standalone check that drops hevc user data SEI above 512 bytes; the series still carries the earlier form in 0004."
+      "note": "Merged in the reduced form, a fixed limit of 512 bytes of hevc SEI payload per picture. The series still carries the earlier form in 0004, with 0003 and 0028, until Pelorus 0022 builds on the merged form."
     },
     {
       "number": 25053,

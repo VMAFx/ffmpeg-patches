@@ -1,4 +1,4 @@
-status = "submitted"
+status = "merged"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994"
 consumers = ["vmafx", "pelorus"]
 origin = "new; rule measured by the Pelorus GPU lane (RTX 4090, driver 615.78.08)"
@@ -19,8 +19,16 @@ Upstream form: FFmpeg PR #24994, first checked on master ba987fe24d on \
 the RTX 4090 and noted on FFmpeg issue #24972. On 2026-10-22 the PR was \
 reduced to a standalone check that drops hevc user data SEI above 512 \
 bytes; this patch is the earlier form, which builds on 0003. NVIDIA report \
-not yet filed. Drop trigger: NVIDIA reports a driver fix for the \
-truncation; when PR #24994 merges, compare this patch with the merged form."""
+not yet filed. PR #24994 merged on 2026-10-24 as FFmpeg master \
+96b7f8281a5f in that reduced form: it drops hevc SEI above 512 bytes of \
+payload per picture and has no rule for the truncation of zero-heavy \
+payloads, so FFmpeg master still writes those truncated. The series keeps \
+this earlier form, with 0003 and 0028, as series-only patches, because \
+Pelorus 0022 builds on the budget and the truncation rule here and no \
+longer applies on the merged form. Drop trigger: once Pelorus 0022 builds \
+on the merged form, replace 0003, 0004 and 0028 with a backport of \
+96b7f8281a5f; separately, drop the truncation rule once NVIDIA reports a \
+driver fix for it."""
 
 [[exceptions]]
 rule = "HISS-04"
@@ -30,7 +38,7 @@ lines = 95
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 90 lines before the patch; the change inside it is part of FFmpeg PR 24994 under review, and splitting the function would change that form"
+reason = "upstream function, 90 lines before the patch; the change inside it is the earlier form of FFmpeg PR 24994, which merged as 96b7f8281a5f in a reduced form; the patch is replaced by that backport, not split"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -40,4 +48,4 @@ lines = 127
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 126 lines before the patch; the change inside it is part of FFmpeg PR 24994 under review, and splitting the function would change that form"
+reason = "upstream function, 126 lines before the patch; the change inside it is the earlier form of FFmpeg PR 24994, which merged as 96b7f8281a5f in a reduced form; the patch is replaced by that backport, not split"
