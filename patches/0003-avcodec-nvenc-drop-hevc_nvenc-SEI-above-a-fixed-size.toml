@@ -1,0 +1,15 @@
+status = "merged"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994"
+upstream_commit = "96b7f8281a5f971ef1b061024d50b971c85d4a95"
+consumers = ["vmafx", "pelorus"]
+origin = "backport of FFmpeg master 96b7f8281a5f971ef1b061024d50b971c85d4a95 (lusoris, 2026-10-22, merged 2026-10-24), the reduced form of FFmpeg PR 24994"
+notes = """
+Already on FFmpeg master; release/9.0 does not carry it (checked \
+2026-10-25 against release/9.0 9a9b70bb8c). Drop the patch once the \
+pinned base contains the commit. It applies to n9.0.2 unchanged. \
+hevc_nvenc drops a SEI that would take the payload bytes of a picture \
+above 512, with one warning. It replaces the earlier form of the series \
+(the SEI budget, the rule for payloads that NVENC writes truncated, and \
+the nvenc_sei.h header), which FFmpeg did not take; the truncation rule moves \
+into Pelorus 0022. FFmpeg master has no rule for zero-heavy payloads \
+and still writes those truncated."""

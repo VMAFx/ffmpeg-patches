@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patch 0027 (hqdn3d_videotoolbox).
+"""Regression tests for patch 0026 (hqdn3d_videotoolbox).
 
-0027: the new hqdn3d_videotoolbox filter runs the integer hqdn3d filter in
+0026: the new hqdn3d_videotoolbox filter runs the integer hqdn3d filter in
 two Metal kernels and must give the same output samples as the CPU hqdn3d
 filter (ADR-0004), by the comparison rule of tests/test_hqdn3d_vulkan.py.
 The filter takes yuv420p and the two-plane nv12, nv16, nv24, p010, p210,
@@ -53,7 +53,7 @@ FORMATS = {
     "p216le": ("yuv422p16le", 16, False),
     "p416le": ("yuv444p16le", 16, False),
 }
-PATCH = next((Path(__file__).resolve().parent.parent / "patches").glob("0027-*.patch"))
+PATCH = next((Path(__file__).resolve().parent.parent / "patches").glob("0026-*.patch"))
 
 
 def patch_formats(text: str) -> tuple[set[str], set[str]]:
@@ -105,7 +105,7 @@ def lavfi() -> list[str]:
 
 
 class FormatListTest(unittest.TestCase):
-    """0027: the patch accepts and documents exactly the formats under test."""
+    """0026: the patch accepts and documents exactly the formats under test."""
 
     def test_patch_formats_match(self) -> None:
         code, doc = patch_formats(PATCH.read_text(encoding="utf-8"))
@@ -120,7 +120,7 @@ class FormatListTest(unittest.TestCase):
 
 @unittest.skipUnless(FFMPEG, "set VT_FFMPEG")
 class Hqdn3dVideoToolboxTest(unittest.TestCase):
-    """0027: the Metal hqdn3d path must match the CPU path."""
+    """0026: the Metal hqdn3d path must match the CPU path."""
 
     def compare(self, source: list[str], fmt: str, options: str, prefix: str = "") -> int:
         cpu_chain, metal_chain = chains(fmt, options, prefix)

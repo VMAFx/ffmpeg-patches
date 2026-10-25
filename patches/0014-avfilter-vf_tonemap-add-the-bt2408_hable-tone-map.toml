@@ -1,6 +1,0 @@
-status = "unsubmitted"
-upstream = ""
-consumers = ["vmafx", "pelorus"]
-origin = "part 2 of the Dolby Vision profile 5 tone-mapping series without libplacebo (ADR-0002): tonemap=bt2408_hable on the CPU"
-notes = """
-New tonemap value bt2408_hable through the 0013 helper; the existing curves are untouched (FFmpeg has no tonemap FATE references to change). Peak from MaxCLL, then the mastering display, as for the other curves. With 0015, scripts/tonemap_parity.py against vf_libplacebo hable: on the profile 5 clip of tests/fixtures/dv5 (dovi_reshape, zscale linear, tonemap=bt2408_hable, zscale bt709) mean CIEDE2000 0.869, p95 3.328; on a 2160p HDR10 clip mean 0.746, p95 1.329 (ADR-0002 bar 2.3). A planted fixed peak of 4000 cd/m^2 fails both at 5.275 and 4.816. Wall time 2.9 s against 4.9 s for libplacebo at 720p, 40.7 s against 7.8 s at 2160p on the CPU; no VRAM. make fate-filter-tonemap-bt2408-hable passes, with a planted wrong MaxCLL detected; a build that ignores the frame's peak fails it. No version.h or Changelog bump."""

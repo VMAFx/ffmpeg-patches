@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patch 0026 (hqdn3d_opencl).
+"""Regression tests for patch 0025 (hqdn3d_opencl).
 
-0026: the new hqdn3d_opencl filter runs the integer hqdn3d filter in two
+0025: the new hqdn3d_opencl filter runs the integer hqdn3d filter in two
 OpenCL kernels and must give the same output samples as the CPU hqdn3d
 filter (ADR-0004), by the comparison rule of tests/test_hqdn3d_vulkan.py.
 The OpenCL frames context keeps no LSB-aligned 10- or 12-bit planar format,
@@ -95,7 +95,7 @@ def lavfi() -> list[str]:
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set OCL_FFMPEG and OCL_DEVICE")
 class Hqdn3dOpenCLTest(unittest.TestCase):
-    """0026: the OpenCL hqdn3d path must match the CPU path."""
+    """0025: the OpenCL hqdn3d path must match the CPU path."""
 
     def compare(self, source: list[str], fmt: str, options: str, prefix: str = "") -> int:
         cpu_chain, opencl_chain = chains(fmt, options, prefix)

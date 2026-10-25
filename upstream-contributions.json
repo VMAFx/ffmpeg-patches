@@ -10,7 +10,7 @@
       "merged_at": "2026-08-07T19:14:03Z",
       "merged_commit": "63d0237033cca9782932b809f960378d34ee4869",
       "in_release": "",
-      "patch": "0037-avutil-hwcontext_vulkan-Query-export-support-with-th.patch",
+      "patch": "0035-avutil-hwcontext_vulkan-Query-export-support-with-th.patch",
       "project": "pelorus",
       "note": "By softworkz, not from this series; the series carries it as a backport onto the pinned release."
     },
@@ -23,7 +23,7 @@
       "merged_at": "2026-10-19T14:58:27Z",
       "merged_commit": "fd9a8f25a07bbec3e6b25339177ef1e2d49cbf05",
       "in_release": "",
-      "patch": "0017-avfilter-vf_tonemap_opencl-zero-the-peak-detection-b.patch",
+      "patch": "0016-avfilter-vf_tonemap_opencl-zero-the-peak-detection-b.patch",
       "project": "vmafx, pelorus",
       "note": "By dhalsimax, not from this series; the series carries it as a backport onto the pinned release, and 0018 keeps the zeroed buffer."
     },
@@ -114,9 +114,9 @@
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
-      "patch": "0003-avcodec-nvenc-keep-hevc_nvenc-user-data-SEI-within-t.patch",
+      "patch": "",
       "project": "pelorus",
-      "note": "Closed unmerged by its author on 2026-10-22 in favour of the smaller fixed-size check in 24994."
+      "note": "Closed unmerged by its author on 2026-10-22 in favour of the smaller fixed-size check in 24994. The series dropped its form when 0003 became the backport of 24994."
     },
     {
       "number": 24994,
@@ -127,9 +127,9 @@
       "merged_at": "2026-10-24T21:22:41Z",
       "merged_commit": "96b7f8281a5f971ef1b061024d50b971c85d4a95",
       "in_release": "",
-      "patch": "0004-avcodec-nvenc-drop-user-data-SEI-that-NVENC-would-wr.patch",
+      "patch": "0003-avcodec-nvenc-drop-hevc_nvenc-SEI-above-a-fixed-size.patch",
       "project": "pelorus",
-      "note": "Merged in the reduced form, a fixed limit of 512 bytes of hevc SEI payload per picture. The series still carries the earlier form in 0004, with 0003 and 0028, until Pelorus 0022 builds on the merged form."
+      "note": "Merged in the reduced form, a fixed limit of 512 bytes of hevc SEI payload per picture. The series carries it as the backport 0003."
     },
     {
       "number": 25053,
@@ -140,7 +140,7 @@
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
-      "patch": "0009-hwcontext_vulkan-import-a-frame-again-when-the-CUDA-.patch",
+      "patch": "0008-hwcontext_vulkan-import-a-frame-again-when-the-CUDA-.patch",
       "project": "pelorus",
       "note": "Fixes FFmpeg issue 25052."
     },
@@ -153,7 +153,7 @@
       "merged_at": "2026-10-14T18:36:57Z",
       "merged_commit": "669f5ab083c7732c10f1ce9e4f1915960dd88457",
       "in_release": "",
-      "patch": "0008-vulkan-de-phase-queue-rotation-and-pin-video-pools-t.patch",
+      "patch": "0007-vulkan-de-phase-queue-rotation-and-pin-video-pools-t.patch",
       "project": "pelorus",
       "note": "Backport of FFmpeg master commit d0d7d813178fec964716aa2c48f5896ce5c26284."
     },
@@ -166,7 +166,7 @@
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
-      "patch": "0005-hwcontext_vaapi-accept-GR1616-chroma-for-P010-and-P0.patch",
+      "patch": "0004-hwcontext_vaapi-accept-GR1616-chroma-for-P010-and-P0.patch",
       "project": "pelorus",
       "note": ""
     },
@@ -179,7 +179,7 @@
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
-      "patch": "0007-hwcontext_vulkan-wait-on-the-CPU-before-mapping-RADV.patch",
+      "patch": "0006-hwcontext_vulkan-wait-on-the-CPU-before-mapping-RADV.patch",
       "project": "pelorus",
       "note": ""
     },

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression test for patch 0010 (h264_qsv and hevc_qsv on MP4 edit lists).
+"""Regression test for patch 0009 (h264_qsv and hevc_qsv on MP4 edit lists).
 
 The fixture is an H.264 MP4 whose edit list starts 1.5 s into a 120-frame
 GOP, so its first 90 packets carry AV_PKT_FLAG_DISCARD. FFmpeg n9.0.2 wrote

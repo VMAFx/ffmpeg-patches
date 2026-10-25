@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Thu, 22 Oct 2026 20:41:33 +0200
+Subject: [PATCH] avcodec/nvenc: drop hevc_nvenc SEI above a fixed size
+
+hevc_nvenc stops the encode with "Failed locking bitstream buffer: out
+of memory" once the SEI of a picture are large: nvEncLockBitstream()
+returns NV_ENC_ERR_OUT_OF_MEMORY. With driver 615.78.08 at 1920x1080 a
+single user data unregistered payload of up to 898 bytes passes on an
+IDR picture and up to 999 on a P picture, 672 and 747 when the payload
+is all zero bytes after the UUID. h264_nvenc carried 8192 bytes.
+
+Count the payload bytes of the A/53, timecode and user data unregistered
+SEI of an hevc_nvenc picture in order and drop a SEI that would take the
+total above 512 bytes, with a warning for the first one and verbose
+messages after that.
+
+Measured on an RTX 4090 with that driver, 1920x1080, five frames, one
+user data unregistered SEI on the IDR or on a P picture: payloads up to
+512 bytes give output byte-identical to the unpatched encoder, payloads
+of 513, 898, 999 and 1000 bytes are dropped with the warning and all
+five frames encode, and h264_nvenc output is unchanged.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+(cherry picked from commit 96b7f8281a5f971ef1b061024d50b971c85d4a95)
+---
+ libavcodec/nvenc.c | 39 +++++++++++++++++++++++++++++++++++++--
+ libavcodec/nvenc.h |  1 +
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/nvenc.c b/libavcodec/nvenc.c
+index 9203fb65c05f8261de396ca02ebca411329e4dce..d30b8645d3b37280be1d4bd757376835b1008f68 100644
+--- a/libavcodec/nvenc.c
++++ b/libavcodec/nvenc.c
+@@ -2675,6 +2675,41 @@ static int output_ready(AVCodecContext *avctx, int flush)
+     return (nb_ready > 0) && (nb_ready + nb_pending >= ctx->async_depth);
+ }
+ 
++/* hevc_nvenc fails nvEncLockBitstream() with NV_ENC_ERR_OUT_OF_MEMORY when
++ * the SEI of a picture are too large. With driver 615.78.08 at 1080p a single
++ * payload of up to 898 bytes passes on an IDR picture, 672 when it is all
++ * zero bytes; stay well below that. */
++#define NVENC_HEVC_SEI_MAX_PAYLOAD 512
++
++/* Drop the SEI that would take the total payload size of the picture above
++ * NVENC_HEVC_SEI_MAX_PAYLOAD and return the new count. */
++static int nvenc_hevc_sei_size_check(AVCodecContext *avctx, int count)
++{
++    NvencContext *ctx = avctx->priv_data;
++    size_t total = 0;
++    int kept = 0;
++
++    if (avctx->codec->id != AV_CODEC_ID_HEVC)
++        return count;
++
++    for (int i = 0; i < count; i++) {
++        NV_ENC_SEI_PAYLOAD *sei = &ctx->sei_data[i];
++
++        if (total + sei->payloadSize <= NVENC_HEVC_SEI_MAX_PAYLOAD) {
++            total += sei->payloadSize;
++            ctx->sei_data[kept++] = *sei;
++            continue;
++        }
++        av_log(avctx, ctx->sei_size_warned ? AV_LOG_VERBOSE : AV_LOG_WARNING,
++               "Not writing a %"PRIu32"-byte SEI of type %"PRIu32": hevc_nvenc "
++               "fails on more than about %d bytes of SEI per picture.\n",
++               sei->payloadSize, sei->payloadType, NVENC_HEVC_SEI_MAX_PAYLOAD);
++        ctx->sei_size_warned = 1;
++        av_freep(&sei->payload);
++    }
++    return kept;
++}
++
+ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+ {
+     NvencContext *ctx = avctx->priv_data;
+@@ -2750,7 +2785,7 @@ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+     }
+ 
+     if (!ctx->udu_sei)
+-        return sei_count;
++        return nvenc_hevc_sei_size_check(avctx, sei_count);
+ 
+     for (i = 0; i < frame->nb_side_data; i++) {
+         AVFrameSideData *side_data = frame->side_data[i];
+@@ -2780,7 +2815,7 @@ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+         }
+     }
+ 
+-    return sei_count;
++    return nvenc_hevc_sei_size_check(avctx, sei_count);
+ 
+ error:
+     for (i = 0; i < sei_count; i++)
+diff --git a/libavcodec/nvenc.h b/libavcodec/nvenc.h
+index ad6ddaa4347a03e8b319ac57c6ce4a55b06224ee..738fc0e8c99d9fd52ac56ad42fc9273fbfa5f126 100644
+--- a/libavcodec/nvenc.h
++++ b/libavcodec/nvenc.h
+@@ -197,6 +197,7 @@ typedef struct NvencContext
+ 
+     NV_ENC_SEI_PAYLOAD *sei_data;
+     int sei_data_size;
++    int sei_size_warned; ///< a SEI was dropped by nvenc_hevc_sei_size_check()
+ 
+     struct {
+         void *ptr;

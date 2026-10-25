@@ -7,10 +7,10 @@ notes = """
 Already on FFmpeg master; release/9.0 does not carry it (checked \
 2026-10-22 against release/9.0 4cf298e66a). Drop the patch once the \
 pinned base contains the commit. It applies to n9.0.2 unchanged. \
-0018 moves the util buffer into create_opencl_objects(); before this \
+0017 moves the util buffer into create_opencl_objects(); before this \
 backport it created the buffer without a host pointer there, so the \
 series kept the undefined peak detection state that the upstream fix \
-removes and conflicted with it on FFmpeg master. 0018 now creates the \
+removes and conflicted with it on FFmpeg master. 0017 now creates the \
 buffer from the zeroed array as this patch does; the tree after the \
 whole series differs from the earlier series only in that buffer."""
 
@@ -22,4 +22,4 @@ lines = 166
 category = "D"
 entered = "2026-10-22"
 expires = "2027-02-19"
-reason = "upstream function, 163 lines before the patch; the patch carries FFmpeg PR 24835 of another author unchanged, so it drops cleanly once the pinned base contains it; 0032 and 0036 later split it below 60 lines"
+reason = "upstream function, 163 lines before the patch; the patch carries FFmpeg PR 24835 of another author unchanged, so it drops cleanly once the pinned base contains it; 0030 and 0034 later split it below 60 lines"
