@@ -19,6 +19,14 @@ name: consumer stacks
   schedule:
     - cron: '11 4 * * *'
   workflow_dispatch:
+    inputs:
+      pelorus_ref:
+        description: >-
+          Pelorus branch whose stack to apply; empty takes the Pelorus
+          default branch
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -57,6 +65,23 @@ jobs:
         if: github.event.pull_request.draft != true
         with:
           python-version-file: .python-version
+      # A dispatch may name the Pelorus branch to test, for a Pelorus change
+      # that has to fit a series branch before either lands. The name only
+      # reaches the shell through the environment, and only branch-name
+      # characters pass; everything else stops the run before any clone.
+      - name: Check the Pelorus ref
+        if: github.event.pull_request.draft != true
+        env:
+          PELORUS_REF: ${{ inputs.pelorus_ref }}
+        run: |
+          if [ -n "$PELORUS_REF" ]; then
+            if ! [[ "$PELORUS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
+              || ! git check-ref-format --branch "$PELORUS_REF" > /dev/null; then
+              echo "::error::pelorus_ref is not a plain branch name"
+              exit 1
+            fi
+          fi
+          echo "PELORUS_REF=$PELORUS_REF" >> "$GITHUB_ENV"
       - name: Load the pinned base
         if: github.event.pull_request.draft != true
         run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
@@ -80,7 +105,11 @@ jobs:
         if: github.event.pull_request.draft != true
         run: |
           for consumer in vmafx pelorus; do
-            git clone -q --depth=1 --filter=blob:none --sparse \
+            branch=()
+            if [ "$consumer" = pelorus ] && [ -n "$PELORUS_REF" ]; then
+              branch=(--branch "$PELORUS_REF")
+            fi
+            git clone -q --depth=1 --filter=blob:none --sparse "${branch[@]}" \
               "https://github.com/VMAFx/${consumer}.git" "consumers/${consumer}"
             git -C "consumers/${consumer}" sparse-checkout set ffmpeg-patches
             git -C "consumers/${consumer}" log -1 --format="${consumer} %H %cs %s" \

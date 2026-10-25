@@ -47,20 +47,20 @@ without a series patch is a change the series does not carry.
 <!-- upstream-contributions:start -->
 | Pull request | Target | State | Change | Series patch |
 | --- | --- | --- | --- | --- |
-| [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0037 |
-| [24835](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835) | `master` | merged 2026-10-19 (`fd9a8f25a07b`), in no release yet | avfilter/vf_tonemap_opencl: zero the peak detection buffer | 0017 |
+| [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0035 |
+| [24835](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835) | `master` | merged 2026-10-19 (`fd9a8f25a07b`), in no release yet | avfilter/vf_tonemap_opencl: zero the peak detection buffer | 0016 |
 | [24970](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970) | `master` | open | avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED | 0001 |
 | [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | none |
 | [24974](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974) | `master` | merged 2026-10-20 (`2a8c6d30b934`), in no release yet | avcodec/av1dec: remove the coding bias from exported chroma grain params | none |
 | [24975](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975) | `release/9.0` | merged 2026-10-12 (`7e93014c5bbb`), in no release yet | [release/9.0] hwcontext_vulkan: only originate host image layout transitions from copyable layouts | none |
 | [24977](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24977) | `master` | open | avcodec/vaapi_encode_h265: enable cu_qp_delta for ROI in CQP mode | none |
 | [24978](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24978) | `master` | open | avfilter/vf_libvmaf: add max pool method, reject unknown ones | none |
-| [24993](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993) | `master` | closed | avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit | 0003 |
-| [24994](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994) | `master` | merged 2026-10-24 (`96b7f8281a5f`), in no release yet | avcodec/nvenc: drop hevc_nvenc SEI above a fixed size | 0004 |
-| [25053](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25053) | `master` | open | hwcontext_vulkan: import a frame again when the CUDA context changes | 0009 |
-| [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | merged 2026-10-14 (`669f5ab083c7`), in no release yet | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0008 |
-| [25109](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109) | `master` | open | avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import | 0005 |
-| [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | open | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0007 |
+| [24993](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993) | `master` | closed | avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit | none |
+| [24994](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994) | `master` | merged 2026-10-24 (`96b7f8281a5f`), in no release yet | avcodec/nvenc: drop hevc_nvenc SEI above a fixed size | 0003 |
+| [25053](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25053) | `master` | open | hwcontext_vulkan: import a frame again when the CUDA context changes | 0008 |
+| [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | merged 2026-10-14 (`669f5ab083c7`), in no release yet | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0007 |
+| [25109](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109) | `master` | open | avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import | 0004 |
+| [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | open | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0006 |
 | [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | open | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat, libswscale and tests | 0002 |
 | [25112](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25112) | `master` | merged 2026-10-16 (`30b16e57ff3d`), in no release yet | ffbuild/library.mak: add the devprogs target | none |
 | [25189](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25189) | `master` | merged 2026-10-18 (`ffb15c94c286`), in no release yet | avfilter/Makefile: link cuda/load_helper.o into three CUDA filters | none |
@@ -193,7 +193,7 @@ repositories.
 
 When two linked filters share no pixel or sample format, libavfilter inserts
 a converter named `auto_<filter>_<n>` without asking. On a hardware path
-(for example the Vulkan and CUDA import of 0009) that converter is a silent
+(for example the Vulkan and CUDA import of 0008) that converter is a silent
 software round trip. FFmpeg 8.0 and later dump the negotiated graph, and
 `scripts/graph_check.py` exits 1 when the dump contains such a converter:
 
@@ -249,7 +249,7 @@ a device case is skipped, or when a GPU filter leaves the CPU filter's output:
 | Tests | Filters | Bound |
 | --- | --- | --- |
 | `tests/test_hqdn3d_vulkan.py`, `tests/test_hqdn3d_opencl.py` | `hqdn3d_vulkan`, `hqdn3d_opencl` | the samples of `hqdn3d` ([ADR-0004](docs/adr/0004-hqdn3d-on-the-gpu.md)) |
-| `tests/test_tonemap_vulkan.py`, `tests/test_tonemap_opencl.py` | `tonemap_vulkan`, `tonemap_opencl` (0016, 0018, 0020, 0022, 0036) | one 8-bit code value of `tonemap=bt2408_hable`, with and without peak detection; a software conversion after `tonemap_opencl` keeps its output matrix (0016) |
+| `tests/test_tonemap_vulkan.py`, `tests/test_tonemap_opencl.py` | `tonemap_vulkan`, `tonemap_opencl` (0015, 0017, 0019, 0021, 0034) | one 8-bit code value of `tonemap=bt2408_hable`, with and without peak detection; a software conversion after `tonemap_opencl` keeps its output matrix (0015) |
 
 Each test file also holds a planted wrong case that the comparison must refuse.
 

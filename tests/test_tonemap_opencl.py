@@ -1,17 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for patches 0016, 0018 and 0036 (tonemap_opencl).
+"""Regression tests for patches 0015, 0017 and 0034 (tonemap_opencl).
 
-0016: tonemap_opencl declares the matrix and range of its output on the
+0015: tonemap_opencl declares the matrix and range of its output on the
 link. Without it, a software conversion after hwdownload took BT.709 frames
 as the input's BT.2020 matrix and converted them again; a pure red HDR10
 frame came out with Y 73 instead of 63 after format=yuv420p.
 
-0018: tonemap_opencl=tonemap=bt2408_hable runs the CPU tonemap=bt2408_hable
+0017: tonemap_opencl=tonemap=bt2408_hable runs the CPU tonemap=bt2408_hable
 math on the GPU. On flat frames both paths give the same 8-bit code values;
 the test allows one code value of difference.
 
-0036: tonemap_opencl=tonemap=bt2408_hable:peak_detect=1 measures the peak
+0034: tonemap_opencl=tonemap=bt2408_hable:peak_detect=1 measures the peak
 on the GPU like tonemap=bt2408_hable:peak_detect=1 does on the CPU. A raw
 frame carries no light level side data, so its static peak is the PQ
 maximum of 10000 cd/m^2, far above the flat test colours.
@@ -120,7 +120,7 @@ class HelperTest(unittest.TestCase):
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set OCL_FFMPEG and OCL_DEVICE")
 class OutputLinkTest(unittest.TestCase):
-    """0016: a software conversion after tonemap_opencl must not re-matrix."""
+    """0015: a software conversion after tonemap_opencl must not re-matrix."""
 
     def test_conversion_keeps_the_output_matrix(self) -> None:
         frame = flat_frame(*COLOURS[0])
@@ -142,7 +142,7 @@ class OutputLinkTest(unittest.TestCase):
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set OCL_FFMPEG and OCL_DEVICE")
 class Bt2408HableTest(unittest.TestCase):
-    """0018: the GPU bt2408_hable path must match the CPU path."""
+    """0017: the GPU bt2408_hable path must match the CPU path."""
 
     def test_gpu_matches_cpu(self) -> None:
         for colour in COLOURS:
@@ -166,7 +166,7 @@ class Bt2408HableTest(unittest.TestCase):
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set OCL_FFMPEG and OCL_DEVICE")
 class PeakDetectTest(unittest.TestCase):
-    """0036: GPU peak detection must match CPU peak detection."""
+    """0034: GPU peak detection must match CPU peak detection."""
 
     def worst_against_cpu_detection(self, gpu_chain: str) -> int:
         worst = 0

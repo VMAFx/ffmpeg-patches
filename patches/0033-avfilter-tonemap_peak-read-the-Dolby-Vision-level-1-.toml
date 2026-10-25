@@ -1,6 +1,0 @@
-status = "unsubmitted"
-upstream = ""
-consumers = ["vmafx", "pelorus"]
-origin = "#63 Dolby Vision peak on the GPU tone maps (ADR-0002 filters table), part 1: the level 1 reader shared by tonemap_opencl and tonemap_vaapi"
-notes = """
-Adds ff_tonemap_peak_read_dovi_l1(): the lavfi.dovi.l1_max_pq frame metadata of vf_dovi_reshape first, then the level 1 block of the DOVI metadata side data. A max_pq of zero is treated as absent, as a zero MaxCLL is in ff_determine_signal_peak(), because ff_bt2408_hable_init() refuses a zero peak. ff_tonemap_peak_read_l1() and its callers vf_tonemap and tonemap_vulkan keep their behavior; only the PQ to peak conversion moves into a shared static helper. Measurements are in the notes of 0034 and 0035."""

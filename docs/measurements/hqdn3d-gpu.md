@@ -1,12 +1,12 @@
 # hqdn3d on the GPU: speed and quality
 
-Measurement of the GPU `hqdn3d` filters of patches 0024 to 0027 against
+Measurement of the GPU `hqdn3d` filters of patches 0023 to 0026 against
 the CPU `hqdn3d`, `nlmeans_vulkan` and the AV1 encoders' own denoisers, as
 [ADR-0004](../adr/0004-hqdn3d-on-the-gpu.md) plans it. The plan comes first,
 the results of the main run on 2026-10-18 follow it, and then a second run
 the same day on the RTX 4090, which the main run had to skip.
 
-`hqdn3d_videotoolbox` (0027) is not measured: no Apple host is available.
+`hqdn3d_videotoolbox` (0026) is not measured: no Apple host is available.
 It compiles on the macOS job of `series.yml`; its speed and its parity with
 the CPU filter are unknown.
 
@@ -100,7 +100,7 @@ behind it, next to this file, and the tables below give its sha256.
 Run of 2026-10-18, 06:05 to 06:26 UTC, with `scripts/measure_hqdn3d.py`
 at commit `011c329` of this branch:
 
-- FFmpeg `n9.0.2-26-g04622fa` (n9.0.2 with patches 0001 to 0026), binary
+- FFmpeg `n9.0.2-26-g04622fa` (n9.0.2 with patches 0001 to 0025), binary
   sha256 `649795e673624dc2b7fc4f559ca03da24ee64108c062d6da84b23dfe99d315f0`.
 - `vmaf` `v3.1.0-2519-g19c8a4be1`, CPU backend on every score.
 - Clips: `bbb` sha256 `9fcbaa58…5c6ae9`, `netflix-bar` sha256

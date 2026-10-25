@@ -25,29 +25,29 @@ precedence = "override"
 SPDX-FileCopyrightText = ["2000-2026 the FFmpeg developers", "2026 Lusoris"]
 SPDX-License-Identifier = "LGPL-2.1-or-later"
 
-# 0023 ports p5_to_p81 from dovi_tool 2.3.4, whose MIT notice the patch
+# 0022 ports p5_to_p81 from dovi_tool 2.3.4, whose MIT notice the patch
 # carries next to the ported code in libavfilter/dovi_reshape.c.
 [[annotations]]
-path = ["patches/0023-avfilter-vf_dovi_reshape-add-a-profile-8.1-RPU-outpu.patch"]
+path = ["patches/0022-avfilter-vf_dovi_reshape-add-a-profile-8.1-RPU-outpu.patch"]
 precedence = "override"
 SPDX-FileCopyrightText = ["2000-2026 the FFmpeg developers", "2026 Lusoris", "2026 quietvoid"]
 SPDX-License-Identifier = "LGPL-2.1-or-later AND MIT"
 
-# 0011, 0021, 0022, 0032 and 0036 port libplacebo code (LGPL-2.1-or-later)
+# 0010, 0020, 0021, 0030 and 0034 port libplacebo code (LGPL-2.1-or-later)
 # and carry its notice next to the ported code; series.py check refuses a
 # patch that adds the notice without this entry, or the reverse.
 [[annotations]]
-path = ["patches/0011-avfilter-dovi_reshape-add-a-Dolby-Vision-RPU-reshapi.patch", "patches/0021-avfilter-vf_tonemap-add-dynamic-peak-detection.patch", "patches/0022-avfilter-vf_tonemap_vulkan-add-dynamic-peak-detectio.patch", "patches/0032-avfilter-vf_tonemap_opencl-reshape-Dolby-Vision-prof.patch", "patches/0036-avfilter-vf_tonemap_opencl-detect-the-bt2408_hable-s.patch"]
+path = ["patches/0010-avfilter-dovi_reshape-add-a-Dolby-Vision-RPU-reshapi.patch", "patches/0020-avfilter-vf_tonemap-add-dynamic-peak-detection.patch", "patches/0021-avfilter-vf_tonemap_vulkan-add-dynamic-peak-detectio.patch", "patches/0030-avfilter-vf_tonemap_opencl-reshape-Dolby-Vision-prof.patch", "patches/0034-avfilter-vf_tonemap_opencl-detect-the-bt2408_hable-s.patch"]
 precedence = "override"
 SPDX-FileCopyrightText = ["2000-2026 the FFmpeg developers", "2026 Lusoris", "Niklas Haas and the libplacebo contributors"]
 SPDX-License-Identifier = "LGPL-2.1-or-later"
 
-# 0024 moves code of the GPL-2.0-or-later vf_hqdn3d.c into hqdn3d_coefs.c and
+# 0023 moves code of the GPL-2.0-or-later vf_hqdn3d.c into hqdn3d_coefs.c and
 # ports its algorithm to new GPL-2.0-or-later files; the build glue it touches
-# stays LGPL-2.1-or-later. 0025, 0026 and 0027 port the same algorithm to
+# stays LGPL-2.1-or-later. 0024, 0025 and 0026 port the same algorithm to
 # CUDA, OpenCL and Metal the same way.
 [[annotations]]
-path = ["patches/0024-avfilter-vf_hqdn3d_vulkan-add-a-Vulkan-hqdn3d-filter.patch", "patches/0025-avfilter-vf_hqdn3d_cuda-add-a-CUDA-hqdn3d-filter.patch", "patches/0026-avfilter-vf_hqdn3d_opencl-add-an-OpenCL-hqdn3d-filte.patch", "patches/0027-avfilter-vf_hqdn3d_videotoolbox-add-a-Metal-hqdn3d-f.patch"]
+path = ["patches/0023-avfilter-vf_hqdn3d_vulkan-add-a-Vulkan-hqdn3d-filter.patch", "patches/0024-avfilter-vf_hqdn3d_cuda-add-a-CUDA-hqdn3d-filter.patch", "patches/0025-avfilter-vf_hqdn3d_opencl-add-an-OpenCL-hqdn3d-filte.patch", "patches/0026-avfilter-vf_hqdn3d_videotoolbox-add-a-Metal-hqdn3d-f.patch"]
 precedence = "override"
 SPDX-FileCopyrightText = ["2000-2026 the FFmpeg developers", "2003 Daniel Moreno", "2010 Baptiste Coudurier", "2012 Loren Merritt", "2026 Lusoris"]
 SPDX-License-Identifier = "LGPL-2.1-or-later AND GPL-2.0-or-later"

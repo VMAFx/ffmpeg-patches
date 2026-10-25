@@ -1,0 +1,6 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx", "pelorus"]
+origin = "part 2 of the Dolby Vision profile 5 tone-mapping series without libplacebo (ADR-0002): tonemap_opencl=tonemap=bt2408_hable on the GPU"
+notes = """
+The 0012 helper state is uploaded as a constant buffer; opencl/bt2408_hable.cl ports its per-pixel part. Output primaries BT.709, light level and mastering display side data removed; param, desat and threshold ignored, no peak detection. Needs 0015 and 0016. scripts/tonemap_parity.py against vf_libplacebo hable on an RTX 4090: profile 5 clip of tests/fixtures/dv5 (dovi_reshape, scale to BT.2020 limited, tonemap_opencl) mean CIEDE2000 1.01, p95 3.383; 2160p HDR10 clip mean 0.721, p95 1.329 (ADR-0002 bar 2.3). A planted fixed peak of 4000 cd/m^2 fails both at 5.125 and 4.781. Against the 0013 CPU path on the HDR10 clip mean 0.177, p95 0.981. Wall time 1.7 s against 1.6 s for libplacebo at 720p, 2.8 s against 5.0 s at 2160p; VRAM above idle 404 and 435 MiB against 227 and 604. tests/test_tonemap_opencl.py matches the CPU path within one 8-bit code value on five flat colours on an RTX 4090 and an Arc A380, and refuses a planted peak of 4000 cd/m^2. No version.h or Changelog bump."""

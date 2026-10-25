@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Regression tests for the Dolby Vision metadata after patches 0012 and 0023 (dovi_reshape).
+"""Regression tests for the Dolby Vision metadata after patches 0011 and 0022 (dovi_reshape).
 
 dovi_reshape turns the profile 5 IPT base layer into BT.2020 PQ pixels. The
 profile 5 RPU describes the IPT layer, so it must not reach an encoder with
@@ -12,7 +12,7 @@ an RPU.
 The planted wrong case encodes the clip without dovi_reshape and with
 dolbyvision=1, which keeps the profile 5 RPU; the same check must find it.
 
-With rpu=p81 (0023) the filter rewrites the RPU to profile 8.1 for the
+With rpu=p81 (0022) the filter rewrites the RPU to profile 8.1 for the
 reshaped pixels and drops the level 5 active area. Those cases give the clip
 a level 5 block with dovi_tool, encode it and read the output RPU back with
 dovi_tool: profile 8, no level 5, and a profile 8.1 configuration record.
@@ -20,7 +20,7 @@ Their planted wrong case encodes the same input without dovi_reshape; the same
 checks must find profile 5 and the level 5 block.
 
 The cases need an FFmpeg built with the series and libx265, its ffprobe next
-to it, and dovi_tool 2.3.4 for the 0023 cases:
+to it, and dovi_tool 2.3.4 for the 0022 cases:
 
     DV_FFMPEG=/path/to/ffmpeg DV_DOVI_TOOL=/path/to/dovi_tool \
         python3 -m unittest tests.test_dovi_reshape_rpu
@@ -141,7 +141,7 @@ def dovi_metadata(path: Path) -> list[str]:
 
 @unittest.skipUnless(FFMPEG, "set DV_FFMPEG")
 class ReshapedRpuTest(unittest.TestCase):
-    """0012: reshaped pixels never leave with the profile 5 RPU."""
+    """0011: reshaped pixels never leave with the profile 5 RPU."""
 
     def test_reshaped_encode_carries_no_dolby_vision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,7 +168,7 @@ class ReshapedRpuTest(unittest.TestCase):
 
 @unittest.skipUnless(FFMPEG and DOVI_TOOL, "set DV_FFMPEG and DV_DOVI_TOOL")
 class Profile81RpuTest(unittest.TestCase):
-    """0023: rpu=p81 writes a profile 8.1 RPU without the level 5 active area."""
+    """0022: rpu=p81 writes a profile 8.1 RPU without the level 5 active area."""
 
     def test_p81_encode_is_profile_81_without_level5(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -9,7 +9,7 @@ from the Vulkan device with hwupload=derive_device=cuda after \
 hwupload_cuda on its own device, reused those handles, and \
 cuWaitExternalSemaphoresAsync() failed with CUDA_ERROR_INVALID_VALUE. \
 Measured with the reproducer from the commit message on an RTX 4090 \
-(driver 615.78.08), n9.0.2 plus 0001-0008: without this patch 3 of 3 \
+(driver 615.78.08), n9.0.2 plus 0001-0007: without this patch 3 of 3 \
 runs exit 187 with that error and no frame; with it 3 of 3 runs write \
 120 frames whose framemd5 equals the same pipeline without the GPU hop. \
 The upstream pull request has the same diff (equal patch-id) on FFmpeg \

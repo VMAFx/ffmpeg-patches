@@ -7,7 +7,7 @@ notes = """
 Already on FFmpeg master; release/9.0 does not carry it (checked \
 2026-10-18 against release/9.0 7e93014c5b). Drop the patch once the \
 pinned base contains the commit. The one-line change applies to the \
-series unchanged, after 0006 in try_export_flags(). \
+series unchanged, after 0005 in try_export_flags(). \
 On n9.0.2 an NV12 frames pool with OPTIMAL tiling asks for OPAQUE_FD \
 export support with VK_IMAGE_CREATE_ALIAS_BIT only; for the \
 G8_B8R8_2PLANE_420 storage image that query fails, so the pool memory \

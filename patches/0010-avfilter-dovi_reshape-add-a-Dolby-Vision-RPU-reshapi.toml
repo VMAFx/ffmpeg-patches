@@ -6,9 +6,9 @@ notes = """
 Shared helper that validates a Dolby Vision RPU, evaluates its \
 polynomial and MMR reshaping curves and decodes the result to PQ \
 BT.2020 RGB, ported from libplacebo v7.360.1 (LGPL-2.1+, notice kept). \
-No filter uses it on its own; 0012 is the first user, and the tone-map \
+No filter uses it on its own; 0011 is the first user, and the tone-map \
 paths of ADR-0002 follow. Profile 7 residual enhancement layers are \
-refused. make fate-filter-dovi-reshape passes on n9.0.2 plus 0001-0011; \
+refused. make fate-filter-dovi-reshape passes on n9.0.2 plus 0001-0010; \
 the unit test checks the helper against a double-precision model, the \
 pivot boundary, a planted wrong MMR coefficient and the refusals. No \
 version.h or Changelog bump: the series carries no release entry."""
