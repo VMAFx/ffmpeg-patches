@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# ffmpeg-forgejo: file issues and pull requests on code.ffmpeg.org (Forgejo).
+#
+# The access token lives in the desktop keyring (Secret Service), stored once with
+#   secret-tool store --label='code.ffmpeg.org API token' service code.ffmpeg.org
+# and is never printed or placed on a command line.
+#
+# Usage:
+#   ffmpeg-forgejo whoami
+#   ffmpeg-forgejo search  <text>                    open issues and PRs matching text
+#   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
+#   ffmpeg-forgejo push    [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
+#                          --lease force-pushes only while the remote branch is still <sha>
+#   ffmpeg-forgejo pr      <branch> <title> <body-file>       open PR <you>:<branch> -> master
+#   ffmpeg-forgejo issue   <title> <body-file>
+#   ffmpeg-forgejo comment <number> <body-file>       comment on an issue or PR
+#   ffmpeg-forgejo edit-body [--wait] <number> <body-file>   replace a PR body; refuses (exit 75) while the
+#                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
+#                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
+#                          a failure status on the head: edit the body before pushing, or after Autolabel.
+#   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
+# Environment: FFMPEG_FORGEJO_REPO (default FFmpeg/FFmpeg), FFMPEG_FORGEJO_BASE (default master),
+#   FFMPEG_FORGEJO_API (API base override, for tests).
+set -euo pipefail
+
+HOST="https://code.ffmpeg.org"
+API="${FFMPEG_FORGEJO_API:-$HOST/api/v1}"
+REPO="${FFMPEG_FORGEJO_REPO:-FFmpeg/FFmpeg}"
+BASE="${FFMPEG_FORGEJO_BASE:-master}"
+
+die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
+
+token() {
+  local t
+  if ! t="$(secret-tool lookup service code.ffmpeg.org 2>/dev/null)"; then t=""; fi
+  [ -n "$t" ] || die "no token in the keyring; store it with: secret-tool store --label='code.ffmpeg.org API token' service code.ffmpeg.org"
+  printf '%s' "$t"
+}
+
+# api METHOD PATH [JSON-BODY-FILE]; the token goes through a header file, not argv.
+api() {
+  local method="$1" path="$2" body="${3:-}" hdr tok
+  tok="$(token)" || exit 1
+  hdr="$(mktemp)"
+  trap 'rm -f "$hdr"' RETURN
+  chmod 600 "$hdr"
+  printf 'Authorization: token %s\n' "$tok" >"$hdr"
+  if [ -n "$body" ]; then
+    curl -fsS --max-time 60 -X "$method" -H @"$hdr" -H 'Content-Type: application/json' \
+      --data-binary @"$body" "$API$path"
+  else
+    curl -fsS --max-time 60 -X "$method" -H @"$hdr" "$API$path"
+  fi
+}
+
+login() {
+  local out
+  out="$(api GET /user)" || exit 1
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out"
+}
+
+json_body() { # json_body KEY=VALUE... ; values starting with @ are read from that file
+  python3 -c '
+import json, sys
+out = {}
+for arg in sys.argv[1:]:
+    k, v = arg.split("=", 1)
+    out[k] = open(v[1:], encoding="utf-8").read() if v.startswith("@") else v
+print(json.dumps(out))' "$@"
+}
+
+# head_sha NUMBER: prints the current head commit of that PR.
+head_sha() {
+  local out
+  out="$(api GET "/repos/$REPO/pulls/$1")" || exit 1
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])' <<<"$out"
+}
+
+# autolabel_state SHA: prints done, pending, none or unknown for the Autolabel contexts on that
+# commit. The status list is paged (X-Total-Count; the body's total_count counts one page only),
+# so it reads pages until an empty one; more than 20 pages, or a status outside Forgejo's
+# CommitStatusState values, is unknown.
+autolabel_state() {
+  local out page rows=""
+  for ((page = 1; page <= 20; page++)); do
+    out="$(api GET "/repos/$REPO/commits/$1/status?limit=50&page=$page")" || exit 1
+    out="$(python3 -c 'import json,sys
+st = json.load(sys.stdin).get("statuses") or []
+print(len(st))
+for s in st:
+    if s["context"].startswith("Autolabel"): print(s["status"])' <<<"$out")" || exit 1
+    if [ "${out%%$'\n'*}" = 0 ]; then
+      python3 -c 'import sys
+st = sys.argv[1].split()
+terminal = {"success", "error", "failure", "warning", "skipped"}
+print("none" if not st else "pending" if "pending" in st else "done" if set(st) <= terminal else "unknown")' "$rows"
+      return
+    fi
+    [[ "$out" != *$'\n'* ]] || rows+=" ${out#*$'\n'}"
+  done
+  echo unknown
+}
+
+cmd="${1:-}"
+if [ $# -gt 0 ]; then shift; fi
+case "$cmd" in
+  whoami)
+    login
+    ;;
+  search)
+    [ $# -ge 1 ] || die "usage: search <text>"
+    q="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$*")"
+    out="$(api GET "/repos/$REPO/issues?state=open&q=$q&limit=20")" || exit 1
+    python3 -c 'import json,sys
+for i in json.load(sys.stdin):
+    kind = "PR" if i.get("pull_request") else "issue"
+    print("#{number} [{k}] {title}  {html_url}".format(k=kind, **i))' <<<"$out"
+    ;;
+  fork)
+    me="$(login)"
+    if api GET "/repos/$me/${REPO#*/}" >/dev/null 2>&1; then
+      echo "$HOST/$me/${REPO#*/} exists"
+    else
+      body="$(mktemp)"; echo '{}' >"$body"
+      api POST "/repos/$REPO/forks" "$body" >/dev/null
+      rm -f "$body"
+      echo "forked $REPO to $HOST/$me/${REPO#*/}"
+    fi
+    ;;
+  push)
+    lease=""
+    if [ "${1:-}" = "--lease" ]; then
+      [ $# -ge 3 ] || die "usage: push --lease <expected-remote-sha> <local-branch> [<remote-branch>]"
+      [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die "--lease takes the full 40-hex sha the remote branch has now: $2"
+      lease="$2"; shift 2
+    fi
+    [ $# -ge 1 ] || die "usage: push [--lease <expected-remote-sha>] <local-branch> [<remote-branch>]"
+    me="$(login)"
+    git rev-parse --verify --quiet "$1^{commit}" >/dev/null || die "no local branch $1"
+    rb="${2:-$1}"
+    # The credential helper reads the keyring at push time; nothing lands in argv or config.
+    # --lease rewrites the remote branch only while it still points at the expected sha.
+    git -c credential.helper= \
+        -c "credential.$HOST.helper=!f() { echo username=$me; printf 'password='; secret-tool lookup service code.ffmpeg.org; echo; }; f" \
+        push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$1:refs/heads/$rb"
+    ;;
+  pr)
+    [ $# -eq 3 ] || die "usage: pr <branch> <title> <body-file>"
+    [ -f "$3" ] || die "no body file $3"
+    me="$(login)"
+    body="$(mktemp)"
+    json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
+    api POST "/repos/$REPO/pulls" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    rm -f "$body"
+    ;;
+  issue)
+    [ $# -eq 2 ] || die "usage: issue <title> <body-file>"
+    [ -f "$2" ] || die "no body file $2"
+    body="$(mktemp)"
+    json_body "title=$1" "body=@$2" >"$body"
+    api POST "/repos/$REPO/issues" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    rm -f "$body"
+    ;;
+  comment)
+    [ $# -eq 2 ] || die "usage: comment <number> <body-file>"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: $1"
+    [ -f "$2" ] || die "no body file $2"
+    body="$(mktemp)"
+    json_body "body=@$2" >"$body"
+    api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    rm -f "$body"
+    ;;
+  edit-body)
+    wait=0
+    if [ "${1:-}" = "--wait" ]; then wait=1; shift; fi
+    [ $# -eq 2 ] || die "usage: edit-body [--wait] <number> <body-file>"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
+    [ -f "$2" ] || die "no body file $2"
+    # The head is read again after the status check: a push in between starts a new Autolabel
+    # run, and the finished statuses of the old head must not clear the edit. Forgejo's PR edit
+    # takes no expected head, so a push landing between this last read and the PATCH still races.
+    for ((i = 1; i <= 80; i++)); do
+      sha="$(head_sha "$1")"
+      state="$(autolabel_state "$sha")"
+      if [ "$state" = done ]; then
+        [ "$(head_sha "$1")" = "$sha" ] && break
+        state="superseded by a new push"
+      fi
+      if [ "$wait" = 0 ] || [ "$i" = 80 ]; then
+        printf 'ffmpeg-forgejo: Autolabel for head %s is %s; a body edit now cancels it. Retry after it finishes, or use --wait.\n' "$sha" "$state" >&2
+        exit 75
+      fi
+      sleep "${FFMPEG_FORGEJO_POLL:-15}"
+    done
+    body="$(mktemp)"
+    json_body "body=@$2" >"$body"
+    api PATCH "/repos/$REPO/pulls/$1" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    rm -f "$body"
+    ;;
+  reviewers)
+    [ $# -ge 1 ] || die "usage: reviewers <number> [<login>...]"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
+    n="$1"; shift
+    if [ $# -gt 0 ]; then
+      for u in "$@"; do [[ "$u" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $u"; done
+      body="$(mktemp)"
+      python3 -c 'import json,sys; print(json.dumps({"reviewers": sys.argv[1:]}))' "$@" >"$body"
+      api POST "/repos/$REPO/pulls/$n/requested_reviewers" "$body" >/dev/null
+      rm -f "$body"
+    fi
+    api GET "/repos/$REPO/pulls/$n" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print("#{} requested reviewers: {}".format(d["number"], ", ".join(u["login"] for u in d.get("requested_reviewers") or []) or "none"))'
+    ;;
+  *)
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+    [ -z "$cmd" ] || exit 64
+    ;;
+esac
