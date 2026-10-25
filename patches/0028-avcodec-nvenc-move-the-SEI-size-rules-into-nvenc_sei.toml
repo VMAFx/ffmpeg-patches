@@ -11,8 +11,10 @@ NVENC header, so Pelorus can include it instead of mirroring the numbers. \
 No change in behavior: the old and the new functions agree on 1000000 \
 random payloads (a planted change of the escape rule gives 1639143 \
 mismatches). 0003 and 0004 stay as sent upstream (FFmpeg PRs 24993 and \
-24994); this patch is series-only and is redone on top of their merged \
-form. tests/test_nvenc_sei.py compiles the header alone and checks it \
+24994); this patch is series-only. PR #24994 merged as FFmpeg master \
+96b7f8281a5f in a reduced form that has none of these rules, so this \
+patch stays with 0003 and 0004 until Pelorus 0022 builds on the merged \
+form; then it is redone on top of that backport or dropped. tests/test_nvenc_sei.py compiles the header alone and checks it \
 against a Python model. Not run on NVENC hardware: the RTX 4090 had \
 906 MiB free on 2026-10-18. Adopted: Pelorus 0ef64d5 (series v0.3.0) \
 includes nvenc_sei.h from pelorus_sei_fit.h and keeps no copy of the \

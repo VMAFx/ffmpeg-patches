@@ -12,9 +12,13 @@ Fixes FFmpeg issue #24972. Upstream form: FFmpeg PR #24993 on master \
 ba987fe24d, also checked there on the RTX 4090. PR #24993 was closed \
 unmerged by its author on 2026-10-22 in favour of the smaller \
 fixed-size check now in PR #24994. The truncation of \
-zero-heavy payloads is handled by 0004. The series keeps 0003 as a \
-series-only patch; when PR #24994 merges, compare 0003 with the merged \
-form and decide whether to keep or drop it."""
+zero-heavy payloads is handled by 0004. PR #24994 merged on 2026-10-24 \
+as FFmpeg master 96b7f8281a5f: a fixed limit of 512 bytes of SEI payload \
+per picture, without this patch's budget in NAL unit bytes. The series \
+keeps 0003 as a series-only patch while Pelorus 0022 builds on \
+nvenc_hevc_sei_fits() and the budget. Drop trigger: once Pelorus 0022 \
+builds on the merged form, replace 0003, 0004 and 0028 with a backport \
+of 96b7f8281a5f."""
 
 [[exceptions]]
 rule = "HISS-04"
