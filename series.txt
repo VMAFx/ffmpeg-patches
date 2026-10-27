@@ -40,3 +40,7 @@
 0033-avfilter-vf_tonemap_vaapi-take-the-bt2408_hable-peak.patch
 0034-avfilter-vf_tonemap_opencl-detect-the-bt2408_hable-s.patch
 0035-avutil-hwcontext_vulkan-Query-export-support-with-th.patch
+0036-checkasm-snowdsp-Include-intmath-before-public-heade.patch
+0037-avcodec-aom_film_grain-Check-the-predicted-luma-poin.patch
+0038-avcodec-vvc-intra_template-Bound-reference-corner-ex.patch
+0039-avcodec-wmalosslessdec-Clear-subframe-flags-as-an-ar.patch

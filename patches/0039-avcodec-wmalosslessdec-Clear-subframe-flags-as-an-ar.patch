@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Tue, 27 Oct 2026 17:06:28 +0100
+Subject: [PATCH] avcodec/wmalosslessdec: Clear subframe flags as an array
+
+decode_init already rejects more than WMALL_MAX_CHANNELS channels, and
+num_channels is not reassigned during decoding. The channel-dependent
+clear in decode_tilehdr nevertheless triggers a stringop-overflow
+warning with gcc 15.2 with -march=x86-64-v3, also seen for generic
+x86-64.
+
+Clear the whole contains_subframe array before selecting channels on
+each tiling pass. The clear is now bounded by sizeof rather than the
+channel count. Each used flag is subsequently overwritten as before;
+flags for other channels remain zero. No new channel-limit rejection is
+needed because initialization already enforces the limit.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavcodec/wmalosslessdec.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/wmalosslessdec.c b/libavcodec/wmalosslessdec.c
+index 72d2f31751b476f48cb03849e95c225cc8509d65..b47b2c406d8e447202f72b27e98c1ea53ed2ea9d 100644
+--- a/libavcodec/wmalosslessdec.c
++++ b/libavcodec/wmalosslessdec.c
+@@ -357,6 +357,7 @@ static int decode_tilehdr(WmallDecodeCtx *s)
+         int subframe_len, in_use = 0;
+ 
+         /* check which channels contain the subframe */
++        memset(contains_subframe, 0, sizeof(contains_subframe));
+         for (c = 0; c < s->num_channels; c++) {
+             if (num_samples[c] == min_channel_len) {
+                 if (fixed_channel_layout || channels_for_cur_subframe == 1 ||
+@@ -366,8 +367,7 @@ static int decode_tilehdr(WmallDecodeCtx *s)
+                     contains_subframe[c] = get_bits1(&s->gb);
+                 }
+                 in_use |= contains_subframe[c];
+-            } else
+-                contains_subframe[c] = 0;
++            }
+         }
+ 
+         if (!in_use) {

@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Tue, 27 Oct 2026 17:06:28 +0100
+Subject: [PATCH] checkasm/snowdsp: Include intmath before public headers
+
+Checkasm objects are built without HAVE_AV_CONFIG_H. Including snow.h
+first reaches common.h through avcodec.h, which installs the generic
+av_popcount, av_popcount64 and av_zero_extend aliases. The later
+rangecoder.h inclusion reaches x86/intmath.h and redefines them when
+POPCNT and BMI2 are enabled.
+
+Include intmath.h before the public headers so common.h sees the chosen
+implementations. This fixes the redefinition warnings reported with gcc
+15.2 with -march=x86-64-v3 without changing all checkasm objects or
+making the architecture header retain the generic fallbacks.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ tests/checkasm/snowdsp.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tests/checkasm/snowdsp.c b/tests/checkasm/snowdsp.c
+index 99cfae679e204c85b42b1e7140aaa297be8a186a..aa031e4d85104a60d217efe06ee44b26d96e4927 100644
+--- a/tests/checkasm/snowdsp.c
++++ b/tests/checkasm/snowdsp.c
+@@ -21,6 +21,7 @@
+ #include <stdint.h>
+ #include <string.h>
+ 
++#include "libavutil/intmath.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/macros.h"
+ #include "libavutil/mem_internal.h"
