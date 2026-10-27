@@ -402,3 +402,40 @@ jobs:
         run: |
           clang --version >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/series.py warnings ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"
+      # Probe for #114, not for merge: report the Metal device the hosted
+      # runner exposes, then run the device cases of the Metal hqdn3d test.
+      # A hosted runner is a virtual machine; a result here is no parity
+      # result on Apple hardware.
+      - name: Probe the Metal device of the runner
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
+        run: |
+          {
+            echo "## Metal probe"
+            echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            sw_vers
+            sysctl -n machdep.cpu.brand_string hw.model
+            system_profiler SPDisplaysDataType
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          cat > probe.swift <<'SWIFT'
+          import Foundation
+          import Metal
+          guard let d = MTLCreateSystemDefaultDevice() else {
+              print("MTLCreateSystemDefaultDevice: nil")
+              exit(3)
+          }
+          print("device: \(d.name)")
+          print("registryID: \(d.registryID) lowPower: \(d.isLowPower) headless: \(d.isHeadless) removable: \(d.isRemovable)")
+          print("unifiedMemory: \(d.hasUnifiedMemory) apple7: \(d.supportsFamily(.apple7)) mac2: \(d.supportsFamily(.mac2))")
+          print("recommendedMaxWorkingSetSize: \(d.recommendedMaxWorkingSetSize)")
+          SWIFT
+          swiftc -O probe.swift -o probe
+          ./probe | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Run the device cases of the Metal hqdn3d test
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
+        run: |
+          make -C build -j"$(sysctl -n hw.ncpu)" tools/hqdn3d_reset_test
+          VT_FFMPEG="$PWD/build/ffmpeg" \
+          HQDN3D_RESET_TOOL="$PWD/build/tools/hqdn3d_reset_test" \
+            python3 -m unittest -v tests.test_hqdn3d_videotoolbox 2>&1 \
+            | tee device-cases.log
+          { echo '```'; cat device-cases.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
