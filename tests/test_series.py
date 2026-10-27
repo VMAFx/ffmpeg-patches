@@ -17,24 +17,15 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import series  # noqa: E402
 
+from tests.helpers import init_upstream, run_git  # noqa: E402
+
 LINES = [f"int line_{n} = {n};" for n in range(1, 41)]
 METADATA = 'status = "submitted"\nupstream = "https://example.invalid/pulls/1"\nconsumers = ["a"]\n'
-
-
-def run_git(tree: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(tree), "-c", "user.name=Dev", "-c", "user.email=dev@invalid", *args],
-        env=series.git_env(),
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=60,
-    )
-    return result.stdout.strip()
 
 
 def write_lines(tree: Path, lines: list[str]) -> None:
@@ -54,16 +45,7 @@ class Fixture:
     def __init__(self, scratch: Path) -> None:
         self.tree = scratch / "upstream"
         self.root = scratch / "series"
-        self.tree.mkdir()
-        self.root.mkdir()
-        run_git(self.tree, "init", "-q")
-        write_lines(self.tree, LINES)
-        run_git(self.tree, "add", "lib.c")
-        run_git(self.tree, "commit", "-q", "-m", "base")
-        self.base = run_git(self.tree, "rev-parse", "HEAD")
-        (self.root / "base.env").write_text(
-            f"FFMPEG_REMOTE=https://example.invalid/up.git\nFFMPEG_TAG=v1\nFFMPEG_COMMIT={self.base}\n"
-        )
+        self.base = init_upstream(self.tree, self.root, lambda: write_lines(self.tree, LINES))
         (self.root / "series.txt").write_text("# header kept by export\n")
         commit_edit(self.tree, 4, "int line_5 = 50;", "lib: fix line five")
         commit_edit(self.tree, 29, "int line_30 = 300;", "lib: fix line thirty")
@@ -113,6 +95,13 @@ class Fixture:
         self.reset()
         commit_edit(self.tree, index, text, "upstream change")
         return run_git(self.tree, "rev-parse", "HEAD")
+
+
+def write_merged_record(fixture: Fixture) -> None:
+    merged = fixture.record(
+        1, state="merged", merged_at="2026-01-01T10:00:00Z", merged_commit=fixture.base
+    )
+    fixture.write_records([merged, fixture.record(2)])
 
 
 class SeriesTestCase(unittest.TestCase):
@@ -366,10 +355,7 @@ class CheckTest(SeriesTestCase):
 
     def test_merged_warns_but_passes(self) -> None:
         self.fx.patch(1).with_suffix(".toml").write_text(METADATA.replace("submitted", "merged"))
-        merged = self.fx.record(
-            1, state="merged", merged_at="2026-01-01T10:00:00Z", merged_commit=self.fx.base
-        )
-        self.fx.write_records([merged, self.fx.record(2)])
+        write_merged_record(self.fx)
         findings = series.check(self.fx.root)
         self.assertEqual(findings.errors, [])
         self.assertIn("drop it", findings.warnings[0])
@@ -787,10 +773,7 @@ class MasterFormTest(SeriesTestCase):
     def test_master_form_requires_submitted_status(self) -> None:
         path = self.fx.patch(1).with_suffix(".toml")
         path.write_text(path.read_text().replace("submitted", "merged"))
-        merged = self.fx.record(
-            1, state="merged", merged_at="2026-01-01T10:00:00Z", merged_commit=self.fx.base
-        )
-        self.fx.write_records([merged, self.fx.record(2)])
+        write_merged_record(self.fx)
         self.assert_error(series.check(self.fx.root), "master_form is allowed only")
 
     def test_master_form_requires_exact_table_keys(self) -> None:

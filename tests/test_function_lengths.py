@@ -6,28 +6,18 @@ from __future__ import annotations
 
 import contextlib
 import io
-import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import series  # noqa: E402
 
-
-def run_git(tree: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(tree), "-c", "user.name=Dev", "-c", "user.email=dev@invalid", *args],
-        env=series.git_env(),
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=60,
-    )
-    return result.stdout.strip()
+from tests.helpers import capture_main, init_upstream, run_git, write_base  # noqa: E402
 
 
 def build_c_function(
@@ -51,15 +41,8 @@ class LengthFixture:
     def __init__(self, scratch: Path) -> None:
         self.tree = scratch / "upstream"
         self.root = scratch / "series"
-        self.tree.mkdir()
-        self.root.mkdir()
-        run_git(self.tree, "init", "-q")
-        self.write_file("lib.c", build_c_function("f", 58))
-        run_git(self.tree, "add", "lib.c")
-        run_git(self.tree, "commit", "-q", "-m", "base")
-        self.base = run_git(self.tree, "rev-parse", "HEAD")
-        (self.root / "base.env").write_text(
-            f"FFMPEG_REMOTE=https://example.invalid/up.git\nFFMPEG_TAG=v1\nFFMPEG_COMMIT={self.base}\n"
+        self.base = init_upstream(
+            self.tree, self.root, lambda: self.write_file("lib.c", build_c_function("f", 58))
         )
         (self.root / "series.txt").write_text("# header\n")
 
@@ -107,10 +90,12 @@ class LengthFixture:
 
 
 def run_series_cli(root: Path, *args: str) -> tuple[int, str, str]:
-    out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = series.main(["--root", str(root), *args])
-    return code, out.getvalue(), err.getvalue()
+    return capture_main(series.main, "--root", str(root), *args)
+
+
+def check_lengths(fixture: LengthFixture) -> tuple[int, str, str]:
+    fixture.export()
+    return run_series_cli(fixture.root, "lengths", str(fixture.tree), "--today", "2026-10-18")
 
 
 class TestFunctionLengths(unittest.TestCase):
@@ -123,10 +108,7 @@ class TestFunctionLengths(unittest.TestCase):
 
     def test_planted_growth_without_exception_fails(self) -> None:
         self.fx.commit_file("lib.c", build_c_function("f", 61), "grow f to 61")
-        self.fx.export()
-        rc, out, _ = run_series_cli(
-            self.fx.root, "lengths", str(self.fx.tree), "--today", "2026-10-18"
-        )
+        rc, out, _ = check_lengths(self.fx)
         self.assertEqual(rc, 1)
         msg = "58 -> 61 lines, over the 60-line cap (HISS-04) without a live exception"
         self.assertIn(msg, out)
@@ -134,10 +116,7 @@ class TestFunctionLengths(unittest.TestCase):
 
     def test_boundary_growth_passes(self) -> None:
         self.fx.commit_file("lib.c", build_c_function("f", 60), "grow f to 60")
-        self.fx.export()
-        rc, out, _ = run_series_cli(
-            self.fx.root, "lengths", str(self.fx.tree), "--today", "2026-10-18"
-        )
+        rc, out, _ = check_lengths(self.fx)
         self.assertEqual(rc, 0)
         self.assertIn("0 function(s) over 60 lines, 0 excused, 0 failing", out)
 
@@ -204,10 +183,7 @@ class TestFunctionLengths(unittest.TestCase):
     def test_new_function_over_cap_fails(self) -> None:
         lines = build_c_function("f", 58) + [""] + build_c_function("new_f", 61)
         self.fx.commit_file("lib.c", lines, "add new function 61 lines")
-        self.fx.export()
-        rc, out, _ = run_series_cli(
-            self.fx.root, "lengths", str(self.fx.tree), "--today", "2026-10-18"
-        )
+        rc, out, _ = check_lengths(self.fx)
         self.assertEqual(rc, 1)
         msg = "new_f 0 -> 61 lines, over the 60-line cap (HISS-04) without a live exception"
         self.assertIn(msg, out)
@@ -217,16 +193,11 @@ class TestFunctionLengths(unittest.TestCase):
         self.fx.commit_file("lib.c", base_lines, "base with long_fn")
         run_git(self.fx.tree, "commit", "--amend", "-q", "-m", "base with long_fn")
         self.fx.base = run_git(self.fx.tree, "rev-parse", "HEAD")
-        (self.fx.root / "base.env").write_text(
-            f"FFMPEG_REMOTE=https://example.invalid/up.git\nFFMPEG_TAG=v1\nFFMPEG_COMMIT={self.fx.base}\n"
-        )
+        write_base(self.fx.root, self.fx.base)
 
         lines_untouched = build_c_function("f", 59) + [""] + build_c_function("long_fn", 80)
         self.fx.commit_file("lib.c", lines_untouched, "grow f, long_fn untouched")
-        self.fx.export()
-        rc, out, _ = run_series_cli(
-            self.fx.root, "lengths", str(self.fx.tree), "--today", "2026-10-18"
-        )
+        rc, out, _ = check_lengths(self.fx)
         self.assertEqual(rc, 0)
         self.assertIn("0 function(s) over 60 lines, 0 excused, 0 failing", out)
 
@@ -236,10 +207,7 @@ class TestFunctionLengths(unittest.TestCase):
         lines_shortened = build_c_function("f", 58) + [""] + long_fn
         run_git(self.fx.tree, "reset", "--hard", self.fx.base)
         self.fx.commit_file("lib.c", lines_shortened, "shorten long_fn")
-        self.fx.export()
-        rc, out, _ = run_series_cli(
-            self.fx.root, "lengths", str(self.fx.tree), "--today", "2026-10-18"
-        )
+        rc, out, _ = check_lengths(self.fx)
         self.assertEqual(rc, 0)
         self.assertIn("0 function(s) over 60 lines, 0 excused, 0 failing", out)
 

@@ -17,9 +17,7 @@ format=yuv444p and FFmpeg inserts auto_scale_0; the second needs none.
 
 from __future__ import annotations
 
-import contextlib
 import copy
-import io
 import json
 import sys
 import tempfile
@@ -28,19 +26,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "graphs"
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import graph_check  # noqa: E402
 
+from tests.helpers import capture_main  # noqa: E402
+
 
 def check(*argv: str) -> tuple[int, str, str]:
     """Run main() and return the exit status, stdout and stderr."""
-    with (
-        contextlib.redirect_stdout(io.StringIO()) as out,
-        contextlib.redirect_stderr(io.StringIO()) as err,
-    ):
-        status = graph_check.main(list(argv))
-    return status, out.getvalue(), err.getvalue()
+    return capture_main(graph_check.main, *argv)
 
 
 class GraphCheckTest(unittest.TestCase):

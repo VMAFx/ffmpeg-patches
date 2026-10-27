@@ -34,48 +34,29 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests.helpers import (  # noqa: E402
+    COLOURS,
+    CPU,
+    PQ_INPUT,
+    SIZE,
+    centre_yuv,
+    flat_frame,
+    worst_difference,
+)
 
 FFMPEG = os.environ.get("OCL_FFMPEG", "")
 DEVICE = os.environ.get("OCL_DEVICE", "")
-SIZE = 64
-# PQ BT.2020 limited range 10-bit code values (Y, Cb, Cr); the first is pure red.
-COLOURS = [(292, 388, 956), (600, 512, 512), (500, 600, 400), (700, 450, 580), (350, 700, 480)]
-PQ_INPUT = (
-    "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv"
-)  # fmt: skip
-CPU = (
-    "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=bt2408_hable:peak={peak},"
-    "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
-)
 GPU = (
     "format=p010,hwupload,tonemap_opencl=tonemap={curve}:m=bt709:r=tv:p=bt709:t=bt709:"
     "peak={peak},hwdownload,format=nv12"
 )
 CPU_DETECT = CPU.replace("peak={peak},", "peak={peak}:peak_detect=1,")
 GPU_DETECT = GPU.replace("peak={peak},", "peak={peak}:peak_detect=1,")
-
-
-def flat_frame(y: int, u: int, v: int) -> bytes:
-    """Return one SIZE x SIZE yuv420p10le frame with constant planes."""
-    luma = y.to_bytes(2, "little") * (SIZE * SIZE)
-    quarter = SIZE * SIZE // 4
-    return luma + u.to_bytes(2, "little") * quarter + v.to_bytes(2, "little") * quarter
-
-
-def centre_yuv(frame: bytes) -> tuple[int, int, int]:
-    """Return the centre code values of a SIZE x SIZE yuv420p frame."""
-    half = SIZE // 2
-    luma = SIZE * SIZE
-    chroma = half * (half // 2) + half // 2
-    if len(frame) != luma * 3 // 2:
-        raise ValueError(f"want {luma * 3 // 2} bytes, got {len(frame)}")
-    return frame[half * SIZE + half], frame[luma + chroma], frame[luma + luma // 4 + chroma]
-
-
-def worst_difference(want: tuple[int, ...], got: tuple[int, ...]) -> int:
-    """Return the largest per-component difference of two code value tuples."""
-    return max(abs(left - right) for left, right in zip(want, got, strict=True))
 
 
 def run(frame: bytes, chain: str) -> bytes:

@@ -35,15 +35,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tests.test_tonemap_opencl import (  # noqa: E402
-    COLOURS,
-    CPU,
-    PQ_INPUT,
-    SIZE,
-    centre_yuv,
-    flat_frame,
-    worst_difference,
-)
+from tests import helpers  # noqa: E402
 
 FFMPEG = os.environ.get("VK_FFMPEG", "")
 DEVICE = os.environ.get("VK_DEVICE", "")
@@ -57,22 +49,13 @@ PQ_ONLY = "Unsupported input color properties"
 
 
 def run(frame: bytes, chain: str) -> subprocess.CompletedProcess[bytes]:
-    """Filter one raw frame through PQ_INPUT and chain on the Vulkan device."""
-    cmd = [
-        FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error",
-        "-init_hw_device", f"vulkan=vk:{DEVICE}", "-filter_hw_device", "vk",
-        "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-s", f"{SIZE}x{SIZE}", "-i", "pipe:0",
-        "-vf", f"{PQ_INPUT},{chain}", "-f", "rawvideo", "pipe:1",
-    ]  # fmt: skip
-    return subprocess.run(cmd, input=frame, capture_output=True, timeout=120, check=False)
+    return helpers.filter_frame(
+        FFMPEG, (f"vulkan=vk:{DEVICE}", "vk"), frame, chain, (helpers.SIZE, helpers.PQ_INPUT)
+    )
 
 
 def output(frame: bytes, chain: str) -> bytes:
-    """Return the raw output of a run that must succeed."""
-    done = run(frame, chain)
-    if done.returncode != 0:
-        raise AssertionError(f"{chain} exited {done.returncode}: {done.stderr.decode()}")
-    return done.stdout
+    return helpers.raw_output(run(frame, chain), chain)
 
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")
@@ -80,50 +63,54 @@ class Bt2408HableTest(unittest.TestCase):
     """0019, 0021: the Vulkan bt2408_hable path must match the CPU path."""
 
     def test_vulkan_matches_cpu(self) -> None:
-        for colour in COLOURS:
+        for colour in helpers.COLOURS:
             with self.subTest(colour=colour):
-                frame = flat_frame(*colour)
-                cpu = centre_yuv(output(frame, CPU.format(peak=10)))
-                vulkan = centre_yuv(output(frame, VULKAN.format(peak=10)))
-                self.assertLessEqual(worst_difference(cpu, vulkan), 1, f"cpu {cpu} vulkan {vulkan}")
+                frame = helpers.flat_frame(*colour)
+                cpu = helpers.centre_yuv(output(frame, helpers.CPU.format(peak=10)))
+                vulkan = helpers.centre_yuv(output(frame, VULKAN.format(peak=10)))
+                self.assertLessEqual(
+                    helpers.worst_difference(cpu, vulkan), 1, f"cpu {cpu} vulkan {vulkan}"
+                )
 
     def test_planted_wrong_peak_is_refused(self) -> None:
         worst = 0
-        for colour in COLOURS:
-            frame = flat_frame(*colour)
-            cpu = centre_yuv(output(frame, CPU.format(peak=10)))
-            vulkan = centre_yuv(output(frame, VULKAN.format(peak=40)))
-            worst = max(worst, worst_difference(cpu, vulkan))
+        for colour in helpers.COLOURS:
+            frame = helpers.flat_frame(*colour)
+            cpu = helpers.centre_yuv(output(frame, helpers.CPU.format(peak=10)))
+            vulkan = helpers.centre_yuv(output(frame, VULKAN.format(peak=40)))
+            worst = max(worst, helpers.worst_difference(cpu, vulkan))
         self.assertGreater(worst, 1)
 
     def test_detected_peak_matches_cpu(self) -> None:
-        for colour in COLOURS:
+        for colour in helpers.COLOURS:
             with self.subTest(colour=colour):
-                frame = flat_frame(*colour)
-                cpu = centre_yuv(output(frame, CPU.format(peak=DETECT)))
-                vulkan = centre_yuv(output(frame, VULKAN.format(peak=DETECT)))
-                self.assertLessEqual(worst_difference(cpu, vulkan), 1, f"cpu {cpu} vulkan {vulkan}")
+                frame = helpers.flat_frame(*colour)
+                cpu = helpers.centre_yuv(output(frame, helpers.CPU.format(peak=DETECT)))
+                vulkan = helpers.centre_yuv(output(frame, VULKAN.format(peak=DETECT)))
+                self.assertLessEqual(
+                    helpers.worst_difference(cpu, vulkan), 1, f"cpu {cpu} vulkan {vulkan}"
+                )
 
     def test_detection_changes_the_output(self) -> None:
         worst = 0
-        for colour in COLOURS:
-            frame = flat_frame(*colour)
-            fixed = centre_yuv(output(frame, VULKAN.format(peak=10)))
-            detected = centre_yuv(output(frame, VULKAN.format(peak=DETECT)))
-            worst = max(worst, worst_difference(fixed, detected))
+        for colour in helpers.COLOURS:
+            frame = helpers.flat_frame(*colour)
+            fixed = helpers.centre_yuv(output(frame, VULKAN.format(peak=10)))
+            detected = helpers.centre_yuv(output(frame, VULKAN.format(peak=DETECT)))
+            worst = max(worst, helpers.worst_difference(fixed, detected))
         self.assertGreater(worst, 1)
 
     def test_planted_wrong_detected_peak_is_refused(self) -> None:
         worst = 0
-        for colour in COLOURS:
-            frame = flat_frame(*colour)
-            cpu = centre_yuv(output(frame, CPU.format(peak=DETECT)))
-            vulkan = centre_yuv(output(frame, VULKAN.format(peak=40)))
-            worst = max(worst, worst_difference(cpu, vulkan))
+        for colour in helpers.COLOURS:
+            frame = helpers.flat_frame(*colour)
+            cpu = helpers.centre_yuv(output(frame, helpers.CPU.format(peak=DETECT)))
+            vulkan = helpers.centre_yuv(output(frame, VULKAN.format(peak=40)))
+            worst = max(worst, helpers.worst_difference(cpu, vulkan))
         self.assertGreater(worst, 1)
 
     def test_hlg_input_is_refused(self) -> None:
-        done = run(flat_frame(*COLOURS[0]), f"{HLG_INPUT},{VULKAN.format(peak=10)}")
+        done = run(helpers.flat_frame(*helpers.COLOURS[0]), f"{HLG_INPUT},{VULKAN.format(peak=10)}")
         self.assertNotEqual(done.returncode, 0)
         self.assertIn(PQ_ONLY, done.stderr.decode())
 

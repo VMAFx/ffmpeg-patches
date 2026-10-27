@@ -17,21 +17,19 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import release_guard  # noqa: E402
+
+from tests.helpers import capture_main  # noqa: E402
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 def guard(*argv: str) -> tuple[int, str, str]:
     """Run main() and return the exit status, stdout and stderr."""
-    with (
-        contextlib.redirect_stdout(io.StringIO()) as out,
-        contextlib.redirect_stderr(io.StringIO()) as err,
-    ):
-        status = release_guard.main(list(argv))
-    return status, out.getvalue(), err.getvalue()
+    return capture_main(release_guard.main, *argv)
 
 
 class TagTest(unittest.TestCase):

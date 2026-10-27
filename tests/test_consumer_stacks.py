@@ -7,30 +7,20 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import consumer_stacks  # noqa: E402
 import series  # noqa: E402
 
+from tests.helpers import run_git as git  # noqa: E402
+
 LINES = [f"int line_{n} = {n};" for n in range(1, 41)]
-
-
-def git(tree: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(tree), "-c", "user.name=Dev", "-c", "user.email=dev@invalid", *args],
-        env=series.git_env(),
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=60,
-    )
-    return result.stdout.strip()
 
 
 def edit(tree: Path, index: int, text: str, subject: str) -> None:
