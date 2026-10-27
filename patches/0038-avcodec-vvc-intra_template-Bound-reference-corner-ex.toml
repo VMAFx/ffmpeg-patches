@@ -1,0 +1,6 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx"]
+origin = "#107 FFmpeg n9.0.2 warnings under the gcc of the GitHub ubuntu-26.04 runner"
+notes = """
+The corner extension loop runs from -1 down to ref_line, which is in [-4, -1] for every valid ref_idx. gcc 15.2 with -march=x86-64-v3 vectorises it and reports -Wstringop-overflow for stores before the IntraEdgeParams object (12 warnings over the 8, 10 and 12 bit templates). Adding i >= -4 to the loop condition makes the bound local; valid reference lines write the same samples. Measured on 2026-10-27 in a podman ubuntu:26.04 container with APT::Architecture-Variants amd64v3, the package variant the GitHub ubuntu-26.04 runner installs (gcc 15.2.0-16ubuntu1, default -march=x86-64-v3): ./configure --fatal-warnings --enable-version3 --disable-indevs, make build checkasm. n9.0.2 with patches 0001-0035 reports 17 warnings over 7 sites; with 0036-0039 it reports none. The generic x86-64 gcc of ubuntu:26.04 reports only the wmalosslessdec.c warning without these patches and none with them. FATE vvc, lossless-wmall, checkasm and film_grain_params pass on the x86-64-v3 build (134 tests). FFmpeg master 86444dd368 has the same code at every site. Issue #107."""

@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Tue, 27 Oct 2026 17:06:28 +0100
+Subject: [PATCH] avcodec/vvc/intra_template: Bound reference corner extension
+
+The corner extension uses at most four samples before the top and left
+origins. Those origins have MAX_TB_SIZE + 3 samples of headroom, so the
+negative indices are valid. However, the ref_idx range is not explicit
+in this loop, and gcc 15.2 with -march=x86-64-v3 reports vector stores
+before the edge object.
+
+State the four-sample limit in the loop condition. The compiler can now
+bound every corner index to [-4, -1] and the trip count to four,
+independently of the caller's reference index. Valid reference lines
+produce exactly the same samples.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavcodec/vvc/intra_template.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavcodec/vvc/intra_template.c b/libavcodec/vvc/intra_template.c
+index 3ec6c72213e7f24dfe3bade923f3bc927ec418e3..e1f2c512e4168ccc4c275288d9b1d1d76df5fc0e 100644
+--- a/libavcodec/vvc/intra_template.c
++++ b/libavcodec/vvc/intra_template.c
+@@ -526,7 +526,7 @@ do {                                  \
+     top_available = ff_vvc_get_top_available(lc, x, y, unfilter_top_size, c_idx);
+     memcpy(top, src + ref_line * stride, top_available * sizeof(pixel));
+ 
+-    for (int i = -1; i >= ref_line; i--) {
++    for (int i = -1; i >= ref_line && i >= -4; i--) {
+         if (cand_up_left) {
+             left[i] = POS(ref_line, i);
+             top[i]  = POS(i, ref_line);

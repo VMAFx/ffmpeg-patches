@@ -1,0 +1,6 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx"]
+origin = "#107 FFmpeg n9.0.2 warnings under the gcc of the GitHub ubuntu-26.04 runner"
+notes = """
+decode_init rejects more than WMALL_MAX_CHANNELS channels, but the per-channel clear of contains_subframe[] in decode_tilehdr (inlined into decode_frame) is reported as -Wstringop-overflow by gcc 15.2, with and without -march=x86-64-v3. The patch clears the whole array with memset at the start of every tiling pass and drops the else branch; the flags the rest of the function reads are unchanged. Measured on 2026-10-27 in a podman ubuntu:26.04 container with APT::Architecture-Variants amd64v3, the package variant the GitHub ubuntu-26.04 runner installs (gcc 15.2.0-16ubuntu1, default -march=x86-64-v3): ./configure --fatal-warnings --enable-version3 --disable-indevs, make build checkasm. n9.0.2 with patches 0001-0035 reports 17 warnings over 7 sites; with 0036-0039 it reports none. The generic x86-64 gcc of ubuntu:26.04 reports only the wmalosslessdec.c warning without these patches and none with them. FATE vvc, lossless-wmall, checkasm and film_grain_params pass on the x86-64-v3 build (134 tests). FFmpeg master 86444dd368 has the same code at every site. Issue #107."""

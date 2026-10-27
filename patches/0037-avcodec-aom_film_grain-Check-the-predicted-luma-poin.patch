@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Tue, 27 Oct 2026 17:06:28 +0100
+Subject: [PATCH] avcodec/aom_film_grain: Check the predicted luma point count
+
+The predicted luma path copies the reference point count before indexing
+res[14] and y_points[14]. The first reference set is checked when
+parsed, but gcc 15.2 with -march=x86-64-v3 does not retain that bound
+here and reports a stringop-overflow warning.
+
+Check the copied count before both loops, using the existing error path.
+This makes the upper bound local and protects the arrays against an
+oversized reference count without changing valid streams.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavcodec/aom_film_grain.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/libavcodec/aom_film_grain.c b/libavcodec/aom_film_grain.c
+index bb60c5577418131a5a8c1bf2e23997f0f18025cc..9b836be275552cc2980b83a7ab7f330abd59ceae 100644
+--- a/libavcodec/aom_film_grain.c
++++ b/libavcodec/aom_film_grain.c
+@@ -225,6 +225,8 @@ int ff_aom_parse_film_grain_sets(AVFilmGrainAFGS1Params *s,
+             if (bits_res) {
+                 int res[14], pred, granularity;
+                 aom->num_y_points = ref->codec.aom.num_y_points;
++                if (aom->num_y_points > 14)
++                    goto error;
+                 for (i = 0; i < aom->num_y_points; i++)
+                     res[i] = get_bits(gb, bits_res);
+                 granularity = get_bits(gb, 3);
