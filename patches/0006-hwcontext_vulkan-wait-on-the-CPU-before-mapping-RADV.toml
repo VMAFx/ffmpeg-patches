@@ -1,4 +1,4 @@
-status = "submitted"
+status = "rejected"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110"
 consumers = ["pelorus"]
 origin = "found by the Pelorus GPU lane (Vulkan to VAAPI DRM-modifier mapping, Pelorus #103)"
@@ -18,7 +18,12 @@ run before, 0 after); ANV with iHD on an Arc A380 keeps the sync file \
 path (63 imports per run either way) and matches in both builds. The \
 exported sync file is still pending at hand-off in every frame, and \
 waiting on it on the CPU also removes the race, so the fence is correct \
-and only ignored. FFmpeg master ba987fe24d has the same map path."""
+and only ignored. FFmpeg master ba987fe24d has the same map path. \
+Withdrawn upstream on 2026-10-25 (PR 25110 comment 76307): on master \
+31855b2a70 the race no longer reproduces with or without the patch \
+(0 of 120 frames), while n9.0.2 differs in 84 of 120 frames without it \
+and 0 with it, so the series keeps it until the pinned base no longer \
+races."""
 
 [[exceptions]]
 rule = "HISS-04"
@@ -28,4 +33,4 @@ lines = 169
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 163 lines before the patch; the change inside it is part of FFmpeg PR 25110 under review, and splitting the function would change that form"
+reason = "upstream function, 163 lines before the patch; the change inside it is carried by the series; FFmpeg PR 25110 was withdrawn because master no longer races, and splitting the function would change that form"

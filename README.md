@@ -60,12 +60,26 @@ without a series patch is a change the series does not carry.
 | [25053](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25053) | `master` | open | hwcontext_vulkan: import a frame again when the CUDA context changes | 0008 |
 | [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | merged 2026-10-14 (`669f5ab083c7`), in no release yet | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0007 |
 | [25109](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109) | `master` | open | avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import | 0004 |
-| [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | open | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0006 |
-| [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | open | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat, libswscale and tests | 0002 |
+| [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | closed | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0006 |
+| [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | closed | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat and tests | 0002 |
 | [25112](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25112) | `master` | merged 2026-10-16 (`30b16e57ff3d`), in no release yet | ffbuild/library.mak: add the devprogs target | none |
 | [25189](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25189) | `master` | merged 2026-10-18 (`ffb15c94c286`), in no release yet | avfilter/Makefile: link cuda/load_helper.o into three CUDA filters | none |
+| [25468](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25468) | `master` | merged 2026-10-27 (`fa4daf630eb5`), in no release yet | avcodec/rv60dec: validate angular prediction buffer bounds | none |
+| [25469](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25469) | `master` | open | swresample/tests/swresample: allocate sample buffers and test indices | none |
+| [25470](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25470) | `master` | open | avcodec/tests: give large test buffers static storage | none |
+| [25471](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25471) | `master` | open | tools/ismindex: allocate output paths and report manifest errors | none |
+| [25473](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25473) | `master` | open | avfilter/vf_find_rect: assert the mipmap search pass bounds | none |
+| [25474](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25474) | `master` | open | avfilter: fix GCC 14 and 16 warnings in vf_median, af_firequalizer and af_afftfilt | none |
+| [25475](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25475) | `master` | open | avformat: fix GCC 14 and 16 -Wformat-truncation warnings in dashenc, matroskaenc and smoothstreamingenc | none |
+| [25476](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25476) | `master` | open | avformat: fix GCC 14 and 16 warnings in mpegts, nspdec and rtsp | none |
+| [25477](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477) | `master` | open | avcodec/ffv1enc: move float remap scratch to slice state | none |
+| [25478](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25478) | `master` | open | avcodec/aac: fix GCC 14 and 16 -Wstringop-overflow warnings in aacenc and aacsbr | none |
+| [25479](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25479) | `master` | open | avcodec: fix GCC 14 and 16 warnings in a64multienc, h264dec, vlc and wmadec | none |
+| [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
+| [25481](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25481) | `master` | open | tests/checkasm: move large scratch buffers to the heap | none |
+| [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | open | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
 
-State read from the FFmpeg forge on 2026-10-25.
+State read from the FFmpeg forge on 2026-10-27.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned

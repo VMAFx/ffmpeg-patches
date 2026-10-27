@@ -1,11 +1,15 @@
-status = "submitted"
+status = "rejected"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111"
-master_form = { base = "713d9fa4b794d6df513ae742d3180732a54e0b66", head = "434b46354314010cb346548f1f333bd59d6d8dee" }
 consumers = ["vmafx"]
 origin = "VMAFx/vmafx c61115a0723e ffmpeg-patches/0019-ffmpeg-eliminate-gcc-14-build-diagnostics.patch"
 notes = """
 Touches 50 files in libavcodec, libavfilter, libavformat, libswresample, \
-tests and tools; an upstream submission needs one patch per area."""
+tests and tools; an upstream submission needs one patch per area. \
+FFmpeg PR 25111 was closed on 2026-10-26 and split into one pull \
+request per code-owner area: 25468 to 25481 and 25483 (adpcm, \
+reworked); the svq1enc change was dropped because master a53f3f8613 \
+clears that warning. upstream-contributions.json records each of \
+them; drop 0002 once the pinned base contains all of them."""
 
 [[exceptions]]
 rule = "HISS-04"
@@ -15,7 +19,7 @@ lines = 109
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 94 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 94 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -25,7 +29,7 @@ lines = 313
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 307 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 307 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -35,7 +39,7 @@ lines = 146
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 145 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 145 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -45,7 +49,7 @@ lines = 105
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 100 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 100 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -55,7 +59,7 @@ lines = 100
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 97 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 97 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -65,7 +69,7 @@ lines = 112
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 99 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 99 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -75,7 +79,7 @@ lines = 159
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 152 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 152 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -85,7 +89,7 @@ lines = 61
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 54 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 54 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -95,7 +99,7 @@ lines = 149
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 133 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 133 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -105,7 +109,7 @@ lines = 347
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 344 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 344 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -115,7 +119,7 @@ lines = 112
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 109 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 109 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -125,7 +129,7 @@ lines = 77
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 74 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 74 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -135,7 +139,7 @@ lines = 89
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 88 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 88 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -145,7 +149,7 @@ lines = 139
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 133 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 133 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -155,7 +159,7 @@ lines = 232
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 228 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 228 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -165,7 +169,7 @@ lines = 62
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 60 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 60 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -175,7 +179,7 @@ lines = 217
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 202 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 202 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -185,7 +189,7 @@ lines = 63
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 62 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 62 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -195,7 +199,7 @@ lines = 73
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 72 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 72 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -205,7 +209,7 @@ lines = 273
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 262 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 262 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -215,7 +219,7 @@ lines = 90
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 83 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 83 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -225,7 +229,7 @@ lines = 140
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 123 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 123 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -235,7 +239,7 @@ lines = 114
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 102 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 102 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -245,7 +249,7 @@ lines = 208
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 193 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 193 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -255,7 +259,7 @@ lines = 63
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 58 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 58 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -265,7 +269,7 @@ lines = 166
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 138 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 138 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -275,7 +279,7 @@ lines = 66
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 60 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 60 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -285,7 +289,7 @@ lines = 63
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 56 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 56 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -295,7 +299,7 @@ lines = 67
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 58 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 58 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -305,7 +309,7 @@ lines = 63
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 56 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 56 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -315,7 +319,7 @@ lines = 70
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 52 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 52 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -325,7 +329,7 @@ lines = 95
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 82 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 82 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -335,4 +339,4 @@ lines = 73
 category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
-reason = "upstream function, 53 lines before the patch; the change inside it is part of FFmpeg PR 25111 under review, and splitting the function would change that form"
+reason = "upstream function, 53 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
