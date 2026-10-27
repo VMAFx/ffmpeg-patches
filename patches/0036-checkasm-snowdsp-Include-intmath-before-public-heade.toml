@@ -1,5 +1,5 @@
-status = "unsubmitted"
-upstream = ""
+status = "submitted"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25533"
 consumers = ["vmafx"]
 origin = "#107 FFmpeg n9.0.2 warnings under the gcc of the GitHub ubuntu-26.04 runner"
 notes = """
