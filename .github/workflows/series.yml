@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
 #
-# Pull request and main gate: lint the series, then apply it on the pinned
-# FFmpeg release, check deterministic regeneration, build FFmpeg with every
-# compiler warning in the files the series changes refused, and run the
-# FATE tests that need no samples.
+# Pull requests always lint and test the series; changed files scope the
+# pinned FFmpeg apply, regeneration, build, FATE, parity and warning gates
+# and the macOS Metal build. Main and release runs keep the full gate.
 name: series
 
 'on':
@@ -35,6 +34,52 @@ defaults:
     shell: bash
 
 jobs:
+  scope:
+    name: series (scope · changed files)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      ffmpeg: ${{ steps.scope.outputs.ffmpeg }}
+      parity: ${{ steps.scope.outputs.parity }}
+      macos: ${{ steps.scope.outputs.macos }}
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.draft != true
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: github.event.pull_request.draft != true
+        with:
+          python-version-file: .python-version
+      - name: Select CI work from changed files
+        id: scope
+        if: github.event.pull_request.draft != true
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            python3 scripts/series.py scope --base "$BASE_SHA" --head "$HEAD_SHA" \
+              --github-output "$GITHUB_OUTPUT" --report "$GITHUB_STEP_SUMMARY"
+          else
+            python3 scripts/series.py scope --full \
+              --github-output "$GITHUB_OUTPUT" --report "$GITHUB_STEP_SUMMARY"
+          fi
+
   check:
     name: series (check · lint · unit tests)
     runs-on: ubuntu-26.04
@@ -75,6 +120,13 @@ jobs:
 
   apply-build:
     name: series (apply · regenerate · build · FATE · warnings) on the pinned base
+    needs: scope
+    if: ${{ !cancelled() }}
+    # The job runs even after a failed scope job (a skipped job reports
+    # success to the required checks); its steps run when the scope job
+    # selects it or did not succeed.
+    env:
+      IN_SCOPE: ${{ needs.scope.result != 'success' || needs.scope.outputs.ffmpeg == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
@@ -90,19 +142,24 @@ jobs:
           echo "::error title=$TITLE::$MESSAGE"
           echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
           exit 1
+      - name: Skip the gate outside the scope of the change
+        if: env.IN_SCOPE != 'true'
+        run: |
+          echo "The scope job selected no work for this job; see its summary." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         with:
           python-version-file: .python-version
       - name: Load the pinned base
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
       - name: Install the FFmpeg build toolchain
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -112,7 +169,7 @@ jobs:
           glslc --version | head -1
           pkg-config --modversion vulkan ffnvcodec libva libdrm vpl zimg OpenCL
       - name: Fetch and verify the pinned FFmpeg source
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           git init -q ffmpeg
           git -C ffmpeg remote add origin "$FFMPEG_REMOTE"
@@ -125,15 +182,15 @@ jobs:
           fi
           git -C ffmpeg checkout -q --detach "$FFMPEG_COMMIT"
       - name: Apply the series
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: python3 scripts/series.py apply --expect-base ffmpeg --report "$GITHUB_STEP_SUMMARY"
       - name: Refuse functions the series grows past 60 lines without an exception
         # Rule HISS-04: functions grown past 60 lines need a live exception in
         # the patch's metadata TOML; unexcused or stale entries fail the gate.
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: python3 scripts/series.py lengths ffmpeg --report "$GITHUB_STEP_SUMMARY"
       - name: Patches match deterministic regeneration
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           python3 scripts/series.py export ffmpeg
           if ! git diff --exit-code --stat -- patches series.txt; then
@@ -142,7 +199,7 @@ jobs:
             exit 1
           fi
       - name: Configure FFmpeg
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           mkdir build
           cd build
@@ -162,7 +219,7 @@ jobs:
         # The list is the clang_tidy lane of .standards.yaml. The DV5 fixture
         # generator (ADR-0002) compiles against the pinned FFmpeg headers, taken
         # as system headers so that only the generator is judged.
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           clang-tidy --version | head -2
           cppcheck --version
@@ -171,11 +228,11 @@ jobs:
           cppcheck --enable=all --std=c17 --check-level=exhaustive --error-exitcode=1 \
             --suppress=missingIncludeSystem --suppress=checkersReport "${sources[@]}"
       - name: Build FFmpeg, its tools and test programs
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         working-directory: build
         run: make -j"$(nproc)" build 2>&1 | tee build.log
       - name: Run the FATE tests that need no samples
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         working-directory: build
         run: |
           mapfile -t targets < <(make -s fate-list | grep '^fate-')
@@ -194,7 +251,9 @@ jobs:
         # is not used: it offers FFmpeg no planar or semi-planar image format.
         # The loaders see only those drivers; the step fails when FFmpeg opens
         # another device or when a device case is skipped instead of run.
-        if: github.event.pull_request.draft != true
+        if: >-
+          github.event.pull_request.draft != true && env.IN_SCOPE == 'true' &&
+          (needs.scope.result != 'success' || needs.scope.outputs.parity == 'true')
         run: |
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers mesa-opencl-icd
           lvp=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' | head -1)
@@ -240,12 +299,12 @@ jobs:
       - name: Refuse a build that skipped a C file the series changes
         # A file in a component this configuration leaves out would pass the
         # warning gate unseen, so every changed C file needs a CC line.
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: python3 scripts/series.py coverage ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"
       - name: Refuse compiler warnings in the files the series changes
         # Warnings elsewhere depend on the runner's libraries and FFmpeg's own
         # sources; they are counted in the summary, not gated.
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           gcc --version | head -1 >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/series.py warnings ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"
@@ -255,6 +314,13 @@ jobs:
     # macOS; their GPU output is not compared with the CPU filter until an
     # Apple host can run the parity tests.
     name: series (apply · build · warnings) on macOS with Metal
+    needs: scope
+    if: ${{ !cancelled() }}
+    # The job runs even after a failed scope job (a skipped job reports
+    # success to the required checks); its steps run when the scope job
+    # selects it or did not succeed.
+    env:
+      IN_SCOPE: ${{ needs.scope.result != 'success' || needs.scope.outputs.macos == 'true' }}
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -270,21 +336,26 @@ jobs:
           echo "::error title=$TITLE::$MESSAGE"
           echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
           exit 1
+      - name: Skip the gate outside the scope of the change
+        if: env.IN_SCOPE != 'true'
+        run: |
+          echo "The scope job selected no work for this job; see its summary." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         with:
           python-version-file: .python-version
       - name: Load the pinned base
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
       - name: Install the Metal toolchain
         # Xcode ships the Metal compiler as a separate component; without it
         # configure turns Metal off instead of failing.
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           xcodebuild -version
           if ! xcrun -sdk macosx metal -v; then
@@ -292,7 +363,7 @@ jobs:
             xcrun -sdk macosx metal -v
           fi
       - name: Fetch and verify the pinned FFmpeg source
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           git init -q ffmpeg
           git -C ffmpeg remote add origin "$FFMPEG_REMOTE"
@@ -305,10 +376,10 @@ jobs:
           fi
           git -C ffmpeg checkout -q --detach "$FFMPEG_COMMIT"
       - name: Apply the series
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: python3 scripts/series.py apply --expect-base ffmpeg --report "$GITHUB_STEP_SUMMARY"
       - name: Configure FFmpeg with Metal and VideoToolbox
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           mkdir build
           cd build
@@ -323,11 +394,11 @@ jobs:
             exit 1
           fi
       - name: Build FFmpeg, its tools and test programs
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         working-directory: build
         run: make -j"$(sysctl -n hw.ncpu)" build 2>&1 | tee build.log
       - name: Refuse compiler warnings in the files the series changes
-        if: github.event.pull_request.draft != true
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           clang --version >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/series.py warnings ffmpeg build/build.log --report "$GITHUB_STEP_SUMMARY"

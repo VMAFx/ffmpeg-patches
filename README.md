@@ -162,7 +162,9 @@ prints one result per patch:
 
 ## Checks
 
-Every pull request runs:
+`series.yml` always runs the series check, lint and unit tests on pull requests. Its `scope` job compares the pull request head with its merge base: `ffmpeg` selects the pinned-base apply, regeneration, clang-tidy, build, FATE, coverage and warning gates; `parity` selects the GPU parity step within that job; `macos` selects the Metal build and warning gate and runs for every change to the patches, `series.txt`, `base.env` or the gate itself, because that job refuses clang warnings in every file the series changes. Both heavy jobs always start, so they stay required checks; outside the scope of a change they skip every step, so a docs-only change finishes them in seconds. When the `scope` job itself fails, both heavy jobs run in full, and the `scope` job is a required check of its own. Pushes to `main` and release calls run the full set (`scope --full`); draft pull requests still fail the check job until marked ready for review.
+
+The checks cover:
 
 - `make test`: series check, ruff, REUSE and the unit tests of
   `scripts/series.py`

@@ -129,6 +129,182 @@ class SeriesTestCase(unittest.TestCase):
         )
 
 
+class ScopeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self._scratch.cleanup)
+        self.root = Path(self._scratch.name)
+        run_git(self.root, "init", "-q")
+        run_git(self.root, "commit", "-q", "--allow-empty", "-m", "base")
+        self.base = run_git(self.root, "rev-parse", "HEAD")
+        self.output = self.root / "github-output"
+        self.report = self.root / "summary.md"
+
+    def commit_file(self, name: str, text: str = "changed\n") -> None:
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        run_git(self.root, "add", "--", name)
+        run_git(self.root, "commit", "-q", "-m", "change")
+
+    def patch_text(self, path: str) -> str:
+        return (
+            f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
+        )
+
+    def scope(self, *extra: str) -> tuple[dict[str, str], str]:
+        stdout = io.StringIO()
+        args = [
+            "--root",
+            str(self.root),
+            "scope",
+            "--base",
+            self.base,
+            "--head",
+            "HEAD",
+            "--github-output",
+            str(self.output),
+            "--report",
+            str(self.report),
+            *extra,
+        ]
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(series.main(args), 0)
+        values = dict(line.split("=", 1) for line in self.output.read_text().splitlines())
+        return values, stdout.getvalue()
+
+    def test_hqdn3d_patch_runs_ffmpeg_and_parity(self) -> None:
+        name = "patches/0001-filter.patch"
+        target = "libavfilter/vf_hqdn3d_vulkan.c"
+        self.commit_file(name, self.patch_text(target))
+        values, stdout = self.scope()
+        self.assertEqual(values, {"ffmpeg": "true", "parity": "true", "macos": "true"})
+        self.assertIn(name, stdout)
+        self.assertIn(target, stdout)
+
+    def test_planted_docs_only_skips_heavy_jobs(self) -> None:
+        self.commit_file("docs/README.md")
+        values, stdout = self.scope()
+        self.assertEqual(values, {"ffmpeg": "false", "parity": "false", "macos": "false"})
+        self.assertIn("changed files: 1\n", stdout)
+
+    def test_workflow_change_runs_everything(self) -> None:
+        self.commit_file(".github/workflows/series.yml")
+        values, _ = self.scope()
+        self.assertEqual(values, dict.fromkeys(("ffmpeg", "parity", "macos"), "true"))
+
+    def test_full_without_diff_runs_everything(self) -> None:
+        values, stdout = self.scope("--full")
+        self.assertEqual(values, dict.fromkeys(("ffmpeg", "parity", "macos"), "true"))
+        self.assertIn("--full", stdout)
+
+    def test_empty_diff_skips_everything(self) -> None:
+        values, stdout = self.scope()
+        self.assertEqual(values, dict.fromkeys(("ffmpeg", "parity", "macos"), "false"))
+        self.assertIn("changed files: 0\n", stdout)
+
+    def test_full_needs_no_refs(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(series.main(["--root", str(self.root), "scope", "--full"]), 0)
+        for key in ("ffmpeg", "parity", "macos"):
+            self.assertIn(f"{key}=true: --full", stdout.getvalue())
+
+    def test_direct_path_rules(self) -> None:
+        cases = {
+            "series.txt": ("true", "false", "true"),
+            "base.env": ("true", "true", "true"),
+            "scripts/series.py": ("true", "true", "true"),
+            "scripts/tonemap_parity.py": ("true", "true", "false"),
+            "tests/test_hqdn3d_opencl.py": ("true", "true", "false"),
+            "tests/test_tonemap_vulkan.py": ("true", "true", "false"),
+            ".config/clang-tidy/config.yaml": ("true", "false", "false"),
+            ".python-version": ("true", "false", "true"),
+            "patches/0001-tonemap.toml": ("true", "false", "true"),
+            "tests/test_series.py": ("false", "false", "false"),
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.base = run_git(self.root, "rev-parse", "HEAD")
+                self.commit_file(path)
+                values, stdout = self.scope()
+                self.assertEqual(tuple(values.values()), expected)
+                self.assertIn("changed files: 1\n", stdout)
+
+    def test_clang_tidy_source_list(self) -> None:
+        self.commit_file(".config/clang-tidy/sources.txt", "tests/fixtures/example.c\n")
+        self.base = run_git(self.root, "rev-parse", "HEAD")
+        self.commit_file("tests/fixtures/example.c")
+        values, _ = self.scope()
+        self.assertEqual(values, {"ffmpeg": "true", "parity": "false", "macos": "false"})
+
+    def test_patch_target_rules_ignore_patch_names_and_content(self) -> None:
+        cases = {
+            "libavfilter/vf_tonemap_opencl.c": ("true", "true", "true"),
+            "libavfilter/vf_yadif_VideoToolbox.m": ("true", "false", "true"),
+            "libavfilter/Metal/yadif.metal": ("true", "false", "true"),
+            "libavfilter/vf_other.c": ("true", "false", "true"),
+        }
+        for number, (target, expected) in enumerate(cases.items(), 1):
+            with self.subTest(target=target):
+                self.base = run_git(self.root, "rev-parse", "HEAD")
+                self.commit_file(
+                    f"patches/{number:04d}-tonemap-metal.patch",
+                    self.patch_text(target).replace("+new", "+hqdn3d tonemap metal"),
+                )
+                values, _ = self.scope()
+                self.assertEqual(tuple(values.values()), expected)
+
+    def test_deleted_patch_still_runs_parity(self) -> None:
+        name = "patches/0001-filter.patch"
+        self.commit_file(name, self.patch_text("libavfilter/vf_hqdn3d_vulkan.c"))
+        self.base = run_git(self.root, "rev-parse", "HEAD")
+        run_git(self.root, "rm", "--", name)
+        run_git(self.root, "commit", "-q", "-m", "remove patch")
+        values, _ = self.scope()
+        self.assertEqual(values, {"ffmpeg": "true", "parity": "true", "macos": "true"})
+
+    def test_removed_target_still_runs_parity(self) -> None:
+        name = "patches/0001-filter.patch"
+        self.commit_file(name, self.patch_text("libavfilter/vf_hqdn3d_vulkan.c"))
+        self.base = run_git(self.root, "rev-parse", "HEAD")
+        self.commit_file(name, self.patch_text("libavfilter/vf_other.c"))
+        values, _ = self.scope()
+        self.assertEqual(values, {"ffmpeg": "true", "parity": "true", "macos": "true"})
+
+    def test_deleted_target_header_runs_parity(self) -> None:
+        path = "libavfilter/vf_tonemap.c"
+        self.commit_file(
+            "patches/0001-filter.patch",
+            f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n",
+        )
+        values, _ = self.scope()
+        self.assertEqual(values, {"ffmpeg": "true", "parity": "true", "macos": "true"})
+
+    def test_merge_base_excludes_base_branch_only_changes(self) -> None:
+        self.commit_file("docs/README.md")
+        head = run_git(self.root, "rev-parse", "HEAD")
+        run_git(self.root, "checkout", "-q", "--detach", self.base)
+        self.commit_file(".github/workflows/series.yml")
+        self.base = run_git(self.root, "rev-parse", "HEAD")
+        run_git(self.root, "checkout", "-q", "--detach", head)
+        values, stdout = self.scope()
+        self.assertEqual(values, dict.fromkeys(("ffmpeg", "parity", "macos"), "false"))
+        self.assertIn("changed files: 1\n", stdout)
+
+    def test_outputs_and_summary_append(self) -> None:
+        self.output.write_text("existing=true\n")
+        self.report.write_text("# Existing summary\n")
+        self.commit_file(".github/workflows/series.yml")
+        self.scope()
+        self.assertTrue(self.output.read_text().startswith("existing=true\n"))
+        summary = self.report.read_text()
+        self.assertTrue(summary.startswith("# Existing summary\n"))
+        self.assertIn("changed files: 1", summary)
+        self.assertIn("`ffmpeg=true`", summary)
+        self.assertIn(".github/workflows/series.yml", summary)
+
+
 class CheckTest(SeriesTestCase):
     def test_valid_series_passes(self) -> None:
         findings = series.check(self.fx.root)
