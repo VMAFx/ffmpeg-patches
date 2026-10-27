@@ -78,6 +78,10 @@ without a series patch is a change the series does not carry.
 | [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
 | [25481](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25481) | `master` | open | tests/checkasm: move large scratch buffers to the heap | none |
 | [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | open | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
+| [25533](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25533) | `master` | open | checkasm/snowdsp: Include intmath before public headers | 0036 |
+| [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Check the predicted luma point count | 0037 |
+| [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: Bound reference corner extension | 0038 |
+| [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
 
 State read from the FFmpeg forge on 2026-10-27.
 <!-- upstream-contributions:end -->
