@@ -32,6 +32,9 @@
         Print the table of upstream pull requests rendered from
         upstream-contributions.json; --write puts it into README.md
         between its two marker comments. `check` compares the two.
+    series.py scope [--base REF] [--head REF] [--full]
+        Select FFmpeg, GPU parity and macOS CI work from the changed files.
+        Append outputs with --github-output FILE and a summary with --report FILE.
 
 Exit status: 0 on success, 1 on findings or a failed apply, 2 when the
 tool cannot run (unreadable series files, unusable checkout).
@@ -48,6 +51,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -716,6 +720,14 @@ def require_clean(tree: Path, base: dict[str, str], expect_base: bool) -> None:
         raise SeriesError(f"{tree}: HEAD is {head}, base.env pins {base['FFMPEG_COMMIT']}")
 
 
+def patch_path(line: str) -> str | None:
+    """Read a file header from a patch, including a removed file's old path."""
+    for prefix in ("+++ b/", "--- a/"):
+        if line.startswith(prefix):
+            return line[len(prefix) :]
+    return None
+
+
 def added_runs(text: str) -> dict[str, list[list[str]]]:
     """Map each file the patch writes to its runs of consecutive added lines."""
     runs: dict[str, list[list[str]]] = {}
@@ -729,7 +741,7 @@ def added_runs(text: str) -> dict[str, list[list[str]]]:
             runs.setdefault(path, []).append(run)
         run = []
         if line.startswith("+++ "):
-            path = line[6:] if line.startswith("+++ b/") else None
+            path = patch_path(line)
     if run and path:
         runs.setdefault(path, []).append(run)
     return runs
@@ -1449,11 +1461,87 @@ def lengths_gate(
     return 1 if (total_failing > 0 or had_errors) else 0
 
 
+def scope_patch_paths(root: Path, changed: list[str], refs: tuple[str, str]) -> dict[str, set[str]]:
+    """Inspect both versions, so deleted patches and renamed targets remain covered."""
+    patches = {path for path in changed if path.startswith("patches/") and path.endswith(".patch")}
+    targets: dict[str, set[str]] = {}
+    for ref in refs:
+        files = git(root, "ls-tree", "-r", "--name-only", "-z", ref, "--", "patches/")
+        for path in sorted(patches.intersection(files.stdout.split("\0"))):
+            text = git(root, "show", f"{ref}:{path}").stdout
+            paths = targets.setdefault(path, set())
+            for line in text.splitlines():
+                target = patch_path(line)
+                if target:
+                    paths.add(target)
+                elif line.startswith("diff --git "):
+                    # Also cover rename-only and binary diffs without +/- headers.
+                    paths.update(name[2:] for name in shlex.split(line)[2:])
+    return targets
+
+
+def scope_reasons(
+    root: Path, changed: list[str], targets: dict[str, set[str]]
+) -> dict[str, list[str]]:
+    infra = {".github/workflows/series.yml", "base.env", "scripts/series.py"}
+    # The macOS job applies the whole series and refuses clang warnings in
+    # every file it changes, so any change to the patched tree runs it.
+    tree = infra | {"series.txt", ".python-version"}
+    ffmpeg = tree | {"scripts/tonemap_parity.py"}
+    sources = root / ".config/clang-tidy/sources.txt"
+    if sources.is_file():
+        ffmpeg.update(line.strip() for line in sources.read_text().splitlines() if line.strip())
+    reasons: dict[str, list[str]] = {"ffmpeg": [], "parity": [], "macos": []}
+    for path in changed:
+        gpu_test = bool(re.fullmatch(r"tests/test_(?:hqdn3d|tonemap)_.*\.py", path))
+        if path in ffmpeg or path.startswith(("patches/", ".config/clang-tidy/")) or gpu_test:
+            reasons["ffmpeg"].append(path)
+        if path in infra or path == "scripts/tonemap_parity.py" or gpu_test:
+            reasons["parity"].append(path)
+        if path in tree or path.startswith("patches/"):
+            reasons["macos"].append(path)
+        for target in sorted(targets.get(path, set())):
+            if re.search(r"hqdn3d|tonemap", target, re.IGNORECASE):
+                reasons["parity"].append(f"{path} -> {target}")
+    return reasons
+
+
+def scope(
+    root: Path, refs: tuple[str, str], full: bool, output: Path | None, report: Path | None
+) -> int:
+    base, head = refs
+    before = git(root, "merge-base", base, head).stdout.strip()
+    diff = git(root, "diff", "--name-only", "--no-renames", "-z", f"{base}...{head}", "--")
+    changed = [path for path in diff.stdout.split("\0") if path]
+    targets = {} if full else scope_patch_paths(root, changed, (before, head))
+    reasons = scope_reasons(root, changed, targets)
+    print(f"changed files: {len(changed)}")
+    rows = ["## Series CI scope", "", f"changed files: {len(changed)}", ""]
+    for key, paths in reasons.items():
+        value = str(full or bool(paths)).lower()
+        cause = "; ".join(["--full", *paths] if full else paths) or "no matching paths"
+        print(f"{key}={value}: {cause}")
+        rows.append(f"- `{key}={value}`: {cause}")
+        if output is not None:
+            with output.open("a", encoding="utf-8") as out:
+                out.write(f"{key}={value}\n")
+    if report is not None:
+        with report.open("a", encoding="utf-8") as out:
+            out.write("\n".join(rows) + "\n")
+    return 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="series repository root")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check", help="lint the series and its metadata")
+    scope_parser = sub.add_parser("scope", help="select CI work from changed files")
+    scope_parser.add_argument("--base", default="HEAD", help="diff merge base (default: HEAD)")
+    scope_parser.add_argument("--head", default="HEAD", help="diff head (default: HEAD)")
+    scope_parser.add_argument("--full", action="store_true", help="force every scope key true")
+    scope_parser.add_argument("--github-output", type=Path, help="append key=value outputs")
+    scope_parser.add_argument("--report", type=Path, help="append a Markdown summary")
     apply = sub.add_parser(
         "apply", help="apply pinned-release or recorded master forms onto FFmpeg"
     )
@@ -1525,6 +1613,9 @@ def run(args: argparse.Namespace) -> int:
     if args.command in ("notes", "contributions"):
         return run_text(args)
     gates = {
+        "scope": lambda: scope(
+            args.root, (args.base, args.head), args.full, args.github_output, args.report
+        ),
         "warnings": lambda: warnings_gate(args.root, args.tree, args.log, args.report, args.base),
         "coverage": lambda: coverage_gate(args.root, args.tree, args.log, args.report, args.base),
         "lengths": lambda: lengths_gate(args.root, args.tree, args.report, args.base, args.today),

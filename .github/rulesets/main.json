@@ -75,6 +75,9 @@
           },
           {
             "context": "series (apply · build · warnings) on macOS with Metal"
+          },
+          {
+            "context": "series (scope · changed files)"
           }
         ],
         "strict_required_status_checks_policy": true
