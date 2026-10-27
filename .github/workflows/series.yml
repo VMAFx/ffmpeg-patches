@@ -430,6 +430,29 @@ jobs:
           SWIFT
           swiftc -O probe.swift -o probe
           ./probe | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Compare with an upstream Metal filter and record a backtrace
+        # Control: yadif_videotoolbox is upstream FFmpeg code on the same
+        # hwupload path. If it crashes too, the crash is the runner's, not
+        # the hqdn3d filter's.
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
+        continue-on-error: true
+        run: |
+          vt=(-hide_banner -nostdin -loglevel verbose
+              -init_hw_device videotoolbox=vt -filter_hw_device vt
+              -f lavfi -i testsrc2=size=320x240:rate=25:duration=0.4)
+          for f in yadif_videotoolbox hqdn3d_videotoolbox; do
+            set +e
+            build/ffmpeg "${vt[@]}" -vf "format=nv12,hwupload,$f,hwdownload,format=nv12" \
+              -f null - > "control-$f.log" 2>&1
+            rc=$?
+            set -e
+            echo "$f exited $rc" | tee -a "$GITHUB_STEP_SUMMARY"
+            tail -15 "control-$f.log"
+          done
+          lldb --batch -o run -k bt -k quit -- build/ffmpeg_g "${vt[@]}" \
+            -vf "format=nv12,hwupload,hqdn3d_videotoolbox,hwdownload,format=nv12" -f null - \
+            2>&1 | tail -60 | tee lldb-hqdn3d.log
+          { echo '```'; cat lldb-hqdn3d.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Run the device cases of the Metal hqdn3d test
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
