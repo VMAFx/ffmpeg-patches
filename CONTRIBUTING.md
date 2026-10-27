@@ -45,6 +45,23 @@ Every public function requires:
 - **Negative tests**: Invalid inputs, expected error returns.
 - **Boundary tests**: Zero, one, max limits, off-by-one bounds.
 
+### Pull Request CI
+
+A pull request always runs the series lint and unit tests. The heavier jobs
+run only when the changed files need them; the `series (scope · changed
+files)` job prints the file count and the reason for each choice
+(`scripts/series.py scope`):
+
+- `ffmpeg`: pinned FFmpeg apply, regeneration, build, FATE and warning gates,
+  for `patches/`, `series.txt`, `base.env`, `.python-version`, the series
+  workflow and script, clang-tidy configuration and the GPU filter tests.
+- `parity`: tone-mapping and hqdn3d parity, for the workflow, the series
+  script, `scripts/tonemap_parity.py`, those tests, and patches that touch
+  `hqdn3d` or `tonemap` files.
+- `macos`: the macOS Metal build, for `patches/` and the series inputs.
+
+Pushes to `main` and release runs always run the full set.
+
 ### Commit Messages
 
 We enforce Conventional Commits:
