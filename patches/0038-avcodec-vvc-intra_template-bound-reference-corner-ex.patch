@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: lusoris <lusoris@proton.me>
 Date: Tue, 27 Oct 2026 17:06:28 +0100
-Subject: [PATCH] avcodec/vvc/intra_template: Bound reference corner extension
+Subject: [PATCH] avcodec/vvc/intra_template: bound reference corner extension
 
 The corner extension uses at most four samples before the top and left
 origins. Those origins have MAX_TB_SIZE + 3 samples of headroom, so the

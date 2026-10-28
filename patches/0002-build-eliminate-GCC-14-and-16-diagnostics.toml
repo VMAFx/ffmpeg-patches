@@ -10,6 +10,7 @@ request per code-owner area: 25468 to 25481 and 25483 (adpcm, \
 reworked); the svq1enc change was dropped because master a53f3f8613 \
 clears that warning. upstream-contributions.json records each of \
 them; drop 0002 once the pinned base contains all of them."""
+release_only = "split into 15 upstream pull requests (25468 to 25481, 25483), each tested on master by its own CI; the release form conflicts with master in libswresample/tests/swresample.c and tools/seek_print.c"
 
 [[exceptions]]
 rule = "HISS-04"

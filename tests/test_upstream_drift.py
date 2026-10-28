@@ -281,6 +281,13 @@ class DriftTest(unittest.TestCase):
         self.assertIn("1: title is '[release/9.0] lib: change 1' on the forge", out)
         self.assertIn("2: base is 'release/9.0' on the forge, 'master' in", out)
 
+    def test_title_case_change_is_drift(self) -> None:
+        forge = FakeForge({1: pull(1, title="lib: Change 1"), 2: pull(2)})
+        status, out, _ = self.run_main(forge)
+        self.assertEqual(status, 1)
+        self.assertIn("1: title is 'lib: Change 1' on the forge, 'lib: change 1' in", out)
+        self.assertIn("1 field(s) drifted", out)
+
     def test_other_merge_commit_is_drift(self) -> None:
         self.write(
             self.record(1),

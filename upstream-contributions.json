@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-27",
+  "checked": "2026-10-28",
   "contributions": [
     {
       "number": 24045,
@@ -420,26 +420,26 @@
     {
       "number": 25534,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534",
-      "title": "avcodec/aom_film_grain: Check the predicted luma point count",
+      "title": "avcodec/aom_film_grain: Assume the predicted luma point bound",
       "base": "master",
       "state": "open",
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
-      "patch": "0037-avcodec-aom_film_grain-Check-the-predicted-luma-poin.patch",
+      "patch": "0037-avcodec-aom_film_grain-Assume-the-predicted-luma-poi.patch",
       "project": "vmafx",
       "note": "Master form of the issue 107 fix, one pull request per area."
     },
     {
       "number": 25535,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535",
-      "title": "avcodec/vvc/intra_template: Bound reference corner extension",
+      "title": "avcodec/vvc/intra_template: bound reference corner extension",
       "base": "master",
       "state": "open",
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
-      "patch": "0038-avcodec-vvc-intra_template-Bound-reference-corner-ex.patch",
+      "patch": "0038-avcodec-vvc-intra_template-bound-reference-corner-ex.patch",
       "project": "vmafx",
       "note": "Master form of the issue 107 fix, one pull request per area."
     },

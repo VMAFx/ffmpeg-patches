@@ -79,11 +79,11 @@ without a series patch is a change the series does not carry.
 | [25481](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25481) | `master` | open | tests/checkasm: move large scratch buffers to the heap | none |
 | [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | open | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
 | [25533](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25533) | `master` | open | checkasm/snowdsp: Include intmath before public headers | 0036 |
-| [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Check the predicted luma point count | 0037 |
-| [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: Bound reference corner extension | 0038 |
+| [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Assume the predicted luma point bound | 0037 |
+| [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: bound reference corner extension | 0038 |
 | [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
 
-State read from the FFmpeg forge on 2026-10-27.
+State read from the FFmpeg forge on 2026-10-28.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned
@@ -125,6 +125,9 @@ records the PR's merge base with master at submission and its head commit.
 Update these ids whenever the PR is pushed again. For a `merged` patch,
 optional `upstream_commit = "<40-hex>"` records the commit carrying the fix
 on FFmpeg master. All ids must be full lowercase commit hashes.
+A patch whose release form has no single master form (for example, one split
+into several upstream pull requests) records
+`release_only = "<reason>"`; it excludes `master_form` and `upstream_commit`.
 The daily upstream drift check fails when a recorded `master_form` no longer
 matches the PR's head or merge base on the forge. An `unsubmitted` patch whose
 fix travels in another author's PR records it as
@@ -191,10 +194,11 @@ It fetches each recorded `master_form` and applies that PR diff instead of
 the pinned-release patch. A recorded `upstream_commit` that is an ancestor
 of the tested master reports the patch as upstream without applying it;
 a missing commit fails the run because its history cannot be checked.
+A `release_only` patch is reported as `release-only` and not applied.
 Other patches use the series form. The run reports drop candidates and
 fails on any conflict or tool error. Applying without `--master-forms`,
 including consumer and CI runs with `--expect-base`, uses only the
-pinned-release patches and ignores both metadata keys.
+pinned-release patches and ignores these metadata keys.
 
 A daily run (`upstream.yml`) reads every pull request in
 `upstream-contributions.json` from code.ffmpeg.org and fails when its state,

@@ -8,8 +8,9 @@
     series.py apply TREE [--expect-base] [--keep-going] [--report FILE] [--master-forms URL]
         Apply the series with `git am --3way` onto the clean FFmpeg
         checkout TREE and print one status per patch. With --master-forms,
-        fetch recorded upstream PR forms from URL and recognise recorded
-        upstream commits already in the tested master's history.
+        fetch recorded upstream PR forms from URL, recognise recorded
+        upstream commits already in the tested master's history and skip
+        patches marked release_only.
     series.py export TREE
         Regenerate patches/ and series.txt from the commits on TREE after
         the pinned base commit.
@@ -71,6 +72,7 @@ METADATA_KEYS = {
     "notes",
     "master_form",
     "upstream_commit",
+    "release_only",
     "covered_by",
     "exceptions",
 }
@@ -407,6 +409,12 @@ def check_master_metadata(data: dict, name: str, findings: Findings) -> None:
             findings.error(name, "upstream_commit is allowed only with status merged")
         if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
             findings.error(name, "upstream_commit must be a full 40-hex commit")
+    if "release_only" in data:
+        reason = data["release_only"]
+        if not isinstance(reason, str) or not reason.strip():
+            findings.error(name, "release_only must be a non-empty reason")
+        if "master_form" in data or "upstream_commit" in data:
+            findings.error(name, "release_only excludes master_form and upstream_commit")
 
 
 def check_tree(root: Path, names: list[str], findings: Findings, today: date | None = None) -> None:
@@ -844,6 +852,8 @@ def apply_for_master(tree: Path, patch: Path, url: str) -> str:
         return "upstream"
     if "master_form" in meta:
         return apply_master_form(tree, patch, url, meta["master_form"])
+    if "release_only" in meta:
+        return "release-only"
     return apply_one(tree, patch)
 
 
