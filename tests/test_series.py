@@ -204,6 +204,8 @@ class ScopeTest(unittest.TestCase):
             "series.txt": ("true", "false", "true"),
             "base.env": ("true", "true", "true"),
             "scripts/series.py": ("true", "true", "true"),
+            ".github/actions/prepare-series/action.yml": ("true", "true", "true"),
+            ".github/actions/unrelated/action.yml": ("false", "false", "false"),
             "scripts/tonemap_parity.py": ("true", "true", "false"),
             "tests/test_hqdn3d_opencl.py": ("true", "true", "false"),
             "tests/test_tonemap_vulkan.py": ("true", "true", "false"),

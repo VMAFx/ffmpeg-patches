@@ -43,7 +43,8 @@ jobs:
       parity: ${{ steps.scope.outputs.parity }}
       macos: ${{ steps.scope.outputs.macos }}
     steps:
-      - name: Stop on a draft pull request
+      - &stop-on-draft
+        name: Stop on a draft pull request
         if: github.event.pull_request.draft == true
         shell: bash
         env:
@@ -85,18 +86,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - name: Stop on a draft pull request
-        if: github.event.pull_request.draft == true
-        shell: bash
-        env:
-          TITLE: Gate not run on a draft
-          MESSAGE: >-
-            The gate did not run because the pull request is a draft.
-            It runs when the pull request is marked ready for review.
-        run: |
-          echo "::error title=$TITLE::$MESSAGE"
-          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
-          exit 1
+      - *stop-on-draft
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event.pull_request.draft != true
         with:
@@ -130,50 +120,25 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
-      - name: Stop on a draft pull request
-        if: github.event.pull_request.draft == true
-        shell: bash
-        env:
-          TITLE: Gate not run on a draft
-          MESSAGE: >-
-            The gate did not run because the pull request is a draft.
-            It runs when the pull request is marked ready for review.
-        run: |
-          echo "::error title=$TITLE::$MESSAGE"
-          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-      - name: Skip the gate outside the scope of the change
+      - *stop-on-draft
+      - &skip-outside-scope
+        name: Skip the gate outside the scope of the change
         if: env.IN_SCOPE != 'true'
         run: |
           echo "The scope job selected no work for this job; see its summary." \
             | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - &checkout-in-scope
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         with:
           persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - name: Prepare the pinned source and build toolchain
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
+        uses: ./.github/actions/prepare-series
         with:
-          python-version-file: .python-version
-      - name: Load the pinned base
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
-      - name: Install the FFmpeg build toolchain
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential nasm pkg-config libvulkan-dev spirv-headers libffmpeg-nvenc-dev \
-            libva-dev libdrm-dev libvpl-dev libzimg-dev ocl-icd-opencl-dev glslc clang-tidy cppcheck
-          gcc --version | head -1
-          glslc --version | head -1
-          pkg-config --modversion vulkan ffnvcodec libva libdrm vpl zimg OpenCL
-      - name: Fetch and verify the pinned FFmpeg source
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        run: bash scripts/fetch_ffmpeg.sh
-      - name: Apply the series
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        run: python3 scripts/series.py apply --expect-base ffmpeg --report "$GITHUB_STEP_SUMMARY"
+          toolchain: linux
+          in-scope: ${{ env.IN_SCOPE }}
+          draft: ${{ github.event.pull_request.draft == true }}
       - name: Refuse functions the series grows past 60 lines without an exception
         # Rule HISS-04: functions grown past 60 lines need a live exception in
         # the patch's metadata TOML; unexcused or stale entries fail the gate.
@@ -314,50 +279,16 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 90
     steps:
-      - name: Stop on a draft pull request
-        if: github.event.pull_request.draft == true
-        shell: bash
-        env:
-          TITLE: Gate not run on a draft
-          MESSAGE: >-
-            The gate did not run because the pull request is a draft.
-            It runs when the pull request is marked ready for review.
-        run: |
-          echo "::error title=$TITLE::$MESSAGE"
-          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-      - name: Skip the gate outside the scope of the change
-        if: env.IN_SCOPE != 'true'
-        run: |
-          echo "The scope job selected no work for this job; see its summary." \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - *stop-on-draft
+      - *skip-outside-scope
+      - *checkout-in-scope
+      - name: Prepare the pinned source and build toolchain
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
+        uses: ./.github/actions/prepare-series
         with:
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        with:
-          python-version-file: .python-version
-      - name: Load the pinned base
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
-      - name: Install the Metal toolchain
-        # Xcode ships the Metal compiler as a separate component; without it
-        # configure turns Metal off instead of failing.
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        run: |
-          xcodebuild -version
-          if ! xcrun -sdk macosx metal -v; then
-            xcodebuild -downloadComponent MetalToolchain
-            xcrun -sdk macosx metal -v
-          fi
-      - name: Fetch and verify the pinned FFmpeg source
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        run: bash scripts/fetch_ffmpeg.sh
-      - name: Apply the series
-        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
-        run: python3 scripts/series.py apply --expect-base ffmpeg --report "$GITHUB_STEP_SUMMARY"
+          toolchain: metal
+          in-scope: ${{ env.IN_SCOPE }}
+          draft: ${{ github.event.pull_request.draft == true }}
       - name: Configure FFmpeg with Metal and VideoToolbox
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
