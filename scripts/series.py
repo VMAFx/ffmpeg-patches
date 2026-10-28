@@ -1478,7 +1478,12 @@ def scope_patch_paths(root: Path, changed: list[str], refs: tuple[str, str]) -> 
 def scope_reasons(
     root: Path, changed: list[str], targets: dict[str, set[str]]
 ) -> dict[str, list[str]]:
-    infra = {".github/workflows/series.yml", "base.env", "scripts/series.py"}
+    infra = {
+        ".github/workflows/series.yml",
+        ".github/actions/prepare-series/action.yml",
+        "base.env",
+        "scripts/series.py",
+    }
     # The macOS job applies the whole series and refuses clang warnings in
     # every file it changes, so any change to the patched tree runs it.
     tree = infra | {"series.txt", ".python-version"}

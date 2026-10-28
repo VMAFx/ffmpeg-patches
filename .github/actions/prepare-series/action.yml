@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+name: Prepare the series
+description: Set up Python, install the build toolchain, and fetch and apply the pinned series.
+inputs:
+  toolchain:
+    description: linux for the FFmpeg build tools; metal for the Xcode Metal compiler.
+    required: true
+  in-scope:
+    description: Whether the scope job selected this build.
+    required: true
+  draft:
+    description: Whether the pull request is a draft.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      if: inputs.draft != 'true' && inputs.in-scope == 'true'
+      with:
+        python-version-file: .python-version
+    - name: Load the pinned base
+      if: inputs.draft != 'true' && inputs.in-scope == 'true'
+      shell: bash
+      run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
+    - name: Install the FFmpeg build toolchain
+      if: inputs.draft != 'true' && inputs.in-scope == 'true' && inputs.toolchain == 'linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential nasm pkg-config libvulkan-dev spirv-headers libffmpeg-nvenc-dev \
+          libva-dev libdrm-dev libvpl-dev libzimg-dev ocl-icd-opencl-dev glslc clang-tidy cppcheck
+        gcc --version | head -1
+        glslc --version | head -1
+        pkg-config --modversion vulkan ffnvcodec libva libdrm vpl zimg OpenCL
+    - name: Install the Metal toolchain
+      # Xcode ships the Metal compiler as a separate component; without it
+      # configure turns Metal off instead of failing.
+      if: inputs.draft != 'true' && inputs.in-scope == 'true' && inputs.toolchain == 'metal'
+      shell: bash
+      run: |
+        xcodebuild -version
+        if ! xcrun -sdk macosx metal -v; then
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal -v
+        fi
+    - name: Fetch and verify the pinned FFmpeg source
+      if: inputs.draft != 'true' && inputs.in-scope == 'true'
+      shell: bash
+      run: bash scripts/fetch_ffmpeg.sh
+    - name: Apply the series
+      if: inputs.draft != 'true' && inputs.in-scope == 'true'
+      shell: bash
+      run: python3 scripts/series.py apply --expect-base ffmpeg --report "$GITHUB_STEP_SUMMARY"
