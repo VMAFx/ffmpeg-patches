@@ -55,6 +55,7 @@ jobs:
               conflict) echo "::warning title=Conflict on master::$name" ;;
               upstream) echo "::warning title=Drop candidate::$name is already in master" ;;
               master-form) echo "::warning title=Master form::$name applied as upstream PR head" ;;
+              release-only) echo "::notice title=Release only::$name is not applied to master" ;;
             esac
           done < results.txt
           exit "$status"

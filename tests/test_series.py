@@ -800,6 +800,49 @@ class MasterFormTest(SeriesTestCase):
                     )
                     self.assert_error(series.check(self.fx.root), "full 40-hex commit")
 
+    def set_release_only(self, value: str = '"split into several upstream PRs"') -> None:
+        self.fx.patch(1).with_suffix(".toml").write_text(METADATA + f"release_only = {value}\n")
+
+    def test_release_only_skips_conflicting_patch_on_master(self) -> None:
+        commit_edit(self.fx.tree, 6, "int line_7 = 700;", "conflicting master")
+        self.set_release_only()
+        self.assertEqual(series.check(self.fx.root).errors, [])
+        results = self.apply()
+        self.assertEqual([s for _, s in results], ["release-only", "applied"])
+        self.assertFalse(series.apply_failed(results, False))
+        self.assert_clean()
+
+    def test_conflict_without_release_only_still_fails(self) -> None:
+        commit_edit(self.fx.tree, 6, "int line_7 = 700;", "conflicting master")
+        self.fx.patch(1).with_suffix(".toml").write_text(METADATA)
+        results = self.apply(keep_going=True)
+        self.assertEqual([s for _, s in results], ["conflict", "applied"])
+        self.assertTrue(series.apply_failed(results, False))
+        self.assert_clean()
+
+    def test_release_only_requires_a_reason(self) -> None:
+        for value in ('""', '"   "', "42", "true"):
+            with self.subTest(value=value):
+                self.set_release_only(value)
+                self.assert_error(series.check(self.fx.root), "non-empty reason")
+                with self.assertRaisesRegex(series.SeriesError, "non-empty reason"):
+                    self.apply()
+
+    def test_release_only_excludes_master_form(self) -> None:
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA
+            + 'release_only = "split"\n'
+            + f'master_form = {{ base = "{self.fx.base}", head = "{self.head}" }}\n'
+        )
+        self.assert_error(series.check(self.fx.root), "release_only excludes")
+
+    def test_pinned_apply_ignores_release_only(self) -> None:
+        self.set_release_only()
+        self.fx.reset()
+        results = series.apply_series(self.fx.root, self.fx.tree, True, False)
+        self.assertEqual([s for _, s in results], ["applied", "applied"])
+        self.assert_clean()
+
     def test_upstream_commit_requires_merged_status(self) -> None:
         self.set_upstream(self.fx.base, status="submitted")
         self.assert_error(series.check(self.fx.root), "upstream_commit is allowed only")
