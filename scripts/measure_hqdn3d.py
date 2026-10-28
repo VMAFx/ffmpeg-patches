@@ -649,6 +649,21 @@ def encode_and_decode_point(
     return achieved, flagged, dec_yuv, enc_cmd
 
 
+def score_rate_point(
+    tools: ToolPaths,
+    input_yuv: Path,
+    clip: ClipSpec,
+    params: EncodeParams,
+    curve: list[dict[str, float]],
+) -> tuple[float, bool, float, list[str]]:
+    """Encode, score and record one rate-distortion point."""
+    achieved, flagged, dec_yuv, cmd = encode_and_decode_point(tools, input_yuv, clip, params)
+    v_score, _, _ = evaluate_vmaf_score(tools, clip.path, dec_yuv, clip)
+    dec_yuv.unlink(missing_ok=True)
+    curve.append({"bitrate_kbps": achieved, "score": v_score})
+    return achieved, flagged, v_score, cmd
+
+
 def run_rate_stage(
     tools: ToolPaths,
     clips: list[ClipSpec],
@@ -678,12 +693,9 @@ def run_rate_stage(
                     curves[key] = []
                     for rate in DEFAULT_RATES_KBPS:
                         params = EncodeParams(enc_args=enc_opts, rate_k=rate)
-                        achieved, flagged, dec_yuv, cmd = encode_and_decode_point(
-                            tools, in_path, clip, params
+                        achieved, flagged, v_score, cmd = score_rate_point(
+                            tools, in_path, clip, params, curves[key]
                         )
-                        v_score, _, _ = evaluate_vmaf_score(tools, clip.path, dec_yuv, clip)
-                        dec_yuv.unlink(missing_ok=True)
-                        curves[key].append({"bitrate_kbps": achieved, "score": v_score})
                         results.append({
                             "stage": "rate", "clip": clip.name, "noise": n, "arm": arm,
                             "encoder": enc_name, "grain_synth": "off", "target_kbps": rate,
@@ -728,12 +740,9 @@ def run_encoder_arms_and_bd(
             curves[key] = []
             for rate in DEFAULT_RATES_KBPS:
                 params = EncodeParams(enc_args=enc_opts, rate_k=rate, grain_off=g_off)
-                achieved, flagged, dec_yuv, cmd = encode_and_decode_point(
-                    tools, gclip.path, clip, params
+                achieved, flagged, v_score, cmd = score_rate_point(
+                    tools, gclip.path, clip, params, curves[key]
                 )
-                v_score, _, _ = evaluate_vmaf_score(tools, clip.path, dec_yuv, clip)
-                dec_yuv.unlink(missing_ok=True)
-                curves[key].append({"bitrate_kbps": achieved, "score": v_score})
                 results.append({
                     "stage": "rate", "clip": clip.name, "noise": gclip.noise, "arm": arm_name,
                     "encoder": base_enc, "grain_synth": g_label, "target_kbps": rate,

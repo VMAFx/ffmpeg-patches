@@ -955,13 +955,8 @@ def export_series(root: Path, tree: Path) -> list[str]:
     return names
 
 
-def series_files(root: Path, tree: Path, base: str | None = None) -> set[str]:
-    """Paths the commits on TREE after BASE (default: the pinned base) change.
-
-    BASE must be an ancestor of HEAD: on a tree that applies the series to a
-    newer upstream, the pinned base would count upstream changes as the
-    series' own.
-    """
+def resolve_series_base(root: Path, tree: Path, base: str | None) -> str:
+    """Resolve the base commit and require it to precede HEAD."""
     if base is None:
         base = pinned_commit(root)
     resolved = git(tree, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
@@ -974,6 +969,17 @@ def series_files(root: Path, tree: Path, base: str | None = None) -> set[str]:
         f"base {base!r} is not an ancestor of HEAD; "
         "pass --base with the upstream commit the series was applied to",
     )
+    return commit
+
+
+def series_files(root: Path, tree: Path, base: str | None = None) -> set[str]:
+    """Paths the commits on TREE after BASE (default: the pinned base) change.
+
+    BASE must be an ancestor of HEAD: on a tree that applies the series to a
+    newer upstream, the pinned base would count upstream changes as the
+    series' own.
+    """
+    commit = resolve_series_base(root, tree, base)
     names = git(tree, "diff", "--name-only", commit, "HEAD").stdout
     return {name for name in names.splitlines() if name}
 
@@ -1400,18 +1406,7 @@ def parse_today(today_str: str | None) -> date:
 def resolve_lengths_commits(
     root: Path, tree: Path, base: str | None
 ) -> tuple[list[str], list[str]]:
-    if base is None:
-        base = pinned_commit(root)
-    resolved = git(tree, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
-    if resolved.returncode:
-        raise SeriesError(f"{tree}: base {base!r} is not a commit")
-    commit = resolved.stdout.strip()
-    require_descendant(
-        tree,
-        commit,
-        f"base {base!r} is not an ancestor of HEAD; "
-        "pass --base with the upstream commit the series was applied to",
-    )
+    commit = resolve_series_base(root, tree, base)
     findings = Findings()
     names = read_series(root, findings)
     if findings.errors:
