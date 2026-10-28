@@ -1493,7 +1493,9 @@ def scope_reasons(
         ffmpeg.update(line.strip() for line in sources.read_text().splitlines() if line.strip())
     reasons: dict[str, list[str]] = {"ffmpeg": [], "parity": [], "macos": []}
     for path in changed:
-        gpu_test = bool(re.fullmatch(r"tests/test_(?:hqdn3d|tonemap)_.*\.py", path))
+        gpu_test = path == "tests/helpers.py" or bool(
+            re.fullmatch(r"tests/test_(?:hqdn3d|tonemap)_.*\.py", path)
+        )
         if path in ffmpeg or path.startswith(("patches/", ".config/clang-tidy/")) or gpu_test:
             reasons["ffmpeg"].append(path)
         if path in infra or path == "scripts/tonemap_parity.py" or gpu_test:

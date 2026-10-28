@@ -32,14 +32,11 @@ both variables they are skipped.
 
 from __future__ import annotations
 
-import os
 import subprocess
-import sys
 import unittest
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tests.helpers import (  # noqa: E402
+from tests import helpers
+from tests.helpers import (
     COLOURS,
     CPU,
     PQ_INPUT,
@@ -49,8 +46,7 @@ from tests.helpers import (  # noqa: E402
     worst_difference,
 )
 
-FFMPEG = os.environ.get("OCL_FFMPEG", "")
-DEVICE = os.environ.get("OCL_DEVICE", "")
+FFMPEG, DEVICE = helpers.device_environment("OCL")
 GPU = (
     "format=p010,hwupload,tonemap_opencl=tonemap={curve}:m=bt709:r=tv:p=bt709:t=bt709:"
     "peak={peak},hwdownload,format=nv12"

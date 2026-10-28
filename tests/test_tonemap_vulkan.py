@@ -28,17 +28,11 @@ Without both variables they are skipped.
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 import unittest
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tests import helpers  # noqa: E402
+from tests import helpers
 
-FFMPEG = os.environ.get("VK_FFMPEG", "")
-DEVICE = os.environ.get("VK_DEVICE", "")
+FFMPEG, DEVICE = helpers.device_environment("VK")
 VULKAN = (
     "format=p010,hwupload,tonemap_vulkan=tonemap=bt2408_hable:peak={peak},"
     "hwdownload,format=nv12,format=yuv420p"
@@ -48,66 +42,32 @@ HLG_INPUT = "setparams=color_trc=arib-std-b67"
 PQ_ONLY = "Unsupported input color properties"
 
 
-def run(frame: bytes, chain: str) -> subprocess.CompletedProcess[bytes]:
-    return helpers.filter_frame(
-        FFMPEG, (f"vulkan=vk:{DEVICE}", "vk"), frame, chain, (helpers.SIZE, helpers.PQ_INPUT)
-    )
-
-
-def output(frame: bytes, chain: str) -> bytes:
-    return helpers.raw_output(run(frame, chain), chain)
+runner = helpers.TonemapRunner(FFMPEG, (f"vulkan=vk:{DEVICE}", "vk"), VULKAN, "vulkan")
+run = runner.run
+output = runner.output
 
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")
-class Bt2408HableTest(unittest.TestCase):
+class Bt2408HableTest(helpers.TonemapDeviceMixin, unittest.TestCase):
     """0019, 0021: the Vulkan bt2408_hable path must match the CPU path."""
 
-    def test_vulkan_matches_cpu(self) -> None:
-        for colour in helpers.COLOURS:
-            with self.subTest(colour=colour):
-                frame = helpers.flat_frame(*colour)
-                cpu = helpers.centre_yuv(output(frame, helpers.CPU.format(peak=10)))
-                vulkan = helpers.centre_yuv(output(frame, VULKAN.format(peak=10)))
-                self.assertLessEqual(
-                    helpers.worst_difference(cpu, vulkan), 1, f"cpu {cpu} vulkan {vulkan}"
-                )
+    runner = runner
 
-    def test_planted_wrong_peak_is_refused(self) -> None:
-        worst = 0
-        for colour in helpers.COLOURS:
-            frame = helpers.flat_frame(*colour)
-            cpu = helpers.centre_yuv(output(frame, helpers.CPU.format(peak=10)))
-            vulkan = helpers.centre_yuv(output(frame, VULKAN.format(peak=40)))
-            worst = max(worst, helpers.worst_difference(cpu, vulkan))
-        self.assertGreater(worst, 1)
+    def test_vulkan_matches_cpu(self) -> None:
+        self.assert_matches_cpu()
 
     def test_detected_peak_matches_cpu(self) -> None:
-        for colour in helpers.COLOURS:
-            with self.subTest(colour=colour):
-                frame = helpers.flat_frame(*colour)
-                cpu = helpers.centre_yuv(output(frame, helpers.CPU.format(peak=DETECT)))
-                vulkan = helpers.centre_yuv(output(frame, VULKAN.format(peak=DETECT)))
-                self.assertLessEqual(
-                    helpers.worst_difference(cpu, vulkan), 1, f"cpu {cpu} vulkan {vulkan}"
-                )
+        self.assert_matches_cpu(DETECT)
 
     def test_detection_changes_the_output(self) -> None:
-        worst = 0
-        for colour in helpers.COLOURS:
-            frame = helpers.flat_frame(*colour)
-            fixed = helpers.centre_yuv(output(frame, VULKAN.format(peak=10)))
-            detected = helpers.centre_yuv(output(frame, VULKAN.format(peak=DETECT)))
-            worst = max(worst, helpers.worst_difference(fixed, detected))
-        self.assertGreater(worst, 1)
+        self.assertGreater(
+            self.worst_between(VULKAN.format(peak=10), VULKAN.format(peak=DETECT)), 1
+        )
 
     def test_planted_wrong_detected_peak_is_refused(self) -> None:
-        worst = 0
-        for colour in helpers.COLOURS:
-            frame = helpers.flat_frame(*colour)
-            cpu = helpers.centre_yuv(output(frame, helpers.CPU.format(peak=DETECT)))
-            vulkan = helpers.centre_yuv(output(frame, VULKAN.format(peak=40)))
-            worst = max(worst, helpers.worst_difference(cpu, vulkan))
-        self.assertGreater(worst, 1)
+        self.assertGreater(
+            self.worst_between(helpers.CPU.format(peak=DETECT), VULKAN.format(peak=40)), 1
+        )
 
     def test_hlg_input_is_refused(self) -> None:
         done = run(helpers.flat_frame(*helpers.COLOURS[0]), f"{HLG_INPUT},{VULKAN.format(peak=10)}")
