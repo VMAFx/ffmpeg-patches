@@ -10,19 +10,14 @@ import io
 import json
 import shutil
 import subprocess
-import sys
 import tarfile
 import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-
-import series  # noqa: E402
-
-from tests.helpers import init_upstream, run_git  # noqa: E402
+from scripts import series
+from tests.helpers import init_upstream, run_git
 
 LINES = [f"int line_{n} = {n};" for n in range(1, 41)]
 METADATA = 'status = "submitted"\nupstream = "https://example.invalid/pulls/1"\nconsumers = ["a"]\n'
@@ -207,6 +202,8 @@ class ScopeTest(unittest.TestCase):
             "scripts/tonemap_parity.py": ("true", "true", "false"),
             "tests/test_hqdn3d_opencl.py": ("true", "true", "false"),
             "tests/test_tonemap_vulkan.py": ("true", "true", "false"),
+            "tests/helpers.py": ("true", "true", "false"),
+            "tests/helpers_notes.py": ("false", "false", "false"),
             ".config/clang-tidy/config.yaml": ("true", "false", "false"),
             ".python-version": ("true", "false", "true"),
             "patches/0001-tonemap.toml": ("true", "false", "true"),

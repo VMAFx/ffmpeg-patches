@@ -6,18 +6,13 @@ from __future__ import annotations
 
 import contextlib
 import io
-import sys
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-
-import series  # noqa: E402
-
-from tests.helpers import capture_main, init_upstream, run_git, write_base  # noqa: E402
+from scripts import series
+from tests.helpers import capture_main, init_upstream, run_git, write_base
 
 
 def build_c_function(

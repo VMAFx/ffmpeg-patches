@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import subprocess
 import tempfile
 import unittest
 from array import array
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 from scripts import series
@@ -39,6 +41,124 @@ CPU = (
     "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=bt2408_hable:peak={peak},"
     "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
 )
+RESET_TOOL = os.environ.get("HQDN3D_RESET_TOOL", "")
+
+
+def device_environment(prefix: str) -> tuple[str, str]:
+    return os.environ.get(f"{prefix}_FFMPEG", ""), os.environ.get(f"{prefix}_DEVICE", "")
+
+
+@dataclass
+class Hqdn3dRunner:
+    binary: str
+    device: tuple[str, str]
+    backend: str
+    formats: dict[str, tuple[str, int, bool]]
+    noautoscale: bool = False
+
+    def ffmpeg(self, source: list[str], chain: str) -> subprocess.CompletedProcess[bytes]:
+        return filter_frames(self.binary, self.device, source, chain, noautoscale=self.noautoscale)
+
+    def run(self, source: list[str], chain: str) -> bytes:
+        return raw_output(self.ffmpeg(source, chain), chain)
+
+    def chains(self, fmt: str, options: str, prefix: str = "") -> tuple[str, str]:
+        return hqdn3d_chains(fmt, self.formats[fmt][0], options, prefix, self.backend)
+
+    def compare(self, source: list[str], fmt: str, options: str, prefix: str = "") -> int:
+        return compare_hqdn3d(
+            source, self.chains(fmt, options, prefix), self.run, self.formats[fmt]
+        )
+
+
+class Hqdn3dDeviceMixin:
+    """Shared device cases; only backend subclasses inherit TestCase."""
+
+    runner: Hqdn3dRunner
+    reset_device: str
+    temporal_formats = ("yuv420p", "p010le", "yuv444p16le")
+
+    def compare(self, source: list[str], fmt: str, options: str, prefix: str = "") -> int:
+        return self.runner.compare(source, fmt, options, prefix)
+
+    def test_temporal_only_after_command(self) -> None:
+        assert_temporal_match(self, self.compare, self.temporal_formats)
+
+    def test_state_resets_on_graph_rebuild(self) -> None:
+        assert_ffv1_rebuild_matches(self, self.runner.binary, self.compare)
+
+    @unittest.skipUnless(RESET_TOOL, "set HQDN3D_RESET_TOOL")
+    def test_state_resets_on_in_graph_resize(self) -> None:
+        done = run_reset(RESET_TOOL, self.reset_device)
+        self.assertEqual(done.returncode, 0, done.stdout.decode() + done.stderr.decode())
+
+    def test_planted_wrong_strength_is_refused(self) -> None:
+        cpu_chain, _ = self.runner.chains("yuv420p", "")
+        _, gpu_chain = self.runner.chains("yuv420p", "=luma_spatial=4.5")
+        self.assertGreater(
+            mismatches(
+                self.runner.run(lavfi(), cpu_chain), self.runner.run(lavfi(), gpu_chain), 8, False
+            ),
+            0,
+        )
+
+
+class Hqdn3dSizedRebuildMixin(Hqdn3dDeviceMixin):
+    def test_state_resets_on_graph_rebuild(self) -> None:
+        cpu_chain, gpu_chain = self.runner.chains("yuv420p", "")
+        with rebuilt_input(self.runner.binary, "mjpeg") as source:
+            cpu = self.runner.run(source, cpu_chain)
+            self.assertEqual(len(cpu), REBUILD_BYTES)
+            self.assertEqual(mismatches(cpu, self.runner.run(source, gpu_chain), 8, False), 0)
+
+    def test_planted_sizeless_rebuild_source_is_refused(self) -> None:
+        cpu_chain, _ = self.runner.chains("yuv420p", "")
+        with rebuilt_input(self.runner.binary, "ffv1") as source:
+            self.assertNotEqual(len(self.runner.run(source, cpu_chain)), REBUILD_BYTES)
+
+
+@dataclass
+class TonemapRunner:
+    binary: str
+    device: tuple[str, str]
+    chain: str
+    backend: str
+
+    def run(self, frame: bytes, chain: str) -> subprocess.CompletedProcess[bytes]:
+        return filter_frame(self.binary, self.device, frame, chain, (SIZE, PQ_INPUT))
+
+    def output(self, frame: bytes, chain: str) -> bytes:
+        return raw_output(self.run(frame, chain), chain)
+
+
+class TonemapDeviceMixin:
+    """Keep backend test ids while sharing comparisons and the planted case."""
+
+    runner: TonemapRunner
+
+    def assert_matches_cpu(self, peak: int | str = 10) -> None:
+        for colour in COLOURS:
+            with self.subTest(colour=colour):
+                frame = flat_frame(*colour)
+                cpu = centre_yuv(self.runner.output(frame, CPU.format(peak=peak)))
+                gpu = centre_yuv(self.runner.output(frame, self.runner.chain.format(peak=peak)))
+                self.assertLessEqual(
+                    worst_difference(cpu, gpu), 1, f"cpu {cpu} {self.runner.backend} {gpu}"
+                )
+
+    def worst_between(self, left: str, right: str) -> int:
+        worst = 0
+        for colour in COLOURS:
+            frame = flat_frame(*colour)
+            first = centre_yuv(self.runner.output(frame, left))
+            second = centre_yuv(self.runner.output(frame, right))
+            worst = max(worst, worst_difference(first, second))
+        return worst
+
+    def test_planted_wrong_peak_is_refused(self) -> None:
+        self.assertGreater(
+            self.worst_between(CPU.format(peak=10), self.runner.chain.format(peak=40)), 1
+        )
 
 
 def mismatches(cpu: bytes, vulkan: bytes, depth: int, high_bits: bool) -> int:
@@ -195,20 +315,6 @@ def assert_temporal_match(
             case.assertEqual(compare(lavfi(), fmt, "", TEMPORAL_ONLY), 0)
 
 
-def assert_rebuild_matches(
-    case: unittest.TestCase,
-    ffmpeg: str,
-    chains: Callable[..., tuple[str, str]],
-    run: Callable[[list[str], str], bytes],
-) -> None:
-    cpu_chain, gpu_chain = chains("yuv420p", "")
-    with tempfile.TemporaryDirectory() as tmp:
-        source = rebuild_source(ffmpeg, tmp, "mjpeg")
-        cpu = run(source, cpu_chain)
-        case.assertEqual(len(cpu), REBUILD_BYTES)
-        case.assertEqual(mismatches(cpu, run(source, gpu_chain), 8, False), 0)
-
-
 def run_reset(tool: str, device: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run([tool, device], capture_output=True, timeout=300, check=False)
 
@@ -216,21 +322,14 @@ def run_reset(tool: str, device: str) -> subprocess.CompletedProcess[bytes]:
 def assert_ffv1_rebuild_matches(
     case: unittest.TestCase, ffmpeg: str, compare: Callable[..., int]
 ) -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        source = rebuild_source(ffmpeg, tmp, "ffv1", ",format=yuv420p")
+    with rebuilt_input(ffmpeg, "ffv1", ",format=yuv420p") as source:
         case.assertEqual(compare(source, "yuv420p", ""), 0)
 
 
-def assert_sizeless_rebuild_refused(
-    case: unittest.TestCase,
-    ffmpeg: str,
-    chains: Callable[..., tuple[str, str]],
-    run: Callable[[list[str], str], bytes],
-) -> None:
-    cpu_chain, _ = chains("yuv420p", "")
+@contextlib.contextmanager
+def rebuilt_input(ffmpeg: str, codec: str, pixel_format: str = "") -> Iterator[list[str]]:
     with tempfile.TemporaryDirectory() as tmp:
-        source = rebuild_source(ffmpeg, tmp, "ffv1")
-        case.assertNotEqual(len(run(source, cpu_chain)), REBUILD_BYTES)
+        yield rebuild_source(ffmpeg, tmp, codec, pixel_format)
 
 
 def flat_frame(y: int, u: int, v: int) -> bytes:
