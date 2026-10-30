@@ -1491,6 +1491,7 @@ def scope_reasons(
     infra = {
         ".github/workflows/series.yml",
         ".github/actions/prepare-series/action.yml",
+        ".github/actions/setup-python/action.yml",
         "base.env",
         "scripts/series.py",
     }

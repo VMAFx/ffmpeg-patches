@@ -1,11 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
 name: Prepare the series
-description: Set up Python, install the build toolchain, and fetch and apply the pinned series.
+description: Set up Python, optionally install a toolchain, and fetch and apply the pinned series.
 inputs:
   toolchain:
-    description: linux for the FFmpeg build tools; metal for the Xcode Metal compiler.
+    description: linux for the FFmpeg build tools; metal for the Xcode Metal compiler; none to skip.
     required: true
+  setup-python:
+    description: Whether to set up Python before preparing the series.
+    default: 'true'
+  report:
+    description: Whether to append the apply report to the job summary.
+    default: 'true'
   in-scope:
     description: Whether the scope job selected this build.
     required: true
@@ -15,10 +21,8 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-      if: inputs.draft != 'true' && inputs.in-scope == 'true'
-      with:
-        python-version-file: .python-version
+    - uses: ./.github/actions/setup-python
+      if: inputs.draft != 'true' && inputs.in-scope == 'true' && inputs.setup-python == 'true'
     - name: Load the pinned base
       if: inputs.draft != 'true' && inputs.in-scope == 'true'
       shell: bash
@@ -52,4 +56,11 @@ runs:
     - name: Apply the series
       if: inputs.draft != 'true' && inputs.in-scope == 'true'
       shell: bash
-      run: python3 scripts/series.py apply --expect-base ffmpeg --report "$GITHUB_STEP_SUMMARY"
+      env:
+        REPORT: ${{ inputs.report }}
+      run: |
+        args=()
+        if [ "$REPORT" = true ]; then
+          args=(--report "$GITHUB_STEP_SUMMARY")
+        fi
+        python3 scripts/series.py apply --expect-base ffmpeg "${args[@]}"
