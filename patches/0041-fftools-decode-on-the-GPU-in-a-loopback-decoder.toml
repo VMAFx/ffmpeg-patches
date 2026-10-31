@@ -1,0 +1,14 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx"]
+origin = "the VMAFx fork, so an encoder's loopback decode output stays on the GPU instead of round-tripping through system memory"
+notes = """
+Lets -hwaccel, -hwaccel_device and -hwaccel_output_format precede -dec and set \
+up the loopback decoder's hardware decoding the way they already do for an input \
+stream (fftools/ffmpeg_dec_hwaccel.c). Without them an encoder's loopback output \
+always returned through system memory, so a pipeline that encodes and scores on \
+the GPU round-tripped every frame over the bus.
+
+Generic: carries no VMAFx identifiers and no downstream references; public cuda \
+and NVDEC names are upstream FFmpeg hwaccel vocabulary. Not sent upstream yet; \
+refreshed against the pinned base with every FFmpeg release."""

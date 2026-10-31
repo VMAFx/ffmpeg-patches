@@ -1,0 +1,15 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx"]
+origin = "the VMAFx vmaf-tune workflow, which needs one per-frame QP-offset file format shared across the libx264, libsvtav1 and libaom encoders"
+notes = """
+Adds a -qpfile <path> AVOption on libx264, libsvtav1 and libaom-av1. A shared \
+parser at libavcodec/qpfile_parser.{c,h} reads the file once into an FFQpFile \
+struct (header lines <frame_idx> <I|P|B> <qp>, optional per-MB-row delta lines) \
+so each encoder adapter maps it into its native ROI or per-block QP-offset API. \
+libx264 forwards the path to x264's native qpfile reader; libsvtav1 and libaom \
+use the shared parser directly.
+
+Generic: carries no VMAFx or vmaf-tune identifiers and no downstream ADR \
+references. Not sent upstream yet; refreshed against the pinned base with every \
+FFmpeg release."""
