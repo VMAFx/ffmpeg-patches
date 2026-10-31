@@ -72,7 +72,7 @@ without a series patch is a change the series does not carry.
 | [25474](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25474) | `master` | open | avfilter: fix GCC 14 and 16 warnings in vf_median, af_firequalizer and af_afftfilt | none |
 | [25475](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25475) | `master` | open | avformat: fix GCC 14 and 16 -Wformat-truncation warnings in dashenc, matroskaenc and smoothstreamingenc | none |
 | [25476](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25476) | `master` | open | avformat: fix GCC 14 and 16 warnings in mpegts, nspdec and rtsp | none |
-| [25477](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477) | `master` | open | avcodec/ffv1enc: move float remap scratch to slice state | none |
+| [25477](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477) | `master` | open | avcodec/ffv1enc: move float remap scratch off the stack | none |
 | [25478](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25478) | `master` | open | avcodec/aac: fix GCC 14 and 16 -Wstringop-overflow warnings in aacenc and aacsbr | none |
 | [25479](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25479) | `master` | open | avcodec: fix GCC 14 and 16 warnings in a64multienc, h264dec, vlc and wmadec | none |
 | [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
