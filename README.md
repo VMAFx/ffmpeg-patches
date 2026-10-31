@@ -158,7 +158,9 @@ prints one result per patch:
    style and add a `Signed-off-by` trailer.
 3. Regenerate: `python3 scripts/series.py export ffmpeg`. Metadata follows
    its patch when the number changes.
-4. Write or update `patches/NNNN-slug.toml` and run `make test`.
+4. Write or update `patches/NNNN-slug.toml` and run `make test`, then
+   `make lengths FFMPEG_TREE=ffmpeg` to catch a function grown past the
+   60-line cap (HISS-04) before it reaches CI.
 5. When a patch file is renamed, or its `status` or `upstream` link
    changes, update its record in `upstream-contributions.json` and
    regenerate the table; `check` names a record that no longer fits.
@@ -187,6 +189,13 @@ The checks cover:
   tree that applies the series to another upstream commit, such as FFmpeg
   master, `series.py warnings TREE LOG --base <commit>` names that commit,
   so upstream changes are not counted as the series' own
+- a function-length gate (HISS-04): no patch makes a C function longer than
+  60 lines without a live exception in that patch's `.toml` sidecar. CI runs
+  it on every pull request. It needs the series applied to an FFmpeg checkout,
+  so `make verify-all` runs it only when `FFMPEG_TREE` names one and otherwise
+  skips it with a notice. Run it before pushing a patch change, with
+  `make verify-all FFMPEG_TREE=<applied tree>` or the gate on its own,
+  `make lengths FFMPEG_TREE=<applied tree>`
 
 A nightly run applies the series onto FFmpeg master with
 `series.py apply TREE --master-forms https://code.ffmpeg.org/FFmpeg/FFmpeg.git`.
@@ -311,6 +320,16 @@ Versions follow SemVer and start below 1.0.0:
 - `v1.0.0` once both consume it; from then on MAJOR moves with the FFmpeg base
   (consumers rebase their own patches), MINOR when a patch is added or
   dropped, PATCH for metadata or tooling
+
+## Support ffmpeg-patches
+
+**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [35 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 9 merged, 23 open.
+
+**What support funds.**
+- Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
+- Cloud test time on an Apple host to compare the Metal (VideoToolbox) filters with the CPU filters.
+
+Sponsor on [GitHub Sponsors](https://github.com/sponsors/lusoris), any amount; no support or priority is sold. Open Collective: pending.
 
 ## Licence
 
