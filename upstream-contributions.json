@@ -329,7 +329,7 @@
     {
       "number": 25477,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477",
-      "title": "avcodec/ffv1enc: move float remap scratch to slice state",
+      "title": "avcodec/ffv1enc: move float remap scratch off the stack",
       "base": "master",
       "state": "open",
       "merged_at": "",
