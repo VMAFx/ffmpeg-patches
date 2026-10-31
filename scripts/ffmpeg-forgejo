@@ -11,10 +11,12 @@
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
 #   ffmpeg-forgejo push    [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#   ffmpeg-forgejo pr      <branch> <title> <body-file>       open PR <you>:<branch> -> master
+#   ffmpeg-forgejo pr      <branch> <title> <body-file>       open PR <you>:<branch> -> master; reads requested_reviewers back and exits 3 when nobody was requested
 #   ffmpeg-forgejo issue   <title> <body-file>
-#   ffmpeg-forgejo comment <number> <body-file>       comment on an issue or PR
-#   ffmpeg-forgejo edit-body [--wait] <number> <body-file>   replace a PR body; refuses (exit 75) while the
+#   ffmpeg-forgejo comment (--tested-head <sha> | --no-test-claims) <number> <body-file>
+#                          comment on an issue or PR; test claims must match the live PR head
+#   ffmpeg-forgejo edit-body [--wait] (--tested-head <sha> | --no-test-claims) <number> <body-file>
+#                          replace a PR body; test claims must match the live PR head; refuses (exit 75) while the
 #                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
@@ -29,6 +31,8 @@ REPO="${FFMPEG_FORGEJO_REPO:-FFmpeg/FFmpeg}"
 BASE="${FFMPEG_FORGEJO_BASE:-master}"
 
 die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
+
+usage_error() { printf 'ffmpeg-forgejo: usage: %s\n' "$*" >&2; exit 64; }
 
 token() {
   local t
@@ -74,6 +78,45 @@ head_sha() {
   local out
   out="$(api GET "/repos/$REPO/pulls/$1")" || exit 1
   python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])' <<<"$out"
+}
+
+# parse_claim_option USAGE ARGS...: set claim_mode, tested_head and claim_args.
+parse_claim_option() {
+  local usage="$1"
+  shift
+  claim_mode=""; tested_head=""; claim_args=0
+  while [ "${1:-}" = "--tested-head" ] || [ "${1:-}" = "--no-test-claims" ]; do
+    [ -z "$claim_mode" ] || usage_error "$usage"
+    if [ "$1" = "--tested-head" ]; then
+      [ $# -ge 2 ] || usage_error "$usage"
+      tested_head="${2,,}"
+      [[ "$tested_head" =~ ^[0-9a-f]{7,40}$ ]] || usage_error "$usage"
+      claim_mode="tested-head"
+      claim_args=2
+      shift 2
+    else
+      claim_mode="no-test-claims"
+      claim_args=1
+      shift
+    fi
+  done
+  [ -n "$claim_mode" ] || usage_error "$usage"
+}
+
+# require_tested_head NUMBER TESTED: refuse unless TESTED prefixes the live PR head.
+require_tested_head() {
+  local number="$1" tested="$2" live
+  if ! live="$(head_sha "$number")"; then
+    printf 'ffmpeg-forgejo: #%s is not a pull request; tested head %s cannot be checked.\n' \
+      "$number" "$tested" >&2
+    exit 76
+  fi
+  live="${live,,}"
+  if [[ "$live" != "$tested"* ]]; then
+    printf 'ffmpeg-forgejo: tested head %s does not match live head %s.\n' \
+      "$tested" "$live" >&2
+    exit 76
+  fi
 }
 
 # autolabel_state SHA: prints done, pending, none or unknown for the Autolabel contexts on that
@@ -150,8 +193,26 @@ for i in json.load(sys.stdin):
     me="$(login)"
     body="$(mktemp)"
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
-    api POST "/repos/$REPO/pulls" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
     rm -f "$body"
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])' <<<"$out"
+    n="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])' <<<"$out")"
+    # .forgejo/CODEOWNERS requests reviewers only for the paths it lists; a PR nobody is asked
+    # to review sits unseen. Read the field back (3 tries) and flag an empty list with exit 3.
+    for ((i = 1; i <= 3; i++)); do
+      revs="$(api GET "/repos/$REPO/pulls/$n" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+users = [u["login"] for u in d.get("requested_reviewers") or []]
+teams = ["team:" + t["name"] for t in d.get("requested_reviewers_teams") or []]
+print(" ".join(users + teams))')"
+      [ -z "$revs" ] || break
+      [ "$i" = 3 ] || sleep "${FFMPEG_FORGEJO_POLL:-15}"
+    done
+    if [ -z "$revs" ]; then
+      printf 'ffmpeg-forgejo: #%s has no requested reviewer; pick from MAINTAINERS and git log on the touched files, then: ffmpeg-forgejo reviewers %s <login>...\n' "$n" "$n" >&2
+      exit 3
+    fi
+    echo "#$n requested reviewers: $revs"
     ;;
   issue)
     [ $# -eq 2 ] || die "usage: issue <title> <body-file>"
@@ -162,9 +223,13 @@ for i in json.load(sys.stdin):
     rm -f "$body"
     ;;
   comment)
-    [ $# -eq 2 ] || die "usage: comment <number> <body-file>"
+    usage='comment (--tested-head <sha> | --no-test-claims) <number> <body-file>'
+    parse_claim_option "$usage" "$@"
+    shift "$claim_args"
+    [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: $1"
     [ -f "$2" ] || die "no body file $2"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head"
     body="$(mktemp)"
     json_body "body=@$2" >"$body"
     api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
@@ -173,16 +238,20 @@ for i in json.load(sys.stdin):
   edit-body)
     wait=0
     if [ "${1:-}" = "--wait" ]; then wait=1; shift; fi
-    [ $# -eq 2 ] || die "usage: edit-body [--wait] <number> <body-file>"
+    usage='edit-body [--wait] (--tested-head <sha> | --no-test-claims) <number> <body-file>'
+    parse_claim_option "$usage" "$@"
+    shift "$claim_args"
+    [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
     [ -f "$2" ] || die "no body file $2"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head"
     # The head is read again after the status check: a push in between starts a new Autolabel
     # run, and the finished statuses of the old head must not clear the edit. Forgejo's PR edit
     # takes no expected head, so a push landing between this last read and the PATCH still races.
     for ((i = 1; i <= 80; i++)); do
       sha="$(head_sha "$1")"
       state="$(autolabel_state "$sha")"
-      if [ "$state" = done ]; then
+      if [ "$state" = "done" ]; then
         [ "$(head_sha "$1")" = "$sha" ] && break
         state="superseded by a new push"
       fi
@@ -192,6 +261,7 @@ for i in json.load(sys.stdin):
       fi
       sleep "${FFMPEG_FORGEJO_POLL:-15}"
     done
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head"
     body="$(mktemp)"
     json_body "body=@$2" >"$body"
     api PATCH "/repos/$REPO/pulls/$1" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
