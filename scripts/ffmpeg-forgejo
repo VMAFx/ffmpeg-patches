@@ -80,7 +80,8 @@ head_sha() {
   python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])' <<<"$out"
 }
 
-# pull_status NUMBER: prints the HTTP status, then the response body.
+# pull_status NUMBER: prints the HTTP status, then the response body. --no-fail preserves the
+# user's curl config while overriding curlrc fail, so a 404 remains a status instead of curl rc 22.
 pull_status() {
   local number="$1" hdr response tok code curl_rc
   tok="$(token)" || exit 1
@@ -89,7 +90,7 @@ pull_status() {
   trap 'rm -f "$hdr" "$response"' RETURN
   chmod 600 "$hdr" "$response"
   printf 'Authorization: token %s\n' "$tok" >"$hdr"
-  if code="$(curl -q -sS -o "$response" -w '%{http_code}' --max-time 60 -X GET \
+  if code="$(curl --no-fail -sS -o "$response" -w '%{http_code}' --max-time 60 -X GET \
     -H @"$hdr" "$API/repos/$REPO/pulls/$number")"; then
     curl_rc=0
   else

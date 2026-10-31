@@ -61,6 +61,7 @@ class Stub:
         self.reviewer_reads = 0
         self.poll_index = {sha: -1 for sha in polls}
         self.requests: list[tuple[str, str, str]] = []
+        self.pull_headers: list[dict[str, str]] = []
 
     def head(self) -> object:
         """Return the next scripted pull head, repeating the last."""
@@ -130,6 +131,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if url.path == "/api/v1/user":
             self.reply(200, {"login": "tester"})
         elif url.path.endswith("/pulls/1"):
+            stub.pull_headers.append(dict(self.headers.items()))
             if stub.pull_status == 200:
                 self.reply(200, stub.pull())
             else:
@@ -415,6 +417,49 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertIn("not a pull request", proc.stderr)
         self.assertEqual(self.posts(stub), [])
         self.assertEqual(self.patches(stub), [])
+
+    def test_curl_transport_failure_exits_one_without_post(self) -> None:
+        """A curl transport failure reports its status without attempting a POST."""
+
+        fake_bin = self.tmp / "fake-bin"
+        fake_bin.mkdir()
+        log = self.tmp / "curl.log"
+        curl = fake_bin / "curl"
+        curl.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >>"$CURL_LOG"\nexit 7\n')
+        curl.chmod(0o755)
+        stub = Stub()
+        proc = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "1",
+            str(self.tmp / "body.md"),
+            path_first=fake_bin,
+            env_updates={"CURL_LOG": str(log)},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("curl rc 7", proc.stderr)
+        invocations = log.read_text().splitlines()
+        self.assertEqual(len(invocations), 1)
+        self.assertIn("-X GET", invocations[0])
+
+    def test_curlrc_header_reaches_the_pull_read(self) -> None:
+        """The tested-head pull read preserves headers configured in curlrc."""
+
+        (self.tmp / ".curlrc").write_text('header = "X-Curlrc: 1"\n')
+        stub = Stub()
+        proc = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "1",
+            str(self.tmp / "body.md"),
+            env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.pull_headers[0].get("X-Curlrc"), "1")
 
     def test_null_live_head_exits_one_without_post(self) -> None:
         """A null live head exits 1 as unreadable without posting a comment."""
