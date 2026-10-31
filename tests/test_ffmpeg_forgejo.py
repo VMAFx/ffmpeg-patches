@@ -39,6 +39,7 @@ class Stub:
     heads: head sha returned by successive GET /pulls/1 (the last one repeats).
     polls: sha -> list of status lists, one per poll (page 1 starts a poll; the last repeats).
     fail_status: answer the status endpoint with HTTP 500.
+    pull_status: answer GET /pulls/1 with this HTTP status instead of a pull.
     """
 
     def __init__(
@@ -46,7 +47,7 @@ class Stub:
         heads: list[str] | None = None,
         polls: dict[str, list[list[dict]]] | None = None,
         fail_status: bool = False,
-        pull_exists: bool = True,
+        pull_status: int = 200,
         reviewers: list[list[str]] | None = None,
     ):
         """Initialize scripted pull, status, and reviewer responses."""
@@ -54,7 +55,7 @@ class Stub:
         heads = heads or [A]
         polls = polls or {}
         self.heads, self.polls, self.fail_status = heads, polls, fail_status
-        self.pull_exists = pull_exists
+        self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
         self.head_reads = 0
         self.reviewer_reads = 0
@@ -128,8 +129,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         is_status = len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status"
         if url.path == "/api/v1/user":
             self.reply(200, {"login": "tester"})
-        elif url.path.endswith("/pulls/1") and stub.pull_exists:
-            self.reply(200, stub.pull())
+        elif url.path.endswith("/pulls/1"):
+            if stub.pull_status == 200:
+                self.reply(200, stub.pull())
+            else:
+                self.reply(stub.pull_status, {"message": "pull read failed"})
         elif is_status and stub.fail_status:
             self.reply(500, {"message": "boom"})
         elif is_status:
@@ -364,6 +368,30 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertIn(LIVE, proc.stderr)
         self.assertEqual(self.posts(stub), [])
 
+    def test_comment_pull_server_failure_exits_one_without_post(self) -> None:
+        """A pull HTTP 500 exits 1 with its status and never posts a comment."""
+
+        stub = Stub(pull_status=500)
+        proc = self.comment(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            f"cannot read the head of #1 (HTTP 500); tested head {A} not checked",
+            proc.stderr,
+        )
+        self.assertEqual(self.posts(stub), [])
+
+    def test_edit_body_pull_auth_failure_exits_one_without_patch(self) -> None:
+        """A pull HTTP 401 exits 1 with its status and never patches the body."""
+
+        stub = Stub(pull_status=401)
+        proc = self.edit_body(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            f"cannot read the head of #1 (HTTP 401); tested head {A} not checked",
+            proc.stderr,
+        )
+        self.assertEqual(self.patches(stub), [])
+
     def test_matching_prefix_and_full_head_are_posted(self) -> None:
         """Both matching head prefixes and full hashes authorize a comment."""
 
@@ -437,13 +465,13 @@ class TestClaimHeadTest(ForgejoTest):
     def test_issue_refuses_tested_head_and_accepts_no_test_claims(self) -> None:
         """Issue comments reject tested-head claims but accept no-test claims."""
 
-        stub = Stub(pull_exists=False)
+        stub = Stub(pull_status=404)
         proc = self.comment(stub, "--tested-head", A)
         self.assertEqual(proc.returncode, 76)
         self.assertIn("not a pull request", proc.stderr)
         self.assertEqual(self.posts(stub), [])
 
-        stub = Stub(pull_exists=False)
+        stub = Stub(pull_status=404)
         proc = self.comment(stub, "--no-test-claims")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
@@ -451,7 +479,7 @@ class TestClaimHeadTest(ForgejoTest):
     def test_issue_edit_body_refuses_tested_head_before_autolabel(self) -> None:
         """An issue body edit exits 76 before status reads and never PATCHes."""
 
-        stub = Stub(pull_exists=False)
+        stub = Stub(pull_status=404)
         proc = self.edit_body(stub, "--tested-head", A)
         self.assertEqual(proc.returncode, 76)
         self.assertIn(f"#1 is not a pull request; tested head {A} cannot be checked", proc.stderr)
