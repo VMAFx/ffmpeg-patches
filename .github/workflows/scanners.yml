@@ -35,7 +35,8 @@ jobs:
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
-      - name: Stop on a draft pull request
+      - &stop-on-draft
+        name: Stop on a draft pull request
         if: github.event.pull_request.draft == true
         shell: bash
         env:
@@ -82,19 +83,9 @@ jobs:
       # digest as Docker Hub without its anonymous pull limit.
       image: mirror.gcr.io/semgrep/semgrep:1.178.0@sha256:32e459968daabe7ab86968184a29109b9564aa00392401156f9788452b42786b
     steps:
-      - name: Stop on a draft pull request
-        if: github.event.pull_request.draft == true
-        shell: bash
-        env:
-          TITLE: Gate not run on a draft
-          MESSAGE: >-
-            The gate did not run because the pull request is a draft.
-            It runs when the pull request is marked ready for review.
-        run: |
-          echo "::error title=$TITLE::$MESSAGE"
-          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - *stop-on-draft
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event.pull_request.draft != true
         with:
           persist-credentials: false
@@ -129,22 +120,8 @@ jobs:
         # gates on the pinned release; they are not source of this repository.
         language: [python, actions]
     steps:
-      - name: Stop on a draft pull request
-        if: github.event.pull_request.draft == true
-        shell: bash
-        env:
-          TITLE: Gate not run on a draft
-          MESSAGE: >-
-            The gate did not run because the pull request is a draft.
-            It runs when the pull request is marked ready for review.
-        run: |
-          echo "::error title=$TITLE::$MESSAGE"
-          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event.pull_request.draft != true
-        with:
-          persist-credentials: false
+      - *stop-on-draft
+      - *checkout
       - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         if: github.event.pull_request.draft != true
         with:
@@ -164,22 +141,8 @@ jobs:
       TRIVY_VERSION: 0.74.0
       TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
     steps:
-      - name: Stop on a draft pull request
-        if: github.event.pull_request.draft == true
-        shell: bash
-        env:
-          TITLE: Gate not run on a draft
-          MESSAGE: >-
-            The gate did not run because the pull request is a draft.
-            It runs when the pull request is marked ready for review.
-        run: |
-          echo "::error title=$TITLE::$MESSAGE"
-          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event.pull_request.draft != true
-        with:
-          persist-credentials: false
+      - *stop-on-draft
+      - *checkout
       - name: Install trivy at the pinned version and digest
         if: github.event.pull_request.draft != true
         run: |
@@ -204,22 +167,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - name: Stop on a draft pull request
-        if: github.event.pull_request.draft == true
-        shell: bash
-        env:
-          TITLE: Gate not run on a draft
-          MESSAGE: >-
-            The gate did not run because the pull request is a draft.
-            It runs when the pull request is marked ready for review.
-        run: |
-          echo "::error title=$TITLE::$MESSAGE"
-          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event.pull_request.draft != true
-        with:
-          persist-credentials: false
+      - *stop-on-draft
+      - *checkout
       - name: Lint the workflows
         # rhysd/actionlint:1.7.12, by digest; Renovate updates tag and digest
         # together. The image carries its own shellcheck and pyflakes, which
