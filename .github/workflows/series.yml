@@ -61,10 +61,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/setup-python
         if: github.event.pull_request.draft != true
-        with:
-          python-version-file: .python-version
       - name: Select CI work from changed files
         id: scope
         if: github.event.pull_request.draft != true
@@ -91,10 +89,8 @@ jobs:
         if: github.event.pull_request.draft != true
         with:
           persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/setup-python
         if: github.event.pull_request.draft != true
-        with:
-          python-version-file: .python-version
       # numpy: the CIEDE2000 arithmetic of scripts/tonemap_parity.py (ADR-0002).
       - name: Install ruff, reuse and numpy
         if: github.event.pull_request.draft != true

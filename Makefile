@@ -2,11 +2,11 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit build test lint apply dist
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit build test lint apply lengths lengths-local dist
 
 all: build
 
-verify-all: compile-context-verify caveman-sources audit test
+verify-all: compile-context-verify caveman-sources audit test lengths-local
 
 compile-context:
 	@$(PRAETORCTL) compile-context
@@ -37,6 +37,32 @@ lint:
 apply:
 	@test -n "$(FFMPEG_TREE)" || { echo 'set FFMPEG_TREE to an FFmpeg checkout' >&2; exit 1; }
 	@python3 scripts/series.py apply --expect-base "$(FFMPEG_TREE)"
+
+# HISS-04 function-length gate on the applied series. It needs the series
+# applied to an FFmpeg checkout (base..HEAD, one commit per patch), so it is
+# not in the default local gate; CI runs it unconditionally. Run it directly:
+#   make lengths FFMPEG_TREE=/path/to/applied-ffmpeg
+lengths:
+	@test -n "$(FFMPEG_TREE)" || { echo 'set FFMPEG_TREE to an FFmpeg checkout with the series applied' >&2; exit 1; }
+	@python3 scripts/series.py lengths "$(FFMPEG_TREE)"
+
+# verify-all hook for the applied-tree length gate: run it when FFMPEG_TREE
+# names an applied checkout, otherwise skip loudly (never a silent pass) so a
+# tree-less local run says plainly that only CI will catch an over-length
+# function. `make verify-all FFMPEG_TREE=<applied tree>` runs the full gate.
+lengths-local:
+	@if [ -n "$(FFMPEG_TREE)" ]; then \
+		python3 scripts/series.py lengths "$(FFMPEG_TREE)"; \
+	else \
+		{ \
+		  echo 'lengths-local: SKIPPED - no FFMPEG_TREE.'; \
+		  echo '  The HISS-04 applied-tree function-length gate needs the series'; \
+		  echo '  applied to an FFmpeg checkout. Before pushing a patch change run:'; \
+		  echo '    make verify-all FFMPEG_TREE=<applied FFmpeg tree>'; \
+		  echo '  (see "Apply the series" in README.md). CI enforces this gate'; \
+		  echo '  unconditionally, so a tree-less local run cannot catch it.'; \
+		} >&2; \
+	fi
 
 # Release tarball of the committed series, the same bytes for the same commit:
 #   make dist VERSION=v1.0.0
