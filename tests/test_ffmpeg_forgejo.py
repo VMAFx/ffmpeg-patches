@@ -44,7 +44,7 @@ class Stub:
 
     def __init__(
         self,
-        heads: list[str] | None = None,
+        heads: list[object] | None = None,
         polls: dict[str, list[list[dict]]] | None = None,
         fail_status: bool = False,
         pull_status: int = 200,
@@ -62,7 +62,7 @@ class Stub:
         self.poll_index = {sha: -1 for sha in polls}
         self.requests: list[tuple[str, str, str]] = []
 
-    def head(self) -> str:
+    def head(self) -> object:
         """Return the next scripted pull head, repeating the last."""
 
         sha = self.heads[min(self.head_reads, len(self.heads) - 1)]
@@ -187,7 +187,11 @@ class ForgejoTest(unittest.TestCase):
         (self.tmp / "body.md").write_text(BODY)
 
     def run_command(
-        self, stub: Stub, *args: str, path_first: Path | None = None
+        self,
+        stub: Stub,
+        *args: str,
+        path_first: Path | None = None,
+        env_updates: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run one allow-listed helper subcommand against the stub API."""
 
@@ -202,6 +206,7 @@ class ForgejoTest(unittest.TestCase):
                 FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
                 FFMPEG_FORGEJO_POLL="0",
             )
+            env.update(env_updates or {})
             return subprocess.run(  # nosec B603 - fixed interpreter/helper, allow-list, test literals.
                 ["bash", str(self.helper), *args],
                 env=env,
@@ -391,6 +396,43 @@ class TestClaimHeadTest(ForgejoTest):
             proc.stderr,
         )
         self.assertEqual(self.patches(stub), [])
+
+    def test_curlrc_fail_keeps_a_missing_pull_as_exit_76(self) -> None:
+        """A curlrc fail option cannot turn a missing pull into a curl failure."""
+
+        (self.tmp / ".curlrc").write_text("fail\n")
+        stub = Stub(pull_status=404)
+        proc = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "1",
+            str(self.tmp / "body.md"),
+            env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)},
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("not a pull request", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+        self.assertEqual(self.patches(stub), [])
+
+    def test_null_live_head_exits_one_without_post(self) -> None:
+        """A null live head exits 1 as unreadable without posting a comment."""
+
+        stub = Stub([None])
+        proc = self.comment(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot read the head", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_short_live_head_exits_one_without_post(self) -> None:
+        """A short live head exits 1 as unreadable without posting a comment."""
+
+        stub = Stub(["abc"])
+        proc = self.comment(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot read the head", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
 
     def test_matching_prefix_and_full_head_are_posted(self) -> None:
         """Both matching head prefixes and full hashes authorize a comment."""
