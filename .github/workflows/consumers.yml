@@ -4,8 +4,11 @@
 # The consumers apply their own FFmpeg patch stacks on top of this series:
 # VMAFx/vmafx and VMAFx/pelorus, each from ffmpeg-patches/series.txt on its
 # default branch. This run applies the series on the pinned base, then each
-# consumer stack on top, the way their builds do, and fails when one no
-# longer applies. On a pull request it shows that a series change breaks a
+# consumer stack on top, the way their builds do. A handed-over patch passes
+# only when a series patch declares its consumer and covers all its added
+# lines, and the consumer's pinned tag does not yet contain that series patch;
+# the consumer must drop it on its next pin bump. Other failures stay red.
+# On a pull request it shows that a series change breaks a
 # consumer before a release carries it; the nightly run shows that a
 # consumer change no longer fits the series on main. Apply only: the
 # consumers' builds need their own libraries and run in their repositories.
@@ -60,6 +63,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event.pull_request.draft != true
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: github.event.pull_request.draft != true
@@ -102,8 +106,28 @@ jobs:
             git clone -q --depth=1 --filter=blob:none --sparse "${branch[@]}" \
               "https://github.com/VMAFx/${consumer}.git" "consumers/${consumer}"
             git -C "consumers/${consumer}" sparse-checkout set ffmpeg-patches
+            # Cone mode keeps root files, including the consumer's series pin.
+            test -f "consumers/${consumer}/build-config.env"
             git -C "consumers/${consumer}" log -1 --format="${consumer} %H %cs %s" \
               | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Read the consumer series pins
+        if: github.event.pull_request.draft != true
+        run: |
+          for consumer in vmafx pelorus; do
+            case "$consumer" in
+              vmafx) variable=FFMPEG_FIX_SERIES_TAG ;;
+              pelorus) variable=FFMPEG_SERIES_TAG ;;
+            esac
+            tag=$(grep -E "^${variable}=" "consumers/${consumer}/build-config.env")
+            tag=${tag#*=}
+            tag=${tag//\"/}
+            tag=${tag//\'/}
+            if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::${consumer} series pin is not a vMAJOR.MINOR.PATCH tag"
+              exit 1
+            fi
+            printf '%s_SERIES_TAG=%s\n' "${consumer^^}" "$tag" >> "$GITHUB_ENV"
           done
       - name: Apply each consumer stack on top of the series
         if: github.event.pull_request.draft != true
@@ -111,4 +135,6 @@ jobs:
           python3 scripts/consumer_stacks.py ffmpeg \
             vmafx=consumers/vmafx/ffmpeg-patches \
             pelorus=consumers/pelorus/ffmpeg-patches \
+            --series-dir . \
+            --pin "vmafx=$VMAFX_SERIES_TAG" --pin "pelorus=$PELORUS_SERIES_TAG" \
             --report "$GITHUB_STEP_SUMMARY"
