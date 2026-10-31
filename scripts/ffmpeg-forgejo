@@ -201,7 +201,10 @@ for i in json.load(sys.stdin):
     # to review sits unseen. Read the field back (3 tries) and flag an empty list with exit 3.
     for ((i = 1; i <= 3; i++)); do
       revs="$(api GET "/repos/$REPO/pulls/$n" | python3 -c 'import json,sys
-print(" ".join(u["login"] for u in json.load(sys.stdin).get("requested_reviewers") or []))')"
+d = json.load(sys.stdin)
+users = [u["login"] for u in d.get("requested_reviewers") or []]
+teams = ["team:" + t["name"] for t in d.get("requested_reviewers_teams") or []]
+print(" ".join(users + teams))')"
       [ -z "$revs" ] || break
       [ "$i" = 3 ] || sleep "${FFMPEG_FORGEJO_POLL:-15}"
     done
@@ -241,6 +244,7 @@ print(" ".join(u["login"] for u in json.load(sys.stdin).get("requested_reviewers
     [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
     [ -f "$2" ] || die "no body file $2"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head"
     # The head is read again after the status check: a push in between starts a new Autolabel
     # run, and the finished statuses of the old head must not clear the edit. Forgejo's PR edit
     # takes no expected head, so a push landing between this last read and the PATCH still races.
