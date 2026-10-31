@@ -7,8 +7,10 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -60,6 +62,34 @@ class StackFixture:
         edit(self.tree, index, text, "series: another fix")
         self.tip = git(self.tree, "rev-parse", "HEAD")
 
+    def handover(self, scratch: Path, *, two_files: bool = False) -> Path:
+        """Publish a consumer fix in the series after its old pin, with a new pin too."""
+        lines = (self.tree / "lib.c").read_text().splitlines()
+        lines[14:16] = ["int line_15 = 150;", "int line_16 = 160;"]
+        (self.tree / "lib.c").write_text("\n".join(lines) + "\n")
+        if two_files:
+            (self.tree / "other.c").write_text("int line_15 = 150;\nint line_16 = 160;\n")
+        git(self.tree, "add", ".")
+        git(self.tree, "commit", "-q", "-m", "shared consumer fix")
+        patch = git(self.tree, "format-patch", "-1", "--stdout") + "\n"
+        (self.stack / self.names[0]).write_text(patch)
+        self.tip = git(self.tree, "rev-parse", "HEAD")
+        root = scratch / "series"
+        root.mkdir()
+        git(root, "init", "-q")
+        (root / "README").write_text("shared series\n")
+        git(root, "add", ".")
+        git(root, "commit", "-q", "-m", "before handover")
+        git(root, "tag", "v0.1.0")
+        (root / "patches").mkdir()
+        shared = root / "patches" / "0001-shared.patch"
+        shared.write_text(patch)
+        shared.with_suffix(".toml").write_text('consumers = ["vmafx"]\n')
+        git(root, "add", ".")
+        git(root, "commit", "-q", "-m", "take consumer fix")
+        git(root, "tag", "v0.2.0")
+        return shared
+
 
 class ConsumerStacksTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -78,6 +108,124 @@ class ConsumerStacksTest(unittest.TestCase):
 
     def head(self) -> str:
         return git(self.fx.tree, "rev-parse", "HEAD")
+
+    def run_handover(
+        self, pin: str | None = "v0.1.0", *, report: Path | None = None
+    ) -> tuple[int, str, str]:
+        pins = ["--pin", f"vmafx={pin}"] if pin else []
+        return self.run_main(
+            f"vmafx={self.fx.stack}",
+            "--series-dir",
+            str(self.scratch / "series"),
+            *pins,
+            report=report,
+        )
+
+    def assert_in_series(self, pin: str | None = "v0.1.0") -> None:
+        status, out, err = self.run_handover(pin)
+        self.assertEqual((status, err), (1, ""))
+        self.assertIn(f"vmafx: in-series  {self.fx.names[0]}", out)
+        self.assertIn(f"vmafx: not-tried  {self.fx.names[1]}", out)
+        self.assertNotIn("::warning::", out)
+        self.assertEqual(self.head(), self.fx.tip)
+
+    def test_declared_handover_before_pin_continues_stack(self) -> None:
+        shared = self.fx.handover(self.scratch)
+        report = self.scratch / "summary.md"
+        status, out, err = self.run_handover(report=report)
+        self.assertEqual((status, err), (0, ""))
+        label = f"{self.fx.names[0]} -> {shared.name}"
+        self.assertIn(f"vmafx: handed-over {label}", out)
+        self.assertIn(f"| vmafx | `{label}` | handed-over |", report.read_text())
+        self.assertIn(f"vmafx: applied    {self.fx.names[1]}", out)
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("vmafx must drop", out)
+        self.assertIn("next pin bump", out)
+        self.assertEqual(self.head(), self.fx.tip)
+        self.assertEqual(git(self.fx.tree, "status", "--porcelain"), "")
+
+    def test_handover_requires_declared_consumer(self) -> None:
+        shared = self.fx.handover(self.scratch)
+        shared.with_suffix(".toml").write_text('consumers = ["pelorus"]\n')
+        self.assert_in_series()
+
+    def test_handover_requires_every_added_line(self) -> None:
+        shared = self.fx.handover(self.scratch)
+        shared.write_text(shared.read_text().replace("+int line_16 = 160;", "+int other = 1;"))
+        self.assert_in_series()
+
+    def test_handover_expires_when_pin_contains_patch(self) -> None:
+        self.fx.handover(self.scratch)
+        self.assert_in_series("v0.2.0")
+
+    def test_handover_rejects_run_across_separate_hunks(self) -> None:
+        shared = self.fx.handover(self.scratch)
+        shared.write_text(
+            "diff --git a/lib.c b/lib.c\n"
+            "--- a/lib.c\n+++ b/lib.c\n"
+            "@@ -14,2 +14,2 @@\n"
+            "-int line_14 = 14;\n-int line_15 = 15;\n"
+            "+int line_14 = 140;\n+int line_15 = 150;\n"
+            "@@ -30,2 +30,2 @@\n"
+            "-int line_30 = 30;\n-int line_31 = 31;\n"
+            "+int line_16 = 160;\n+int line_31 = 310;\n"
+        )
+        added = series.added_runs(shared.read_text())["lib.c"]
+        consumer_runs = series.added_runs((self.fx.stack / self.fx.names[0]).read_text())
+        self.assertEqual(len(added), 2)
+        self.assertEqual(consumer_runs["lib.c"], [[added[0][-1], added[1][0]]])
+        self.assert_in_series()
+
+    def test_handover_expires_when_pin_contains_renumbered_patch(self) -> None:
+        shared = self.fx.handover(self.scratch)
+        shared.rename(shared.with_name("0002-shared.patch"))
+        shared.with_suffix(".toml").rename(shared.with_name("0002-shared.toml"))
+        self.assert_in_series("v0.2.0")
+
+    def test_handover_requires_consumer_pin(self) -> None:
+        self.fx.handover(self.scratch)
+        self.assert_in_series(None)
+
+    def test_unknown_pin_is_tool_error(self) -> None:
+        self.fx.handover(self.scratch)
+        status, out, err = self.run_handover("v9.9.9")
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("v9.9.9", err)
+        self.assertEqual(self.head(), self.fx.tip)
+
+    def test_handover_requires_matching_additions_in_every_file(self) -> None:
+        shared = self.fx.handover(self.scratch, two_files=True)
+        shared.write_text(shared.read_text().split("diff --git a/other.c")[0])
+        self.assert_in_series()
+
+    def test_handover_requires_sidecar(self) -> None:
+        shared = self.fx.handover(self.scratch)
+        shared.with_suffix(".toml").unlink()
+        self.assert_in_series()
+
+    def test_handover_requires_consumers_list_not_string(self) -> None:
+        shared = self.fx.handover(self.scratch)
+        shared.with_suffix(".toml").write_text('consumers = "vmafx"\n')
+        self.assert_in_series()
+
+    def test_repeated_pins_are_specific_to_each_consumer(self) -> None:
+        shared = self.fx.handover(self.scratch)
+        shared.with_suffix(".toml").write_text('consumers = ["vmafx", "pelorus"]\n')
+        status, out, err = self.run_main(
+            f"vmafx={self.fx.stack}",
+            f"pelorus={self.fx.stack}",
+            "--series-dir",
+            str(self.scratch / "series"),
+            "--pin",
+            "vmafx=v0.1.0",
+            "--pin",
+            "pelorus=v0.2.0",
+        )
+        self.assertEqual((status, err), (1, ""))
+        self.assertIn("vmafx: handed-over", out)
+        self.assertIn("pelorus: in-series", out)
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertEqual(self.head(), self.fx.tip)
 
     # Positive.
 
@@ -169,6 +317,72 @@ class ConsumerStacksTest(unittest.TestCase):
         status, out, _ = self.run_main(f"a={self.fx.stack}")
         self.assertEqual(status, 0)
         self.assertEqual(out.count("applied"), 1)
+
+
+class ConsumerPinWorkflowTest(unittest.TestCase):
+    """Execute the workflow's pin-reader shell verbatim against local consumer files."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.env_file = self.root / "env"
+        workflow = Path(__file__).resolve().parent.parent / ".github/workflows/consumers.yml"
+        step = workflow.read_text().split("      - name: Read the consumer series pins\n")[1]
+        self.script = textwrap.dedent(step.split("        run: |\n")[1].split("      - ")[0])
+        for name in ("vmafx", "pelorus"):
+            (self.root / "consumers" / name).mkdir(parents=True)
+
+    def read_pins(self, vmafx: str, pelorus: str) -> subprocess.CompletedProcess[str]:
+        for name, value in (("vmafx", vmafx), ("pelorus", pelorus)):
+            (self.root / "consumers" / name / "build-config.env").write_text(value)
+        self.env_file.write_text("")
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.script],
+            cwd=self.root,
+            env={**os.environ, "GITHUB_ENV": str(self.env_file)},
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_pin_reader_keeps_each_consumers_value_and_strips_quotes(self) -> None:
+        for quote in ('"', "'", ""):
+            with self.subTest(quote=quote):
+                done = self.read_pins(
+                    f"FFMPEG_FIX_SERIES_TAG={quote}v1.2.3{quote}\n",
+                    f"FFMPEG_SERIES_TAG={quote}v4.5.6{quote}\n",
+                )
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(
+                    self.env_file.read_text(),
+                    "VMAFX_SERIES_TAG=v1.2.3\nPELORUS_SERIES_TAG=v4.5.6\n",
+                )
+
+    def test_pin_reader_refuses_planted_invalid_or_missing_values(self) -> None:
+        bad = (
+            "",
+            "v1.2",
+            "v1.2.3-rc.1",
+            "xv1.2.3",
+            "v1a2b3",
+            "v1.2.3 ",
+            "$(touch injected)",
+            "v1.2.3\nFFMPEG_FIX_SERIES_TAG=v2.0.0",
+        )
+        for value in bad:
+            with self.subTest(value=value):
+                done = self.read_pins(
+                    f"FFMPEG_FIX_SERIES_TAG={value}\n", "FFMPEG_SERIES_TAG=v4.5.6\n"
+                )
+                self.assertNotEqual(done.returncode, 0)
+                self.assertEqual(self.env_file.read_text(), "")
+                self.assertFalse((self.root / "injected").exists())
+        for missing in ("", "# FFMPEG_SERIES_TAG=v4.5.6\n", "OTHER_FFMPEG_SERIES_TAG=v4.5.6\n"):
+            with self.subTest(missing=missing):
+                done = self.read_pins("FFMPEG_FIX_SERIES_TAG=v1.2.3\n", missing)
+                self.assertNotEqual(done.returncode, 0)
 
 
 if __name__ == "__main__":

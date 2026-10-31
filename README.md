@@ -222,6 +222,14 @@ longer applies, so a series change that breaks a consumer shows before a
 release carries it. It applies only; the consumers build in their own
 repositories.
 
+A consumer patch reports `handed-over` only when a series patch's `.toml`
+declares that consumer and its added lines contain every consumer added-line
+run at the same file path, while the consumer's known `--pin NAME=TAG` does
+not yet contain that series patch (`--series-dir` defaults to this repository).
+The gate warns that the consumer must drop the patch on its next pin bump
+and continues its stack; a missing pin, an expired handover, or incomplete
+coverage still fails, and an unknown tag is a tool error.
+
 ## Graph check
 
 When two linked filters share no pixel or sample format, libavfilter inserts
