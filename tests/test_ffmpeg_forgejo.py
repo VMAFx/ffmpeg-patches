@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Tests for the edit-body guard of scripts/ffmpeg-forgejo against a stub Forgejo API."""
+"""Tests for scripts/ffmpeg-forgejo against a stub Forgejo API."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
 A = "a" * 40
 B = "b" * 40
+LIVE = "77c2f4b1c12b" + "0" * 28
+STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
 
 
@@ -37,10 +39,20 @@ class Stub:
     """
 
     def __init__(
-        self, heads: list[str], polls: dict[str, list[list[dict]]], fail_status: bool = False
+        self,
+        heads: list[str] | None = None,
+        polls: dict[str, list[list[dict]]] | None = None,
+        fail_status: bool = False,
+        pull_exists: bool = True,
+        reviewers: list[list[str]] | None = None,
     ):
+        heads = heads or [A]
+        polls = polls or {}
         self.heads, self.polls, self.fail_status = heads, polls, fail_status
+        self.pull_exists = pull_exists
+        self.reviewers = reviewers or [[]]
         self.head_reads = 0
+        self.reviewer_reads = 0
         self.poll_index = {sha: -1 for sha in polls}
         self.requests: list[tuple[str, str, str]] = []
 
@@ -58,46 +70,74 @@ class Stub:
         full = seq[min(max(self.poll_index.get(sha, 0), 0), len(seq) - 1)]
         return full[(page - 1) * limit : page * limit]
 
+    def pull(self) -> dict:
+        reviewers = self.reviewers[min(self.reviewer_reads, len(self.reviewers) - 1)]
+        self.reviewer_reads += 1
+        return {
+            "number": 1,
+            "head": {"sha": self.head()},
+            "html_url": "stub/pulls/1",
+            "requested_reviewers": [{"login": login} for login in reviewers],
+        }
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def stub(self) -> Stub:
+        return self.server.stub  # type: ignore[attr-defined]
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        """Keep request logging out of the test output."""
+
+    def reply(self, code: int, obj: object) -> None:
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        stub = self.stub()
+        url = urllib.parse.urlsplit(self.path)
+        stub.requests.append(("GET", self.path, ""))
+        parts = url.path.split("/")
+        is_status = len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status"
+        if url.path == "/api/v1/user":
+            self.reply(200, {"login": "tester"})
+        elif url.path.endswith("/pulls/1") and stub.pull_exists:
+            self.reply(200, stub.pull())
+        elif is_status and stub.fail_status:
+            self.reply(500, {"message": "boom"})
+        elif is_status:
+            st = stub.statuses(parts[-2], urllib.parse.parse_qs(url.query))
+            self.reply(200, {"statuses": st, "total_count": len(st)})
+        else:
+            self.reply(404, {})
+
+    def do_POST(self) -> None:
+        data = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
+        self.stub().requests.append(("POST", self.path, data))
+        if self.path.endswith("/pulls"):
+            self.reply(201, {"number": 1, "html_url": "stub/pulls/1"})
+        elif self.path.endswith("/issues/1/comments"):
+            self.reply(201, {"html_url": "stub/issues/1#issuecomment-1"})
+        else:
+            self.reply(404, {})
+
+    def do_PATCH(self) -> None:
+        data = self.rfile.read(int(self.headers["Content-Length"])).decode()
+        self.stub().requests.append(("PATCH", self.path, data))
+        self.reply(200, {"html_url": "stub/pulls/1"})
+
 
 def serve(stub: Stub) -> http.server.HTTPServer:
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-            """Keep request logging out of the test output."""
-
-        def reply(self, code: int, obj: object) -> None:
-            data = json.dumps(obj).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def do_GET(self) -> None:
-            url = urllib.parse.urlsplit(self.path)
-            stub.requests.append(("GET", self.path, ""))
-            parts = url.path.split("/")
-            is_status = len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status"
-            if url.path.endswith("/pulls/1"):
-                self.reply(200, {"head": {"sha": stub.head()}, "html_url": "stub/pulls/1"})
-            elif is_status and stub.fail_status:
-                self.reply(500, {"message": "boom"})
-            elif is_status:
-                st = stub.statuses(parts[-2], urllib.parse.parse_qs(url.query))
-                self.reply(200, {"statuses": st, "total_count": len(st)})
-            else:
-                self.reply(404, {})
-
-        def do_PATCH(self) -> None:
-            data = self.rfile.read(int(self.headers["Content-Length"])).decode()
-            stub.requests.append(("PATCH", self.path, data))
-            self.reply(200, {"html_url": "stub/pulls/1"})
-
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    server.stub = stub  # type: ignore[attr-defined]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
-class EditBodyTest(unittest.TestCase):
+class ForgejoTest(unittest.TestCase):
     helper: Path = HELPER
 
     def setUp(self) -> None:
@@ -110,7 +150,9 @@ class EditBodyTest(unittest.TestCase):
         self.bin_dir = bin_dir
         (self.tmp / "body.md").write_text(BODY)
 
-    def run_helper(self, stub: Stub, *args: str, path_first: Path | None = None) -> int:
+    def run_command(
+        self, stub: Stub, *args: str, path_first: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
         server = serve(stub)
         try:
             env = dict(os.environ)
@@ -120,21 +162,37 @@ class EditBodyTest(unittest.TestCase):
                 FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
                 FFMPEG_FORGEJO_POLL="0",
             )
-            proc = subprocess.run(
-                ["bash", str(self.helper), "edit-body", *args, "1", str(self.tmp / "body.md")],
+            return subprocess.run(
+                ["bash", str(self.helper), *args],
                 env=env,
                 capture_output=True,
                 text=True,
                 timeout=60,
                 check=False,
             )
-            return proc.returncode
         finally:
             server.shutdown()
             server.server_close()
 
+    def sent_bodies(self, stub: Stub, method: str) -> list[str]:
+        return [json.loads(data)["body"] for got, _, data in stub.requests if got == method]
+
+
+class EditBodyTest(ForgejoTest):
+    def run_helper(self, stub: Stub, *args: str, path_first: Path | None = None) -> int:
+        proc = self.run_command(
+            stub,
+            "edit-body",
+            *args,
+            "--no-test-claims",
+            "1",
+            str(self.tmp / "body.md"),
+            path_first=path_first,
+        )
+        return proc.returncode
+
     def patches(self, stub: Stub) -> list[str]:
-        return [json.loads(d)["body"] for m, _, d in stub.requests if m == "PATCH"]
+        return self.sent_bodies(stub, "PATCH")
 
     def assert_refused(self, stub: Stub, *args: str) -> None:
         self.assertEqual(self.run_helper(stub, *args), 75)
@@ -199,8 +257,129 @@ class EditBodyTest(unittest.TestCase):
         self.assertEqual(self.patches(stub), [])
 
 
+class TestClaimHeadTest(ForgejoTest):
+    def comment(self, stub: Stub, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.run_command(stub, "comment", *args, "1", str(self.tmp / "body.md"))
+
+    def edit_body(self, stub: Stub, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.run_command(stub, "edit-body", *args, "1", str(self.tmp / "body.md"))
+
+    def posts(self, stub: Stub) -> list[str]:
+        return self.sent_bodies(stub, "POST")
+
+    def patches(self, stub: Stub) -> list[str]:
+        return self.sent_bodies(stub, "PATCH")
+
+    def test_stale_tested_head_is_refused_without_post(self) -> None:
+        stub = Stub([LIVE])
+        proc = self.comment(stub, "--tested-head", STALE)
+        self.assertEqual(proc.returncode, 76)
+        self.assertIn(STALE, proc.stderr)
+        self.assertIn(LIVE, proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_matching_prefix_and_full_head_are_posted(self) -> None:
+        for tested in (LIVE[:12], LIVE):
+            with self.subTest(tested=tested):
+                stub = Stub([LIVE])
+                proc = self.comment(stub, "--tested-head", tested)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(self.posts(stub), [BODY])
+
+    def test_invalid_tested_heads_are_usage_errors(self) -> None:
+        for tested in (LIVE[:6], "not-hex"):
+            with self.subTest(tested=tested):
+                stub = Stub([LIVE])
+                proc = self.comment(stub, "--tested-head", tested)
+                self.assertEqual(proc.returncode, 64)
+                self.assertIn("usage: comment", proc.stderr)
+                self.assertEqual(self.posts(stub), [])
+
+    def test_missing_or_conflicting_claim_options_are_usage_errors(self) -> None:
+        for args in ((), ("--tested-head", LIVE, "--no-test-claims")):
+            with self.subTest(args=args):
+                stub = Stub([LIVE])
+                proc = self.comment(stub, *args)
+                self.assertEqual(proc.returncode, 64)
+                self.assertIn("usage: comment", proc.stderr)
+                self.assertEqual(self.posts(stub), [])
+
+    def test_no_test_claims_posts_without_reading_the_head(self) -> None:
+        stub = Stub([LIVE])
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.head_reads, 0)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_edit_body_uses_head_read_after_autolabel(self) -> None:
+        stub = Stub([A, A, B], {A: [[label("success")]]})
+        proc = self.edit_body(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 76)
+        self.assertIn(A, proc.stderr)
+        self.assertIn(B, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_edit_body_matching_tested_head_is_patched(self) -> None:
+        stub = Stub([A], {A: [[label("success")]]})
+        proc = self.edit_body(stub, "--tested-head", A[:12])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [BODY])
+
+    def test_edit_body_requires_exactly_one_claim_option(self) -> None:
+        for args in ((), ("--tested-head", A, "--no-test-claims")):
+            with self.subTest(args=args):
+                stub = Stub([A], {A: [[label("success")]]})
+                proc = self.edit_body(stub, *args)
+                self.assertEqual(proc.returncode, 64)
+                self.assertIn("usage: edit-body", proc.stderr)
+                self.assertEqual(self.patches(stub), [])
+
+    def test_issue_refuses_tested_head_and_accepts_no_test_claims(self) -> None:
+        stub = Stub(pull_exists=False)
+        proc = self.comment(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 76)
+        self.assertIn("not a pull request", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+        stub = Stub(pull_exists=False)
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+
+class PullRequestReviewerTest(ForgejoTest):
+    def pr(self, stub: Stub) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            stub,
+            "pr",
+            "topic",
+            "title",
+            str(self.tmp / "body.md"),
+        )
+
+    def test_empty_reviewers_three_times_exits_three(self) -> None:
+        stub = Stub(reviewers=[[], [], []])
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(proc.stdout, "stub/pulls/1\n")
+        self.assertIn("#1 has no requested reviewer", proc.stderr)
+        reads = [
+            path for method, path, _ in stub.requests if method == "GET" and "/pulls/1" in path
+        ]
+        self.assertEqual(len(reads), 3)
+
+    def test_requested_reviewers_are_printed(self) -> None:
+        stub = Stub(reviewers=[["alice", "bob"]])
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout,
+            "stub/pulls/1\n#1 requested reviewers: alice bob\n",
+        )
+
+
 MUTANTS = {
-    "guard removed": ('if [ "$state" = done ]; then', "if true; then"),
+    "guard removed": ('if [ "$state" = "done" ]; then', "if true; then"),
     "head not rechecked": ('[ "$(head_sha "$1")" = "$sha" ] && break', "break"),
     "first page only": ("page <= 20; page++", "page <= 1; page++"),
     "terminal set narrowed": ('"warning", "skipped"}', "}"),
