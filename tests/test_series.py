@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -1451,13 +1452,24 @@ class MakeTargetsTest(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._scratch.cleanup()
 
+    # Variables that would leak an outer FFMPEG_TREE into a spawned make: the
+    # plain environment variable, and the make-flag channels through which
+    # `make verify-all FFMPEG_TREE=<tree>` (the documented command) passes a
+    # command-line assignment down to recipe processes and sub-makes. Scrubbing
+    # all of them makes each spawned make hermetic however the suite was
+    # launched; a test that wants a tree passes it as a make argument, which
+    # overrides the environment either way.
+    _LEAKY_MAKE_VARS = ("FFMPEG_TREE", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS")
+
     def run_make(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = {k: v for k, v in os.environ.items() if k not in self._LEAKY_MAKE_VARS}
         return subprocess.run(
             [self.make, "-s", "-C", str(self.clone), *arguments],
             capture_output=True,
             text=True,
             timeout=300,
             check=False,
+            env=env,
         )
 
     def dist(self, version: str) -> bytes:
@@ -1510,6 +1522,32 @@ class MakeTargetsTest(unittest.TestCase):
         result = self.run_make("apply", f"FFMPEG_TREE={tree}")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("base.env pins", result.stderr)
+
+    def test_lengths_requires_a_tree(self) -> None:
+        result = self.run_make("lengths")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("set FFMPEG_TREE", result.stderr)
+
+    def test_lengths_local_skips_loudly_without_a_tree(self) -> None:
+        # verify-all must stay green without an FFmpeg checkout, but the skip is
+        # announced (never a silent pass) and names that CI still enforces it.
+        result = self.run_make("lengths-local")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SKIPPED", result.stderr)
+        self.assertIn("CI enforces this gate", result.stderr)
+
+    def test_lengths_local_runs_the_gate_when_a_tree_is_given(self) -> None:
+        # A tree that is not the applied series makes the gate fail rather than
+        # skip, proving the FFMPEG_TREE branch invokes series.py lengths.
+        tree = Path(self._scratch.name) / "lengths-not-the-base"
+        tree.mkdir()
+        run_git(tree, "init", "-q")
+        (tree / "file.c").write_text("int x;\n")
+        run_git(tree, "add", "file.c")
+        run_git(tree, "commit", "-q", "-m", "not the pinned base")
+        result = self.run_make("lengths-local", f"FFMPEG_TREE={tree}")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("SKIPPED", result.stderr)
 
 
 if __name__ == "__main__":
