@@ -2,9 +2,6 @@ From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: lusoris <lusoris@proton.me>
 Date: Tue, 5 May 2026 23:24:55 +0200
 Subject: [PATCH] libavcodec: unified -qpfile across libx264/libsvtav1/libaom
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
 
 Adds an -qpfile <path> AVOption on libx264, libsvtav1, and libaom-av1
 that consumes a per-frame QP-offset file
@@ -43,12 +40,12 @@ offsets to [-12,+12].
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
  libavcodec/Makefile        |   4 +-
- libavcodec/libaomenc.c     | 235 ++++++++++++++++++++++++++++
- libavcodec/libsvtav1.c     | 312 +++++++++++++++++++++++++++++++++++++
+ libavcodec/libaomenc.c     | 235 ++++++++++++++++++++++++++
+ libavcodec/libsvtav1.c     | 332 +++++++++++++++++++++++++++++++++++++
  libavcodec/libx264.c       |  77 +++++++++
- libavcodec/qpfile_parser.c | 302 +++++++++++++++++++++++++++++++++++
- libavcodec/qpfile_parser.h |  55 +++++++
- 6 files changed, 984 insertions(+), 1 deletion(-)
+ libavcodec/qpfile_parser.c | 314 +++++++++++++++++++++++++++++++++++
+ libavcodec/qpfile_parser.h |  55 ++++++
+ 6 files changed, 1016 insertions(+), 1 deletion(-)
  create mode 100644 libavcodec/qpfile_parser.c
  create mode 100644 libavcodec/qpfile_parser.h
 
@@ -68,7 +65,7 @@ index 95ba308504d2c022a94293cafbb510e7d20e673c..00d07477384157b4fe715ae22847d707
  OBJS-$(CONFIG_LIBXAVS_ENCODER)            += libxavs.o
  OBJS-$(CONFIG_LIBXAVS2_ENCODER)           += libxavs2.o
 diff --git a/libavcodec/libaomenc.c b/libavcodec/libaomenc.c
-index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..0d0efa80bd07cc9679f1422e06ebc8ac268370df 100644
+index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..64a2d5839e6d853acf10aacae57a6cc5478d3cbc 100644
 --- a/libavcodec/libaomenc.c
 +++ b/libavcodec/libaomenc.c
 @@ -50,6 +50,10 @@
@@ -356,7 +353,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..0d0efa80bd07cc9679f1422e06ebc8ac
      { "still-picture", "Encode in single frame mode (typically used for still AVIF images).", OFFSET(still_picture), AV_OPT_TYPE_BOOL, {.i64 = 0}, -1, 1, VE },
      { "dolbyvision",     "Enable Dolby Vision RPU coding", OFFSET(dovi.enable), AV_OPT_TYPE_BOOL, {.i64 = FF_DOVI_AUTOMATIC }, -1, 1, VE, .unit = "dovi" },
 diff --git a/libavcodec/libsvtav1.c b/libavcodec/libsvtav1.c
-index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe105f08a7 100644
+index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..37a5f18e730b9e0b4a8d0e3508d1bfd934a63bc2 100644
 --- a/libavcodec/libsvtav1.c
 +++ b/libavcodec/libsvtav1.c
 @@ -20,6 +20,8 @@
@@ -468,7 +465,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe
      svt_ret = svt_av1_enc_init(svt_enc->svt_handle);
      if (svt_ret != EB_ErrorNone) {
          return svt_print_error(avctx, svt_ret, "Error initializing encoder");
-@@ -551,6 +620,199 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
+@@ -551,6 +620,219 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
      return alloc_buffer(&svt_enc->enc_params, svt_enc);
  }
  
@@ -506,23 +503,11 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe
 +#define QPFILE_SVTAV1_MAX_SEGMENTS 8
 +#define QPFILE_SVTAV1_SB_SIDE      4   /* 4 MBs (16 px each) per SB (64 px) */
 +
-+static int build_one_roi_evt(const FFQpFrame *qf,
-+                             unsigned dest_b64_cols,
-+                             unsigned dest_b64_rows,
-+                             SvtAv1RoiMapEvt *out_evt,
-+                             uint8_t **out_seg_map)
++static unsigned roi_segment_values(const FFQpFrame *qf, int *seg_values)
 +{
-+    unsigned mb_cols = qf->block_cols;
-+    unsigned mb_rows = qf->block_rows;
-+    int seg_values[QPFILE_SVTAV1_MAX_SEGMENTS];
-+    unsigned n_seg = 0;
-+    unsigned i, j, sb_x, sb_y;
++    unsigned mb_cols = qf->block_cols, mb_rows = qf->block_rows;
++    unsigned i, j, n_seg = 0;
 +    int min_off = QPFILE_DELTA_MAX, max_off = QPFILE_DELTA_MIN;
-+    uint8_t *seg_map = NULL;
-+
-+    if (mb_cols == 0 || mb_rows == 0 || !qf->block_offsets ||
-+        dest_b64_cols == 0 || dest_b64_rows == 0)
-+        return AVERROR(EINVAL);
 +
 +    /* Pass 1: discover the value range. */
 +    for (i = 0; i < mb_rows; i++) {
@@ -553,11 +538,15 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe
 +        }
 +    }
 +
-+    /* Pass 3: emit the per-SB segment map at the encoder grid. */
-+    seg_map = av_calloc((size_t)dest_b64_rows * dest_b64_cols,
-+                        sizeof(*seg_map));
-+    if (!seg_map)
-+        return AVERROR(ENOMEM);
++    return n_seg;
++}
++
++static void roi_fill_map(const FFQpFrame *qf, unsigned dest_b64_cols,
++                         unsigned dest_b64_rows, const int *seg_values,
++                         unsigned n_seg, uint8_t *seg_map)
++{
++    unsigned mb_cols = qf->block_cols, mb_rows = qf->block_rows;
++    unsigned i, j, sb_x, sb_y;
 +
 +    for (sb_y = 0; sb_y < dest_b64_rows; sb_y++) {
 +        for (sb_x = 0; sb_x < dest_b64_cols; sb_x++) {
@@ -597,6 +586,34 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe
 +            seg_map[sb_y * dest_b64_cols + sb_x] = (uint8_t)best_idx;
 +        }
 +    }
++}
++
++static int build_one_roi_evt(const FFQpFrame *qf,
++                             unsigned dest_b64_cols,
++                             unsigned dest_b64_rows,
++                             SvtAv1RoiMapEvt *out_evt,
++                             uint8_t **out_seg_map)
++{
++    unsigned mb_cols = qf->block_cols;
++    unsigned mb_rows = qf->block_rows;
++    int seg_values[QPFILE_SVTAV1_MAX_SEGMENTS];
++    unsigned n_seg = 0;
++    unsigned i;
++    uint8_t *seg_map = NULL;
++
++    if (mb_cols == 0 || mb_rows == 0 || !qf->block_offsets ||
++        dest_b64_cols == 0 || dest_b64_rows == 0)
++        return AVERROR(EINVAL);
++
++    n_seg = roi_segment_values(qf, seg_values);
++
++    /* Pass 3: emit the per-SB segment map at the encoder grid. */
++    seg_map = av_calloc((size_t)dest_b64_rows * dest_b64_cols,
++                        sizeof(*seg_map));
++    if (!seg_map)
++        return AVERROR(ENOMEM);
++
++    roi_fill_map(qf, dest_b64_cols, dest_b64_rows, seg_values, n_seg, seg_map);
 +
 +    memset(out_evt, 0, sizeof(*out_evt));
 +    out_evt->start_picture_number = qf->frame_index;
@@ -668,7 +685,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe
  static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
  {
      SvtContext           *svt_enc = avctx->priv_data;
-@@ -613,8 +875,40 @@ static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
+@@ -613,8 +895,40 @@ static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
          return AVERROR_INVALIDDATA;
      }
  
@@ -709,7 +726,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe
      if (svt_ret != EB_ErrorNone)
          return svt_print_error(avctx, svt_ret, "Error sending a frame to encoder");
  
-@@ -784,6 +1078,23 @@ static av_cold int eb_enc_close(AVCodecContext *avctx)
+@@ -784,6 +1098,23 @@ static av_cold int eb_enc_close(AVCodecContext *avctx)
      ff_dovi_ctx_unref(&svt_enc->dovi);
      av_freep(&svt_enc->stats_buf);
  
@@ -733,7 +750,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe
      return 0;
  }
  
-@@ -828,6 +1139,7 @@ static const AVOption options[] = {
+@@ -828,6 +1159,7 @@ static const AVOption options[] = {
      { "qp", "Initial Quantizer level value", OFFSET(qp),
        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 63, VE },
      { "svtav1-params", "Set the SVT-AV1 configuration using a :-separated list of key=value parameters", OFFSET(svtav1_opts), AV_OPT_TYPE_DICT, { 0 }, 0, 0, VE },
@@ -742,7 +759,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..2932a0079f280ce292fe1859fa31ebbe
      { "dolbyvision", "Enable Dolby Vision RPU coding", OFFSET(dovi.enable), AV_OPT_TYPE_BOOL, {.i64 = FF_DOVI_AUTOMATIC }, -1, 1, VE, .unit = "dovi" },
      {   "auto", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = FF_DOVI_AUTOMATIC}, .flags = VE, .unit = "dovi" },
 diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
-index b688d4f3218414b4b572438c455625f7e4ce8e72..15beb2e2e4d259bd6b59730c7a5193a27f8f30d7 100644
+index b688d4f3218414b4b572438c455625f7e4ce8e72..01d74559971969ebfee5f94958ef9dc8d8762031 100644
 --- a/libavcodec/libx264.c
 +++ b/libavcodec/libx264.c
 @@ -39,6 +39,8 @@
@@ -873,10 +890,10 @@ index b688d4f3218414b4b572438c455625f7e4ce8e72..15beb2e2e4d259bd6b59730c7a5193a2
  
 diff --git a/libavcodec/qpfile_parser.c b/libavcodec/qpfile_parser.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..e0330af5d74354559d46cc6f0e98c82993a222ce
+index 0000000000000000000000000000000000000000..e94ca014ee6d0487a3ef91bb483969e88c69b727
 --- /dev/null
 +++ b/libavcodec/qpfile_parser.c
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,314 @@
 +/*
 + * Copyright 2026 Lusoris
 + *
@@ -1058,112 +1075,124 @@ index 0000000000000000000000000000000000000000..e0330af5d74354559d46cc6f0e98c829
 +    }
 +}
 +
++typedef struct QpLoadState {
++    unsigned bw, bh, cap_frames, row_count;
++    int *row_buf;
++    FFQpFrame *cur_frame;
++} QpLoadState;
++
++static int qpfile_finish_frame(QpLoadState *st)
++{
++    FFQpFrame *f = st->cur_frame;
++    if (f && st->row_count > 0) {
++        if (st->bw == 0) { st->bw = f->block_cols; st->bh = st->row_count; }
++        else if (st->row_count != st->bh) return AVERROR(EINVAL);
++        f->block_offsets = av_calloc((size_t)st->bh * st->bw, sizeof(int));
++        if (!f->block_offsets) return AVERROR(ENOMEM);
++        memcpy(f->block_offsets, st->row_buf, (size_t)st->bh * st->bw * sizeof(int));
++        f->block_rows = st->bh;
++        f->block_cols = st->bw;
++    }
++    return 0;
++}
++
++static int qpfile_add_header(FFQpFile *out, QpLoadState *st, const char *line)
++{
++    int ret = qpfile_finish_frame(st);
++    if (ret < 0) return ret;
++    if (out->frame_count == st->cap_frames) {
++        unsigned nc = st->cap_frames * 2u;
++        FFQpFrame *nf;
++        if (nc > QPFILE_MAX_FRAMES) return AVERROR(EINVAL);
++        nf = av_realloc_array(out->frames, nc, sizeof(*nf));
++        if (!nf) return AVERROR(ENOMEM);
++        memset(nf + st->cap_frames, 0, (nc - st->cap_frames) * sizeof(*nf));
++        out->frames = nf;
++        st->cap_frames = nc;
++    }
++    st->cur_frame = &out->frames[out->frame_count];
++    ret = parse_header(line, st->cur_frame);
++    if (ret < 0) return ret;
++    out->frame_count++;
++    st->row_count = 0;
++    return 0;
++}
++
++static int qpfile_add_row(QpLoadState *st, const char *line)
++{
++    unsigned tokens, this_bw, needed;
++    int *nrow, ret;
++    if (!st->cur_frame) return AVERROR(EINVAL);
++    tokens = count_tokens(line);
++    if (tokens == 0) return 0;
++    if (tokens > QPFILE_MAX_BLOCKS_PER_DIM) return AVERROR(EINVAL);
++    if (st->cur_frame->block_cols == 0) {
++        st->cur_frame->block_cols = tokens;
++        if (st->bw && tokens != st->bw) return AVERROR(EINVAL);
++    } else if (tokens != st->cur_frame->block_cols) {
++        return AVERROR(EINVAL);
++    }
++    this_bw = st->cur_frame->block_cols;
++    needed = (st->row_count + 1) * this_bw;
++    nrow = av_realloc_array(st->row_buf, needed, sizeof(int));
++    if (!nrow) return AVERROR(ENOMEM);
++    st->row_buf = nrow;
++    ret = parse_row(line, &st->row_buf[st->row_count * this_bw], this_bw);
++    if (ret < 0) return ret;
++    st->row_count++;
++    if (st->row_count > QPFILE_MAX_BLOCKS_PER_DIM) return AVERROR(EINVAL);
++    return 0;
++}
++
++static int qpfile_read_frames(FILE *fp, FFQpFile *out, QpLoadState *st,
++                              char **line, size_t *line_cap)
++{
++    ssize_t got = 0;
++    int ret;
++    while (got >= 0) {
++        ret = qpfile_getline(line, line_cap, fp, &got);
++        if (ret < 0) return ret;
++        if (got < 0) break;
++        if ((size_t)got > QPFILE_MAX_LINE_BYTES) return AVERROR(EINVAL);
++        if (got == 0 || (*line)[0] == '#' || (*line)[0] == '\n' || (*line)[0] == '\r')
++            continue;
++        if (looks_like_header(*line))
++            ret = qpfile_add_header(out, st, *line);
++        else
++            ret = qpfile_add_row(st, *line);
++        if (ret < 0) return ret;
++    }
++    return qpfile_finish_frame(st);
++}
++
 +int ff_qpfile_load(const char *path, FFQpFile *out)
 +{
-+    FILE *fp = NULL;
++    FILE *fp;
 +    char *line = NULL;
 +    size_t line_cap = 0;
-+    int ret = 0;
-+    unsigned bw = 0, bh = 0, cap_frames = 0;
-+    int *row_buf = NULL;
-+    unsigned row_count = 0;
-+    FFQpFrame *cur_frame = NULL;
++    QpLoadState st = { 0 };
++    int ret;
 +
 +    if (!path || !out) return AVERROR(EINVAL);
 +    memset(out, 0, sizeof(*out));
-+
 +    fp = fopen(path, "rb");
 +    if (!fp) return AVERROR(errno ? errno : ENOENT);
-+
-+    cap_frames = 16;
-+    out->frames = av_calloc(cap_frames, sizeof(*out->frames));
-+    if (!out->frames) { ret = AVERROR(ENOMEM); goto fail; }
-+
-+    while (1) {
-+        ssize_t got = 0;
-+        ret = qpfile_getline(&line, &line_cap, fp, &got);
-+        if (ret < 0) goto fail;
-+        if (got < 0) break;
-+        if ((size_t)got > QPFILE_MAX_LINE_BYTES) { ret = AVERROR(EINVAL); goto fail; }
-+        if (got == 0 || line[0] == '#' || line[0] == '\n' || line[0] == '\r')
-+            continue;
-+
-+        if (looks_like_header(line)) {
-+            if (cur_frame && row_count > 0) {
-+                if (bw == 0) { bw = cur_frame->block_cols; bh = row_count; }
-+                else if (row_count != bh) { ret = AVERROR(EINVAL); goto fail; }
-+                cur_frame->block_offsets = av_calloc((size_t)bh * bw, sizeof(int));
-+                if (!cur_frame->block_offsets) { ret = AVERROR(ENOMEM); goto fail; }
-+                memcpy(cur_frame->block_offsets, row_buf,
-+                       (size_t)bh * bw * sizeof(int));
-+                cur_frame->block_rows = bh;
-+                cur_frame->block_cols = bw;
-+            }
-+
-+            if (out->frame_count == cap_frames) {
-+                unsigned nc = cap_frames * 2u;
-+                if (nc > QPFILE_MAX_FRAMES) { ret = AVERROR(EINVAL); goto fail; }
-+                FFQpFrame *nf = av_realloc_array(out->frames, nc, sizeof(*nf));
-+                if (!nf) { ret = AVERROR(ENOMEM); goto fail; }
-+                memset(nf + cap_frames, 0, (nc - cap_frames) * sizeof(*nf));
-+                out->frames = nf;
-+                cap_frames = nc;
-+            }
-+
-+            cur_frame = &out->frames[out->frame_count];
-+            ret = parse_header(line, cur_frame);
-+            if (ret < 0) goto fail;
-+            out->frame_count++;
-+            row_count = 0;
-+        } else {
-+            if (!cur_frame) { ret = AVERROR(EINVAL); goto fail; }
-+            unsigned tokens = count_tokens(line);
-+            if (tokens == 0) continue;
-+            if (tokens > QPFILE_MAX_BLOCKS_PER_DIM) { ret = AVERROR(EINVAL); goto fail; }
-+            if (cur_frame->block_cols == 0) {
-+                cur_frame->block_cols = tokens;
-+                if (bw && tokens != bw) { ret = AVERROR(EINVAL); goto fail; }
-+            } else if (tokens != cur_frame->block_cols) {
-+                ret = AVERROR(EINVAL); goto fail;
-+            }
-+            unsigned this_bw = cur_frame->block_cols;
-+            unsigned needed = (row_count + 1) * this_bw;
-+            int *nrow = av_realloc_array(row_buf, needed, sizeof(int));
-+            if (!nrow) { ret = AVERROR(ENOMEM); goto fail; }
-+            row_buf = nrow;
-+            ret = parse_row(line, &row_buf[row_count * this_bw], this_bw);
-+            if (ret < 0) goto fail;
-+            row_count++;
-+            if (row_count > QPFILE_MAX_BLOCKS_PER_DIM) { ret = AVERROR(EINVAL); goto fail; }
-+        }
++    st.cap_frames = 16;
++    out->frames = av_calloc(st.cap_frames, sizeof(*out->frames));
++    if (!out->frames)
++        ret = AVERROR(ENOMEM);
++    else
++        ret = qpfile_read_frames(fp, out, &st, &line, &line_cap);
++    av_freep(&st.row_buf);
++    if (ret >= 0) {
++        out->block_cols = st.bw;
++        out->block_rows = st.bh;
++        if (out->frame_count == 0)
++            ret = AVERROR(EINVAL);
 +    }
-+
-+    if (cur_frame && row_count > 0) {
-+        if (bw == 0) { bw = cur_frame->block_cols; bh = row_count; }
-+        else if (row_count != bh) { ret = AVERROR(EINVAL); goto fail; }
-+        cur_frame->block_offsets = av_calloc((size_t)bh * bw, sizeof(int));
-+        if (!cur_frame->block_offsets) { ret = AVERROR(ENOMEM); goto fail; }
-+        memcpy(cur_frame->block_offsets, row_buf,
-+               (size_t)bh * bw * sizeof(int));
-+        cur_frame->block_rows = bh;
-+        cur_frame->block_cols = bw;
-+    }
-+    av_freep(&row_buf);
-+
-+    out->block_cols = bw;
-+    out->block_rows = bh;
-+
-+    if (out->frame_count == 0) { ret = AVERROR(EINVAL); goto fail; }
-+
 +    av_free(line);
 +    fclose(fp);
-+    return 0;
-+
-+fail:
-+    av_freep(&row_buf);
-+    av_free(line);
-+    if (fp) fclose(fp);
-+    ff_qpfile_free(out);
++    if (ret < 0) ff_qpfile_free(out);
 +    return ret;
 +}
 +
@@ -1181,7 +1210,7 @@ index 0000000000000000000000000000000000000000..e0330af5d74354559d46cc6f0e98c829
 +}
 diff --git a/libavcodec/qpfile_parser.h b/libavcodec/qpfile_parser.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a4a3c1127481aee6b96e6f956f6c8dc2fc89d4a
+index 0000000000000000000000000000000000000000..e38b1632f0f0ebe9a101d7a36813a36a570aecec
 --- /dev/null
 +++ b/libavcodec/qpfile_parser.h
 @@ -0,0 +1,55 @@

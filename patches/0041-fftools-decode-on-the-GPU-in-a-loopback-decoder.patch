@@ -120,7 +120,7 @@ index 1b37d39e6dcb606e81bc694df6c058414af8c713..e9b8a05e0d8748782b3ee14b580ca2a9
          dp->standalone_init.codec = avcodec_find_decoder_by_name(name);
 diff --git a/fftools/ffmpeg_dec_hwaccel.c b/fftools/ffmpeg_dec_hwaccel.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..d58fe0359e6dcff9cf2bff3aa08da94effabc3d2
+index 0000000000000000000000000000000000000000..c6e7e3e46b92f18031627742bffc1f5bd0714106
 --- /dev/null
 +++ b/fftools/ffmpeg_dec_hwaccel.c
 @@ -0,0 +1,106 @@
@@ -231,10 +231,10 @@ index 0000000000000000000000000000000000000000..d58fe0359e6dcff9cf2bff3aa08da94e
 +    av_freep(&hw->hwaccel_device);
 +}
 diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
-index fb92acf2e5f28d6c66c158e77402a20aff27eb31..81a82bec4c252076031f8b90d30e7f2f810e73b1 100644
+index 2c362c64af8fffb02438af0051609281bfaa45d5..2b894e00961bc84a1875743a04de95137da5f2e2 100644
 --- a/fftools/ffmpeg_opt.c
 +++ b/fftools/ffmpeg_opt.c
-@@ -1966,13 +1966,13 @@ const OptionDef options[] = {
+@@ -1926,13 +1926,13 @@ const OptionDef options[] = {
      { "b",                          OPT_TYPE_FUNC,   OPT_VIDEO | OPT_FUNC_ARG | OPT_PERFILE | OPT_OUTPUT,
          { .func_arg = opt_bitrate },
          "video bitrate (please use -b:v)", "bitrate" },
