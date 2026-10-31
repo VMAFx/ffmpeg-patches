@@ -65,10 +65,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/setup-python
         if: github.event.pull_request.draft != true
-        with:
-          python-version-file: .python-version
       # A dispatch may name the Pelorus branch to test, for a Pelorus change
       # that has to fit a series branch before either lands. The name only
       # reaches the shell through the environment, and only branch-name
@@ -86,15 +84,15 @@ jobs:
             fi
           fi
           echo "PELORUS_REF=$PELORUS_REF" >> "$GITHUB_ENV"
-      - name: Load the pinned base
+      - name: Prepare the pinned source
         if: github.event.pull_request.draft != true
-        run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
-      - name: Fetch and verify the pinned FFmpeg source
-        if: github.event.pull_request.draft != true
-        run: bash scripts/fetch_ffmpeg.sh
-      - name: Apply the series
-        if: github.event.pull_request.draft != true
-        run: python3 scripts/series.py apply --expect-base ffmpeg
+        uses: ./.github/actions/prepare-series
+        with:
+          toolchain: none
+          setup-python: 'false'
+          report: 'false'
+          in-scope: 'true'
+          draft: ${{ github.event.pull_request.draft == true }}
       - name: Fetch the consumer stacks
         if: github.event.pull_request.draft != true
         run: |
