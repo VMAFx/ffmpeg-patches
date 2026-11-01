@@ -1442,7 +1442,7 @@ class MakeTargetsTest(unittest.TestCase):
             raise unittest.SkipTest("make is not installed")
         cls._scratch = tempfile.TemporaryDirectory()
         cls.clone = Path(cls._scratch.name) / "clone"
-        subprocess.run(
+        subprocess.run(  # nosec B603 B607 - fixed git clone argv targets temporary test paths.
             ["git", "clone", "-q", "--no-hardlinks", str(series.ROOT), str(cls.clone)],
             env=series.git_env(),
             capture_output=True,
@@ -1465,7 +1465,7 @@ class MakeTargetsTest(unittest.TestCase):
 
     def run_make(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         env = {k: v for k, v in os.environ.items() if k not in self._LEAKY_MAKE_VARS}
-        return subprocess.run(
+        return subprocess.run(  # nosec B603 - make path and arguments are controlled test inputs.
             [self.make, "-s", "-C", str(self.clone), *arguments],
             capture_output=True,
             text=True,

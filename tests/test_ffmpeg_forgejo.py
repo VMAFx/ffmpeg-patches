@@ -37,7 +37,16 @@ def open_pull(number: int = 25612, login: str = "tester") -> dict:
     return {"number": number, "state": "open", "user": {"login": login}}
 
 
+def git(repo: Path, *args: str) -> None:
+    """Run Git with fixed argv in a temporary test repository."""
+
+    subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
+        ["git", *args], cwd=repo, check=True
+    )
+
+
 OTHER = {"context": "Test / Fate", "status": "pending"}
+ChangedFile = str | dict[str, str]
 
 
 class Stub:
@@ -65,7 +74,7 @@ class Stub:
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
         self.open_pulls: list[dict] = []
-        self.pull_files: dict[int, list[str]] = {}
+        self.pull_files: dict[int, list[ChangedFile]] = {}
         self.fail_pulls = False
         self.fail_files: set[int] = set()
         self.head_reads = 0
@@ -126,12 +135,15 @@ class Stub:
         page = int(query.get("page", ["1"])[0])
         limit = int(query.get("limit", ["30"])[0])
         rows = self.pull_files.get(number, [])
-        return [{"filename": name} for name in rows[(page - 1) * limit : page * limit]]
+        return [
+            row if isinstance(row, dict) else {"filename": row}
+            for row in rows[(page - 1) * limit : page * limit]
+        ]
 
 
 def overlap_stub(
     open_pulls: list[dict] | None = None,
-    pull_files: dict[int, list[str]] | None = None,
+    pull_files: dict[int, list[ChangedFile]] | None = None,
     reviewers: list[list[str]] | None = None,
     fail_pulls: bool = False,
     fail_files: set[int] | None = None,
@@ -244,13 +256,12 @@ class ForgejoTest(unittest.TestCase):
         (self.tmp / "body.md").write_text(BODY)
         self.repo = self.tmp / "ffmpeg"
         self.repo.mkdir()
-        subprocess.run(["git", "init", "-q", "-b", "master"], cwd=self.repo, check=True)
+        git(self.repo, "init", "-q", "-b", "master")
         candidate = self.repo / OVERLAP_FILE
         candidate.parent.mkdir(parents=True)
         candidate.write_text("base\n")
-        subprocess.run(["git", "add", OVERLAP_FILE], cwd=self.repo, check=True)
+        git(self.repo, "add", OVERLAP_FILE)
         commit = [
-            "git",
             "-c",
             "user.name=Test",
             "-c",
@@ -260,11 +271,11 @@ class ForgejoTest(unittest.TestCase):
             "commit",
             "-qm",
         ]
-        subprocess.run([*commit, "base"], cwd=self.repo, check=True)
-        subprocess.run(["git", "checkout", "-qb", "topic"], cwd=self.repo, check=True)
+        git(self.repo, *commit, "base")
+        git(self.repo, "checkout", "-qb", "topic")
         candidate.write_text("topic\n")
-        subprocess.run(["git", "add", OVERLAP_FILE], cwd=self.repo, check=True)
-        subprocess.run([*commit, "topic"], cwd=self.repo, check=True)
+        git(self.repo, "add", OVERLAP_FILE)
+        git(self.repo, *commit, "topic")
 
     def run_command(
         self,
@@ -740,6 +751,19 @@ class PullRequestOverlapTest(ForgejoTest):
         self.assertEqual(proc.returncode, 77, proc.stderr)
         self.assertIn("#25612", proc.stderr)
         self.assertIn(OVERLAP_FILE, proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
+    def test_own_open_pull_renaming_shared_file_is_refused(self) -> None:
+        """An own open pull renaming the candidate file exits 77 without a POST."""
+
+        changed_file = {
+            "filename": "libavfilter/vf_new.c",
+            "previous_filename": OVERLAP_FILE,
+        }
+        stub = overlap_stub(open_pulls=[open_pull()], pull_files={25612: [changed_file]})
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertIn("#25612", proc.stderr)
         self.assertEqual(self.pull_posts(stub), [])
 
     def test_nonoverlapping_open_pull_allows_creation(self) -> None:

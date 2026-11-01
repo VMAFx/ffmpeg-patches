@@ -133,7 +133,9 @@ def cosign_arguments(args: argparse.Namespace) -> list[str]:
 def verify(args: argparse.Namespace) -> list[str]:
     """Verify the signature of SUMS, then the files it lists."""
     try:
-        result = subprocess.run(cosign_arguments(args), check=False, timeout=300)
+        result = subprocess.run(  # nosec B603 - cosign argv is allow-listed by cosign_arguments.
+            cosign_arguments(args), check=False, timeout=300
+        )
     except FileNotFoundError as exc:
         raise GuardError("cosign is not installed") from exc
     if result.returncode != 0:

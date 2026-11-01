@@ -56,7 +56,9 @@ def first_difference(want: list[str], got: list[str]) -> str:
 def framecrc(*args: str) -> list[str]:
     """Decode the fixture with FFMPEG and return its framecrc frame lines."""
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", *args]
-    done = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    done = subprocess.run(  # nosec B603 - test argv uses explicit fixture tool paths and values.
+        cmd, capture_output=True, text=True, timeout=120, check=False
+    )
     if done.returncode != 0:
         raise AssertionError(f"{cmd} exited {done.returncode}: {done.stderr}")
     return framecrc_lines(done.stdout)

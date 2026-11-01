@@ -337,7 +337,7 @@ class ConsumerPinWorkflowTest(unittest.TestCase):
         for name, value in (("vmafx", vmafx), ("pelorus", pelorus)):
             (self.root / "consumers" / name / "build-config.env").write_text(value)
         self.env_file.write_text("")
-        return subprocess.run(
+        return subprocess.run(  # nosec B603 B607 - fixed bash argv executes a test fixture script.
             ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.script],
             cwd=self.root,
             env={**os.environ, "GITHUB_ENV": str(self.env_file)},

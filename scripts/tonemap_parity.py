@@ -110,7 +110,7 @@ def self_check() -> None:
 
 
 def frame_size(ffprobe: str, clip: str) -> tuple[int, int]:
-    out = subprocess.run(
+    out = subprocess.run(  # nosec B603 - ffprobe path and clip are explicit CLI inputs.
         [
             ffprobe,
             "-v",
@@ -151,7 +151,9 @@ def dump_samples(ffmpeg: str, pre: list[str], clip: str, vf: str, out: Path) -> 
         "rawvideo",
         str(out),
     ]
-    subprocess.run(cmd, check=True, timeout=RUN_TIMEOUT_S)
+    subprocess.run(  # nosec B603 - measurement argv is assembled from validated inputs.
+        cmd, check=True, timeout=RUN_TIMEOUT_S
+    )
 
 
 def load(path: Path, w: int, h: int) -> np.ndarray:
@@ -165,7 +167,7 @@ def load(path: Path, w: int, h: int) -> np.ndarray:
 def vram_mib() -> int | None:
     if not shutil.which("nvidia-smi"):
         return None
-    out = subprocess.run(
+    out = subprocess.run(  # nosec B603 B607 - fixed nvidia-smi query with bounded timeout.
         ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", "0"],
         capture_output=True,
         text=True,
@@ -182,7 +184,7 @@ def timed_run(ffmpeg: str, pre: list[str], clip: str, vf: str, work: Path) -> di
     smi = None
     if idle is not None:
         with log.open("w") as fh:
-            smi = subprocess.Popen(
+            smi = subprocess.Popen(  # nosec B603 B607 - fixed nvidia-smi monitor argv.
                 [
                     "nvidia-smi",
                     "--query-gpu=memory.used",
@@ -210,7 +212,9 @@ def timed_run(ffmpeg: str, pre: list[str], clip: str, vf: str, work: Path) -> di
         "-",
     ]
     t0 = time.monotonic()
-    rc = subprocess.run(cmd, check=False, timeout=RUN_TIMEOUT_S).returncode
+    rc = subprocess.run(  # nosec B603 - benchmark argv is assembled from validated inputs.
+        cmd, check=False, timeout=RUN_TIMEOUT_S
+    ).returncode
     wall = time.monotonic() - t0
     peak = None
     if smi is not None:
