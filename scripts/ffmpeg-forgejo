@@ -24,13 +24,14 @@
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
 # Environment: FFMPEG_FORGEJO_REPO (default FFmpeg/FFmpeg), FFMPEG_FORGEJO_BASE (default master),
-#   FFMPEG_FORGEJO_API (API base override, for tests).
+#   FFMPEG_FORGEJO_API (API base override, for tests), FFMPEG_FORGEJO_GIT (upstream Git URL override).
 set -euo pipefail
 
 HOST="https://code.ffmpeg.org"
 API="${FFMPEG_FORGEJO_API:-$HOST/api/v1}"
 REPO="${FFMPEG_FORGEJO_REPO:-FFmpeg/FFmpeg}"
 BASE="${FFMPEG_FORGEJO_BASE:-master}"
+GIT_URL="${FFMPEG_FORGEJO_GIT:-$HOST/$REPO.git}"
 
 die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
 
@@ -203,6 +204,7 @@ check_pull_files() {
     fi
     if ! parsed="$(python3 -c 'import json, os, pathlib, sys
 rows = json.load(sys.stdin)
+if rows is None and int(sys.argv[2]) >= 2: rows = []
 if not isinstance(rows, list): raise SystemExit(1)
 names = []
 for row in rows:
@@ -218,7 +220,7 @@ raw = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")
 candidates = {os.fsdecode(name) for name in raw if name}
 print(len(rows))
 print(json.dumps(sorted(candidates.intersection(names)), ensure_ascii=False))' \
-      "$candidates" <<<"$out" 2>/dev/null)"; then
+      "$candidates" "$file_page" <<<"$out" 2>/dev/null)"; then
       printf 'ffmpeg-forgejo: cannot parse files of own open pull #%s.\n' "$number" >&2
       return 1
     fi
@@ -241,8 +243,13 @@ print(json.dumps(sorted(candidates.intersection(names)), ensure_ascii=False))' \
 check_pr_overlap() {
   local branch="$1" me="$2" allowed="$3" candidates pull_page out parsed count number encoded_me rc
   local -a numbers
+  if ! timeout 120 git fetch --quiet --no-tags "$GIT_URL" "refs/heads/$BASE"; then
+    printf 'ffmpeg-forgejo: cannot fetch %s from %s; overlap not proven absent; no pull request opened.\n' \
+      "$BASE" "$GIT_URL" >&2
+    return 1
+  fi
   candidates="$(mktemp)"
-  if ! git diff --no-ext-diff --no-renames --name-only -z "$BASE...$branch" -- >"$candidates"; then
+  if ! git diff --no-ext-diff --no-renames --name-only -z "FETCH_HEAD...$branch" -- >"$candidates"; then
     printf 'ffmpeg-forgejo: cannot determine files in %s relative to %s; no pull request opened.\n' \
       "$branch" "$BASE" >&2
     rm -f "$candidates"

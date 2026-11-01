@@ -51,6 +51,19 @@ def git(repo: Path, *args: str) -> None:
     )
 
 
+def git_output(repo: Path, *args: str) -> str:
+    """Return the stripped output of Git with fixed argv in a temporary test repository."""
+
+    return subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        cwd=repo,
+        env=isolated_git_environment(),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 OTHER = {"context": "Test / Fate", "status": "pending"}
 ChangedFile = str | dict[str, str]
 
@@ -192,16 +205,17 @@ class Stub:
         limit = int(query.get("limit", ["30"])[0])
         return rows[(page - 1) * limit : page * limit]
 
-    def files(self, number: int, query: dict[str, list[str]]) -> list[dict]:
+    def files(self, number: int, query: dict[str, list[str]]) -> list[dict] | None:
         """Return one page of changed files for a pull request."""
 
         page = int(query.get("page", ["1"])[0])
         limit = int(query.get("limit", ["30"])[0])
         rows = self.pull_files.get(number, [])
-        return [
+        result = [
             row if isinstance(row, dict) else {"filename": row}
             for row in rows[(page - 1) * limit : page * limit]
         ]
+        return None if page > 1 and not result else result
 
 
 def overlap_stub(
@@ -335,6 +349,8 @@ class ForgejoTest(unittest.TestCase):
             "-qm",
         ]
         git(self.repo, *commit, "base")
+        self.upstream = self.tmp / "upstream.git"
+        git(self.tmp, "clone", "-q", "--bare", str(self.repo), str(self.upstream))
         git(self.repo, "checkout", "-qb", "topic")
         candidate.write_text("topic\n")
         git(self.repo, "add", OVERLAP_FILE)
@@ -358,6 +374,7 @@ class ForgejoTest(unittest.TestCase):
             env.update(
                 PATH=os.pathsep.join(dirs + [env.get("PATH", "")]),
                 FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
+                FFMPEG_FORGEJO_GIT=str(self.upstream),
                 FFMPEG_FORGEJO_POLL="0",
             )
             env.update(env_updates or {})
@@ -851,6 +868,90 @@ class PullRequestOverlapTest(ForgejoTest):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.pull_posts(stub)), 1)
 
+    def test_full_file_page_followed_by_null_allows_creation(self) -> None:
+        """A full first file page followed by a null page ends the listing and allows creation."""
+
+        files = [f"libavfilter/other_{number}.c" for number in range(50)]
+        stub = overlap_stub(
+            reviewers=[["alice"]], open_pulls=[open_pull()], pull_files={25612: files}
+        )
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.pull_posts(stub)), 1)
+
+    def test_null_first_file_page_fails_closed(self) -> None:
+        """A null first file page exits one as unparsable without a POST."""
+
+        stub = overlap_stub(open_pulls=[open_pull()])
+        with unittest.mock.patch.object(stub, "files", return_value=None):
+            proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot parse files", proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
+    def test_upstream_base_avoids_stale_local_master(self) -> None:
+        """The guard diffs against the fetched upstream base, not a stale local master."""
+
+        upstream_work = self.tmp / "upstream-work"
+        git(self.tmp, "clone", "-q", str(self.upstream), str(upstream_work))
+        upstream_work.joinpath("upstream-file").write_text("upstream\n")
+        git(upstream_work, "add", "upstream-file")
+        git(
+            upstream_work,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "advance upstream",
+        )
+        git(upstream_work, "push", "-q", "origin", "master")
+        master = git_output(self.repo, "rev-parse", "master")
+        git(self.repo, "fetch", "-q", str(self.upstream), "refs/heads/master")
+        git(self.repo, "reset", "--hard", "-q", "FETCH_HEAD")
+        self.repo.joinpath(OVERLAP_FILE).write_text("topic on upstream\n")
+        git(self.repo, "add", OVERLAP_FILE)
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "new topic",
+        )
+        stub = overlap_stub(
+            reviewers=[["alice"]], open_pulls=[open_pull()], pull_files={25612: ["upstream-file"]}
+        )
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.pull_posts(stub)), 1)
+        after = git_output(self.repo, "rev-parse", "master")
+        self.assertEqual(after, master)
+
+    def test_unreachable_upstream_fails_closed(self) -> None:
+        """An unreachable upstream base exits one without a POST."""
+
+        stub = overlap_stub(reviewers=[["alice"]])
+        missing = str(self.tmp / "missing.git")
+        proc = self.run_command(
+            stub,
+            "pr",
+            "topic",
+            "title",
+            str(self.tmp / "body.md"),
+            env_updates={"FFMPEG_FORGEJO_GIT": missing},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"cannot fetch master from {missing}; overlap not proven absent", proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
     def test_other_login_overlap_allows_creation(self) -> None:
         """The poster filter excludes an overlapping pull from another login."""
 
@@ -937,6 +1038,46 @@ class MutantTest(unittest.TestCase):
                     result = unittest.TestResult()
                     suite.run(result)
                     self.assertTrue(result.failures or result.errors, f"{name} survived")
+
+
+class PullOverlapMutantTest(unittest.TestCase):
+    """Check that pagination and upstream regressions are detected."""
+
+    def test_overlap_mutants_are_caught(self) -> None:
+        """Each planted pagination or base defect fails at least one overlap case."""
+
+        source = HELPER.read_text()
+        mutations = (
+            (
+                "if rows is None and int(sys.argv[2]) >= 2: rows = []",
+                "",
+                (
+                    "test_nonoverlapping_open_pull_allows_creation",
+                    "test_full_file_page_followed_by_null_allows_creation",
+                ),
+            ),
+            (
+                "if rows is None and int(sys.argv[2]) >= 2: rows = []",
+                "if rows is None: rows = []",
+                ("test_null_first_file_page_fails_closed",),
+            ),
+            (
+                '"FETCH_HEAD...$branch"',
+                '"$BASE...$branch"',
+                ("test_upstream_base_avoids_stale_local_master",),
+            ),
+        )
+        for old, new, cases in mutations:
+            self.assertEqual(source.count(old), 1, "mutation site missing")
+            with tempfile.TemporaryDirectory() as tmp:
+                mutant = Path(tmp) / "ffmpeg-forgejo"
+                mutant.write_text(source.replace(old, new))
+                case = type("MutatedOverlap", (PullRequestOverlapTest,), {"helper": mutant})
+                for name in cases:
+                    with self.subTest(test=name):
+                        result = unittest.TestResult()
+                        case(name).run(result)
+                        self.assertTrue(result.failures or result.errors, f"{name} survived")
 
 
 if __name__ == "__main__":
