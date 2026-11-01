@@ -44,3 +44,5 @@
 0037-avcodec-aom_film_grain-Assume-the-predicted-luma-poi.patch
 0038-avcodec-vvc-intra_template-bound-reference-corner-ex.patch
 0039-avcodec-wmalosslessdec-Clear-subframe-flags-as-an-ar.patch
+0040-libavcodec-unified-qpfile-across-libx264-libsvtav1-l.patch
+0041-fftools-decode-on-the-GPU-in-a-loopback-decoder.patch

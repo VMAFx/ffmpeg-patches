@@ -1,0 +1,75 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx"]
+origin = "the VMAFx vmaf-tune workflow, which needs one per-frame QP-offset file format shared across the libx264, libsvtav1 and libaom encoders"
+notes = """
+Adds a -qpfile <path> AVOption on libx264, libsvtav1 and libaom-av1. A shared \
+parser at libavcodec/qpfile_parser.{c,h} reads the file once into an FFQpFile \
+struct (header lines <frame_idx> <I|P|B> <qp>, optional per-MB-row delta lines) \
+so each encoder adapter maps it into its native ROI or per-block QP-offset API. \
+libx264 forwards the path to x264's native qpfile reader; libsvtav1 and libaom \
+use the shared parser directly.
+
+Generic: carries no VMAFx or vmaf-tune identifiers and no downstream ADR \
+references. Not sent upstream yet; refreshed against the pinned base with every \
+FFmpeg release."""
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/libaomenc.c"
+function = "aom_init"
+lines = 322
+category = "D"
+entered = "2026-10-31"
+expires = "2027-02-28"
+reason = "upstream function, 294 lines at the pinned base; the patch adds the -qpfile load inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/libaomenc.c"
+function = "aom_encode"
+lines = 142
+category = "D"
+entered = "2026-10-31"
+expires = "2027-02-28"
+reason = "upstream function, 136 lines at the pinned base; the patch adds the per-frame qpfile ROI apply call inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/libsvtav1.c"
+function = "eb_enc_init"
+lines = 104
+category = "D"
+entered = "2026-10-31"
+expires = "2027-02-28"
+reason = "upstream function, 68 lines at the pinned base; the patch adds the -qpfile load inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/libsvtav1.c"
+function = "eb_send_frame"
+lines = 101
+category = "D"
+entered = "2026-10-31"
+expires = "2027-02-28"
+reason = "upstream function, 69 lines at the pinned base; the patch adds the per-frame ROI event attach inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/libx264.c"
+function = "setup_frame"
+lines = 148
+category = "D"
+entered = "2026-10-31"
+expires = "2027-02-28"
+reason = "upstream function, 142 lines at the pinned base; the patch adds the per-frame qpfile offsets inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/libx264.c"
+function = "X264_init"
+lines = 401
+category = "D"
+entered = "2026-10-31"
+expires = "2027-02-28"
+reason = "upstream function, 372 lines at the pinned base; the patch adds the -qpfile load and macroblock-grid setup inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
