@@ -211,10 +211,13 @@ class SubprocessNosecTest(unittest.TestCase):
                 "out(['tool'])",
                 "subprocess.run(['tool'], **options)",
                 "subprocess.run(['tool'], timeout=None)",
+                "subprocess.run(['tool'], 5)",
+                "subprocess.check_output(['tool'], 5)",
+                "subprocess.check_call(['tool'], 5)",
                 "",
             )
         )
-        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 4, 5, 6])
+        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 4, 5, 6, 7, 8, 9])
 
     def test_popen_wait_without_timeout_is_reported(self) -> None:
         """wait() and communicate() on a Popen result need a deadline; other waits do not."""
