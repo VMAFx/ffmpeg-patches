@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from array import array
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +29,19 @@ SEMIPLANAR_FORMATS = {
     "p012le": ("yuv420p12le", 12, True),
     "p016le": ("yuv420p16le", 16, True),
 }
+GIT_ENVIRONMENT_NAMES = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    }
+)
 
 
 SIZE = 64
@@ -44,18 +57,28 @@ CPU = (
 RESET_TOOL = os.environ.get("HQDN3D_RESET_TOOL", "")
 
 
+def isolated_git_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return an environment without caller Git repository overrides."""
+
+    source = os.environ if environment is None else environment
+    return {name: value for name, value in source.items() if name not in GIT_ENVIRONMENT_NAMES}
+
+
 def python_sources(root: Path) -> list[Path]:
     """Return tracked Python modules and shebang-identified scripts."""
 
-    tracked = subprocess.run(  # nosec B603 B607 - fixed git query against the test repository.
-        ["git", "ls-files", "-z"],
-        cwd=root,
-        env=series.git_env(),
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
+    try:
+        tracked = subprocess.run(  # nosec B603 B607 - fixed query against the test repository.
+            ["git", "ls-files", "-z"],
+            cwd=root,
+            env=isolated_git_environment(series.git_env()),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        raise RuntimeError(f"cannot list tracked files in {root}: {error}") from error
     sources = []
     tests = root / "tests"
     scripts = root / "scripts"
@@ -63,6 +86,8 @@ def python_sources(root: Path) -> list[Path]:
         if not name:
             continue
         path = root / name
+        if not path.is_file():
+            continue
         if path.suffix == ".py" and (tests in path.parents or scripts in path.parents):
             sources.append(path)
             continue
@@ -231,7 +256,7 @@ def lavfi() -> list[str]:
 def run_git(tree: Path, *args: str) -> str:
     result = subprocess.run(  # nosec B603 B607 - fixed git argv in a temporary test tree.
         ["git", "-C", str(tree), "-c", "user.name=Dev", "-c", "user.email=dev@invalid", *args],
-        env=series.git_env(),
+        env=isolated_git_environment(series.git_env()),
         capture_output=True,
         text=True,
         check=True,

@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import ast
+import os
+import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from tests.helpers import python_sources, run_git
@@ -31,6 +34,50 @@ def find_import_and_import_from(source: str, *, filename: str = "<unknown>") -> 
 
 
 class ImportStyleTest(unittest.TestCase):
+    def test_python_sources_and_run_git_ignore_checkout_environment(self) -> None:
+        """Source discovery and fixture Git use the requested repository."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_git(root, "init", "-q")
+            source = root / "scripts" / "tracked.py"
+            source.parent.mkdir()
+            source.write_text("pass\n", encoding="utf-8")
+            run_git(root, "add", "scripts/tracked.py")
+            bogus = root / "bogus"
+            overrides = {"GIT_DIR": str(bogus / "git"), "GIT_INDEX_FILE": str(bogus / "index")}
+
+            with unittest.mock.patch.dict(os.environ, overrides):
+                self.assertEqual(run_git(root, "ls-files"), "scripts/tracked.py")
+                self.assertEqual(python_sources(root), [source])
+
+    def test_python_sources_names_repository_when_git_fails(self) -> None:
+        """Source discovery identifies a directory that Git cannot inspect."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(RuntimeError) as caught:
+                python_sources(root)
+            self.assertIn(str(root), str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, subprocess.CalledProcessError)
+
+    def test_python_sources_skips_deleted_tracked_files(self) -> None:
+        """Tracked paths missing from the worktree are outside the scan."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_git(root, "init", "-q")
+            scripts = root / "scripts"
+            scripts.mkdir()
+            sources = [scripts / "x.py", scripts / "y"]
+            sources[0].write_text("pass\n", encoding="utf-8")
+            sources[1].write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            run_git(root, "add", "scripts/x.py", "scripts/y")
+            for source in sources:
+                source.unlink()
+
+            self.assertEqual(python_sources(root), [])
+
     def test_python_sources_excludes_tracked_python_outside_scanned_directories(self) -> None:
         """Tracked Python outside tests and scripts remains outside scanner scope."""
 
