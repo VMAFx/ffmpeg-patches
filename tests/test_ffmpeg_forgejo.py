@@ -39,14 +39,15 @@ class Stub:
     heads: head sha returned by successive GET /pulls/1 (the last one repeats).
     polls: sha -> list of status lists, one per poll (page 1 starts a poll; the last repeats).
     fail_status: answer the status endpoint with HTTP 500.
+    pull_status: answer GET /pulls/1 with this HTTP status instead of a pull.
     """
 
     def __init__(
         self,
-        heads: list[str] | None = None,
+        heads: list[object] | None = None,
         polls: dict[str, list[list[dict]]] | None = None,
         fail_status: bool = False,
-        pull_exists: bool = True,
+        pull_status: int = 200,
         reviewers: list[list[str]] | None = None,
     ):
         """Initialize scripted pull, status, and reviewer responses."""
@@ -54,14 +55,15 @@ class Stub:
         heads = heads or [A]
         polls = polls or {}
         self.heads, self.polls, self.fail_status = heads, polls, fail_status
-        self.pull_exists = pull_exists
+        self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
         self.head_reads = 0
         self.reviewer_reads = 0
         self.poll_index = {sha: -1 for sha in polls}
         self.requests: list[tuple[str, str, str]] = []
+        self.pull_headers: list[dict[str, str]] = []
 
-    def head(self) -> str:
+    def head(self) -> object:
         """Return the next scripted pull head, repeating the last."""
 
         sha = self.heads[min(self.head_reads, len(self.heads) - 1)]
@@ -128,8 +130,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         is_status = len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status"
         if url.path == "/api/v1/user":
             self.reply(200, {"login": "tester"})
-        elif url.path.endswith("/pulls/1") and stub.pull_exists:
-            self.reply(200, stub.pull())
+        elif url.path.endswith("/pulls/1"):
+            stub.pull_headers.append(dict(self.headers.items()))
+            if stub.pull_status == 200:
+                self.reply(200, stub.pull())
+            else:
+                self.reply(stub.pull_status, {"message": "pull read failed"})
         elif is_status and stub.fail_status:
             self.reply(500, {"message": "boom"})
         elif is_status:
@@ -183,7 +189,11 @@ class ForgejoTest(unittest.TestCase):
         (self.tmp / "body.md").write_text(BODY)
 
     def run_command(
-        self, stub: Stub, *args: str, path_first: Path | None = None
+        self,
+        stub: Stub,
+        *args: str,
+        path_first: Path | None = None,
+        env_updates: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run one allow-listed helper subcommand against the stub API."""
 
@@ -198,6 +208,7 @@ class ForgejoTest(unittest.TestCase):
                 FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
                 FFMPEG_FORGEJO_POLL="0",
             )
+            env.update(env_updates or {})
             return subprocess.run(  # nosec B603 - fixed interpreter/helper, allow-list, test literals.
                 ["bash", str(self.helper), *args],
                 env=env,
@@ -364,6 +375,120 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertIn(LIVE, proc.stderr)
         self.assertEqual(self.posts(stub), [])
 
+    def test_comment_pull_server_failure_exits_one_without_post(self) -> None:
+        """A pull HTTP 500 exits 1 with its status and never posts a comment."""
+
+        stub = Stub(pull_status=500)
+        proc = self.comment(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            f"cannot read the head of #1 (HTTP 500); tested head {A} not checked",
+            proc.stderr,
+        )
+        self.assertEqual(self.posts(stub), [])
+
+    def test_edit_body_pull_auth_failure_exits_one_without_patch(self) -> None:
+        """A pull HTTP 401 exits 1 with its status and never patches the body."""
+
+        stub = Stub(pull_status=401)
+        proc = self.edit_body(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            f"cannot read the head of #1 (HTTP 401); tested head {A} not checked",
+            proc.stderr,
+        )
+        self.assertEqual(self.patches(stub), [])
+
+    def test_curlrc_fail_keeps_a_missing_pull_as_exit_76(self) -> None:
+        """A curlrc fail option cannot turn a missing pull into a curl failure."""
+
+        (self.tmp / ".curlrc").write_text("fail\n")
+        stub = Stub(pull_status=404)
+        proc = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "1",
+            str(self.tmp / "body.md"),
+            env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)},
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("not a pull request", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+        self.assertEqual(self.patches(stub), [])
+
+    def test_curl_transport_failure_exits_one_without_post(self) -> None:
+        """A curl transport failure reports its status without attempting a POST."""
+
+        fake_bin = self.tmp / "fake-bin"
+        fake_bin.mkdir()
+        log = self.tmp / "curl.log"
+        curl = fake_bin / "curl"
+        curl.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >>"$CURL_LOG"\nexit 7\n')
+        curl.chmod(0o755)
+        stub = Stub()
+        proc = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "1",
+            str(self.tmp / "body.md"),
+            path_first=fake_bin,
+            env_updates={"CURL_LOG": str(log)},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("curl rc 7", proc.stderr)
+        invocations = log.read_text().splitlines()
+        self.assertEqual(len(invocations), 1)
+        self.assertIn("-X GET", invocations[0])
+
+    def test_curlrc_header_reaches_the_pull_read(self) -> None:
+        """The tested-head pull read preserves headers configured in curlrc."""
+
+        (self.tmp / ".curlrc").write_text('header = "X-Curlrc: 1"\n')
+        stub = Stub()
+        proc = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "1",
+            str(self.tmp / "body.md"),
+            env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.pull_headers[0].get("X-Curlrc"), "1")
+
+    def test_null_live_head_exits_one_without_post(self) -> None:
+        """A null live head exits 1 as unreadable without posting a comment."""
+
+        stub = Stub([None])
+        proc = self.comment(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot read the head", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_short_live_head_exits_one_without_post(self) -> None:
+        """A short live head exits 1 as unreadable without posting a comment."""
+
+        stub = Stub(["abc"])
+        proc = self.comment(stub, "--tested-head", A)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot read the head", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_matching_seven_character_live_head_exits_one_without_post(self) -> None:
+        """A matching seven-character live head cannot authorize a comment."""
+
+        short = LIVE[:7]
+        stub = Stub([short])
+        proc = self.comment(stub, "--tested-head", short)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot read the head", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
     def test_matching_prefix_and_full_head_are_posted(self) -> None:
         """Both matching head prefixes and full hashes authorize a comment."""
 
@@ -437,13 +562,13 @@ class TestClaimHeadTest(ForgejoTest):
     def test_issue_refuses_tested_head_and_accepts_no_test_claims(self) -> None:
         """Issue comments reject tested-head claims but accept no-test claims."""
 
-        stub = Stub(pull_exists=False)
+        stub = Stub(pull_status=404)
         proc = self.comment(stub, "--tested-head", A)
         self.assertEqual(proc.returncode, 76)
         self.assertIn("not a pull request", proc.stderr)
         self.assertEqual(self.posts(stub), [])
 
-        stub = Stub(pull_exists=False)
+        stub = Stub(pull_status=404)
         proc = self.comment(stub, "--no-test-claims")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
@@ -451,7 +576,7 @@ class TestClaimHeadTest(ForgejoTest):
     def test_issue_edit_body_refuses_tested_head_before_autolabel(self) -> None:
         """An issue body edit exits 76 before status reads and never PATCHes."""
 
-        stub = Stub(pull_exists=False)
+        stub = Stub(pull_status=404)
         proc = self.edit_body(stub, "--tested-head", A)
         self.assertEqual(proc.returncode, 76)
         self.assertIn(f"#1 is not a pull request; tested head {A} cannot be checked", proc.stderr)

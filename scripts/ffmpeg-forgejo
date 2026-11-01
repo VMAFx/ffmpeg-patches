@@ -80,6 +80,27 @@ head_sha() {
   python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])' <<<"$out"
 }
 
+# pull_status NUMBER: prints the HTTP status, then the response body. --no-fail preserves the
+# user's curl config while overriding curlrc fail, so a 404 remains a status instead of curl rc 22.
+pull_status() {
+  local number="$1" hdr response tok code curl_rc
+  tok="$(token)" || exit 1
+  hdr="$(mktemp)"
+  response="$(mktemp)"
+  trap 'rm -f "$hdr" "$response"' RETURN
+  chmod 600 "$hdr" "$response"
+  printf 'Authorization: token %s\n' "$tok" >"$hdr"
+  if code="$(curl --no-fail -sS -o "$response" -w '%{http_code}' --max-time 60 -X GET \
+    -H @"$hdr" "$API/repos/$REPO/pulls/$number")"; then
+    curl_rc=0
+  else
+    curl_rc=$?
+  fi
+  printf '%s\n' "$code"
+  [ "$curl_rc" -eq 0 ] || return "$curl_rc"
+  cat "$response"
+}
+
 # parse_claim_option USAGE ARGS...: set claim_mode, tested_head and claim_args.
 parse_claim_option() {
   local usage="$1"
@@ -105,11 +126,37 @@ parse_claim_option() {
 
 # require_tested_head NUMBER TESTED: refuse unless TESTED prefixes the live PR head.
 require_tested_head() {
-  local number="$1" tested="$2" live
-  if ! live="$(head_sha "$number")"; then
+  local number="$1" tested="$2" response status body live rc
+  if response="$(pull_status "$number")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -ne 0 ]; then
+    printf 'ffmpeg-forgejo: cannot read the head of #%s (curl rc %s); tested head %s not checked.\n' \
+      "$number" "$rc" "$tested" >&2
+    exit 1
+  fi
+  status="${response%%$'\n'*}"
+  if [ "$status" = 404 ]; then
     printf 'ffmpeg-forgejo: #%s is not a pull request; tested head %s cannot be checked.\n' \
       "$number" "$tested" >&2
     exit 76
+  fi
+  if [ "$status" != 200 ]; then
+    printf 'ffmpeg-forgejo: cannot read the head of #%s (HTTP %s); tested head %s not checked.\n' \
+      "$number" "$status" "$tested" >&2
+    exit 1
+  fi
+  body="${response#*$'\n'}"
+  if ! live="$(python3 -c 'import json,re,sys
+try:
+    sha = json.load(sys.stdin)["head"]["sha"]
+except (KeyError, TypeError):
+    raise SystemExit(1)
+if not isinstance(sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None:
+    raise SystemExit(1)
+print(sha)' \
+    <<<"$body" 2>/dev/null)"; then
+    printf 'ffmpeg-forgejo: cannot read the head of #%s (HTTP %s); tested head %s not checked.\n' \
+      "$number" "$status" "$tested" >&2
+    exit 1
   fi
   live="${live,,}"
   if [[ "$live" != "$tested"* ]]; then
