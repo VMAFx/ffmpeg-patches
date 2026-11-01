@@ -92,6 +92,12 @@ def popen_waits(tree: ast.AST, popens: list[ast.Call]) -> list[ast.Call]:
         if isinstance(node, ast.Assign) and node.value in popens:
             process_names.update(t.id for t in node.targets if isinstance(t, ast.Name))
         elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value in popens
+            and isinstance(node.target, ast.Name)
+        ):
+            process_names.add(node.target.id)
+        elif (
             isinstance(node, ast.withitem)
             and node.context_expr in popens
             and isinstance(node.optional_vars, ast.Name)
@@ -209,6 +215,8 @@ class SubprocessNosecTest(unittest.TestCase):
                 "import subprocess",
                 "proc = subprocess.Popen(['tool'])",
                 "proc.communicate()",
+                "ann: subprocess.Popen = subprocess.Popen(['tool'])",
+                "ann.wait()",
                 "subprocess.Popen(['tool']).wait()",
                 "proc.wait(timeout=None)",
                 "proc.wait(timeout=5)",
@@ -219,7 +227,7 @@ class SubprocessNosecTest(unittest.TestCase):
                 "",
             )
         )
-        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 4, 5, 8])
+        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 5, 6, 7, 10])
 
     def test_blocking_call_with_timeout_and_popen_are_accepted(self) -> None:
         """A call with an explicit timeout and a Popen constructor produce no offenders."""
