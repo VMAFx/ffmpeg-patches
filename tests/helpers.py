@@ -185,7 +185,9 @@ def rebuild_source(ffmpeg: str, tmp: str, codec: str, pixel_format: str = "") ->
             f"testsrc2=s={width}x{height}:d=0.32,noise=alls=20:allf=t{pixel_format}",
             "-c:v", codec, str(part),
         ]  # fmt: skip
-        subprocess.run(encode, capture_output=True, timeout=120, check=True)
+        subprocess.run(  # nosec B603 - test builds encoder argv from fixture-controlled values.
+            encode, capture_output=True, timeout=120, check=True
+        )
         parts.append(f"file '{part}'\n")
     listing = Path(tmp) / "list.txt"
     listing.write_text("".join(parts), encoding="utf-8")
@@ -197,7 +199,7 @@ def lavfi() -> list[str]:
 
 
 def run_git(tree: Path, *args: str) -> str:
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603 B607 - fixed git argv in a temporary test tree.
         ["git", "-C", str(tree), "-c", "user.name=Dev", "-c", "user.email=dev@invalid", *args],
         env=series.git_env(),
         capture_output=True,
@@ -257,7 +259,9 @@ def filter_frames(
         *source, "-vf", chain, *(["-noautoscale"] if noautoscale else []),
         "-f", "rawvideo", "pipe:1",
     ]  # fmt: skip
-    return subprocess.run(cmd, capture_output=True, timeout=300, check=False)
+    return subprocess.run(  # nosec B603 - test command comes from fixture-controlled tool paths.
+        cmd, capture_output=True, timeout=300, check=False
+    )
 
 
 def filter_frame(
@@ -271,7 +275,9 @@ def filter_frame(
         "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-s", f"{size}x{size}", "-i", "pipe:0",
         "-vf", f"{pq_input},{chain}", "-f", "rawvideo", "pipe:1",
     ]  # fmt: skip
-    return subprocess.run(cmd, input=frame, capture_output=True, timeout=120, check=False)
+    return subprocess.run(  # nosec B603 - test command comes from fixture-controlled tool paths.
+        cmd, input=frame, capture_output=True, timeout=120, check=False
+    )
 
 
 def hqdn3d_chains(
@@ -316,7 +322,9 @@ def assert_temporal_match(
 
 
 def run_reset(tool: str, device: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run([tool, device], capture_output=True, timeout=300, check=False)
+    return subprocess.run(  # nosec B603 - test tool and device are explicit fixture inputs.
+        [tool, device], capture_output=True, timeout=300, check=False
+    )
 
 
 def assert_ffv1_rebuild_matches(

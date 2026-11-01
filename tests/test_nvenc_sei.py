@@ -174,7 +174,7 @@ def run_function(function: str, scratch: Path, rows: list[Picture]) -> list[str]
     source.write_text(PRELUDE + function + DRIVER)
     exe = scratch / "check"
     cmd = [CC, "-std=c99", "-Wall", "-Wextra", "-pedantic", "-Werror"]
-    build = subprocess.run(
+    build = subprocess.run(  # nosec B603 - compiler argv uses fixture-controlled paths and flags.
         [*cmd, str(source), "-o", str(exe)],
         capture_output=True,
         text=True,
@@ -184,7 +184,7 @@ def run_function(function: str, scratch: Path, rows: list[Picture]) -> list[str]
     if build.returncode != 0:
         raise AssertionError(f"{cmd} exited {build.returncode}: {build.stderr}")
     stdin = "".join(f"{codec} {len(sizes)} {' '.join(map(str, sizes))}\n" for codec, sizes in rows)
-    done = subprocess.run(
+    done = subprocess.run(  # nosec B603 - executable is built in the temporary test directory.
         [str(exe)], input=stdin, capture_output=True, text=True, timeout=120, check=False
     )
     if done.returncode != 0:

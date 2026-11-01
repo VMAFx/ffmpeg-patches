@@ -214,7 +214,7 @@ def resolve_device_to_vulkan(device_str: str, mapping: dict[str, str]) -> int | 
 
 def query_vulkaninfo_text(timeout: float = 30.0) -> str:
     """Run vulkaninfo command safely and return text output."""
-    res = subprocess.run(
+    res = subprocess.run(  # nosec B603 B607 - fixed diagnostic command and bounded timeout.
         ["vulkaninfo"],
         capture_output=True,
         text=True,
@@ -260,7 +260,7 @@ def run_command_line(
         else cmd
     )
     try:
-        return subprocess.run(
+        return subprocess.run(  # nosec B603 - caller builds the benchmark argv from validated inputs.
             full_cmd,
             capture_output=True,
             timeout=timeout,
@@ -374,7 +374,9 @@ def run_bd_rate(
     with open(arm_file, "w", encoding="utf-8") as f:
         json.dump(arm_pts, f)
     cmd = [sys.executable, bd_rate_script, str(base_file), str(arm_file)]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
+    res = subprocess.run(  # nosec B603 - command comes from the validated benchmark configuration.
+        cmd, capture_output=True, text=True, timeout=60, check=True
+    )
     match = re.search(r"\{.*?\}", res.stdout, re.DOTALL)
     if not match:
         raise ValueError(f"No JSON in bd_rate output: {res.stdout}")

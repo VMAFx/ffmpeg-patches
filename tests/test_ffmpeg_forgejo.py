@@ -13,6 +13,7 @@ import threading
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
@@ -21,7 +22,27 @@ B = "b" * 40
 LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
+OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr"})
+GIT_ENVIRONMENT_NAMES = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    }
+)
+
+
+def isolated_git_environment() -> dict[str, str]:
+    """Return the process environment without caller Git repository overrides."""
+
+    return {name: value for name, value in os.environ.items() if name not in GIT_ENVIRONMENT_NAMES}
 
 
 def label(status: str, n: int = 0) -> dict:
@@ -30,7 +51,82 @@ def label(status: str, n: int = 0) -> dict:
     return {"context": f"Autolabel / Labeler {n} (pull_request_target)", "status": status}
 
 
+def open_pull(number: int = 25612, login: str = "tester") -> dict:
+    """Build one open pull request list item."""
+
+    return {"number": number, "state": "open", "user": {"login": login}}
+
+
+def git(repo: Path, *args: str) -> None:
+    """Run Git with fixed argv in a temporary test repository."""
+
+    subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        cwd=repo,
+        env=isolated_git_environment(),
+        check=True,
+    )
+
+
 OTHER = {"context": "Test / Fate", "status": "pending"}
+ChangedFile = str | dict[str, str]
+
+
+class GitEnvironmentTest(unittest.TestCase):
+    def test_git_ignores_checkout_environment(self) -> None:
+        """Fixture Git commands do not inherit the caller's repository paths."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            bogus_git_dir = root / "bogus-git-dir"
+            bogus_index = root / "bogus-index"
+            with mock.patch.dict(
+                os.environ,
+                {"GIT_DIR": str(bogus_git_dir), "GIT_INDEX_FILE": str(bogus_index)},
+            ):
+                git(repo, "init", "-q", "-b", "master")
+            self.assertTrue(repo.joinpath(".git").is_dir())
+            self.assertFalse(bogus_git_dir.exists())
+            self.assertFalse(bogus_index.exists())
+
+    def test_git_ignores_global_hooks(self) -> None:
+        """Fixture Git commands bypass hooks from the caller's global config."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            hooks = root / "hooks"
+            hooks.mkdir()
+            pre_commit = hooks / "pre-commit"
+            pre_commit.write_text("#!/bin/sh\nexit 1\n")
+            pre_commit.chmod(0o755)
+            global_config = root / "gitconfig"
+            global_config.write_text(f"[core]\n\thooksPath = {hooks}\n")
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(root / "home"), "GIT_CONFIG_GLOBAL": str(global_config)},
+            ):
+                self.assertEqual(
+                    isolated_git_environment()["GIT_CONFIG_GLOBAL"], str(global_config)
+                )
+                git(repo, "init", "-q", "-b", "master")
+                repo.joinpath("tracked").write_text("content\n")
+                git(repo, "add", "tracked")
+                git(
+                    repo,
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                )
 
 
 class Stub:
@@ -57,6 +153,10 @@ class Stub:
         self.heads, self.polls, self.fail_status = heads, polls, fail_status
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
+        self.open_pulls: list[dict] = []
+        self.pull_files: dict[int, list[ChangedFile]] = {}
+        self.fail_pulls = False
+        self.fail_files: set[int] = set()
         self.head_reads = 0
         self.reviewer_reads = 0
         self.poll_index = {sha: -1 for sha in polls}
@@ -100,6 +200,43 @@ class Stub:
             ],
         }
 
+    def pulls(self, query: dict[str, list[str]]) -> list[dict]:
+        """Return one filtered page of open pull requests."""
+
+        poster = query.get("poster", [None])[0]
+        rows = [row for row in self.open_pulls if poster is None or row["user"]["login"] == poster]
+        page = int(query.get("page", ["1"])[0])
+        limit = int(query.get("limit", ["30"])[0])
+        return rows[(page - 1) * limit : page * limit]
+
+    def files(self, number: int, query: dict[str, list[str]]) -> list[dict]:
+        """Return one page of changed files for a pull request."""
+
+        page = int(query.get("page", ["1"])[0])
+        limit = int(query.get("limit", ["30"])[0])
+        rows = self.pull_files.get(number, [])
+        return [
+            row if isinstance(row, dict) else {"filename": row}
+            for row in rows[(page - 1) * limit : page * limit]
+        ]
+
+
+def overlap_stub(
+    open_pulls: list[dict] | None = None,
+    pull_files: dict[int, list[ChangedFile]] | None = None,
+    reviewers: list[list[str]] | None = None,
+    fail_pulls: bool = False,
+    fail_files: set[int] | None = None,
+) -> Stub:
+    """Build a stub configured for pull-overlap probes."""
+
+    stub = Stub(reviewers=reviewers)
+    stub.open_pulls = open_pulls or []
+    stub.pull_files = pull_files or {}
+    stub.fail_pulls = fail_pulls
+    stub.fail_files = fail_files or set()
+    return stub
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def stub(self) -> Stub:
@@ -128,8 +265,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         stub.requests.append(("GET", self.path, ""))
         parts = url.path.split("/")
         is_status = len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status"
+        is_pull_list = url.path.endswith("/pulls")
+        is_pull_files = len(parts) > 3 and parts[-3] == "pulls" and parts[-1] == "files"
         if url.path == "/api/v1/user":
             self.reply(200, {"login": "tester"})
+        elif is_pull_list and stub.fail_pulls:
+            self.reply(500, {"message": "pull list failed"})
+        elif is_pull_list:
+            self.reply(200, stub.pulls(urllib.parse.parse_qs(url.query)))
+        elif is_pull_files and int(parts[-2]) in stub.fail_files:
+            self.reply(500, {"message": "pull files failed"})
+        elif is_pull_files:
+            self.reply(200, stub.files(int(parts[-2]), urllib.parse.parse_qs(url.query)))
         elif url.path.endswith("/pulls/1"):
             stub.pull_headers.append(dict(self.headers.items()))
             if stub.pull_status == 200:
@@ -187,6 +334,28 @@ class ForgejoTest(unittest.TestCase):
         tool.chmod(0o755)
         self.bin_dir = bin_dir
         (self.tmp / "body.md").write_text(BODY)
+        self.repo = self.tmp / "ffmpeg"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "master")
+        candidate = self.repo / OVERLAP_FILE
+        candidate.parent.mkdir(parents=True)
+        candidate.write_text("base\n")
+        git(self.repo, "add", OVERLAP_FILE)
+        commit = [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+        ]
+        git(self.repo, *commit, "base")
+        git(self.repo, "checkout", "-qb", "topic")
+        candidate.write_text("topic\n")
+        git(self.repo, "add", OVERLAP_FILE)
+        git(self.repo, *commit, "topic")
 
     def run_command(
         self,
@@ -201,7 +370,7 @@ class ForgejoTest(unittest.TestCase):
             raise ValueError(f"unsupported helper subcommand: {args[0] if args else '<missing>'}")
         server = serve(stub)
         try:
-            env = dict(os.environ)
+            env = isolated_git_environment()
             dirs = [str(p) for p in (path_first, self.bin_dir) if p]
             env.update(
                 PATH=os.pathsep.join(dirs + [env.get("PATH", "")]),
@@ -212,6 +381,7 @@ class ForgejoTest(unittest.TestCase):
             return subprocess.run(  # nosec B603 - fixed interpreter/helper, allow-list, test literals.
                 ["bash", str(self.helper), *args],
                 env=env,
+                cwd=self.repo,
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -629,6 +799,131 @@ class PullRequestReviewerTest(ForgejoTest):
             proc.stdout,
             "stub/pulls/1\n#1 requested reviewers: team:codec\n",
         )
+
+
+class PullRequestOverlapTest(ForgejoTest):
+    def pr(self, stub: Stub, *options: str) -> subprocess.CompletedProcess[str]:
+        """Attempt to create the shared topic pull request."""
+
+        return self.run_command(
+            stub,
+            "pr",
+            *options,
+            "topic",
+            "title",
+            str(self.tmp / "body.md"),
+        )
+
+    def pull_posts(self, stub: Stub) -> list[str]:
+        """Return pull creation request bodies."""
+
+        return [
+            data
+            for method, path, data in stub.requests
+            if method == "POST" and path.endswith("/pulls")
+        ]
+
+    def test_own_open_pull_with_shared_file_is_refused(self) -> None:
+        """An own open pull touching the candidate file exits 77 without a POST."""
+
+        stub = overlap_stub(open_pulls=[open_pull()], pull_files={25612: [OVERLAP_FILE]})
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertIn("#25612", proc.stderr)
+        self.assertIn(OVERLAP_FILE, proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
+    def test_own_open_pull_renaming_shared_file_is_refused(self) -> None:
+        """An own open pull renaming the candidate file exits 77 without a POST."""
+
+        changed_file = {
+            "filename": "libavfilter/vf_new.c",
+            "previous_filename": OVERLAP_FILE,
+        }
+        stub = overlap_stub(open_pulls=[open_pull()], pull_files={25612: [changed_file]})
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertIn("#25612", proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
+    def test_own_open_pull_bare_rename_fails_closed(self) -> None:
+        """A renamed file without its previous name exits one without a POST."""
+
+        changed_file = {"filename": "libavfilter/vf_new.c", "status": "renamed"}
+        stub = overlap_stub(open_pulls=[open_pull()], pull_files={25612: [changed_file]})
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot parse files", proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
+    def test_nonoverlapping_open_pull_allows_creation(self) -> None:
+        """An own open pull touching another file does not block creation."""
+
+        stub = overlap_stub(
+            reviewers=[["alice"]],
+            open_pulls=[open_pull()],
+            pull_files={25612: ["libavfilter/vf_other.c"]},
+        )
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.pull_posts(stub)), 1)
+
+    def test_other_login_overlap_allows_creation(self) -> None:
+        """The poster filter excludes an overlapping pull from another login."""
+
+        stub = overlap_stub(
+            reviewers=[["alice"]],
+            open_pulls=[open_pull(login="other")],
+            pull_files={25612: [OVERLAP_FILE]},
+        )
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.pull_posts(stub)), 1)
+        list_paths = [
+            path for method, path, _ in stub.requests if method == "GET" and "/pulls?" in path
+        ]
+        self.assertTrue(
+            any("state=open" in path and "poster=tester" in path for path in list_paths)
+        )
+
+    def test_exact_overlap_override_allows_creation(self) -> None:
+        """Only an overlap with the explicitly allowed pull is accepted."""
+
+        allowed = overlap_stub(
+            reviewers=[["alice"]],
+            open_pulls=[open_pull()],
+            pull_files={25612: [OVERLAP_FILE]},
+        )
+        self.assertEqual(self.pr(allowed, "--overlap-ok", "25612").returncode, 0)
+        refused = overlap_stub(open_pulls=[open_pull()], pull_files={25612: [OVERLAP_FILE]})
+        proc = self.pr(refused, "--overlap-ok", "999")
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertEqual(self.pull_posts(refused), [])
+
+    def test_probe_failures_never_create_a_pull(self) -> None:
+        """Pull-list and pull-file probe failures exit 1 without a POST."""
+
+        cases = (
+            overlap_stub(fail_pulls=True),
+            overlap_stub(open_pulls=[open_pull()], fail_files={25612}),
+        )
+        for stub in cases:
+            with self.subTest(stub=stub):
+                proc = self.pr(stub)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertEqual(self.pull_posts(stub), [])
+
+    def test_overlap_on_second_file_page_is_refused(self) -> None:
+        """An overlap on the second changed-file page cannot evade the guard."""
+
+        files = [f"libavfilter/filler_{number}.c" for number in range(50)] + [OVERLAP_FILE]
+        stub = overlap_stub(open_pulls=[open_pull()], pull_files={25612: files})
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertTrue(
+            any("/pulls/25612/files?" in path and "page=2" in path for _, path, _ in stub.requests)
+        )
+        self.assertEqual(self.pull_posts(stub), [])
 
 
 MUTANTS = {

@@ -63,7 +63,9 @@ def run(frame: bytes, chain: str) -> bytes:
         "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-s", f"{SIZE}x{SIZE}", "-i", "pipe:0",
         "-vf", f"{PQ_INPUT},{chain}", "-f", "rawvideo", "pipe:1",
     ]  # fmt: skip
-    done = subprocess.run(cmd, input=frame, capture_output=True, timeout=120, check=False)
+    done = subprocess.run(  # nosec B603 - test argv uses explicit fixture tool paths and values.
+        cmd, input=frame, capture_output=True, timeout=120, check=False
+    )
     if done.returncode != 0:
         raise AssertionError(f"{cmd} exited {done.returncode}: {done.stderr.decode()}")
     return done.stdout
