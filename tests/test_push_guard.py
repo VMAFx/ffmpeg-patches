@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess  # nosec B404 - mocked queries and local temporary Git repositories.
 import tempfile
 import threading
@@ -18,6 +19,8 @@ from tests.helpers import capture_main
 
 REPOSITORY = "VMAFx/ffmpeg-patches"
 REMOTE = f"https://github.com/{REPOSITORY}.git"
+# GIT_CONFIG_GLOBAL needs Git 2.32 or newer.
+ISOLATED_GIT_CONFIG = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 BRANCH = "fix/example"
 ZERO = "0" * 40
 HEAD = "a" * 40
@@ -213,6 +216,26 @@ class ConfigModeTest(unittest.TestCase):
 
 
 class ConfigReaderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Real-Git fixtures must not see the developer's global or system rewrite rules.
+        isolation = unittest.mock.patch.dict(os.environ, ISOLATED_GIT_CONFIG)
+        isolation.start()
+        self.addCleanup(isolation.stop)
+
+    def test_global_rewrite_rules_would_change_the_push_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            hostile = os.path.join(directory, "global.gitconfig")
+            with open(hostile, "w", encoding="utf-8") as handle:
+                handle.write('[url "git@github.com:"]\n\tpushInsteadOf = https://github.com/\n')
+            repository = os.path.join(directory, "repository")
+            os.mkdir(repository)
+            fixture_git(repository, "init")
+            fixture_git(repository, "remote", "add", "origin", REMOTE)
+            self.assertEqual(push_guard.read_remote_config(cwd=repository), {"origin": [REMOTE]})
+            with unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": hostile}):
+                urls = push_guard.read_remote_config(cwd=repository)["origin"]
+            self.assertEqual(urls, [f"git@github.com:{REPOSITORY}.git"])
+
     def test_push_url_command_has_argv_data_and_deadline(self) -> None:
         name = "x';true;#"
         outputs = [
@@ -305,7 +328,7 @@ class ConfigReaderTest(unittest.TestCase):
             with self.subTest(rule=rule), tempfile.TemporaryDirectory() as directory:
                 fixture_git(directory, "init")
                 fixture_git(
-                    directory, "config", "set", "--local", f"url.https://github.com/.{rule}", "gh:"
+                    directory, "config", "--local", f"url.https://github.com/.{rule}", "gh:"
                 )
                 fixture_git(directory, "remote", "add", "origin", f"gh:{REPOSITORY}")
                 urls = push_guard.read_remote_config(cwd=directory)["origin"]
@@ -331,8 +354,41 @@ class ConfigReaderTest(unittest.TestCase):
             reader.assert_called_once_with(REPOSITORY, BRANCH)
 
 
+class FixtureGitTest(unittest.TestCase):
+    def test_modern_config_subcommands_are_refused_before_running_git(self) -> None:
+        for command in ("get", "set", "unset", "list", "rename-section", "remove-section", "edit"):
+            with self.subTest(command=command), unittest.mock.patch("subprocess.run") as run:
+                with self.assertRaisesRegex(ValueError, "Git 2.46"):
+                    fixture_git("/fixture", "config", command, "--local", "test.key", "value")
+                run.assert_not_called()
+
+    def test_legacy_config_and_other_commands_are_forwarded(self) -> None:
+        for args in (
+            (),
+            ("config",),
+            ("config", "--local", "test.key", "value"),
+            ("config", "--get-regexp", r"^remote\.origin\.url$"),
+            ("remote", "set-url", "origin", REMOTE),
+        ):
+            with self.subTest(args=args), unittest.mock.patch("subprocess.run") as run:
+                run.return_value.stdout = "output"
+                self.assertEqual(fixture_git("/fixture", *args), "output")
+                run.assert_called_once_with(
+                    ["git", *args],
+                    cwd="/fixture",
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=push_guard.CONFIG_DEADLINE,
+                )
+
+
 def fixture_git(directory: str, *args: str) -> str:
     """Run local Git commands only in a disposable integration fixture."""
+    modern_commands = ("get", "set", "unset", "list", "rename-section", "remove-section", "edit")
+    if len(args) >= 2 and args[0] == "config" and args[1] in modern_commands:
+        raise ValueError("Git 2.46 config subcommands are not portable; use legacy option syntax")
     return subprocess.run(  # nosec B603 B607 - fixture argv, no network or shell.
         ["git", *args],
         cwd=directory,
