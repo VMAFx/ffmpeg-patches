@@ -11,9 +11,11 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.parse
 from pathlib import Path
-from unittest import mock
+
+from tests.helpers import isolated_git_environment
 
 ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
@@ -24,25 +26,6 @@ STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr"})
-GIT_ENVIRONMENT_NAMES = frozenset(
-    {
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_COMMON_DIR",
-        "GIT_DIR",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-        "GIT_INDEX_FILE",
-        "GIT_NAMESPACE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_WORK_TREE",
-    }
-)
-
-
-def isolated_git_environment() -> dict[str, str]:
-    """Return the process environment without caller Git repository overrides."""
-
-    return {name: value for name, value in os.environ.items() if name not in GIT_ENVIRONMENT_NAMES}
 
 
 def label(status: str, n: int = 0) -> dict:
@@ -82,7 +65,7 @@ class GitEnvironmentTest(unittest.TestCase):
             repo.mkdir()
             bogus_git_dir = root / "bogus-git-dir"
             bogus_index = root / "bogus-index"
-            with mock.patch.dict(
+            with unittest.mock.patch.dict(
                 os.environ,
                 {"GIT_DIR": str(bogus_git_dir), "GIT_INDEX_FILE": str(bogus_index)},
             ):
@@ -105,7 +88,7 @@ class GitEnvironmentTest(unittest.TestCase):
             pre_commit.chmod(0o755)
             global_config = root / "gitconfig"
             global_config.write_text(f"[core]\n\thooksPath = {hooks}\n")
-            with mock.patch.dict(
+            with unittest.mock.patch.dict(
                 os.environ,
                 {"HOME": str(root / "home"), "GIT_CONFIG_GLOBAL": str(global_config)},
             ):
