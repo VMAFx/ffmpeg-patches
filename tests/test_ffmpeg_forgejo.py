@@ -48,6 +48,7 @@ def git(repo: Path, *args: str) -> None:
         cwd=repo,
         env=isolated_git_environment(),
         check=True,
+        timeout=120,
     )
 
 
@@ -61,6 +62,7 @@ def git_output(repo: Path, *args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        timeout=120,
     ).stdout.strip()
 
 

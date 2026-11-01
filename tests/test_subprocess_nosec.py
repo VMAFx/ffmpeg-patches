@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Require rationales on Python subprocess security suppressions."""
+"""Require rationales on Python subprocess security suppressions and deadlines on blocking calls."""
 
 from __future__ import annotations
 
@@ -15,15 +15,16 @@ from tests.helpers import python_sources
 
 ROOT = Path(__file__).resolve().parent.parent
 SUBPROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_output"})
+# Popen returns at once; its deadline belongs to communicate() or wait().
+BLOCKING_CALLS = SUBPROCESS_CALLS - {"Popen"}
 NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b.*\s-\s+\S")
 
 
-def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknown>") -> list[int]:
-    """Return line numbers of subprocess calls without a suppression rationale."""
+def subprocess_calls(tree: ast.AST) -> list[tuple[ast.Call, str]]:
+    """Return each subprocess call in a parsed module with the subprocess function it names."""
 
-    tree = ast.parse(source, filename=filename)
     module_names = {"subprocess"}
-    function_names = set()
+    function_names: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             module_names.update(
@@ -31,25 +32,37 @@ def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknow
             )
         elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
             function_names.update(
-                name.asname or name.name for name in node.names if name.name in SUBPROCESS_CALLS
+                (name.asname or name.name, name.name)
+                for name in node.names
+                if name.name in SUBPROCESS_CALLS
             )
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id in module_names
+            and func.attr in SUBPROCESS_CALLS
+        ):
+            calls.append((node, func.attr))
+        elif isinstance(func, ast.Name) and func.id in function_names:
+            calls.append((node, function_names[func.id]))
+    return calls
+
+
+def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknown>") -> list[int]:
+    """Return line numbers of subprocess calls without a suppression rationale."""
+
+    tree = ast.parse(source, filename=filename)
     comments: dict[int, list[str]] = {}
     for token in tokenize.generate_tokens(io.StringIO(source).readline):
         if token.type == tokenize.COMMENT:
             comments.setdefault(token.start[0], []).append(token.string)
     offenders = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        is_module_call = (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in module_names
-            and node.func.attr in SUBPROCESS_CALLS
-        )
-        is_imported_call = isinstance(node.func, ast.Name) and node.func.id in function_names
-        if not is_module_call and not is_imported_call:
-            continue
+    for node, _ in subprocess_calls(tree):
         call_comments = (
             comment
             for line in range(node.lineno, node.end_lineno + 1)
@@ -58,6 +71,17 @@ def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknow
         if not any(NOSEC_RATIONALE.match(comment) for comment in call_comments):
             offenders.append(node.lineno)
     return sorted(offenders)
+
+
+def find_blocking_calls_without_timeout(source: str, *, filename: str = "<unknown>") -> list[int]:
+    """Return line numbers of blocking subprocess calls that pass no explicit timeout."""
+
+    tree = ast.parse(source, filename=filename)
+    return sorted(
+        node.lineno
+        for node, name in subprocess_calls(tree)
+        if name in BLOCKING_CALLS and not any(kw.arg == "timeout" for kw in node.keywords)
+    )
 
 
 class SubprocessNosecTest(unittest.TestCase):
@@ -125,6 +149,41 @@ class SubprocessNosecTest(unittest.TestCase):
                 )
             )
         self.assertEqual(offenders, [], "missing nosec rationale:\n" + "\n".join(offenders))
+
+    def test_blocking_call_without_timeout_is_reported(self) -> None:
+        """Planted blocking calls without a timeout are reported, module and imported form alike."""
+
+        source = "\n".join(
+            (
+                "import subprocess",
+                "from subprocess import check_output as out",
+                "subprocess.run(['tool'], check=True)",
+                "out(['tool'])",
+                "subprocess.run(['tool'], **options)",
+                "",
+            )
+        )
+        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 4, 5])
+
+    def test_blocking_call_with_timeout_and_popen_are_accepted(self) -> None:
+        """A call with an explicit timeout and a Popen constructor produce no offenders."""
+
+        source = (
+            "import subprocess\nsubprocess.run(['tool'], timeout=0)\nsubprocess.Popen(['tool'])\n"
+        )
+        self.assertEqual(find_blocking_calls_without_timeout(source), [])
+
+    def test_repository_blocking_subprocess_calls_have_timeouts(self) -> None:
+        """Every in-scope blocking subprocess call passes an explicit timeout."""
+
+        offenders = []
+        for path in python_sources(ROOT):
+            relative = str(path.relative_to(ROOT))
+            offenders.extend(
+                f"{relative}:{line}"
+                for line in find_blocking_calls_without_timeout(path.read_text(), filename=relative)
+            )
+        self.assertEqual(offenders, [], "missing subprocess timeout:\n" + "\n".join(offenders))
 
 
 if __name__ == "__main__":
