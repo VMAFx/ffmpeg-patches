@@ -16,10 +16,10 @@ SUBPROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_outpu
 NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b.*\s-\s+\S")
 
 
-def find_subprocess_calls_without_nosec(source: str) -> list[int]:
+def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknown>") -> list[int]:
     """Return line numbers of subprocess calls without a suppression rationale."""
 
-    tree = ast.parse(source)
+    tree = ast.parse(source, filename=filename)
     module_names = {"subprocess"}
     function_names = set()
     for node in ast.walk(tree):
@@ -71,6 +71,13 @@ def python_sources() -> list[Path]:
 
 
 class SubprocessNosecTest(unittest.TestCase):
+    def test_syntax_error_names_scanned_file(self) -> None:
+        """A syntax error identifies the repository file being scanned."""
+
+        with self.assertRaises(SyntaxError) as caught:
+            find_subprocess_calls_without_nosec("if:\n", filename="planted.py")
+        self.assertEqual(caught.exception.filename, "planted.py")
+
     def test_call_without_nosec_rationale_is_reported(self) -> None:
         """A planted unannotated subprocess call produces one offender."""
 
@@ -123,7 +130,9 @@ class SubprocessNosecTest(unittest.TestCase):
             source = path.read_text()
             offenders.extend(
                 f"{path.relative_to(ROOT)}:{line}"
-                for line in find_subprocess_calls_without_nosec(source)
+                for line in find_subprocess_calls_without_nosec(
+                    source, filename=str(path.relative_to(ROOT))
+                )
             )
         self.assertEqual(offenders, [], "missing nosec rationale:\n" + "\n".join(offenders))
 

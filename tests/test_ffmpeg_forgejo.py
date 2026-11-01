@@ -61,7 +61,10 @@ def git(repo: Path, *args: str) -> None:
     """Run Git with fixed argv in a temporary test repository."""
 
     subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
-        ["git", *args], cwd=repo, env=isolated_git_environment(), check=True
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        cwd=repo,
+        env=isolated_git_environment(),
+        check=True,
     )
 
 
@@ -87,6 +90,43 @@ class GitEnvironmentTest(unittest.TestCase):
             self.assertTrue(repo.joinpath(".git").is_dir())
             self.assertFalse(bogus_git_dir.exists())
             self.assertFalse(bogus_index.exists())
+
+    def test_git_ignores_global_hooks(self) -> None:
+        """Fixture Git commands bypass hooks from the caller's global config."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            hooks = root / "hooks"
+            hooks.mkdir()
+            pre_commit = hooks / "pre-commit"
+            pre_commit.write_text("#!/bin/sh\nexit 1\n")
+            pre_commit.chmod(0o755)
+            global_config = root / "gitconfig"
+            global_config.write_text(f"[core]\n\thooksPath = {hooks}\n")
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(root / "home"), "GIT_CONFIG_GLOBAL": str(global_config)},
+            ):
+                self.assertEqual(
+                    isolated_git_environment()["GIT_CONFIG_GLOBAL"], str(global_config)
+                )
+                git(repo, "init", "-q", "-b", "master")
+                repo.joinpath("tracked").write_text("content\n")
+                git(repo, "add", "tracked")
+                git(
+                    repo,
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                )
 
 
 class Stub:
