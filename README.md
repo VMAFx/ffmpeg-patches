@@ -1,5 +1,8 @@
 # ffmpeg-patches
 
+[![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/VMAFx/ffmpeg-patches?utm_source=oss&utm_medium=github&utm_campaign=VMAFx%2Fffmpeg-patches&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/59284a64ef65425eb779b400aa2b624c)](https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard)
+
 One shared FFmpeg patch series for VMAFx projects: fixes tracked against FFmpeg master and sent upstream; consumers carry only their own feature patches.
 
 <!-- praetor:readme-governance:start -->
