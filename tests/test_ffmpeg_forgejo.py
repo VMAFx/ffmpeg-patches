@@ -479,6 +479,16 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertIn("cannot read the head", proc.stderr)
         self.assertEqual(self.posts(stub), [])
 
+    def test_matching_seven_character_live_head_exits_one_without_post(self) -> None:
+        """A matching seven-character live head cannot authorize a comment."""
+
+        short = LIVE[:7]
+        stub = Stub([short])
+        proc = self.comment(stub, "--tested-head", short)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot read the head", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
     def test_matching_prefix_and_full_head_are_posted(self) -> None:
         """Both matching head prefixes and full hashes authorize a comment."""
 
