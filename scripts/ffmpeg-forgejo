@@ -11,7 +11,9 @@
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
 #   ffmpeg-forgejo push    [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#   ffmpeg-forgejo pr      <branch> <title> <body-file>       open PR <you>:<branch> -> master; reads requested_reviewers back and exits 3 when nobody was requested
+#   ffmpeg-forgejo pr      [--overlap-ok <number>]... <branch> <title> <body-file>
+#                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
+#                          (exit 77); --overlap-ok permits exactly that PR; exits 3 when no reviewer was requested
 #   ffmpeg-forgejo issue   <title> <body-file>
 #   ffmpeg-forgejo comment (--tested-head <sha> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head
@@ -191,6 +193,102 @@ print("none" if not st else "pending" if "pending" in st else "done" if set(st) 
   echo unknown
 }
 
+# check_pull_files NUMBER CANDIDATE-FILE: refuse when one pull shares a candidate path.
+check_pull_files() {
+  local number="$1" candidates="$2" file_page out parsed count overlap
+  for ((file_page = 1; file_page <= 20; file_page++)); do
+    if ! out="$(api GET "/repos/$REPO/pulls/$number/files?limit=50&page=$file_page")"; then
+      printf 'ffmpeg-forgejo: cannot check files of own open pull #%s.\n' "$number" >&2
+      return 1
+    fi
+    if ! parsed="$(python3 -c 'import json, os, pathlib, sys
+rows = json.load(sys.stdin)
+if not isinstance(rows, list): raise SystemExit(1)
+names = []
+for row in rows:
+    if not isinstance(row, dict) or not isinstance(row.get("filename"), str):
+        raise SystemExit(1)
+    names.append(row["filename"])
+raw = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")
+candidates = {os.fsdecode(name) for name in raw if name}
+print(len(rows))
+print(json.dumps(sorted(candidates.intersection(names)), ensure_ascii=False))' \
+      "$candidates" <<<"$out" 2>/dev/null)"; then
+      printf 'ffmpeg-forgejo: cannot parse files of own open pull #%s.\n' "$number" >&2
+      return 1
+    fi
+    count="${parsed%%$'\n'*}"
+    overlap="${parsed#*$'\n'}"
+    [ "$count" -ne 0 ] || return 0
+    if [ "$file_page" -eq 20 ]; then
+      printf 'ffmpeg-forgejo: own open pull #%s has more than 19 pages of files; overlap not proven absent.\n' "$number" >&2
+      return 1
+    fi
+    if [ "$overlap" != "[]" ]; then
+      printf 'ffmpeg-forgejo: own open pull #%s shares files with this branch: %s; use --overlap-ok %s only for a deliberate stack.\n' \
+        "$number" "$overlap" "$number" >&2
+      return 77
+    fi
+  done
+}
+
+# check_pr_overlap BRANCH LOGIN ALLOWED-NUMBERS: refuse overlap with own open pulls.
+check_pr_overlap() {
+  local branch="$1" me="$2" allowed="$3" candidates pull_page out parsed count number encoded_me rc
+  local -a numbers
+  candidates="$(mktemp)"
+  if ! git diff --no-ext-diff --no-renames --name-only -z "$BASE...$branch" -- >"$candidates"; then
+    printf 'ffmpeg-forgejo: cannot determine files in %s relative to %s; no pull request opened.\n' \
+      "$branch" "$BASE" >&2
+    rm -f "$candidates"
+    return 1
+  fi
+  encoded_me="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
+  for ((pull_page = 1; pull_page <= 20; pull_page++)); do
+    if ! out="$(api GET "/repos/$REPO/pulls?state=open&poster=$encoded_me&limit=50&page=$pull_page")"; then
+      printf 'ffmpeg-forgejo: cannot list own open pull requests; no pull request opened.\n' >&2
+      rm -f "$candidates"
+      return 1
+    fi
+    if ! parsed="$(python3 -c 'import json, sys
+rows = json.load(sys.stdin)
+if not isinstance(rows, list): raise SystemExit(1)
+numbers = []
+for row in rows:
+    number = row.get("number") if isinstance(row, dict) else None
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise SystemExit(1)
+    numbers.append(number)
+print(len(numbers))
+print(*numbers, sep="\n")' <<<"$out" 2>/dev/null)"; then
+      printf 'ffmpeg-forgejo: cannot parse own open pull requests; no pull request opened.\n' >&2
+      rm -f "$candidates"
+      return 1
+    fi
+    count="${parsed%%$'\n'*}"
+    [ "$count" -ne 0 ] || break
+    if [ "$pull_page" -eq 20 ]; then
+      printf 'ffmpeg-forgejo: more than 19 pages of own open pull requests; overlap not proven absent.\n' >&2
+      rm -f "$candidates"
+      return 1
+    fi
+    mapfile -t numbers <<<"${parsed#*$'\n'}"
+    for number in "${numbers[@]}"; do
+      if [[ " $allowed " == *" $number "* ]]; then
+        continue
+      fi
+      if check_pull_files "$number" "$candidates"; then
+        continue
+      else
+        rc=$?
+        rm -f "$candidates"
+        return "$rc"
+      fi
+    done
+  done
+  rm -f "$candidates"
+}
+
 cmd="${1:-}"
 if [ $# -gt 0 ]; then shift; fi
 case "$cmd" in
@@ -235,9 +333,20 @@ for i in json.load(sys.stdin):
         push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$1:refs/heads/$rb"
     ;;
   pr)
-    [ $# -eq 3 ] || die "usage: pr <branch> <title> <body-file>"
+    usage='pr [--overlap-ok <number>]... <branch> <title> <body-file>'
+    overlap_ok=""
+    pr_argc=$#
+    for ((pr_i = 0; pr_i < pr_argc; pr_i++)); do
+      [ "${1:-}" = "--overlap-ok" ] || break
+      [ $# -ge 2 ] || usage_error "$usage"
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage_error "$usage"
+      overlap_ok+=" $2"
+      shift 2
+    done
+    [ $# -eq 3 ] || usage_error "$usage"
     [ -f "$3" ] || die "no body file $3"
     me="$(login)"
+    check_pr_overlap "$1" "$me" "$overlap_ok"
     body="$(mktemp)"
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
     out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
