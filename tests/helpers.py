@@ -44,6 +44,36 @@ CPU = (
 RESET_TOOL = os.environ.get("HQDN3D_RESET_TOOL", "")
 
 
+def python_sources(root: Path) -> list[Path]:
+    """Return tracked Python modules and shebang-identified scripts."""
+
+    tracked = subprocess.run(  # nosec B603 B607 - fixed git query against the test repository.
+        ["git", "ls-files", "-z"],
+        cwd=root,
+        env=series.git_env(),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    sources = []
+    tests = root / "tests"
+    scripts = root / "scripts"
+    for name in tracked.stdout.split("\0"):
+        if not name:
+            continue
+        path = root / name
+        if path.suffix == ".py" and (tests in path.parents or scripts in path.parents):
+            sources.append(path)
+            continue
+        if path.suffix or scripts not in path.parents:
+            continue
+        first_line = path.read_text(encoding="utf-8").splitlines()[:1]
+        if first_line and first_line[0].startswith("#!") and "python" in first_line[0]:
+            sources.append(path)
+    return sorted(sources)
+
+
 def device_environment(prefix: str) -> tuple[str, str]:
     return os.environ.get(f"{prefix}_FFMPEG", ""), os.environ.get(f"{prefix}_DEVICE", "")
 

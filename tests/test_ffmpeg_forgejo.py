@@ -11,9 +11,9 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.parse
 from pathlib import Path
-from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
@@ -82,7 +82,7 @@ class GitEnvironmentTest(unittest.TestCase):
             repo.mkdir()
             bogus_git_dir = root / "bogus-git-dir"
             bogus_index = root / "bogus-index"
-            with mock.patch.dict(
+            with unittest.mock.patch.dict(
                 os.environ,
                 {"GIT_DIR": str(bogus_git_dir), "GIT_INDEX_FILE": str(bogus_index)},
             ):
@@ -105,7 +105,7 @@ class GitEnvironmentTest(unittest.TestCase):
             pre_commit.chmod(0o755)
             global_config = root / "gitconfig"
             global_config.write_text(f"[core]\n\thooksPath = {hooks}\n")
-            with mock.patch.dict(
+            with unittest.mock.patch.dict(
                 os.environ,
                 {"HOME": str(root / "home"), "GIT_CONFIG_GLOBAL": str(global_config)},
             ):

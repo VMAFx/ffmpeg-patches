@@ -11,6 +11,8 @@ import tokenize
 import unittest
 from pathlib import Path
 
+from tests.helpers import python_sources
+
 ROOT = Path(__file__).resolve().parent.parent
 SUBPROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_output"})
 NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b.*\s-\s+\S")
@@ -56,18 +58,6 @@ def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknow
         if not any(NOSEC_RATIONALE.match(comment) for comment in call_comments):
             offenders.append(node.lineno)
     return sorted(offenders)
-
-
-def python_sources() -> list[Path]:
-    """Return Python modules and shebang-identified extension-less scripts."""
-
-    sources = [*ROOT.joinpath("tests").rglob("*.py"), *ROOT.joinpath("scripts").rglob("*.py")]
-    for path in ROOT.joinpath("scripts").rglob("*"):
-        if path.is_file() and not path.suffix:
-            first_line = path.read_text().splitlines()[:1]
-            if first_line and first_line[0].startswith("#!") and "python" in first_line[0]:
-                sources.append(path)
-    return sorted(set(sources))
 
 
 class SubprocessNosecTest(unittest.TestCase):
@@ -126,7 +116,7 @@ class SubprocessNosecTest(unittest.TestCase):
         """Every in-scope subprocess call carries an inline nosec rationale."""
 
         offenders = []
-        for path in python_sources():
+        for path in python_sources(ROOT):
             source = path.read_text()
             offenders.extend(
                 f"{path.relative_to(ROOT)}:{line}"
