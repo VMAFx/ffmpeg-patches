@@ -21,13 +21,13 @@ import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 MAX_UPDATES = 1000
-GITHUB_REMOTE = re.compile(
-    r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
-    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/?"
-)
+SCP_REMOTE = re.compile(r"(?:[^/@:\s]+@)?([A-Za-z0-9_.-]+):(.+)")
+REPOSITORY_PATH = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+GITHUB_HOSTS = {"github.com", "www.github.com"}
+REMOTE_SCHEMES = {"https", "http", "ssh", "git", "git+ssh", "ssh+git"}
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 APIReader = Callable[[str, str], str]
 
@@ -40,10 +40,28 @@ class PullRequest:
     merged: bool
 
 
+def remote_location(url: str) -> tuple[str, str]:
+    """Extract a host and repository path from URL or scp remote syntax."""
+    if "://" in url:
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname or ""
+        except ValueError:
+            return "", ""
+        if parsed.scheme not in REMOTE_SCHEMES or parsed.query or parsed.fragment:
+            return host, ""
+        return host, parsed.path.removeprefix("/")
+    match = SCP_REMOTE.fullmatch(url)
+    return (match.group(1).lower(), match.group(2)) if match else ("", "")
+
+
 def github_repository(url: str) -> str | None:
-    """Extract owner/repo only from supported github.com remote URL forms."""
-    match = GITHUB_REMOTE.fullmatch(url)
-    return match.group(1).removesuffix(".git") if match else None
+    """Extract owner/repo only from supported GitHub remote URL forms."""
+    host, path = remote_location(url)
+    repository = path.removesuffix("/").removesuffix(".git")
+    if host in GITHUB_HOSTS and REPOSITORY_PATH.fullmatch(repository):
+        return repository
+    return None
 
 
 def read_pull_requests(repository: str, branch: str) -> str:
@@ -133,6 +151,14 @@ def main(argv: list[str], reader: APIReader = read_pull_requests) -> int:
     args = parser.parse_args(argv)
     repository = github_repository(args.remote_url)
     if repository is None:
+        host, _ = remote_location(args.remote_url)
+        if "github" in host:
+            print(
+                f"push_guard: cannot tell whether {args.remote_url} is GitHub; "
+                "refusing (fail closed)",
+                file=sys.stderr,
+            )
+            return 2
         print("push_guard: non-GitHub remote; skipping", file=sys.stderr)
         return 0
     try:

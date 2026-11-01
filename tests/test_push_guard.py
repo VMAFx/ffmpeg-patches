@@ -138,6 +138,21 @@ class RemoteTest(unittest.TestCase):
             REMOTE,
             f"git@github.com:{REPOSITORY}.git",
             f"ssh://git@github.com/{REPOSITORY}.git",
+            f"github.com:{REPOSITORY}",
+            f"user@github.com:{REPOSITORY}/",
+            f"git@GitHub.com:{REPOSITORY}.git/",
+            f"www.github.com:{REPOSITORY}.git/",
+            f"https://x-access-token:abc@github.com/{REPOSITORY}.git",
+            f"ssh://git@github.com:22/{REPOSITORY}.git",
+            f"ssh://github.com/{REPOSITORY}",
+            f"git://github.com/{REPOSITORY}.git",
+            f"http://github.com/{REPOSITORY}",
+            f"git+ssh://git@github.com/{REPOSITORY}.git",
+            f"ssh+git://github.com/{REPOSITORY}.git/",
+            f"https://GitHub.com/{REPOSITORY}/",
+            f"https://www.GitHub.com/{REPOSITORY}.git/",
+            f"https://user@github.com:443/{REPOSITORY}",
+            f"ssh://user:token@github.com:22/{REPOSITORY}.git/",
         ):
             with self.subTest(remote=remote):
                 self.assertEqual(push_guard.github_repository(remote), REPOSITORY)
@@ -149,14 +164,45 @@ class RemoteTest(unittest.TestCase):
         for remote in (
             f"https://gitlab.com/{REPOSITORY}.git",
             f"git@example.org:{REPOSITORY}.git",
-            f"https://github.com.example.org/{REPOSITORY}",
+            f"https://code.ffmpeg.org/{REPOSITORY}.git",
+            f"git://code.ffmpeg.org/{REPOSITORY}",
+            "https://gitlab.com/github/repository.git",
+            "github-user@gitlab.com:owner/repository.git",
+            "/local/path",
             "/local/repository.git",
+            "/local/github.com:repository.git",
         ):
             with self.subTest(remote=remote):
+                self.assertIsNone(push_guard.github_repository(remote))
                 reader = unittest.mock.Mock()
                 status, _, err = guard(reader, update(), remote)
                 self.assertEqual(status, 0)
                 self.assertIn("non-GitHub remote; skipping", err)
+                reader.assert_not_called()
+
+    def test_invalid_repository_paths(self) -> None:
+        for path in ("owner", "owner/", "owner/repo/extra", "owner/repo//", "owner/.git"):
+            for prefix in ("https://github.com/", "git@github.com:"):
+                with self.subTest(path=path, prefix=prefix):
+                    self.assertIsNone(push_guard.github_repository(prefix + path))
+
+    def test_ambiguous_github_hosts_fail_closed(self) -> None:
+        for remote in (
+            f"git@github.com-work:{REPOSITORY}.git",
+            f"GitHub-work:{REPOSITORY}",
+            f"https://github.com.example.org/{REPOSITORY}",
+            f"ssh://git@GitHub.com-work:22/{REPOSITORY}.git",
+            f"https://www.github.com.example.org/{REPOSITORY}",
+        ):
+            with self.subTest(remote=remote):
+                self.assertIsNone(push_guard.github_repository(remote))
+                reader = unittest.mock.Mock()
+                status, out, err = guard(reader, update(), remote)
+                self.assertEqual((status, out), (2, ""))
+                self.assertEqual(
+                    err,
+                    f"push_guard: cannot tell whether {remote} is GitHub; refusing (fail closed)\n",
+                )
                 reader.assert_not_called()
 
 
