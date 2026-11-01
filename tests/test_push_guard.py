@@ -201,7 +201,32 @@ class RemoteTest(unittest.TestCase):
                 self.assertEqual((status, out), (2, ""))
                 self.assertEqual(
                     err,
-                    f"push_guard: cannot tell whether {remote} is GitHub; refusing (fail closed)\n",
+                    f"push_guard: cannot tell whether {remote.replace('git@', '')} is GitHub; "
+                    "refusing (fail closed)\n",
+                )
+                reader.assert_not_called()
+
+    def test_ambiguous_remote_userinfo_is_redacted(self) -> None:
+        for remote, redacted in (
+            (
+                "https://user:secret@github.example.com/o/r.git",
+                "https://github.example.com/o/r.git",
+            ),
+            (
+                "ssh://user:secret@github.example.com:22/o/r.git",
+                "ssh://github.example.com:22/o/r.git",
+            ),
+            ("secret@github.example.com:o/r.git", "github.example.com:o/r.git"),
+        ):
+            with self.subTest(remote=remote):
+                reader = unittest.mock.Mock()
+                status, out, err = guard(reader, update(), remote)
+                self.assertEqual((status, out), (2, ""))
+                self.assertNotIn("secret", err)
+                self.assertEqual(
+                    err,
+                    f"push_guard: cannot tell whether {redacted} is GitHub; "
+                    "refusing (fail closed)\n",
                 )
                 reader.assert_not_called()
 

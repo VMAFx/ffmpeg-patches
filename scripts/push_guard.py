@@ -64,6 +64,15 @@ def github_repository(url: str) -> str | None:
     return None
 
 
+def redact_remote(url: str) -> str:
+    """Remove userinfo from URL and scp remotes before displaying them."""
+    if "://" in url:
+        parsed = urlsplit(url)
+        return parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1]).geturl()
+    match = SCP_REMOTE.fullmatch(url)
+    return f"{match.group(1)}:{match.group(2)}" if match else url
+
+
 def read_pull_requests(repository: str, branch: str) -> str:
     """Read only the newest PR for this head, with a twenty-second deadline."""
     owner = repository.split("/", 1)[0]
@@ -94,6 +103,11 @@ def newest_pull_request(raw: str) -> PullRequest | None:
     pr = payload[0]
     if not isinstance(pr, dict):
         raise ValueError("expected a pull request object")
+    return PullRequest(*_pull_request_fields(pr))
+
+
+def _pull_request_fields(pr: dict) -> tuple[int, str, str, bool]:
+    """Validate the fields used to decide whether a pull request blocks a push."""
     number, state, head = pr.get("number"), pr.get("state"), pr.get("head")
     if type(number) is not int or number < 1:
         raise ValueError("invalid pull request number")
@@ -107,7 +121,7 @@ def newest_pull_request(raw: str) -> PullRequest | None:
     merged_at = pr.get("merged_at")
     if merged_at is not None and not isinstance(merged_at, str):
         raise ValueError("invalid pull request merge timestamp")
-    return PullRequest(number, state, head_sha, merged_at is not None)
+    return number, state, head_sha, merged_at is not None
 
 
 def check_branch(repository: str, branch: str, remote_sha: str, reader: APIReader) -> int:
@@ -154,7 +168,7 @@ def main(argv: list[str], reader: APIReader = read_pull_requests) -> int:
         host, _ = remote_location(args.remote_url)
         if "github" in host:
             print(
-                f"push_guard: cannot tell whether {args.remote_url} is GitHub; "
+                f"push_guard: cannot tell whether {redact_remote(args.remote_url)} is GitHub; "
                 "refusing (fail closed)",
                 file=sys.stderr,
             )
