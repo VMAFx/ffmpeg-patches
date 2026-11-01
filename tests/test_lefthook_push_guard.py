@@ -31,7 +31,10 @@ class LefthookPushGuardTest(unittest.TestCase):
         self.assertIn("script", guard)
         self.assertNotIn("run", guard)
         self.assertIs(guard["use_stdin"], True)
-        for key in ("args", "glob", "files", "root", "exclude", "file_types"):
+        # Quote each Git argument so remote URLs containing spaces stay intact.
+        # {1}/{2} are plain templates, never skipped like file templates.
+        self.assertEqual(guard.get("args"), "'{1}' '{2}'")
+        for key in ("glob", "files", "root", "exclude", "file_types"):
             with self.subTest(key=key):
                 self.assertNotIn(key, guard)
 
@@ -42,6 +45,31 @@ class LefthookPushGuardTest(unittest.TestCase):
             'exec sh .config/lefthook/python.sh scripts/push_guard.py "$@"',
             script.read_text(encoding="utf-8"),
         )
+
+    def test_contributing_dependency_pins_match_ci(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
+        )
+        install_steps = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("name") == "Install ruff, reuse, numpy and PyYAML"
+        ]
+        self.assertEqual(len(install_steps), 1)
+        prefix = "python3 -m pip install "
+        ci_command = install_steps[0]["run"]
+        self.assertTrue(ci_command.startswith(prefix))
+        documented_commands = [
+            line
+            for line in (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8").splitlines()
+            if line.startswith(prefix)
+        ]
+        self.assertEqual(len(documented_commands), 1)
+        ci_pins = set(ci_command.removeprefix(prefix).split())
+        self.assertTrue(ci_pins)
+        self.assertTrue(all("==" in pin for pin in ci_pins))
+        self.assertEqual(set(documented_commands[0].removeprefix(prefix).split()), ci_pins)
 
     def test_hooks_start_python_through_selector(self) -> None:
         config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
