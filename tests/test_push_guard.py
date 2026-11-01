@@ -7,6 +7,8 @@ from __future__ import annotations
 import io
 import json
 import subprocess  # nosec B404 - exception and result fixtures; process calls are mocked.
+import threading
+import time
 import unittest
 import unittest.mock
 
@@ -136,6 +138,84 @@ class PushGuardTest(unittest.TestCase):
     def test_sha256_zero_is_supported(self) -> None:
         reader = unittest.mock.Mock(return_value=pull_request())
         self.assertEqual(guard(reader, update("0" * 64, "b" * 64))[0], 1)
+
+
+class StdinTest(unittest.TestCase):
+    def test_stdin_deadline_fails_closed(self) -> None:
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_read(_size: int) -> str:
+            # Independent timeout keeps a missing join timeout from hanging the test.
+            release.wait(timeout=1)
+            finished.set()
+            return ""
+
+        stdin = unittest.mock.Mock(read=blocked_read)
+        reader = unittest.mock.Mock(return_value="[]")
+        with (
+            unittest.mock.patch("sys.stdin", stdin),
+            unittest.mock.patch.object(push_guard, "STDIN_DEADLINE", 0.1),
+        ):
+            start = time.monotonic()
+            try:
+                status, _, err = capture_main(
+                    lambda argv: push_guard.main(argv, reader), "origin", REMOTE
+                )
+                elapsed = time.monotonic() - start
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(timeout=2))
+        self.assertEqual(status, 2)
+        self.assertIn("stdin deadline", err)
+        self.assertIn("refusing (fail closed)", err)
+        self.assertLess(elapsed, 0.75)
+        reader.assert_not_called()
+
+    def test_stdin_byte_cap_boundary(self) -> None:
+        for ref in (BRANCH, "fix/é"):
+            line = update(ref=ref)
+            size = len(line.encode("utf-8"))
+            for cap, expected in ((size - 1, 2), (size, 0), (size + 1, 0)):
+                with (
+                    self.subTest(ref=ref, cap=cap),
+                    unittest.mock.patch.object(push_guard, "MAX_STDIN_BYTES", cap),
+                ):
+                    reader = unittest.mock.Mock(return_value="[]")
+                    status, _, err = guard(reader, line)
+                    self.assertEqual(status, expected)
+                    if expected:
+                        self.assertIn("byte cap", err)
+                        self.assertIn("refusing (fail closed)", err)
+                        reader.assert_not_called()
+
+    def test_stdin_read_errors_fail_closed(self) -> None:
+        for error in (OSError("stdin failed"), ValueError("stdin closed")):
+            with (
+                self.subTest(error=error),
+                unittest.mock.patch(
+                    "sys.stdin", unittest.mock.Mock(read=unittest.mock.Mock(side_effect=error))
+                ),
+            ):
+                reader = unittest.mock.Mock()
+                status, _, err = capture_main(
+                    lambda argv, reader=reader: push_guard.main(argv, reader), "origin", REMOTE
+                )
+                self.assertEqual(status, 2)
+                self.assertIn(str(error), err)
+                self.assertIn("refusing (fail closed)", err)
+                reader.assert_not_called()
+
+    def test_short_reads_preserve_update_lines(self) -> None:
+        stdin = unittest.mock.Mock()
+        stdin.read.side_effect = [*update(ref="fix/é"), ""]
+        reader = unittest.mock.Mock(return_value="[]")
+        with unittest.mock.patch("sys.stdin", stdin):
+            self.assertEqual(
+                capture_main(lambda argv: push_guard.main(argv, reader), "origin", REMOTE),
+                (0, "", ""),
+            )
+        reader.assert_called_once_with(REPOSITORY, "fix/é")
 
 
 class RemoteTest(unittest.TestCase):

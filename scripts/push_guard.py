@@ -15,15 +15,21 @@ head branch, 2 when the guard cannot determine whether the push is safe.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import subprocess  # nosec B404 - fixed gh argv, no shell, explicit timeout.
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TextIO
 from urllib.parse import quote, urlsplit
 
 MAX_UPDATES = 1000
+STDIN_DEADLINE = 10
+# Budget 4096 UTF-8 bytes per update across the complete input.
+MAX_STDIN_BYTES = MAX_UPDATES * 4096
 SCP_REMOTE = re.compile(r"(?:[^/@:\s]+@)?([A-Za-z0-9_.-]+):(.+)")
 REPOSITORY_PATH = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 GITHUB_HOSTS = {"github.com", "www.github.com"}
@@ -158,6 +164,37 @@ def check_update(repository: str, line: str, reader: APIReader) -> int:
     return check_branch(repository, branch, remote_sha, reader)
 
 
+def _collect_stdin(stream: TextIO, chunks: list[str], errors: list[Exception]) -> None:
+    """Read bounded chunks; read_stdin limits the caller's wait for this worker."""
+    total = 0
+    try:
+        # Each nonempty chunk consumes at least one byte, including short reads.
+        for _ in range(MAX_STDIN_BYTES + 1):
+            chunk = stream.read(min(4096, MAX_STDIN_BYTES - total + 1))
+            if not chunk:
+                return
+            total += len(chunk.encode("utf-8", errors="surrogatepass"))
+            if total > MAX_STDIN_BYTES:
+                raise ValueError(f"stdin exceeds {MAX_STDIN_BYTES} byte cap")
+            chunks.append(chunk)
+    except (OSError, ValueError) as exc:
+        errors.append(exc)
+
+
+def read_stdin() -> io.StringIO:
+    """Collect text stdin with a portable deadline and a UTF-8 byte cap."""
+    chunks: list[str] = []
+    errors: list[Exception] = []
+    worker = threading.Thread(target=_collect_stdin, args=(sys.stdin, chunks, errors), daemon=True)
+    worker.start()
+    worker.join(timeout=STDIN_DEADLINE)
+    if worker.is_alive():
+        raise ValueError(f"stdin deadline exceeded ({STDIN_DEADLINE} seconds)")
+    if errors:
+        raise errors[0]
+    return io.StringIO("".join(chunks))
+
+
 def main(argv: list[str], reader: APIReader = read_pull_requests) -> int:
     """Check at most MAX_UPDATES ref updates, failing closed on input or API errors."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -177,8 +214,9 @@ def main(argv: list[str], reader: APIReader = read_pull_requests) -> int:
         print("push_guard: non-GitHub remote; skipping", file=sys.stderr)
         return 0
     try:
+        updates = read_stdin()
         for index in range(MAX_UPDATES + 1):
-            line = sys.stdin.readline()
+            line = updates.readline()
             if not line:
                 return 0
             if index == MAX_UPDATES:
