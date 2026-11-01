@@ -210,6 +210,8 @@ for row in rows:
         raise SystemExit(1)
     names.append(row["filename"])
     previous = row.get("previous_filename")
+    if row.get("status") == "renamed" and (not isinstance(previous, str) or not previous):
+        raise SystemExit(1)
     if isinstance(previous, str) and previous:
         names.append(previous)
 raw = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")

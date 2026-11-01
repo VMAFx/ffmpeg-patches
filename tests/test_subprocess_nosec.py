@@ -5,28 +5,55 @@
 from __future__ import annotations
 
 import ast
+import io
+import re
+import tokenize
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SUBPROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_output"})
+NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b.*\s-\s+\S")
 
 
 def find_subprocess_calls_without_nosec(source: str) -> list[int]:
     """Return line numbers of subprocess calls without a suppression rationale."""
 
-    lines = source.splitlines()
+    tree = ast.parse(source)
+    module_names = {"subprocess"}
+    function_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            module_names.update(
+                name.asname or name.name for name in node.names if name.name == "subprocess"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            function_names.update(
+                name.asname or name.name for name in node.names if name.name in SUBPROCESS_CALLS
+            )
+    comments: dict[int, list[str]] = {}
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.COMMENT:
+            comments.setdefault(token.start[0], []).append(token.string)
     offenders = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
             continue
-        owner = node.func.value
-        if not isinstance(owner, ast.Name) or owner.id != "subprocess":
+        is_module_call = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in module_names
+            and node.func.attr in SUBPROCESS_CALLS
+        )
+        is_imported_call = isinstance(node.func, ast.Name) and node.func.id in function_names
+        if not is_module_call and not is_imported_call:
             continue
-        if node.func.attr not in SUBPROCESS_CALLS:
-            continue
-        comments = lines[node.lineno - 1 : node.end_lineno]
-        if not any("# nosec" in line and " - " in line for line in comments):
+        call_comments = (
+            comment
+            for line in range(node.lineno, node.end_lineno + 1)
+            for comment in comments.get(line, ())
+        )
+        if not any(NOSEC_RATIONALE.match(comment) for comment in call_comments):
             offenders.append(node.lineno)
     return sorted(offenders)
 
@@ -63,6 +90,30 @@ class SubprocessNosecTest(unittest.TestCase):
             )
         )
         self.assertEqual(find_subprocess_calls_without_nosec(source), [])
+
+    def test_module_alias_call_without_rationale_is_reported(self) -> None:
+        """A subprocess module alias remains in scanner scope."""
+
+        source = "import subprocess as process\nprocess.run(['tool'])\n"
+        self.assertEqual(find_subprocess_calls_without_nosec(source), [2])
+
+    def test_imported_alias_call_without_rationale_is_reported(self) -> None:
+        """An imported subprocess function alias remains in scanner scope."""
+
+        source = "from subprocess import run as execute\nexecute(['tool'])\n"
+        self.assertEqual(find_subprocess_calls_without_nosec(source), [2])
+
+    def test_nosec_text_in_string_is_not_a_rationale(self) -> None:
+        """A nosec-shaped string literal does not suppress a call."""
+
+        source = "import subprocess\nsubprocess.run(['# nosec B603 - fake'])\n"
+        self.assertEqual(find_subprocess_calls_without_nosec(source), [2])
+
+    def test_blank_nosec_rationale_is_reported(self) -> None:
+        """A nosec comment with a blank rationale does not suppress a call."""
+
+        source = "import subprocess\nsubprocess.run(['tool'])  # nosec B603 - \n"
+        self.assertEqual(find_subprocess_calls_without_nosec(source), [2])
 
     def test_repository_subprocess_calls_have_nosec_rationales(self) -> None:
         """Every in-scope subprocess call carries an inline nosec rationale."""

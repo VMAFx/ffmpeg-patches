@@ -13,6 +13,7 @@ import threading
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
@@ -23,6 +24,25 @@ STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr"})
+GIT_ENVIRONMENT_NAMES = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    }
+)
+
+
+def isolated_git_environment() -> dict[str, str]:
+    """Return the process environment without caller Git repository overrides."""
+
+    return {name: value for name, value in os.environ.items() if name not in GIT_ENVIRONMENT_NAMES}
 
 
 def label(status: str, n: int = 0) -> dict:
@@ -41,12 +61,32 @@ def git(repo: Path, *args: str) -> None:
     """Run Git with fixed argv in a temporary test repository."""
 
     subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
-        ["git", *args], cwd=repo, check=True
+        ["git", *args], cwd=repo, env=isolated_git_environment(), check=True
     )
 
 
 OTHER = {"context": "Test / Fate", "status": "pending"}
 ChangedFile = str | dict[str, str]
+
+
+class GitEnvironmentTest(unittest.TestCase):
+    def test_git_ignores_checkout_environment(self) -> None:
+        """Fixture Git commands do not inherit the caller's repository paths."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            bogus_git_dir = root / "bogus-git-dir"
+            bogus_index = root / "bogus-index"
+            with mock.patch.dict(
+                os.environ,
+                {"GIT_DIR": str(bogus_git_dir), "GIT_INDEX_FILE": str(bogus_index)},
+            ):
+                git(repo, "init", "-q", "-b", "master")
+            self.assertTrue(repo.joinpath(".git").is_dir())
+            self.assertFalse(bogus_git_dir.exists())
+            self.assertFalse(bogus_index.exists())
 
 
 class Stub:
@@ -290,7 +330,7 @@ class ForgejoTest(unittest.TestCase):
             raise ValueError(f"unsupported helper subcommand: {args[0] if args else '<missing>'}")
         server = serve(stub)
         try:
-            env = dict(os.environ)
+            env = isolated_git_environment()
             dirs = [str(p) for p in (path_first, self.bin_dir) if p]
             env.update(
                 PATH=os.pathsep.join(dirs + [env.get("PATH", "")]),
@@ -764,6 +804,16 @@ class PullRequestOverlapTest(ForgejoTest):
         proc = self.pr(stub)
         self.assertEqual(proc.returncode, 77, proc.stderr)
         self.assertIn("#25612", proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
+    def test_own_open_pull_bare_rename_fails_closed(self) -> None:
+        """A renamed file without its previous name exits one without a POST."""
+
+        changed_file = {"filename": "libavfilter/vf_new.c", "status": "renamed"}
+        stub = overlap_stub(open_pulls=[open_pull()], pull_files={25612: [changed_file]})
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot parse files", proc.stderr)
         self.assertEqual(self.pull_posts(stub), [])
 
     def test_nonoverlapping_open_pull_allows_creation(self) -> None:
