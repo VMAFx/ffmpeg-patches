@@ -27,6 +27,7 @@ MAX_UPDATES = 1000
 SCP_REMOTE = re.compile(r"(?:[^/@:\s]+@)?([A-Za-z0-9_.-]+):(.+)")
 REPOSITORY_PATH = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 GITHUB_HOSTS = {"github.com", "www.github.com"}
+GH_HOSTNAME = "github.com"
 REMOTE_SCHEMES = {"https", "http", "ssh", "git", "git+ssh", "ssh+git"}
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 APIReader = Callable[[str, str], str]
@@ -81,7 +82,7 @@ def read_pull_requests(repository: str, branch: str) -> str:
         "&state=all&sort=created&direction=desc&per_page=1"
     )
     result = subprocess.run(  # nosec B603 B607 - fixed gh command; encoded head query, no shell.
-        ["gh", "api", endpoint],
+        ["gh", "api", endpoint, "--hostname", GH_HOSTNAME],
         timeout=20,
         check=False,
         capture_output=True,

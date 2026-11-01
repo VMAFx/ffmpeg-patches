@@ -241,7 +241,7 @@ class RemoteTest(unittest.TestCase):
 
 
 class APIReaderTest(unittest.TestCase):
-    def test_newest_head_query_and_timeout(self) -> None:
+    def test_newest_head_query_hostname_and_timeout(self) -> None:
         done = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
         with unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done) as run:
             self.assertEqual(push_guard.read_pull_requests(REPOSITORY, BRANCH), "[]")
@@ -251,6 +251,8 @@ class APIReaderTest(unittest.TestCase):
                 "api",
                 f"repos/{REPOSITORY}/pulls?head=VMAFx:{BRANCH}"
                 "&state=all&sort=created&direction=desc&per_page=1",
+                "--hostname",
+                "github.com",
             ],
             timeout=20,
             check=False,
