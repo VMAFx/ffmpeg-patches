@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import ast
 import os
-import subprocess
+import subprocess  # nosec B404 - CalledProcessError type for the git failure assertion.
 import tempfile
 import unittest
 import unittest.mock
@@ -56,6 +56,8 @@ class ImportStyleTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            # An unreadable gitdir stops Git from finding an ancestor checkout under TMPDIR.
+            (root / ".git").write_text("gitdir: missing\n", encoding="utf-8")
             with self.assertRaises(RuntimeError) as caught:
                 python_sources(root)
             self.assertIn(str(root), str(caught.exception))
