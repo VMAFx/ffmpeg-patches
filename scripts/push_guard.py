@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+"""Refuse pushes that revive the head branch of a closed pull request.
+
+    push_guard.py REMOTE_NAME REMOTE_URL
+        Read Git pre-push ref updates from stdin. For each branch update,
+        query its newest GitHub pull request through gh. Non-GitHub remotes,
+        tags and branch deletions pass without querying GitHub.
+
+Exit status: 0 when allowed, 1 for a closed pull request's absent or unchanged
+head branch, 2 when the guard cannot determine whether the push is safe.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from urllib.parse import quote
+
+MAX_UPDATES = 1000
+GITHUB_REMOTE = re.compile(
+    r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/?"
+)
+SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+APIReader = Callable[[str, str], str]
+
+
+@dataclass(frozen=True)
+class PullRequest:
+    number: int
+    state: str
+    head_sha: str
+    merged: bool
+
+
+def github_repository(url: str) -> str | None:
+    """Extract owner/repo only from supported github.com remote URL forms."""
+    match = GITHUB_REMOTE.fullmatch(url)
+    return match.group(1).removesuffix(".git") if match else None
+
+
+def read_pull_requests(repository: str, branch: str) -> str:
+    """Read only the newest PR for this head, with a twenty-second deadline."""
+    owner = repository.split("/", 1)[0]
+    endpoint = (
+        f"repos/{repository}/pulls?head={owner}:{quote(branch, safe='/')}"
+        "&state=all&sort=created&direction=desc&per_page=1"
+    )
+    result = subprocess.run(  # nosec B603 B607 - fixed gh command; encoded head query, no shell.
+        ["gh", "api", endpoint],
+        timeout=20,
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or f"gh api exited {result.returncode}")
+    return result.stdout
+
+
+def newest_pull_request(raw: str) -> PullRequest | None:
+    """Validate the API response so malformed data cannot silently allow a push."""
+    payload = json.loads(raw)
+    if not isinstance(payload, list):
+        raise ValueError("expected a pull request list")
+    if not payload:
+        return None
+    pr = payload[0]
+    if not isinstance(pr, dict):
+        raise ValueError("expected a pull request object")
+    number, state, head = pr.get("number"), pr.get("state"), pr.get("head")
+    if type(number) is not int or number < 1:
+        raise ValueError("invalid pull request number")
+    if state not in ("open", "closed"):
+        raise ValueError("invalid pull request state")
+    if not isinstance(head, dict):
+        raise ValueError("missing pull request head")
+    head_sha = head.get("sha")
+    if not isinstance(head_sha, str) or not SHA.fullmatch(head_sha):
+        raise ValueError("invalid pull request head SHA")
+    merged_at = pr.get("merged_at")
+    if merged_at is not None and not isinstance(merged_at, str):
+        raise ValueError("invalid pull request merge timestamp")
+    return PullRequest(number, state, head_sha, merged_at is not None)
+
+
+def check_branch(repository: str, branch: str, remote_sha: str, reader: APIReader) -> int:
+    try:
+        pr = newest_pull_request(reader(repository, branch))
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        print(
+            f"push_guard: cannot read pull requests for {branch}: {exc}; refusing (fail closed)",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        pr is not None
+        and pr.state == "closed"
+        and (set(remote_sha) == {"0"} or remote_sha == pr.head_sha)
+    ):
+        disposition = "merged" if pr.merged else "closed-unmerged"
+        print(
+            f"push_guard: refusing branch {branch}: PR #{pr.number} is {pr.state} ({disposition})",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def check_update(repository: str, line: str, reader: APIReader) -> int:
+    _, local_sha, remote_ref, remote_sha = line.split()
+    if not SHA.fullmatch(local_sha) or not SHA.fullmatch(remote_sha):
+        raise ValueError("invalid pre-push SHA")
+    if set(local_sha) == {"0"} or not remote_ref.startswith("refs/heads/"):
+        return 0
+    branch = remote_ref.removeprefix("refs/heads/")
+    return check_branch(repository, branch, remote_sha, reader)
+
+
+def main(argv: list[str], reader: APIReader = read_pull_requests) -> int:
+    """Check at most MAX_UPDATES ref updates, failing closed on input or API errors."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("remote_name")
+    parser.add_argument("remote_url")
+    args = parser.parse_args(argv)
+    repository = github_repository(args.remote_url)
+    if repository is None:
+        print("push_guard: non-GitHub remote; skipping", file=sys.stderr)
+        return 0
+    try:
+        for index in range(MAX_UPDATES + 1):
+            line = sys.stdin.readline()
+            if not line:
+                return 0
+            if index == MAX_UPDATES:
+                raise ValueError(f"more than {MAX_UPDATES} pre-push updates")
+            status = check_update(repository, line, reader)
+            if status:
+                return status
+    except (OSError, ValueError) as exc:
+        print(f"push_guard: invalid ref updates: {exc}; refusing (fail closed)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
