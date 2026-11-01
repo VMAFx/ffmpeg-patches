@@ -54,7 +54,7 @@ pre-push:
     - name: push-guard
       script: push-guard.sh
       runner: sh
-      args: "'{1}' '{2}'"
+      args: "--from-config"
       use_stdin: true
     - name: flavor-audit
       run: sh .config/lefthook/engine.sh flavor audit .

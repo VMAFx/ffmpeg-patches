@@ -8,6 +8,12 @@
         query its newest GitHub pull request through gh. Non-GitHub remotes,
         tags and branch deletions pass without querying GitHub.
 
+    push_guard.py --from-config
+        Check updates against every GitHub repository in configured remote
+        URLs and push URLs, without passing Git arguments through lefthook.
+        Known gap: a push to a bare URL absent from all configured remotes
+        is not seen in this mode.
+
 Exit status: 0 when allowed, 1 for a closed pull request's absent or unchanged
 head branch, 2 when the guard cannot determine whether the push is safe.
 """
@@ -18,7 +24,7 @@ import argparse
 import io
 import json
 import re
-import subprocess  # nosec B404 - fixed gh argv, no shell, explicit timeout.
+import subprocess  # nosec B404 - fixed git/gh argv, no shell, explicit timeout.
 import sys
 import threading
 from collections.abc import Callable
@@ -27,6 +33,9 @@ from typing import TextIO
 from urllib.parse import quote, urlsplit
 
 MAX_UPDATES = 1000
+MAX_REPOSITORIES = 32
+MAX_CONFIG_ENTRIES = 1000
+CONFIG_DEADLINE = 10
 STDIN_DEADLINE = 10
 # Budget 4096 UTF-8 bytes per update across the complete input.
 MAX_STDIN_BYTES = MAX_UPDATES * 4096
@@ -37,6 +46,7 @@ GH_HOSTNAME = "github.com"
 REMOTE_SCHEMES = {"https", "http", "ssh", "git", "git+ssh", "ssh+git"}
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 APIReader = Callable[[str, str], str]
+ConfigReader = Callable[[], str]
 
 
 @dataclass(frozen=True)
@@ -78,6 +88,52 @@ def redact_remote(url: str) -> str:
         return parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1]).geturl()
     match = SCP_REMOTE.fullmatch(url)
     return f"{match.group(1)}:{match.group(2)}" if match else url
+
+
+def read_remote_config() -> str:
+    """Read remote URL entries once; NUL records preserve whitespace in values."""
+    result = subprocess.run(  # nosec B603 B607 - fixed git argv, no shell.
+        ["git", "config", "--null", "--get-regexp", r"^remote\..*\.(url|pushurl)$"],
+        timeout=CONFIG_DEADLINE,
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode:
+        raise ValueError(f"git config exited {result.returncode}")
+    return result.stdout
+
+
+def validated_repository(url: str) -> str | None:
+    """Reject ambiguous GitHub hosts rather than skipping their updates."""
+    repository = github_repository(url)
+    host, _ = remote_location(url)
+    if repository is None and "github" in host:
+        raise ValueError(f"cannot tell whether {redact_remote(url)} is GitHub")
+    return repository
+
+
+def config_repositories(reader: ConfigReader) -> list[str]:
+    """Collect distinct repositories from bounded, NUL-delimited config entries."""
+    records = reader().split("\0", MAX_CONFIG_ENTRIES + 1)
+    if len(records) > MAX_CONFIG_ENTRIES + 1:
+        raise ValueError(f"more than {MAX_CONFIG_ENTRIES} remote configuration entries")
+    if records[-1]:
+        raise ValueError("unterminated remote configuration entry")
+    repositories: list[str] = []
+    for index in range(MAX_CONFIG_ENTRIES):
+        if index == len(records) - 1:
+            break
+        key, separator, url = records[index].partition("\n")
+        if not separator or not re.fullmatch(r"remote\..*\.(url|pushurl)", key):
+            raise ValueError("invalid remote configuration entry")
+        repository = validated_repository(url)
+        if repository is not None and repository not in repositories:
+            if len(repositories) == MAX_REPOSITORIES:
+                raise ValueError(f"more than {MAX_REPOSITORIES} GitHub repositories")
+            repositories.append(repository)
+    return repositories
 
 
 def read_pull_requests(repository: str, branch: str) -> str:
@@ -195,25 +251,26 @@ def read_stdin() -> io.StringIO:
     return io.StringIO("".join(chunks))
 
 
-def main(argv: list[str], reader: APIReader = read_pull_requests) -> int:
-    """Check at most MAX_UPDATES ref updates, failing closed on input or API errors."""
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    """Accept either config mode or the original pair of Git arguments."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("remote_name")
-    parser.add_argument("remote_url")
+    parser.add_argument("--from-config", action="store_true")
+    parser.add_argument("remote_name", nargs="?")
+    parser.add_argument("remote_url", nargs="?")
     args = parser.parse_args(argv)
-    repository = github_repository(args.remote_url)
-    if repository is None:
-        host, _ = remote_location(args.remote_url)
-        if "github" in host:
-            print(
-                f"push_guard: cannot tell whether {redact_remote(args.remote_url)} is GitHub; "
-                "refusing (fail closed)",
-                file=sys.stderr,
-            )
-            return 2
-        print("push_guard: non-GitHub remote; skipping", file=sys.stderr)
-        return 0
+    if args.from_config:
+        if args.remote_name is not None or args.remote_url is not None:
+            parser.error("--from-config cannot be combined with remote arguments")
+    elif args.remote_name is None or args.remote_url is None:
+        parser.error("provide --from-config or both REMOTE_NAME and REMOTE_URL")
+    return args
+
+
+def check_updates(repositories: list[str], reader: APIReader) -> int:
+    """Check at most MAX_UPDATES ref updates, failing closed on input or API errors."""
     try:
+        if len(repositories) > MAX_REPOSITORIES:
+            raise ValueError(f"more than {MAX_REPOSITORIES} GitHub repositories")
         updates = read_stdin()
         for index in range(MAX_UPDATES + 1):
             line = updates.readline()
@@ -221,12 +278,38 @@ def main(argv: list[str], reader: APIReader = read_pull_requests) -> int:
                 return 0
             if index == MAX_UPDATES:
                 raise ValueError(f"more than {MAX_UPDATES} pre-push updates")
-            status = check_update(repository, line, reader)
-            if status:
-                return status
+            for repository_index in range(MAX_REPOSITORIES):
+                if repository_index == len(repositories):
+                    break
+                status = check_update(repositories[repository_index], line, reader)
+                if status:
+                    return status
     except (OSError, ValueError) as exc:
         print(f"push_guard: invalid ref updates: {exc}; refusing (fail closed)", file=sys.stderr)
     return 2
+
+
+def main(
+    argv: list[str],
+    reader: APIReader = read_pull_requests,
+    config_reader: ConfigReader = read_remote_config,
+) -> int:
+    """Resolve repositories without shell interpolation, then check stdin once."""
+    args = parse_arguments(argv)
+    try:
+        if args.from_config:
+            repositories = config_repositories(config_reader)
+        else:
+            repository = validated_repository(args.remote_url)
+            repositories = [repository] if repository is not None else []
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        reason = "cannot read remote configuration: " if args.from_config else ""
+        print(f"push_guard: {reason}{exc}; refusing (fail closed)", file=sys.stderr)
+        return 2
+    if not repositories:
+        print("push_guard: non-GitHub remote; skipping", file=sys.stderr)
+        return 0
+    return check_updates(repositories, reader)
 
 
 if __name__ == "__main__":

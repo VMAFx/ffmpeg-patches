@@ -5,12 +5,28 @@
 from __future__ import annotations
 
 import os
+import re
+import tempfile
 import unittest
+from importlib import metadata
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def run_with_fixture(method: str, files: dict[str, str]) -> unittest.TestResult:
+    """Replay a policy check against planted files without touching the checkout."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for name, content in files.items():
+            (root / name).write_text(content, encoding="utf-8")
+        result = unittest.TestResult()
+        with patch(f"{__name__}.ROOT", root):
+            LefthookPushGuardTest(method).run(result)
+        return result
 
 
 class LefthookPushGuardTest(unittest.TestCase):
@@ -31,9 +47,8 @@ class LefthookPushGuardTest(unittest.TestCase):
         self.assertIn("script", guard)
         self.assertNotIn("run", guard)
         self.assertIs(guard["use_stdin"], True)
-        # Quote each Git argument so remote URLs containing spaces stay intact.
-        # {1}/{2} are plain templates, never skipped like file templates.
-        self.assertEqual(guard.get("args"), "'{1}' '{2}'")
+        # Literal custom args keep Git's remote name and URL out of shell text.
+        self.assertEqual(guard.get("args"), "--from-config")
         for key in ("glob", "files", "root", "exclude", "file_types"):
             with self.subTest(key=key):
                 self.assertNotIn(key, guard)
@@ -71,6 +86,90 @@ class LefthookPushGuardTest(unittest.TestCase):
         self.assertTrue(all("==" in pin for pin in ci_pins))
         self.assertEqual(set(documented_commands[0].removeprefix(prefix).split()), ci_pins)
 
+    def test_hook_jobs_never_interpolate_git_arguments(self) -> None:
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        for hook, settings in config.items():
+            if not isinstance(settings, dict):
+                continue
+            jobs = list(settings.get("commands", {}).values()) + settings.get("jobs", [])
+            for index, job in enumerate(jobs):
+                for field in ("run", "args"):
+                    with self.subTest(hook=hook, job=index, field=field):
+                        self.assertNotRegex(str(job.get(field, "")), r"\{\d+\}")
+
+    def test_contributing_python_minimum_supports_installed_pins(self) -> None:
+        document = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        minimum = re.search(r"Python (\d+)\.(\d+) or newer", document)
+        self.assertIsNotNone(minimum)
+        documented = tuple(map(int, minimum.groups()))
+        pins = re.findall(r"([A-Za-z0-9_.-]+)==([^\s`]+)", document)
+        self.assertTrue(pins)
+        for name, version in pins:
+            with self.subTest(pin=f"{name}=={version}"):
+                try:
+                    requires = metadata.metadata(name).get("Requires-Python", "")
+                except metadata.PackageNotFoundError:
+                    self.skipTest(f"{name} is not installed")
+                lower = re.search(r"(?:^|,)\s*>=\s*(\d+)\.(\d+)(?=[.,\s]|$)", requires)
+                if lower is None:
+                    self.skipTest(f"{name}: no simple >=X.Y in Requires-Python {requires!r}")
+                self.assertGreaterEqual(documented, tuple(map(int, lower.groups())))
+
+    def test_planted_git_argument_templates_are_refused(self) -> None:
+        for config in (
+            "pre-push:\n  jobs:\n    - args: \"'{1}' '{2}'\"\n",
+            'pre-commit:\n  commands:\n    example:\n      run: "echo {0}"\n',
+            'post-commit:\n  jobs:\n    - run: "echo {123}"\n',
+        ):
+            with self.subTest(config=config):
+                result = run_with_fixture(
+                    "test_hook_jobs_never_interpolate_git_arguments", {"lefthook.yml": config}
+                )
+                self.assertEqual(len(result.failures), 1)
+                self.assertFalse(result.errors)
+
+    def test_planted_python_minimum_is_refused(self) -> None:
+        with patch.object(metadata, "metadata", return_value={"Requires-Python": ">=3.12"}):
+            result = run_with_fixture(
+                "test_contributing_python_minimum_supports_installed_pins",
+                {"CONTRIBUTING.md": "Python 3.10 or newer\npython3 -m pip install numpy==2.5.4\n"},
+            )
+        self.assertEqual(len(result.failures), 1)
+        self.assertFalse(result.errors)
+
+    def test_contributing_uses_ignored_virtual_environment(self) -> None:
+        document = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        self.assertRegex(
+            document,
+            r"```bash\npython3 -m venv \.venv\n\. \.venv/bin/activate\npython3 -m pip install ",
+        )
+        self.assertIn(".venv/", (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
+
+    def test_planted_virtual_environment_omissions_are_refused(self) -> None:
+        document = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        ignored = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        for missing in ("python3 -m venv .venv\n", ". .venv/bin/activate\n", ".venv/\n"):
+            with self.subTest(missing=missing):
+                result = run_with_fixture(
+                    "test_contributing_uses_ignored_virtual_environment",
+                    {
+                        "CONTRIBUTING.md": document.replace(missing, ""),
+                        ".gitignore": ignored.replace(missing, ""),
+                    },
+                )
+                self.assertEqual(len(result.failures), 1)
+                self.assertFalse(result.errors)
+
+    def test_selector_scan_accepts_binary_hook_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lefthook.yml").write_text("{}\n", encoding="utf-8")
+            hook = root / ".lefthook" / "pre-push"
+            hook.mkdir(parents=True)
+            (hook / ".DS_Store").write_bytes(b"\xff")
+            with patch(f"{__name__}.ROOT", root):
+                self.test_hooks_start_python_through_selector()
+
     def test_hooks_start_python_through_selector(self) -> None:
         config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
         commands = {}
@@ -83,7 +182,9 @@ class LefthookPushGuardTest(unittest.TestCase):
                     commands[f"lefthook.yml:{hook}:{index}"] = job["run"]
         for script in (ROOT / ".lefthook").rglob("*"):
             if script.is_file():
-                commands[str(script.relative_to(ROOT))] = script.read_text(encoding="utf-8")
+                commands[str(script.relative_to(ROOT))] = script.read_text(
+                    encoding="utf-8", errors="replace"
+                )
         for source, command in commands.items():
             with self.subTest(source=source):
                 self.assertNotRegex(
