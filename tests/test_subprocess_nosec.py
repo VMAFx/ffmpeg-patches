@@ -18,6 +18,7 @@ SUBPROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_outpu
 # Popen returns at once; wait() and communicate() on the started process block.
 BLOCKING_CALLS = SUBPROCESS_CALLS - {"Popen"}
 PROCESS_WAIT_METHODS = frozenset({"wait", "communicate"})
+POSITIONAL_TIMEOUT = {"wait": 0, "communicate": 1}
 NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b.*\s-\s+\S")
 
 
@@ -117,12 +118,18 @@ def popen_waits(tree: ast.AST, popens: list[ast.Call]) -> list[ast.Call]:
 
 
 def has_deadline(node: ast.Call) -> bool:
-    """Return whether a call passes a timeout keyword other than a literal None."""
+    """Return whether a call passes a timeout other than a literal None."""
 
-    return any(
-        kw.arg == "timeout" and not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
-        for kw in node.keywords
-    )
+    timeout = next((kw.value for kw in node.keywords if kw.arg == "timeout"), None)
+    if timeout is not None:
+        return not (isinstance(timeout, ast.Constant) and timeout.value is None)
+    if not isinstance(node.func, ast.Attribute):
+        return False
+    index = POSITIONAL_TIMEOUT.get(node.func.attr)
+    if index is None or len(node.args) <= index:
+        return False
+    value = node.args[index]
+    return not (isinstance(value, ast.Constant) and value.value is None)
 
 
 class SubprocessNosecTest(unittest.TestCase):
@@ -219,6 +226,8 @@ class SubprocessNosecTest(unittest.TestCase):
                 "ann.wait()",
                 "subprocess.Popen(['tool']).wait()",
                 "proc.wait(timeout=None)",
+                "proc.wait(None)",
+                "proc.communicate(b'', None)",
                 "proc.wait(timeout=5)",
                 "with subprocess.Popen(['tool']) as child:",
                 "    child.wait()",
@@ -227,13 +236,20 @@ class SubprocessNosecTest(unittest.TestCase):
                 "",
             )
         )
-        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 5, 6, 7, 10])
+        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 5, 6, 7, 8, 9, 12])
 
     def test_blocking_call_with_timeout_and_popen_are_accepted(self) -> None:
         """A call with an explicit timeout and a Popen constructor produce no offenders."""
 
-        source = (
-            "import subprocess\nsubprocess.run(['tool'], timeout=0)\nsubprocess.Popen(['tool'])\n"
+        source = "\n".join(
+            (
+                "import subprocess",
+                "subprocess.run(['tool'], timeout=0)",
+                "proc = subprocess.Popen(['tool'])",
+                "proc.wait(5)",
+                "proc.communicate(None, 5)",
+                "",
+            )
         )
         self.assertEqual(find_blocking_calls_without_timeout(source), [])
 
