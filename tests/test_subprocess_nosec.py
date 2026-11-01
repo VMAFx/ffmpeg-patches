@@ -15,7 +15,7 @@ from tests.helpers import python_sources
 
 ROOT = Path(__file__).resolve().parent.parent
 SUBPROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_output"})
-# Popen returns at once; in a module that starts one, its wait() and communicate() block.
+# Popen returns at once; wait() and communicate() on the started process block.
 BLOCKING_CALLS = SUBPROCESS_CALLS - {"Popen"}
 PROCESS_WAIT_METHODS = frozenset({"wait", "communicate"})
 NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b.*\s-\s+\S")
@@ -80,15 +80,34 @@ def find_blocking_calls_without_timeout(source: str, *, filename: str = "<unknow
     tree = ast.parse(source, filename=filename)
     calls = subprocess_calls(tree)
     blocking = [node for node, name in calls if name in BLOCKING_CALLS]
-    if any(name == "Popen" for _, name in calls):
-        blocking.extend(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in PROCESS_WAIT_METHODS
-        )
+    blocking.extend(popen_waits(tree, [node for node, name in calls if name == "Popen"]))
     return sorted(node.lineno for node in blocking if not has_deadline(node))
+
+
+def popen_waits(tree: ast.AST, popens: list[ast.Call]) -> list[ast.Call]:
+    """Return wait() and communicate() calls on a Popen result, chained or bound to a name."""
+
+    process_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and node.value in popens:
+            process_names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif (
+            isinstance(node, ast.withitem)
+            and node.context_expr in popens
+            and isinstance(node.optional_vars, ast.Name)
+        ):
+            process_names.add(node.optional_vars.id)
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in PROCESS_WAIT_METHODS
+        and (
+            node.func.value in popens
+            or (isinstance(node.func.value, ast.Name) and node.func.value.id in process_names)
+        )
+    ]
 
 
 def has_deadline(node: ast.Call) -> bool:
@@ -183,7 +202,7 @@ class SubprocessNosecTest(unittest.TestCase):
         self.assertEqual(find_blocking_calls_without_timeout(source), [3, 4, 5, 6])
 
     def test_popen_wait_without_timeout_is_reported(self) -> None:
-        """In a module that starts a Popen, wait() and communicate() need a deadline."""
+        """wait() and communicate() on a Popen result need a deadline; other waits do not."""
 
         source = "\n".join(
             (
@@ -193,10 +212,14 @@ class SubprocessNosecTest(unittest.TestCase):
                 "subprocess.Popen(['tool']).wait()",
                 "proc.wait(timeout=None)",
                 "proc.wait(timeout=5)",
+                "with subprocess.Popen(['tool']) as child:",
+                "    child.wait()",
+                "event.wait()",
+                "await asyncio.wait_for(event.wait(), timeout=5)",
                 "",
             )
         )
-        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 4, 5])
+        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 4, 5, 8])
 
     def test_blocking_call_with_timeout_and_popen_are_accepted(self) -> None:
         """A call with an explicit timeout and a Popen constructor produce no offenders."""
