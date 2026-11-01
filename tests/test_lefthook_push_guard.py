@@ -38,4 +38,28 @@ class LefthookPushGuardTest(unittest.TestCase):
         script = ROOT / ".lefthook" / "pre-push" / guard["script"]
         self.assertTrue(script.is_file(), f"missing script: {script}")
         self.assertTrue(os.access(script, os.X_OK), f"script is not executable: {script}")
-        self.assertIn('exec python3 scripts/push_guard.py "$@"', script.read_text(encoding="utf-8"))
+        self.assertIn(
+            'exec sh .config/lefthook/python.sh scripts/push_guard.py "$@"',
+            script.read_text(encoding="utf-8"),
+        )
+
+    def test_hooks_start_python_through_selector(self) -> None:
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        commands = {}
+        for hook, settings in config.items():
+            if not isinstance(settings, dict):
+                continue
+            jobs = list(settings.get("commands", {}).values()) + settings.get("jobs", [])
+            for index, job in enumerate(jobs):
+                if "run" in job:
+                    commands[f"lefthook.yml:{hook}:{index}"] = job["run"]
+        for script in (ROOT / ".lefthook").rglob("*"):
+            if script.is_file():
+                commands[str(script.relative_to(ROOT))] = script.read_text(encoding="utf-8")
+        for source, command in commands.items():
+            with self.subTest(source=source):
+                self.assertNotRegex(
+                    command,
+                    r"(?m)(?:^|[;&|])\s*(?:exec\s+)?(?:python3?|py\s+-3)(?=\s|$)",
+                    "start Python through .config/lefthook/python.sh",
+                )
