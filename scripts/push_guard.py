@@ -10,9 +10,11 @@
 
     push_guard.py --from-config
         Check updates against every GitHub repository in configured remote
-        URLs and push URLs, without passing Git arguments through lefthook.
+        expanded push URLs, without passing Git arguments through lefthook.
         Known gap: a push to a bare URL absent from all configured remotes
         is not seen in this mode.
+        The guard reads PR state once before Git updates the ref, so it narrows
+        but cannot close a race with a merge that happens during the push.
 
 Exit status: 0 when allowed, 1 for a closed pull request's absent or unchanged
 head branch, 2 when the guard cannot determine whether the push is safe.
@@ -34,6 +36,7 @@ from urllib.parse import quote, urlsplit
 
 MAX_UPDATES = 1000
 MAX_REPOSITORIES = 32
+MAX_REMOTES = 1000
 MAX_CONFIG_ENTRIES = 1000
 CONFIG_DEADLINE = 10
 STDIN_DEADLINE = 10
@@ -46,7 +49,7 @@ GH_HOSTNAME = "github.com"
 REMOTE_SCHEMES = {"https", "http", "ssh", "git", "git+ssh", "ssh+git"}
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 APIReader = Callable[[str, str], str]
-ConfigReader = Callable[[], str]
+ConfigReader = Callable[[], dict[str, list[str]]]
 
 
 @dataclass(frozen=True)
@@ -90,19 +93,49 @@ def redact_remote(url: str) -> str:
     return f"{match.group(1)}:{match.group(2)}" if match else url
 
 
-def read_remote_config() -> str:
-    """Read remote URL entries once; NUL records preserve whitespace in values."""
-    result = subprocess.run(  # nosec B603 B607 - fixed git argv, no shell.
-        ["git", "config", "--null", "--get-regexp", r"^remote\..*\.(url|pushurl)$"],
-        timeout=CONFIG_DEADLINE,
-        check=False,
-        capture_output=True,
-        text=True,
-        stdin=subprocess.DEVNULL,
-    )
+def git_remote(args: list[str], cwd: str | None) -> str:
+    """Run a local remote query with a deadline and a named failure reason."""
+    command = ["git", "remote", *args]
+    label = "git remote" + (f" get-url for {args[-1]!r}" if args else "")
+    try:
+        result = subprocess.run(  # nosec B603 B607 - argv data, no shell.
+            command,
+            cwd=cwd,
+            timeout=CONFIG_DEADLINE,
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"{label} failed: {type(exc).__name__}") from exc
     if result.returncode:
-        raise ValueError(f"git config exited {result.returncode}")
+        raise ValueError(f"{label} exited {result.returncode}")
     return result.stdout
+
+
+def remote_lines(raw: str, limit: int, label: str) -> list[str]:
+    """Parse bounded newline records without stripping URL or name whitespace."""
+    lines = raw.removesuffix("\n").split("\n", limit) if raw else []
+    if len(lines) > limit:
+        raise ValueError(f"more than {limit} {label}")
+    return lines
+
+
+def read_remote_config(cwd: str | None = None) -> dict[str, list[str]]:
+    """Ask Git for expanded push URLs, including insteadOf and pushInsteadOf."""
+    names = remote_lines(git_remote([], cwd), MAX_REMOTES, "remotes")
+    remotes = {}
+    for index in range(MAX_REMOTES):
+        if index == len(names):
+            break
+        name = names[index]
+        remotes[name] = remote_lines(
+            git_remote(["get-url", "--push", "--all", name], cwd),
+            MAX_CONFIG_ENTRIES,
+            "remote push URLs",
+        )
+    return remotes
 
 
 def validated_repository(url: str) -> str | None:
@@ -115,20 +148,24 @@ def validated_repository(url: str) -> str | None:
 
 
 def config_repositories(reader: ConfigReader) -> list[str]:
-    """Collect distinct repositories from bounded, NUL-delimited config entries."""
-    records = reader().split("\0", MAX_CONFIG_ENTRIES + 1)
-    if len(records) > MAX_CONFIG_ENTRIES + 1:
-        raise ValueError(f"more than {MAX_CONFIG_ENTRIES} remote configuration entries")
-    if records[-1]:
-        raise ValueError("unterminated remote configuration entry")
+    """Collect distinct repositories from bounded, expanded remote push URLs."""
+    remotes = reader()
+    if len(remotes) > MAX_REMOTES:
+        raise ValueError(f"more than {MAX_REMOTES} remotes")
+    urls: list[str] = []
+    entries = iter(remotes.values())
+    for _ in range(MAX_REMOTES):
+        remote_urls = next(entries, None)
+        if remote_urls is None:
+            break
+        if len(urls) + len(remote_urls) > MAX_CONFIG_ENTRIES:
+            raise ValueError(f"more than {MAX_CONFIG_ENTRIES} remote push URLs")
+        urls.extend(remote_urls)
     repositories: list[str] = []
     for index in range(MAX_CONFIG_ENTRIES):
-        if index == len(records) - 1:
+        if index == len(urls):
             break
-        key, separator, url = records[index].partition("\n")
-        if not separator or not re.fullmatch(r"remote\..*\.(url|pushurl)", key):
-            raise ValueError("invalid remote configuration entry")
-        repository = validated_repository(url)
+        repository = validated_repository(urls[index])
         if repository is not None and repository not in repositories:
             if len(repositories) == MAX_REPOSITORIES:
                 raise ValueError(f"more than {MAX_REPOSITORIES} GitHub repositories")
