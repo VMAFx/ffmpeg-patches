@@ -227,6 +227,7 @@ class SubprocessNosecTest(unittest.TestCase):
                 "subprocess.Popen(['tool']).wait()",
                 "proc.wait(timeout=None)",
                 "proc.wait(None)",
+                "proc.wait(5, timeout=None)",
                 "proc.communicate(b'', None)",
                 "proc.wait(timeout=5)",
                 "with subprocess.Popen(['tool']) as child:",
@@ -236,7 +237,7 @@ class SubprocessNosecTest(unittest.TestCase):
                 "",
             )
         )
-        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 5, 6, 7, 8, 9, 12])
+        self.assertEqual(find_blocking_calls_without_timeout(source), [3, 5, 6, 7, 8, 9, 10, 13])
 
     def test_blocking_call_with_timeout_and_popen_are_accepted(self) -> None:
         """A call with an explicit timeout and a Popen constructor produce no offenders."""
@@ -248,6 +249,7 @@ class SubprocessNosecTest(unittest.TestCase):
                 "proc = subprocess.Popen(['tool'])",
                 "proc.wait(5)",
                 "proc.communicate(None, 5)",
+                "proc.communicate(None, None, timeout=5)",
                 "",
             )
         )
