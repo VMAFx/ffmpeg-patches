@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
+import subprocess  # nosec B404 - fixed gh argv, no shell, explicit timeout.
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -109,7 +109,7 @@ def newest_pull_request(raw: str) -> PullRequest | None:
 def _pull_request_fields(pr: dict) -> tuple[int, str, str, bool]:
     """Validate the fields used to decide whether a pull request blocks a push."""
     number, state, head = pr.get("number"), pr.get("state"), pr.get("head")
-    if type(number) is not int or number < 1:
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise ValueError("invalid pull request number")
     if state not in ("open", "closed"):
         raise ValueError("invalid pull request state")

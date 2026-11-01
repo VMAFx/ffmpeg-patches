@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import io
 import json
-import subprocess
+import subprocess  # nosec B404 - exception and result fixtures; process calls are mocked.
 import unittest
 import unittest.mock
 
@@ -103,8 +103,15 @@ class PushGuardTest(unittest.TestCase):
                 self.assertIn("; refusing (fail closed)", err)
 
     def test_bad_json_and_invalid_pr_data_fail_closed(self) -> None:
-        for raw in ("bad JSON", "null", "{}", "[null]", '[{"state": "closed"}]'):
+        malformed = ["bad JSON", "null", "{}", "[null]", '[{"state": "closed"}]']
+        for number in (True, False):
+            payload = json.loads(pull_request())
+            payload[0]["number"] = number
+            malformed.append(json.dumps(payload))
+        for raw in malformed:
             with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    push_guard.newest_pull_request(raw)
                 status, _, err = guard(unittest.mock.Mock(return_value=raw), update())
                 self.assertEqual(status, 2)
                 self.assertIn(f"cannot read pull requests for {BRANCH}:", err)
@@ -135,6 +142,8 @@ class RemoteTest(unittest.TestCase):
     def test_github_urls(self) -> None:
         for remote in (
             f"https://github.com/{REPOSITORY}",
+            f"https://GitHub.Com/{REPOSITORY}",
+            f"ssh://git@GITHUB.COM/{REPOSITORY}.git",
             REMOTE,
             f"git@github.com:{REPOSITORY}.git",
             f"ssh://git@github.com/{REPOSITORY}.git",
