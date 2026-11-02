@@ -376,6 +376,50 @@ class CheckTest(SeriesTestCase):
         self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
         self.assert_error(series.check(self.fx.root), "ssize_t line_5 = 50;")
 
+    def test_added_ssize_t_in_block_comment_passes(self) -> None:
+        """An added ssize_t in a block comment is ignored."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text().replace("+int line_5 = 50;", "+/* ssize_t is unavailable */")
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_in_line_comment_passes(self) -> None:
+        """An added ssize_t in a line comment is ignored."""
+        path = self.fx.patch(1)
+        path.write_text(path.read_text().replace("+int line_5 = 50;", "+// ssize_t"))
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_in_string_literal_passes(self) -> None:
+        """An added ssize_t in a string literal is ignored."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text().replace("+int line_5 = 50;", '+const char *s = "ssize_t";')
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_in_multiline_block_comment_passes(self) -> None:
+        """An added ssize_t on the second line of a block comment is ignored."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text().replace(
+                "+int line_5 = 50;", "+/* comment starts\n+ * ssize_t is unavailable */"
+            )
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_with_trailing_comment_fails(self) -> None:
+        """An added ssize_t before a trailing comment is refused."""
+        path = self.fx.patch(1)
+        path.write_text(path.read_text().replace("+int line_5 = 50;", "+ssize_t n; /* note */"))
+        self.assert_error(series.check(self.fx.root), "ssize_t n; /* note */")
+
+    def test_added_ssize_t_after_closed_comment_fails(self) -> None:
+        """An added ssize_t after a closed comment is refused."""
+        path = self.fx.patch(1)
+        path.write_text(path.read_text().replace("+int line_5 = 50;", "+/* x */ ssize_t n;"))
+        self.assert_error(series.check(self.fx.root), "/* x */ ssize_t n;")
+
     def test_added_ptrdiff_t_passes(self) -> None:
         """An added ptrdiff_t line passes."""
         path = self.fx.patch(1)

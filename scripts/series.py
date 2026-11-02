@@ -240,14 +240,64 @@ def check_patch_form(path: Path, findings: Findings) -> None:
         findings.error(name, "no diff --git section")
 
 
+def _skip_literal(line: str, index: int, quote: str) -> int:
+    """Return the index after a quoted C literal, honoring backslash escapes."""
+    index += 1
+    while index < len(line):
+        if line[index] == "\\":
+            index += 2
+        elif line[index] == quote:
+            return index + 1
+        else:
+            index += 1
+    return index
+
+
+def _code_line(line: str, in_block_comment: bool) -> tuple[str, bool]:
+    """Strip comments and C literals from one line and return block state."""
+    code: list[str] = []
+    index = 0
+    while index < len(line):
+        char = line[index]
+        next_char = line[index + 1] if index + 1 < len(line) else ""
+        if in_block_comment:
+            if char == "*" and next_char == "/":
+                in_block_comment = False
+                index += 2
+            else:
+                index += 1
+        elif char == "/" and next_char == "*":
+            in_block_comment = True
+            index += 2
+        elif char == "/" and next_char == "/":
+            break
+        elif char in "\"'":
+            index = _skip_literal(line, index, char)
+        else:
+            code.append(char)
+            index += 1
+    return "".join(code), in_block_comment
+
+
+def _code_lines(run: list[str]) -> list[str]:
+    """Strip comments and C literals from one added-line run."""
+    code_lines: list[str] = []
+    in_block_comment = False
+    for line in run:
+        code, in_block_comment = _code_line(line, in_block_comment)
+        code_lines.append(code)
+    return code_lines
+
+
 def check_added_posix_types(path: Path, findings: Findings) -> None:
     """Reject added `ssize_t` in C sources because MSVC lacks the POSIX type."""
     for file_name, runs in added_runs(path.read_text(errors="replace")).items():
         if not file_name.endswith((".c", ".h")):
             continue
         for run in runs:
-            for line in run:
-                if re.search(r"\bssize_t\b", line):
+            for index, code in enumerate(_code_lines(run)):
+                if re.search(r"\bssize_t\b", code):
+                    line = run[index]
                     findings.error(
                         path.name,
                         f"{file_name}: added line {line!r}: POSIX type; MSVC lacks it, "
