@@ -176,6 +176,8 @@ class ConfigModeTest(unittest.TestCase):
                 reader.assert_not_called()
 
     def test_repository_count_boundary(self) -> None:
+        """MAX_REPOSITORIES is accepted, one more is refused before any read."""
+
         self._assert_count_boundary(
             push_guard.MAX_REPOSITORIES,
             lambda count: {"origin": [f"https://github.com/o/r{index}" for index in range(count)]},
@@ -242,6 +244,8 @@ class ConfigModeTest(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 2)
 
     def test_config_entry_count_boundary(self) -> None:
+        """MAX_CONFIG_ENTRIES push URLs are accepted, one more is refused before any read."""
+
         self._assert_count_boundary(
             push_guard.MAX_CONFIG_ENTRIES,
             lambda count: {"origin": [REMOTE] * count},

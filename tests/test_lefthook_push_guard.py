@@ -100,6 +100,8 @@ class LefthookPushGuardTest(unittest.TestCase):
         self.assertEqual(set(documented_commands[0].removeprefix(prefix).split()), ci_pins)
 
     def test_hook_jobs_never_interpolate_git_arguments(self) -> None:
+        """No lefthook run/args field contains a {N} positional git-argument placeholder."""
+
         for hook, index, job in iter_hook_jobs(ROOT):
             for field in ("run", "args"):
                 with self.subTest(hook=hook, job=index, field=field):
@@ -179,6 +181,8 @@ class LefthookPushGuardTest(unittest.TestCase):
                 self.test_hooks_start_python_through_selector()
 
     def test_hooks_start_python_through_selector(self) -> None:
+        """Every hook command and .lefthook script starts Python through the selector."""
+
         commands = {}
         for hook, index, job in iter_hook_jobs(ROOT):
             if "run" in job:
