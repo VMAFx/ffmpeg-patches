@@ -408,6 +408,40 @@ class CheckTest(SeriesTestCase):
         )
         self.assertEqual(series.check(self.fx.root).errors, [])
 
+    def test_added_ssize_t_in_context_block_comment_passes(self) -> None:
+        """An added ssize_t between context comment lines is ignored."""
+        path = self.fx.patch(1)
+        text = path.read_text()
+        text = text.replace(" int line_4 = 4;", " /* note")
+        text = text.replace("+int line_5 = 50;", "+ * ssize_t is unavailable")
+        text = text.replace(" int line_6 = 6;", " */")
+        path.write_text(text)
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_removed_comment_does_not_hide_added_ssize_t(self) -> None:
+        """A removed comment opener does not affect added-line state."""
+        path = self.fx.patch(1)
+        text = path.read_text().replace("-int line_5 = 5;", "-/* x")
+        text = text.replace("+int line_5 = 50;", "+ssize_t n;")
+        path.write_text(text)
+        self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
+
+    def test_context_closed_comment_does_not_hide_added_ssize_t(self) -> None:
+        """An added ssize_t after a context comment is refused."""
+        path = self.fx.patch(1)
+        text = path.read_text().replace(" int line_4 = 4;", " /* note */")
+        text = text.replace("+int line_5 = 50;", "+ssize_t n;")
+        path.write_text(text)
+        self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
+
+    def test_block_comment_state_does_not_cross_hunks(self) -> None:
+        """An open comment in one hunk does not hide additions in the next."""
+        path = self.fx.patch(1)
+        text = path.read_text().replace(" int line_4 = 4;", " /* note")
+        text += "@@ -20,1 +20,2 @@\n int line_20 = 20;\n+ssize_t n;\n"
+        path.write_text(text)
+        self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
+
     def test_added_ssize_t_with_trailing_comment_fails(self) -> None:
         """An added ssize_t before a trailing comment is refused."""
         path = self.fx.patch(1)

@@ -279,30 +279,40 @@ def _code_line(line: str, in_block_comment: bool) -> tuple[str, bool]:
     return "".join(code), in_block_comment
 
 
-def _code_lines(run: list[str]) -> list[str]:
-    """Strip comments and C literals from one added-line run."""
-    code_lines: list[str] = []
-    in_block_comment = False
-    for line in run:
-        code, in_block_comment = _code_line(line, in_block_comment)
-        code_lines.append(code)
-    return code_lines
-
-
 def check_added_posix_types(path: Path, findings: Findings) -> None:
     """Reject added `ssize_t` in C sources because MSVC lacks the POSIX type."""
-    for file_name, runs in added_runs(path.read_text(errors="replace")).items():
-        if not file_name.endswith((".c", ".h")):
+    file_name: str | None = None
+    in_hunk = False
+    in_block_comment = False
+    for diff_line in path.read_text(errors="replace").splitlines():
+        if diff_line.startswith("diff --git "):
+            file_name = None
+            in_hunk = False
+            in_block_comment = False
             continue
-        for run in runs:
-            for index, code in enumerate(_code_lines(run)):
-                if re.search(r"\bssize_t\b", code):
-                    line = run[index]
-                    findings.error(
-                        path.name,
-                        f"{file_name}: added line {line!r}: POSIX type; MSVC lacks it, "
-                        "use ptrdiff_t or size_t",
-                    )
+        if diff_line.startswith("+++ "):
+            file_name = patch_path(diff_line)
+            in_hunk = False
+            in_block_comment = False
+            continue
+        if diff_line.startswith("@@"):
+            in_hunk = True
+            in_block_comment = False
+            continue
+        if not in_hunk or not file_name or not file_name.endswith((".c", ".h")):
+            continue
+        if diff_line.startswith(("-", "\\ No newline")):
+            continue
+        if not diff_line.startswith((" ", "+")):
+            continue
+        code, in_block_comment = _code_line(diff_line[1:], in_block_comment)
+        if diff_line.startswith("+") and re.search(r"\bssize_t\b", code):
+            line = diff_line[1:].rstrip()
+            findings.error(
+                path.name,
+                f"{file_name}: added line {line!r}: POSIX type; MSVC lacks it, "
+                "use ptrdiff_t or size_t",
+            )
 
 
 def check_exception_dates(entry: dict, name: str, findings: Findings, today: date) -> None:
