@@ -12,6 +12,15 @@ All changes must pass local verification before submitting:
 make verify-all
 ```
 
+Use Python 3.12 or newer and install the same pinned tools as CI before
+running local verification. CI uses the version in `.python-version`.
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install ruff==0.16.8 reuse==6.2.0 numpy==2.5.4 pyyaml==6.0.3
+```
+
 ### Modernized NASA JPL Power-of-10 Rules
 
 1. **Simple Control Flow (HISS-01)**: Recursion is strictly banned; call graph

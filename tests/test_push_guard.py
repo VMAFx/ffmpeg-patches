@@ -6,22 +6,28 @@ from __future__ import annotations
 
 import io
 import json
-import subprocess  # nosec B404 - exception and result fixtures; process calls are mocked.
+import os
+import subprocess  # nosec B404 - mocked queries and local temporary Git repositories.
+import tempfile
 import threading
 import time
 import unittest
 import unittest.mock
 
 from scripts import push_guard
-from tests.helpers import capture_main
+from tests.helpers import GIT_ENVIRONMENT_NAMES, capture_main
+from tests.helpers import isolated_git_environment as without_repository_variables
 
 REPOSITORY = "VMAFx/ffmpeg-patches"
 REMOTE = f"https://github.com/{REPOSITORY}.git"
+# GIT_CONFIG_GLOBAL needs Git 2.32 or newer.
+ISOLATED_GIT_CONFIG = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 BRANCH = "fix/example"
 ZERO = "0" * 40
 HEAD = "a" * 40
 LOCAL = "b" * 40
 OTHER = "c" * 40
+REWRITE_RULES = ("insteadOf", "pushInsteadOf")
 
 
 def pull_request(state: str = "closed", merged: bool = True) -> str:
@@ -44,6 +50,488 @@ def update(remote_sha: str = ZERO, local_sha: str = LOCAL, ref: str = BRANCH) ->
 def guard(reader: push_guard.APIReader, lines: str, remote: str = REMOTE) -> tuple[int, str, str]:
     with unittest.mock.patch("sys.stdin", io.StringIO(lines)):
         return capture_main(lambda argv: push_guard.main(argv, reader), "origin", remote)
+
+
+def config_guard(
+    reader: push_guard.APIReader, config_reader: push_guard.ConfigReader, lines: str = ""
+) -> tuple[int, str, str]:
+    with unittest.mock.patch("sys.stdin", io.StringIO(lines)):
+        return capture_main(
+            lambda argv: push_guard.main(argv, reader, config_reader), "--from-config"
+        )
+
+
+class ConfigModeTest(unittest.TestCase):
+    def test_closed_head_refused_in_either_repository_order(self) -> None:
+        for urls in ((REMOTE, "https://github.com/o/r"), ("https://github.com/o/r", REMOTE)):
+            with self.subTest(urls=urls):
+                reader = unittest.mock.Mock(
+                    side_effect=lambda repository, branch: (
+                        pull_request() if repository == REPOSITORY else "[]"
+                    )
+                )
+                config_reader = unittest.mock.Mock(return_value={"origin": list(urls)})
+                self.assertEqual(config_guard(reader, config_reader, update())[0], 1)
+
+    def test_other_repository_closed_head_refuses_push_to_origin(self) -> None:
+        config = {"origin": [REMOTE], "other": ["https://github.com/o/r"]}
+        reader = unittest.mock.Mock(side_effect=["[]", pull_request()])
+        self.assertEqual(config_guard(reader, lambda: config, update())[0], 1)
+        self.assertEqual(
+            reader.call_args_list,
+            [unittest.mock.call(REPOSITORY, BRANCH), unittest.mock.call("o/r", BRANCH)],
+        )
+
+    def test_no_pull_requests_in_either_repository_allows_push(self) -> None:
+        config = {"origin": [REMOTE], "other": ["https://github.com/o/r"]}
+        reader = unittest.mock.Mock(return_value="[]")
+        self.assertEqual(config_guard(reader, lambda: config, update())[0], 0)
+        self.assertEqual(
+            reader.call_args_list,
+            [unittest.mock.call(REPOSITORY, BRANCH), unittest.mock.call("o/r", BRANCH)],
+        )
+
+    def test_merged_and_fresh_heads(self) -> None:
+        for response, expected in ((pull_request(), 1), ("[]", 0)):
+            with self.subTest(expected=expected):
+                reader = unittest.mock.Mock(return_value=response)
+                config_reader = unittest.mock.Mock(return_value={"origin": [REMOTE]})
+                self.assertEqual(config_guard(reader, config_reader, update())[0], expected)
+                reader.assert_called_once_with(REPOSITORY, BRANCH)
+                config_reader.assert_called_once_with()
+
+    def test_second_repository_and_later_update_are_checked(self) -> None:
+        config = {"origin": [REMOTE], "fork": ["https://github.com/o/r"]}
+        reader = unittest.mock.Mock(side_effect=["[]", "[]", "[]", pull_request()])
+        with unittest.mock.patch.object(
+            push_guard, "read_stdin", return_value=io.StringIO(update(ref="fresh") + update())
+        ) as stdin:
+            self.assertEqual(config_guard(reader, lambda: config)[0], 1)
+        stdin.assert_called_once_with()
+        self.assertEqual(
+            reader.call_args_list,
+            [
+                unittest.mock.call(REPOSITORY, "fresh"),
+                unittest.mock.call("o/r", "fresh"),
+                unittest.mock.call(REPOSITORY, BRANCH),
+                unittest.mock.call("o/r", BRANCH),
+            ],
+        )
+
+    def test_only_non_github_remotes_skip(self) -> None:
+        reader = unittest.mock.Mock()
+        config = {"origin": ["https://gitlab.com/o/r"], "local": ["/local/repo"]}
+        status, _, err = config_guard(reader, lambda: config, "invalid updates")
+        self.assertEqual(status, 0)
+        self.assertIn("non-GitHub remote; skipping", err)
+        reader.assert_not_called()
+
+    def test_unparsable_github_host_fails_closed(self) -> None:
+        for remote in ("https://github.com/owner", "git@github.work:o/r"):
+            with self.subTest(remote=remote):
+                reader = unittest.mock.Mock()
+                config = {"origin": [REMOTE], "bad": [remote]}
+                status, _, err = config_guard(
+                    reader, unittest.mock.Mock(return_value=config), update()
+                )
+                self.assertEqual(status, 2)
+                self.assertIn("cannot tell whether", err)
+                reader.assert_not_called()
+
+    def test_config_reader_errors_fail_closed(self) -> None:
+        for error in (
+            OSError("git missing"),
+            ValueError("git remote exited 1"),
+            subprocess.TimeoutExpired("git", 10),
+        ):
+            with self.subTest(error=error):
+                reader = unittest.mock.Mock()
+                config_reader = unittest.mock.Mock(side_effect=error)
+                status, _, err = config_guard(reader, config_reader, update())
+                self.assertEqual(status, 2)
+                self.assertIn("cannot read remote configuration", err)
+                self.assertIn("refusing (fail closed)", err)
+                reader.assert_not_called()
+
+    def test_repository_count_boundary(self) -> None:
+        for count, expected in (
+            (push_guard.MAX_REPOSITORIES, 0),
+            (push_guard.MAX_REPOSITORIES + 1, 2),
+        ):
+            with self.subTest(count=count):
+                config = {"origin": [f"https://github.com/o/r{index}" for index in range(count)]}
+                reader = unittest.mock.Mock(return_value="[]")
+                status, _, err = config_guard(
+                    reader, unittest.mock.Mock(return_value=config), update()
+                )
+                self.assertEqual(status, expected)
+                self.assertEqual(reader.call_count, 0 if expected else count)
+                if expected:
+                    self.assertIn("repositories", err)
+
+    def test_duplicate_repositories_are_checked_once(self) -> None:
+        config = {"origin": [REMOTE, f"git@github.com:{REPOSITORY}"], "fork": [REMOTE]}
+        reader = unittest.mock.Mock(return_value="[]")
+        self.assertEqual(config_guard(reader, lambda: config, update())[0], 0)
+        reader.assert_called_once_with(REPOSITORY, BRANCH)
+
+    def test_repository_case_variants_keep_first_spelling(self) -> None:
+        config = {"origin": ["https://github.com/VMAFx/x", "https://github.com/vmafx/X"]}
+        self.assertEqual(push_guard.config_repositories(lambda: config), ["VMAFx/x"])
+
+    def test_repository_count_ignores_case_variants(self) -> None:
+        owner = "ownername"
+        urls = [
+            "https://github.com/"
+            + "".join(
+                char.upper() if index & (1 << bit) else char for bit, char in enumerate(owner)
+            )
+            + "/repo"
+            for index in range(push_guard.MAX_REPOSITORIES + 1)
+        ]
+        self.assertEqual(
+            push_guard.config_repositories(lambda: {"origin": urls}), ["ownername/repo"]
+        )
+
+    def test_distinct_repositories_above_limit_raise(self) -> None:
+        urls = [
+            f"https://github.com/owner/repo{index}"
+            for index in range(push_guard.MAX_REPOSITORIES + 1)
+        ]
+        with self.assertRaises(ValueError):
+            push_guard.config_repositories(lambda: {"origin": urls})
+
+    def test_shell_metacharacters_in_remote_name_are_data(self) -> None:
+        config = {"x';true;#": [REMOTE]}
+        reader = unittest.mock.Mock(return_value=pull_request())
+        self.assertEqual(config_guard(reader, lambda: config, update())[0], 1)
+        reader.assert_called_once_with(REPOSITORY, BRANCH)
+
+    def test_first_nonzero_status_wins(self) -> None:
+        config = {"origin": [REMOTE], "fork": ["https://github.com/o/r"]}
+        for response, expected in ((pull_request(), 1), ("bad JSON", 2)):
+            with self.subTest(expected=expected):
+                reader = unittest.mock.Mock(return_value=response)
+                self.assertEqual(config_guard(reader, lambda: config, update())[0], expected)
+                reader.assert_called_once_with(REPOSITORY, BRANCH)
+
+    def test_config_mode_excludes_positionals_and_requires_a_complete_mode(self) -> None:
+        for argv in (
+            [],
+            ["origin"],
+            ["--from-config", "origin"],
+            ["--from-config", "origin", REMOTE],
+        ):
+            with self.subTest(argv=argv), unittest.mock.patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    push_guard.main(argv, unittest.mock.Mock(), unittest.mock.Mock())
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_config_entry_count_boundary(self) -> None:
+        for count, expected in (
+            (push_guard.MAX_CONFIG_ENTRIES, 0),
+            (push_guard.MAX_CONFIG_ENTRIES + 1, 2),
+        ):
+            with self.subTest(count=count):
+                config = {"origin": [REMOTE] * count}
+                reader = unittest.mock.Mock(return_value="[]")
+                status, _, err = config_guard(
+                    reader, unittest.mock.Mock(return_value=config), update()
+                )
+                self.assertEqual(status, expected)
+                self.assertEqual(reader.call_count, 0 if expected else 1)
+                if expected:
+                    self.assertIn("remote push URLs", err)
+
+    def test_no_remotes_skip(self) -> None:
+        reader = unittest.mock.Mock()
+        self.assertEqual(config_guard(reader, lambda: {}, "invalid updates")[0], 0)
+        reader.assert_not_called()
+
+    def test_expanded_rewritten_url_checks_merged_head(self) -> None:
+        reader = unittest.mock.Mock(return_value=pull_request())
+        expanded = {"origin": [f"https://github.com/{REPOSITORY}"]}
+        self.assertEqual(config_guard(reader, lambda: expanded, update())[0], 1)
+        reader.assert_called_once_with(REPOSITORY, BRANCH)
+
+    def test_remote_count_boundary(self) -> None:
+        for count, expected in (
+            (push_guard.MAX_REMOTES, 0),
+            (push_guard.MAX_REMOTES + 1, 2),
+        ):
+            with self.subTest(count=count):
+                remotes = {f"r{index}": [REMOTE] for index in range(count)}
+                reader = unittest.mock.Mock(return_value="[]")
+                status, _, err = config_guard(
+                    reader, unittest.mock.Mock(return_value=remotes), update()
+                )
+                self.assertEqual(status, expected)
+                self.assertEqual(reader.call_count, 0 if expected else 1)
+                if expected:
+                    self.assertIn("remotes", err)
+
+
+def isolated_git_environment() -> dict[str, str]:
+    """Drop the repository variables Git exports to hooks; ignore global and system config."""
+    environment = without_repository_variables()
+    environment.update(ISOLATED_GIT_CONFIG)
+    return environment
+
+
+class GitEnvironmentNamesTest(unittest.TestCase):
+    def test_shared_list_covers_every_repository_variable_git_names(self) -> None:
+        local = subprocess.run(  # nosec B603 B607 - fixed argv, no shell.
+            ["git", "rev-parse", "--local-env-vars"],
+            check=True,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=push_guard.CONFIG_DEADLINE,
+        ).stdout.split()
+        self.assertTrue(local)
+        self.assertEqual(set(local) - GIT_ENVIRONMENT_NAMES, set())
+
+
+class ConfigDeadlineTest(unittest.TestCase):
+    def test_expired_budget_stops_before_get_url(self) -> None:
+        clock = unittest.mock.Mock(side_effect=[0, 0, 31])
+        with (
+            unittest.mock.patch.object(push_guard, "git_remote", return_value="origin\n") as git,
+            self.assertRaisesRegex(ValueError, "remote config deadline of 30 s passed"),
+        ):
+            push_guard.read_remote_config(clock=clock)
+        git.assert_called_once_with([], None, 10)
+
+    def test_timeouts_shrink_with_remaining_budget(self) -> None:
+        clock = unittest.mock.Mock(side_effect=[0, 0, 15, 25])
+        with unittest.mock.patch.object(
+            push_guard, "git_remote", side_effect=["one\ntwo\n", "url1\n", "url2\n"]
+        ) as git:
+            self.assertEqual(
+                push_guard.read_remote_config(clock=clock), {"one": ["url1"], "two": ["url2"]}
+            )
+        self.assertEqual(
+            git.call_args_list,
+            [
+                unittest.mock.call([], None, 10),
+                unittest.mock.call(["get-url", "--push", "--all", "one"], None, 10),
+                unittest.mock.call(["get-url", "--push", "--all", "two"], None, 5),
+            ],
+        )
+
+    def test_config_deadline_fails_closed(self) -> None:
+        config_reader = unittest.mock.Mock(
+            side_effect=ValueError("remote config deadline of 30 s passed")
+        )
+        status, _, err = config_guard(unittest.mock.Mock(), config_reader, update())
+        self.assertEqual(status, 2)
+        self.assertIn("remote config deadline of 30 s passed", err)
+
+
+class ConfigReaderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Hooks export GIT_DIR and friends; without this, fixtures would write to the caller's
+        # repository, and personal or system rewrite rules would change expanded URLs.
+        isolation = unittest.mock.patch.dict(os.environ, isolated_git_environment(), clear=True)
+        isolation.start()
+        self.addCleanup(isolation.stop)
+
+    def test_inherited_repository_variables_do_not_reach_the_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as caller, tempfile.TemporaryDirectory() as fixture:
+            fixture_git(caller, "init")
+            hook_variables = {"GIT_DIR": os.path.join(caller, ".git"), "GIT_WORK_TREE": caller}
+            with unittest.mock.patch.dict(os.environ, hook_variables):
+                environment = isolated_git_environment()
+                with unittest.mock.patch.dict(os.environ, environment, clear=True):
+                    fixture_git(fixture, "init")
+                    fixture_git(fixture, "remote", "add", "origin", REMOTE)
+            self.assertNotIn("GIT_DIR", environment)
+            self.assertNotIn("GIT_WORK_TREE", environment)
+            self.assertEqual(fixture_git(caller, "remote"), "")
+            self.assertEqual(fixture_git(fixture, "remote"), "origin\n")
+
+    def test_global_rewrite_rules_would_change_the_push_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            hostile = os.path.join(directory, "global.gitconfig")
+            with open(hostile, "w", encoding="utf-8") as handle:
+                handle.write('[url "git@github.com:"]\n\tpushInsteadOf = https://github.com/\n')
+            repository = os.path.join(directory, "repository")
+            os.mkdir(repository)
+            fixture_git(repository, "init")
+            fixture_git(repository, "remote", "add", "origin", REMOTE)
+            self.assertEqual(push_guard.read_remote_config(cwd=repository), {"origin": [REMOTE]})
+            with unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": hostile}):
+                urls = push_guard.read_remote_config(cwd=repository)["origin"]
+            self.assertEqual(urls, [f"git@github.com:{REPOSITORY}.git"])
+
+    def test_push_url_command_has_argv_data_and_deadline(self) -> None:
+        name = "x';true;#"
+        outputs = [
+            subprocess.CompletedProcess([], 0, stdout=f"{name}\n", stderr=""),
+            subprocess.CompletedProcess(
+                [], 0, stdout=f"{REMOTE}\nhttps://github.com/o/r\n", stderr=""
+            ),
+        ]
+        with unittest.mock.patch("scripts.push_guard.subprocess.run", side_effect=outputs) as run:
+            self.assertEqual(
+                push_guard.read_remote_config(cwd="/fixture"),
+                {name: [REMOTE, "https://github.com/o/r"]},
+            )
+        options = dict(
+            cwd="/fixture",
+            timeout=push_guard.CONFIG_DEADLINE,
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(
+            run.call_args_list,
+            [
+                unittest.mock.call(["git", "remote"], **options),
+                unittest.mock.call(
+                    ["git", "remote", "get-url", "--push", "--all", name], **options
+                ),
+            ],
+        )
+
+    def test_git_errors_and_timeouts_name_the_failed_query(self) -> None:
+        listed = subprocess.CompletedProcess([], 0, stdout="origin\n", stderr="")
+        failures = (
+            subprocess.CompletedProcess([], 1, stdout="", stderr="error"),
+            subprocess.CompletedProcess([], 128, stdout="", stderr="error"),
+            subprocess.TimeoutExpired("git", push_guard.CONFIG_DEADLINE),
+        )
+        for failure in failures:
+            for prefix, reason in (
+                ([], "git remote"),
+                ([listed], "git remote get-url for 'origin'"),
+            ):
+                with (
+                    self.subTest(failure=failure, reason=reason),
+                    unittest.mock.patch(
+                        "scripts.push_guard.subprocess.run", side_effect=[*prefix, failure]
+                    ),
+                ):
+                    reader = unittest.mock.Mock()
+                    status, _, err = config_guard(reader, push_guard.read_remote_config, update())
+                    self.assertEqual(status, 2)
+                    self.assertIn(reason, err)
+                    self.assertIn(
+                        "TimeoutExpired" if isinstance(failure, Exception) else "exited", err
+                    )
+                    reader.assert_not_called()
+
+    def test_no_remotes_needs_only_one_query(self) -> None:
+        done = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done) as run:
+            self.assertEqual(
+                config_guard(unittest.mock.Mock(), push_guard.read_remote_config)[0], 0
+            )
+        self.assertEqual(run.call_count, 1)
+
+    def test_remote_count_over_bound_stops_before_url_query(self) -> None:
+        names = "origin\n" * (push_guard.MAX_REMOTES + 1)
+        done = subprocess.CompletedProcess([], 0, stdout=names, stderr="")
+        with unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done) as run:
+            status, _, err = config_guard(unittest.mock.Mock(), push_guard.read_remote_config)
+        self.assertEqual(status, 2)
+        self.assertIn("remotes", err)
+        self.assertEqual(run.call_count, 1)
+
+    def test_push_url_count_over_bound_fails_closed(self) -> None:
+        outputs = [
+            subprocess.CompletedProcess([], 0, stdout="origin\n", stderr=""),
+            subprocess.CompletedProcess(
+                [], 0, stdout=f"{REMOTE}\n" * (push_guard.MAX_CONFIG_ENTRIES + 1), stderr=""
+            ),
+        ]
+        with unittest.mock.patch("scripts.push_guard.subprocess.run", side_effect=outputs):
+            status, _, err = config_guard(unittest.mock.Mock(), push_guard.read_remote_config)
+        self.assertEqual(status, 2)
+        self.assertIn("remote push URLs", err)
+
+    def test_real_reader_expands_rewritten_push_urls(self) -> None:
+        for rule in REWRITE_RULES:
+            with self.subTest(rule=rule), tempfile.TemporaryDirectory() as directory:
+                fixture_git(directory, "init")
+                fixture_git(
+                    directory, "config", "--local", f"url.https://github.com/.{rule}", "gh:"
+                )
+                fixture_git(directory, "remote", "add", "origin", f"gh:{REPOSITORY}")
+                urls = push_guard.read_remote_config(cwd=directory)["origin"]
+                self.assertEqual(len(urls), 1)
+                self.assertEqual(push_guard.github_repository(urls[0]), REPOSITORY)
+
+    def test_planted_raw_config_reader_is_refused(self) -> None:
+        result = unittest.TestResult()
+        with unittest.mock.patch.object(push_guard, "read_remote_config", raw_config_reader):
+            ConfigReaderTest("test_real_reader_expands_rewritten_push_urls").run(result)
+        self.assertEqual(len(result.failures), len(REWRITE_RULES))
+        self.assertFalse(result.errors)
+
+    def test_real_reader_checks_push_url_instead_of_fetch_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_git(directory, "init")
+            fixture_git(directory, "remote", "add", "origin", "https://gitlab.com/o/r")
+            fixture_git(directory, "remote", "set-url", "--push", "origin", REMOTE)
+            reader = unittest.mock.Mock(return_value=pull_request())
+            remotes = push_guard.read_remote_config(cwd=directory)
+            self.assertEqual(remotes, {"origin": [REMOTE]})
+            self.assertEqual(config_guard(reader, lambda: remotes, update())[0], 1)
+            reader.assert_called_once_with(REPOSITORY, BRANCH)
+
+
+class FixtureGitTest(unittest.TestCase):
+    def test_modern_config_subcommands_are_refused_before_running_git(self) -> None:
+        for command in ("get", "set", "unset", "list", "rename-section", "remove-section", "edit"):
+            with self.subTest(command=command), unittest.mock.patch("subprocess.run") as run:
+                with self.assertRaisesRegex(ValueError, "Git 2.46"):
+                    fixture_git("/fixture", "config", command, "--local", "test.key", "value")
+                run.assert_not_called()
+
+    def test_legacy_config_and_other_commands_are_forwarded(self) -> None:
+        for args in (
+            (),
+            ("config",),
+            ("config", "--local", "test.key", "value"),
+            ("config", "--get-regexp", r"^remote\.origin\.url$"),
+            ("remote", "set-url", "origin", REMOTE),
+        ):
+            with self.subTest(args=args), unittest.mock.patch("subprocess.run") as run:
+                run.return_value.stdout = "output"
+                self.assertEqual(fixture_git("/fixture", *args), "output")
+                run.assert_called_once_with(
+                    ["git", *args],
+                    cwd="/fixture",
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=push_guard.CONFIG_DEADLINE,
+                )
+
+
+def fixture_git(directory: str, *args: str) -> str:
+    """Run local Git commands only in a disposable integration fixture."""
+    modern_commands = ("get", "set", "unset", "list", "rename-section", "remove-section", "edit")
+    if len(args) >= 2 and args[0] == "config" and args[1] in modern_commands:
+        raise ValueError("Git 2.46 config subcommands are not portable; use legacy option syntax")
+    return subprocess.run(  # nosec B603 B607 - fixture argv, no network or shell.
+        ["git", *args],
+        cwd=directory,
+        check=True,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=push_guard.CONFIG_DEADLINE,
+    ).stdout
+
+
+def raw_config_reader(cwd: str) -> dict[str, list[str]]:
+    """Plant the old raw-config behavior against the temporary origin fixture."""
+    raw = fixture_git(cwd, "config", "--get-regexp", r"^remote\.origin\.url$")
+    return {"origin": [raw.rstrip("\n").partition(" ")[2]]}
 
 
 class PushGuardTest(unittest.TestCase):
@@ -82,6 +570,49 @@ class PushGuardTest(unittest.TestCase):
         lines = update(HEAD, ZERO) + f"refs/tags/v1 {LOCAL} refs/tags/v1 {ZERO}\n"
         self.assertEqual(guard(reader, lines), (0, "", ""))
         reader.assert_not_called()
+
+    def test_api_request_limit_boundary(self) -> None:
+        for count, expected in (
+            (push_guard.MAX_API_REQUESTS, 0),
+            (push_guard.MAX_API_REQUESTS + 1, 2),
+        ):
+            with self.subTest(count=count):
+                reader = unittest.mock.Mock(return_value="[]")
+                status, _, err = guard(reader, update() * count)
+                self.assertEqual(status, expected)
+                self.assertEqual(reader.call_count, push_guard.MAX_API_REQUESTS)
+                if expected:
+                    self.assertIn("more than 256 pull request lookups", err)
+                    self.assertIn("refusing (fail closed)", err)
+
+    def test_skipped_updates_do_not_consume_api_budget(self) -> None:
+        reader = unittest.mock.Mock(return_value="[]")
+        tag = f"refs/tags/v1 {LOCAL} refs/tags/v1 {ZERO}\n"
+        lines = update() * push_guard.MAX_API_REQUESTS + tag + update(HEAD, ZERO)
+        self.assertEqual(guard(reader, lines), (0, "", ""))
+        self.assertEqual(reader.call_count, push_guard.MAX_API_REQUESTS)
+
+    def test_api_budget_is_shared_across_repositories(self) -> None:
+        reader = unittest.mock.Mock(return_value="[]")
+        config = {"origin": [REMOTE], "other": ["https://github.com/o/r"]}
+        status, _, err = config_guard(reader, lambda: config, update() * 129)
+        self.assertEqual(status, 2)
+        self.assertIn("more than 256 pull request lookups", err)
+        self.assertEqual(reader.call_count, push_guard.MAX_API_REQUESTS)
+
+    def test_api_deadline_before_second_lookup(self) -> None:
+        reader = unittest.mock.Mock(return_value="[]")
+        clock = unittest.mock.Mock(
+            side_effect=[0, push_guard.CHECK_DEADLINE, push_guard.CHECK_DEADLINE + 1]
+        )
+        with unittest.mock.patch("sys.stdin", io.StringIO(update() * 2)):
+            status, _, err = capture_main(
+                lambda argv: push_guard.check_updates([REPOSITORY], reader, clock)
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("check deadline of 120 s passed", err)
+        self.assertIn("refusing (fail closed)", err)
+        reader.assert_called_once_with(REPOSITORY, BRANCH)
 
     def test_empty_push_does_not_query_api(self) -> None:
         reader = unittest.mock.Mock()

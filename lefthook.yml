@@ -50,14 +50,15 @@ post-commit:
 
 pre-push:
   parallel: false
-  commands:
-    push-guard:
-      priority: 1
-      run: python3 scripts/push_guard.py {0}
+  jobs:
+    - name: push-guard
+      script: push-guard.sh
+      runner: sh
+      args: "--from-config"
       use_stdin: true
-    flavor-audit:
+    - name: flavor-audit
       run: sh .config/lefthook/engine.sh flavor audit .
-    audit:
+    - name: audit
       run: sh .config/lefthook/engine.sh audit
-    gate:
+    - name: gate
       run: sh .config/lefthook/engine.sh gate run --path=. --admit-unsupported
