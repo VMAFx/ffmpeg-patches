@@ -240,6 +240,21 @@ def check_patch_form(path: Path, findings: Findings) -> None:
         findings.error(name, "no diff --git section")
 
 
+def check_added_posix_types(path: Path, findings: Findings) -> None:
+    """Reject added `ssize_t` in C sources because MSVC lacks the POSIX type."""
+    for file_name, runs in added_runs(path.read_text(errors="replace")).items():
+        if not file_name.endswith((".c", ".h")):
+            continue
+        for run in runs:
+            for line in run:
+                if re.search(r"\bssize_t\b", line):
+                    findings.error(
+                        path.name,
+                        f"{file_name}: added line {line!r}: POSIX type; MSVC lacks it, "
+                        "use ptrdiff_t or size_t",
+                    )
+
+
 def check_exception_dates(entry: dict, name: str, findings: Findings, today: date) -> None:
     cat = entry.get("category")
     ent_raw = entry.get("entered")
@@ -428,6 +443,7 @@ def check_tree(root: Path, names: list[str], findings: Findings, today: date | N
             findings.error(name, "listed in series.txt but missing from patches/")
             continue
         check_patch_form(path, findings)
+        check_added_posix_types(path, findings)
         sidecar = path.with_suffix(".toml")
         if sidecar.is_file():
             check_metadata(sidecar, findings, today=today)

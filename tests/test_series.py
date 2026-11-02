@@ -369,6 +369,25 @@ class CheckTest(SeriesTestCase):
         self.fx.write_records([self.fx.record(2)])
         self.assertEqual(series.check(self.fx.root).errors, [])
 
+    def test_added_ssize_t_fails(self) -> None:
+        """An added ssize_t line in a C file is refused."""
+        path = self.fx.patch(1)
+        path.write_text(path.read_text().replace("+int line_5 = 50;", "+ssize_t line_5 = 50;"))
+        self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
+        self.assert_error(series.check(self.fx.root), "ssize_t line_5 = 50;")
+
+    def test_added_ptrdiff_t_passes(self) -> None:
+        """An added ptrdiff_t line passes."""
+        path = self.fx.patch(1)
+        path.write_text(path.read_text().replace("+int line_5 = 50;", "+ptrdiff_t line_5 = 50;"))
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_context_ssize_t_passes(self) -> None:
+        """ssize_t in a context line is not the patch's addition, so it passes."""
+        path = self.fx.patch(1)
+        path.write_text(path.read_text().replace(" int line_4 = 4;", " ssize_t line_4 = 4;"))
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
 
 class UpstreamCreditTest(SeriesTestCase):
     # Split so REUSE does not read the fixture text as a notice on this file.

@@ -7,8 +7,16 @@ Adds a -qpfile <path> AVOption on libx264, libsvtav1 and libaom-av1. A shared \
 parser at libavcodec/qpfile_parser.{c,h} reads the file once into an FFQpFile \
 struct (header lines <frame_idx> <I|P|B> <qp>, optional per-MB-row delta lines) \
 so each encoder adapter maps it into its native ROI or per-block QP-offset API. \
-libx264 forwards the path to x264's native qpfile reader; libsvtav1 and libaom \
-use the shared parser directly.
+libx264 uses the shared parser and adds per-MB offsets through \
+x264_picture_t prop.quant_offsets (only when aq-mode is not 0); frame_type and \
+baseline_qp are parsed but no adapter applies them. libsvtav1 and libaom use the \
+shared parser directly. Offsets are x264 QP units, while SVT-AV1 seg_qp and \
+libaom delta_q are AV1 qindex deltas, so the same value is weaker on AV1.
+
+libaom requires one-pass encoding with -lag-in-frames 0 because it applies the \
+ROI map to the frame coded in each call. The shared lookup uses the greatest \
+record index not greater than the frame, while header-only records clear ROI \
+offsets from that frame onward.
 
 Generic: carries no VMAFx or vmaf-tune identifiers and no downstream ADR \
 references. Not sent upstream yet; refreshed against the pinned base with every \
@@ -18,7 +26,7 @@ FFmpeg release."""
 rule = "HISS-04"
 path = "libavcodec/libaomenc.c"
 function = "aom_init"
-lines = 322
+lines = 340
 category = "D"
 entered = "2026-10-31"
 expires = "2027-02-28"
