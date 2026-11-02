@@ -4,6 +4,7 @@
 """Refuse pushes that revive the head branch of a closed pull request.
 
 At most 256 pull request lookups may start within a 120-second check deadline.
+Remote configuration queries share a 30-second deadline.
 
     push_guard.py REMOTE_NAME REMOTE_URL
         Read Git pre-push ref updates from stdin. For each branch update,
@@ -46,6 +47,7 @@ CHECK_DEADLINE = 120
 MAX_REMOTES = 1000
 MAX_CONFIG_ENTRIES = 1000
 CONFIG_DEADLINE = 10
+CONFIG_TOTAL_DEADLINE = 30
 STDIN_DEADLINE = 10
 # Budget 4096 UTF-8 bytes per update across the complete input.
 MAX_STDIN_BYTES = MAX_UPDATES * 4096
@@ -100,7 +102,7 @@ def redact_remote(url: str) -> str:
     return f"{match.group(1)}:{match.group(2)}" if match else url
 
 
-def git_remote(args: list[str], cwd: str | None) -> str:
+def git_remote(args: list[str], cwd: str | None, timeout: float) -> str:
     """Run a local remote query with a deadline and a named failure reason."""
     command = ["git", "remote", *args]
     label = "git remote" + (f" get-url for {args[-1]!r}" if args else "")
@@ -108,7 +110,7 @@ def git_remote(args: list[str], cwd: str | None) -> str:
         result = subprocess.run(  # nosec B603 B607 - argv data, no shell.
             command,
             cwd=cwd,
-            timeout=CONFIG_DEADLINE,
+            timeout=timeout,
             check=False,
             capture_output=True,
             text=True,
@@ -129,16 +131,26 @@ def remote_lines(raw: str, limit: int, label: str) -> list[str]:
     return lines
 
 
-def read_remote_config(cwd: str | None = None) -> dict[str, list[str]]:
+def read_remote_config(
+    cwd: str | None = None, clock: Callable[[], float] = time.monotonic
+) -> dict[str, list[str]]:
     """Ask Git for expanded push URLs, including insteadOf and pushInsteadOf."""
-    names = remote_lines(git_remote([], cwd), MAX_REMOTES, "remotes")
+    start = clock()
+
+    def timeout() -> float:
+        remaining = CONFIG_TOTAL_DEADLINE - (clock() - start)
+        if remaining <= 0:
+            raise ValueError(f"remote config deadline of {CONFIG_TOTAL_DEADLINE} s passed")
+        return min(CONFIG_DEADLINE, remaining)
+
+    names = remote_lines(git_remote([], cwd, timeout()), MAX_REMOTES, "remotes")
     remotes = {}
     for index in range(MAX_REMOTES):
         if index == len(names):
             break
         name = names[index]
         remotes[name] = remote_lines(
-            git_remote(["get-url", "--push", "--all", name], cwd),
+            git_remote(["get-url", "--push", "--all", name], cwd, timeout()),
             MAX_CONFIG_ENTRIES,
             "remote push URLs",
         )

@@ -266,6 +266,42 @@ class GitEnvironmentNamesTest(unittest.TestCase):
         self.assertEqual(set(local) - GIT_ENVIRONMENT_NAMES, set())
 
 
+class ConfigDeadlineTest(unittest.TestCase):
+    def test_expired_budget_stops_before_get_url(self) -> None:
+        clock = unittest.mock.Mock(side_effect=[0, 0, 31])
+        with (
+            unittest.mock.patch.object(push_guard, "git_remote", return_value="origin\n") as git,
+            self.assertRaisesRegex(ValueError, "remote config deadline of 30 s passed"),
+        ):
+            push_guard.read_remote_config(clock=clock)
+        git.assert_called_once_with([], None, 10)
+
+    def test_timeouts_shrink_with_remaining_budget(self) -> None:
+        clock = unittest.mock.Mock(side_effect=[0, 0, 15, 25])
+        with unittest.mock.patch.object(
+            push_guard, "git_remote", side_effect=["one\ntwo\n", "url1\n", "url2\n"]
+        ) as git:
+            self.assertEqual(
+                push_guard.read_remote_config(clock=clock), {"one": ["url1"], "two": ["url2"]}
+            )
+        self.assertEqual(
+            git.call_args_list,
+            [
+                unittest.mock.call([], None, 10),
+                unittest.mock.call(["get-url", "--push", "--all", "one"], None, 10),
+                unittest.mock.call(["get-url", "--push", "--all", "two"], None, 5),
+            ],
+        )
+
+    def test_config_deadline_fails_closed(self) -> None:
+        config_reader = unittest.mock.Mock(
+            side_effect=ValueError("remote config deadline of 30 s passed")
+        )
+        status, _, err = config_guard(unittest.mock.Mock(), config_reader, update())
+        self.assertEqual(status, 2)
+        self.assertIn("remote config deadline of 30 s passed", err)
+
+
 class ConfigReaderTest(unittest.TestCase):
     def setUp(self) -> None:
         # Hooks export GIT_DIR and friends; without this, fixtures would write to the caller's
