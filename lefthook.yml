@@ -40,7 +40,7 @@ pre-commit:
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit --offline
     docstrings:
-      run: sh .config/lefthook/python.sh -B scripts/docstring_diff.py --cached
+      run: sh .config/lefthook/python.sh --keep-index -B scripts/docstring_diff.py --cached
 
 post-commit:
   commands:

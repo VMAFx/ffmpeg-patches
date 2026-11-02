@@ -140,6 +140,30 @@ class DocstringDiffTest(unittest.TestCase):
         self.write_and_stage("def old():\n    return 1\n")
         self.assertEqual(self.run_check("--cached").returncode, 0)
 
+    def test_deleted_public_docstring_fails_both_modes(self) -> None:
+        """Deleting only a public function's docstring selects that function."""
+        self.write_and_stage('def f():\n    """Doc."""\n    return 1\n')
+        self.git("commit", "-qm", "documented base")
+        self.write_and_stage("def f():\n    return 1\n")
+        self.assert_finding(self.run_check("--cached"), 1, "f")
+        self.assert_finding(self.run_check("--base", "HEAD"), 1, "f")
+
+    def test_deleted_line_inside_documented_function_passes(self) -> None:
+        """Deleting a body line selects the function but preserves its passing result."""
+        self.write_and_stage('def f():\n    """Doc."""\n    value = 1\n    return value\n')
+        self.git("commit", "-qm", "body base")
+        self.write_and_stage('def f():\n    """Doc."""\n    return 1\n')
+        self.assertEqual(self.run_check("--cached").returncode, 0)
+
+    def test_deletion_between_undocumented_functions_passes(self) -> None:
+        """Deleting a separator after one function does not select either neighbor."""
+        self.write_and_stage(
+            "def first():\n    return 1\n\n# removed\n\ndef second():\n    return 2\n"
+        )
+        self.git("commit", "-qm", "separator base")
+        self.write_and_stage("def first():\n    return 1\n\ndef second():\n    return 2\n")
+        self.assertEqual(self.run_check("--cached").returncode, 0)
+
     def test_unresolvable_base_fails_closed(self) -> None:
         """An unknown ref is a tool error, not a clean scan."""
         result = self.run_check("--base", "no-such-ref")

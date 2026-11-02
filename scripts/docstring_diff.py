@@ -53,8 +53,8 @@ def diff_options(cached: bool, ref: str | None) -> list[str]:
     return [base]
 
 
-def changed_files(options: list[str]) -> list[tuple[str, set[int]]]:
-    """Pair each new Python path with its zero-context added line numbers."""
+def changed_files(options: list[str]) -> list[tuple[str, set[int], set[int]]]:
+    """Pair each new Python path with added lines and deletion points."""
     common = ["diff", "--no-ext-diff", "--no-color", "--find-renames", "--diff-filter=AMR"]
     paths = [
         os.fsdecode(path)
@@ -62,23 +62,28 @@ def changed_files(options: list[str]) -> list[tuple[str, set[int]]]:
         if path
     ]
     patch = git(*common, "-U0", *options, "--", "*.py").decode("utf-8")
-    sections: list[set[int]] = []
+    sections: list[tuple[set[int], set[int]]] = []
     added: set[int] | None = None
+    deleted: set[int] | None = None
     for line in patch.splitlines():
         if line.startswith("diff --git "):
             added = set()
-            sections.append(added)
+            deleted = set()
+            sections.append((added, deleted))
             continue
         match = HUNK.match(line)
-        if match and added is not None:
+        if match and added is not None and deleted is not None:
             start = int(match.group(1))
             count = int(match.group(2) or "1")
-            added.update(range(start, start + count))
+            if count == 0:
+                deleted.add(start)
+            else:
+                added.update(range(start, start + count))
     if len(paths) != len(sections):
         raise RuntimeError(
             f"git diff path/patch mismatch: {len(paths)} paths, {len(sections)} patches"
         )
-    return list(zip(paths, sections, strict=True))
+    return [(path, added, deleted) for path, (added, deleted) in zip(paths, sections, strict=True)]
 
 
 def public_functions(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -94,7 +99,7 @@ def public_functions(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFuncti
     return found
 
 
-def findings(path: str, added: set[int], cached: bool) -> list[str]:
+def findings(path: str, added: set[int], deleted: set[int], cached: bool) -> list[str]:
     """Report undocumented selected functions in one new file version."""
     source = (
         git("show", f":{path}").decode("utf-8")
@@ -108,10 +113,10 @@ def findings(path: str, added: set[int], cached: bool) -> list[str]:
     result = []
     for node in public_functions(tree):
         start = min([node.lineno, *(item.lineno for item in node.decorator_list)])
-        if (
-            not added.isdisjoint(range(start, node.end_lineno + 1))
-            and ast.get_docstring(node) is None
-        ):
+        selected = not added.isdisjoint(range(start, node.end_lineno + 1)) or any(
+            start <= point and point + 1 <= node.end_lineno for point in deleted
+        )
+        if selected and ast.get_docstring(node) is None:
             result.append(
                 f"{path}:{node.lineno}: {node.name} has no docstring "
                 "(new or changed public function)"
@@ -130,8 +135,8 @@ def main(argv: list[str] | None = None) -> int:
         options = diff_options(args.cached, args.base)
         reports = [
             report
-            for path, added in changed_files(options)
-            for report in findings(path, added, args.cached)
+            for path, added, deleted in changed_files(options)
+            for report in findings(path, added, deleted, args.cached)
         ]
     except (RuntimeError, OSError, UnicodeError, ValueError) as error:
         print(f"docstring_diff: {error}", file=sys.stderr)

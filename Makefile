@@ -23,7 +23,7 @@ audit:
 	@$(PRAETORCTL) audit
 
 docstrings:
-	@python3 scripts/docstring_diff.py --base "$(DOCSTRING_BASE)"
+	@sh .config/lefthook/python.sh -B scripts/docstring_diff.py --base "$(DOCSTRING_BASE)"
 
 # The repository builds nothing: "build" lints the series and its metadata.
 build:
