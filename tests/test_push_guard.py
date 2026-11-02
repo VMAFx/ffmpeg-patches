@@ -175,6 +175,32 @@ class ConfigModeTest(unittest.TestCase):
         self.assertEqual(config_guard(reader, lambda: config, update())[0], 0)
         reader.assert_called_once_with(REPOSITORY, BRANCH)
 
+    def test_repository_case_variants_keep_first_spelling(self) -> None:
+        config = {"origin": ["https://github.com/VMAFx/x", "https://github.com/vmafx/X"]}
+        self.assertEqual(push_guard.config_repositories(lambda: config), ["VMAFx/x"])
+
+    def test_repository_count_ignores_case_variants(self) -> None:
+        owner = "ownername"
+        urls = [
+            "https://github.com/"
+            + "".join(
+                char.upper() if index & (1 << bit) else char for bit, char in enumerate(owner)
+            )
+            + "/repo"
+            for index in range(push_guard.MAX_REPOSITORIES + 1)
+        ]
+        self.assertEqual(
+            push_guard.config_repositories(lambda: {"origin": urls}), ["ownername/repo"]
+        )
+
+    def test_distinct_repositories_above_limit_raise(self) -> None:
+        urls = [
+            f"https://github.com/owner/repo{index}"
+            for index in range(push_guard.MAX_REPOSITORIES + 1)
+        ]
+        with self.assertRaises(ValueError):
+            push_guard.config_repositories(lambda: {"origin": urls})
+
     def test_shell_metacharacters_in_remote_name_are_data(self) -> None:
         config = {"x';true;#": [REMOTE]}
         reader = unittest.mock.Mock(return_value=pull_request())

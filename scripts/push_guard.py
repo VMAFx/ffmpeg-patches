@@ -181,13 +181,15 @@ def config_repositories(reader: ConfigReader) -> list[str]:
             raise ValueError(f"more than {MAX_CONFIG_ENTRIES} remote push URLs")
         urls.extend(remote_urls)
     repositories: list[str] = []
+    seen: set[str] = set()
     for index in range(MAX_CONFIG_ENTRIES):
         if index == len(urls):
             break
         repository = validated_repository(urls[index])
-        if repository is not None and repository not in repositories:
-            if len(repositories) == MAX_REPOSITORIES:
+        if repository is not None and repository.casefold() not in seen:
+            if len(seen) == MAX_REPOSITORIES:
                 raise ValueError(f"more than {MAX_REPOSITORIES} GitHub repositories")
+            seen.add(repository.casefold())
             repositories.append(repository)
     return repositories
 
