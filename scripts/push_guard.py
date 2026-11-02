@@ -9,8 +9,10 @@
         tags and branch deletions pass without querying GitHub.
 
     push_guard.py --from-config
-        Check updates against every GitHub repository in configured remote
-        expanded push URLs, without passing Git arguments through lefthook.
+        Check each update against every GitHub repository in configured remote
+        expanded push URLs because lefthook cannot safely pass the pushed remote.
+        A matching closed PR head in another repository also refuses the push
+        (fail closed); rename the branch to proceed.
         Known gap: a push to a bare URL absent from all configured remotes
         is not seen in this mode.
         The guard reads PR state once before Git updates the ref, so it narrows

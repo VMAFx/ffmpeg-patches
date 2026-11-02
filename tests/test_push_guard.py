@@ -62,6 +62,35 @@ def config_guard(
 
 
 class ConfigModeTest(unittest.TestCase):
+    def test_closed_head_refused_in_either_repository_order(self) -> None:
+        for urls in ((REMOTE, "https://github.com/o/r"), ("https://github.com/o/r", REMOTE)):
+            with self.subTest(urls=urls):
+                reader = unittest.mock.Mock(
+                    side_effect=lambda repository, branch: (
+                        pull_request() if repository == REPOSITORY else "[]"
+                    )
+                )
+                config_reader = unittest.mock.Mock(return_value={"origin": list(urls)})
+                self.assertEqual(config_guard(reader, config_reader, update())[0], 1)
+
+    def test_other_repository_closed_head_refuses_push_to_origin(self) -> None:
+        config = {"origin": [REMOTE], "other": ["https://github.com/o/r"]}
+        reader = unittest.mock.Mock(side_effect=["[]", pull_request()])
+        self.assertEqual(config_guard(reader, lambda: config, update())[0], 1)
+        self.assertEqual(
+            reader.call_args_list,
+            [unittest.mock.call(REPOSITORY, BRANCH), unittest.mock.call("o/r", BRANCH)],
+        )
+
+    def test_no_pull_requests_in_either_repository_allows_push(self) -> None:
+        config = {"origin": [REMOTE], "other": ["https://github.com/o/r"]}
+        reader = unittest.mock.Mock(return_value="[]")
+        self.assertEqual(config_guard(reader, lambda: config, update())[0], 0)
+        self.assertEqual(
+            reader.call_args_list,
+            [unittest.mock.call(REPOSITORY, BRANCH), unittest.mock.call("o/r", BRANCH)],
+        )
+
     def test_merged_and_fresh_heads(self) -> None:
         for response, expected in ((pull_request(), 1), ("[]", 0)):
             with self.subTest(expected=expected):
