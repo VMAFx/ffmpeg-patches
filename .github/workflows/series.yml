@@ -163,8 +163,11 @@ jobs:
           # encoders and filters that compile shaders, such as ffv1enc_vulkan.c (0007).
           # --enable-libzimg builds vf_zscale.c, which 0014 changes; --enable-opencl
           # builds vf_tonemap_opencl.c and its kernels, which 0015 and 0017 change.
+          # --enable-libx264, --enable-libsvtav1 and --enable-libaom build the encoder
+          # wrappers and qpfile_parser.c that 0040 changes.
           ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl --enable-vulkan \
             --enable-nvenc --enable-vaapi --enable-libdrm --enable-libvpl --enable-libzimg \
+            --enable-libx264 --enable-libsvtav1 --enable-libaom \
             --enable-opencl \
             || { tail -40 ffbuild/config.log; exit 1; }
       - name: Lint the C sources of this repository with clang-tidy and cppcheck
