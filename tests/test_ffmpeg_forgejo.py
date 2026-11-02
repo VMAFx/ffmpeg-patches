@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import os
@@ -13,6 +14,7 @@ import threading
 import unittest
 import unittest.mock
 import urllib.parse
+from collections.abc import Iterator
 from pathlib import Path
 
 from tests.helpers import isolated_git_environment
@@ -522,6 +524,26 @@ class TestClaimHeadTest(ForgejoTest):
 
         return self.run_command(stub, "comment", *args, "1", str(self.tmp / "body.md"))
 
+    def comment_body(
+        self,
+        stub: Stub,
+        *,
+        path_first: Path | None = None,
+        env_updates: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a tested-head comment with the shared issue and body arguments."""
+
+        return self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "1",
+            str(self.tmp / "body.md"),
+            path_first=path_first,
+            env_updates=env_updates,
+        )
+
     def edit_body(self, stub: Stub, *args: str) -> subprocess.CompletedProcess[str]:
         """Run an edit-body command with the shared pull and body arguments."""
 
@@ -576,14 +598,8 @@ class TestClaimHeadTest(ForgejoTest):
 
         (self.tmp / ".curlrc").write_text("fail\n")
         stub = Stub(pull_status=404)
-        proc = self.run_command(
-            stub,
-            "comment",
-            "--tested-head",
-            A,
-            "1",
-            str(self.tmp / "body.md"),
-            env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)},
+        proc = self.comment_body(
+            stub, env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)}
         )
         self.assertEqual(proc.returncode, 76, proc.stderr)
         self.assertIn("not a pull request", proc.stderr)
@@ -600,13 +616,8 @@ class TestClaimHeadTest(ForgejoTest):
         curl.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >>"$CURL_LOG"\nexit 7\n')
         curl.chmod(0o755)
         stub = Stub()
-        proc = self.run_command(
+        proc = self.comment_body(
             stub,
-            "comment",
-            "--tested-head",
-            A,
-            "1",
-            str(self.tmp / "body.md"),
             path_first=fake_bin,
             env_updates={"CURL_LOG": str(log)},
         )
@@ -621,35 +632,30 @@ class TestClaimHeadTest(ForgejoTest):
 
         (self.tmp / ".curlrc").write_text('header = "X-Curlrc: 1"\n')
         stub = Stub()
-        proc = self.run_command(
-            stub,
-            "comment",
-            "--tested-head",
-            A,
-            "1",
-            str(self.tmp / "body.md"),
-            env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)},
+        proc = self.comment_body(
+            stub, env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)}
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(stub.pull_headers[0].get("X-Curlrc"), "1")
 
-    def test_null_live_head_exits_one_without_post(self) -> None:
-        """A null live head exits 1 as unreadable without posting a comment."""
+    def assert_unreadable_head(self, live: str | None) -> None:
+        """Assert that an unreadable live head prevents a comment."""
 
-        stub = Stub([None])
+        stub = Stub([live])
         proc = self.comment(stub, "--tested-head", A)
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("cannot read the head", proc.stderr)
         self.assertEqual(self.posts(stub), [])
+
+    def test_null_live_head_exits_one_without_post(self) -> None:
+        """A null live head exits 1 as unreadable without posting a comment."""
+
+        self.assert_unreadable_head(None)
 
     def test_short_live_head_exits_one_without_post(self) -> None:
         """A short live head exits 1 as unreadable without posting a comment."""
 
-        stub = Stub(["abc"])
-        proc = self.comment(stub, "--tested-head", A)
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("cannot read the head", proc.stderr)
-        self.assertEqual(self.posts(stub), [])
+        self.assert_unreadable_head("abc")
 
     def test_matching_seven_character_live_head_exits_one_without_post(self) -> None:
         """A matching seven-character live head cannot authorize a comment."""
@@ -1022,6 +1028,22 @@ MUTANTS = {
 }
 
 
+@contextlib.contextmanager
+def mutant_case(
+    source: str,
+    old: str,
+    new: str,
+    base: type[unittest.TestCase],
+    name: str,
+) -> Iterator[type[unittest.TestCase]]:
+    """Write one mutated helper and yield its temporary test case class."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mutant = Path(tmp) / "ffmpeg-forgejo"
+        mutant.write_text(source.replace(old, new))
+        yield type(name, (base,), {"helper": mutant})
+
+
 class MutantTest(unittest.TestCase):
     """Each planted defect in the guard must make at least one EditBodyTest case fail."""
 
@@ -1032,10 +1054,7 @@ class MutantTest(unittest.TestCase):
         for name, (old, new) in MUTANTS.items():
             with self.subTest(mutant=name):
                 self.assertEqual(source.count(old), 1, "mutation site missing")
-                with tempfile.TemporaryDirectory() as tmp:
-                    mutant = Path(tmp) / "ffmpeg-forgejo"
-                    mutant.write_text(source.replace(old, new))
-                    case = type("Mutated", (EditBodyTest,), {"helper": mutant})
+                with mutant_case(source, old, new, EditBodyTest, "Mutated") as case:
                     suite = unittest.defaultTestLoader.loadTestsFromTestCase(case)
                     result = unittest.TestResult()
                     suite.run(result)
@@ -1071,10 +1090,7 @@ class PullOverlapMutantTest(unittest.TestCase):
         )
         for old, new, cases in mutations:
             self.assertEqual(source.count(old), 1, "mutation site missing")
-            with tempfile.TemporaryDirectory() as tmp:
-                mutant = Path(tmp) / "ffmpeg-forgejo"
-                mutant.write_text(source.replace(old, new))
-                case = type("MutatedOverlap", (PullRequestOverlapTest,), {"helper": mutant})
+            with mutant_case(source, old, new, PullRequestOverlapTest, "MutatedOverlap") as case:
                 for name in cases:
                     with self.subTest(test=name):
                         result = unittest.TestResult()
