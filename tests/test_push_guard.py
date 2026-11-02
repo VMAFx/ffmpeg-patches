@@ -15,7 +15,8 @@ import unittest
 import unittest.mock
 
 from scripts import push_guard
-from tests.helpers import capture_main
+from tests.helpers import GIT_ENVIRONMENT_NAMES, capture_main
+from tests.helpers import isolated_git_environment as without_repository_variables
 
 REPOSITORY = "VMAFx/ffmpeg-patches"
 REMOTE = f"https://github.com/{REPOSITORY}.git"
@@ -215,12 +216,48 @@ class ConfigModeTest(unittest.TestCase):
                     self.assertIn("remotes", err)
 
 
+def isolated_git_environment() -> dict[str, str]:
+    """Drop the repository variables Git exports to hooks; ignore global and system config."""
+    environment = without_repository_variables()
+    environment.update(ISOLATED_GIT_CONFIG)
+    return environment
+
+
+class GitEnvironmentNamesTest(unittest.TestCase):
+    def test_shared_list_covers_every_repository_variable_git_names(self) -> None:
+        local = subprocess.run(  # nosec B603 B607 - fixed argv, no shell.
+            ["git", "rev-parse", "--local-env-vars"],
+            check=True,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=push_guard.CONFIG_DEADLINE,
+        ).stdout.split()
+        self.assertTrue(local)
+        self.assertEqual(set(local) - GIT_ENVIRONMENT_NAMES, set())
+
+
 class ConfigReaderTest(unittest.TestCase):
     def setUp(self) -> None:
-        # Real-Git fixtures must not see the developer's global or system rewrite rules.
-        isolation = unittest.mock.patch.dict(os.environ, ISOLATED_GIT_CONFIG)
+        # Hooks export GIT_DIR and friends; without this, fixtures would write to the caller's
+        # repository, and personal or system rewrite rules would change expanded URLs.
+        isolation = unittest.mock.patch.dict(os.environ, isolated_git_environment(), clear=True)
         isolation.start()
         self.addCleanup(isolation.stop)
+
+    def test_inherited_repository_variables_do_not_reach_the_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as caller, tempfile.TemporaryDirectory() as fixture:
+            fixture_git(caller, "init")
+            hook_variables = {"GIT_DIR": os.path.join(caller, ".git"), "GIT_WORK_TREE": caller}
+            with unittest.mock.patch.dict(os.environ, hook_variables):
+                environment = isolated_git_environment()
+                with unittest.mock.patch.dict(os.environ, environment, clear=True):
+                    fixture_git(fixture, "init")
+                    fixture_git(fixture, "remote", "add", "origin", REMOTE)
+            self.assertNotIn("GIT_DIR", environment)
+            self.assertNotIn("GIT_WORK_TREE", environment)
+            self.assertEqual(fixture_git(caller, "remote"), "")
+            self.assertEqual(fixture_git(fixture, "remote"), "origin\n")
 
     def test_global_rewrite_rules_would_change_the_push_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
