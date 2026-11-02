@@ -2,11 +2,13 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit build test lint apply lengths lengths-local dist
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings build test lint apply lengths lengths-local dist
+
+DOCSTRING_BASE ?= origin/main
 
 all: build
 
-verify-all: compile-context-verify caveman-sources audit test lengths-local
+verify-all: compile-context-verify caveman-sources audit docstrings test lengths-local
 
 compile-context:
 	@$(PRAETORCTL) compile-context
@@ -19,6 +21,9 @@ caveman-sources:
 
 audit:
 	@$(PRAETORCTL) audit
+
+docstrings:
+	@sh .config/lefthook/python.sh -B scripts/docstring_diff.py --base "$(DOCSTRING_BASE)"
 
 # The repository builds nothing: "build" lints the series and its metadata.
 build:
