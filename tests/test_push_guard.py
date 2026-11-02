@@ -509,6 +509,49 @@ class PushGuardTest(unittest.TestCase):
         self.assertEqual(guard(reader, lines), (0, "", ""))
         reader.assert_not_called()
 
+    def test_api_request_limit_boundary(self) -> None:
+        for count, expected in (
+            (push_guard.MAX_API_REQUESTS, 0),
+            (push_guard.MAX_API_REQUESTS + 1, 2),
+        ):
+            with self.subTest(count=count):
+                reader = unittest.mock.Mock(return_value="[]")
+                status, _, err = guard(reader, update() * count)
+                self.assertEqual(status, expected)
+                self.assertEqual(reader.call_count, push_guard.MAX_API_REQUESTS)
+                if expected:
+                    self.assertIn("more than 256 pull request lookups", err)
+                    self.assertIn("refusing (fail closed)", err)
+
+    def test_skipped_updates_do_not_consume_api_budget(self) -> None:
+        reader = unittest.mock.Mock(return_value="[]")
+        tag = f"refs/tags/v1 {LOCAL} refs/tags/v1 {ZERO}\n"
+        lines = update() * push_guard.MAX_API_REQUESTS + tag + update(HEAD, ZERO)
+        self.assertEqual(guard(reader, lines), (0, "", ""))
+        self.assertEqual(reader.call_count, push_guard.MAX_API_REQUESTS)
+
+    def test_api_budget_is_shared_across_repositories(self) -> None:
+        reader = unittest.mock.Mock(return_value="[]")
+        config = {"origin": [REMOTE], "other": ["https://github.com/o/r"]}
+        status, _, err = config_guard(reader, lambda: config, update() * 129)
+        self.assertEqual(status, 2)
+        self.assertIn("more than 256 pull request lookups", err)
+        self.assertEqual(reader.call_count, push_guard.MAX_API_REQUESTS)
+
+    def test_api_deadline_before_second_lookup(self) -> None:
+        reader = unittest.mock.Mock(return_value="[]")
+        clock = unittest.mock.Mock(
+            side_effect=[0, push_guard.CHECK_DEADLINE, push_guard.CHECK_DEADLINE + 1]
+        )
+        with unittest.mock.patch("sys.stdin", io.StringIO(update() * 2)):
+            status, _, err = capture_main(
+                lambda argv: push_guard.check_updates([REPOSITORY], reader, clock)
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("check deadline of 120 s passed", err)
+        self.assertIn("refusing (fail closed)", err)
+        reader.assert_called_once_with(REPOSITORY, BRANCH)
+
     def test_empty_push_does_not_query_api(self) -> None:
         reader = unittest.mock.Mock()
         self.assertEqual(guard(reader, ""), (0, "", ""))

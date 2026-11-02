@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Refuse pushes that revive the head branch of a closed pull request.
 
+At most 256 pull request lookups may start within a 120-second check deadline.
+
     push_guard.py REMOTE_NAME REMOTE_URL
         Read Git pre-push ref updates from stdin. For each branch update,
         query its newest GitHub pull request through gh. Non-GitHub remotes,
@@ -31,6 +33,7 @@ import re
 import subprocess  # nosec B404 - fixed git/gh argv, no shell, explicit timeout.
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TextIO
@@ -38,6 +41,8 @@ from urllib.parse import quote, urlsplit
 
 MAX_UPDATES = 1000
 MAX_REPOSITORIES = 32
+MAX_API_REQUESTS = 256
+CHECK_DEADLINE = 120
 MAX_REMOTES = 1000
 MAX_CONFIG_ENTRIES = 1000
 CONFIG_DEADLINE = 10
@@ -305,8 +310,27 @@ def parse_arguments(argv: list[str]) -> argparse.Namespace:
     return args
 
 
-def check_updates(repositories: list[str], reader: APIReader) -> int:
+def bounded_api_reader(reader: APIReader, clock: Callable[[], float], start: float) -> APIReader:
+    """Limit actual API calls across all updates and repositories."""
+    requests = 0
+
+    def bounded_reader(repository: str, branch: str) -> str:
+        nonlocal requests
+        if requests >= MAX_API_REQUESTS:
+            raise ValueError(f"more than {MAX_API_REQUESTS} pull request lookups")
+        if clock() - start > CHECK_DEADLINE:
+            raise ValueError(f"check deadline of {CHECK_DEADLINE} s passed")
+        requests += 1
+        return reader(repository, branch)
+
+    return bounded_reader
+
+
+def check_updates(
+    repositories: list[str], reader: APIReader, clock: Callable[[], float] = time.monotonic
+) -> int:
     """Check at most MAX_UPDATES ref updates, failing closed on input or API errors."""
+    bounded_reader = bounded_api_reader(reader, clock, clock())
     try:
         if len(repositories) > MAX_REPOSITORIES:
             raise ValueError(f"more than {MAX_REPOSITORIES} GitHub repositories")
@@ -320,7 +344,7 @@ def check_updates(repositories: list[str], reader: APIReader) -> int:
             for repository_index in range(MAX_REPOSITORIES):
                 if repository_index == len(repositories):
                     break
-                status = check_update(repositories[repository_index], line, reader)
+                status = check_update(repositories[repository_index], line, bounded_reader)
                 if status:
                     return status
     except (OSError, ValueError) as exc:
