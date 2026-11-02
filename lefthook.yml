@@ -39,6 +39,8 @@ pre-commit:
       run: sh .config/lefthook/engine.sh compile-context --verify
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit --offline
+    docstrings:
+      run: sh .config/lefthook/python.sh -B scripts/docstring_diff.py --cached
 
 post-commit:
   commands:
