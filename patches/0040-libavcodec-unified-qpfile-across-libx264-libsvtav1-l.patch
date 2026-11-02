@@ -7,19 +7,19 @@ Adds an -qpfile <path> AVOption on libx264, libsvtav1, and libaom-av1 that consu
 
 libx264 uses the shared parser and adds per-MB offsets through x264_picture_t prop.quant_offsets; frame_type and baseline_qp are parsed but not applied by any adapter, and offsets act only with aq-mode other than 0. Header-only records mean no offsets from that frame on.
 
-libsvtav1 maps records to ROI_MAP_EVENT nodes only at exact record indices, and a header-only record emits a neutral event so the previous map stops there. libaom applies its ROI map only in one-pass encoding with -lag-in-frames 0; unset lag is forced to zero, pass modes and positive lag are rejected, and missing or header-only records clear the ROI map.
+libsvtav1 maps records to ROI_MAP_EVENT nodes only at exact record indices, and a header-only record emits a neutral event so the previous map stops there. libaom applies its ROI map only with -usage realtime and -cpu-used >= 7 (7 or 8); two-pass encoding is refused, and missing or header-only records clear the ROI map.
 
 Offsets are x264 QP units. SVT-AV1 seg_qp and libaom delta_q are AV1 qindex deltas (0..255, with libaom limiting each delta to +/-63), so the same value is weaker on AV1. Control failures are fatal instead of silently falling back.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
  libavcodec/Makefile        |   4 +-
- libavcodec/libaomenc.c     | 241 ++++++++++++++++++++++++++
+ libavcodec/libaomenc.c     | 240 ++++++++++++++++++++++++++
  libavcodec/libsvtav1.c     | 329 +++++++++++++++++++++++++++++++++++
  libavcodec/libx264.c       |  73 ++++++++
  libavcodec/qpfile_parser.c | 343 +++++++++++++++++++++++++++++++++++++
  libavcodec/qpfile_parser.h |  61 +++++++
- 6 files changed, 1050 insertions(+), 1 deletion(-)
+ 6 files changed, 1049 insertions(+), 1 deletion(-)
  create mode 100644 libavcodec/qpfile_parser.c
  create mode 100644 libavcodec/qpfile_parser.h
 
@@ -39,7 +39,7 @@ index 95ba308504d2c022a94293cafbb510e7d20e673c..00d07477384157b4fe715ae22847d707
  OBJS-$(CONFIG_LIBXAVS_ENCODER)            += libxavs.o
  OBJS-$(CONFIG_LIBXAVS2_ENCODER)           += libxavs2.o
 diff --git a/libavcodec/libaomenc.c b/libavcodec/libaomenc.c
-index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..d4e6eb2325c2d61adfcf7804991313cf6b0a82b3 100644
+index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..cfb1070518192bb5d727b5032576966fc24a83e3 100644
 --- a/libavcodec/libaomenc.c
 +++ b/libavcodec/libaomenc.c
 @@ -50,6 +50,10 @@
@@ -53,7 +53,19 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..d4e6eb2325c2d61adfcf7804991313cf
  
  /*
   * Portion of struct aom_codec_cx_pkt from aom_encoder.h.
-@@ -107,6 +111,31 @@ typedef struct AOMEncoderContext {
+@@ -69,6 +73,11 @@ struct FrameListData {
+     struct FrameListData *next;
+ };
+ 
++/* libaom 3.15.3 applies ROI maps only in realtime usage at cpu-used >= 7
++ * (measured: lower speeds and good usage ignore the map content). */
++#define QPFILE_AOM_USAGE_REALTIME 1 /* AOM_USAGE_REALTIME */
++#define QPFILE_AOM_MIN_CPU_USED   7
++
+ typedef struct AOMEncoderContext {
+     AVClass *class;
+     AVBSFContext *bsf;
+@@ -107,6 +116,31 @@ typedef struct AOMEncoderContext {
      int enable_global_motion;
      int enable_intrabc;
      int enable_restoration;
@@ -85,7 +97,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..d4e6eb2325c2d61adfcf7804991313cf
      int usage;
      int tune;
      int still_picture;
-@@ -503,6 +532,14 @@ static av_cold int aom_free(AVCodecContext *avctx)
+@@ -503,6 +537,14 @@ static av_cold int aom_free(AVCodecContext *avctx)
  
      aom_codec_destroy(&ctx->encoder);
      aom_img_remove_metadata(&ctx->rawimg);
@@ -100,7 +112,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..d4e6eb2325c2d61adfcf7804991313cf
      av_freep(&ctx->twopass_stats.buf);
      av_freep(&avctx->stats_out);
      free_frame_list(ctx->coded_frame_list);
-@@ -1042,6 +1079,52 @@ static av_cold int aom_init(AVCodecContext *avctx,
+@@ -1042,6 +1084,46 @@ static av_cold int aom_init(AVCodecContext *avctx,
      }
  #endif
  
@@ -111,17 +123,11 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..d4e6eb2325c2d61adfcf7804991313cf
 +                   "ROI maps only without recode.\n");
 +            return AVERROR(EINVAL);
 +        }
-+        if (ctx->lag_in_frames > 0) {
++        if (ctx->usage != QPFILE_AOM_USAGE_REALTIME || ctx->cpu_used < QPFILE_AOM_MIN_CPU_USED) {
 +            av_log(avctx, AV_LOG_ERROR,
-+                   "libaom: -qpfile needs -lag-in-frames 0 because ROI maps "
-+                   "apply to the frame coded in each call.\n");
++                   "libaom: -qpfile with libaom-av1 needs -usage realtime "
++                   "-cpu-used 7 or 8; libaom ignores ROI maps otherwise.\n");
 +            return AVERROR(EINVAL);
-+        }
-+        if (ctx->lag_in_frames < 0) {
-+            enccfg.g_lag_in_frames = 0;
-+            av_log(avctx, AV_LOG_INFO,
-+                   "libaom: -qpfile requires -lag-in-frames 0; defaulting "
-+                   "lag-in-frames to 0.\n");
 +        }
 +        int qret = ff_qpfile_load(ctx->qpfile_path, &ctx->qpfile);
 +        if (qret < 0) {
@@ -153,7 +159,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..d4e6eb2325c2d61adfcf7804991313cf
      // provide dummy value to initialize wrapper, values will be updated each _encode()
      aom_img_wrap(&ctx->rawimg, img_fmt, avctx->width, avctx->height, 1,
                   (unsigned char*)1);
-@@ -1301,6 +1384,157 @@ static enum AVPixelFormat aomfmt_to_pixfmt(struct aom_image *img)
+@@ -1301,6 +1383,157 @@ static enum AVPixelFormat aomfmt_to_pixfmt(struct aom_image *img)
      return AV_PIX_FMT_NONE;
  }
  
@@ -311,7 +317,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..d4e6eb2325c2d61adfcf7804991313cf
  static int aom_encode(AVCodecContext *avctx, AVPacket *pkt,
                        const AVFrame *frame, int *got_packet)
  {
-@@ -1375,6 +1609,12 @@ static int aom_encode(AVCodecContext *avctx, AVPacket *pkt,
+@@ -1375,6 +1608,12 @@ static int aom_encode(AVCodecContext *avctx, AVPacket *pkt,
              return res;
      }
  
@@ -324,7 +330,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..d4e6eb2325c2d61adfcf7804991313cf
      res = aom_codec_encode(&ctx->encoder, rawimg, timestamp, duration, flags);
      if (res != AOM_CODEC_OK) {
          log_encoder_error(avctx, "Error encoding frame");
-@@ -1568,6 +1808,7 @@ static const AVOption options[] = {
+@@ -1568,6 +1807,7 @@ static const AVOption options[] = {
      { "tune",            "The metric that the encoder tunes for. Automatically chosen by the encoder by default", OFFSET(tune), AV_OPT_TYPE_INT, {.i64 = -1}, -1, AOM_TUNE_SSIM, VE, .unit = "tune"},
      { "psnr",            NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_PSNR}, 0, 0, VE, .unit = "tune"},
      { "ssim",            NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_SSIM}, 0, 0, VE, .unit = "tune"},
