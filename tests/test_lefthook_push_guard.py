@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import unittest
+from collections.abc import Iterator
 from importlib import metadata
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +28,18 @@ def run_with_fixture(method: str, files: dict[str, str]) -> unittest.TestResult:
         with patch(f"{__name__}.ROOT", root):
             LefthookPushGuardTest(method).run(result)
         return result
+
+
+def iter_hook_jobs(root: Path) -> Iterator[tuple[str, int, dict]]:
+    """Yield each lefthook job with its hook name and index."""
+
+    config = yaml.safe_load((root / "lefthook.yml").read_text(encoding="utf-8"))
+    for hook, settings in config.items():
+        if not isinstance(settings, dict):
+            continue
+        jobs = list(settings.get("commands", {}).values()) + settings.get("jobs", [])
+        for index, job in enumerate(jobs):
+            yield hook, index, job
 
 
 class LefthookPushGuardTest(unittest.TestCase):
@@ -87,15 +100,10 @@ class LefthookPushGuardTest(unittest.TestCase):
         self.assertEqual(set(documented_commands[0].removeprefix(prefix).split()), ci_pins)
 
     def test_hook_jobs_never_interpolate_git_arguments(self) -> None:
-        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
-        for hook, settings in config.items():
-            if not isinstance(settings, dict):
-                continue
-            jobs = list(settings.get("commands", {}).values()) + settings.get("jobs", [])
-            for index, job in enumerate(jobs):
-                for field in ("run", "args"):
-                    with self.subTest(hook=hook, job=index, field=field):
-                        self.assertNotRegex(str(job.get(field, "")), r"\{\d+\}")
+        for hook, index, job in iter_hook_jobs(ROOT):
+            for field in ("run", "args"):
+                with self.subTest(hook=hook, job=index, field=field):
+                    self.assertNotRegex(str(job.get(field, "")), r"\{\d+\}")
 
     def test_contributing_python_minimum_supports_installed_pins(self) -> None:
         document = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
@@ -171,15 +179,10 @@ class LefthookPushGuardTest(unittest.TestCase):
                 self.test_hooks_start_python_through_selector()
 
     def test_hooks_start_python_through_selector(self) -> None:
-        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
         commands = {}
-        for hook, settings in config.items():
-            if not isinstance(settings, dict):
-                continue
-            jobs = list(settings.get("commands", {}).values()) + settings.get("jobs", [])
-            for index, job in enumerate(jobs):
-                if "run" in job:
-                    commands[f"lefthook.yml:{hook}:{index}"] = job["run"]
+        for hook, index, job in iter_hook_jobs(ROOT):
+            if "run" in job:
+                commands[f"lefthook.yml:{hook}:{index}"] = job["run"]
         for script in (ROOT / ".lefthook").rglob("*"):
             if script.is_file():
                 commands[str(script.relative_to(ROOT))] = script.read_text(

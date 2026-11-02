@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import unittest.mock
+from collections.abc import Callable
 
 from scripts import push_guard
 from tests.helpers import GIT_ENVIRONMENT_NAMES, capture_main
@@ -62,6 +63,27 @@ def config_guard(
 
 
 class ConfigModeTest(unittest.TestCase):
+    def _assert_count_boundary(
+        self,
+        limit: int,
+        make_config: Callable[[int], dict[str, list[str]]],
+        calls_when_ok: Callable[[int], int],
+        error_word: str,
+    ) -> None:
+        """Assert the accepted and rejected count boundary for one config shape."""
+
+        for count, expected in ((limit, 0), (limit + 1, 2)):
+            with self.subTest(count=count):
+                config = make_config(count)
+                reader = unittest.mock.Mock(return_value="[]")
+                status, _, err = config_guard(
+                    reader, unittest.mock.Mock(return_value=config), update()
+                )
+                self.assertEqual(status, expected)
+                self.assertEqual(reader.call_count, calls_when_ok(count) if expected == 0 else 0)
+                if expected:
+                    self.assertIn(error_word, err)
+
     def test_closed_head_refused_in_either_repository_order(self) -> None:
         for urls in ((REMOTE, "https://github.com/o/r"), ("https://github.com/o/r", REMOTE)):
             with self.subTest(urls=urls):
@@ -154,20 +176,12 @@ class ConfigModeTest(unittest.TestCase):
                 reader.assert_not_called()
 
     def test_repository_count_boundary(self) -> None:
-        for count, expected in (
-            (push_guard.MAX_REPOSITORIES, 0),
-            (push_guard.MAX_REPOSITORIES + 1, 2),
-        ):
-            with self.subTest(count=count):
-                config = {"origin": [f"https://github.com/o/r{index}" for index in range(count)]}
-                reader = unittest.mock.Mock(return_value="[]")
-                status, _, err = config_guard(
-                    reader, unittest.mock.Mock(return_value=config), update()
-                )
-                self.assertEqual(status, expected)
-                self.assertEqual(reader.call_count, 0 if expected else count)
-                if expected:
-                    self.assertIn("repositories", err)
+        self._assert_count_boundary(
+            push_guard.MAX_REPOSITORIES,
+            lambda count: {"origin": [f"https://github.com/o/r{index}" for index in range(count)]},
+            lambda count: count,
+            "repositories",
+        )
 
     def test_duplicate_repositories_are_checked_once(self) -> None:
         config = {"origin": [REMOTE, f"git@github.com:{REPOSITORY}"], "fork": [REMOTE]}
@@ -228,20 +242,12 @@ class ConfigModeTest(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 2)
 
     def test_config_entry_count_boundary(self) -> None:
-        for count, expected in (
-            (push_guard.MAX_CONFIG_ENTRIES, 0),
-            (push_guard.MAX_CONFIG_ENTRIES + 1, 2),
-        ):
-            with self.subTest(count=count):
-                config = {"origin": [REMOTE] * count}
-                reader = unittest.mock.Mock(return_value="[]")
-                status, _, err = config_guard(
-                    reader, unittest.mock.Mock(return_value=config), update()
-                )
-                self.assertEqual(status, expected)
-                self.assertEqual(reader.call_count, 0 if expected else 1)
-                if expected:
-                    self.assertIn("remote push URLs", err)
+        self._assert_count_boundary(
+            push_guard.MAX_CONFIG_ENTRIES,
+            lambda count: {"origin": [REMOTE] * count},
+            lambda count: 1,
+            "remote push URLs",
+        )
 
     def test_no_remotes_skip(self) -> None:
         reader = unittest.mock.Mock()
