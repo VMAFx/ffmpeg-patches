@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from array import array
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +29,28 @@ SEMIPLANAR_FORMATS = {
     "p012le": ("yuv420p12le", 12, True),
     "p016le": ("yuv420p16le", 16, True),
 }
+GIT_ENVIRONMENT_NAMES = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    }
+)
 
 
 SIZE = 64
@@ -42,6 +64,48 @@ CPU = (
     "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
 )
 RESET_TOOL = os.environ.get("HQDN3D_RESET_TOOL", "")
+
+
+def isolated_git_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return an environment without caller Git repository overrides."""
+
+    source = os.environ if environment is None else environment
+    return {name: value for name, value in source.items() if name not in GIT_ENVIRONMENT_NAMES}
+
+
+def python_sources(root: Path) -> list[Path]:
+    """Return tracked Python modules and shebang-identified scripts."""
+
+    try:
+        tracked = subprocess.run(  # nosec B603 B607 - fixed query against the test repository.
+            ["git", "ls-files", "-z"],
+            cwd=root,
+            env=isolated_git_environment(series.git_env()),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        raise RuntimeError(f"cannot list tracked files in {root}: {error}") from error
+    sources = []
+    tests = root / "tests"
+    scripts = root / "scripts"
+    for name in tracked.stdout.split("\0"):
+        if not name:
+            continue
+        path = root / name
+        if not path.is_file():
+            continue
+        if path.suffix == ".py" and (tests in path.parents or scripts in path.parents):
+            sources.append(path)
+            continue
+        if path.suffix or scripts not in path.parents:
+            continue
+        first_line = path.read_text(encoding="utf-8").splitlines()[:1]
+        if first_line and first_line[0].startswith("#!") and "python" in first_line[0]:
+            sources.append(path)
+    return sorted(sources)
 
 
 def device_environment(prefix: str) -> tuple[str, str]:
@@ -185,7 +249,9 @@ def rebuild_source(ffmpeg: str, tmp: str, codec: str, pixel_format: str = "") ->
             f"testsrc2=s={width}x{height}:d=0.32,noise=alls=20:allf=t{pixel_format}",
             "-c:v", codec, str(part),
         ]  # fmt: skip
-        subprocess.run(encode, capture_output=True, timeout=120, check=True)
+        subprocess.run(  # nosec B603 - test builds encoder argv from fixture-controlled values.
+            encode, capture_output=True, timeout=120, check=True
+        )
         parts.append(f"file '{part}'\n")
     listing = Path(tmp) / "list.txt"
     listing.write_text("".join(parts), encoding="utf-8")
@@ -197,9 +263,9 @@ def lavfi() -> list[str]:
 
 
 def run_git(tree: Path, *args: str) -> str:
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603 B607 - fixed git argv in a temporary test tree.
         ["git", "-C", str(tree), "-c", "user.name=Dev", "-c", "user.email=dev@invalid", *args],
-        env=series.git_env(),
+        env=isolated_git_environment(series.git_env()),
         capture_output=True,
         text=True,
         check=True,
@@ -257,7 +323,9 @@ def filter_frames(
         *source, "-vf", chain, *(["-noautoscale"] if noautoscale else []),
         "-f", "rawvideo", "pipe:1",
     ]  # fmt: skip
-    return subprocess.run(cmd, capture_output=True, timeout=300, check=False)
+    return subprocess.run(  # nosec B603 - test command comes from fixture-controlled tool paths.
+        cmd, capture_output=True, timeout=300, check=False
+    )
 
 
 def filter_frame(
@@ -271,7 +339,9 @@ def filter_frame(
         "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-s", f"{size}x{size}", "-i", "pipe:0",
         "-vf", f"{pq_input},{chain}", "-f", "rawvideo", "pipe:1",
     ]  # fmt: skip
-    return subprocess.run(cmd, input=frame, capture_output=True, timeout=120, check=False)
+    return subprocess.run(  # nosec B603 - test command comes from fixture-controlled tool paths.
+        cmd, input=frame, capture_output=True, timeout=120, check=False
+    )
 
 
 def hqdn3d_chains(
@@ -316,7 +386,9 @@ def assert_temporal_match(
 
 
 def run_reset(tool: str, device: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run([tool, device], capture_output=True, timeout=300, check=False)
+    return subprocess.run(  # nosec B603 - test tool and device are explicit fixture inputs.
+        [tool, device], capture_output=True, timeout=300, check=False
+    )
 
 
 def assert_ffv1_rebuild_matches(

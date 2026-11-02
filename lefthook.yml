@@ -39,6 +39,8 @@ pre-commit:
       run: sh .config/lefthook/engine.sh compile-context --verify
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit --offline
+    docstrings:
+      run: sh .config/lefthook/python.sh --keep-index -B scripts/docstring_diff.py --cached
 
 post-commit:
   commands:
@@ -50,10 +52,15 @@ post-commit:
 
 pre-push:
   parallel: false
-  commands:
-    flavor-audit:
+  jobs:
+    - name: push-guard
+      script: push-guard.sh
+      runner: sh
+      args: "--from-config"
+      use_stdin: true
+    - name: flavor-audit
       run: sh .config/lefthook/engine.sh flavor audit .
-    audit:
+    - name: audit
       run: sh .config/lefthook/engine.sh audit
-    gate:
+    - name: gate
       run: sh .config/lefthook/engine.sh gate run --path=. --admit-unsupported

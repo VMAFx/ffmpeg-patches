@@ -1,5 +1,8 @@
 # ffmpeg-patches
 
+[![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/VMAFx/ffmpeg-patches?utm_source=oss&utm_medium=github&utm_campaign=VMAFx%2Fffmpeg-patches&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/59284a64ef65425eb779b400aa2b624c)](https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard)
+
 One shared FFmpeg patch series for VMAFx projects: fixes tracked against FFmpeg master and sent upstream; consumers carry only their own feature patches.
 
 <!-- praetor:readme-governance:start -->
@@ -72,7 +75,7 @@ without a series patch is a change the series does not carry.
 | [25474](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25474) | `master` | open | avfilter: fix GCC 14 and 16 warnings in vf_median, af_firequalizer and af_afftfilt | none |
 | [25475](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25475) | `master` | open | avformat: fix GCC 14 and 16 -Wformat-truncation warnings in dashenc, matroskaenc and smoothstreamingenc | none |
 | [25476](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25476) | `master` | open | avformat: fix GCC 14 and 16 warnings in mpegts, nspdec and rtsp | none |
-| [25477](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477) | `master` | open | avcodec/ffv1enc: move float remap scratch to slice state | none |
+| [25477](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477) | `master` | open | avcodec/ffv1enc: move float remap scratch off the stack | none |
 | [25478](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25478) | `master` | open | avcodec/aac: fix GCC 14 and 16 -Wstringop-overflow warnings in aacenc and aacsbr | none |
 | [25479](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25479) | `master` | open | avcodec: fix GCC 14 and 16 warnings in a64multienc, h264dec, vlc and wmadec | none |
 | [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
@@ -221,6 +224,14 @@ on every pull request, on `main` and nightly, and fails when a stack no
 longer applies, so a series change that breaks a consumer shows before a
 release carries it. It applies only; the consumers build in their own
 repositories.
+
+A consumer patch reports `handed-over` only when a series patch's `.toml`
+declares that consumer and its added lines contain every consumer added-line
+run at the same file path, while the consumer's known `--pin NAME=TAG` does
+not yet contain that series patch (`--series-dir` defaults to this repository).
+The gate warns that the consumer must drop the patch on its next pin bump
+and continues its stack; a missing pin, an expired handover, or incomplete
+coverage still fails, and an unknown tag is a tool error.
 
 ## Graph check
 

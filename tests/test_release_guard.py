@@ -191,7 +191,7 @@ class CosignTest(unittest.TestCase):
         )  # fmt: skip
 
     def cosign(self, *args: str) -> None:
-        subprocess.run(
+        subprocess.run(  # nosec B603 - cosign path and arguments are test fixtures.
             [COSIGN or "cosign", *args],
             cwd=self.scratch,
             env={**os.environ, "COSIGN_PASSWORD": ""},

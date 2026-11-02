@@ -164,7 +164,7 @@ def git_env() -> dict[str, str]:
 def git(
     tree: Path, *args: str, check: bool = True, timeout: int = GIT_TIMEOUT
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return subprocess.run(  # nosec B603 B607 - fixed git argv plus caller-supplied Git arguments.
         ["git", "-C", str(tree), *GIT_IDENTITY, *GIT_POLICY, *args],
         env=git_env(),
         capture_output=True,

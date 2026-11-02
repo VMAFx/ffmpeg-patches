@@ -92,9 +92,10 @@ jobs:
       - uses: ./.github/actions/setup-python
         if: github.event.pull_request.draft != true
       # numpy: the CIEDE2000 arithmetic of scripts/tonemap_parity.py (ADR-0002).
-      - name: Install ruff, reuse and numpy
+      # PyYAML: tests/test_lefthook_push_guard.py reads lefthook.yml.
+      - name: Install ruff, reuse, numpy and PyYAML
         if: github.event.pull_request.draft != true
-        run: python3 -m pip install ruff==0.16.8 reuse==6.2.0 numpy==2.5.4
+        run: python3 -m pip install ruff==0.16.8 reuse==6.2.0 numpy==2.5.4 pyyaml==6.0.3
       # The release guard tests sign and verify with a throwaway key; the same
       # cosign as the release build, and no transparency log.
       - name: Install cosign

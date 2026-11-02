@@ -11,24 +11,31 @@
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
 #   ffmpeg-forgejo push    [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#   ffmpeg-forgejo pr      <branch> <title> <body-file>       open PR <you>:<branch> -> master
+#   ffmpeg-forgejo pr      [--overlap-ok <number>]... <branch> <title> <body-file>
+#                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
+#                          (exit 77); --overlap-ok permits exactly that PR; exits 3 when no reviewer was requested
 #   ffmpeg-forgejo issue   <title> <body-file>
-#   ffmpeg-forgejo comment <number> <body-file>       comment on an issue or PR
-#   ffmpeg-forgejo edit-body [--wait] <number> <body-file>   replace a PR body; refuses (exit 75) while the
+#   ffmpeg-forgejo comment (--tested-head <sha> | --no-test-claims) <number> <body-file>
+#                          comment on an issue or PR; test claims must match the live PR head
+#   ffmpeg-forgejo edit-body [--wait] (--tested-head <sha> | --no-test-claims) <number> <body-file>
+#                          replace a PR body; test claims must match the live PR head; refuses (exit 75) while the
 #                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
 # Environment: FFMPEG_FORGEJO_REPO (default FFmpeg/FFmpeg), FFMPEG_FORGEJO_BASE (default master),
-#   FFMPEG_FORGEJO_API (API base override, for tests).
+#   FFMPEG_FORGEJO_API (API base override, for tests), FFMPEG_FORGEJO_GIT (upstream Git URL override).
 set -euo pipefail
 
 HOST="https://code.ffmpeg.org"
 API="${FFMPEG_FORGEJO_API:-$HOST/api/v1}"
 REPO="${FFMPEG_FORGEJO_REPO:-FFmpeg/FFmpeg}"
 BASE="${FFMPEG_FORGEJO_BASE:-master}"
+GIT_URL="${FFMPEG_FORGEJO_GIT:-$HOST/$REPO.git}"
 
 die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
+
+usage_error() { printf 'ffmpeg-forgejo: usage: %s\n' "$*" >&2; exit 64; }
 
 token() {
   local t
@@ -76,6 +83,92 @@ head_sha() {
   python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])' <<<"$out"
 }
 
+# pull_status NUMBER: prints the HTTP status, then the response body. --no-fail preserves the
+# user's curl config while overriding curlrc fail, so a 404 remains a status instead of curl rc 22.
+pull_status() {
+  local number="$1" hdr response tok code curl_rc
+  tok="$(token)" || exit 1
+  hdr="$(mktemp)"
+  response="$(mktemp)"
+  trap 'rm -f "$hdr" "$response"' RETURN
+  chmod 600 "$hdr" "$response"
+  printf 'Authorization: token %s\n' "$tok" >"$hdr"
+  if code="$(curl --no-fail -sS -o "$response" -w '%{http_code}' --max-time 60 -X GET \
+    -H @"$hdr" "$API/repos/$REPO/pulls/$number")"; then
+    curl_rc=0
+  else
+    curl_rc=$?
+  fi
+  printf '%s\n' "$code"
+  [ "$curl_rc" -eq 0 ] || return "$curl_rc"
+  cat "$response"
+}
+
+# parse_claim_option USAGE ARGS...: set claim_mode, tested_head and claim_args.
+parse_claim_option() {
+  local usage="$1"
+  shift
+  claim_mode=""; tested_head=""; claim_args=0
+  while [ "${1:-}" = "--tested-head" ] || [ "${1:-}" = "--no-test-claims" ]; do
+    [ -z "$claim_mode" ] || usage_error "$usage"
+    if [ "$1" = "--tested-head" ]; then
+      [ $# -ge 2 ] || usage_error "$usage"
+      tested_head="${2,,}"
+      [[ "$tested_head" =~ ^[0-9a-f]{7,40}$ ]] || usage_error "$usage"
+      claim_mode="tested-head"
+      claim_args=2
+      shift 2
+    else
+      claim_mode="no-test-claims"
+      claim_args=1
+      shift
+    fi
+  done
+  [ -n "$claim_mode" ] || usage_error "$usage"
+}
+
+# require_tested_head NUMBER TESTED: refuse unless TESTED prefixes the live PR head.
+require_tested_head() {
+  local number="$1" tested="$2" response status body live rc
+  if response="$(pull_status "$number")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -ne 0 ]; then
+    printf 'ffmpeg-forgejo: cannot read the head of #%s (curl rc %s); tested head %s not checked.\n' \
+      "$number" "$rc" "$tested" >&2
+    exit 1
+  fi
+  status="${response%%$'\n'*}"
+  if [ "$status" = 404 ]; then
+    printf 'ffmpeg-forgejo: #%s is not a pull request; tested head %s cannot be checked.\n' \
+      "$number" "$tested" >&2
+    exit 76
+  fi
+  if [ "$status" != 200 ]; then
+    printf 'ffmpeg-forgejo: cannot read the head of #%s (HTTP %s); tested head %s not checked.\n' \
+      "$number" "$status" "$tested" >&2
+    exit 1
+  fi
+  body="${response#*$'\n'}"
+  if ! live="$(python3 -c 'import json,re,sys
+try:
+    sha = json.load(sys.stdin)["head"]["sha"]
+except (KeyError, TypeError):
+    raise SystemExit(1)
+if not isinstance(sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None:
+    raise SystemExit(1)
+print(sha)' \
+    <<<"$body" 2>/dev/null)"; then
+    printf 'ffmpeg-forgejo: cannot read the head of #%s (HTTP %s); tested head %s not checked.\n' \
+      "$number" "$status" "$tested" >&2
+    exit 1
+  fi
+  live="${live,,}"
+  if [[ "$live" != "$tested"* ]]; then
+    printf 'ffmpeg-forgejo: tested head %s does not match live head %s.\n' \
+      "$tested" "$live" >&2
+    exit 76
+  fi
+}
+
 # autolabel_state SHA: prints done, pending, none or unknown for the Autolabel contexts on that
 # commit. The status list is paged (X-Total-Count; the body's total_count counts one page only),
 # so it reads pages until an empty one; more than 20 pages, or a status outside Forgejo's
@@ -99,6 +192,113 @@ print("none" if not st else "pending" if "pending" in st else "done" if set(st) 
     [[ "$out" != *$'\n'* ]] || rows+=" ${out#*$'\n'}"
   done
   echo unknown
+}
+
+# check_pull_files NUMBER CANDIDATE-FILE: refuse when one pull shares a candidate path.
+check_pull_files() {
+  local number="$1" candidates="$2" file_page out parsed count overlap
+  for ((file_page = 1; file_page <= 20; file_page++)); do
+    if ! out="$(api GET "/repos/$REPO/pulls/$number/files?limit=50&page=$file_page")"; then
+      printf 'ffmpeg-forgejo: cannot check files of own open pull #%s.\n' "$number" >&2
+      return 1
+    fi
+    if ! parsed="$(python3 -c 'import json, os, pathlib, sys
+rows = json.load(sys.stdin)
+if rows is None and int(sys.argv[2]) >= 2: rows = []
+if not isinstance(rows, list): raise SystemExit(1)
+names = []
+for row in rows:
+    if not isinstance(row, dict) or not isinstance(row.get("filename"), str):
+        raise SystemExit(1)
+    names.append(row["filename"])
+    previous = row.get("previous_filename")
+    if row.get("status") == "renamed" and (not isinstance(previous, str) or not previous):
+        raise SystemExit(1)
+    if isinstance(previous, str) and previous:
+        names.append(previous)
+raw = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")
+candidates = {os.fsdecode(name) for name in raw if name}
+print(len(rows))
+print(json.dumps(sorted(candidates.intersection(names)), ensure_ascii=False))' \
+      "$candidates" "$file_page" <<<"$out" 2>/dev/null)"; then
+      printf 'ffmpeg-forgejo: cannot parse files of own open pull #%s.\n' "$number" >&2
+      return 1
+    fi
+    count="${parsed%%$'\n'*}"
+    overlap="${parsed#*$'\n'}"
+    [ "$count" -ne 0 ] || return 0
+    if [ "$file_page" -eq 20 ]; then
+      printf 'ffmpeg-forgejo: own open pull #%s has more than 19 pages of files; overlap not proven absent.\n' "$number" >&2
+      return 1
+    fi
+    if [ "$overlap" != "[]" ]; then
+      printf 'ffmpeg-forgejo: own open pull #%s shares files with this branch: %s; use --overlap-ok %s only for a deliberate stack.\n' \
+        "$number" "$overlap" "$number" >&2
+      return 77
+    fi
+  done
+}
+
+# check_pr_overlap BRANCH LOGIN ALLOWED-NUMBERS: refuse overlap with own open pulls.
+check_pr_overlap() {
+  local branch="$1" me="$2" allowed="$3" candidates pull_page out parsed count number encoded_me rc
+  local -a numbers
+  if ! timeout 120 git fetch --quiet --no-tags "$GIT_URL" "refs/heads/$BASE"; then
+    printf 'ffmpeg-forgejo: cannot fetch %s from %s; overlap not proven absent; no pull request opened.\n' \
+      "$BASE" "$GIT_URL" >&2
+    return 1
+  fi
+  candidates="$(mktemp)"
+  if ! git diff --no-ext-diff --no-renames --name-only -z "FETCH_HEAD...$branch" -- >"$candidates"; then
+    printf 'ffmpeg-forgejo: cannot determine files in %s relative to %s; no pull request opened.\n' \
+      "$branch" "$BASE" >&2
+    rm -f "$candidates"
+    return 1
+  fi
+  encoded_me="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
+  for ((pull_page = 1; pull_page <= 20; pull_page++)); do
+    if ! out="$(api GET "/repos/$REPO/pulls?state=open&poster=$encoded_me&limit=50&page=$pull_page")"; then
+      printf 'ffmpeg-forgejo: cannot list own open pull requests; no pull request opened.\n' >&2
+      rm -f "$candidates"
+      return 1
+    fi
+    if ! parsed="$(python3 -c 'import json, sys
+rows = json.load(sys.stdin)
+if not isinstance(rows, list): raise SystemExit(1)
+numbers = []
+for row in rows:
+    number = row.get("number") if isinstance(row, dict) else None
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise SystemExit(1)
+    numbers.append(number)
+print(len(numbers))
+print(*numbers, sep="\n")' <<<"$out" 2>/dev/null)"; then
+      printf 'ffmpeg-forgejo: cannot parse own open pull requests; no pull request opened.\n' >&2
+      rm -f "$candidates"
+      return 1
+    fi
+    count="${parsed%%$'\n'*}"
+    [ "$count" -ne 0 ] || break
+    if [ "$pull_page" -eq 20 ]; then
+      printf 'ffmpeg-forgejo: more than 19 pages of own open pull requests; overlap not proven absent.\n' >&2
+      rm -f "$candidates"
+      return 1
+    fi
+    mapfile -t numbers <<<"${parsed#*$'\n'}"
+    for number in "${numbers[@]}"; do
+      if [[ " $allowed " == *" $number "* ]]; then
+        continue
+      fi
+      if check_pull_files "$number" "$candidates"; then
+        continue
+      else
+        rc=$?
+        rm -f "$candidates"
+        return "$rc"
+      fi
+    done
+  done
+  rm -f "$candidates"
 }
 
 cmd="${1:-}"
@@ -145,13 +345,42 @@ for i in json.load(sys.stdin):
         push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$1:refs/heads/$rb"
     ;;
   pr)
-    [ $# -eq 3 ] || die "usage: pr <branch> <title> <body-file>"
+    usage='pr [--overlap-ok <number>]... <branch> <title> <body-file>'
+    overlap_ok=""
+    pr_argc=$#
+    for ((pr_i = 0; pr_i < pr_argc; pr_i++)); do
+      [ "${1:-}" = "--overlap-ok" ] || break
+      [ $# -ge 2 ] || usage_error "$usage"
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage_error "$usage"
+      overlap_ok+=" $2"
+      shift 2
+    done
+    [ $# -eq 3 ] || usage_error "$usage"
     [ -f "$3" ] || die "no body file $3"
     me="$(login)"
+    check_pr_overlap "$1" "$me" "$overlap_ok"
     body="$(mktemp)"
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
-    api POST "/repos/$REPO/pulls" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
     rm -f "$body"
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])' <<<"$out"
+    n="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])' <<<"$out")"
+    # .forgejo/CODEOWNERS requests reviewers only for the paths it lists; a PR nobody is asked
+    # to review sits unseen. Read the field back (3 tries) and flag an empty list with exit 3.
+    for ((i = 1; i <= 3; i++)); do
+      revs="$(api GET "/repos/$REPO/pulls/$n" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+users = [u["login"] for u in d.get("requested_reviewers") or []]
+teams = ["team:" + t["name"] for t in d.get("requested_reviewers_teams") or []]
+print(" ".join(users + teams))')"
+      [ -z "$revs" ] || break
+      [ "$i" = 3 ] || sleep "${FFMPEG_FORGEJO_POLL:-15}"
+    done
+    if [ -z "$revs" ]; then
+      printf 'ffmpeg-forgejo: #%s has no requested reviewer; pick from MAINTAINERS and git log on the touched files, then: ffmpeg-forgejo reviewers %s <login>...\n' "$n" "$n" >&2
+      exit 3
+    fi
+    echo "#$n requested reviewers: $revs"
     ;;
   issue)
     [ $# -eq 2 ] || die "usage: issue <title> <body-file>"
@@ -162,9 +391,13 @@ for i in json.load(sys.stdin):
     rm -f "$body"
     ;;
   comment)
-    [ $# -eq 2 ] || die "usage: comment <number> <body-file>"
+    usage='comment (--tested-head <sha> | --no-test-claims) <number> <body-file>'
+    parse_claim_option "$usage" "$@"
+    shift "$claim_args"
+    [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: $1"
     [ -f "$2" ] || die "no body file $2"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head"
     body="$(mktemp)"
     json_body "body=@$2" >"$body"
     api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
@@ -173,16 +406,20 @@ for i in json.load(sys.stdin):
   edit-body)
     wait=0
     if [ "${1:-}" = "--wait" ]; then wait=1; shift; fi
-    [ $# -eq 2 ] || die "usage: edit-body [--wait] <number> <body-file>"
+    usage='edit-body [--wait] (--tested-head <sha> | --no-test-claims) <number> <body-file>'
+    parse_claim_option "$usage" "$@"
+    shift "$claim_args"
+    [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
     [ -f "$2" ] || die "no body file $2"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head"
     # The head is read again after the status check: a push in between starts a new Autolabel
     # run, and the finished statuses of the old head must not clear the edit. Forgejo's PR edit
     # takes no expected head, so a push landing between this last read and the PATCH still races.
     for ((i = 1; i <= 80; i++)); do
       sha="$(head_sha "$1")"
       state="$(autolabel_state "$sha")"
-      if [ "$state" = done ]; then
+      if [ "$state" = "done" ]; then
         [ "$(head_sha "$1")" = "$sha" ] && break
         state="superseded by a new push"
       fi
@@ -192,6 +429,7 @@ for i in json.load(sys.stdin):
       fi
       sleep "${FFMPEG_FORGEJO_POLL:-15}"
     done
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head"
     body="$(mktemp)"
     json_body "body=@$2" >"$body"
     api PATCH "/repos/$REPO/pulls/$1" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'

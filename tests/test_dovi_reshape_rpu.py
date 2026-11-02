@@ -66,7 +66,9 @@ MASTER = (
 
 def run(cmd: list[str]) -> str:
     """Run cmd and return its stdout; a non-zero exit raises with its stderr."""
-    done = subprocess.run(cmd, capture_output=True, timeout=300, check=False)
+    done = subprocess.run(  # nosec B603 - test argv uses explicit fixture tool paths and values.
+        cmd, capture_output=True, timeout=300, check=False
+    )
     if done.returncode != 0:
         tool = Path(cmd[0]).name
         raise AssertionError(f"{tool} exited {done.returncode}: {done.stderr.decode()}")
@@ -124,7 +126,9 @@ def dovi_metadata(path: Path) -> list[str]:
         ffprobe, "-v", "error", "-select_streams", "v:0", "-of", "json",
         "-show_entries", entries, "-show_frames", str(path),
     ]  # fmt: skip
-    done = subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+    done = subprocess.run(  # nosec B603 - test argv uses explicit fixture tool paths and values.
+        cmd, capture_output=True, timeout=120, check=True
+    )
     probe = json.loads(done.stdout)
     found = []
     for stream in probe.get("streams", []):

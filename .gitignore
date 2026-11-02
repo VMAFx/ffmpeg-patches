@@ -5,6 +5,7 @@ bin/
 
 # Python bytecode from scripts/ and tests/
 __pycache__/
+.venv/
 # Release tarballs from make dist
 /dist/
 # Linked worktrees of local agent sessions
