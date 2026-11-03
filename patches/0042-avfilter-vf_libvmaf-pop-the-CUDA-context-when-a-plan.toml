@@ -1,0 +1,6 @@
+status = "unsubmitted"
+consumers = ["vmafx"]
+origin = "pull 168 review thread 4459606104 (Sourcery)"
+notes = """
+Routes failed CUDA plane copies through one context-pop cleanup path, preserves the copy error when popping succeeds, and reports pop failures as AVERROR_EXTERNAL. Allocation and push failures return before cleanup. The early-return leak predates patches 0040/0041 and also exists in FFmpeg master 200a98d5ba4a, libavfilter/vf_libvmaf.c:832-834. Mocked-driver tests inject all three plane-copy failures plus allocation, push and pop failures, check successful copy geometry at 8/10/12/16 bits, and detect a planted early return. An own upstream submission will follow.
+"""
