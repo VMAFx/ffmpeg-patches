@@ -5,9 +5,8 @@
 import contextlib
 import io
 import json
-import unittest
+import unittest.mock
 import urllib.error
-from unittest import mock
 
 from scripts import fairy_unanswered as fairy
 
@@ -18,14 +17,22 @@ NEW = "2026-11-02T00:00:00Z"
 
 def _activity(number, op="comment_issue"):
     """Build an activity-feed comment row."""
-    return {"op_type": op, "repo": {"full_name": "FFmpeg/FFmpeg"},
-            "content": json.dumps([str(number), "reply"])}
+    return {
+        "op_type": op,
+        "repo": {"full_name": "FFmpeg/FFmpeg"},
+        "content": json.dumps([str(number), "reply"]),
+    }
 
 
 def _word(who="Forgejo_Fairy", timestamp=NEW):
     """Build a comment or review with a body and both timestamp fields."""
-    return {"user": {"login": who}, "body": "finding", "created_at": timestamp,
-            "submitted_at": timestamp, "state": "COMMENTED"}
+    return {
+        "user": {"login": who},
+        "body": "finding",
+        "created_at": timestamp,
+        "submitted_at": timestamp,
+        "state": "COMMENTED",
+    }
 
 
 def _routes():
@@ -33,14 +40,20 @@ def _routes():
     return {
         "/pulls?state=open&poster=lusoris&limit=50&page=1": [
             {"number": 1, "user": {"login": "lusoris"}},
-            {"number": 99, "user": {"login": "other"}}],
-        "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [
-            {"number": 2}],
+            {"number": 99, "user": {"login": "other"}},
+        ],
+        "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [{"number": 2}],
         FEED + "?only-performed-by=true&limit=50&page=1": [
-            _activity(1), _activity(2), _activity(3), _activity(3),
-            _activity(4, "comment_pull"), _activity(5), _activity(6)],
+            _activity(1),
+            _activity(2),
+            _activity(3),
+            _activity(3),
+            _activity(4, "comment_pull"),
+            _activity(5),
+            _activity(6),
+        ],
         "/issues/3": {"number": 3, "state": "open"},
-        "/issues/4": {"number": 4, "state": "open", "pull_request": {}},
+        "/issues/4": {"number": 4, "state": "open", "pull_request": {"merged": False}},
         "/issues/5": {"number": 5, "state": "closed"},
         "/issues/6": urllib.error.HTTPError("fixture", 404, "missing", {}, io.BytesIO()),
         "/issues/1/comments": [_word(timestamp=OLD), _word("lusoris")],
@@ -57,8 +70,9 @@ class FairyUnansweredTest(unittest.TestCase):
 
     def setUp(self):
         """Fail immediately if a fixture accidentally attempts network I/O."""
-        network = mock.patch.object(fairy.urllib.request, "urlopen",
-                                    side_effect=AssertionError("network forbidden"))
+        network = unittest.mock.patch.object(
+            fairy.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")
+        )
         network.start()
         self.addCleanup(network.stop)
 
@@ -70,9 +84,11 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_owed_always_false_mutation_fails(self):
         """Suppressing every owed thread must be detected by a planted fixture."""
         errors = io.StringIO()
-        with mock.patch.object(fairy, "owed", return_value=("", "", False)):
-            with contextlib.redirect_stderr(errors):
-                self.assertEqual(fairy.self_test(), 1)
+        with (
+            unittest.mock.patch.object(fairy, "owed", return_value=("", "", False)),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.self_test(), 1)
         self.assertIn("self-test FAIL owed", errors.getvalue())
 
     def test_mixed_thread_discovery(self):
@@ -87,15 +103,44 @@ class FairyUnansweredTest(unittest.TestCase):
             return response
 
         output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(fairy, "get", side_effect=fetch) as request:
-            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-                self.assertEqual(fairy.main([]), 0)
-        self.assertEqual(output.getvalue(),
-                         f"2\tissue\tfairy={NEW}\tlusoris=-\n"
-                         f"3\tissue\tfairy={NEW}\tlusoris=-\n"
-                         f"4\tpr\tfairy={NEW}\tlusoris=-\n")
+        with (
+            unittest.mock.patch.object(fairy, "get", side_effect=fetch) as request,
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.main([]), 0)
+        self.assertEqual(
+            output.getvalue(),
+            f"2\tissue\tfairy={NEW}\tlusoris=-\n"
+            f"3\tissue\tfairy={NEW}\tlusoris=-\n"
+            f"4\tpr\tfairy={NEW}\tlusoris=-\n",
+        )
         self.assertEqual(errors.getvalue(), "checked_prs=2 checked_issues=2 unanswered=3\n")
-        self.assertEqual(request.call_args_list.count(mock.call("/issues/3")), 1)
+        self.assertEqual(request.call_args_list.count(unittest.mock.call("/issues/3")), 1)
+
+    def test_discovery_thread_kind(self):
+        """Classify null, populated, and missing PR metadata on both discovery paths."""
+        cases = (
+            ({"pull_request": None}, "issue"),
+            ({"pull_request": {"merged": False}}, "pr"),
+            ({}, "issue"),
+        )
+        for metadata, expected in cases:
+            for from_activity in (False, True):
+                with self.subTest(metadata=metadata, from_activity=from_activity):
+                    issue = {"number": 3, "state": "open", **metadata}
+                    routes = {
+                        "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
+                        "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": []
+                        if from_activity
+                        else [issue],
+                        FEED + "?only-performed-by=true&limit=50&page=1": [_activity(3)]
+                        if from_activity
+                        else [],
+                        "/issues/3": issue,
+                    }
+                    with unittest.mock.patch.object(fairy, "get", side_effect=routes.__getitem__):
+                        self.assertEqual(fairy.discover_threads(), {3: expected})
 
     def test_feed_page_boundary(self):
         """Only a full tenth page warns that older comments were not read."""
@@ -104,24 +149,31 @@ class FairyUnansweredTest(unittest.TestCase):
                 pages = [[_activity(3)] * 50 for _ in range(9)]
                 pages.append([_activity(4)] * last_size)
                 errors = io.StringIO()
-                with mock.patch.object(fairy, "get", side_effect=pages) as request:
-                    with contextlib.redirect_stderr(errors):
-                        self.assertEqual(fairy.commented_numbers(), {3, 4})
+                with (
+                    unittest.mock.patch.object(fairy, "get", side_effect=pages) as request,
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(fairy.commented_numbers(), {3, 4})
                 self.assertEqual(request.call_count, 10)
-                self.assertEqual("older comments were not read" in errors.getvalue(),
-                                 last_size == 50)
+                self.assertEqual(
+                    "older comments were not read" in errors.getvalue(), last_size == 50
+                )
 
     def test_malformed_activity_reported(self):
         """Malformed matching rows are visible; unrelated activity is ignored."""
-        bad = [dict(_activity(3), content=content) for content in
-               ("{", "[]", '["oops", "text"]', '["3", null]', "null")]
+        bad = [
+            dict(_activity(3), content=content)
+            for content in ("{", "[]", '["oops", "text"]', '["3", null]', "null")
+        ]
         bad.append(None)
         unrelated = dict(_activity(8), repo={"full_name": "other/repo"})
         rows = bad + [unrelated, _activity(9, "create_issue"), _activity(4)]
         errors = io.StringIO()
-        with mock.patch.object(fairy, "get", return_value=rows):
-            with contextlib.redirect_stderr(errors):
-                self.assertEqual(fairy.commented_numbers(), {4})
+        with (
+            unittest.mock.patch.object(fairy, "get", return_value=rows),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.commented_numbers(), {4})
         for row in bad:
             self.assertIn(repr(row), errors.getvalue())
         self.assertEqual(len(errors.getvalue().splitlines()), len(bad))
@@ -140,15 +192,18 @@ class FairyUnansweredTest(unittest.TestCase):
             return response
 
         errors = io.StringIO()
-        with mock.patch.object(fairy, "get", side_effect=fetch):
-            with contextlib.redirect_stderr(errors):
-                self.assertEqual(fairy.main([]), 1)
+        with (
+            unittest.mock.patch.object(fairy, "get", side_effect=fetch),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.main([]), 1)
         self.assertIn("500", errors.getvalue())
 
     def test_get_timeout(self):
         """Every repository and feed GET uses the required 30-second timeout."""
         for path, url in (("/issues/3", fairy.API + "/issues/3"), (FEED, FEED)):
-            with mock.patch.object(fairy.urllib.request, "urlopen",
-                                   return_value=io.BytesIO(b"[]")) as request:
+            with unittest.mock.patch.object(
+                fairy.urllib.request, "urlopen", return_value=io.BytesIO(b"[]")
+            ) as request:
                 self.assertEqual(fairy.get(path), [])
             request.assert_called_once_with(url, timeout=30)
