@@ -3,7 +3,7 @@
 """Planted upstream-lint defects; no repository gates or credential tests.
 
 Deterministic fixtures stub the pre-commit subprocess, never its surrounding
-Git, restoration or reporting logic. Real-tool fixtures copy base files with
+Git, isolation or reporting logic. Real-tool fixtures copy base files with
 git show from the named upstream checkout and skip explicitly if unavailable.
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import subprocess  # nosec B404 - fixed commands in disposable Git repositories.
 import sys
 import tempfile
@@ -21,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402
 
-UPSTREAM = Path("/home/kilian/dev/worktrees/ffmpeg-hls-warn-once")
+UPSTREAM = Path(os.environ["UPSTREAM_TREE"]) if os.environ.get("UPSTREAM_TREE") else None
 SOURCE = "int ff_value(void)\n{\n    return 1;\n}\n"
 FAKE_CONFIG = "repos: []\n"
 FAKE_MESSAGE = '#!/bin/sh\ngit log --format=%s "$1" | grep -Eq "^[^:]+: .+"\n'
@@ -196,7 +197,7 @@ class FixtureTest(unittest.TestCase):
         self.base = self.git("rev-parse", "HEAD").strip()
         self.real_run = upstream_lint._run
         self.hook_rc = 0
-        self.hook_effect = lambda: None
+        self.hook_effect = lambda cwd: None
         self.hook_calls = []
 
     def git(self, *args):
@@ -235,7 +236,7 @@ class FixtureTest(unittest.TestCase):
         """Intercept only pre-commit; execute the real bounded runner otherwise."""
         if argv[0] == upstream_lint.PRE_COMMIT:
             self.hook_calls.append((argv, Path(argv[3]).read_text()))
-            self.hook_effect()
+            self.hook_effect(Path(cwd))
             return subprocess.CompletedProcess(argv, self.hook_rc, "fixture pre-commit\n")
         return self.real_run(argv, cwd, data, timeout)
 
@@ -387,13 +388,13 @@ class PipelineTest(FixtureTest):
         self.assertEqual(rc, 1, output)
         self.assertIn("with spaces.c:1: TAB character", output)
 
-    def test_fixer_edits_fail_and_restore_index_and_new_files(self):
+    def test_fixer_edits_fail_and_discard_index_and_new_files(self):
         """A zero-exit fixer still fails and leaves the original clean checkout."""
 
-        def modify():
-            self.write("libavfilter/vf_x.c", "changed\n")
-            self.write("new-file.txt", "generated\n")
-            self.git("add", "libavfilter/vf_x.c")
+        def modify(cwd):
+            (cwd / "libavfilter/vf_x.c").write_text("changed\n")
+            (cwd / "new-file.txt").write_text("generated\n")
+            self.git("-C", str(cwd), "add", "libavfilter/vf_x.c")
 
         self.hook_effect = modify
         rc, output = self.check()
@@ -403,11 +404,11 @@ class PipelineTest(FixtureTest):
         self.assertFalse((self.root / "new-file.txt").exists())
         self.assertEqual(self.git("status", "--porcelain"), "")
 
-    def test_fixer_edits_restore_after_command_error(self):
-        """The finally path restores files if launching or waiting for a hook fails."""
+    def test_fixer_edits_discard_after_command_error(self):
+        """The finally path discards files if launching or waiting for a hook fails."""
 
-        def modify():
-            self.write("libavfilter/vf_x.c", "changed\n")
+        def modify(cwd):
+            (cwd / "libavfilter/vf_x.c").write_text("changed\n")
             raise OSError("planted hook error")
 
         self.hook_effect = modify
@@ -416,6 +417,81 @@ class PipelineTest(FixtureTest):
         self.assertIn("step: pre-commit rc: 2", output)
         self.assertIn("step: developer.texi rc: 0", output)
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_hook_ignored_artifact_never_touches_source_tree(self):
+        """Ignored hook output stays inside the discarded detached worktree."""
+        self.write(".gitignore", "ignored.out\n")
+        self.commit()
+        worktrees = self.git("worktree", "list", "--porcelain")
+        hook_trees = []
+
+        def modify(cwd):
+            hook_trees.append(cwd)
+            (cwd / "ignored.out").write_text("generated\n")
+
+        self.hook_effect = modify
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertFalse((self.root / "ignored.out").exists())
+        self.assertNotEqual(hook_trees[0], self.root)
+        self.assertFalse(hook_trees[0].exists())
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), worktrees)
+
+    def test_deleted_c_path_passes(self):
+        """Deleted C files count toward the cap without requiring a head blob."""
+        self.git("rm", "libavfilter/vf_x.c")
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+
+    def test_path_cap_boundary_passes(self):
+        """Exactly the permitted number of changed paths still runs the hooks."""
+        self.write("one.txt", "one\n")
+        self.commit()
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertEqual(len(self.hook_calls), 1)
+
+    def test_deadline_exhausted_during_hook_cleans_worktree(self):
+        """Hook-budget exhaustion preserves cleanup time and fails the run."""
+        worktrees = self.git("worktree", "list", "--porcelain")
+        now = upstream_lint.time.monotonic()
+        elapsed = [0]
+        hook_trees = []
+
+        def expire(cwd):
+            hook_trees.append(cwd)
+            elapsed[0] = upstream_lint.RUN_TIMEOUT - upstream_lint.CLEANUP_TIMEOUT
+
+        self.hook_effect = expire
+        with unittest.mock.patch.object(
+            upstream_lint.time, "monotonic", side_effect=lambda: now + elapsed[0]
+        ):
+            rc, output = self.check()
+        self.assertNotEqual(rc, 0, output)
+        self.assertIn("overall deadline exhausted", output)
+        self.assertFalse(hook_trees[0].exists())
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), worktrees)
+
+    def test_over_cap_paths_refused(self):
+        """Exceeding the path cap refuses the run before any hook executes."""
+        self.write("one.txt", "one\n")
+        self.write("two.txt", "two\n")
+        self.commit()
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1, create=True):
+            rc, output = self.check()
+        self.assertEqual(rc, 2, output)
+        self.assertIn("changed paths exceed MAX_PATHS=1", output)
+        self.assertEqual(self.hook_calls, [])
+
+    def test_deadline_exhausted_refuses_run(self):
+        """An exhausted overall budget fails before launching a subprocess."""
+        with unittest.mock.patch.object(upstream_lint, "RUN_TIMEOUT", 0, create=True):
+            rc, output = self.check()
+        self.assertEqual(rc, 2, output)
+        self.assertIn("overall deadline exhausted", output)
+        self.assertEqual(self.hook_calls, [])
 
     def test_dirty_worktree_index_and_untracked_files_are_refused(self):
         """All dirty states fail before hooks run and preserve the user's text."""
@@ -426,7 +502,7 @@ class PipelineTest(FixtureTest):
                 if state == "staged":
                     self.git("add", name)
                 rc, output = self.check()
-                self.assertEqual(rc, 1, output)
+                self.assertEqual(rc, 2, output)
                 self.assertIn("dirty tree refused", output)
                 self.assertEqual(self.hook_calls, [])
                 self.assertEqual((self.root / name).read_text(), "user edit\n")
@@ -436,7 +512,7 @@ class PipelineTest(FixtureTest):
         self.write("notes.txt", "new\n")
         self.commit()
         rc, output = self.check("--head", self.base)
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 2)
         self.assertIn("checked-out HEAD", output)
         self.assertEqual(self.hook_calls, [])
 
@@ -463,6 +539,8 @@ class RealToolsTest(FixtureTest):
 
     def setUp(self):
         """Copy upstream files at its pinned HEAD, or name the missing source."""
+        if UPSTREAM is None:
+            self.skipTest("UPSTREAM_TREE unset; real upstream fixtures require an FFmpeg checkout")
         if not UPSTREAM.is_dir():
             self.skipTest(f"upstream fixture source unavailable: {UPSTREAM}")
         super().setUp()
@@ -531,11 +609,54 @@ class RealToolsTest(FixtureTest):
 class RunnerTest(unittest.TestCase):
     """Exercise real subprocess deadlines and byte-preserving Git output."""
 
+    def test_non_allow_listed_executable_refused(self):
+        """Unknown executable basenames return rc 2 without invoking Popen."""
+        with unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen:
+            popen.return_value.__enter__.return_value.communicate.return_value = (b"", None)
+            result = upstream_lint._run(["/unused/not-allowed"], Path.cwd())
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("executable refused", result.stdout)
+        popen.assert_not_called()
+
+    def test_command_timeout_uses_remaining_overall_budget(self):
+        """A later command shares the deadline rather than restarting its budget."""
+        process = unittest.mock.MagicMock()
+        process.communicate.return_value = (b"ok\n", None)
+        process.returncode = 0
+        token = upstream_lint._DEADLINE.set(100)
+        self.addCleanup(upstream_lint._DEADLINE.reset, token)
+        with (
+            unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen,
+            unittest.mock.patch.object(upstream_lint.time, "monotonic", return_value=75),
+        ):
+            popen.return_value.__enter__.return_value = process
+            result = upstream_lint._run(["git", "--version"], Path.cwd(), timeout=60)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(process.communicate.call_args.kwargs["timeout"], 15)
+
+    def test_timeout_exit_race_preserves_real_status(self):
+        """A process gone before killpg is reaped with its actual return code."""
+        process = unittest.mock.MagicMock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["git"], 1),
+            (b"finished\n", None),
+        ]
+        process.returncode = 7
+        with (
+            unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen,
+            unittest.mock.patch.object(upstream_lint.os, "killpg", side_effect=ProcessLookupError),
+        ):
+            popen.return_value.__enter__.return_value = process
+            result = upstream_lint._run(["git", "--version"], Path.cwd(), timeout=1)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "finished\n")
+        self.assertEqual(process.communicate.call_count, 2)
+
     def test_timeout_returns_failure(self):
         """A planted slow subprocess is killed and reported with rc 124."""
         with tempfile.TemporaryDirectory() as directory:
             result = upstream_lint._run(
-                [sys.executable, "-c", "import time; time.sleep(5)"],
+                ["bash", "-c", "sleep 5"],
                 Path(directory),
                 timeout=0.05,
             )
@@ -546,7 +667,7 @@ class RunnerTest(unittest.TestCase):
         """Text-mode newline normalization cannot hide trailing CR violations."""
         with tempfile.TemporaryDirectory() as directory:
             result = upstream_lint._run(
-                [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'line\\r\\n')"],
+                ["bash", "-c", "printf 'line\\r\\n'"],
                 Path(directory),
             )
         self.assertEqual(result.stdout, "line\r\n")

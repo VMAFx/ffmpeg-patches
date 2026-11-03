@@ -71,16 +71,16 @@ lengths-local:
 
 # Pre-POST checks using the upstream base's own policy and developer.texi rules:
 # Only allow-listed patcheck categories block; other added-line hints need review.
-#   make upstream-lint FFMPEG_TREE=/path/to/ffmpeg UPSTREAM_BASE=<revision>
+#   make upstream-lint UPSTREAM_TREE=/path/to/ffmpeg UPSTREAM_BASE=<revision>
 # This optional checkout is distinct from the applied-series length checkout.
 upstream-lint:
-	@if [ -n "$(FFMPEG_TREE)" ] && [ -n "$(UPSTREAM_BASE)" ]; then \
-		python3 scripts/upstream_lint.py --tree "$(FFMPEG_TREE)" --base "$(UPSTREAM_BASE)"; \
+	@if [ -n "$(UPSTREAM_TREE)" ] && [ -n "$(UPSTREAM_BASE)" ]; then \
+		python3 scripts/upstream_lint.py --tree "$(UPSTREAM_TREE)" --base "$(UPSTREAM_BASE)"; \
 	else \
 		{ \
-		  echo 'upstream-lint: SKIPPED - both FFMPEG_TREE and UPSTREAM_BASE required.'; \
+		  echo 'upstream-lint: SKIPPED - both UPSTREAM_TREE and UPSTREAM_BASE required.'; \
 		  echo '  Before posting upstream, run:'; \
-		  echo '    make upstream-lint FFMPEG_TREE=<clean FFmpeg tree> UPSTREAM_BASE=<revision>'; \
+		  echo '    make upstream-lint UPSTREAM_TREE=<clean FFmpeg tree> UPSTREAM_BASE=<revision>'; \
 		} >&2; \
 	fi
 
