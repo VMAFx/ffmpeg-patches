@@ -162,7 +162,7 @@ class Stub:
         reviewers: list[list[str]] | None = None,
         **kwargs: object,
     ):
-        """Initialize scripted pull, status, and reviewer responses."""
+        """Initialize scripted pull, status, reviewer, and API settings responses."""
 
         heads = heads or [A]
         polls = polls or {}
@@ -171,6 +171,7 @@ class Stub:
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
         self.login = str(kwargs.get("login", "tester"))
+        self.max_response_items = kwargs.get("max_response_items", 50)
         self.open_pulls: list[dict] = []
         self.pull_files: dict[int, list[ChangedFile]] = {}
         self.fail_pulls = False
@@ -191,10 +192,10 @@ class Stub:
         return sha
 
     def statuses(self, sha: str, query: dict[str, list[str]]) -> list[dict]:
-        """Return the requested page from the current scripted status poll."""
+        """Return a server-capped page from the current scripted status poll."""
 
         page = int(query.get("page", ["1"])[0])
-        limit = int(query.get("limit", ["30"])[0])
+        limit = self.page_limit(query)
         if page == 1:
             self.poll_index[sha] += 1
         seq = self.polls.get(sha, [[]])
@@ -221,19 +222,19 @@ class Stub:
         }
 
     def pulls(self, query: dict[str, list[str]]) -> list[dict]:
-        """Return one filtered page of open pull requests."""
+        """Return one filtered, server-capped page of open pull requests."""
 
         poster = query.get("poster", [None])[0]
         rows = [row for row in self.open_pulls if poster is None or row["user"]["login"] == poster]
         page = int(query.get("page", ["1"])[0])
-        limit = int(query.get("limit", ["30"])[0])
+        limit = self.page_limit(query)
         return rows[(page - 1) * limit : page * limit]
 
     def files(self, number: int, query: dict[str, list[str]]) -> list[dict] | None:
-        """Return one page of changed files for a pull request."""
+        """Return one server-capped page of changed files for a pull request."""
 
         page = int(query.get("page", ["1"])[0])
-        limit = int(query.get("limit", ["30"])[0])
+        limit = self.page_limit(query)
         rows = self.pull_files.get(number, [])
         result = [
             row if isinstance(row, dict) else {"filename": row}
@@ -242,11 +243,16 @@ class Stub:
         return None if page > 1 and not result else result
 
     def review_page(self, number: int, query: dict[str, list[str]]) -> list[dict]:
-        """Return one page of reviews for a pull request."""
+        """Return one server-capped page of reviews for a pull request."""
 
         page = int(query.get("page", ["1"])[0])
-        limit = int(query.get("limit", ["30"])[0])
+        limit = self.page_limit(query)
         return self.reviews.get(number, [])[(page - 1) * limit : page * limit]
+
+    def page_limit(self, query: dict[str, list[str]]) -> int:
+        """Cap the requested page size at the configured server maximum."""
+
+        return min(int(query.get("limit", ["30"])[0]), self.max_response_items)
 
 
 def overlap_stub(
@@ -290,6 +296,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if url.path == "/api/v1/user":
             self.reply(200, {"login": stub.login})
+            return True
+        return False
+
+    def _route_settings(self, stub: Stub, url: urllib.parse.SplitResult) -> bool:
+        """Handle public API pagination settings requests."""
+
+        if url.path == "/api/v1/settings/api":
+            self.reply(200, {"max_response_items": stub.max_response_items})
             return True
         return False
 
@@ -350,8 +364,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return False
 
     def _dispatch_get(self, stub: Stub, url: urllib.parse.SplitResult, parts: list[str]) -> bool:
-        """Route a GET request to the matching handler."""
+        """Route settings and repository GET requests to the matching handler."""
 
+        if self._route_settings(stub, url):
+            return True
         if self._route_user(stub, url):
             return True
         if self._route_pull(stub, url):
@@ -579,6 +595,71 @@ class FairyReviewsTest(ForgejoTest):
             [fairy_review("REQUEST_REVIEW", "") for _ in range(50)] + [fairy_review()],
             f"1\tAPPROVED\t{A[:12]}",
         )
+
+    def test_server_page_cap_counts_all_reviews(self) -> None:
+        """A thirty-row server cap cannot truncate a forty-five-review listing."""
+
+        stub = Stub(max_response_items=30)
+        stub.reviews = {1: [fairy_review()] * 45}
+        proc = self.run_command(stub, "fairy-reviews", "1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, f"1\t45\tAPPROVED\t{A[:12]}\n")
+
+    def test_invalid_server_page_cap_fails_without_output(self) -> None:
+        """Noninteger and nonpositive settings fail before listing reviews."""
+
+        for maximum in ("x", 0, -1, True, 1.5, None):
+            with self.subTest(max_response_items=maximum):
+                stub = Stub(max_response_items=maximum)
+                with unittest.mock.patch.object(stub, "review_page", return_value=[]):
+                    proc = self.run_command(stub, "fairy-reviews", "1")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn("invalid max_response_items", proc.stderr)
+                self.assertEqual(stub.requests, [("GET", "/api/v1/settings/api", "")])
+
+    def test_server_page_cap_is_cached_across_default_listings(self) -> None:
+        """One settings read supplies capped pull and review listings for the process."""
+
+        stub = Stub(max_response_items=1)
+        stub.open_pulls = [open_pull(1), open_pull(2)]
+        stub.reviews = {1: [fairy_review()] * 2}
+        proc = self.run_command(stub, "fairy-reviews")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, f"1\t2\tAPPROVED\t{A[:12]}\n2\t0\t-\t-\n")
+        self.assertEqual(stub.requests.count(("GET", "/api/v1/settings/api", "")), 1)
+        paths = [path for _, path, _ in stub.requests if "page=" in path]
+        self.assertTrue(all("limit=1" in path for path in paths))
+
+    def test_server_page_cap_above_fifty_uses_fifty(self) -> None:
+        """A larger server maximum preserves the client fifty-row limit."""
+
+        stub = Stub(max_response_items=100)
+        stub.reviews = {1: [fairy_review()] * 51}
+        proc = self.run_command(stub, "fairy-reviews", "1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, f"1\t51\tAPPROVED\t{A[:12]}\n")
+        paths = [path for _, path, _ in stub.requests if "page=" in path]
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(all("limit=50" in path for path in paths))
+
+    def test_capped_page_twenty_boundary(self) -> None:
+        """A capped twentieth page succeeds only when shorter than the server cap."""
+
+        for count in (599, 600):
+            with self.subTest(count=count):
+                stub = Stub(max_response_items=30)
+                stub.reviews = {1: [fairy_review()] * count}
+                proc = self.run_command(stub, "fairy-reviews", "1")
+                if count == 599:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout, f"1\t599\tAPPROVED\t{A[:12]}\n")
+                else:
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(proc.stdout, "")
+                    self.assertIn("pagination limit reached", proc.stderr)
+                paths = [path for _, path, _ in stub.requests if "page=" in path]
+                self.assertEqual(len(paths), 20)
 
     def test_explicit_numbers_preserve_order(self) -> None:
         """Explicit pull numbers each receive their own summary in argument order."""

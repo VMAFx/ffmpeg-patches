@@ -34,6 +34,7 @@ API="${FFMPEG_FORGEJO_API:-$HOST/api/v1}"
 REPO="${FFMPEG_FORGEJO_REPO:-FFmpeg/FFmpeg}"
 BASE="${FFMPEG_FORGEJO_BASE:-master}"
 GIT_URL="${FFMPEG_FORGEJO_GIT:-$HOST/$REPO.git}"
+page_size=""
 
 die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
 
@@ -303,11 +304,25 @@ print(*numbers, sep="\n")' <<<"$out" 2>/dev/null)"; then
   rm -f "$candidates"
 }
 
+# discover_page_size: cache API settings in the parent shell before listing subshells.
+discover_page_size() {
+  [ -z "$page_size" ] || return 0
+  local out
+  out="$(api GET /settings/api)" || die "cannot read /settings/api"
+  page_size="$(python3 -c 'import json,sys
+size = json.load(sys.stdin)["max_response_items"]
+if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+    raise SystemExit(1)
+print(min(50, size))' <<<"$out" 2>/dev/null)" \
+    || die "invalid max_response_items in /settings/api; expected a positive integer"
+}
+
 # api_list PATH: collect a JSON list from at most 20 pages; PATH ends in ? or &.
 api_list() {
   local path="$1" list_page out parsed count pages=""
+  [ -n "$page_size" ] || die "api_list: page size not discovered"
   for ((list_page = 1; list_page <= 20; list_page++)); do
-    out="$(api GET "${path}page=$list_page&limit=50")" || die "cannot read $path"
+    out="$(api GET "${path}page=$list_page&limit=$page_size")" || die "cannot read $path"
     parsed="$(python3 -c 'import json,sys
 rows = json.load(sys.stdin)
 if not isinstance(rows, list): raise SystemExit(1)
@@ -315,7 +330,7 @@ print(len(rows))
 print(json.dumps(rows))' <<<"$out")" || die "cannot parse $path"
     count="${parsed%%$'\n'*}"
     pages+="${parsed#*$'\n'}"$'\n'
-    if [ "$count" -lt 50 ]; then
+    if [ "$count" -lt "$page_size" ]; then
       python3 -c 'import json,sys
 print(json.dumps([row for page in sys.stdin if page.strip() for row in json.loads(page)]))' <<<"$pages"
       return
@@ -400,6 +415,7 @@ case "$cmd" in
     for n in "$@"; do
       [[ "$n" =~ ^[1-9][0-9]*$ ]] || usage_error "fairy-reviews [<number>...]"
     done
+    discover_page_size
     numbers=("$@")
     if [ $# -eq 0 ]; then
       out="$(own_open_pr_numbers)" || exit 1
