@@ -65,7 +65,7 @@ def git(repo: Path, *args: str) -> None:
     subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
         ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=repo,
-        env=isolated_git_environment(),
+        env=isolated_git_environment(preserve_config=True),
         check=True,
         timeout=120,
     )
@@ -77,7 +77,7 @@ def git_output(repo: Path, *args: str) -> str:
     return subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
         ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=repo,
-        env=isolated_git_environment(),
+        env=isolated_git_environment(preserve_config=True),
         check=True,
         capture_output=True,
         text=True,
@@ -114,7 +114,9 @@ class GitEnvironmentTest(unittest.TestCase):
         with unittest.mock.patch("subprocess.run") as run:
             git(Path("fixture"), "init", "-q")
         self.assertEqual(run.call_args.args[0][:3], ["git", "-c", "core.hooksPath=/dev/null"])
-        self.assertEqual(run.call_args.kwargs["env"], isolated_git_environment())
+        self.assertEqual(
+            run.call_args.kwargs["env"], isolated_git_environment(preserve_config=True)
+        )
 
 
 class Stub:
@@ -444,7 +446,7 @@ class ForgejoTest(unittest.TestCase):
             raise ValueError(f"unsupported helper subcommand: {args[0] if args else '<missing>'}")
         server = serve(stub)
         try:
-            env = isolated_git_environment()
+            env = isolated_git_environment(preserve_config=True)
             dirs = [str(p) for p in (path_first, self.bin_dir) if p]
             env.update(
                 PATH=os.pathsep.join(dirs + [env.get("PATH", "")]),
@@ -1404,6 +1406,34 @@ class SweepTest(ForgejoTest):
     """Require a reviewed sweep before either outbound operation."""
 
     helper = HELPER
+
+    def test_sweep_rejects_non_table_findings(self) -> None:
+        """Malformed findings and unrecognized text cannot disappear during validation."""
+
+        original = self.sweep.read_text()
+        for line in (
+            "sibling.c:4 | play | discarded | no | TODO |",
+            "unexpected text",
+            "no hits trailing junk",
+            "| sibling.c:4 | play | discarded | no | TODO",
+        ):
+            with self.subTest(line=line):
+                self.sweep.write_text(original + line + "\n")
+                self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_rejects_metadata_only_prefix(self) -> None:
+        """A metadata-only prefix is incomplete rather than a reviewed empty report."""
+
+        self.sweep.write_text(self.sweep.read_text().replace("no hits\n", ""))
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_report_size_limit(self) -> None:
+        """An oversized report is refused by name before outbound operations."""
+
+        self.sweep.write_text(self.sweep.read_text() + " " * (4 * 1024 * 1024))
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertIn("report size limit", result.stderr)
 
     def sweep_command(self, command: str, *options: str) -> subprocess.CompletedProcess[str]:
         """Attempt an outbound operation with API and Git push stubbed."""

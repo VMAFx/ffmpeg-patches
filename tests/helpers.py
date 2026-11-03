@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts import series
+from scripts import series, variant_sweep
 
 SOURCE = "testsrc2=s=320x184:d=0.32,noise=alls=20:allf=t"
 OPTIONS = ("", "=254:254:254:254", "=0.5:0.5:0.5:0.5", "=luma_spatial=60:luma_tmp=0:chroma_tmp=200")
@@ -66,21 +66,27 @@ CPU = (
 RESET_TOOL = os.environ.get("HQDN3D_RESET_TOOL", "")
 
 
-def isolated_git_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
+def isolated_git_environment(
+    environment: Mapping[str, str] | None = None, *, preserve_config: bool = False
+) -> dict[str, str]:
     """Return an environment without caller Git repository overrides."""
 
     source = os.environ if environment is None else environment
+    if preserve_config:
+        return variant_sweep.git_environment(source)
     return {name: value for name, value in source.items() if name not in GIT_ENVIRONMENT_NAMES}
 
 
-def python_sources(root: Path) -> list[Path]:
+def python_sources(root: Path, *, preserve_config: bool = False) -> list[Path]:
     """Return tracked Python modules and shebang-identified scripts."""
 
     try:
         tracked = subprocess.run(  # nosec B603 B607 - fixed query against the test repository.
             ["git", "ls-files", "-z"],
             cwd=root,
-            env=isolated_git_environment(series.git_env()),
+            env=isolated_git_environment(
+                None if preserve_config else series.git_env(), preserve_config=preserve_config
+            ),
             capture_output=True,
             text=True,
             check=True,
@@ -262,11 +268,26 @@ def lavfi() -> list[str]:
     return ["-f", "lavfi", "-i", SOURCE]
 
 
-def run_git(tree: Path, *args: str) -> str:
+def run_git(tree: Path, *args: str, preserve_config: bool = False) -> str:
     """Run Git in a fixture tree with isolated configuration; return stdout."""
+    policy = (
+        ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false"] if preserve_config else []
+    )
     result = subprocess.run(  # nosec B603 B607 - fixed git argv in a temporary test tree.
-        ["git", "-C", str(tree), "-c", "user.name=Dev", "-c", "user.email=dev@invalid", *args],
-        env=isolated_git_environment(series.git_env()),
+        [
+            "git",
+            "-C",
+            str(tree),
+            "-c",
+            "user.name=Dev",
+            "-c",
+            "user.email=dev@invalid",
+            *policy,
+            *args,
+        ],
+        env=isolated_git_environment(
+            None if preserve_config else series.git_env(), preserve_config=preserve_config
+        ),
         capture_output=True,
         text=True,
         check=True,

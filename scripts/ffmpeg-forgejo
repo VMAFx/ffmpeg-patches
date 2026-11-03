@@ -407,35 +407,17 @@ require_sweep() {
   [ -n "$report" ] || die "--sweep <file> required"
   [ -f "$report" ] || die "no sweep file $report"
   sha="$(git rev-parse --verify --end-of-options "$branch^{commit}")" || die "sweep: no local branch $branch"
-  python3 - "$report" "$sha" <<'PY' || die "sweep rejected: $report"
+  python3 - "$report" "$sha" "${BASH_SOURCE[0]%/*}" <<'PY' || die "sweep rejected: $report"
 import pathlib
-import re
 import sys
 
-def validate_report(path, sha):
-    """Accept one matching head, one class, and allow-listed table dispositions."""
-    lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
-    heads = [line.removeprefix("head: ") for line in lines if line.startswith("head:")]
-    classes = [line.removeprefix("class: ") for line in lines if line.startswith("class:")]
-    if heads != [sha] or len(classes) != 1 or classes[0] != "unchecked-return":
-        return False
-    for line in lines:
-        if not line.lstrip().startswith("|"):
-            continue
-        cells = [cell.strip() for cell in line.strip().split("|")[1:-1]]
-        if cells == ["file:line", "callee", "kind", "same file as fix", "disposition"]:
-            continue
-        if len(cells) == 5 and all(re.fullmatch(r":?-+:?", cell) for cell in cells):
-            continue
-        if len(cells) != 5 or not line.rstrip().endswith("|"):
-            return False
-        if cells[-1] != "fold" and not re.fullmatch(r"follow-up: \S(?:.*\S)?", cells[-1]):
-            return False
-    return True
+sys.path.insert(0, sys.argv[3])
+from variant_sweep import validate_report
 
 try:
-    valid = validate_report(sys.argv[1], sys.argv[2])
-except (OSError, UnicodeError):
+    valid = validate_report(pathlib.Path(sys.argv[1]), sys.argv[2])
+except (OSError, UnicodeError, RuntimeError) as error:
+    print(f"sweep: {error}", file=sys.stderr)
     valid = False
 sys.exit(0 if valid else 1)
 PY

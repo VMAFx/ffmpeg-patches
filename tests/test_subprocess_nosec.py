@@ -19,7 +19,7 @@ SUBPROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_outpu
 BLOCKING_CALLS = SUBPROCESS_CALLS - {"Popen"}
 PROCESS_WAIT_METHODS = frozenset({"wait", "communicate"})
 POSITIONAL_TIMEOUT = {"wait": 0, "communicate": 1}
-NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b.*\s-\s+\S")
+NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b(?P<ids>.*?)\s-\s+\S")
 
 
 def subprocess_calls(tree: ast.AST) -> list[tuple[ast.Call, str]]:
@@ -65,7 +65,7 @@ def find_subprocess_imports_without_nosec(source: str, *, filename: str = "<unkn
         imports_subprocess = (
             isinstance(node, ast.Import) and any(n.name == "subprocess" for n in node.names)
         ) or (isinstance(node, ast.ImportFrom) and node.module == "subprocess")
-        if imports_subprocess and not has_rationale(comments, node):
+        if imports_subprocess and not has_rationale(comments, node, required_test="B404"):
             offenders.append(node.lineno)
     return sorted(offenders)
 
@@ -80,14 +80,22 @@ def comments_by_line(source: str) -> dict[int, list[str]]:
     return comments
 
 
-def has_rationale(comments: dict[int, list[str]], node: ast.stmt | ast.expr) -> bool:
+def has_rationale(
+    comments: dict[int, list[str]], node: ast.stmt | ast.expr, *, required_test: str | None = None
+) -> bool:
     """Return whether a node's lines carry a nosec comment with a rationale."""
 
-    return any(
-        NOSEC_RATIONALE.match(comment)
-        for line in range(node.lineno, (node.end_lineno or node.lineno) + 1)
-        for comment in comments.get(line, ())
-    )
+    for line in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+        for comment in comments.get(line, ()):
+            match = NOSEC_RATIONALE.match(comment)
+            if match is None:
+                continue
+            selectors = set(re.split(r"[,\s]+", match["ids"].strip())) - {""}
+            if required_test is None or not selectors or required_test in selectors:
+                return True
+            if required_test == "B404" and "import_subprocess" in selectors:
+                return True
+    return False
 
 
 def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknown>") -> list[int]:
@@ -160,6 +168,28 @@ def has_deadline(node: ast.Call) -> bool:
 
 
 class SubprocessNosecTest(unittest.TestCase):
+    def test_unrelated_suppression_does_not_cover_b404(self) -> None:
+        """Selective call suppressions cannot justify a subprocess import."""
+
+        for ids in ("B603", "B603 B607", "B4040", "subprocess_popen_with_shell_equals_true"):
+            with self.subTest(ids=ids):
+                source = f"import subprocess  # nosec {ids} - fixed argv only.\n"
+                self.assertEqual(find_subprocess_imports_without_nosec(source), [1])
+        for ids in ("B404", "B603, B404", "import_subprocess", ""):
+            with self.subTest(ids=ids):
+                source = f"import subprocess  # nosec {ids} - fixed argv only.\n"
+                self.assertEqual(find_subprocess_imports_without_nosec(source), [])
+
+    def test_variant_import_rationales_cover_b404(self) -> None:
+        """Both reviewed imports already justify B404; planted removals are caught."""
+
+        for relative in ("scripts/variant_sweep.py", "tests/test_variant_sweep.py"):
+            with self.subTest(path=relative):
+                source = (ROOT / relative).read_text()
+                self.assertEqual(find_subprocess_imports_without_nosec(source), [])
+                planted = re.sub(r"(import subprocess)\s+# nosec[^\n]*", r"\1", source)
+                self.assertEqual(len(find_subprocess_imports_without_nosec(planted)), 1)
+
     def test_syntax_error_names_scanned_file(self) -> None:
         """A syntax error identifies the repository file being scanned."""
 
@@ -215,7 +245,7 @@ class SubprocessNosecTest(unittest.TestCase):
         """Every in-scope subprocess call carries an inline nosec rationale."""
 
         offenders = []
-        for path in python_sources(ROOT):
+        for path in python_sources(ROOT, preserve_config=True):
             source = path.read_text()
             offenders.extend(
                 f"{path.relative_to(ROOT)}:{line}"
@@ -248,7 +278,7 @@ class SubprocessNosecTest(unittest.TestCase):
         """Every in-scope subprocess import carries an inline B404 rationale."""
 
         offenders = []
-        for path in python_sources(ROOT):
+        for path in python_sources(ROOT, preserve_config=True):
             relative = str(path.relative_to(ROOT))
             offenders.extend(
                 f"{relative}:{line}"
@@ -331,7 +361,7 @@ class SubprocessNosecTest(unittest.TestCase):
         """Every in-scope blocking subprocess call passes an explicit timeout."""
 
         offenders = []
-        for path in python_sources(ROOT):
+        for path in python_sources(ROOT, preserve_config=True):
             relative = str(path.relative_to(ROOT))
             offenders.extend(
                 f"{relative}:{line}"
