@@ -27,7 +27,7 @@ LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
-HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr"})
+HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "fairy-reviews"})
 
 
 def label(status: str, n: int = 0) -> dict:
@@ -40,6 +40,22 @@ def open_pull(number: int = 25612, login: str = "tester") -> dict:
     """Build one open pull request list item."""
 
     return {"number": number, "state": "open", "user": {"login": login}}
+
+
+def fairy_review(
+    state: str = "APPROVED",
+    submitted_at: str = "2026-11-03T12:00:00Z",
+    login: str = "Forgejo_Fairy",
+    commit_id: str = A,
+) -> dict:
+    """Build one submitted or requested review payload."""
+
+    return {
+        "user": {"login": login},
+        "state": state,
+        "submitted_at": submitted_at,
+        "commit_id": commit_id,
+    }
 
 
 def git(repo: Path, *args: str) -> None:
@@ -157,6 +173,8 @@ class Stub:
         self.pull_files: dict[int, list[ChangedFile]] = {}
         self.fail_pulls = False
         self.fail_files: set[int] = set()
+        self.reviews: dict[int, list[dict]] = {}
+        self.fail_reviews: set[int] = set()
         self.head_reads = 0
         self.reviewer_reads = 0
         self.poll_index = {sha: -1 for sha in polls}
@@ -221,6 +239,13 @@ class Stub:
         ]
         return None if page > 1 and not result else result
 
+    def review_page(self, number: int, query: dict[str, list[str]]) -> list[dict]:
+        """Return one page of reviews for a pull request."""
+
+        page = int(query.get("page", ["1"])[0])
+        limit = int(query.get("limit", ["30"])[0])
+        return self.reviews.get(number, [])[(page - 1) * limit : page * limit]
+
 
 def overlap_stub(
     open_pulls: list[dict] | None = None,
@@ -268,6 +293,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         is_status = len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status"
         is_pull_list = url.path.endswith("/pulls")
         is_pull_files = len(parts) > 3 and parts[-3] == "pulls" and parts[-1] == "files"
+        is_review = len(parts) > 3 and parts[-3] == "pulls" and parts[-1] == "reviews"
         if url.path == "/api/v1/user":
             self.reply(200, {"login": "tester"})
         elif is_pull_list and stub.fail_pulls:
@@ -278,6 +304,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(500, {"message": "pull files failed"})
         elif is_pull_files:
             self.reply(200, stub.files(int(parts[-2]), urllib.parse.parse_qs(url.query)))
+        elif is_review and int(parts[-2]) in stub.fail_reviews:
+            self.reply(500, {"message": "reviews failed"})
+        elif is_review:
+            self.reply(200, stub.review_page(int(parts[-2]), urllib.parse.parse_qs(url.query)))
         elif url.path.endswith("/pulls/1"):
             stub.pull_headers.append(dict(self.headers.items()))
             if stub.pull_status == 200:
@@ -409,6 +439,158 @@ class RunCommandTest(ForgejoTest):
         with self.assertRaises(ValueError):
             self.run_command(stub, "unknown")
         self.assertEqual(stub.requests, [])
+
+
+class FairyReviewsTest(ForgejoTest):
+    def assert_summary(self, rows: list[dict], expected: str) -> None:
+        """Assert the exact tab-separated review summary for one pull."""
+
+        stub = Stub()
+        stub.reviews = {1: rows}
+        proc = self.run_command(stub, "fairy-reviews", "1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, f"1\t{expected}\n")
+        self.assertTrue(all(method == "GET" for method, _, _ in stub.requests))
+        self.assertFalse(any(path.endswith("/user") for _, path, _ in stub.requests))
+
+    def test_submitted_approval_counts(self) -> None:
+        """A submitted Fairy approval counts and reports its abbreviated commit."""
+
+        self.assert_summary([fairy_review()], f"1\tAPPROVED\t{A[:12]}")
+
+    def test_request_review_is_not_submitted(self) -> None:
+        """A requested Fairy reviewer row cannot count as a submitted review."""
+
+        self.assert_summary([fairy_review("REQUEST_REVIEW", "")], "0\t-\t-")
+
+    def test_pending_is_not_submitted(self) -> None:
+        """A pending Fairy row stays excluded even with a timestamp."""
+
+        self.assert_summary([fairy_review("PENDING")], "0\t-\t-")
+
+    def test_request_with_timestamp_is_not_submitted(self) -> None:
+        """A request state stays excluded even with a timestamp."""
+
+        self.assert_summary([fairy_review("REQUEST_REVIEW")], "0\t-\t-")
+
+    def test_missing_submission_time_is_not_submitted(self) -> None:
+        """An approval without a submission timestamp stays excluded."""
+
+        self.assert_summary([fairy_review(submitted_at="")], "0\t-\t-")
+
+    def test_another_reviewer_is_not_fairy(self) -> None:
+        """Another users submitted approval cannot count as a Fairy review."""
+
+        self.assert_summary([fairy_review(login="other")], "0\t-\t-")
+
+    def test_empty_reviews(self) -> None:
+        """An empty review list produces explicit zero and missing fields."""
+
+        self.assert_summary([], "0\t-\t-")
+
+    def test_newest_submission_ignores_list_order(self) -> None:
+        """Mixed reviews select the newest submitted instant across timezones."""
+
+        rows = [
+            fairy_review("COMMENT", "2026-11-03T12:30:00Z", commit_id=B),
+            fairy_review("REQUEST_REVIEW", ""),
+            fairy_review("PENDING", "2026-11-03T15:00:00Z"),
+            fairy_review(login="other"),
+            fairy_review("APPROVED", "2026-11-03T13:00:00+01:00"),
+        ]
+        self.assert_summary(rows, f"2\tCOMMENT\t{B[:12]}")
+
+    def test_reviews_on_later_page_count(self) -> None:
+        """A submitted Fairy review after a full page of requests is seen."""
+
+        self.assert_summary(
+            [fairy_review("REQUEST_REVIEW", "") for _ in range(50)] + [fairy_review()],
+            f"1\tAPPROVED\t{A[:12]}",
+        )
+
+    def test_explicit_numbers_preserve_order(self) -> None:
+        """Explicit pull numbers each receive their own summary in argument order."""
+
+        stub = Stub()
+        stub.reviews = {2: [fairy_review()]}
+        proc = self.run_command(stub, "fairy-reviews", "2", "1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, f"2\t1\tAPPROVED\t{A[:12]}\n1\t0\t-\t-\n")
+
+    def test_default_lists_only_own_open_pulls_across_pages(self) -> None:
+        """Default selection uses the poster filter and paginates open pulls."""
+
+        stub = Stub()
+        stub.open_pulls = [open_pull(n) for n in range(1, 52)] + [open_pull(99, "other")]
+        proc = self.run_command(stub, "fairy-reviews")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), [f"{n}\t0\t-\t-" for n in range(1, 52)])
+        paths = [path for _, path, _ in stub.requests if "/pulls?" in path]
+        self.assertTrue(any("page=2" in path for path in paths))
+        self.assertTrue(all("state=open" in path and "poster=tester" in path for path in paths))
+
+    def test_no_own_open_pulls(self) -> None:
+        """Default selection with no own open pulls prints nothing."""
+
+        proc = self.run_command(Stub(), "fairy-reviews")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_api_failures_are_errors(self) -> None:
+        """Failed pull or review API reads cannot print a successful zero count."""
+
+        for explicit in (False, True):
+            stub = Stub()
+            stub.fail_pulls = True
+            stub.fail_reviews = {1}
+            with self.subTest(explicit=explicit):
+                proc = self.run_command(stub, "fairy-reviews", *(("1",) if explicit else ()))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
+
+    def test_pagination_limit_fails_without_partial_count(self) -> None:
+        """Neither review nor pull listings can exceed twenty page requests."""
+
+        for explicit in (False, True):
+            stub = Stub()
+            stub.reviews = {1: [fairy_review()] * 1001}
+            stub.open_pulls = [open_pull(n) for n in range(1, 1002)]
+            with self.subTest(explicit=explicit):
+                proc = self.run_command(stub, "fairy-reviews", *(("1",) if explicit else ()))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
+                paths = [path for _, path, _ in stub.requests if "page=" in path]
+                self.assertEqual(len(paths), 20)
+
+    def test_invalid_number_is_rejected_before_api_reads(self) -> None:
+        """Invalid pull arguments fail usage validation before any API request."""
+
+        stub = Stub()
+        proc = self.run_command(stub, "fairy-reviews", "1", "invalid")
+        self.assertEqual(proc.returncode, 64)
+        self.assertEqual(stub.requests, [])
+
+    def test_from_json_uses_the_same_classifier(self) -> None:
+        """Offline JSON classification needs no API or keyring request."""
+
+        path = self.tmp / "reviews.json"
+        path.write_text(json.dumps([fairy_review(), fairy_review("REQUEST_REVIEW", "")]))
+        stub = Stub()
+        proc = self.run_command(stub, "fairy-reviews", "--from-json", str(path))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, f"1\tAPPROVED\t{A[:12]}\n")
+        self.assertEqual(stub.requests, [])
+
+    def test_invalid_json_payloads_fail(self) -> None:
+        """Invalid review shapes and commit hashes fail offline classification."""
+
+        path = self.tmp / "reviews.json"
+        for rows in ({}, [fairy_review(commit_id="invalid")]):
+            path.write_text(json.dumps(rows))
+            with self.subTest(rows=rows):
+                proc = self.run_command(Stub(), "fairy-reviews", "--from-json", str(path))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
 
 
 class EditBodyTest(ForgejoTest):
@@ -1059,6 +1241,28 @@ class MutantTest(unittest.TestCase):
                     result = unittest.TestResult()
                     suite.run(result)
                     self.assertTrue(result.failures or result.errors, f"{name} survived")
+
+
+class FairyReviewsMutantTest(unittest.TestCase):
+    def test_naive_fairy_row_counter_is_caught(self) -> None:
+        """The requested-only negative kills a counter accepting every Fairy row."""
+
+        old = (
+            '        and row.get("state") not in {"REQUEST_REVIEW", "PENDING"}\n'
+            '        and row.get("submitted_at")'
+        )
+        source = HELPER.read_text()
+        self.assertEqual(source.count(old), 1, "mutation site missing")
+        source = source.replace(
+            'key=lambda row: datetime.fromisoformat(row["submitted_at"])',
+            'key=lambda row: row["submitted_at"]',
+        )
+        with mutant_case(source, old, "", FairyReviewsTest, "NaiveFairyCounter") as case:
+            result = unittest.TestResult()
+            case("test_request_review_is_not_submitted").run(result)
+            self.assertEqual(len(result.failures), 1, "naive Fairy counter survived")
+            self.assertEqual(result.errors, [])
+            self.assertIn("AssertionError: '1\\t1\\tREQUEST_REVIEW", result.failures[0][1])
 
 
 class PullOverlapMutantTest(unittest.TestCase):
