@@ -283,6 +283,83 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _route_user(self, stub: Stub, url: urllib.parse.SplitResult) -> bool:
+        """Handle user read requests."""
+
+        if url.path == "/api/v1/user":
+            self.reply(200, {"login": "tester"})
+            return True
+        return False
+
+    def _route_pull(self, stub: Stub, url: urllib.parse.SplitResult) -> bool:
+        """Handle pull list and single pull read requests."""
+
+        if url.path.endswith("/pulls"):
+            if stub.fail_pulls:
+                self.reply(500, {"message": "pull list failed"})
+            else:
+                self.reply(200, stub.pulls(urllib.parse.parse_qs(url.query)))
+            return True
+        if url.path.endswith("/pulls/1"):
+            stub.pull_headers.append(dict(self.headers.items()))
+            if stub.pull_status == 200:
+                self.reply(200, stub.pull())
+            else:
+                self.reply(stub.pull_status, {"message": "pull read failed"})
+            return True
+        return False
+
+    def _route_pull_files(
+        self, stub: Stub, parts: list[str], url: urllib.parse.SplitResult
+    ) -> bool:
+        """Handle pull changed files requests."""
+
+        if len(parts) > 3 and parts[-3] == "pulls" and parts[-1] == "files":
+            number = int(parts[-2])
+            if number in stub.fail_files:
+                self.reply(500, {"message": "pull files failed"})
+            else:
+                self.reply(200, stub.files(number, urllib.parse.parse_qs(url.query)))
+            return True
+        return False
+
+    def _route_reviews(self, stub: Stub, parts: list[str], url: urllib.parse.SplitResult) -> bool:
+        """Handle pull reviews requests."""
+
+        if len(parts) > 3 and parts[-3] == "pulls" and parts[-1] == "reviews":
+            number = int(parts[-2])
+            if number in stub.fail_reviews:
+                self.reply(500, {"message": "reviews failed"})
+            else:
+                self.reply(200, stub.review_page(number, urllib.parse.parse_qs(url.query)))
+            return True
+        return False
+
+    def _route_status(self, stub: Stub, parts: list[str], url: urllib.parse.SplitResult) -> bool:
+        """Handle commit status requests."""
+
+        if len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status":
+            if stub.fail_status:
+                self.reply(500, {"message": "boom"})
+            else:
+                st = stub.statuses(parts[-2], urllib.parse.parse_qs(url.query))
+                self.reply(200, {"statuses": st, "total_count": len(st)})
+            return True
+        return False
+
+    def _dispatch_get(self, stub: Stub, url: urllib.parse.SplitResult, parts: list[str]) -> bool:
+        """Route a GET request to the matching handler."""
+
+        if self._route_user(stub, url):
+            return True
+        if self._route_pull(stub, url):
+            return True
+        if self._route_pull_files(stub, parts, url):
+            return True
+        if self._route_reviews(stub, parts, url):
+            return True
+        return self._route_status(stub, parts, url)
+
     def do_GET(self) -> None:
         """Serve scripted user, pull, and commit-status reads."""
 
@@ -290,36 +367,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         stub.requests.append(("GET", self.path, ""))
         parts = url.path.split("/")
-        is_status = len(parts) > 3 and parts[-3] == "commits" and parts[-1] == "status"
-        is_pull_list = url.path.endswith("/pulls")
-        is_pull_files = len(parts) > 3 and parts[-3] == "pulls" and parts[-1] == "files"
-        is_review = len(parts) > 3 and parts[-3] == "pulls" and parts[-1] == "reviews"
-        if url.path == "/api/v1/user":
-            self.reply(200, {"login": "tester"})
-        elif is_pull_list and stub.fail_pulls:
-            self.reply(500, {"message": "pull list failed"})
-        elif is_pull_list:
-            self.reply(200, stub.pulls(urllib.parse.parse_qs(url.query)))
-        elif is_pull_files and int(parts[-2]) in stub.fail_files:
-            self.reply(500, {"message": "pull files failed"})
-        elif is_pull_files:
-            self.reply(200, stub.files(int(parts[-2]), urllib.parse.parse_qs(url.query)))
-        elif is_review and int(parts[-2]) in stub.fail_reviews:
-            self.reply(500, {"message": "reviews failed"})
-        elif is_review:
-            self.reply(200, stub.review_page(int(parts[-2]), urllib.parse.parse_qs(url.query)))
-        elif url.path.endswith("/pulls/1"):
-            stub.pull_headers.append(dict(self.headers.items()))
-            if stub.pull_status == 200:
-                self.reply(200, stub.pull())
-            else:
-                self.reply(stub.pull_status, {"message": "pull read failed"})
-        elif is_status and stub.fail_status:
-            self.reply(500, {"message": "boom"})
-        elif is_status:
-            st = stub.statuses(parts[-2], urllib.parse.parse_qs(url.query))
-            self.reply(200, {"statuses": st, "total_count": len(st)})
-        else:
+        if not self._dispatch_get(stub, url, parts):
             self.reply(404, {})
 
     def do_POST(self) -> None:
