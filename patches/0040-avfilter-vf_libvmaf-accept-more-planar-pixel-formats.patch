@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: luoye-cpu <3412829159@qq.com>
+Date: Mon, 19 Oct 2026 18:55:54 +0800
+Subject: [PATCH] avfilter/vf_libvmaf: accept more planar pixel formats for
+ CUDA frames
+
+supported_formats[] decides which sw_format of CUDA hardware frames the
+libvmaf_cuda filter accepts. Only AV_PIX_FMT_YUV420P and AV_PIX_FMT_YUV444P16
+were listed, so uploading 10/12-bit or 4:2:2 frames with hwupload_cuda failed
+with "Unsupported input format: yuv420p10le".
+
+List the missing 8/10/12-bit planar variants, matching the pixel formats the
+software path already maps in pix_fmt_map(). The 16-bit 4:2:0/4:2:2
+combinations are intentionally not added: the mapping exists, but they have
+not been exercised on the CUDA path. Semi-planar formats (nv12/p010, as
+produced by NVDEC) remain unsupported and require scale_cuda=format=<planar>
+before the filter.
+
+Signed-off-by: luoye-cpu <3412829159@qq.com>
+---
+ libavfilter/vf_libvmaf.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/libavfilter/vf_libvmaf.c b/libavfilter/vf_libvmaf.c
+index 3ab67d3dba590ce61a1968e00da82a9757a115b3..6400168f40b764599a57053b15d0685f809b7e6f 100644
+--- a/libavfilter/vf_libvmaf.c
++++ b/libavfilter/vf_libvmaf.c
+@@ -634,6 +634,14 @@ const FFFilter ff_vf_libvmaf = {
+ #if CONFIG_LIBVMAF_CUDA_FILTER
+ static const enum AVPixelFormat supported_formats[] = {
+     AV_PIX_FMT_YUV420P,
++    AV_PIX_FMT_YUV422P,
++    AV_PIX_FMT_YUV444P,
++    AV_PIX_FMT_YUV420P10LE,
++    AV_PIX_FMT_YUV422P10LE,
++    AV_PIX_FMT_YUV444P10LE,
++    AV_PIX_FMT_YUV420P12LE,
++    AV_PIX_FMT_YUV422P12LE,
++    AV_PIX_FMT_YUV444P12LE,
+     AV_PIX_FMT_YUV444P16,
+ };
+ 

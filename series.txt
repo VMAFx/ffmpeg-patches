@@ -44,3 +44,5 @@
 0037-avcodec-aom_film_grain-Assume-the-predicted-luma-poi.patch
 0038-avcodec-vvc-intra_template-bound-reference-corner-ex.patch
 0039-avcodec-wmalosslessdec-Clear-subframe-flags-as-an-ar.patch
+0040-avfilter-vf_libvmaf-accept-more-planar-pixel-formats.patch
+0041-avfilter-vf_libvmaf-copy-all-planes-of-CUDA-hardware.patch

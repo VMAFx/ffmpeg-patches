@@ -1,0 +1,9 @@
+status = "submitted"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708"
+consumers = ["vmafx"]
+origin = "VMAFx/vmafx#3274 (luoye-cpu), FFmpeg PR 25708 commit e8785e8fceb5ac06c183b31da3addc36c4265c8f"
+notes = """
+Adds the missing 8-bit 4:2:2/4:4:4 and 10/12-bit 4:2:0/4:2:2/4:4:4 planar formats to the libvmaf_cuda supported_formats list. Semi-planar formats and 16-bit 4:2:0/4:2:2 are not added.
+25708 stacks on 24973, which the series does not carry; the conflict was context only, the change is identical.
+GPU before/after: see PR
+"""
