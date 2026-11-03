@@ -43,7 +43,7 @@ def open_pull(number: int = 25612, login: str = "tester") -> dict:
 
 
 def fairy_review(
-    state: str = "APPROVED",
+    state: str | None = "APPROVED",
     submitted_at: str = "2026-11-03T12:00:00Z",
     login: str = "Forgejo_Fairy",
     commit_id: str = A,
@@ -158,17 +158,19 @@ class Stub:
         self,
         heads: list[object] | None = None,
         polls: dict[str, list[list[dict]]] | None = None,
-        fail_status: bool = False,
         pull_status: int = 200,
         reviewers: list[list[str]] | None = None,
+        **kwargs: object,
     ):
         """Initialize scripted pull, status, and reviewer responses."""
 
         heads = heads or [A]
         polls = polls or {}
-        self.heads, self.polls, self.fail_status = heads, polls, fail_status
+        self.heads, self.polls = heads, polls
+        self.fail_status = bool(kwargs.get("fail_status", False))
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
+        self.login = str(kwargs.get("login", "tester"))
         self.open_pulls: list[dict] = []
         self.pull_files: dict[int, list[ChangedFile]] = {}
         self.fail_pulls = False
@@ -287,7 +289,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Handle user read requests."""
 
         if url.path == "/api/v1/user":
-            self.reply(200, {"login": "tester"})
+            self.reply(200, {"login": stub.login})
             return True
         return False
 
@@ -526,6 +528,28 @@ class FairyReviewsTest(ForgejoTest):
 
         self.assert_summary([fairy_review(submitted_at="")], "0\t-\t-")
 
+    def test_state_null_is_not_submitted(self) -> None:
+        """A review row with null state cannot count as a submitted review."""
+
+        self.assert_summary([fairy_review(state=None)], "0\t-\t-")
+
+    def test_state_empty_is_not_submitted(self) -> None:
+        """A review row with empty state cannot count as a submitted review."""
+
+        self.assert_summary([fairy_review(state="")], "0\t-\t-")
+
+    def test_unknown_state_is_not_submitted(self) -> None:
+        """An unknown review state cannot count as a submitted review."""
+
+        self.assert_summary([fairy_review(state="FOO")], "0\t-\t-")
+
+    def test_each_allowed_state_counts(self) -> None:
+        """Each valid Forgejo review state counts when submitted."""
+
+        for state in ("APPROVED", "COMMENT", "REQUEST_CHANGES"):
+            with self.subTest(state=state):
+                self.assert_summary([fairy_review(state=state)], f"1\t{state}\t{A[:12]}")
+
     def test_another_reviewer_is_not_fairy(self) -> None:
         """Another users submitted approval cannot count as a Fairy review."""
 
@@ -568,14 +592,54 @@ class FairyReviewsTest(ForgejoTest):
     def test_default_lists_only_own_open_pulls_across_pages(self) -> None:
         """Default selection uses the poster filter and paginates open pulls."""
 
-        stub = Stub()
-        stub.open_pulls = [open_pull(n) for n in range(1, 52)] + [open_pull(99, "other")]
+        stub = Stub(login="someone-else")
+        stub.open_pulls = [open_pull(n, "someone-else") for n in range(1, 52)] + [
+            open_pull(99, "other")
+        ]
         proc = self.run_command(stub, "fairy-reviews")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.splitlines(), [f"{n}\t0\t-\t-" for n in range(1, 52)])
         paths = [path for _, path, _ in stub.requests if "/pulls?" in path]
         self.assertTrue(any("page=2" in path for path in paths))
-        self.assertTrue(all("state=open" in path and "poster=tester" in path for path in paths))
+        self.assertTrue(
+            all("state=open" in path and "poster=someone-else" in path for path in paths)
+        )
+        review_pulls = [
+            int(path.split("/pulls/")[1].split("/reviews")[0])
+            for _, path, _ in stub.requests
+            if "/reviews?" in path
+        ]
+        self.assertEqual(review_pulls, list(range(1, 52)))
+
+    def test_second_pull_failure_emits_no_partial_output(self) -> None:
+        """A failure reading reviews for a later pull emits no partial output on stdout."""
+
+        stub = Stub()
+        stub.reviews = {1: [fairy_review()]}
+        stub.fail_reviews = {2}
+        proc = self.run_command(stub, "fairy-reviews", "1", "2")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+
+    def test_reviews_at_page_twenty_short_page_succeeds(self) -> None:
+        """A short twentieth page completes the listing without hitting pagination limit."""
+
+        stub = Stub()
+        stub.reviews = {1: [fairy_review()] * 999}
+        proc = self.run_command(stub, "fairy-reviews", "1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, f"1\t999\tAPPROVED\t{A[:12]}\n")
+
+    def test_reviews_at_page_twenty_full_page_dies(self) -> None:
+        """A full twentieth page reaches the pagination limit and fails closed."""
+
+        stub = Stub()
+        stub.reviews = {1: [fairy_review()] * 1000}
+        proc = self.run_command(stub, "fairy-reviews", "1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        paths = [path for _, path, _ in stub.requests if "page=" in path]
+        self.assertEqual(len(paths), 20)
 
     def test_no_own_open_pulls(self) -> None:
         """Default selection with no own open pulls prints nothing."""
@@ -637,6 +701,30 @@ class FairyReviewsTest(ForgejoTest):
             path.write_text(json.dumps(rows))
             with self.subTest(rows=rows):
                 proc = self.run_command(Stub(), "fairy-reviews", "--from-json", str(path))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
+
+    def test_malformed_review_rows_fail(self) -> None:
+        """Malformed review rows fail classification with exit non-zero and no stdout."""
+
+        fairy_no_state = {
+            "user": {"login": "Forgejo_Fairy"},
+            "submitted_at": "2026-11-03T12:00:00Z",
+        }
+        cases: list[tuple[str, list[object]]] = [
+            ("empty_dict_row", [{}]),
+            ("fairy_row_without_state", [fairy_no_state]),
+            ("row_not_a_dict", ["not-a-dict"]),
+            ("state_not_str_or_null", [{"state": 123}]),
+            ("user_not_dict_or_null", [{"state": "APPROVED", "user": "not-a-dict"}]),
+            ("submitted_at_not_str_or_null", [{"state": "APPROVED", "submitted_at": 123}]),
+            ("commit_id_not_str_or_null", [{"state": "APPROVED", "commit_id": 123}]),
+        ]
+        for name, rows in cases:
+            with self.subTest(case=name):
+                stub = Stub()
+                stub.reviews = {1: rows}  # type: ignore[dict-item]
+                proc = self.run_command(stub, "fairy-reviews", "1")
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, "")
 
@@ -1295,10 +1383,7 @@ class FairyReviewsMutantTest(unittest.TestCase):
     def test_naive_fairy_row_counter_is_caught(self) -> None:
         """The requested-only negative kills a counter accepting every Fairy row."""
 
-        old = (
-            '        and row.get("state") not in {"REQUEST_REVIEW", "PENDING"}\n'
-            '        and row.get("submitted_at")'
-        )
+        old = '        and row["state"] in ALLOWED_STATES\n        and row.get("submitted_at")'
         source = HELPER.read_text()
         self.assertEqual(source.count(old), 1, "mutation site missing")
         source = source.replace(
