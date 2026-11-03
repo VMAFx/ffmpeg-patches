@@ -69,12 +69,19 @@ class FairyUnansweredTest(unittest.TestCase):
     """Exercise public behavior with network access forbidden."""
 
     def setUp(self):
-        """Fail immediately if a fixture accidentally attempts network I/O."""
+        """Forbid network I/O through both global and restricted openers."""
         network = unittest.mock.patch.object(
             fairy.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")
         )
         network.start()
         self.addCleanup(network.stop)
+        transport = unittest.mock.patch.object(
+            fairy.urllib.request.AbstractHTTPHandler,
+            "do_open",
+            side_effect=AssertionError("network forbidden"),
+        )
+        transport.start()
+        self.addCleanup(transport.stop)
 
     def test_self_test(self):
         """All planted fixtures pass through both supported entry points."""
@@ -320,13 +327,81 @@ class FairyUnansweredTest(unittest.TestCase):
         self.assertIn("500", errors.getvalue())
 
     def test_get_timeout(self):
-        """Every repository and feed GET uses the required 30-second timeout."""
+        """Every GET uses the restricted opener with a 30-second timeout."""
         for path, url in (("/issues/3", fairy.API + "/issues/3"), (FEED, FEED)):
-            with unittest.mock.patch.object(
-                fairy.urllib.request, "urlopen", return_value=io.BytesIO(b"[]")
-            ) as request:
+            with (
+                unittest.mock.patch.object(
+                    fairy.OPENER, "open", return_value=io.BytesIO(b"[]")
+                ) as request,
+                unittest.mock.patch.object(fairy.urllib.request, "urlopen") as unrestricted,
+            ):
                 self.assertEqual(fairy.get(path), [])
             request.assert_called_once_with(url, timeout=30)
+            unrestricted.assert_not_called()
+
+    def test_redirect_refuses_http(self):
+        """A same-host redirect cannot downgrade the connection to HTTP."""
+        url = "http://code.ffmpeg.org/x"
+        handler = fairy.RestrictedRedirectHandler()
+        request = fairy.urllib.request.Request(FEED)
+        with self.assertRaises(fairy.RefusedURL) as caught:
+            handler.redirect_request(request, None, 302, "Found", {}, url)
+        self.assertEqual(str(caught.exception), url)
+
+    def test_redirect_refuses_foreign_host(self):
+        """An HTTPS redirect cannot leave the allow-listed API host."""
+        url = "https://evil.example/x"
+        handler = fairy.RestrictedRedirectHandler()
+        request = fairy.urllib.request.Request(FEED)
+        with self.assertRaises(fairy.RefusedURL) as caught:
+            handler.redirect_request(request, None, 302, "Found", {}, url)
+        self.assertEqual(str(caught.exception), url)
+
+    def test_redirect_allows_api_host_https(self):
+        """An HTTPS redirect within the API host produces the next request."""
+        url = "https://code.ffmpeg.org/api/v1/x"
+        handler = fairy.RestrictedRedirectHandler()
+        request = fairy.urllib.request.Request(FEED)
+        redirected = handler.redirect_request(request, None, 302, "Found", {}, url)
+        self.assertEqual(redirected.full_url, url)
+
+    def test_opener_excludes_unsafe_handlers(self):
+        """Only HTTPS transport is installed; local and other transports stay absent."""
+        forbidden = (
+            fairy.urllib.request.HTTPHandler,
+            fairy.urllib.request.FileHandler,
+            fairy.urllib.request.FTPHandler,
+            fairy.urllib.request.DataHandler,
+        )
+        for handler in fairy.OPENER.handlers:
+            with self.subTest(handler=type(handler).__name__):
+                self.assertNotIsInstance(handler, forbidden)
+        self.assertTrue(
+            any(isinstance(h, fairy.urllib.request.HTTPSHandler) for h in fairy.OPENER.handlers)
+        )
+
+    def test_opener_refuses_http(self):
+        """Direct HTTP opening fails before any transport can read a response."""
+        with self.assertRaises(urllib.error.URLError):
+            fairy.OPENER.open("http://code.ffmpeg.org/x", timeout=30)
+
+    def test_redirect_refusal_reported_by_main(self):
+        """Real redirect processing preserves main's distinct refused-URL report."""
+        url = "https://evil.example/x"
+        response = unittest.mock.Mock(code=302, msg="Found")
+        response.info.return_value = {"location": url}
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                fairy.urllib.request.HTTPSHandler, "https_open", return_value=response
+            ) as transport,
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.main([]), 1)
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), f"fairy_unanswered: refused URL: {url}\n")
 
     def test_get_refuses_non_https_and_foreign_host(self):
         """Unsafe URLs raise a distinct ValueError subtype before network I/O."""

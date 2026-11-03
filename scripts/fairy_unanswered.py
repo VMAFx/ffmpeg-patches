@@ -22,13 +22,37 @@ class RefusedURL(ValueError):
     """Identify a URL rejected before any network request."""
 
 
-def get(path):
-    """Decode a deadline-bound API GET, raising RefusedURL for unsafe URLs."""
-    url = path if urllib.parse.urlsplit(path).scheme else API + path
+def check_url(url):
+    """Reject URLs outside HTTPS on the allow-listed API host."""
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname != API_HOST:
         raise RefusedURL(url)
-    with urllib.request.urlopen(url, timeout=30) as r:
+
+
+class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only within the same HTTPS API allow-list."""
+
+    # urllib requires this callback signature, including all six positional arguments.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913, PLR0917
+        """Validate the redirect target before constructing its next request."""
+        check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Install HTTPS and error processing explicitly, without build_opener's other transports.
+OPENER = urllib.request.OpenerDirector()
+OPENER.add_handler(urllib.request.HTTPSHandler())
+OPENER.add_handler(RestrictedRedirectHandler())
+OPENER.add_handler(urllib.request.HTTPDefaultErrorHandler())
+OPENER.add_handler(urllib.request.HTTPErrorProcessor())
+OPENER.add_handler(urllib.request.UnknownHandler())
+
+
+def get(path):
+    """Decode an API GET with a deadline and allow-listed initial and redirect URLs."""
+    url = path if urllib.parse.urlsplit(path).scheme else API + path
+    check_url(url)
+    with OPENER.open(url, timeout=30) as r:
         return json.load(r)
 
 
