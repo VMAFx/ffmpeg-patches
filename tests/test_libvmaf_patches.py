@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404 - runs the fixed local compiler and fixture binary.
 import tempfile
 import unittest
 from pathlib import Path
