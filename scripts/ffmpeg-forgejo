@@ -23,6 +23,8 @@
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
+#   ffmpeg-forgejo fairy-reviews [<number>...]        count submitted Fairy reviews; default: own open PRs
+#   ffmpeg-forgejo fairy-reviews --from-json <file>  offline count, newest state and 12-hex commit (tab separated)
 # Environment: FFMPEG_FORGEJO_REPO (default FFmpeg/FFmpeg), FFMPEG_FORGEJO_BASE (default master),
 #   FFMPEG_FORGEJO_API (API base override, for tests), FFMPEG_FORGEJO_GIT (upstream Git URL override).
 set -euo pipefail
@@ -32,6 +34,7 @@ API="${FFMPEG_FORGEJO_API:-$HOST/api/v1}"
 REPO="${FFMPEG_FORGEJO_REPO:-FFmpeg/FFmpeg}"
 BASE="${FFMPEG_FORGEJO_BASE:-master}"
 GIT_URL="${FFMPEG_FORGEJO_GIT:-$HOST/$REPO.git}"
+page_size=""
 
 die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
 
@@ -301,11 +304,132 @@ print(*numbers, sep="\n")' <<<"$out" 2>/dev/null)"; then
   rm -f "$candidates"
 }
 
+# discover_page_size: cache API settings in the parent shell before listing subshells.
+discover_page_size() {
+  [ -z "$page_size" ] || return 0
+  local out
+  out="$(api GET /settings/api)" || die "cannot read /settings/api"
+  page_size="$(python3 -c 'import json,sys
+size = json.load(sys.stdin)["max_response_items"]
+if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+    raise SystemExit(1)
+print(min(50, size))' <<<"$out" 2>/dev/null)" \
+    || die "invalid max_response_items in /settings/api; expected a positive integer"
+}
+
+# api_list PATH: collect a JSON list from at most 20 pages; PATH ends in ? or &.
+api_list() {
+  local path="$1" list_page out parsed count pages=""
+  [ -n "$page_size" ] || die "api_list: page size not discovered"
+  for ((list_page = 1; list_page <= 20; list_page++)); do
+    out="$(api GET "${path}page=$list_page&limit=$page_size")" || die "cannot read $path"
+    parsed="$(python3 -c 'import json,sys
+rows = json.load(sys.stdin)
+if not isinstance(rows, list): raise SystemExit(1)
+print(len(rows))
+print(json.dumps(rows))' <<<"$out")" || die "cannot parse $path"
+    count="${parsed%%$'\n'*}"
+    pages+="${parsed#*$'\n'}"$'\n'
+    if [ "$count" -lt "$page_size" ]; then
+      python3 -c 'import json,sys
+print(json.dumps([row for page in sys.stdin if page.strip() for row in json.loads(page)]))' <<<"$pages"
+      return
+    fi
+  done
+  die "pagination limit reached for $path; listing incomplete"
+}
+
+# own_open_pr_numbers: list own open pull numbers using the overlap checks poster filter.
+own_open_pr_numbers() {
+  local me encoded_me out
+  me="$(login)" || die "cannot read login"
+  encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
+  out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || exit 1
+  python3 -c 'import json,sys
+for row in json.load(sys.stdin):
+    number = row.get("number")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise SystemExit(1)
+    print(number)' <<<"$out" || die "cannot parse own open pull numbers"
+}
+
+# fairy_review_summary: classify reviews JSON from stdin without accessing the API.
+fairy_review_summary() {
+  python3 -c 'import json,re,sys
+from datetime import datetime
+
+ALLOWED_STATES = {"APPROVED", "COMMENT", "REQUEST_CHANGES"}
+
+def summarize(reviews):
+    """Count submitted Fairy reviews and describe the newest submission.
+
+    Every review row must be a dict containing a state key (str or null).
+    Rows without a state key, or rows that are not dicts, are malformed.
+    """
+    if not isinstance(reviews, list):
+        raise ValueError("reviews must be a list")
+    for row in reviews:
+        if not isinstance(row, dict):
+            raise ValueError("review row must be a dict")
+        if "state" not in row:
+            raise ValueError("review row missing state key")
+        state = row["state"]
+        if state is not None and not isinstance(state, str):
+            raise ValueError("review state must be str or null")
+        user = row.get("user")
+        if user is not None and not isinstance(user, dict):
+            raise ValueError("review user must be dict or null")
+        sub = row.get("submitted_at")
+        if sub is not None and not isinstance(sub, str):
+            raise ValueError("review submitted_at must be str or null")
+        cid = row.get("commit_id")
+        if cid is not None and not isinstance(cid, str):
+            raise ValueError("review commit_id must be str or null")
+        if cid and re.fullmatch(r"[0-9a-fA-F]{40}", cid) is None:
+            raise ValueError("invalid review commit_id")
+    submitted = [row for row in reviews
+        if (row.get("user") or {}).get("login") == "Forgejo_Fairy"
+        and row["state"] in ALLOWED_STATES
+        and row.get("submitted_at")]
+    if not submitted:
+        return 0, "-", "-"
+    newest = max(submitted, key=lambda row: datetime.fromisoformat(row["submitted_at"]))
+    commit = newest.get("commit_id") or ""
+    return len(submitted), newest["state"], commit[:12] if commit else "-"
+
+print(*summarize(json.load(sys.stdin)), sep="\t")'
+}
+
 cmd="${1:-}"
 if [ $# -gt 0 ]; then shift; fi
 case "$cmd" in
   whoami)
     login
+    ;;
+  fairy-reviews)
+    if [ "${1:-}" = "--from-json" ]; then
+      [ $# -eq 2 ] || usage_error "fairy-reviews --from-json <file>"
+      fairy_review_summary <"$2" || die "cannot parse reviews JSON"
+      exit 0
+    fi
+    for n in "$@"; do
+      [[ "$n" =~ ^[1-9][0-9]*$ ]] || usage_error "fairy-reviews [<number>...]"
+    done
+    discover_page_size
+    numbers=("$@")
+    if [ $# -eq 0 ]; then
+      out="$(own_open_pr_numbers)" || exit 1
+      if [ -n "$out" ]; then mapfile -t numbers <<<"$out"; fi
+    fi
+    results=()
+    for n in "${numbers[@]}"; do
+      out="$(api_list "/repos/$REPO/pulls/$n/reviews?")" || exit 1
+      summary="$(fairy_review_summary <<<"$out")" || die "cannot parse reviews for #$n"
+      results+=("$n"$'\t'"$summary")
+    done
+    if [ "${#results[@]}" -gt 0 ]; then
+      printf '%s\n' "${results[@]}"
+    fi
     ;;
   search)
     [ $# -ge 1 ] || die "usage: search <text>"
