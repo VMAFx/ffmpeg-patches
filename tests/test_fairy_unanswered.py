@@ -31,7 +31,7 @@ def _word(who="Forgejo_Fairy", timestamp=NEW):
         "body": "finding",
         "created_at": timestamp,
         "submitted_at": timestamp,
-        "state": "COMMENTED",
+        "state": "COMMENT",
     }
 
 
@@ -90,6 +90,54 @@ class FairyUnansweredTest(unittest.TestCase):
         ):
             self.assertEqual(fairy.self_test(), 1)
         self.assertIn("self-test FAIL owed", errors.getvalue())
+
+    def test_pending_fairy_review_ignored(self):
+        """An unsubmitted Fairy draft with a body creates no reply obligation."""
+        review = dict(_word(), state="PENDING", submitted_at=None)
+        self.assertEqual(fairy.owed([], [review]), ("", "", False))
+
+    def test_pending_lusoris_review_ignored(self):
+        """An unsubmitted reply cannot clear an outstanding Fairy comment."""
+        review = dict(_word("lusoris"), state="PENDING", submitted_at=None)
+        self.assertEqual(fairy.owed([_word()], [review]), (NEW, "", True))
+
+    def test_unknown_review_state_ignored(self):
+        """Unknown and null review states are silent even with a timestamp."""
+        for state in ("FOO", None, "REQUEST_REVIEW"):
+            with self.subTest(state=state):
+                review = dict(_word(), state=state)
+                self.assertEqual(fairy.owed([], [review]), ("", "", False))
+
+    def test_submitted_review_invalid_timestamp_reported(self):
+        """Counted states reject non-string timestamps, including approve-only bodies."""
+        approve = "### Classification\n\n- <details><summary><b>approve — x.</b></summary>\n"
+        for body in ("finding", approve):
+            for timestamp in (None, 0, False, [], {}):
+                with self.subTest(body=body, timestamp=timestamp):
+                    review = dict(_word(), body=body, submitted_at=timestamp)
+                    with self.assertRaises((TypeError, ValueError)):
+                        fairy.owed([], [review])
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        unittest.mock.patch.object(
+                            fairy, "discover_threads", return_value={1: "pr"}
+                        ),
+                        unittest.mock.patch.object(fairy, "get", return_value=[]),
+                        unittest.mock.patch.object(fairy, "paginated", return_value=[review]),
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        self.assertEqual(fairy.main([]), 1)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("malformed API response", errors.getvalue())
+
+    def test_submitted_review_states_and_empty_timestamp(self):
+        """Every counted state needs a non-empty submission timestamp."""
+        for state in ("APPROVED", "COMMENT", "REQUEST_CHANGES"):
+            with self.subTest(state=state):
+                review = dict(_word(), state=state)
+                self.assertEqual(fairy.owed([], [review]), (NEW, "", True))
+                self.assertEqual(fairy.owed([], [dict(review, submitted_at="")]), ("", "", False))
 
     def test_mixed_thread_discovery(self):
         """Dedupe own and commented threads; skip closed/404; review only PRs."""

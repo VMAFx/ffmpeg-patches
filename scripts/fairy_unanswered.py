@@ -157,6 +157,16 @@ def approve_only(body):
     return set(re.findall(r"^#{1,6}\s.*$", body, re.M)) <= OK_HEADINGS
 
 
+def _submitted_review(review):
+    """Accept submitted review states; reject malformed submission timestamps."""
+    if review["state"] not in {"APPROVED", "COMMENT", "REQUEST_CHANGES"}:
+        return False
+    timestamp = review["submitted_at"]
+    if not isinstance(timestamp, str):
+        raise TypeError("review submitted_at must be str")
+    return bool(timestamp)
+
+
 def owed(comments, reviews):
     """Return the newest Fairy word, newest lusoris word, and whether a reply is owed."""
     if not isinstance(comments, list):
@@ -166,7 +176,7 @@ def owed(comments, reviews):
     words = [
         r
         for r in reviews
-        if r["state"] != "REQUEST_REVIEW"
+        if _submitted_review(r)
         and not (r["user"]["login"] == "Forgejo_Fairy" and approve_only(r.get("body")))
     ]
     fairy = _newest_ts(
@@ -188,7 +198,7 @@ def _fixture_word(who, body, timestamp):
         "body": body,
         "created_at": timestamp,
         "submitted_at": timestamp,
-        "state": "COMMENTED",
+        "state": "COMMENT",
     }
 
 
@@ -207,6 +217,13 @@ def _owed_fixtures(head):
         ([mine], [approve], ("", mine["created_at"], False)),
         ([], [minor], (minor["submitted_at"], "", True)),
         ([], [dict(fairy, state="REQUEST_REVIEW")], ("", "", False)),
+        ([], [dict(fairy, state="PENDING", submitted_at=None)], ("", "", False)),
+        (
+            [fairy],
+            [dict(mine, state="PENDING", submitted_at=None)],
+            (fairy["created_at"], "", True),
+        ),
+        ([], [dict(fairy, state="FOO")], ("", "", False)),
         (
             [fairy, dict(mine, created_at=fairy["created_at"])],
             [],
