@@ -1536,6 +1536,7 @@ class MutantTest(unittest.TestCase):
                 with mutant_case(source, old, new, EditBodyTest, "Mutated") as case:
                     suite = unittest.defaultTestLoader.loadTestsFromTestCase(case)
                     result = unittest.TestResult()
+                    result.failfast = True  # one failure kills the mutant; skip the rest
                     suite.run(result)
                     self.assertTrue(result.failures or result.errors, f"{name} survived")
 
