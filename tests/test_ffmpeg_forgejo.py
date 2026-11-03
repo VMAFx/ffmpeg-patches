@@ -8,6 +8,7 @@ import contextlib
 import http.server
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -27,7 +28,7 @@ LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
-HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "fairy-reviews"})
+HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "push", "fairy-reviews"})
 
 
 def label(status: str, n: int = 0) -> dict:
@@ -108,41 +109,12 @@ class GitEnvironmentTest(unittest.TestCase):
             self.assertFalse(bogus_index.exists())
 
     def test_git_ignores_global_hooks(self) -> None:
-        """Fixture Git commands bypass hooks from the caller's global config."""
+        """Fixture Git explicitly bypasses hooks without changing credential settings."""
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
-            repo.mkdir()
-            hooks = root / "hooks"
-            hooks.mkdir()
-            pre_commit = hooks / "pre-commit"
-            pre_commit.write_text("#!/bin/sh\nexit 1\n")
-            pre_commit.chmod(0o755)
-            global_config = root / "gitconfig"
-            global_config.write_text(f"[core]\n\thooksPath = {hooks}\n")
-            with unittest.mock.patch.dict(
-                os.environ,
-                {"HOME": str(root / "home"), "GIT_CONFIG_GLOBAL": str(global_config)},
-            ):
-                self.assertEqual(
-                    isolated_git_environment()["GIT_CONFIG_GLOBAL"], str(global_config)
-                )
-                git(repo, "init", "-q", "-b", "master")
-                repo.joinpath("tracked").write_text("content\n")
-                git(repo, "add", "tracked")
-                git(
-                    repo,
-                    "-c",
-                    "user.name=Test",
-                    "-c",
-                    "user.email=test@example.invalid",
-                    "-c",
-                    "commit.gpgSign=false",
-                    "commit",
-                    "-qm",
-                    "fixture",
-                )
+        with unittest.mock.patch("subprocess.run") as run:
+            git(Path("fixture"), "init", "-q")
+        self.assertEqual(run.call_args.args[0][:3], ["git", "-c", "core.hooksPath=/dev/null"])
+        self.assertEqual(run.call_args.kwargs["env"], isolated_git_environment())
 
 
 class Stub:
@@ -455,6 +427,9 @@ class ForgejoTest(unittest.TestCase):
         candidate.write_text("topic\n")
         git(self.repo, "add", OVERLAP_FILE)
         git(self.repo, *commit, "topic")
+        self.sweep = self.tmp / "sweep.md"
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n")
 
     def run_command(
         self,
@@ -1167,6 +1142,8 @@ class PullRequestReviewerTest(ForgejoTest):
         return self.run_command(
             stub,
             "pr",
+            "--sweep",
+            str(self.sweep),
             "topic",
             "title",
             str(self.tmp / "body.md"),
@@ -1215,6 +1192,8 @@ class PullRequestOverlapTest(ForgejoTest):
         return self.run_command(
             stub,
             "pr",
+            "--sweep",
+            str(self.sweep),
             *options,
             "topic",
             "title",
@@ -1333,6 +1312,8 @@ class PullRequestOverlapTest(ForgejoTest):
             "-qm",
             "new topic",
         )
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n")
         stub = overlap_stub(
             reviewers=[["alice"]], open_pulls=[open_pull()], pull_files={25612: ["upstream-file"]}
         )
@@ -1350,6 +1331,8 @@ class PullRequestOverlapTest(ForgejoTest):
         proc = self.run_command(
             stub,
             "pr",
+            "--sweep",
+            str(self.sweep),
             "topic",
             "title",
             str(self.tmp / "body.md"),
@@ -1415,6 +1398,103 @@ class PullRequestOverlapTest(ForgejoTest):
             any("/pulls/25612/files?" in path and "page=2" in path for _, path, _ in stub.requests)
         )
         self.assertEqual(self.pull_posts(stub), [])
+
+
+class SweepTest(ForgejoTest):
+    """Require a reviewed sweep before either outbound operation."""
+
+    helper = HELPER
+
+    def sweep_command(self, command: str, *options: str) -> subprocess.CompletedProcess[str]:
+        """Attempt an outbound operation with API and Git push stubbed."""
+
+        real_git = shutil.which("git")
+        if real_git is None:
+            raise RuntimeError("git missing")
+        fake = self.bin_dir / "git"
+        fake.write_text(
+            "#!/usr/bin/env python3\nimport os, sys\n"
+            'if "push" in sys.argv:\n    print("stub push")\n    sys.exit(0)\n'
+            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+        )
+        fake.chmod(0o755)
+        stub = Stub(reviewers=[["alice"]])
+        positional = ["topic"]
+        if command == "pr":
+            positional += ["title", str(self.tmp / "body.md")]
+        result = self.run_command(stub, command, *options, *positional)
+        self.sweep_requests = stub.requests
+        return result
+
+    def assert_sweep_refused(self, *options: str) -> None:
+        """Both operations fail locally with a sweep-specific error."""
+
+        for command in ("pr", "push"):
+            with self.subTest(command=command):
+                result = self.sweep_command(command, *options)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("sweep", result.stderr)
+                self.assertEqual(self.sweep_requests, [])
+                self.assertNotIn("stub push", result.stdout)
+
+    def test_sweep_required(self) -> None:
+        """Missing sweep refuses both operations before API or push."""
+
+        self.assert_sweep_refused()
+
+    def test_sweep_missing_file(self) -> None:
+        """An absent report is never accepted."""
+
+        self.assert_sweep_refused("--sweep", str(self.tmp / "missing.md"))
+
+    def test_sweep_head_mismatch(self) -> None:
+        """A reviewed report for another commit is stale."""
+
+        self.sweep.write_text(f"class: unchecked-return\nhead: {A}\nno hits\n")
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_missing_class(self) -> None:
+        """A report without its bug class is refused."""
+
+        self.sweep.write_text(self.sweep.read_text().replace("class: unchecked-return\n", ""))
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_todo(self) -> None:
+        """An unresolved table disposition blocks outbound operations."""
+
+        self.add_sweep_rows("TODO")
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_bad_disposition(self) -> None:
+        """Only the two named disposition forms are accepted."""
+
+        for value in ("ignore", "", "follow-up:", "fold later", "TODO follow-up: x"):
+            with self.subTest(value=value):
+                self.sweep.write_text(self.sweep.read_text().split("|", 1)[0])
+                self.add_sweep_rows(value)
+                self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def add_sweep_rows(self, *values: str) -> None:
+        """Append table headers and planted disposition rows."""
+
+        with self.sweep.open("a") as report:
+            report.write("| file:line | callee | kind | same file as fix | disposition |\n")
+            report.write("| --- | --- | --- | --- | --- |\n")
+            for value in values:
+                report.write(f"| sibling.c:4 | play | discarded | no | {value} |\n")
+
+    def test_sweep_reviewed(self) -> None:
+        """Reviewed fold and follow-up rows allow PR and leased push."""
+
+        self.add_sweep_rows("fold", "follow-up: evidence/ancestor-reproducer.py")
+        for command in ("pr", "push"):
+            with self.subTest(command=command):
+                options = ["--sweep", str(self.sweep)]
+                if command == "push":
+                    options = ["--lease", A, *options]
+                result = self.sweep_command(command, *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.sweep_requests)
 
 
 MUTANTS = {

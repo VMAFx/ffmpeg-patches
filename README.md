@@ -41,6 +41,32 @@ Consumers apply this series first and their own feature patches on top:
 
 A fix lives here once. A consumer does not carry its own copy.
 
+## Pre-PR variant sweep
+
+Before pushing or opening a pull request, scan the committed fix and callers of its targets:
+
+```bash
+python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return master topic -o sweep.md
+```
+
+The report records full base and head commit IDs. Targets combine callees whose return values are consumed on added lines with functions whose bodies contain added lines. The scan covers touched C/header files and C files in the head revision mentioning those targets. It reports discarded calls and checks that normalize an error to `-1` or an `AVERROR_` value. Explicit `(void)` calls are intentional and excluded. This lexical scan supports review; inspect the surrounding control flow when deciding each row.
+
+Replace every `TODO` disposition with one of:
+
+- `fold`: same bug class and same file as the fix; fold the correction into this pull request.
+- `follow-up: <reproducer path>`: otherwise, record the ancestor reproducer path in the evidence and track the correction separately.
+
+Keep the PR body unchanged unless a variant is folded into the fix. After folding, regenerate the report for the new head and review its rows again. A report with no findings ends with `no hits`.
+
+Pass the reviewed report before positional arguments to both commands (run these inside the FFmpeg clone):
+
+```bash
+/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo push --sweep /path/to/sweep.md topic
+/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo pr --sweep /path/to/sweep.md topic "Fix title" /path/to/body.md
+```
+
+Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`.
+
 ## Upstream contributions
 
 Pull requests on the FFmpeg forge that came out of this series and its

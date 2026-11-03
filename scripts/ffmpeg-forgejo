@@ -9,11 +9,12 @@
 #   ffmpeg-forgejo whoami
 #   ffmpeg-forgejo search  <text>                    open issues and PRs matching text
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
-#   ffmpeg-forgejo push    [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
+#   ffmpeg-forgejo push    --sweep <file> [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#   ffmpeg-forgejo pr      [--overlap-ok <number>]... <branch> <title> <body-file>
+#   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
 #                          (exit 77); --overlap-ok permits exactly that PR; exits 3 when no reviewer was requested
+#                          pr/push require a sweep for the local head; every row must be fold or follow-up: <reproducer path>
 #   ffmpeg-forgejo issue   <title> <body-file>
 #   ffmpeg-forgejo comment (--tested-head <sha> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head
@@ -400,6 +401,46 @@ def summarize(reviews):
 print(*summarize(json.load(sys.stdin)), sep="\t")'
 }
 
+# require_sweep FILE BRANCH: validate reviewed dispositions against the local commit.
+require_sweep() {
+  local report="$1" branch="$2" sha
+  [ -n "$report" ] || die "--sweep <file> required"
+  [ -f "$report" ] || die "no sweep file $report"
+  sha="$(git rev-parse --verify --end-of-options "$branch^{commit}")" || die "sweep: no local branch $branch"
+  python3 - "$report" "$sha" <<'PY' || die "sweep rejected: $report"
+import pathlib
+import re
+import sys
+
+def validate_report(path, sha):
+    """Accept one matching head, one class, and allow-listed table dispositions."""
+    lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    heads = [line.removeprefix("head: ") for line in lines if line.startswith("head:")]
+    classes = [line.removeprefix("class: ") for line in lines if line.startswith("class:")]
+    if heads != [sha] or len(classes) != 1 or classes[0] != "unchecked-return":
+        return False
+    for line in lines:
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().split("|")[1:-1]]
+        if cells == ["file:line", "callee", "kind", "same file as fix", "disposition"]:
+            continue
+        if len(cells) == 5 and all(re.fullmatch(r":?-+:?", cell) for cell in cells):
+            continue
+        if len(cells) != 5 or not line.rstrip().endswith("|"):
+            return False
+        if cells[-1] != "fold" and not re.fullmatch(r"follow-up: \S(?:.*\S)?", cells[-1]):
+            return False
+    return True
+
+try:
+    valid = validate_report(sys.argv[1], sys.argv[2])
+except (OSError, UnicodeError):
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+}
+
 cmd="${1:-}"
 if [ $# -gt 0 ]; then shift; fi
 case "$cmd" in
@@ -452,13 +493,24 @@ for i in json.load(sys.stdin):
     fi
     ;;
   push)
-    lease=""
-    if [ "${1:-}" = "--lease" ]; then
-      [ $# -ge 3 ] || die "usage: push --lease <expected-remote-sha> <local-branch> [<remote-branch>]"
-      [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die "--lease takes the full 40-hex sha the remote branch has now: $2"
-      lease="$2"; shift 2
-    fi
-    [ $# -ge 1 ] || die "usage: push [--lease <expected-remote-sha>] <local-branch> [<remote-branch>]"
+    usage='push --sweep <file> [--lease <expected-remote-sha>] <local-branch> [<remote-branch>]'
+    lease=""; sweep=""
+    push_argc=$#
+    for ((push_i = 0; push_i < push_argc; push_i++)); do
+      case "${1:-}" in
+        --sweep)
+          [ $# -ge 2 ] && [ -z "$sweep" ] || die "usage: $usage"
+          sweep="$2"; shift 2 ;;
+        --lease)
+          [ $# -ge 2 ] && [ -z "$lease" ] || die "usage: $usage"
+          [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die "--lease takes the full 40-hex sha the remote branch has now: $2"
+          lease="$2"; shift 2 ;;
+        --*) die "usage: $usage" ;;
+        *) break ;;
+      esac
+    done
+    [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: $usage"
+    require_sweep "$sweep" "$1"
     me="$(login)"
     git rev-parse --verify --quiet "$1^{commit}" >/dev/null || die "no local branch $1"
     rb="${2:-$1}"
@@ -469,17 +521,24 @@ for i in json.load(sys.stdin):
         push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$1:refs/heads/$rb"
     ;;
   pr)
-    usage='pr [--overlap-ok <number>]... <branch> <title> <body-file>'
-    overlap_ok=""
+    usage='pr --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>'
+    overlap_ok=""; sweep=""
     pr_argc=$#
     for ((pr_i = 0; pr_i < pr_argc; pr_i++)); do
-      [ "${1:-}" = "--overlap-ok" ] || break
-      [ $# -ge 2 ] || usage_error "$usage"
-      [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage_error "$usage"
-      overlap_ok+=" $2"
-      shift 2
+      case "${1:-}" in
+        --sweep)
+          [ $# -ge 2 ] && [ -z "$sweep" ] || die "usage: $usage"
+          sweep="$2"; shift 2 ;;
+        --overlap-ok)
+          [ $# -ge 2 ] || usage_error "$usage"
+          [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage_error "$usage"
+          overlap_ok+=" $2"; shift 2 ;;
+        --*) usage_error "$usage" ;;
+        *) break ;;
+      esac
     done
     [ $# -eq 3 ] || usage_error "$usage"
+    require_sweep "$sweep" "$1"
     [ -f "$3" ] || die "no body file $3"
     me="$(login)"
     check_pr_overlap "$1" "$me" "$overlap_ok"
