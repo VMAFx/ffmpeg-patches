@@ -18,12 +18,16 @@ API_HOST = "code.ffmpeg.org"
 FEED = "https://code.ffmpeg.org/api/v1/users/lusoris/activities/feeds"
 
 
+class RefusedURL(ValueError):
+    """Identify a URL rejected before any network request."""
+
+
 def get(path):
-    """Decode one repository-relative or absolute Forgejo API GET with a deadline."""
+    """Decode a deadline-bound API GET, raising RefusedURL for unsafe URLs."""
     url = path if urllib.parse.urlsplit(path).scheme else API + path
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname != API_HOST:
-        raise ValueError(f"refused URL {url!r}: expected https scheme and {API_HOST} host")
+        raise RefusedURL(url)
     with urllib.request.urlopen(url, timeout=30) as r:
         return json.load(r)
 
@@ -245,7 +249,7 @@ def utc_now():
 
 
 def main(argv):
-    """Print owed PR/issue lines and counts; return the process exit status.
+    """Read all review pages, print owed PR/issue counts, and return an exit status.
 
     Reads are not atomic. A reply posted between read_from and read_to may
     show as owed; a rerun clears it.
@@ -258,11 +262,14 @@ def main(argv):
         out = []
         for number, kind in threads.items():
             comments = get(f"/issues/{number}/comments")
-            reviews = get(f"/pulls/{number}/reviews") if kind == "pr" else []
+            reviews = paginated(f"/pulls/{number}/reviews") if kind == "pr" else []
             fairy, mine, unanswered = owed(comments, reviews)
             if unanswered:
                 out.append(f"{number}\t{kind}\tfairy={fairy}\tlusoris={mine or '-'}")
         read_to = utc_now()
+    except RefusedURL as error:
+        print(f"fairy_unanswered: refused URL: {error}", file=sys.stderr)
+        return 1
     except (KeyError, TypeError, ValueError) as error:
         print(f"fairy_unanswered: malformed API response: {error}", file=sys.stderr)
         return 1

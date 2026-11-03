@@ -36,7 +36,7 @@ def _word(who="Forgejo_Fairy", timestamp=NEW):
 
 
 def _routes():
-    """Build mixed own and commented threads, including stale and missing rows."""
+    """Build mixed threads with paged reviews, stale rows, and missing rows."""
     return {
         "/pulls?state=open&poster=lusoris&limit=50&page=1": [
             {"number": 1, "user": {"login": "lusoris"}},
@@ -60,8 +60,8 @@ def _routes():
         "/issues/2/comments": [_word()],
         "/issues/3/comments": [_word()],
         "/issues/4/comments": [],
-        "/pulls/1/reviews": [],
-        "/pulls/4/reviews": [_word()],
+        "/pulls/1/reviews?limit=50&page=1": [],
+        "/pulls/4/reviews?limit=50&page=1": [_word()],
     }
 
 
@@ -124,6 +124,64 @@ class FairyUnansweredTest(unittest.TestCase):
             "read_from=2026-11-03T00:00:00Z read_to=2026-11-03T00:00:01Z\n",
         )
         self.assertEqual(request.call_args_list.count(unittest.mock.call("/issues/3")), 1)
+
+    def _review_pages_output(self, first, second):
+        """Run a PR against a full default page and a final explicit review page."""
+        routes = {
+            "/issues/1/comments": [],
+            "/pulls/1/reviews": first,
+            "/pulls/1/reviews?limit=50&page=1": first,
+            "/pulls/1/reviews?limit=50&page=2": second,
+        }
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            unittest.mock.patch.object(fairy, "discover_threads", return_value={1: "pr"}),
+            unittest.mock.patch.object(fairy, "get", side_effect=routes.__getitem__),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.main([]), 0)
+        return output.getvalue(), errors.getvalue()
+
+    def test_reviews_second_page_fairy_owed(self):
+        """Fairy's newest review after fifty older replies must be reported owed."""
+        output, errors = self._review_pages_output([_word("lusoris", OLD)] * 50, [_word()])
+        self.assertEqual(output, f"1\tpr\tfairy={NEW}\tlusoris={OLD}\n")
+        self.assertIn("checked_prs=1 checked_issues=0 unanswered=1", errors)
+
+    def test_reviews_second_page_reply_clears_owed(self):
+        """A reply after fifty older Fairy reviews must clear the owed thread."""
+        output, errors = self._review_pages_output([_word(timestamp=OLD)] * 50, [_word("lusoris")])
+        self.assertEqual(output, "")
+        self.assertIn("checked_prs=1 checked_issues=0 unanswered=0", errors)
+
+    def test_main_refused_feed_url_reported(self):
+        """Refused feed URLs fail distinctly from malformed JSON before network I/O."""
+        read_pages = fairy.paginated
+        for url in ("http://code.ffmpeg.org/activities", "https://evil.example/activities"):
+            with self.subTest(url=url):
+                output, errors = io.StringIO(), io.StringIO()
+
+                def pages(path, feed_url=url, **kwargs):
+                    """Skip discovery lists while exercising the real feed GET."""
+                    return read_pages(path, **kwargs) if path.startswith(feed_url) else []
+
+                with (
+                    unittest.mock.patch.object(fairy, "FEED", url),
+                    unittest.mock.patch.object(fairy, "paginated", side_effect=pages),
+                    unittest.mock.patch.object(fairy.urllib.request, "urlopen") as request,
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(fairy.main([]), 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(
+                    errors.getvalue(),
+                    f"fairy_unanswered: refused URL: {url}"
+                    "?only-performed-by=true&limit=50&page=1\n",
+                )
+                self.assertNotIn("malformed", errors.getvalue())
+                request.assert_not_called()
 
     def test_discovery_thread_kind(self):
         """Classify null, populated, and missing PR metadata on both discovery paths."""
@@ -223,14 +281,16 @@ class FairyUnansweredTest(unittest.TestCase):
             request.assert_called_once_with(url, timeout=30)
 
     def test_get_refuses_non_https_and_foreign_host(self):
-        """Refuse non-https scheme or foreign host before attempting network I/O."""
+        """Unsafe URLs raise a distinct ValueError subtype before network I/O."""
         with unittest.mock.patch.object(fairy.urllib.request, "urlopen") as mock_open:
             for bad_url in (
                 "http://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg/pulls",
                 "https://evil.example/pulls",
             ):
-                with self.subTest(bad_url=bad_url), self.assertRaises(ValueError):
+                with self.subTest(bad_url=bad_url), self.assertRaises(fairy.RefusedURL) as caught:
                     fairy.get(bad_url)
+                self.assertIsInstance(caught.exception, ValueError)
+                self.assertEqual(str(caught.exception), bad_url)
             mock_open.assert_not_called()
 
     def test_timestamp_comparison_rfc3339(self):
@@ -278,7 +338,7 @@ class FairyUnansweredTest(unittest.TestCase):
             "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [],
             FEED + "?only-performed-by=true&limit=50&page=1": [],
             "/issues/1/comments": [],
-            "/pulls/1/reviews": {"message": "Not Found"},
+            "/pulls/1/reviews?limit=50&page=1": {"message": "Not Found"},
         }
         output, errors = io.StringIO(), io.StringIO()
         with (
