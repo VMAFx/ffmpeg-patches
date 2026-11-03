@@ -34,6 +34,9 @@ GIT_ENVIRONMENT_NAMES = frozenset(
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CEILING_DIRECTORIES",
         "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
         "GIT_DIR",
         "GIT_DISCOVERY_ACROSS_FILESYSTEM",
         "GIT_GRAFT_FILE",
@@ -260,23 +263,10 @@ def lavfi() -> list[str]:
 
 
 def run_git(tree: Path, *args: str) -> str:
-    """Run fixture Git without changing inherited credential configuration."""
+    """Run Git in a fixture tree with isolated configuration; return stdout."""
     result = subprocess.run(  # nosec B603 B607 - fixed git argv in a temporary test tree.
-        [
-            "git",
-            "-C",
-            str(tree),
-            "-c",
-            "user.name=Dev",
-            "-c",
-            "user.email=dev@invalid",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            *args,
-        ],
-        env=isolated_git_environment(),
+        ["git", "-C", str(tree), "-c", "user.name=Dev", "-c", "user.email=dev@invalid", *args],
+        env=isolated_git_environment(series.git_env()),
         capture_output=True,
         text=True,
         check=True,

@@ -71,7 +71,7 @@ class VariantSweepTest(unittest.TestCase):
     def sweep(self, head: str, bug_class: str = "unchecked-return") -> subprocess.CompletedProcess:
         """Invoke the public CLI against the fixture history."""
 
-        return subprocess.run(
+        return subprocess.run(  # nosec B603 - fixed interpreter argv in a temporary test tree.
             [
                 sys.executable,
                 str(SCRIPT),

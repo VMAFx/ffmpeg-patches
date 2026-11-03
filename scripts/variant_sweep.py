@@ -24,7 +24,7 @@ TABLE = "| file:line | callee | kind | same file as fix | disposition |"
 def git(directory: str, *args: str, missing_ok: bool = False) -> str:
     """Read Git output with a deadline; grep may report no matches."""
 
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603 B607 - fixed git argv, no shell.
         ["git", "-C", directory, *args], capture_output=True, text=True, timeout=120, check=False
     )
     if result.returncode and not (missing_ok and result.returncode == 1):
