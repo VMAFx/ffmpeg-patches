@@ -9,7 +9,7 @@ import argparse
 import bisect
 import json
 import re
-import subprocess
+import subprocess  # nosec B404 - fixed git argv, no shell, bounded timeout.
 import sys
 from pathlib import Path
 

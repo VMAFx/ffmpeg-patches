@@ -28,7 +28,7 @@ Without both variables they are skipped. LIBVA_DRIVER_NAME is passed through.
 from __future__ import annotations
 
 import os
-import subprocess
+import subprocess  # nosec B404 - explicit fixture tool paths and values, no shell.
 import unittest
 from pathlib import Path
 

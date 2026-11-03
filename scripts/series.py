@@ -53,7 +53,7 @@ import json
 import os
 import re
 import shlex
-import subprocess
+import subprocess  # nosec B404 - fixed git argv, no shell, explicit timeouts.
 import sys
 import tempfile
 import tomllib

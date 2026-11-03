@@ -26,7 +26,7 @@ import argparse
 import json
 import shlex
 import shutil
-import subprocess
+import subprocess  # nosec B404 - ffprobe, nvidia-smi and benchmark argv from validated inputs, no shell.
 import sys
 import tempfile
 import time

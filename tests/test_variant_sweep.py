@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-import subprocess
+import subprocess  # nosec B404 - fixed interpreter argv in a temporary test tree.
 import sys
 import tempfile
 import unittest

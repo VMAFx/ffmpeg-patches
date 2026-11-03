@@ -19,7 +19,7 @@ import hashlib
 import json
 import os
 import re
-import subprocess
+import subprocess  # nosec B404 - benchmark argv from validated inputs, no shell, bounded timeouts.
 import sys
 import time
 from array import array

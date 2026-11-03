@@ -7,7 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import subprocess
+import subprocess  # nosec B404 - fixture-controlled git and encoder argv, no shell.
 import tempfile
 import unittest
 from array import array

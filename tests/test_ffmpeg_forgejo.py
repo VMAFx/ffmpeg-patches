@@ -9,7 +9,7 @@ import http.server
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 - fixed git and helper argv in temporary test repositories.
 import tempfile
 import threading
 import unittest

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Require rationales on Python subprocess security suppressions and deadlines on blocking calls."""
+"""Require rationales on subprocess imports and suppressions, and deadlines on blocking calls."""
 
 from __future__ import annotations
 
@@ -55,24 +55,49 @@ def subprocess_calls(tree: ast.AST) -> list[tuple[ast.Call, str]]:
     return calls
 
 
-def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknown>") -> list[int]:
-    """Return line numbers of subprocess calls without a suppression rationale."""
+def find_subprocess_imports_without_nosec(source: str, *, filename: str = "<unknown>") -> list[int]:
+    """Return line numbers of subprocess imports without a Bandit B404 rationale."""
 
     tree = ast.parse(source, filename=filename)
+    comments = comments_by_line(source)
+    offenders = []
+    for node in ast.walk(tree):
+        imports_subprocess = (
+            isinstance(node, ast.Import) and any(n.name == "subprocess" for n in node.names)
+        ) or (isinstance(node, ast.ImportFrom) and node.module == "subprocess")
+        if imports_subprocess and not has_rationale(comments, node):
+            offenders.append(node.lineno)
+    return sorted(offenders)
+
+
+def comments_by_line(source: str) -> dict[int, list[str]]:
+    """Map each line number to the comment tokens on it."""
+
     comments: dict[int, list[str]] = {}
     for token in tokenize.generate_tokens(io.StringIO(source).readline):
         if token.type == tokenize.COMMENT:
             comments.setdefault(token.start[0], []).append(token.string)
-    offenders = []
-    for node, _ in subprocess_calls(tree):
-        call_comments = (
-            comment
-            for line in range(node.lineno, node.end_lineno + 1)
-            for comment in comments.get(line, ())
-        )
-        if not any(NOSEC_RATIONALE.match(comment) for comment in call_comments):
-            offenders.append(node.lineno)
-    return sorted(offenders)
+    return comments
+
+
+def has_rationale(comments: dict[int, list[str]], node: ast.stmt | ast.expr) -> bool:
+    """Return whether a node's lines carry a nosec comment with a rationale."""
+
+    return any(
+        NOSEC_RATIONALE.match(comment)
+        for line in range(node.lineno, (node.end_lineno or node.lineno) + 1)
+        for comment in comments.get(line, ())
+    )
+
+
+def find_subprocess_calls_without_nosec(source: str, *, filename: str = "<unknown>") -> list[int]:
+    """Return line numbers of subprocess calls without a suppression rationale."""
+
+    tree = ast.parse(source, filename=filename)
+    comments = comments_by_line(source)
+    return sorted(
+        node.lineno for node, _ in subprocess_calls(tree) if not has_rationale(comments, node)
+    )
 
 
 def find_blocking_calls_without_timeout(source: str, *, filename: str = "<unknown>") -> list[int]:
@@ -199,6 +224,39 @@ class SubprocessNosecTest(unittest.TestCase):
                 )
             )
         self.assertEqual(offenders, [], "missing nosec rationale:\n" + "\n".join(offenders))
+
+    def test_import_without_nosec_rationale_is_reported(self) -> None:
+        """Planted subprocess imports without a B404 rationale are reported in every form."""
+
+        source = "\n".join(
+            (
+                "import subprocess",
+                "import os, subprocess as process",
+                "from subprocess import run",
+                "import subprocess  # nosec B404 - ",
+                "import subprocess  # nosec B404 - fixed argv only.",
+                "from subprocess import (  # nosec B404 - CalledProcessError type only.",
+                "    CalledProcessError,",
+                ")",
+                "import subprocessing",
+                "",
+            )
+        )
+        self.assertEqual(find_subprocess_imports_without_nosec(source), [1, 2, 3, 4])
+
+    def test_repository_subprocess_imports_have_nosec_rationales(self) -> None:
+        """Every in-scope subprocess import carries an inline B404 rationale."""
+
+        offenders = []
+        for path in python_sources(ROOT):
+            relative = str(path.relative_to(ROOT))
+            offenders.extend(
+                f"{relative}:{line}"
+                for line in find_subprocess_imports_without_nosec(
+                    path.read_text(), filename=relative
+                )
+            )
+        self.assertEqual(offenders, [], "missing B404 rationale:\n" + "\n".join(offenders))
 
     def test_blocking_call_without_timeout_is_reported(self) -> None:
         """Planted blocking calls without a timeout are reported, module and imported form alike."""

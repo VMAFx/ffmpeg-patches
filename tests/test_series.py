@@ -10,7 +10,7 @@ import io
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 - fixed git and make argv in temporary test trees; result types for mocks.
 import tarfile
 import tempfile
 import unittest
