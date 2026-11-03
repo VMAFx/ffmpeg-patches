@@ -104,6 +104,9 @@ class FairyUnansweredTest(unittest.TestCase):
 
         output, errors = io.StringIO(), io.StringIO()
         with (
+            unittest.mock.patch.object(
+                fairy, "utc_now", side_effect=["2026-11-03T00:00:00Z", "2026-11-03T00:00:01Z"]
+            ),
             unittest.mock.patch.object(fairy, "get", side_effect=fetch) as request,
             contextlib.redirect_stdout(output),
             contextlib.redirect_stderr(errors),
@@ -115,7 +118,11 @@ class FairyUnansweredTest(unittest.TestCase):
             f"3\tissue\tfairy={NEW}\tlusoris=-\n"
             f"4\tpr\tfairy={NEW}\tlusoris=-\n",
         )
-        self.assertEqual(errors.getvalue(), "checked_prs=2 checked_issues=2 unanswered=3\n")
+        self.assertEqual(
+            errors.getvalue(),
+            "checked_prs=2 checked_issues=2 unanswered=3 "
+            "read_from=2026-11-03T00:00:00Z read_to=2026-11-03T00:00:01Z\n",
+        )
         self.assertEqual(request.call_args_list.count(unittest.mock.call("/issues/3")), 1)
 
     def test_discovery_thread_kind(self):
@@ -155,6 +162,13 @@ class FairyUnansweredTest(unittest.TestCase):
                 ):
                     self.assertEqual(fairy.commented_numbers(), {3, 4})
                 self.assertEqual(request.call_count, 10)
+                expected_urls = [
+                    f"{FEED}?only-performed-by=true&limit=50&page={page}" for page in range(1, 11)
+                ]
+                self.assertEqual(
+                    [call.args[0] for call in request.call_args_list],
+                    expected_urls,
+                )
                 self.assertEqual(
                     "older comments were not read" in errors.getvalue(), last_size == 50
                 )
@@ -207,3 +221,94 @@ class FairyUnansweredTest(unittest.TestCase):
             ) as request:
                 self.assertEqual(fairy.get(path), [])
             request.assert_called_once_with(url, timeout=30)
+
+    def test_get_refuses_non_https_and_foreign_host(self):
+        """Refuse non-https scheme or foreign host before attempting network I/O."""
+        with unittest.mock.patch.object(fairy.urllib.request, "urlopen") as mock_open:
+            for bad_url in (
+                "http://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg/pulls",
+                "https://evil.example/pulls",
+            ):
+                with self.subTest(bad_url=bad_url), self.assertRaises(ValueError):
+                    fairy.get(bad_url)
+            mock_open.assert_not_called()
+
+    def test_timestamp_comparison_rfc3339(self):
+        """Compare timestamps by UTC datetime rather than lexicographic string order."""
+        fairy_word = _word("Forgejo_Fairy", "2026-11-03T10:00:00+02:00")
+        mine_word = _word("lusoris", "2026-11-03T09:00:00Z")
+        fairy_ts, mine_ts, owed = fairy.owed([fairy_word, mine_word], [])
+        self.assertEqual(fairy_ts, "2026-11-03T10:00:00+02:00")
+        self.assertEqual(mine_ts, "2026-11-03T09:00:00Z")
+        self.assertFalse(owed)
+
+        words = [
+            _word("lusoris", "2026-11-03T09:00:00Z"),
+            _word("lusoris", "2026-11-03T09:00:00.5Z"),
+        ]
+        self.assertEqual(
+            fairy.latest(words, "lusoris", lambda c: c["created_at"]),
+            "2026-11-03T09:00:00.5Z",
+        )
+
+    def test_malformed_comment_row_without_user(self):
+        """A comment row missing 'user' exits 1 with malformed response message."""
+        routes = {
+            "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
+            "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [{"number": 1}],
+            FEED + "?only-performed-by=true&limit=50&page=1": [],
+            "/issues/1/comments": [{"body": "no user field", "created_at": NEW}],
+        }
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            unittest.mock.patch.object(fairy, "get", side_effect=routes.__getitem__),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.main([]), 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("fairy_unanswered: malformed API response: 'user'", errors.getvalue())
+
+    def test_malformed_reviews_payload_dict_not_list(self):
+        """A reviews payload that is a dict instead of a list exits 1 with message."""
+        routes = {
+            "/pulls?state=open&poster=lusoris&limit=50&page=1": [
+                {"number": 1, "user": {"login": "lusoris"}}
+            ],
+            "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [],
+            FEED + "?only-performed-by=true&limit=50&page=1": [],
+            "/issues/1/comments": [],
+            "/pulls/1/reviews": {"message": "Not Found"},
+        }
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            unittest.mock.patch.object(fairy, "get", side_effect=routes.__getitem__),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.main([]), 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("fairy_unanswered: malformed API response:", errors.getvalue())
+
+    def test_malformed_issue_row_missing_number(self):
+        """An issue row missing 'number' exits 1 with malformed response message."""
+        routes = {
+            "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
+            "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [
+                {"state": "open"}
+            ],
+            FEED + "?only-performed-by=true&limit=50&page=1": [],
+        }
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            unittest.mock.patch.object(fairy, "get", side_effect=routes.__getitem__),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.main([]), 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("fairy_unanswered: malformed API response: 'number'", errors.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

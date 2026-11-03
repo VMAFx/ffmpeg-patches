@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
-"""List own or commented open FFmpeg threads awaiting lusoris after Fairy's word."""
+"""List own or commented open FFmpeg threads awaiting lusoris after Fairy's word.
 
+Reads are not atomic. A reply posted between read_from and read_to may
+show as owed; a rerun clears it.
+"""
+
+import datetime
 import json
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg"
+API_HOST = "code.ffmpeg.org"
 FEED = "https://code.ffmpeg.org/api/v1/users/lusoris/activities/feeds"
 
 
 def get(path):
     """Decode one repository-relative or absolute Forgejo API GET with a deadline."""
-    url = path if path.startswith("https://") else API + path
+    url = path if urllib.parse.urlsplit(path).scheme else API + path
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != API_HOST:
+        raise ValueError(f"refused URL {url!r}: expected https scheme and {API_HOST} host")
     with urllib.request.urlopen(url, timeout=30) as r:
         return json.load(r)
 
@@ -69,32 +79,61 @@ def thread_kind(issue):
     return "pr" if issue.get("pull_request") else "issue"
 
 
+def _open_issue_kind(number):
+    """Fetch an issue by number; return its thread kind if open, or None."""
+    try:
+        issue = get(f"/issues/{number}")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        error.close()
+        return None
+    if not isinstance(issue, dict):
+        raise TypeError("expected a dict for issue")
+    return thread_kind(issue) if issue["state"] == "open" else None
+
+
 def discover_threads():
     """Dedupe own open PRs/issues and open threads found through comment activity."""
-    threads = {
-        p["number"]: "pr"
-        for p in paginated("/pulls?state=open&poster=lusoris")
-        if p["user"]["login"] == "lusoris"
-    }
-    for issue in paginated("/issues?type=issues&state=open&created_by=lusoris"):
+    pulls = paginated("/pulls?state=open&poster=lusoris")
+    threads = {}
+    for p in pulls:
+        if not isinstance(p, dict):
+            raise TypeError("expected a dict for pull")
+        if p["user"]["login"] == "lusoris":
+            threads[p["number"]] = "pr"
+    issues = paginated("/issues?type=issues&state=open&created_by=lusoris")
+    for issue in issues:
+        if not isinstance(issue, dict):
+            raise TypeError("expected a dict for issue")
         threads.setdefault(issue["number"], thread_kind(issue))
     for number in sorted(commented_numbers() - threads.keys()):
-        try:
-            issue = get(f"/issues/{number}")
-        except urllib.error.HTTPError as error:
-            if error.code != 404:
-                raise
-            error.close()
-            continue
-        if issue["state"] == "open":
-            threads[number] = thread_kind(issue)
+        if (kind := _open_issue_kind(number)) is not None:
+            threads[number] = kind
     return threads
+
+
+def _parse_time(timestamp):
+    """Parse an RFC3339 timestamp into a UTC datetime."""
+    dt = datetime.datetime.fromisoformat(timestamp)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.UTC)
+    return dt.astimezone(datetime.UTC)
+
+
+def _newest_ts(ts1, ts2):
+    """Return the newer of two timestamps, or the non-empty one, or empty string."""
+    if not ts1:
+        return ts2
+    if not ts2:
+        return ts1
+    return max(ts1, ts2, key=_parse_time)
 
 
 def latest(items, who, key):
     """Return the newest timestamp key(i) of items by who with a non-empty body, or ""."""
     ts = [key(i) for i in items if i["user"]["login"] == who and (i.get("body") or "").strip()]
-    return max(ts) if ts else ""
+    return max(ts, key=_parse_time) if ts else ""
 
 
 CLASS_RE = re.compile(
@@ -116,21 +155,26 @@ def approve_only(body):
 
 def owed(comments, reviews):
     """Return the newest Fairy word, newest lusoris word, and whether a reply is owed."""
+    if not isinstance(comments, list):
+        raise TypeError("expected a list of comments")
+    if not isinstance(reviews, list):
+        raise TypeError("expected a list of reviews")
     words = [
         r
         for r in reviews
         if r["state"] != "REQUEST_REVIEW"
         and not (r["user"]["login"] == "Forgejo_Fairy" and approve_only(r.get("body")))
     ]
-    fairy = max(
+    fairy = _newest_ts(
         latest(words, "Forgejo_Fairy", lambda r: r["submitted_at"]),
         latest(comments, "Forgejo_Fairy", lambda c: c["created_at"]),
     )
-    mine = max(
+    mine = _newest_ts(
         latest(words, "lusoris", lambda r: r["submitted_at"]),
         latest(comments, "lusoris", lambda c: c["created_at"]),
     )
-    return fairy, mine, bool(fairy and fairy > mine)
+    unanswered = bool(fairy and (not mine or _parse_time(fairy) > _parse_time(mine)))
+    return fairy, mine, unanswered
 
 
 def _fixture_word(who, body, timestamp):
@@ -195,11 +239,21 @@ def self_test():
     return 1 if bad or owed_bad else 0
 
 
+def utc_now():
+    """Return the current UTC timestamp formatted as ISO 8601."""
+    return datetime.datetime.now(datetime.UTC).isoformat()
+
+
 def main(argv):
-    """Print owed PR/issue lines and counts; return the process exit status."""
+    """Print owed PR/issue lines and counts; return the process exit status.
+
+    Reads are not atomic. A reply posted between read_from and read_to may
+    show as owed; a rerun clears it.
+    """
     if argv == ["--self-test"]:
         return self_test()
     try:
+        read_from = utc_now()
         threads = discover_threads()
         out = []
         for number, kind in threads.items():
@@ -208,7 +262,11 @@ def main(argv):
             fairy, mine, unanswered = owed(comments, reviews)
             if unanswered:
                 out.append(f"{number}\t{kind}\tfairy={fairy}\tlusoris={mine or '-'}")
-    except (OSError, ValueError) as error:
+        read_to = utc_now()
+    except (KeyError, TypeError, ValueError) as error:
+        print(f"fairy_unanswered: malformed API response: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:
         print(f"error: {error}", file=sys.stderr)
         if isinstance(error, urllib.error.HTTPError):
             error.close()
@@ -217,7 +275,8 @@ def main(argv):
         print("\n".join(out))
     prs = sum(kind == "pr" for kind in threads.values())
     print(
-        f"checked_prs={prs} checked_issues={len(threads) - prs} unanswered={len(out)}",
+        f"checked_prs={prs} checked_issues={len(threads) - prs} unanswered={len(out)} "
+        f"read_from={read_from} read_to={read_to}",
         file=sys.stderr,
     )
     return 0
