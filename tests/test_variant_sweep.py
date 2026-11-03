@@ -137,11 +137,12 @@ class VariantSweepTest(unittest.TestCase):
         self.assertIn("no hits\n", self.output.read_text())
 
     def test_consumed_forms_and_lexical_noise(self) -> None:
-        """Assignment lvalues, return and direct conditions seed checked callees."""
+        """Error-tested assignments and direct conditions seed checked callees."""
 
         source = """int changed(int s)
 {
     ctx->status = assign(s);
+    if (ctx->status < 0) return ctx->status;
     if ((status = wrapped(s)) < 0) return status;
     if (less(s) < 0) return -1;
     if (different(s) != 0) return -1;
@@ -164,11 +165,140 @@ int sibling(int s)
         result = self.sweep(head)
         self.assertEqual(result.returncode, 0, result.stderr)
         report = self.output.read_text()
+        self.assertIn("targets: assign, changed, different, less, sibling, wrapped", report)
+        self.assertEqual(report.count("| discarded |"), 4)
+        self.assertEqual(report.count("| normalized |"), 2)
+
+    def test_ternary_averror_not_discarded(self) -> None:
+        """Ternary branches consume calls, including macro-style error constructors."""
+
+        source = (
+            BASE.replace("    write(s);", "    return write(s);")
+            + """int fallback(int ret)
+{
+    if (!ret) return AVERROR(EINVAL);
+    return ret < 0 ? ret : AVERROR(EIO);
+}
+int consume(int ret)
+{
+    ret = (ret < 0) ? ret : AVERROR(EIO);
+    return ret < 0 ? ret : send_cmd(ret);
+}
+"""
+        )
+        head = self.commit_head(source)
+        result = self.sweep(head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no hits\n", self.output.read_text())
+
+    def test_macro_not_target(self) -> None:
+        """Neither returns nor checked assignments promote uppercase macro names."""
+
+        source = """int changed(int ret)
+{
+    ret = AVERROR(EIO);
+    if (ret < 0) return ret;
+    if (CHECK_2(ret) != 0) return -1;
+    return AVERROR(EINVAL);
+}
+"""
+        head = self.commit_head(source)
+        self.assertEqual(self.sweep(head).returncode, 0)
+        self.assertIn("targets: changed\n", self.output.read_text())
+
+    def test_offset_assignment_not_target(self) -> None:
+        """Arithmetic expressions remain consumed even when their result is tested."""
+
+        source = """int changed(int ret)
+{
+    t = now() + 5;
+    rt->teardown_deadline = av_gettime_relative() + 10;
+    ret = offset(ret) + 5;
+    if (ret < 0) return ret;
+    if ((ret = wrapped_offset(ret) + 5) < 0) return ret;
+    return forwarded(ret);
+}
+"""
+        head = self.commit_head(source)
+        self.assertEqual(self.sweep(head).returncode, 0)
+        self.assertIn("targets: changed\n", self.output.read_text())
+
+    def test_assignment_checked_across_added_lines(self) -> None:
+        """Checks within three added lines promote only the tested variable's callee."""
+
+        source = """int changed(int x)
+{
+    ret = f(x);
+    if (ret < 0) return ret;
+    unchecked = ignored(x);
+    different = other(x);
+    if (ret != 0) return ret;
+    status = boundary(x);
+    /* first intervening added line */
+    /* second intervening added line */
+    if (status != 0) return status;
+    late = too_late(x);
+    /* first intervening added line */
+    /* second intervening added line */
+    /* third intervening added line */
+    if (late < 0) return late;
+    same = same_line(x); if (same) return same;
+    negated = false_check(x);
+    if (!negated) return -1;
+    if ((inline_ret = inline_check(x)) < 0) return inline_ret;
+    return 0;
+}
+int sibling(int x)
+{
+    f(x);
+    boundary(x);
+    same_line(x);
+    false_check(x);
+    inline_check(x);
+    ignored(x);
+    other(x);
+    too_late(x);
+    return 0;
+}
+"""
+        head = self.commit_head(source)
+        self.assertEqual(self.sweep(head).returncode, 0)
+        report = self.output.read_text()
         self.assertIn(
-            "targets: assign, changed, different, less, returned, sibling, wrapped", report
+            "targets: boundary, changed, f, false_check, inline_check, same_line, sibling\n",
+            report,
         )
         self.assertEqual(report.count("| discarded |"), 5)
-        self.assertEqual(report.count("| normalized |"), 2)
+
+    def test_discarded_statement_boundaries(self) -> None:
+        """Control headers start statements; casts and expression operands do not."""
+
+        source = (
+            BASE.replace("    write(s);", "    return write(s);")
+            + """int sibling(int s)
+{
+    if (s) send_cmd(s);
+    else send_cmd(s);
+    for (s = 0; s < 3; s++) send_cmd(s);
+    while (s) send_cmd(s);
+    switch (s) send_cmd(s);
+    { } send_cmd(s);
+    (int)send_cmd(s);
+    s ? send_cmd(s) : send_cmd(s);
+    s = send_cmd(s);
+    s, send_cmd(s);
+    s + send_cmd(s);
+    consume(send_cmd(s));
+    (void)send_cmd(s);
+    return send_cmd(s);
+}
+"""
+        )
+        head = self.commit_head(source)
+        self.assertEqual(self.sweep(head).returncode, 0)
+        report = self.output.read_text()
+        self.assertEqual(report.count("| discarded |"), 6)
+        self.assertEqual(report.count("| TODO |"), 6)
 
     def test_git_failure(self) -> None:
         """An invalid revision fails with a diagnostic rather than an empty report."""

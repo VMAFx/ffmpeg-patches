@@ -16,12 +16,8 @@ from pathlib import Path
 IDENTIFIER = r"[A-Za-z_]\w*"
 LEXEMES = re.compile(rf"{IDENTIFIER}|!=|==|<=|>=|->|[^\s]", re.ASCII)
 LITERALS = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', re.S)
-CHECKED = re.compile(
-    rf"(?<![=!<>])=(?!=)\s*({IDENTIFIER})\s*\("
-    rf"|\breturn\s+({IDENTIFIER})\s*\("
-    rf"|\bif\s*\(\s*({IDENTIFIER})\s*\(.*\)\s*(?:<|!=)",
-    re.ASCII,
-)
+MACRO_STYLE = re.compile(r"[A-Z][A-Z0-9_]*", re.ASCII)
+CONTROL_HEADERS = {"if", "for", "while", "switch"}
 TABLE = "| file:line | callee | kind | same file as fix | disposition |"
 
 
@@ -112,27 +108,89 @@ def parse_source(source: str) -> tuple[list[re.Match], dict[int, int], list[tupl
     return tokens, pairs, function_bodies(tokens, pairs)
 
 
+def error_tested(
+    values: list[str], variable: list[str], index: int, end: int | None = None
+) -> bool:
+    """Recognize zero comparisons and boolean if tests of one complete lvalue."""
+
+    if values[index : index + len(variable)] != variable:
+        return False
+    if index and values[index - 1] in {".", "->"}:
+        return False
+    tail = index + len(variable) if end is None else end
+    comparison = tail
+    for comparison in range(tail, len(values)):
+        if values[comparison] != ")":
+            break
+    if values[comparison : comparison + 2] in (["<", "0"], ["!=", "0"]):
+        return True
+    prefix = index - 1
+    for prefix in range(index - 1, -1, -1):
+        if values[prefix] not in {"(", "!"}:
+            break
+    return prefix >= 0 and values[prefix] == "if" and values[tail : tail + 1] == [")"]
+
+
+def checked_assignment(values: list[str], index: int, closing: int, window: list[str]) -> bool:
+    """Require a bare assigned call and an error test of that same lvalue."""
+
+    if index < 2 or values[index - 1] != "=" or not re.fullmatch(IDENTIFIER, values[index - 2]):
+        return False
+    start = index - 2
+    for member in range(start - 1, 0, -2):
+        if values[member] not in {".", "->"} or not re.fullmatch(IDENTIFIER, values[member - 1]):
+            break
+        start = member - 1
+    variable = values[start : index - 1]
+    following = values[closing + 1 : closing + 2]
+    if following == [")"]:
+        return error_tested(values, variable, start, closing + 1)
+    if following != [";"]:
+        return False
+    return any(error_tested(window, variable, offset) for offset in range(len(window)))
+
+
+def checked_callees(
+    tokens: list[re.Match], pairs: dict[int, int], newlines: list[int], changed: dict[int, str]
+) -> set[str]:
+    """Seed callees only from added error checks, looking ahead at most three lines."""
+
+    values = [token[0] for token in tokens]
+    lines = [bisect.bisect_left(newlines, token.start()) + 1 for token in tokens]
+    targets = set()
+    for index, token in enumerate(tokens[:-1]):
+        line = lines[index]
+        if line not in changed or values[index + 1] != "(" or index + 1 not in pairs:
+            continue
+        closing = pairs[index + 1]
+        if values[max(0, index - 2) : index] == ["if", "("] and values[
+            closing + 1 : closing + 4
+        ] in (["<", "0", ")"], ["!=", "0", ")"]):
+            targets.add(token[0])
+            continue
+        first = bisect.bisect_left(lines, line)
+        last = bisect.bisect_left(lines, line + 4)
+        window = [values[offset] for offset in range(first, last) if lines[offset] in changed]
+        if checked_assignment(values, index, closing, window):
+            targets.add(token[0])
+    return targets
+
+
 def touched_targets(source: str, changed: dict[int, str]) -> set[str]:
     """Collect checked callees on added lines and enclosing touched definitions."""
 
-    targets = {
-        name
-        for line in changed.values()
-        for match in CHECKED.finditer(mask_literals(line))
-        for name in match.groups()
-        if name
-    }
-    tokens, _, bodies = parse_source(source)
+    tokens, pairs, bodies = parse_source(source)
     newlines = [match.start() for match in re.finditer("\n", source)]
+    targets = checked_callees(tokens, pairs, newlines, changed)
     for name, opening, closing in bodies:
         first = bisect.bisect_left(newlines, tokens[opening].start()) + 1
         last = bisect.bisect_left(newlines, tokens[closing].start()) + 1
         if any(first <= line <= last for line in changed):
             targets.add(name)
-    return targets
+    return {name for name in targets if not MACRO_STYLE.fullmatch(name)}
 
 
-def call_kind(values: list[str], index: int, closing: int) -> str | None:
+def call_kind(values: list[str], index: int, closing: int, headers: set[int]) -> str | None:
     """Classify whole discarded statements and immediate normalized error returns."""
 
     following = values[closing + 1 : closing + 10]
@@ -140,7 +198,7 @@ def call_kind(values: list[str], index: int, closing: int) -> str | None:
     if following[:1] == [";"]:
         if previous == ["(", "void", ")"]:
             return None
-        if values[index - 1] in {";", "{", "}", ")", ":", "else"}:
+        if index == 0 or values[index - 1] in {";", "{", "}", "else"} or index - 1 in headers:
             return "discarded"
     if previous[-2:] != ["if", "("] or following[:3] not in (["!=", "0", ")"], ["<", "0", ")"]):
         return None
@@ -159,6 +217,11 @@ def find_hits(source: str, targets: set[str]) -> list[tuple[int, str, str]]:
 
     tokens, pairs, bodies = parse_source(source)
     values = [token[0] for token in tokens]
+    headers = {
+        closing
+        for opening, closing in pairs.items()
+        if opening and values[opening] == "(" and values[opening - 1] in CONTROL_HEADERS
+    }
     newlines = [match.start() for match in re.finditer("\n", source)]
     hits = []
     for index, token in enumerate(tokens[:-1]):
@@ -166,7 +229,7 @@ def find_hits(source: str, targets: set[str]) -> list[tuple[int, str, str]]:
             continue
         if not any(opening < index < closing for _, opening, closing in bodies):
             continue
-        kind = call_kind(values, index, pairs[index + 1])
+        kind = call_kind(values, index, pairs[index + 1], headers)
         if kind:
             line = bisect.bisect_left(newlines, token.start()) + 1
             hits.append((line, token[0], kind))
