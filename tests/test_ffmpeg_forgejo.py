@@ -162,7 +162,7 @@ class Stub:
         reviewers: list[list[str]] | None = None,
         **kwargs: object,
     ):
-        """Initialize scripted pull, status, reviewer, and API settings responses."""
+        """Initialize scripted responses and persistent requested team reviewers."""
 
         heads = heads or [A]
         polls = polls or {}
@@ -183,6 +183,12 @@ class Stub:
         self.poll_index = {sha: -1 for sha in polls}
         self.requests: list[tuple[str, str, str]] = []
         self.pull_headers: list[dict[str, str]] = []
+        self.requested_users: list[str] = []
+        self.requested_teams = [
+            name.removeprefix("team:") for name in self.reviewers[0] if name.startswith("team:")
+        ]
+        self.drop_reviewers = False
+        self.request_status = 201
 
     def head(self) -> object:
         """Return the next scripted pull head, repeating the last."""
@@ -203,7 +209,7 @@ class Stub:
         return full[(page - 1) * limit : page * limit]
 
     def pull(self) -> dict:
-        """Return a pull payload with the next scripted reviewer sets."""
+        """Return scripted user reviewers and the persisted requested team state."""
 
         reviewers = self.reviewers[min(self.reviewer_reads, len(self.reviewers) - 1)]
         self.reviewer_reads += 1
@@ -212,13 +218,11 @@ class Stub:
             "head": {"sha": self.head()},
             "html_url": "stub/pulls/1",
             "requested_reviewers": [
-                {"login": login} for login in reviewers if not login.startswith("team:")
+                {"login": login}
+                for login in dict.fromkeys(reviewers + self.requested_users)
+                if not login.startswith("team:")
             ],
-            "requested_reviewers_teams": [
-                {"name": name.removeprefix("team:")}
-                for name in reviewers
-                if name.startswith("team:")
-            ],
+            "requested_reviewers_teams": [{"name": name} for name in self.requested_teams],
         }
 
     def pulls(self, query: dict[str, list[str]]) -> list[dict]:
@@ -389,12 +393,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(404, {})
 
     def do_POST(self) -> None:
-        """Record and serve pull creation and issue-comment writes."""
+        """Record writes and persist additive reviewer requests as Forgejo does."""
 
         data = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
         self.stub().requests.append(("POST", self.path, data))
         if self.path.endswith("/pulls"):
             self.reply(201, {"number": 1, "html_url": "stub/pulls/1"})
+        elif self.path.endswith("/pulls/1/requested_reviewers"):
+            stub = self.stub()
+            if not stub.drop_reviewers and stub.request_status == 201:
+                payload = json.loads(data)
+                stub.requested_users = list(
+                    dict.fromkeys(stub.requested_users + payload.get("reviewers", []))
+                )
+                stub.requested_teams = list(
+                    dict.fromkeys(stub.requested_teams + payload.get("team_reviewers", []))
+                )
+            self.reply(stub.request_status, {})
         elif self.path.endswith("/issues/1/comments"):
             self.reply(201, {"html_url": "stub/issues/1#issuecomment-1"})
         else:
@@ -1160,7 +1175,60 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [])
 
 
-class PullRequestReviewerTest(ForgejoTest):
+class FairyRequestTestBase(unittest.TestCase):
+    """Use the existing HTTP stub with inert Git and keyring executables."""
+
+    helper: Path = HELPER
+
+    def setUp(self) -> None:
+        """Create fixture executables without reading or changing credential settings."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.tmp = Path(temporary.name)
+        self.bin_dir = self.tmp / "bin"
+        self.bin_dir.mkdir()
+        for name, body in {
+            "secret-tool": "printf 'fixture-token\\n'",
+            "git": 'case "$1" in fetch|diff) exit 0;; *) exit 97;; esac',
+        }.items():
+            tool = self.bin_dir / name
+            tool.write_text("#!/bin/sh\n" + body + "\n")
+            tool.chmod(0o755)
+        (self.tmp / "body.md").write_text(BODY)
+
+    def run_command(
+        self, stub: Stub, *args: str, env_updates: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run only request commands against localhost with the inherited environment."""
+        if not args or args[0] not in {"pr", "fairy-requests"}:
+            raise ValueError("unsupported fixture command")
+        server = serve(stub)
+        try:
+            environment = os.environ.copy()
+            environment.update(
+                PATH=os.pathsep.join([str(self.bin_dir), environment.get("PATH", "")]),
+                FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
+                FFMPEG_FORGEJO_GIT="fixture-upstream",
+                FFMPEG_FORGEJO_POLL="0",
+                FFMPEG_FORGEJO_BOT_REVIEWER="Forgejo_Fairy",
+                FFMPEG_FORGEJO_OFFLINE="0",
+            )
+            environment.update(env_updates or {})
+            return subprocess.run(  # nosec B603 B607 - fixed bash helper argv, temporary test directory, test literals
+                ["bash", str(self.helper), *args],
+                env=environment,
+                cwd=self.tmp,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class PullRequestReviewerTest(FairyRequestTestBase):
     def pr(self, stub: Stub) -> subprocess.CompletedProcess[str]:
         """Create a pull request and read its requested reviewers back."""
 
@@ -1172,18 +1240,58 @@ class PullRequestReviewerTest(ForgejoTest):
             str(self.tmp / "body.md"),
         )
 
+    def test_only_fairy_readback_requires_human_reviewer(self) -> None:
+        """Fairy alone cannot satisfy the human-reviewer requirement."""
+
+        stub = Stub(reviewers=[["Forgejo_Fairy"]])
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("has no requested human reviewer", proc.stderr)
+        self.assertIn(
+            "pick from MAINTAINERS and git log on the touched files, then: "
+            "ffmpeg-forgejo reviewers 1 <login>...",
+            proc.stderr,
+        )
+        self.assertNotIn("missing requested reviewer Forgejo_Fairy", proc.stderr)
+        self.assertEqual(stub.reviewer_reads, 5)
+
+    def test_human_reviewer_can_appear_on_later_poll(self) -> None:
+        """Human-reviewer polling allows delayed CODEOWNERS requests."""
+
+        stub = Stub(reviewers=[[], [], [], ["alice"]])
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.reviewer_reads, 4)
+
+    def test_only_configured_bot_requires_human_reviewer(self) -> None:
+        """An overridden bot login cannot count as a human reviewer."""
+
+        stub = Stub(reviewers=[["Other_Bot"]])
+        proc = self.run_command(
+            stub,
+            "pr",
+            "topic",
+            "title",
+            str(self.tmp / "body.md"),
+            env_updates={"FFMPEG_FORGEJO_BOT_REVIEWER": "Other_Bot"},
+        )
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("has no requested human reviewer", proc.stderr)
+        self.assertIn("ffmpeg-forgejo reviewers 1 <login>...", proc.stderr)
+
     def test_empty_reviewers_three_times_exits_three(self) -> None:
         """Three empty user and team reviewer reads exit 3."""
 
         stub = Stub(reviewers=[[], [], []])
+        stub.drop_reviewers = True
         proc = self.pr(stub)
         self.assertEqual(proc.returncode, 3)
         self.assertEqual(proc.stdout, "stub/pulls/1\n")
-        self.assertIn("#1 has no requested reviewer", proc.stderr)
+        self.assertIn("Forgejo_Fairy", proc.stderr)
         reads = [
             path for method, path, _ in stub.requests if method == "GET" and "/pulls/1" in path
         ]
-        self.assertEqual(len(reads), 3)
+        self.assertEqual(len(reads), 4)
 
     def test_requested_reviewers_are_printed(self) -> None:
         """Requested user reviewers are printed after pull creation."""
@@ -1193,19 +1301,166 @@ class PullRequestReviewerTest(ForgejoTest):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(
             proc.stdout,
-            "stub/pulls/1\n#1 requested reviewers: alice bob\n",
+            "stub/pulls/1\n#1 requested reviewers: alice bob Forgejo_Fairy\n",
         )
 
     def test_requested_team_reviewers_are_printed(self) -> None:
-        """A team-only reviewer read succeeds and prints its prefixed name."""
+        """A user-only POST preserves persisted CODEOWNERS teams in later GETs."""
 
         stub = Stub(reviewers=[["team:codec"], ["team:codec"], ["team:codec"]])
         proc = self.pr(stub)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(
             proc.stdout,
-            "stub/pulls/1\n#1 requested reviewers: team:codec\n",
+            "stub/pulls/1\n#1 requested reviewers: Forgejo_Fairy team:codec\n",
         )
+        self.assertEqual(stub.requested_teams, ["codec"])
+        self.assertEqual(stub.pull()["requested_reviewers_teams"], [{"name": "codec"}])
+        requests = [
+            json.loads(data)
+            for method, path, data in stub.requests
+            if method == "POST" and path.endswith("requested_reviewers")
+        ]
+        self.assertEqual(requests, [{"reviewers": ["Forgejo_Fairy"]}])
+
+    def test_dropped_team_is_not_restored_by_readback(self) -> None:
+        """A planted POST team loss remains visible to the human-reviewer check."""
+
+        stub = Stub(reviewers=[["team:codec"], ["team:codec"], ["team:codec"]])
+        original_post = Handler.do_POST
+
+        def drop_team(handler: Handler) -> None:
+            """Plant team loss after a successful review-request POST."""
+
+            original_post(handler)
+            if handler.path.endswith("requested_reviewers"):
+                handler.stub().requested_teams.clear()
+
+        with unittest.mock.patch.object(Handler, "do_POST", drop_team):
+            proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("has no requested human reviewer", proc.stderr)
+        self.assertNotIn("team:codec", proc.stdout)
+        self.assertEqual(stub.requested_teams, [])
+        self.assertEqual(stub.pull()["requested_reviewers_teams"], [])
+
+    def test_invalid_bot_login_is_rejected_before_pull_creation(self) -> None:
+        """Invalid bot logins cannot create a pull or send a reviewer request."""
+
+        for login in ("bad/login", "bad login", "bad@login"):
+            with self.subTest(login=login):
+                stub = Stub(reviewers=[["alice"]])
+                proc = self.run_command(
+                    stub,
+                    "pr",
+                    "topic",
+                    "title",
+                    str(self.tmp / "body.md"),
+                    env_updates={"FFMPEG_FORGEJO_BOT_REVIEWER": login},
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn(f"not a login: {login}", proc.stderr)
+                self.assertEqual(stub.requests, [])
+
+    def test_missing_fairy_readback_is_refused(self) -> None:
+        """A successful POST dropping Fairy cannot pass on a human reviewer."""
+        stub = Stub(reviewers=[["alice"]])
+        stub.drop_reviewers = True
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("missing requested reviewer Forgejo_Fairy after POST", proc.stderr)
+        self.assertNotIn("pick from MAINTAINERS", proc.stderr)
+
+    def test_fairy_is_posted_with_codeowners(self) -> None:
+        """The explicit request merges Fairy and existing CODEOWNERS users."""
+        stub = Stub(reviewers=[["alice", "Forgejo_Fairy"]])
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        requests = [
+            json.loads(data)
+            for method, path, data in stub.requests
+            if method == "POST" and path.endswith("requested_reviewers")
+        ]
+        self.assertEqual(requests, [{"reviewers": ["alice", "Forgejo_Fairy"]}])
+
+    def test_bot_login_override(self) -> None:
+        """The configured bot replaces the default in both request and read-back."""
+        stub = Stub(reviewers=[["alice"]])
+        proc = self.run_command(
+            stub,
+            "pr",
+            "topic",
+            "title",
+            str(self.tmp / "body.md"),
+            env_updates={"FFMPEG_FORGEJO_BOT_REVIEWER": "Other_Bot"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.requested_users, ["alice", "Other_Bot"])
+
+    def test_request_http_failure_is_refused(self) -> None:
+        """A rejected review request fails PR creation's follow-up step."""
+        stub = Stub(reviewers=[["alice"]])
+        stub.request_status = 500
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("500", proc.stderr)
+
+
+class FairyRequestsTest(FairyRequestTestBase):
+    def test_pending_fairy_review_keeps_candidate_listed(self) -> None:
+        """A pending Fairy review without a submission cannot clear an overdue pull."""
+
+        stub = Stub()
+        pull = open_pull(number=2)
+        pull.update(created_at="2000-01-01T00:00:00Z", title="fixture", requested_reviewers=[])
+        stub.open_pulls = [pull]
+        stub.reviews[2] = [fairy_review("PENDING", submitted_at="")]
+        proc = self.run_command(stub, "fairy-requests")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        number, age, title = proc.stdout.strip().split("\t")
+        self.assertEqual(number, "2")
+        self.assertGreater(int(age), 15)
+        self.assertEqual(title, "fixture")
+
+    def test_submitted_configured_bot_reviews_clear_candidate(self) -> None:
+        """Multiple submitted reviews from the configured bot clear an overdue pull."""
+
+        stub = Stub()
+        pull = open_pull(number=2)
+        pull.update(created_at="2000-01-01T00:00:00Z", title="fixture", requested_reviewers=[])
+        stub.open_pulls = [pull]
+        stub.reviews[2] = [fairy_review(login="Other_Bot")] * 2
+        proc = self.run_command(
+            stub,
+            "fairy-requests",
+            env_updates={"FFMPEG_FORGEJO_BOT_REVIEWER": "Other_Bot"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_configured_repository_is_used_for_pulls_and_reviews(self) -> None:
+        """The audit lists pulls and their reviews only in the configured repository."""
+
+        stub = Stub()
+        pull = open_pull(number=2)
+        pull.update(created_at="2000-01-01T00:00:00Z", title="fixture", requested_reviewers=[])
+        stub.open_pulls = [pull]
+        stub.reviews[2] = [fairy_review()]
+        proc = self.run_command(
+            stub, "fairy-requests", env_updates={"FFMPEG_FORGEJO_REPO": "example/custom"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        repository_paths = [
+            urllib.parse.urlsplit(path).path
+            for _, path, _ in stub.requests
+            if path.startswith("/api/v1/repos/")
+        ]
+        for endpoint in ("pulls", "pulls/2/reviews"):
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(
+                    [path for path in repository_paths if path.endswith(f"/{endpoint}")],
+                    [f"/api/v1/repos/example/custom/{endpoint}"],
+                )
 
 
 class PullRequestOverlapTest(ForgejoTest):
