@@ -1194,11 +1194,11 @@ def _get_c_parser() -> Parser:
     try:
         import tree_sitter_c  # noqa: PLC0415 - optional parser dependency.
         from tree_sitter import Language, Parser  # noqa: PLC0415 - optional parser dependency.
-    except ModuleNotFoundError as exc:
-        package = (exc.name or "tree_sitter").replace("_", "-")
-        raise RuntimeError(
+    except ModuleNotFoundError as error:
+        package = (error.name or "tree_sitter").replace("_", "-")
+        raise SeriesError(
             f"Missing package {package}; run pip install --require-hashes -r requirements-dev.txt"
-        ) from exc
+        ) from error
     return Parser(Language(tree_sitter_c.language()))
 
 
@@ -1215,7 +1215,7 @@ def _collect_function_definitions(root: Node, max_steps: int = 1_000_000) -> lis
             continue
         for child in reversed(node.children):
             stack.append(child)
-    raise RuntimeError(f"tree traversal exceeded limit of {max_steps} nodes")
+    raise SeriesError(f"tree traversal exceeded limit of {max_steps} nodes")
 
 
 def _find_declarator_child(node: Node) -> Node | None:

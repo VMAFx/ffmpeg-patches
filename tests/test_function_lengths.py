@@ -133,6 +133,20 @@ class TestFunctionLengths(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("0 function(s) over 60 lines, 0 excused, 0 failing", out)
 
+    def test_lengths_without_tree_sitter_exits_two(self) -> None:
+        """Missing tree-sitter exits two with an install hint and no traceback."""
+        self.fx.commit_file("lib.c", build_c_function("f", 61), "grow f to 61")
+        self.fx.export()
+        script = str(series.ROOT / "scripts" / "series.py")
+        argv = [script, "--root", str(self.fx.root), "lengths", str(self.fx.tree)]
+        result = run_without_tree_sitter(
+            f"import runpy\nsys.argv = {argv!r}\nrunpy.run_path({script!r}, run_name='__main__')\n"
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(result.stderr.startswith("error:"), result.stderr)
+        self.assertIn("requirements-dev.txt", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_live_exception_calibration_and_boundaries(self) -> None:
         self.fx.commit_file("lib.c", build_c_function("f", 61), "grow f to 61")
         names = self.fx.export()
@@ -462,10 +476,18 @@ class TestParseFunctionSpans(unittest.TestCase):
         result = run_without_tree_sitter(
             "import unittest\n"
             "from scripts import series\n"
-            "with unittest.TestCase().assertRaisesRegex(RuntimeError, 'requirements-dev.txt'):\n"
+            "with unittest.TestCase().assertRaisesRegex(\n"
+            "    series.SeriesError, 'requirements-dev.txt'\n"
+            "):\n"
             "    series.parse_function_spans('int f(void) {\\n}\\n')\n"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_traversal_limit_raises_series_error(self) -> None:
+        """Exhausting the traversal limit raises a tool error with the node bound."""
+        tree = series._get_c_parser().parse(b"int f(void) { return 0; }\n")
+        with self.assertRaisesRegex(series.SeriesError, "tree traversal exceeded limit of 1 nodes"):
+            series._collect_function_definitions(tree.root_node, max_steps=1)
 
     def test_ffmpeg_style_spans_fixture_reproduced(self) -> None:
         """New parser reproduces ffmpeg_style.spans.json exactly."""
