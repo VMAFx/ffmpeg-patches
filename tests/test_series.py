@@ -530,6 +530,51 @@ class CheckTest(SeriesTestCase):
         self.assertEqual(len(findings.errors), 1)
         self.assert_error(findings, f"lib.c: added line {first_line!r}: POSIX type; MSVC lacks it")
 
+    def test_added_spliced_ssize_t_across_removed_line_fails(self) -> None:
+        """Removed lines do not interrupt a new-file ssize_t continuation."""
+        path = self.fx.patch(1)
+        first_line = "ssize_\\"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "+int line_5 = 50;", f"+{first_line}\n-int old;\n+t n;"
+            ),
+            encoding="utf-8",
+        )
+        findings = series.check(self.fx.root)
+        self.assertEqual(len(findings.errors), 1)
+        self.assert_error(findings, f"lib.c: added line {first_line!r}: POSIX type; MSVC lacks it")
+
+    def test_added_spliced_ssize_t_from_context_fails(self) -> None:
+        """An added continuation is refused and cited after a context prefix."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", " ssize_\\\n+t n;"),
+            encoding="utf-8",
+        )
+        findings = series.check(self.fx.root)
+        self.assertEqual(len(findings.errors), 1)
+        self.assert_error(findings, "lib.c: added line 't n;': POSIX type; MSVC lacks it")
+
+    def test_context_spliced_ssize_t_passes(self) -> None:
+        """A continuation containing only context lines stays pre-existing."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", " ssize_\\\n t n;"),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_spliced_non_ssize_t_across_removed_line_passes(self) -> None:
+        """Skipping removed lines still requires the exact ssize_t token."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "+int line_5 = 50;", "+ssize_\\\n-int old;\n+x n;"
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
     def test_added_spliced_non_ssize_t_passes(self) -> None:
         """Splicing a different identifier does not create an ssize_t finding."""
         path = self.fx.patch(1)

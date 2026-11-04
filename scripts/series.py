@@ -308,22 +308,25 @@ def _code_line(line: str, in_block_comment: bool) -> tuple[str, bool]:
     return "".join(code), in_block_comment
 
 
-def _spliced_diff_lines(text: str) -> Iterator[tuple[str, str]]:
-    """Join continued added/context lines, retaining the first physical line."""
+def _spliced_diff_lines(text: str) -> Iterator[tuple[str, str, str | None]]:
+    """Join new-file continuations, retaining the first and first added lines."""
     lines = text.splitlines()
     index = 0
     while index < len(lines):
         first_line = line = lines[index]
+        added_line = first_line if first_line.startswith("+") else None
         index += 1
-        while (
-            line.startswith((" ", "+"))
-            and line.endswith("\\")
-            and index < len(lines)
-            and lines[index].startswith((" ", "+"))
-        ):
+        while line.startswith((" ", "+")) and line.endswith("\\") and index < len(lines):
+            if lines[index].startswith(("-", "\\ No newline at end of file")):
+                index += 1
+                continue
+            if not lines[index].startswith((" ", "+")):
+                break
+            if added_line is None and lines[index].startswith("+"):
+                added_line = lines[index]
             line = line[:-1] + lines[index][1:]
             index += 1
-        yield first_line, line
+        yield first_line, line, added_line
 
 
 def check_added_posix_types(path: Path, findings: Findings) -> None:
@@ -332,7 +335,7 @@ def check_added_posix_types(path: Path, findings: Findings) -> None:
     in_hunk = False
     in_block_comment = False
     text = path.read_text(encoding="utf-8", errors="replace")
-    for diff_line, spliced_line in _spliced_diff_lines(text):
+    for diff_line, spliced_line, added_line in _spliced_diff_lines(text):
         if diff_line.startswith("diff --git "):
             file_name = None
             in_hunk = False
@@ -354,8 +357,8 @@ def check_added_posix_types(path: Path, findings: Findings) -> None:
         if not diff_line.startswith((" ", "+")):
             continue
         code, in_block_comment = _code_line(spliced_line[1:], in_block_comment)
-        if diff_line.startswith("+") and re.search(r"\bssize_t\b", code):
-            line = diff_line[1:].rstrip()
+        if added_line is not None and re.search(r"\bssize_t\b", code):
+            line = added_line[1:].rstrip()
             findings.error(
                 path.name,
                 f"{file_name}: added line {line!r}: POSIX type; MSVC lacks it, "
