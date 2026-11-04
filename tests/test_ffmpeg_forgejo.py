@@ -163,6 +163,8 @@ class Stub:
         ]
         self.drop_reviewers = False
         self.request_status = 201
+        self.branch_head = kwargs.get("branch_head")
+        self.branch_status = int(kwargs.get("branch_status", 200))
 
     def head(self) -> object:
         """Return the next scripted pull head, repeating the last."""
@@ -341,20 +343,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         return False
 
+    def _route_branch(self, stub: Stub, parts: list[str]) -> bool:
+        """Return the scripted fork branch commit or a failed read."""
+
+        if len(parts) > 3 and parts[-2] == "branches":
+            self.reply(stub.branch_status, {"commit": {"id": stub.branch_head}})
+            return True
+        return False
+
     def _dispatch_get(self, stub: Stub, url: urllib.parse.SplitResult, parts: list[str]) -> bool:
         """Route settings and repository GET requests to the matching handler."""
 
-        if self._route_settings(stub, url):
-            return True
-        if self._route_user(stub, url):
-            return True
-        if self._route_pull(stub, url):
-            return True
-        if self._route_pull_files(stub, parts, url):
-            return True
-        if self._route_reviews(stub, parts, url):
-            return True
-        return self._route_status(stub, parts, url)
+        routes = (
+            lambda: self._route_settings(stub, url),
+            lambda: self._route_user(stub, url),
+            lambda: self._route_pull(stub, url),
+            lambda: self._route_pull_files(stub, parts, url),
+            lambda: self._route_reviews(stub, parts, url),
+            lambda: self._route_branch(stub, parts),
+            lambda: self._route_status(stub, parts, url),
+        )
+        return any(route() for route in routes)
 
     def do_GET(self) -> None:
         """Serve scripted user, pull, and commit-status reads."""
@@ -459,6 +468,8 @@ class ForgejoTest(unittest.TestCase):
 
         if not args or args[0] not in HELPER_SUBCOMMANDS:
             raise ValueError(f"unsupported helper subcommand: {args[0] if args else '<missing>'}")
+        if args[0] == "pr" and stub.branch_head is None:
+            stub.branch_head = git_output(self.repo, "rev-parse", "topic")
         server = serve(stub)
         try:
             env = isolated_git_environment(preserve_config=True)
@@ -1189,6 +1200,8 @@ class FairyRequestTestBase(unittest.TestCase):
             raise ValueError("unsupported fixture command")
         if args[0] == "pr" and "--sweep" not in args:
             args = ("pr", "--sweep", str(self.sweep), *args[1:])
+        if args[0] == "pr" and stub.branch_head is None:
+            stub.branch_head = FAIRY_FIXTURE_HEAD
         server = serve(stub)
         try:
             environment = os.environ.copy()
@@ -1216,6 +1229,53 @@ class FairyRequestTestBase(unittest.TestCase):
 
 
 class PullRequestReviewerTest(FairyRequestTestBase):
+    def test_pr_refuses_unswept_fork_head(self) -> None:
+        """A different fork head cannot create a pull for a validated local commit."""
+
+        stub = Stub(reviewers=[["alice"]], branch_head=A)
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(FAIRY_FIXTURE_HEAD, proc.stderr)
+        self.assertIn(A, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_pr_refuses_unreadable_swept_fork_branch(self) -> None:
+        """A missing or unavailable fork branch fails before any POST."""
+
+        for status in (404, 500):
+            with self.subTest(status=status):
+                stub = Stub(reviewers=[["alice"]], branch_status=status)
+                proc = self.pr(stub)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn("fork branch", proc.stderr)
+                self.assertIn(FAIRY_FIXTURE_HEAD, proc.stderr)
+                self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_pr_refuses_missing_fork_commit(self) -> None:
+        """A successful read without a commit ID still refuses creation."""
+
+        stub = Stub(reviewers=[["alice"]], branch_head="")
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(FAIRY_FIXTURE_HEAD, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_pr_accepts_matching_swept_fork_head(self) -> None:
+        """The encoded branch in the fork must match before pull creation."""
+
+        stub = Stub(reviewers=[["alice"]])
+        proc = self.run_command(stub, "pr", "fix/swept-head", "title", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        branch_read = ("GET", "/api/v1/repos/tester/FFmpeg/branches/fix%2Fswept-head", "")
+        self.assertIn(branch_read, stub.requests)
+        post_index = next(
+            index
+            for index, (method, path, _) in enumerate(stub.requests)
+            if method == "POST" and path.endswith("/pulls")
+        )
+        self.assertLess(stub.requests.index(branch_read), post_index)
+        self.assertEqual(json.loads(stub.requests[post_index][2])["head"], "tester:fix/swept-head")
+
     def pr(self, stub: Stub) -> subprocess.CompletedProcess[str]:
         """Create a pull request and read its requested reviewers back."""
 
@@ -1672,6 +1732,28 @@ class SweepTest(ForgejoTest):
 
     helper = HELPER
 
+    def test_sweep_ignores_cwd_stdlib_decoys(self) -> None:
+        """Valid sweeps ignore checkout modules shadowing the Python standard library."""
+
+        marker = self.repo / "stdlib-decoy-executed"
+        decoy = f"open({str(marker)!r}, 'w').write('executed')\nraise SystemExit(99)\n"
+        for name in ("pathlib.py", "importlib.py"):
+            (self.repo / name).write_text(decoy)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertFalse(marker.exists(), "checkout-level standard library decoy executed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+
+    def test_push_uses_swept_sha_refspec(self) -> None:
+        """Push uses the validated commit ID and preserves its explicit lease."""
+
+        sha = git_output(self.repo, "rev-parse", "topic")
+        result = self.sweep_command("push", "--lease", A, "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = json.loads((self.tmp / "push-argv.json").read_text())
+        self.assertEqual(argv[-1], f"{sha}:refs/heads/topic")
+        self.assertIn(f"--force-with-lease=refs/heads/topic:{A}", argv)
+
     def test_sweep_accepts_helper_symlink(self) -> None:
         """A helper symlink outside scripts still imports the sweep validator."""
 
@@ -1754,8 +1836,11 @@ class SweepTest(ForgejoTest):
             raise RuntimeError("git missing")
         fake = self.bin_dir / "git"
         fake.write_text(
-            "#!/usr/bin/env python3\nimport os, sys\n"
-            'if "push" in sys.argv:\n    print("stub push")\n    sys.exit(0)\n'
+            "#!/usr/bin/env python3\nimport json, os, sys\n"
+            'if "push" in sys.argv:\n'
+            f"    with open({str(self.tmp / 'push-argv.json')!r}, 'w') as record:\n"
+            "        json.dump(sys.argv[1:], record)\n"
+            '    print("stub push")\n    sys.exit(0)\n'
             f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
         )
         fake.chmod(0o755)

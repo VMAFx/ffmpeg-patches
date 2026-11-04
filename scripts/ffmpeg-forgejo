@@ -40,6 +40,7 @@ BASE="${FFMPEG_FORGEJO_BASE:-master}"
 GIT_URL="${FFMPEG_FORGEJO_GIT:-$HOST/$REPO.git}"
 page_size=""
 BOT_REVIEWER="${FFMPEG_FORGEJO_BOT_REVIEWER:-Forgejo_Fairy}"
+SWEPT_SHA=""
 
 die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
 
@@ -506,7 +507,7 @@ require_sweep() {
   [ -n "$report" ] || die "--sweep <file> required"
   [ -f "$report" ] || die "no sweep file $report"
   sha="$(git rev-parse --verify --end-of-options "$branch^{commit}")" || die "sweep: no local branch $branch"
-  python3 - "$report" "$sha" "${BASH_SOURCE[0]}" <<'PY' || die "sweep rejected: $report"
+  python3 -I - "$report" "$sha" "${BASH_SOURCE[0]}" <<'PY' || die "sweep rejected: $report"
 import importlib.util
 import pathlib
 import sys
@@ -527,6 +528,20 @@ except (AttributeError, ImportError, OSError, UnicodeError, RuntimeError) as err
     valid = False
 sys.exit(0 if valid else 1)
 PY
+  SWEPT_SHA="$sha"
+}
+
+# require_swept_fork_head LOGIN BRANCH: bind PR creation to the reviewed commit.
+require_swept_fork_head() {
+  local me="$1" branch="$2" encoded out remote_sha
+  encoded="$(python3 -I -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$branch")" \
+    || die "sweep: cannot encode fork branch $branch (swept $SWEPT_SHA)"
+  out="$(api GET "/repos/$me/${REPO#*/}/branches/$encoded")" \
+    || die "sweep: cannot read fork branch $me:$branch (swept $SWEPT_SHA)"
+  remote_sha="$(python3 -I -c 'import json,sys; print(json.load(sys.stdin)["commit"]["id"])' <<<"$out")" \
+    || die "sweep: cannot read fork branch commit $me:$branch (swept $SWEPT_SHA)"
+  [ "$remote_sha" = "$SWEPT_SHA" ] \
+    || die "sweep: fork branch $me:$branch has $remote_sha; swept $SWEPT_SHA"
 }
 
 cmd="${1:-}"
@@ -603,13 +618,12 @@ for i in json.load(sys.stdin):
     [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: $usage"
     require_sweep "$sweep" "$1"
     me="$(login)"
-    git rev-parse --verify --quiet "$1^{commit}" >/dev/null || die "no local branch $1"
     rb="${2:-$1}"
     # The credential helper reads the keyring at push time; nothing lands in argv or config.
     # --lease rewrites the remote branch only while it still points at the expected sha.
     git -c credential.helper= \
         -c "credential.$HOST.helper=!f() { echo username=$me; printf 'password='; secret-tool lookup service code.ffmpeg.org; echo; }; f" \
-        push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$1:refs/heads/$rb"
+        push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$SWEPT_SHA:refs/heads/$rb"
     ;;
   pr)
     usage='pr --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>'
@@ -634,6 +648,7 @@ for i in json.load(sys.stdin):
     [[ "$BOT_REVIEWER" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $BOT_REVIEWER"
     me="$(login)"
     check_pr_overlap "$1" "$me" "$overlap_ok"
+    require_swept_fork_head "$me" "$1"
     body="$(mktemp)"
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
     out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
