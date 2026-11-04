@@ -317,6 +317,8 @@ def main(argv):
     if argv == ["--self-test"]:
         return self_test()
     try:
+        PAGE_CACHE.clear()
+        discover_page_size()
         read_from = utc_now()
         threads = discover_threads()
         out = []

@@ -227,7 +227,7 @@ class FairyUnansweredTest(unittest.TestCase):
                     return read_pages(path, **kwargs) if path.startswith(feed_url) else []
 
                 with (
-                    unittest.mock.patch.dict(fairy.PAGE_CACHE, {"page_size": 50}),
+                    unittest.mock.patch.object(fairy, "discover_page_size", return_value=50),
                     unittest.mock.patch.object(fairy, "FEED", url),
                     unittest.mock.patch.object(fairy, "paginated", side_effect=pages),
                     unittest.mock.patch.object(fairy.urllib.request, "urlopen") as request,
@@ -622,6 +622,48 @@ class FairyUnansweredTest(unittest.TestCase):
             ],
         )
 
+    def test_page_size_cleared_per_run_on_module_reuse(self):
+        """When the module is reused, a lowered page size is read fresh and all rows are read."""
+        run = 1
+        items_run2 = [{"number": i, "user": {"login": "lusoris"}} for i in range(1, 46)]
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            if path == fairy.SETTINGS:
+                return {"max_response_items": 50 if run == 1 else 20}
+            if path.startswith("/pulls?"):
+                server_max = 50 if run == 1 else 20
+                items = [] if run == 1 else items_run2
+                parsed = urllib.parse.urlsplit(path)
+                qs = urllib.parse.parse_qs(parsed.query)
+                limit = int(qs.get("limit", [50])[0])
+                page = int(qs.get("page", [1])[0])
+                effective_limit = min(limit, server_max)
+                start = (page - 1) * effective_limit
+                return items[start : start + effective_limit]
+            return []
+
+        errors_run1, errors_run2 = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(errors_run1),
+            ):
+                rc1 = fairy.main([])
+            run = 2
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(errors_run2),
+            ):
+                rc2 = fairy.main([])
+
+        self.assertEqual(rc1, 0)
+        self.assertEqual(rc2, 0)
+        self.assertEqual(calls.count(fairy.SETTINGS), 2)
+        self.assertIn("checked_prs=45", errors_run2.getvalue())
+        self.assertIn("/pulls?state=open&poster=lusoris&limit=20&page=3", calls)
+
     def test_page_size_negative_invalid_settings_reported(self):
         """Invalid max_response_items values raise ValueError and exit 1 in main."""
         cases = (
@@ -639,16 +681,24 @@ class FairyUnansweredTest(unittest.TestCase):
                 ):
                     fairy.discover_page_size()
 
-                fairy.PAGE_CACHE.clear()
+                calls = []
+
+                def fake_get(path, payload=payload, calls=calls):
+                    calls.append(path)
+                    if path == fairy.SETTINGS:
+                        return payload
+                    return []
+
                 output, errors = io.StringIO(), io.StringIO()
                 with (
-                    unittest.mock.patch.object(fairy, "get", return_value=payload),
+                    unittest.mock.patch.object(fairy, "get", side_effect=fake_get),
                     contextlib.redirect_stdout(output),
                     contextlib.redirect_stderr(errors),
                 ):
                     self.assertEqual(fairy.main([]), 1)
                 self.assertEqual(output.getvalue(), "")
                 self.assertIn("malformed API response", errors.getvalue())
+                self.assertEqual(calls, [fairy.SETTINGS])
 
 
 if __name__ == "__main__":
