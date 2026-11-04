@@ -1,0 +1,124 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Lusoris
+ * SPDX-License-Identifier: EUPL-1.2
+ */
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define av_cold __attribute__((cold))
+#define CONFIG_EXTRA 1
+#define CONFIG_OPTIONAL_FEATURE 1
+
+typedef struct FilterState {
+    int width;
+    int height;
+} FilterState;
+
+int prototype_decl_one(int x);
+static void prototype_decl_two(int a, int b);
+
+static const struct {
+    int id;
+    const char *name;
+} codec_table[] = {
+    { 1, "foo" },
+    { 2, "bar" },
+};
+
+/* Comment with { and } in it */
+// Line comment with { and }
+
+static av_cold int init_context(FilterState *st)
+{
+    st->width = 1920;
+    st->height = 1080;
+    return 0;
+}
+
+static av_cold void uninit_context(FilterState *st)
+{
+    st->width = 0;
+    st->height = 0;
+}
+
+static int multi_param(int a,
+                       int b,
+                       int c)
+{
+    return a + b + c;
+}
+
+static void nested_braces(int n)
+{
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            int tmp = i * 2;
+            (void)tmp;
+        }
+    }
+}
+
+static int if_inside_body(int x)
+{
+#if CONFIG_EXTRA
+    x += 1;
+#else
+    x += 2;
+#endif
+    return x;
+}
+
+#if CONFIG_OPTIONAL_FEATURE
+static int optional_feature_calc(int val)
+{
+    return val * 3;
+}
+#endif
+
+static int simple_helper(int a)
+{
+    return a * a;
+}
+
+static int clamp_val(int v, int min_val, int max_val)
+{
+    if (v < min_val)
+        return min_val;
+    if (v > max_val)
+        return max_val;
+    return v;
+}
+
+static int process_plane(uint8_t *dst, const uint8_t *src, int linesize, int w, int h)
+{
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            dst[x] = src[x];
+        }
+        dst += linesize;
+        src += linesize;
+    }
+    return 0;
+}
+
+static int compute_sum(const int *data, int count)
+{
+    int s = 0;
+    for (int i = 0; i < count; i++) {
+        s += data[i];
+    }
+    return s;
+}
+
+static int filter_frame(FilterState *st, int frame_num)
+{
+    int base = simple_helper(frame_num);
+    return clamp_val(base, 0, st->width);
+}
+
+static av_cold int close_filter(FilterState *st)
+{
+    uninit_context(st);
+    return 0;
+}
