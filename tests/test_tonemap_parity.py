@@ -10,7 +10,7 @@ fixture both ways (vf_libplacebo against itself: 0.0; with apply_dolbyvision=0:
 
 from __future__ import annotations
 
-import subprocess
+import subprocess  # nosec B404 - CalledProcessError type only, no process started here.
 import sys
 import tempfile
 import unittest

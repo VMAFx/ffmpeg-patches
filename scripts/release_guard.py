@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
-import subprocess
+import subprocess  # nosec B404 - allow-listed cosign argv, no shell, bounded timeout.
 import sys
 from pathlib import Path
 
@@ -84,10 +84,13 @@ def check_published(expected: str, actual: str) -> None:
 
 
 def read_sums(sums: Path) -> list[tuple[str, str]]:
+    """Read checksum entries or report an unreadable listing with its path."""
     try:
         text = sums.read_text(encoding="utf-8")
     except OSError as exc:
         raise GuardError(f"{sums}: {exc.strerror}") from exc
+    except UnicodeDecodeError as exc:
+        raise GuardError(f"{sums}: {exc}") from exc
     entries = []
     for number, line in enumerate(text.splitlines(), 1):
         match = SUMS_LINE.fullmatch(line)

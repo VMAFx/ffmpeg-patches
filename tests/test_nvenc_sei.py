@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import random
 import shutil
-import subprocess
+import subprocess  # nosec B404 - compiler and test binary argv in a temporary test directory.
 import tempfile
 import unittest
 from pathlib import Path
@@ -171,7 +171,7 @@ def cases() -> list[Picture]:
 def run_function(function: str, scratch: Path, rows: list[Picture]) -> list[str]:
     """Compile function with the stubs and the driver; return one output line per row."""
     source = scratch / "check.c"
-    source.write_text(PRELUDE + function + DRIVER)
+    source.write_text(PRELUDE + function + DRIVER, encoding="utf-8")
     exe = scratch / "check"
     cmd = [CC, "-std=c99", "-Wall", "-Wextra", "-pedantic", "-Werror"]
     build = subprocess.run(  # nosec B603 - compiler argv uses fixture-controlled paths and flags.
@@ -219,7 +219,8 @@ class ModelTest(unittest.TestCase):
 @unittest.skipUnless(shutil.which(CC), f"no C compiler {CC}")
 class CheckTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.function = function_from_patch(PATCH.read_text())
+        """Extract the NVENC SEI function and create its temporary test workspace."""
+        self.function = function_from_patch(PATCH.read_text(encoding="utf-8"))
         self.rows = cases()
         self.scratch = Path(tempfile.mkdtemp(prefix="nvenc_sei_"))
         self.addCleanup(shutil.rmtree, self.scratch)

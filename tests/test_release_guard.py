@@ -10,7 +10,7 @@ import io
 import os
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404 - cosign path and arguments are test fixtures.
 import sys
 import tempfile
 import unittest

@@ -18,8 +18,15 @@ running local verification. CI uses the version in `.python-version`.
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install ruff==0.16.8 reuse==6.2.0 numpy==2.5.4 pyyaml==6.0.3
+python3 -m pip install --require-hashes -r requirements-dev.txt
 ```
+
+Pins live in `requirements-dev.in`; after editing it, recompile from the repository root with `uv pip compile --universal --generate-hashes --python-version=3.12 requirements-dev.in --output-file=requirements-dev.txt`.
+
+Run the mutable-default check directly with `python3 scripts/lint_mutable_defaults.py`
+or through `make lint-mutable-defaults`. Its Pylint pin in `requirements-dev.in`
+must match the script's `PYLINT_VERSION`. The script
+uses that exact version on PATH, falling back to `uvx` to fetch the pinned version.
 
 ### Modernized NASA JPL Power-of-10 Rules
 
@@ -33,7 +40,14 @@ python3 -m pip install ruff==0.16.8 reuse==6.2.0 numpy==2.5.4 pyyaml==6.0.3
    **60 lines of code** ($\le 60$ LOC). When a patch makes a C function exceed
    60 lines, declare an exception in its sidecar TOML (e.g. `[[exceptions]]`
    with `rule = "HISS-04"`, `path`, `function`, `lines`, `category`, `entered`,
-   `expires`, and `reason`). `scripts/series.py lengths` enforces this in CI.
+   `expires`, and `reason`). The `function` field accepts an ASCII C identifier
+   such as `render_charset` or one macro call such as `fn(filter_plane)`,
+   `FUNC(put)`, or `DEF(a, 8)`, with identifiers or integer arguments. Copy the
+   parser's name: whitespace runs collapse to one space, but punctuation spacing
+   stays as written, so `DEF(a,8)` and `DEF(a, 8)` are distinct valid names.
+   Optional single spaces around parentheses and commas are accepted; empty
+   argument lists, nested calls, newlines, and non-ASCII names are rejected.
+   `scripts/series.py lengths` enforces this in CI.
 5. **Assertion Density (HISS-15)**: Functions must assert preconditions, state
    invariants, and postconditions.
 6. **Data Scope**: Variables must be declared at the smallest possible scope.

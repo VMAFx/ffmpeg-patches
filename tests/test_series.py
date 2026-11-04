@@ -10,14 +10,16 @@ import io
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 - fixed git and make argv in temporary test trees; result types for mocks.
 import tarfile
 import tempfile
 import unittest
 import unittest.mock
+from datetime import date
+from importlib import import_module
 from pathlib import Path
 
-from scripts import series
+from scripts import release_guard, series
 from tests.helpers import init_upstream, run_git
 
 LINES = [f"int line_{n} = {n};" for n in range(1, 41)]
@@ -25,11 +27,13 @@ METADATA = 'status = "submitted"\nupstream = "https://example.invalid/pulls/1"\n
 
 
 def write_lines(tree: Path, lines: list[str]) -> None:
-    (tree / "lib.c").write_text("\n".join(lines) + "\n")
+    """Write the fixture C source from its ordered lines."""
+    (tree / "lib.c").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def commit_edit(tree: Path, index: int, text: str, subject: str) -> None:
-    lines = (tree / "lib.c").read_text().splitlines()
+    """Replace one fixture source line and commit the edit."""
+    lines = (tree / "lib.c").read_text(encoding="utf-8").splitlines()
     lines[index] = text
     write_lines(tree, lines)
     run_git(tree, "commit", "-q", "-s", "-am", subject)
@@ -42,16 +46,19 @@ class Fixture:
         self.tree = scratch / "upstream"
         self.root = scratch / "series"
         self.base = init_upstream(self.tree, self.root, lambda: write_lines(self.tree, LINES))
-        (self.root / "series.txt").write_text("# header kept by export\n")
+        (self.root / "series.txt").write_text("# header kept by export\n", encoding="utf-8")
         commit_edit(self.tree, 4, "int line_5 = 50;", "lib: fix line five")
         commit_edit(self.tree, 29, "int line_30 = 300;", "lib: fix line thirty")
         with contextlib.redirect_stderr(io.StringIO()):
             self.names = series.export_series(self.root, self.tree)
         for number, name in enumerate(self.names, 1):
             metadata = METADATA.replace("pulls/1", f"pulls/{number}")
-            (self.root / "patches" / name).with_suffix(".toml").write_text(metadata)
+            (self.root / "patches" / name).with_suffix(".toml").write_text(
+                metadata, encoding="utf-8"
+            )
         (self.root / "README.md").write_text(
-            f"# Fixture\n\n{series.TABLE_START}\n{series.TABLE_END}\n\nText after the table.\n"
+            f"# Fixture\n\n{series.TABLE_START}\n{series.TABLE_END}\n\nText after the table.\n",
+            encoding="utf-8",
         )
         self.write_records([self.record(1), self.record(2)])
         self.reset()
@@ -76,7 +83,9 @@ class Fixture:
     def write_records(self, entries: list[object], render: bool = True) -> None:
         """Write the data file and, unless told otherwise, the README table from it."""
         data = {"checked": "2026-01-02", "contributions": entries}
-        (self.root / series.CONTRIBUTIONS).write_text(json.dumps(data, indent=2) + "\n")
+        (self.root / series.CONTRIBUTIONS).write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8"
+        )
         if render:
             series.contributions(self.root, True)
 
@@ -114,6 +123,104 @@ class SeriesTestCase(unittest.TestCase):
         )
 
 
+class Utf8ReadTest(unittest.TestCase):
+    """Invalid UTF-8 follows each reader's existing contextual error contract."""
+
+    def setUp(self) -> None:
+        """Create file-only inputs for strict UTF-8 readers."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        (self.root / "patches").mkdir()
+        self.patch = self.root / "patches" / "0001-change.patch"
+        self.patch.touch()
+        self.sidecar = self.patch.with_suffix(".toml")
+        self.sidecar.write_bytes(b"\xff")
+
+    def test_check_metadata_invalid_utf8(self) -> None:
+        """Record invalid sidecar encoding as an invalid TOML finding."""
+        findings = series.Findings()
+        series.check_metadata(self.sidecar, findings)
+        self.assertEqual(len(findings.errors), 1)
+        self.assertIn(f"{self.sidecar.name}: invalid TOML:", findings.errors[0])
+
+    def test_patch_links_invalid_utf8(self) -> None:
+        """Report undecodable sidecars while preserving links from valid sidecars."""
+        valid = self.root / "patches" / "0002-valid.toml"
+        valid.write_text(METADATA, encoding="utf-8")
+        findings = series.Findings()
+        self.assertEqual(
+            series.patch_links(
+                self.root, [self.patch.name, valid.with_suffix(".patch").name], findings
+            ),
+            {"0002-valid.patch": ("submitted", "https://example.invalid/pulls/1")},
+        )
+        self.assertEqual(len(findings.errors), 1)
+        self.assertIn(str(self.sidecar), findings.errors[0])
+
+    def test_contributions_write_refuses_unreadable_sidecar(self) -> None:
+        """Reject undecodable or invalid metadata before rewriting the README table."""
+        (self.root / "series.txt").write_text(self.patch.name + "\n", encoding="utf-8")
+        (self.root / series.CONTRIBUTIONS).write_text(
+            json.dumps({"checked": "2026-01-02", "contributions": []}), encoding="utf-8"
+        )
+        readme = self.root / "README.md"
+        readme.write_text(
+            f"{series.TABLE_START}\nold table\n{series.TABLE_END}\n", encoding="utf-8"
+        )
+        before = readme.read_bytes()
+        for content in (b"\xff", b"status ="):
+            with self.subTest(content=content):
+                self.sidecar.write_bytes(content)
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    status = series.main(["--root", str(self.root), "contributions", "--write"])
+                self.assertEqual((status, out.getvalue()), (1, ""))
+                self.assertIn(str(self.sidecar), err.getvalue())
+                self.assertEqual(readme.read_bytes(), before)
+                findings = series.Findings()
+                self.assertIsNone(
+                    series.checked_contributions(self.root, [self.patch.name], findings)
+                )
+                self.assertIn(str(self.sidecar), "\n".join(findings.errors))
+
+    def test_note_metadata_invalid_utf8(self) -> None:
+        """Wrap undecodable note metadata in a sidecar-specific tool error."""
+        with self.assertRaises(series.SeriesError) as caught:
+            series.note_metadata(self.patch)
+        self.assertIn(f"patches/{self.sidecar.name}:", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+
+    def test_load_patch_exceptions_invalid_utf8(self) -> None:
+        """Excuse nothing and report metadata errors for undecodable sidecars."""
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result = series.load_patch_exceptions(self.sidecar, date(2026, 11, 4))
+        self.assertEqual(result, ([], True))
+        self.assertIn(f"{self.sidecar.name}: invalid TOML:", err.getvalue())
+        self.assertIn(f"error: {self.sidecar.name}: 'utf-8'", err.getvalue())
+
+    def test_consumer_stack_invalid_utf8(self) -> None:
+        """Wrap an undecodable consumer listing with its path and decode error."""
+        with unittest.mock.patch.dict("sys.modules", {"series": series}):
+            consumer_stacks = import_module("scripts.consumer_stacks")
+
+        listing = self.root / "series.txt"
+        listing.write_bytes(b"\xff")
+        with self.assertRaises(series.SeriesError) as caught:
+            consumer_stacks.stack(self.root)
+        self.assertIn(f"{listing}:", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+
+    def test_release_sums_invalid_utf8(self) -> None:
+        """Wrap an undecodable checksum listing with its path and decode error."""
+        sums = self.root / "SHA256SUMS"
+        sums.write_bytes(b"\xff")
+        with self.assertRaises(release_guard.GuardError) as caught:
+            release_guard.read_sums(sums)
+        self.assertIn(f"{sums}:", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+
+
 class ScopeTest(unittest.TestCase):
     def setUp(self) -> None:
         self._scratch = tempfile.TemporaryDirectory()
@@ -126,9 +233,10 @@ class ScopeTest(unittest.TestCase):
         self.report = self.root / "summary.md"
 
     def commit_file(self, name: str, text: str = "changed\n") -> None:
+        """Write and commit the requested fixture file."""
         path = self.root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8")
         run_git(self.root, "add", "--", name)
         run_git(self.root, "commit", "-q", "-m", "change")
 
@@ -138,6 +246,7 @@ class ScopeTest(unittest.TestCase):
         )
 
     def scope(self, *extra: str) -> tuple[dict[str, str], str]:
+        """Return the checks selected for the fixture changes."""
         stdout = io.StringIO()
         args = [
             "--root",
@@ -155,7 +264,9 @@ class ScopeTest(unittest.TestCase):
         ]
         with contextlib.redirect_stdout(stdout):
             self.assertEqual(series.main(args), 0)
-        values = dict(line.split("=", 1) for line in self.output.read_text().splitlines())
+        values = dict(
+            line.split("=", 1) for line in self.output.read_text(encoding="utf-8").splitlines()
+        )
         return values, stdout.getvalue()
 
     def test_hqdn3d_patch_runs_ffmpeg_and_parity(self) -> None:
@@ -284,12 +395,13 @@ class ScopeTest(unittest.TestCase):
         self.assertIn("changed files: 1\n", stdout)
 
     def test_outputs_and_summary_append(self) -> None:
-        self.output.write_text("existing=true\n")
-        self.report.write_text("# Existing summary\n")
+        """Verify outputs and summary append."""
+        self.output.write_text("existing=true\n", encoding="utf-8")
+        self.report.write_text("# Existing summary\n", encoding="utf-8")
         self.commit_file(".github/workflows/series.yml")
         self.scope()
-        self.assertTrue(self.output.read_text().startswith("existing=true\n"))
-        summary = self.report.read_text()
+        self.assertTrue(self.output.read_text(encoding="utf-8").startswith("existing=true\n"))
+        summary = self.report.read_text(encoding="utf-8")
         self.assertTrue(summary.startswith("# Existing summary\n"))
         self.assertIn("changed files: 1", summary)
         self.assertIn("`ffmpeg=true`", summary)
@@ -307,7 +419,8 @@ class CheckTest(SeriesTestCase):
         self.assert_error(series.check(self.fx.root), f"{self.fx.names[1]}: no metadata file")
 
     def test_unlisted_patch_fails(self) -> None:
-        (self.fx.root / "patches" / "0003-extra.patch").write_text("x")
+        """Verify unlisted patch fails."""
+        (self.fx.root / "patches" / "0003-extra.patch").write_text("x", encoding="utf-8")
         self.assert_error(
             series.check(self.fx.root), "0003-extra.patch: in patches/ but not listed"
         )
@@ -317,54 +430,80 @@ class CheckTest(SeriesTestCase):
         self.assert_error(series.check(self.fx.root), "missing from patches/")
 
     def test_missing_signoff_fails(self) -> None:
+        """Verify missing signoff fails."""
         path = self.fx.patch(1)
-        path.write_text(path.read_text().replace("Signed-off-by: Dev <dev@invalid>\n", ""))
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("Signed-off-by: Dev <dev@invalid>\n", ""),
+            encoding="utf-8",
+        )
         self.assert_error(series.check(self.fx.root), "lacks a Signed-off-by")
 
     def test_numbered_subject_fails(self) -> None:
+        """Verify numbered subject fails."""
         path = self.fx.patch(1)
-        path.write_text(path.read_text().replace("[PATCH]", "[PATCH 1/2]"))
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("[PATCH]", "[PATCH 1/2]"), encoding="utf-8"
+        )
         self.assert_error(series.check(self.fx.root), "lacks 'Subject: [PATCH]'")
 
     def test_number_must_match_position(self) -> None:
+        """Verify number must match position."""
         series_txt = self.fx.root / "series.txt"
-        lines = series_txt.read_text().splitlines()
-        series_txt.write_text("\n".join([lines[0], lines[2], lines[1]]) + "\n")
+        lines = series_txt.read_text(encoding="utf-8").splitlines()
+        series_txt.write_text("\n".join([lines[0], lines[2], lines[1]]) + "\n", encoding="utf-8")
         self.assert_error(series.check(self.fx.root), "differs from its series position 0001")
 
     def test_bad_status_fails(self) -> None:
-        self.fx.patch(1).with_suffix(".toml").write_text(METADATA.replace("submitted", "done"))
+        """Verify bad status fails."""
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA.replace("submitted", "done"), encoding="utf-8"
+        )
         self.assert_error(series.check(self.fx.root), "status must be one of")
 
     def test_unknown_key_fails(self) -> None:
-        self.fx.patch(1).with_suffix(".toml").write_text(METADATA + 'upstrem = "typo"\n')
+        """Verify unknown key fails."""
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA + 'upstrem = "typo"\n', encoding="utf-8"
+        )
         self.assert_error(series.check(self.fx.root), "unknown key 'upstrem'")
 
     def test_submitted_needs_link(self) -> None:
+        """Verify submitted needs link."""
         self.fx.patch(1).with_suffix(".toml").write_text(
-            'status = "submitted"\nconsumers = ["a"]\n'
+            'status = "submitted"\nconsumers = ["a"]\n', encoding="utf-8"
         )
         self.assert_error(series.check(self.fx.root), "needs an https upstream link")
 
     def test_empty_consumers_fail(self) -> None:
-        self.fx.patch(1).with_suffix(".toml").write_text(METADATA.replace('["a"]', "[]"))
+        """Verify empty consumers fail."""
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA.replace('["a"]', "[]"), encoding="utf-8"
+        )
         self.assert_error(series.check(self.fx.root), "consumers must be a non-empty list")
 
     def test_short_base_commit_fails(self) -> None:
+        """Verify short base commit fails."""
         env = self.fx.root / "base.env"
-        env.write_text(env.read_text().replace(self.fx.base, self.fx.base[:12]))
+        env.write_text(
+            env.read_text(encoding="utf-8").replace(self.fx.base, self.fx.base[:12]),
+            encoding="utf-8",
+        )
         self.assert_error(series.check(self.fx.root), "not a full 40-hex commit")
 
     def test_merged_warns_but_passes(self) -> None:
-        self.fx.patch(1).with_suffix(".toml").write_text(METADATA.replace("submitted", "merged"))
+        """Verify merged warns but passes."""
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA.replace("submitted", "merged"), encoding="utf-8"
+        )
         write_merged_record(self.fx)
         findings = series.check(self.fx.root)
         self.assertEqual(findings.errors, [])
         self.assertIn("drop it", findings.warnings[0])
 
     def test_unsubmitted_needs_no_link(self) -> None:
+        """Verify unsubmitted needs no link."""
         self.fx.patch(1).with_suffix(".toml").write_text(
-            'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n'
+            'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n', encoding="utf-8"
         )
         self.fx.write_records([self.fx.record(2)])
         self.assertEqual(series.check(self.fx.root).errors, [])
@@ -479,6 +618,7 @@ class UpstreamCreditTest(SeriesTestCase):
             stream.write(notice)
 
     def credit(self, *numbers: int) -> None:
+        """Write fixture patch credits into the REUSE configuration."""
         paths = ", ".join(f'"patches/{self.fx.names[n - 1]}"' for n in numbers)
         (self.fx.root / "REUSE.toml").write_text(
             'version = 1\n\n[[annotations]]\npath = "patches/*.patch"\nprecedence = "override"\n'
@@ -486,7 +626,8 @@ class UpstreamCreditTest(SeriesTestCase):
             'SPDX-License-Identifier = "LGPL-2.1-or-later"\n\n'
             f'[[annotations]]\npath = [{paths}]\nprecedence = "override"\n'
             f'SPDX-FileCopyrightText = ["2026 Lusoris", "{self.HOLDER}"]\n'
-            'SPDX-License-Identifier = "LGPL-2.1-or-later"\n'
+            'SPDX-License-Identifier = "LGPL-2.1-or-later"\n',
+            encoding="utf-8",
         )
 
     def test_credited_notice_passes(self) -> None:
@@ -516,11 +657,13 @@ class UpstreamCreditTest(SeriesTestCase):
         )
 
     def test_glob_entry_credits_no_single_patch(self) -> None:
+        """Verify glob entry credits no single patch."""
         self.add_notice(1, self.NOTICE)
         (self.fx.root / "REUSE.toml").write_text(
             'version = 1\n\n[[annotations]]\npath = "patches/*.patch"\nprecedence = "override"\n'
             f'SPDX-FileCopyrightText = "{self.HOLDER}"\n'
-            'SPDX-License-Identifier = "LGPL-2.1-or-later"\n'
+            'SPDX-License-Identifier = "LGPL-2.1-or-later"\n',
+            encoding="utf-8",
         )
         self.assert_error(series.check(self.fx.root), "no REUSE.toml override names it")
 
@@ -530,7 +673,8 @@ class CoveredByTest(SeriesTestCase):
         """Set the first patch's covering URL without changing its contribution record."""
         self.fx.patch(1).with_suffix(".toml").write_text(
             METADATA.replace('status = "submitted"', f'status = "{status}"')
-            + f"covered_by = {value}\n"
+            + f"covered_by = {value}\n",
+            encoding="utf-8",
         )
 
     def test_unsubmitted_patch_with_covering_pull_passes(self) -> None:
@@ -600,8 +744,9 @@ class ApplyTest(SeriesTestCase):
         self.assertEqual([status for _, status in results], ["conflict", "applied"])
 
     def test_upstream_fix_with_other_context_is_a_drop_candidate(self) -> None:
+        """Verify upstream fix with other context is a drop candidate."""
         self.fx.reset()
-        lines = (self.fx.tree / "lib.c").read_text().splitlines()
+        lines = (self.fx.tree / "lib.c").read_text(encoding="utf-8").splitlines()
         lines[4] = "int line_5 = 50;"
         lines[3] = "int line_4 = 4; /* reworded upstream */"
         lines[5] = "int line_6 = 6; /* reworded upstream */"
@@ -618,16 +763,18 @@ class ApplyTest(SeriesTestCase):
             self.apply(expect_base=True)
 
     def test_dirty_tree_is_refused(self) -> None:
-        (self.fx.tree / "lib.c").write_text("dirty\n")
+        """Verify dirty tree is refused."""
+        (self.fx.tree / "lib.c").write_text("dirty\n", encoding="utf-8")
         with self.assertRaises(series.SeriesError):
             self.apply()
 
     def test_report_lists_every_patch(self) -> None:
+        """Verify report lists every patch."""
         results = self.apply()
         report = Path(self._scratch.name) / "report.md"
         with contextlib.redirect_stdout(io.StringIO()):
             series.write_report(results, self.fx.tree, report)
-        text = report.read_text()
+        text = report.read_text(encoding="utf-8")
         for name in self.fx.names:
             self.assertIn(f"| `{name}` | applied |", text)
 
@@ -651,14 +798,16 @@ class MasterFormTest(SeriesTestCase):
         self.master = self.fx.upstream_commit(4, "int line_5 = 50;")
 
     def set_form(self, base: str, head: str) -> None:
+        """Add the requested master-form fields to fixture metadata."""
         self.fx.patch(1).with_suffix(".toml").write_text(
-            METADATA + f'master_form = {{ base = "{base}", head = "{head}" }}\n'
+            METADATA + f'master_form = {{ base = "{base}", head = "{head}" }}\n', encoding="utf-8"
         )
 
     def set_upstream(self, commit: str, status: str = "merged") -> None:
+        """Record the fixture upstream commit and patch status."""
         path = self.fx.patch(2).with_suffix(".toml")
         metadata = METADATA.replace("pulls/1", "pulls/2").replace("submitted", status)
-        path.write_text(metadata + f'upstream_commit = "{commit}"\n')
+        path.write_text(metadata + f'upstream_commit = "{commit}"\n', encoding="utf-8")
         record = self.fx.record(
             2, state="merged", merged_at="2026-01-01T10:00:00Z", merged_commit=self.fx.base
         )
@@ -681,6 +830,7 @@ class MasterFormTest(SeriesTestCase):
         self.assertFalse(series.am_in_progress(self.fx.tree))
 
     def test_fetches_and_applies_pr_head_on_moved_master(self) -> None:
+        """Verify fetches and applies pr head on moved master."""
         self.assertNotEqual(
             series.git(self.fx.tree, "cat-file", "-e", self.head, check=False).returncode, 0
         )
@@ -692,7 +842,7 @@ class MasterFormTest(SeriesTestCase):
         subject = run_git(self.fx.tree, "log", "-1", "--format=%s", "HEAD~1")
         expected = f"{self.fx.names[0]}: master form {self.fx.base[:12]}..{self.head[:12]}"
         self.assertEqual(subject, expected)
-        lines = (self.fx.tree / "lib.c").read_text().splitlines()
+        lines = (self.fx.tree / "lib.c").read_text(encoding="utf-8").splitlines()
         self.assertEqual(
             (lines[4], lines[6], lines[29]),
             ("int line_5 = 50;", "int line_7 = 70;", "int line_30 = 300;"),
@@ -700,11 +850,12 @@ class MasterFormTest(SeriesTestCase):
         self.assert_clean()
 
     def test_main_and_report_include_master_form(self) -> None:
+        """Verify main and report include master form."""
         report = Path(self._scratch.name) / "report.md"
         status, out, err = self.run_main("--master-forms", self.url, "--report", str(report))
         self.assertEqual((status, err), (0, ""))
         self.assertIn("master-form", out)
-        self.assertIn(f"| `{self.fx.names[0]}` | master-form |", report.read_text())
+        self.assertIn(f"| `{self.fx.names[0]}` | master-form |", report.read_text(encoding="utf-8"))
 
     def test_conflict_cleans_tree_and_keep_going_exits_one(self) -> None:
         commit_edit(self.fx.tree, 6, "int line_7 = 700;", "conflicting master")
@@ -870,12 +1021,16 @@ class MasterFormTest(SeriesTestCase):
         self.assertEqual(series.check(self.fx.root).errors, [])
 
     def test_master_form_requires_submitted_status(self) -> None:
+        """Verify master form requires submitted status."""
         path = self.fx.patch(1).with_suffix(".toml")
-        path.write_text(path.read_text().replace("submitted", "merged"))
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("submitted", "merged"), encoding="utf-8"
+        )
         write_merged_record(self.fx)
         self.assert_error(series.check(self.fx.root), "master_form is allowed only")
 
     def test_master_form_requires_exact_table_keys(self) -> None:
+        """Verify master form requires exact table keys."""
         forms = (
             '"not a table"',
             "{}",
@@ -885,23 +1040,27 @@ class MasterFormTest(SeriesTestCase):
         for form in forms:
             with self.subTest(form=form):
                 self.fx.patch(1).with_suffix(".toml").write_text(
-                    METADATA + f"master_form = {form}\n"
+                    METADATA + f"master_form = {form}\n", encoding="utf-8"
                 )
                 self.assert_error(series.check(self.fx.root), "exactly base and head")
 
     def test_master_form_requires_lowercase_full_commit_ids(self) -> None:
+        """Verify master form requires lowercase full commit ids."""
         for bad in ('"abc123"', '"' + "A" * 40 + '"', '"' + "g" * 40 + '"', "42"):
             for key in ("base", "head"):
                 with self.subTest(bad=bad, key=key):
                     values = {"base": f'"{self.fx.base}"', "head": f'"{self.head}"', key: bad}
                     form = ", ".join(f"{k} = {v}" for k, v in values.items())
                     self.fx.patch(1).with_suffix(".toml").write_text(
-                        METADATA + f"master_form = {{ {form} }}\n"
+                        METADATA + f"master_form = {{ {form} }}\n", encoding="utf-8"
                     )
                     self.assert_error(series.check(self.fx.root), "full 40-hex commit")
 
     def set_release_only(self, value: str = '"split into several upstream PRs"') -> None:
-        self.fx.patch(1).with_suffix(".toml").write_text(METADATA + f"release_only = {value}\n")
+        """Set the fixture metadata release-only value."""
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA + f"release_only = {value}\n", encoding="utf-8"
+        )
 
     def test_release_only_skips_conflicting_patch_on_master(self) -> None:
         commit_edit(self.fx.tree, 6, "int line_7 = 700;", "conflicting master")
@@ -913,8 +1072,9 @@ class MasterFormTest(SeriesTestCase):
         self.assert_clean()
 
     def test_conflict_without_release_only_still_fails(self) -> None:
+        """Verify conflict without release only still fails."""
         commit_edit(self.fx.tree, 6, "int line_7 = 700;", "conflicting master")
-        self.fx.patch(1).with_suffix(".toml").write_text(METADATA)
+        self.fx.patch(1).with_suffix(".toml").write_text(METADATA, encoding="utf-8")
         results = self.apply(keep_going=True)
         self.assertEqual([s for _, s in results], ["conflict", "applied"])
         self.assertTrue(series.apply_failed(results, False))
@@ -929,10 +1089,12 @@ class MasterFormTest(SeriesTestCase):
                     self.apply()
 
     def test_release_only_excludes_master_form(self) -> None:
+        """Verify release only excludes master form."""
         self.fx.patch(1).with_suffix(".toml").write_text(
             METADATA
             + 'release_only = "split"\n'
-            + f'master_form = {{ base = "{self.fx.base}", head = "{self.head}" }}\n'
+            + f'master_form = {{ base = "{self.fx.base}", head = "{self.head}" }}\n',
+            encoding="utf-8",
         )
         self.assert_error(series.check(self.fx.root), "release_only excludes")
 
@@ -948,18 +1110,22 @@ class MasterFormTest(SeriesTestCase):
         self.assert_error(series.check(self.fx.root), "upstream_commit is allowed only")
 
     def test_upstream_commit_requires_lowercase_full_commit_id(self) -> None:
+        """Verify upstream commit requires lowercase full commit id."""
         for bad in ("abc123", "A" * 40, "g" * 40):
             with self.subTest(bad=bad):
                 self.set_upstream(bad)
                 self.assert_error(series.check(self.fx.root), "full 40-hex commit")
         path = self.fx.patch(2).with_suffix(".toml")
-        path.write_text(path.read_text().replace(f'"{bad}"', "42"))
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(f'"{bad}"', "42"), encoding="utf-8"
+        )
         self.assert_error(series.check(self.fx.root), "full 40-hex commit")
 
 
 class MainTest(SeriesTestCase):
     def test_tool_error_exits_two(self) -> None:
-        (self.fx.tree / "lib.c").write_text("dirty\n")
+        """Verify tool error exits two."""
+        (self.fx.tree / "lib.c").write_text("dirty\n", encoding="utf-8")
         argv = ["--root", str(self.fx.root), "apply", str(self.fx.tree)]
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(series.main(argv), 2)
@@ -1005,9 +1171,12 @@ class WarningsTest(SeriesTestCase):
         self.assertEqual(series.triage_warnings(log, set(self.FILES)), ([], 0))
 
     def test_gate_reads_the_series_files_from_the_tree(self) -> None:
+        """Verify gate reads the series files from the tree."""
         series.apply_series(self.fx.root, self.fx.tree, True, False)
         log = Path(self._scratch.name) / "build.log"
-        log.write_text("lib.c:5:1: warning: unused variable 'x'\nother.c:1:1: warning: y\n")
+        log.write_text(
+            "lib.c:5:1: warning: unused variable 'x'\nother.c:1:1: warning: y\n", encoding="utf-8"
+        )
         with contextlib.redirect_stdout(io.StringIO()) as out:
             status = series.warnings_gate(self.fx.root, self.fx.tree, log, None)
         self.assertEqual(status, 1)
@@ -1017,13 +1186,15 @@ class WarningsTest(SeriesTestCase):
     def newer_upstream_tree(self) -> tuple[str, Path]:
         """Apply the series on an upstream commit that adds other.c; return it and a log."""
         self.fx.reset()
-        (self.fx.tree / "other.c").write_text("int other;\n")
+        (self.fx.tree / "other.c").write_text("int other;\n", encoding="utf-8")
         run_git(self.fx.tree, "add", "other.c")
         run_git(self.fx.tree, "commit", "-q", "-m", "upstream: add other.c")
         upstream = run_git(self.fx.tree, "rev-parse", "HEAD")
         series.apply_series(self.fx.root, self.fx.tree, False, False)
         log = Path(self._scratch.name) / "build.log"
-        log.write_text("lib.c:5:1: warning: unused variable 'x'\nother.c:1:1: warning: y\n")
+        log.write_text(
+            "lib.c:5:1: warning: unused variable 'x'\nother.c:1:1: warning: y\n", encoding="utf-8"
+        )
         return upstream, log
 
     def warnings_main(self, log: Path, *extra: str) -> tuple[int, str, str]:
@@ -1102,11 +1273,12 @@ class CoverageTest(SeriesTestCase):
         self.assertIn("no C file to check", out[-1])
 
     def test_gate_reads_the_series_files_from_the_tree(self) -> None:
+        """Verify gate reads the series files from the tree."""
         series.apply_series(self.fx.root, self.fx.tree, True, False)
         log = Path(self._scratch.name) / "build.log"
         argv = ["--root", str(self.fx.root), "coverage", str(self.fx.tree), str(log)]
         for text, expected in (("CC\tlib.o\n", 0), ("CC\tother.o\n", 1)):
-            log.write_text(text)
+            log.write_text(text, encoding="utf-8")
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(series.main(argv), expected)
 
@@ -1122,16 +1294,18 @@ class NotesTest(SeriesTestCase):
         self.assertIn("gh attestation verify ffmpeg-patches-v1.2.3.tar.gz --repo Org/repo", notes)
 
     def test_folded_subject_is_unfolded(self) -> None:
+        """Verify folded subject is unfolded."""
         path = self.fx.patch(1)
-        text = path.read_text().replace(
+        text = path.read_text(encoding="utf-8").replace(
             "Subject: [PATCH] lib: fix line five", "Subject: [PATCH] lib: fix line\n five"
         )
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8")
         self.assertEqual(series.patch_subject(path), "lib: fix line five")
 
     def test_unsubmitted_patch_has_no_link(self) -> None:
+        """Verify unsubmitted patch has no link."""
         self.fx.patch(2).with_suffix(".toml").write_text(
-            'status = "unsubmitted"\nupstream = ""\nconsumers = ["a", "b"]\n'
+            'status = "unsubmitted"\nupstream = ""\nconsumers = ["a", "b"]\n', encoding="utf-8"
         )
         notes = series.release_notes(self.fx.root, "v1.2.3", "Org/repo")
         self.assertIn("| unsubmitted | none | a, b |", notes)
@@ -1183,12 +1357,13 @@ class ContributionsTest(SeriesTestCase):
         self.assertIn(f"| {state}, in v1.0.1 | lib: change 3 | none |", self.run_main()[1])
 
     def test_write_repairs_a_stale_table(self) -> None:
+        """Verify write repairs a stale table."""
         readme = self.fx.root / "README.md"
         entries = [self.fx.record(1, title="lib: new title"), self.fx.record(2)]
         self.assert_error(self.check_with(entries, render=False), "contribution table differs")
         self.assertEqual(self.run_main("--write")[0], 0)
         self.assertEqual(series.check(self.fx.root).errors, [])
-        text = readme.read_text()
+        text = readme.read_text(encoding="utf-8")
         self.assertIn("lib: new title", text)
         self.assertTrue(text.startswith("# Fixture\n\n" + series.TABLE_START + "\n"))
         self.assertTrue(text.endswith(series.TABLE_END + "\n\nText after the table.\n"))
@@ -1201,15 +1376,19 @@ class ContributionsTest(SeriesTestCase):
         self.assertIn("| lib: change 3 | none |", self.run_main()[1])
 
     def test_no_pull_request_at_all_passes(self) -> None:
+        """Verify no pull request at all passes."""
         for number in (1, 2):
             self.fx.patch(number).with_suffix(".toml").write_text(
-                'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n'
+                'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n', encoding="utf-8"
             )
         self.assertEqual(self.check_with([]).errors, [])
         self.assertEqual(len(self.run_main()[1].splitlines()), 4)
 
     def test_rejected_patch_matches_a_closed_pull_request(self) -> None:
-        self.fx.patch(1).with_suffix(".toml").write_text(METADATA.replace("submitted", "rejected"))
+        """Verify rejected patch matches a closed pull request."""
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA.replace("submitted", "rejected"), encoding="utf-8"
+        )
         entries = [self.fx.record(1, state="closed"), self.fx.record(2)]
         self.assertEqual(self.check_with(entries).errors, [])
 
@@ -1220,20 +1399,32 @@ class ContributionsTest(SeriesTestCase):
         self.assert_error(series.check(self.fx.root), f"{series.CONTRIBUTIONS}: missing")
 
     def test_invalid_json_fails(self) -> None:
-        self.data_file().write_text("{")
+        """Verify invalid json fails."""
+        self.data_file().write_text("{", encoding="utf-8")
         self.assert_error(series.check(self.fx.root), "invalid JSON")
 
     def test_duplicate_key_fails(self) -> None:
-        text = self.data_file().read_text().replace('"state": "open",', '"state": "open",\n' * 2, 1)
-        self.data_file().write_text(text)
+        """Verify duplicate key fails."""
+        text = (
+            self.data_file()
+            .read_text(encoding="utf-8")
+            .replace('"state": "open",', '"state": "open",\n' * 2, 1)
+        )
+        self.data_file().write_text(text, encoding="utf-8")
         self.assert_error(series.check(self.fx.root), "key 'state' is written twice")
 
     def test_foreign_top_level_key_fails(self) -> None:
-        self.data_file().write_text('{"checked": "2026-01-02", "contributions": [], "x": 1}')
+        """Verify foreign top level key fails."""
+        self.data_file().write_text(
+            '{"checked": "2026-01-02", "contributions": [], "x": 1}', encoding="utf-8"
+        )
         self.assert_error(series.check(self.fx.root), "top level must hold")
 
     def test_checked_must_be_a_day(self) -> None:
-        self.data_file().write_text('{"checked": "yesterday", "contributions": []}')
+        """Verify checked must be a day."""
+        self.data_file().write_text(
+            '{"checked": "yesterday", "contributions": []}', encoding="utf-8"
+        )
         self.assert_error(series.check(self.fx.root), "'checked' must be a YYYY-MM-DD date")
 
     def test_unknown_and_missing_keys_fail(self) -> None:
@@ -1292,7 +1483,45 @@ class ContributionsTest(SeriesTestCase):
         twice = [self.fx.record(1), self.fx.record(2), self.fx.record(3), self.fx.record(3)]
         self.assert_error(self.check_with(twice, render=False), needle)
 
-    # Negative: records against the series metadata.
+    # Records against the series metadata: positive, negative and boundary.
+
+    def test_one_record_can_name_two_linked_patches(self) -> None:
+        """A pull request covers every named patch and renders both series numbers."""
+        self.fx.patch(2).with_suffix(".toml").write_text(METADATA, encoding="utf-8")
+        entries = [self.fx.record(1, patch=", ".join(self.fx.names))]
+        self.assertEqual(self.check_with(entries).errors, [])
+        self.assertIn("| lib: change 1 | 0001, 0002 |", self.run_main()[1])
+
+    def test_each_named_patch_must_link_the_record(self) -> None:
+        """A second patch linked to another pull request fails the shared record."""
+        entries = [self.fx.record(1, patch=", ".join(self.fx.names))]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, f"the metadata of {self.fx.names[1]} does not link")
+
+    def test_patch_named_twice_in_one_record_fails(self) -> None:
+        """Repeating a patch inside one string triggers the duplicate check."""
+        entries = [
+            self.fx.record(1, patch=", ".join([self.fx.names[0]] * 2)),
+            self.fx.record(2),
+        ]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, f"{self.fx.names[0]} is recorded twice")
+
+    def test_linked_patch_omitted_from_shared_record_fails(self) -> None:
+        """A record for the shared URL still must name every linked patch."""
+        self.fx.patch(2).with_suffix(".toml").write_text(METADATA, encoding="utf-8")
+        findings = self.check_with([self.fx.record(1)], render=False)
+        self.assert_error(findings, f"{self.fx.names[1]}: upstream link")
+        self.assert_error(findings, "pulls/1 has no record")
+
+    def test_each_named_patch_must_match_the_record_state(self) -> None:
+        """The second patch's status is checked even when both URLs match."""
+        self.fx.patch(2).with_suffix(".toml").write_text(
+            METADATA.replace("submitted", "rejected"), encoding="utf-8"
+        )
+        entries = [self.fx.record(1, patch=", ".join(self.fx.names))]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, "state 'open' disagrees with status 'rejected'")
 
     def test_upstream_link_without_record_fails(self) -> None:
         findings = self.check_with([self.fx.record(1)], render=False)
@@ -1321,8 +1550,9 @@ class ContributionsTest(SeriesTestCase):
     # Negative: the README table and the command.
 
     def test_readme_without_one_block_fails(self) -> None:
+        """Verify readme without one block fails."""
         readme = self.fx.root / "README.md"
-        whole = readme.read_text()
+        whole = readme.read_text(encoding="utf-8")
         needle = "README.md: lacks one"
         for text in (
             whole.replace(series.TABLE_END, ""),
@@ -1330,33 +1560,41 @@ class ContributionsTest(SeriesTestCase):
             f"{series.TABLE_END}\n{series.TABLE_START}\n",
         ):
             with self.subTest(text=text[:40]):
-                readme.write_text(text)
+                readme.write_text(text, encoding="utf-8")
                 self.assert_error(series.check(self.fx.root), needle)
                 self.assertEqual(self.run_main("--write")[0], 2)
         readme.unlink()
         self.assert_error(series.check(self.fx.root), needle)
 
     def test_hand_edited_table_fails(self) -> None:
+        """Verify hand edited table fails."""
         readme = self.fx.root / "README.md"
-        readme.write_text(readme.read_text().replace("| open |", "| merged |", 1))
+        readme.write_text(
+            readme.read_text(encoding="utf-8").replace("| open |", "| merged |", 1),
+            encoding="utf-8",
+        )
         self.assert_error(
             series.check(self.fx.root), "run `scripts/series.py contributions --write`"
         )
 
     def test_command_refuses_unsound_records(self) -> None:
+        """Verify command refuses unsound records."""
         readme = self.fx.root / "README.md"
-        before = readme.read_text()
+        before = readme.read_text(encoding="utf-8")
         with contextlib.redirect_stderr(io.StringIO()):
             self.fx.write_records([self.fx.record(1, state="draft"), self.fx.record(2)], False)
         for arguments in ((), ("--write",)):
             status, out, err = self.run_main(*arguments)
             self.assertEqual((status, out), (1, ""))
             self.assertIn("state must be one of", err)
-        self.assertEqual(readme.read_text(), before)
+        self.assertEqual(readme.read_text(encoding="utf-8"), before)
 
     def test_command_refuses_a_broken_series_list(self) -> None:
+        """Verify command refuses a broken series list."""
         series_txt = self.fx.root / "series.txt"
-        series_txt.write_text(series_txt.read_text() + self.fx.names[0] + "\n")
+        series_txt.write_text(
+            series_txt.read_text(encoding="utf-8") + self.fx.names[0] + "\n", encoding="utf-8"
+        )
         status, out, err = self.run_main()
         self.assertEqual((status, out), (1, ""))
         self.assertIn("series.txt", err)
@@ -1364,15 +1602,16 @@ class ContributionsTest(SeriesTestCase):
 
 class ExportTest(SeriesTestCase):
     def test_round_trip_is_byte_identical(self) -> None:
+        """Verify round trip is byte identical."""
         before = {p.name: p.read_bytes() for p in (self.fx.root / "patches").iterdir()}
-        series_before = (self.fx.root / "series.txt").read_text()
+        series_before = (self.fx.root / "series.txt").read_text(encoding="utf-8")
         self.assertFalse(
             series.apply_failed(series.apply_series(self.fx.root, self.fx.tree, True, False), True)
         )
         series.export_series(self.fx.root, self.fx.tree)
         after = {p.name: p.read_bytes() for p in (self.fx.root / "patches").iterdir()}
         self.assertEqual(before, after)
-        self.assertEqual((self.fx.root / "series.txt").read_text(), series_before)
+        self.assertEqual((self.fx.root / "series.txt").read_text(encoding="utf-8"), series_before)
         self.assertTrue(series_before.startswith("# header kept by export\n"))
 
     def test_metadata_follows_its_patch_across_renumbering(self) -> None:
@@ -1404,13 +1643,14 @@ class InterfaceGapsTest(SeriesTestCase):
     # A4-1: notes on a series whose metadata is missing or unreadable is a tool error.
 
     def test_notes_without_metadata_exits_two_with_a_message(self) -> None:
+        """Verify notes without metadata exits two with a message."""
         sidecar = self.fx.patch(2).with_suffix(".toml")
         for name, change in (
             ("missing", sidecar.unlink),
-            ("invalid", lambda: sidecar.write_text("x =")),
+            ("invalid", lambda: sidecar.write_text("x =", encoding="utf-8")),
         ):
             with self.subTest(name):
-                self.fx.patch(2).with_suffix(".toml").write_text(METADATA)
+                self.fx.patch(2).with_suffix(".toml").write_text(METADATA, encoding="utf-8")
                 change()
                 status, out, err = self.run_main("notes", "v1.2.3", "Org/repo")
                 self.assertEqual((status, out), (2, ""))
@@ -1420,17 +1660,19 @@ class InterfaceGapsTest(SeriesTestCase):
     # A4-2: a series.txt that lists no patch.
 
     def test_check_on_a_series_listing_no_patch_fails(self) -> None:
-        (self.fx.root / "series.txt").write_text("# header kept by export\n")
+        """Verify check on a series listing no patch fails."""
+        (self.fx.root / "series.txt").write_text("# header kept by export\n", encoding="utf-8")
         self.assert_error(series.check(self.fx.root), "series.txt: lists no patch")
 
     # A4-3: base.env missing, with an unexpected line, with a key written twice.
 
     def test_base_env_missing_unexpected_and_repeated_lines_fail(self) -> None:
+        """Verify base env missing unexpected and repeated lines fail."""
         env = self.fx.root / "base.env"
-        text = env.read_text()
-        env.write_text(text + "EXTRA=1\n")
+        text = env.read_text(encoding="utf-8")
+        env.write_text(text + "EXTRA=1\n", encoding="utf-8")
         self.assert_error(series.check(self.fx.root), "base.env:4: unexpected line 'EXTRA=1'")
-        env.write_text(text + "FFMPEG_TAG=v2\n")
+        env.write_text(text + "FFMPEG_TAG=v2\n", encoding="utf-8")
         self.assert_error(series.check(self.fx.root), "base.env:4: unexpected line 'FFMPEG_TAG=v2'")
         env.unlink()
         self.assert_error(series.check(self.fx.root), "base.env: missing")
@@ -1438,10 +1680,14 @@ class InterfaceGapsTest(SeriesTestCase):
     # A4-4: a patch without the zero From line, and one without a diff.
 
     def test_patch_without_from_line_or_diff_fails(self) -> None:
+        """Verify patch without from line or diff fails."""
         first, second = self.fx.patch(1), self.fx.patch(2)
-        lines = first.read_text().split("\n", 1)
-        first.write_text("From nobody\n" + lines[1])
-        second.write_text(second.read_text().replace("\ndiff --git ", "\nno diff here "))
+        lines = first.read_text(encoding="utf-8").split("\n", 1)
+        first.write_text("From nobody\n" + lines[1], encoding="utf-8")
+        second.write_text(
+            second.read_text(encoding="utf-8").replace("\ndiff --git ", "\nno diff here "),
+            encoding="utf-8",
+        )
         findings = series.check(self.fx.root)
         self.assert_error(findings, f"{first.name}: first line is not a format-patch From line")
         self.assert_error(findings, f"{second.name}: no diff --git section")
@@ -1449,8 +1695,9 @@ class InterfaceGapsTest(SeriesTestCase):
     # A4-5: invalid TOML metadata, and metadata whose patch is not listed.
 
     def test_invalid_toml_and_orphan_metadata_fail(self) -> None:
-        self.fx.patch(1).with_suffix(".toml").write_text("status =\n")
-        (self.fx.root / "patches" / "0009-orphan.toml").write_text(METADATA)
+        """Verify invalid toml and orphan metadata fail."""
+        self.fx.patch(1).with_suffix(".toml").write_text("status =\n", encoding="utf-8")
+        (self.fx.root / "patches" / "0009-orphan.toml").write_text(METADATA, encoding="utf-8")
         findings = series.check(self.fx.root)
         self.assert_error(findings, "invalid TOML")
         self.assert_error(findings, "0009-orphan.toml: metadata without a listed patch")
@@ -1484,18 +1731,19 @@ class InterfaceGapsTest(SeriesTestCase):
     # A4-8: --report appends the summary of warnings and coverage to the file.
 
     def test_warnings_and_coverage_report_append_to_the_file(self) -> None:
+        """Verify warnings and coverage report append to the file."""
         commit_edit(self.fx.tree, 4, "int line_5 = 50;", "lib: fix line five")
         scratch = Path(self._scratch.name)
         log, report = scratch / "build.log", scratch / "summary.md"
-        log.write_text("CC\tlib.o\nlib.c:5:1: warning: unused variable 'x'\n")
-        report.write_text("# Summary\n")
+        log.write_text("CC\tlib.o\nlib.c:5:1: warning: unused variable 'x'\n", encoding="utf-8")
+        report.write_text("# Summary\n", encoding="utf-8")
         tree = str(self.fx.tree)
         for _ in range(2):
             self.assertEqual(
                 self.run_main("warnings", tree, str(log), "--report", str(report))[0], 1
             )
         self.assertEqual(self.run_main("coverage", tree, str(log), "--report", str(report))[0], 0)
-        lines = report.read_text().splitlines()
+        lines = report.read_text(encoding="utf-8").splitlines()
         self.assertEqual(lines[0], "# Summary")
         gated = "1 compiler warning(s) in files the series changes (gated); 0 elsewhere in FFmpeg"
         self.assertEqual(sum(line.startswith(gated) for line in lines), 2)
@@ -1505,12 +1753,14 @@ class InterfaceGapsTest(SeriesTestCase):
     # A4-9: a patch that only removes lines has no added content to find upstream.
 
     def test_content_present_without_added_lines_is_false(self) -> None:
+        """Verify content present without added lines is false."""
         patch = Path(self._scratch.name) / "removal.patch"
         patch.write_text(
             "diff --git a/lib.c b/lib.c\n--- a/lib.c\n+++ b/lib.c\n"
-            "@@ -1,2 +1,1 @@\n-int line_1 = 1;\n int line_2 = 2;\n"
+            "@@ -1,2 +1,1 @@\n-int line_1 = 1;\n int line_2 = 2;\n",
+            encoding="utf-8",
         )
-        self.assertEqual(series.added_runs(patch.read_text()), {})
+        self.assertEqual(series.added_runs(patch.read_text(encoding="utf-8")), {})
         self.assertFalse(series.content_present(self.fx.tree, patch))
 
 
@@ -1609,13 +1859,14 @@ class MakeTargetsTest(unittest.TestCase):
         self.assertEqual(strays, [])
 
     def test_apply_refuses_an_empty_tree_and_passes_the_tree_on(self) -> None:
+        """Verify apply refuses an empty tree and passes the tree on."""
         result = self.run_make("apply")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("set FFMPEG_TREE to an FFmpeg checkout", result.stderr)
         tree = Path(self._scratch.name) / "not-the-base"
         tree.mkdir()
         run_git(tree, "init", "-q")
-        (tree / "file.c").write_text("int x;\n")
+        (tree / "file.c").write_text("int x;\n", encoding="utf-8")
         run_git(tree, "add", "file.c")
         run_git(tree, "commit", "-q", "-m", "not the pinned base")
         result = self.run_make("apply", f"FFMPEG_TREE={tree}")
@@ -1638,10 +1889,11 @@ class MakeTargetsTest(unittest.TestCase):
     def test_lengths_local_runs_the_gate_when_a_tree_is_given(self) -> None:
         # A tree that is not the applied series makes the gate fail rather than
         # skip, proving the FFMPEG_TREE branch invokes series.py lengths.
+        """Verify lengths local runs the gate when a tree is given."""
         tree = Path(self._scratch.name) / "lengths-not-the-base"
         tree.mkdir()
         run_git(tree, "init", "-q")
-        (tree / "file.c").write_text("int x;\n")
+        (tree / "file.c").write_text("int x;\n", encoding="utf-8")
         run_git(tree, "add", "file.c")
         run_git(tree, "commit", "-q", "-m", "not the pinned base")
         result = self.run_make("lengths-local", f"FFMPEG_TREE={tree}")

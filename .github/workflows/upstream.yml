@@ -1,14 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
 #
-# Daily comparison of upstream-contributions.json with the FFmpeg forge. A
-# pull request that merged, closed, changed its title or moved to another
-# base since the file was written fails the run (exit status 1), so the
-# README table cannot go stale unseen; the fix is a pull request that
-# updates the file and regenerates the table. The forge is read without a
-# token. A forge that cannot be read fails the run with exit status 2.
-# Recorded master_form heads and merge bases are checked for drift.
-# A covered_by pull request that merges or closes also fails the run.
+# Daily comparison with the FFmpeg forge, read without a token. Repair
+# contribution fields and inline master_form commits, then regenerate the
+# README table. Publish any changes as upstream-drift.patch and show the
+# diff in the job summary before failing the run for human review.
+# Unfixed covered_by drift or a tool error also fails, even without a diff.
+# No pull request is created; repository permissions remain read-only.
 name: upstream drift
 
 'on':
@@ -32,8 +30,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version-file: .python-version
+      - uses: ./.github/actions/setup-python
       - name: Compare every recorded pull request with the forge
-        run: python3 scripts/upstream_drift.py
+        id: drift
+        run: python3 scripts/upstream_drift.py --fix
+      - name: Prepare the drift patch and job summary
+        id: patch
+        if: success() || failure()
+        run: |
+          if git diff --exit-code > /dev/null; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          else
+            git diff > upstream-drift.patch
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+            {
+              echo '### Upstream drift patch'
+              echo ''
+              echo '```diff'
+              cat upstream-drift.patch
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload the drift patch
+        if: ${{ !cancelled() && steps.patch.outputs.changed == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-drift
+          path: upstream-drift.patch
+          if-no-files-found: error
+      - name: Fail when drift needs review or could not be checked
+        if: ${{ !cancelled() && (steps.patch.outputs.changed == 'true' || steps.drift.outcome == 'failure') }}
+        run: exit 1

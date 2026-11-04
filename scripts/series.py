@@ -33,6 +33,8 @@
         Print the table of upstream pull requests rendered from
         upstream-contributions.json; --write puts it into README.md
         between its two marker comments. `check` compares the two.
+        One record per pull request; its `patch` string lists patch names
+        separated by ", ", or is empty when the series carries none.
     series.py scope [--base REF] [--head REF] [--full]
         Select FFmpeg, GPU parity and macOS CI work from the changed files.
         Append outputs with --github-output FILE and a summary with --report FILE.
@@ -48,18 +50,29 @@ is applied or exported.
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
+import functools
 import json
 import os
 import re
 import shlex
-import subprocess
+import subprocess  # nosec B404 - fixed git argv, no shell, explicit timeouts.
 import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tree_sitter import Node, Parser
+
+try:
+    import forge_settings
+except ModuleNotFoundError:
+    from scripts import forge_settings
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_KEYS = ("FFMPEG_REMOTE", "FFMPEG_TAG", "FFMPEG_COMMIT")
@@ -89,10 +102,15 @@ REQUIRED_EXCEPTION_KEYS = {
 VALID_CATEGORIES = {"A", "B", "C", "D"}
 CATEGORY_INTERVALS = {"B": 3, "C": 10, "D": 120}
 DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-PULL_URL = re.compile(r"(https://code\.ffmpeg\.org)/([^/]+)/([^/]+)/pulls/(\d+)")
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+FUNCTION_NAME = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*"
+    r"(?: ?\( ?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)"
+    r"(?: ?, ?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+))* ?\))?",
+    re.ASCII,
+)
 CONTRIBUTIONS = "upstream-contributions.json"
 CONTRIBUTION_KEYS = (
     "number",
@@ -137,6 +155,14 @@ class SeriesError(Exception):
     """The series or the FFmpeg checkout is unusable; main() exits 2."""
 
 
+def pull_url_pattern() -> re.Pattern[str]:
+    """Resolve forge settings lazily and report invalid settings as tool errors."""
+    try:
+        return forge_settings.pull_url_pattern()
+    except ValueError as exc:
+        raise SeriesError(str(exc)) from exc
+
+
 @dataclass
 class Findings:
     """Errors fail the check; warnings are printed and pass."""
@@ -175,12 +201,13 @@ def git(
 
 
 def read_base(root: Path, findings: Findings) -> dict[str, str]:
+    """Read and validate the pinned upstream settings in base.env."""
     path = root / "base.env"
     if not path.is_file():
         findings.error("base.env", "missing")
         return {}
     values = {}
-    for number, raw in enumerate(path.read_text().splitlines(), 1):
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -198,12 +225,13 @@ def read_base(root: Path, findings: Findings) -> dict[str, str]:
 
 
 def read_series(root: Path, findings: Findings) -> list[str]:
+    """Read ordered patch names and report duplicate series entries."""
     path = root / "series.txt"
     if not path.is_file():
         findings.error("series.txt", "missing")
         return []
     names: list[str] = []
-    for number, line in enumerate(path.read_text().splitlines(), 1):
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         name = line.strip()
         if not name or name.startswith("#"):
             continue
@@ -224,7 +252,7 @@ def check_patch_name(name: str, position: int, findings: Findings) -> None:
 
 def check_patch_form(path: Path, findings: Findings) -> None:
     """Require `git format-patch` form: zero From line, headers, sign-off, diff."""
-    text = path.read_text(errors="replace")
+    text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     name = path.name
     if not lines or not FROM_LINE.match(lines[0]):
@@ -355,6 +383,7 @@ def check_exception_dates(entry: dict, name: str, findings: Findings, today: dat
 
 
 def check_exception_fields(entry: dict, name: str, findings: Findings) -> tuple[str, str] | None:
+    """Validate one HISS-04 exception entry and return its (path, function) key."""
     rule = entry.get("rule")
     if not isinstance(rule, str) or rule != "HISS-04":
         findings.error(name, "rule must be 'HISS-04'")
@@ -364,8 +393,8 @@ def check_exception_fields(entry: dict, name: str, findings: Findings) -> tuple[
         findings.error(name, "path must be a repo-relative file path")
 
     func = entry.get("function")
-    if not isinstance(func, str) or not func.isascii() or not func.isidentifier():
-        findings.error(name, "function must be a C identifier")
+    if not isinstance(func, str) or not FUNCTION_NAME.fullmatch(func):
+        findings.error(name, "function must be a C identifier or a macro call such as FUNC(name)")
 
     lines = entry.get("lines")
     if type(lines) is not int:
@@ -425,12 +454,13 @@ def check_exceptions_metadata(data: dict, name: str, findings: Findings, today: 
 
 
 def check_metadata(path: Path, findings: Findings, today: date | None = None) -> None:
+    """Validate one patch sidecar and record every metadata finding."""
     name = path.name
     if today is None:
         today = date.today()
     try:
-        data = tomllib.loads(path.read_text())
-    except tomllib.TOMLDecodeError as exc:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         findings.error(name, f"invalid TOML: {exc}")
         return
     for key in sorted(set(data) - METADATA_KEYS):
@@ -462,8 +492,10 @@ def check_covered_by(data: dict, name: str, findings: Findings) -> None:
     if data.get("status") != "unsubmitted":
         findings.error(name, "covered_by is allowed only with status unsubmitted")
     url = data["covered_by"]
-    if not isinstance(url, str) or not PULL_URL.fullmatch(url):
-        findings.error(name, "covered_by must be a pull request URL of code.ffmpeg.org")
+    if not isinstance(url, str) or not pull_url_pattern().fullmatch(url):
+        findings.error(
+            name, f"covered_by must be a pull request URL of {forge_settings.keyring_service()}"
+        )
 
 
 def check_master_form(form: object, name: str, findings: Findings) -> None:
@@ -581,12 +613,13 @@ def refuse_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def read_contributions(root: Path, findings: Findings) -> dict | None:
+    """Read contribution JSON and report malformed data or duplicate keys."""
     path = root / CONTRIBUTIONS
     if not path.is_file():
         findings.error(CONTRIBUTIONS, "missing")
         return None
     try:
-        data = json.loads(path.read_text(), object_pairs_hook=refuse_duplicates)
+        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=refuse_duplicates)
     except ValueError as exc:
         findings.error(CONTRIBUTIONS, f"invalid JSON: {exc}")
         return None
@@ -649,39 +682,43 @@ def check_entry(entry: dict, findings: Findings) -> None:
         )
 
 
-def patch_links(root: Path, names: list[str]) -> dict[str, tuple[str, str]]:
+def patch_links(root: Path, names: list[str], findings: Findings) -> dict[str, tuple[str, str]]:
     """Map each listed patch that was sent upstream to (status, upstream link)."""
     links: dict[str, tuple[str, str]] = {}
     for name in names:
         sidecar = (root / "patches" / name).with_suffix(".toml")
         try:
-            data = tomllib.loads(sidecar.read_text())
-        except (OSError, tomllib.TOMLDecodeError):
-            continue  # check_metadata() reports it
+            data = tomllib.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            findings.error(str(sidecar), f"invalid metadata: {exc}")
+            continue
         status, link = data.get("status"), str(data.get("upstream", ""))
         if status in FORGE_STATES and link.startswith("https://"):
             links[name] = (status, link)
     return links
 
 
+def contribution_patches(entry: dict) -> list[str]:
+    """Patch names separated by comma and space; an empty string names none."""
+    return entry["patch"].split(", ") if entry["patch"] else []
+
+
 def check_records(
     entries: list[dict], links: dict[str, tuple[str, str]], findings: Findings
 ) -> None:
-    """Each upstream link of the series has one record, each record's patch that link."""
+    """Check every patch in each record's comma-and-space-separated patch string."""
     recorded: set[str] = set()
     for entry in entries:
-        patch = entry["patch"]
-        if not patch:
-            continue
         where = f"{CONTRIBUTIONS}: {entry['number']}"
-        if patch in recorded:
-            findings.error(where, f"{patch} is recorded twice")
-        recorded.add(patch)
-        status, link = links.get(patch, ("", ""))
-        if link != entry["url"]:
-            findings.error(where, f"the metadata of {patch} does not link {entry['url']}")
-        elif FORGE_STATES[status] != entry["state"]:
-            findings.error(where, f"state {entry['state']!r} disagrees with status {status!r}")
+        for patch in contribution_patches(entry):
+            if patch in recorded:
+                findings.error(where, f"{patch} is recorded twice")
+            recorded.add(patch)
+            status, link = links.get(patch, ("", ""))
+            if link != entry["url"]:
+                findings.error(where, f"the metadata of {patch} does not link {entry['url']}")
+            elif FORGE_STATES[status] != entry["state"]:
+                findings.error(where, f"state {entry['state']!r} disagrees with status {status!r}")
     for name, (_, link) in links.items():
         if name not in recorded:
             findings.error(name, f"upstream link {link} has no record in {CONTRIBUTIONS}")
@@ -703,7 +740,7 @@ def checked_contributions(root: Path, names: list[str], findings: Findings) -> d
     numbers = [entry["number"] for entry in entries]
     if numbers != sorted(set(numbers)):
         findings.error(CONTRIBUTIONS, "numbers must be unique and ascending")
-    check_records(entries, patch_links(root, names), findings)
+    check_records(entries, patch_links(root, names, findings), findings)
     return data if len(findings.errors) == before else None
 
 
@@ -715,15 +752,16 @@ def contribution_state(entry: dict) -> str:
 
 
 def contributions_table(data: dict) -> str:
-    """The README block: one row per pull request and the day the forge was read."""
+    """One README row per pull request, listing all patch numbers and the read day."""
     lines = [
         "| Pull request | Target | State | Change | Series patch |",
         "| --- | --- | --- | --- | --- |",
     ]
     for entry in data["contributions"]:
+        patches = ", ".join(patch[:4] for patch in contribution_patches(entry)) or "none"
         lines.append(
             f"| [{entry['number']}]({entry['url']}) | `{entry['base']}` "
-            f"| {contribution_state(entry)} | {entry['title']} | {entry['patch'][:4] or 'none'} |"
+            f"| {contribution_state(entry)} | {entry['title']} | {patches} |"
         )
     lines += ["", f"State read from the FFmpeg forge on {data['checked']}."]
     return "\n".join(lines)
@@ -740,11 +778,12 @@ def readme_block(text: str) -> str | None:
 
 
 def check_contributions(root: Path, names: list[str], findings: Findings) -> None:
+    """Validate contribution records and their rendered README table."""
     data = checked_contributions(root, names, findings)
     if data is None:
         return
     readme = root / "README.md"
-    block = readme_block(readme.read_text()) if readme.is_file() else None
+    block = readme_block(readme.read_text(encoding="utf-8")) if readme.is_file() else None
     if block is None:
         findings.error("README.md", f"lacks one {TABLE_START} ... {TABLE_END} block")
     elif block != contributions_table(data):
@@ -768,12 +807,12 @@ def contributions(root: Path, write: bool) -> int:
         print(table)
         return 0
     readme = root / "README.md"
-    text = readme.read_text() if readme.is_file() else ""
+    text = readme.read_text(encoding="utf-8") if readme.is_file() else ""
     if readme_block(text) is None:
         raise SeriesError(f"README.md lacks one {TABLE_START} ... {TABLE_END} block")
     head, _, rest = text.partition(TABLE_START)
     tail = rest.partition(TABLE_END)[2]
-    readme.write_text(f"{head}{TABLE_START}\n{table}\n{TABLE_END}{tail}")
+    readme.write_text(f"{head}{TABLE_START}\n{table}\n{TABLE_END}{tail}", encoding="utf-8")
     return 0
 
 
@@ -843,12 +882,15 @@ def content_present(tree: Path, patch: Path) -> bool:
     neither a reverse apply nor a 3-way merge recognises it; the added
     lines themselves still match.
     """
-    runs = added_runs(patch.read_text(errors="replace"))
+    runs = added_runs(patch.read_text(encoding="utf-8", errors="replace"))
     for path, file_runs in runs.items():
         target = tree / path
         if not target.is_file():
             return False
-        lines = [line.rstrip() for line in target.read_text(errors="replace").splitlines()]
+        lines = [
+            line.rstrip()
+            for line in target.read_text(errors="replace", encoding="utf-8").splitlines()
+        ]
         if not all(contains_run(lines, run) for run in file_runs):
             return False
     return bool(runs)
@@ -902,6 +944,7 @@ def fetch_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
 
 
 def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -> str:
+    """Fetch and apply the recorded master form, returning its result."""
     fetch_master_form(tree, patch, url, form)
     base, head = form["base"], form["head"]
     diff = git(tree, "diff", "--binary", "--full-index", base, head).stdout
@@ -909,7 +952,7 @@ def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
         raise SeriesError(f"{patch.name}: empty master form {base}..{head} from {url}")
     with tempfile.TemporaryDirectory() as scratch:
         path = Path(scratch) / "master.patch"
-        path.write_text(diff)
+        path.write_text(diff, encoding="utf-8")
         applied = git(tree, "apply", "--3way", "--index", str(path), check=False)
     if applied.returncode:
         git(tree, "reset", "-q", "--hard", "HEAD")
@@ -996,10 +1039,11 @@ def renamed_sidecars(patches: Path, new_names: list[str]) -> None:
 
 
 def write_series(root: Path, names: list[str]) -> None:
+    """Write ordered patch names while preserving series header comments."""
     path = root / "series.txt"
-    old = path.read_text().splitlines() if path.is_file() else []
+    old = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
     header = [line for line in old if line.startswith("#")]
-    path.write_text("\n".join([*header, *names]) + "\n")
+    path.write_text("\n".join([*header, *names]) + "\n", encoding="utf-8")
 
 
 def pinned_commit(root: Path) -> str:
@@ -1094,7 +1138,8 @@ def triage_warnings(lines: list[str], files: set[str]) -> tuple[list[str], int]:
 def warnings_gate(
     root: Path, tree: Path, log: Path, report: Path | None, base: str | None = None
 ) -> int:
-    lines = log.read_text(errors="replace").splitlines()
+    """Report build warnings in series files; return 1 when any is found."""
+    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
     own, other = triage_warnings(lines, series_files(root, tree, base))
     for line in own:
         print(line)
@@ -1138,7 +1183,8 @@ def coverage_report(files: set[str], lines: list[str]) -> tuple[int, list[str]]:
 def coverage_gate(
     root: Path, tree: Path, log: Path, report: Path | None, base: str | None = None
 ) -> int:
-    lines = log.read_text(errors="replace").splitlines()
+    """Report coverage of the compiled series files and return its status."""
+    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
     status, out = coverage_report(series_files(root, tree, base), lines)
     print("\n".join(out))
     if report is not None:
@@ -1149,7 +1195,7 @@ def coverage_gate(
 
 def patch_subject(path: Path) -> str:
     """The Subject header without its [PATCH] prefix, unfolded."""
-    header = path.read_text(errors="replace").split("\n\n", 1)[0]
+    header = path.read_text(encoding="utf-8", errors="replace").split("\n\n", 1)[0]
     match = re.search(r"^Subject: \[PATCH\] (.*(?:\n .*)*)", header, re.MULTILINE)
     return " ".join(match.group(1).split()) if match else path.name
 
@@ -1160,10 +1206,10 @@ def note_metadata(path: Path) -> dict:
     if not path.is_file():
         raise SeriesError(f"{path.name}: listed in series.txt but missing from patches/")
     try:
-        meta = tomllib.loads(sidecar.read_text())
+        meta = tomllib.loads(sidecar.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise SeriesError(f"{path.name}: no metadata file patches/{sidecar.name}") from None
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise SeriesError(f"patches/{sidecar.name}: {exc}") from exc
     if "status" not in meta:
         raise SeriesError(f"patches/{sidecar.name}: no status")
@@ -1231,69 +1277,121 @@ class LengthFinding:
     new_length: int
 
 
-def is_signature_line(line: str) -> bool:
-    if not line or not (line[0].isalpha() or line[0] == "_"):
-        return False
-    if line.startswith("#") or line.startswith("typedef"):
-        return False
-    if line.rstrip().endswith(";"):
-        return False
-    return "(" in line
+@functools.cache
+def _get_c_parser() -> Parser:
+    """Return the cached tree-sitter C parser singleton."""
+    try:
+        import tree_sitter_c  # noqa: PLC0415 - optional parser dependency.
+        from tree_sitter import Language, Parser  # noqa: PLC0415 - optional parser dependency.
+    except ModuleNotFoundError as error:
+        package = (error.name or "tree_sitter").replace("_", "-")
+        raise SeriesError(
+            f"Missing package {package}; run pip install --require-hashes -r requirements-dev.txt"
+        ) from error
+    return Parser(Language(tree_sitter_c.language()))
 
 
-def signature_name(line: str) -> str | None:
-    before = line.split("(", 1)[0].rstrip()
-    match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", before)
-    return match.group(1) if match else None
+def _collect_function_definitions(root: Node, max_steps: int = 1_000_000) -> list[Node]:
+    """Collect function_definition nodes at any depth without entering their bodies."""
+    nodes: list[Node] = []
+    stack: list[Node] = [root]
+    for _ in range(max_steps):
+        if not stack:
+            return nodes
+        node = stack.pop()
+        if node.type == "function_definition":
+            nodes.append(node)
+            continue
+        for child in reversed(node.children):
+            stack.append(child)
+    raise SeriesError(f"tree traversal exceeded limit of {max_steps} nodes")
 
 
-def update_signature_state(
-    line: str,
-    lineno: int,
-    state: tuple[int | None, int | None, str | None],
-) -> tuple[int | None, int | None, str | None]:
-    first_sig, last_sig, sig_name = state
-    if line.rstrip().endswith(";"):
-        return None, None, None
-    if is_signature_line(line):
-        name = signature_name(line)
-        if name is not None:
-            if last_sig is not None and (lineno - last_sig) <= 8:
-                return first_sig, lineno, sig_name
-            return lineno, lineno, name
-    return state
+def _find_declarator_child(node: Node) -> Node | None:
+    """Return the first declarator-typed child of a node."""
+    for child in node.children:
+        if "declarator" in child.type:
+            return child
+    return None
+
+
+def _find_function_declarator(node: Node) -> Node | None:
+    """Find the function_declarator child in a declarator chain."""
+    curr = node.child_by_field_name("declarator")
+    for _ in range(32):
+        if curr is None or curr.type == "function_declarator":
+            return curr
+        next_decl = curr.child_by_field_name("declarator")
+        if next_decl is None and curr.type == "parenthesized_declarator":
+            next_decl = _find_declarator_child(curr)
+        curr = next_decl
+    return None
+
+
+def _unwrap_parentheses(node: Node | None) -> Node | None:
+    """Unwrap parenthesized_declarator wrappers down to the inner declarator."""
+    curr = node
+    for _ in range(8):
+        if curr is None or curr.type != "parenthesized_declarator":
+            return curr
+        curr = next((c for c in curr.children if c.type not in ("(", ")")), None)
+    return curr
+
+
+def _extract_function_name(node: Node) -> str | None:
+    """Extract the function name from a function_definition node."""
+    fn_decl = _find_function_declarator(node)
+    if fn_decl is None:
+        return None
+    inner = _unwrap_parentheses(fn_decl.child_by_field_name("declarator"))
+    if inner is None or inner.text is None:
+        return None
+    text = inner.text.decode("utf-8", errors="replace")
+    name = " ".join(text.split())
+    return name if name else None
+
+
+def _newline_byte_offsets(source: bytes) -> list[int]:
+    """Index newline byte offsets in one bounded pass over the parser input."""
+    return [offset for offset in range(len(source)) if source[offset] == 10]
+
+
+def _byte_row(newlines: list[int], offset: int) -> int:
+    """Return the zero-based row by counting newlines strictly before offset."""
+    # Avoid Point's borrowed-reference getters: https://github.com/tree-sitter/py-tree-sitter/issues/505
+    return bisect.bisect_right(newlines, offset - 1)
 
 
 def parse_function_spans(
     text: str,
 ) -> tuple[dict[str, FunctionSpan], dict[str, list[FunctionSpan]]]:
+    """Parse C function spans using tree-sitter."""
     longest: dict[str, FunctionSpan] = {}
     all_spans: dict[str, list[FunctionSpan]] = {}
-    in_body = False
-    first_sig: int | None = None
-    last_sig: int | None = None
-    sig_name: str | None = None
+    if not text:
+        return longest, all_spans
 
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if in_body:
-            if line.startswith("}"):
-                if first_sig is not None and sig_name is not None:
-                    length = lineno - first_sig + 1
-                    span = FunctionSpan(sig_name, first_sig, lineno, length)
-                    all_spans.setdefault(sig_name, []).append(span)
-                    if sig_name not in longest or length > longest[sig_name].length:
-                        longest[sig_name] = span
-                in_body = False
-                first_sig, last_sig, sig_name = None, None, None
-        elif line.startswith("{"):
-            if last_sig is not None and (lineno - last_sig) <= 8:
-                in_body = True
-            else:
-                first_sig, last_sig, sig_name = None, None, None
-        else:
-            first_sig, last_sig, sig_name = update_signature_state(
-                line, lineno, (first_sig, last_sig, sig_name)
-            )
+    parser = _get_c_parser()
+    source = text.encode("utf-8")
+    newlines = _newline_byte_offsets(source)
+    tree = parser.parse(source)
+    function_nodes = _collect_function_definitions(tree.root_node)
+
+    for node in function_nodes:
+        name = _extract_function_name(node)
+        if name is None:
+            continue
+        start = _byte_row(newlines, node.start_byte) + 1
+        end_offset = node.end_byte
+        # A missing closing brace can leave the exclusive end just after a newline.
+        if end_offset > node.start_byte and source[end_offset - 1] != 10:
+            end_offset -= 1
+        end = _byte_row(newlines, end_offset) + 1
+        length = end - start + 1
+        span = FunctionSpan(name, start, end, length)
+        all_spans.setdefault(name, []).append(span)
+        if name not in longest or length > longest[name].length:
+            longest[name] = span
 
     return longest, all_spans
 
@@ -1423,6 +1521,7 @@ def triage_single_finding(
 
 
 def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]:
+    """Return a sidecar's length exceptions and whether its metadata had errors."""
     if not sidecar.is_file():
         return [], False
     meta_findings = Findings()
@@ -1433,8 +1532,8 @@ def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]
         for err in meta_findings.errors:
             print(f"error: {err}", file=sys.stderr)
     try:
-        data = tomllib.loads(sidecar.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        data = tomllib.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         # An unreadable sidecar excuses nothing and fails the gate.
         print(f"error: {sidecar.name}: {exc}", file=sys.stderr)
         return [], True
@@ -1564,6 +1663,7 @@ def scope_patch_paths(root: Path, changed: list[str], refs: tuple[str, str]) -> 
 def scope_reasons(
     root: Path, changed: list[str], targets: dict[str, set[str]]
 ) -> dict[str, list[str]]:
+    """Map changed paths and graph targets to the checks they require."""
     infra = {
         ".github/workflows/series.yml",
         ".github/actions/prepare-series/action.yml",
@@ -1577,7 +1677,11 @@ def scope_reasons(
     ffmpeg = tree | {"scripts/tonemap_parity.py"}
     sources = root / ".config/clang-tidy/sources.txt"
     if sources.is_file():
-        ffmpeg.update(line.strip() for line in sources.read_text().splitlines() if line.strip())
+        ffmpeg.update(
+            line.strip()
+            for line in sources.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
     reasons: dict[str, list[str]] = {"ffmpeg": [], "parity": [], "macos": []}
     for path in changed:
         gpu_test = path == "tests/helpers.py" or bool(
@@ -1670,6 +1774,7 @@ def main(argv: list[str]) -> int:
     """Exit 0 on success, 1 on findings or a failed apply, 2 when the tool cannot run."""
     args = parse_args(argv)
     try:
+        pull_url_pattern()
         return run(args)
     except (SeriesError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         detail = getattr(exc, "stderr", None) or ""

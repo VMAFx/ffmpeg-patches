@@ -1,5 +1,5 @@
 {
-  "checked": "2026-10-28",
+  "checked": "2026-11-04",
   "contributions": [
     {
       "number": 24045,
@@ -49,9 +49,9 @@
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
-      "patch": "",
-      "project": "pelorus",
-      "note": "Four commits. The series carries none of them."
+      "patch": "0042-avfilter-vf_libvmaf-pop-the-CUDA-context-when-a-plan.patch",
+      "project": "pelorus, vmafx",
+      "note": "Four commits. The series carries the CUDA context fix (95aa7b1c4052) as 0042 in its n9.0.2 form, on top of the multi-plane copy from 0040/0041; it carries none of the other three."
     },
     {
       "number": 24974,
@@ -396,9 +396,9 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483",
       "title": "avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds",
       "base": "master",
-      "state": "open",
-      "merged_at": "",
-      "merged_commit": "",
+      "state": "merged",
+      "merged_at": "2026-11-02T21:05:18Z",
+      "merged_commit": "f675c507e20ac78cd55f238ede52da470e6f6ec7",
       "in_release": "",
       "patch": "",
       "project": "vmafx",
@@ -455,6 +455,19 @@
       "patch": "0039-avcodec-wmalosslessdec-Clear-subframe-flags-as-an-ar.patch",
       "project": "vmafx",
       "note": "Master form of the issue 107 fix, one pull request per area."
+    },
+    {
+      "number": 25708,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708",
+      "title": "avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0040-avfilter-vf_libvmaf-accept-more-planar-pixel-formats.patch, 0041-avfilter-vf_libvmaf-copy-all-planes-of-CUDA-hardware.patch",
+      "project": "vmafx",
+      "note": "By luoye-cpu, not from this series (VMAFx/vmafx#3274); the series carries it ahead of review. 25708 stacks on 24973, which the series does not carry; the conflict was context only."
     }
   ]
 }

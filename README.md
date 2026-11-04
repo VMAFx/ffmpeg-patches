@@ -41,6 +41,41 @@ Consumers apply this series first and their own feature patches on top:
 
 A fix lives here once. A consumer does not carry its own copy.
 
+## Pre-PR variant sweep
+
+Before pushing or opening a pull request, scan the committed fix and callers of its targets:
+
+```bash
+python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return master topic -o sweep.md
+```
+
+The report records full base and head commit IDs. Targets combine callees whose return values are consumed on added lines with functions whose bodies contain added lines. The scan covers touched C/header files and C files in the head revision mentioning those targets. It reports discarded calls and checks that normalize an error to `-1` or an `AVERROR_` value. Explicit `(void)` calls are intentional and excluded. This lexical scan supports review; inspect the surrounding control flow when deciding each row.
+
+Replace every `TODO` disposition with one of:
+
+- `fold`: same bug class and same file as the fix; fold the correction into this pull request.
+- `follow-up: <reproducer path>`: otherwise, record the ancestor reproducer path in the evidence and track the correction separately.
+
+Keep the PR body unchanged unless a variant is folded into the fix. After folding, regenerate the report for the new head and review its rows again. A report with no findings ends with `no hits`.
+
+Pass the reviewed report before positional arguments to both commands (run these inside the FFmpeg clone):
+
+```bash
+/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo push --sweep /path/to/sweep.md topic
+/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo pr --sweep /path/to/sweep.md topic "Fix title" /path/to/body.md
+```
+
+Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`.
+
+### Forge settings
+
+The forge helper scripts share configuration through environment variables, implemented in [scripts/forge_settings.py](scripts/forge_settings.py) and verified by [tests/test_forge_settings.py](tests/test_forge_settings.py):
+
+- `FFMPEG_FORGEJO_HOST`: forge URL (default: `https://code.ffmpeg.org`).
+- `FFMPEG_FORGEJO_REPO`: repository path (default: `FFmpeg/FFmpeg`).
+- `FFMPEG_FORGEJO_BOT_REVIEWER`: bot reviewer login (default: `Forgejo_Fairy`).
+- `FFMPEG_FORGEJO_LOGIN`: user login on the forge; when unset, discovered from `/user` with the keyring token.
+
 ## Upstream contributions
 
 Pull requests on the FFmpeg forge that came out of this series and its
@@ -53,7 +88,7 @@ without a series patch is a change the series does not carry.
 | [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0035 |
 | [24835](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835) | `master` | merged 2026-10-19 (`fd9a8f25a07b`), in no release yet | avfilter/vf_tonemap_opencl: zero the peak detection buffer | 0016 |
 | [24970](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970) | `master` | open | avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED | 0001 |
-| [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | none |
+| [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | 0042 |
 | [24974](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974) | `master` | merged 2026-10-20 (`2a8c6d30b934`), in no release yet | avcodec/av1dec: remove the coding bias from exported chroma grain params | none |
 | [24975](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975) | `release/9.0` | merged 2026-10-12 (`7e93014c5bbb`), in no release yet | [release/9.0] hwcontext_vulkan: only originate host image layout transitions from copyable layouts | none |
 | [24977](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24977) | `master` | open | avcodec/vaapi_encode_h265: enable cu_qp_delta for ROI in CQP mode | none |
@@ -80,21 +115,43 @@ without a series patch is a change the series does not carry.
 | [25479](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25479) | `master` | open | avcodec: fix GCC 14 and 16 warnings in a64multienc, h264dec, vlc and wmadec | none |
 | [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
 | [25481](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25481) | `master` | open | tests/checkasm: move large scratch buffers to the heap | none |
-| [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | open | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
+| [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | merged 2026-11-02 (`f675c507e20a`), in no release yet | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
 | [25533](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25533) | `master` | open | checkasm/snowdsp: Include intmath before public headers | 0036 |
 | [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Assume the predicted luma point bound | 0037 |
 | [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: bound reference corner extension | 0038 |
 | [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
+| [25708](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708) | `master` | open | avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes | 0040, 0041 |
 
-State read from the FFmpeg forge on 2026-10-28.
+State read from the FFmpeg forge on 2026-11-04.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned
 base with the first release cut from that branch after the merge.
 
 The same facts are in `upstream-contributions.json`, one object per pull
-request, for other pages to read. The table is generated from that file:
+request, for other pages to read. Its `patch` field is a string of patch
+filenames separated by `, `, or an empty string when the series carries
+none. Every named patch must link to that pull request and match its state.
+The table lists all their series numbers and is generated from that file:
 edit the file, then run `python3 scripts/series.py contributions --write`.
+The pre-commit hook also regenerates and stages `README.md` whenever
+`upstream-contributions.json` is staged.
+
+Run `python3 scripts/upstream_drift.py` to compare recorded fields and
+`master_form` commits with the FFmpeg forge. Add `--fix` to update changed
+fields, set the checked date to today in UTC and regenerate the table.
+Unchanged files keep their bytes and checked date. The README table is checked
+even when the forge records match; `--fix` repairs a stale table without changing
+the checked date. Concurrent edits detected before writing abort the repair
+without changing any files. A merged or closed
+`covered_by` pull request still needs human review before dropping its patch;
+`--fix` reports it and exits 1. Tool errors exit 2.
+
+The daily upstream workflow runs `--fix` with read-only repository permissions.
+Changes appear in its job summary and the `upstream-drift` artifact as
+`upstream-drift.patch`; the job fails whenever changes need review or drift
+remains. Apply the downloaded patch with `git apply upstream-drift.patch`,
+review it and submit the update through the usual pull request process.
 
 ## Layout
 
@@ -174,8 +231,10 @@ prints one result per patch:
 
 The checks cover:
 
-- `make test`: series check, ruff, REUSE and the unit tests of
+- `make test`: series check, ruff, mutable defaults and the unit tests of
   `scripts/series.py`
+- REUSE compliance runs in the [REUSE workflow](.github/workflows/reuse.yml); the local `reuse-lint` hook in `lefthook.yml` runs `reuse lint` when REUSE 6.x is installed.
+- `python3 scripts/lint_mutable_defaults.py` (also `make lint-mutable-defaults`): Pylint checks Python sources for `dangerous-default-value` (W0102), including defaults bound to identifiers that ruff B006 misses. The script's `PYLINT_VERSION` pins Pylint; it uses that exact version on PATH or fetches it with `uvx`.
 - inside the series check: every patch with an upstream link has a record
   in `upstream-contributions.json` with a matching state, and the table in
   this file equals the one generated from the records. The check does not

@@ -1,0 +1,7 @@
+status = "submitted"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973"
+consumers = ["vmafx"]
+origin = "pull 168 review thread 4459606104 (Sourcery)"
+notes = """
+Routes failed CUDA plane copies through one context-pop cleanup path, preserves the copy error when popping succeeds, and reports pop failures as AVERROR_EXTERNAL. Allocation and push failures return before cleanup. The early-return leak predates patches 0040/0041 and also exists in FFmpeg master 200a98d5ba4a, libavfilter/vf_libvmaf.c:832-834. Mocked-driver tests inject all three plane-copy failures plus allocation, push and pop failures, check successful copy geometry at 8/10/12/16 bits, and detect a planted early return. Upstream pull request 24973 carries the master form of this fix as commit 95aa7b1c4052 (pop the CUDA context when cuMemcpy2D fails). Master copies one plane per call, so its fix differs in shape; this patch is the n9.0.2 form on top of the multi-plane copy from 0040/0041.
+"""
