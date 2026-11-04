@@ -107,6 +107,8 @@ def stack(directory: Path) -> list[Path]:
         lines = listing.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
         raise series.SeriesError(f"{listing}: {exc.strerror}") from exc
+    except UnicodeDecodeError as exc:
+        raise series.SeriesError(f"{listing}: {exc}") from exc
     names = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
     if not names:
         raise series.SeriesError(f"{listing}: lists no patch")

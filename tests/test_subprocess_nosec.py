@@ -200,7 +200,7 @@ class SubprocessNosecTest(unittest.TestCase):
 
         for relative in ("scripts/variant_sweep.py", "tests/test_variant_sweep.py"):
             with self.subTest(path=relative):
-                source = (ROOT / relative).read_text()
+                source = (ROOT / relative).read_text(encoding="utf-8")
                 self.assertEqual(find_subprocess_imports_without_nosec(source), [])
                 planted = re.sub(r"(import subprocess)\s+# nosec[^\n]*", r"\1", source)
                 self.assertEqual(len(find_subprocess_imports_without_nosec(planted)), 1)
@@ -261,7 +261,7 @@ class SubprocessNosecTest(unittest.TestCase):
 
         offenders = []
         for path in python_sources(ROOT, preserve_config=True):
-            source = path.read_text()
+            source = path.read_text(encoding="utf-8")
             offenders.extend(
                 f"{path.relative_to(ROOT)}:{line}"
                 for line in find_subprocess_calls_without_nosec(
@@ -298,7 +298,7 @@ class SubprocessNosecTest(unittest.TestCase):
             offenders.extend(
                 f"{relative}:{line}"
                 for line in find_subprocess_imports_without_nosec(
-                    path.read_text(), filename=relative
+                    path.read_text(encoding="utf-8"), filename=relative
                 )
             )
         self.assertEqual(offenders, [], "missing B404 rationale:\n" + "\n".join(offenders))
@@ -380,7 +380,9 @@ class SubprocessNosecTest(unittest.TestCase):
             relative = str(path.relative_to(ROOT))
             offenders.extend(
                 f"{relative}:{line}"
-                for line in find_blocking_calls_without_timeout(path.read_text(), filename=relative)
+                for line in find_blocking_calls_without_timeout(
+                    path.read_text(encoding="utf-8"), filename=relative
+                )
             )
         self.assertEqual(offenders, [], "missing subprocess timeout:\n" + "\n".join(offenders))
 

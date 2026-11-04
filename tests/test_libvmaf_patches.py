@@ -160,9 +160,11 @@ class LibvmafPatchesTest(unittest.TestCase):
         shutil.copyfile(ROOT / "tests/fixtures/libvmaf_cuda/vf_libvmaf.c", target)
         patches = [next((ROOT / "patches").glob(f"{number}-*.patch")) for number in PATCH_NUMBERS]
         run("git", "apply", "--whitespace=error", *(str(path) for path in patches), cwd=cls.tree)
-        cls.source = target.read_text()
-        target.write_text(cls.source.split("\nstatic int do_vmaf_cuda(", 1)[0] + "\n#endif\n")
-        (cls.tree / "harness.c").write_text(HARNESS)
+        cls.source = target.read_text(encoding="utf-8")
+        target.write_text(
+            cls.source.split("\nstatic int do_vmaf_cuda(", 1)[0] + "\n#endif\n", encoding="utf-8"
+        )
+        (cls.tree / "harness.c").write_text(HARNESS, encoding="utf-8")
         cls.compile_harness()
 
     @classmethod
@@ -239,11 +241,11 @@ class LibvmafPatchesTest(unittest.TestCase):
     def test_planted_early_return_is_detected(self) -> None:
         """Restoring the early return leaves the context pushed and is detected."""
         target = self.tree / "libavfilter/vf_libvmaf.c"
-        original = target.read_text()
+        original = target.read_text(encoding="utf-8")
         self.assertEqual(original.count("goto fail;"), 1)
         try:
             mutant = original.replace("goto fail;", "return AVERROR_EXTERNAL;")
-            target.write_text(mutant.replace("\nfail:\n", "\n"))
+            target.write_text(mutant.replace("\nfail:\n", "\n"), encoding="utf-8")
             self.compile_harness("mutant")
             result = run(str(self.tree / "mutant"), "0", "0", "2", "0", "8", cwd=self.tree)
             with self.assertRaisesRegex(AssertionError, "Lists differ"):
@@ -252,24 +254,24 @@ class LibvmafPatchesTest(unittest.TestCase):
                     [-1000, 1, 2, 1, 0, 1],
                 )
         finally:
-            target.write_text(original)
+            target.write_text(original, encoding="utf-8")
 
     def test_planted_added_trailing_space_is_rejected(self) -> None:
         """git apply refuses a patch whose added line ends in a space."""
         patches = [next((ROOT / "patches").glob(f"{n}-*.patch")) for n in PATCH_NUMBERS]
         bad = (
             patches[2]
-            .read_text()
+            .read_text(encoding="utf-8")
             .replace("+            goto fail;\n", "+            goto fail; \n")
         )
-        self.assertNotEqual(bad, patches[2].read_text())
+        self.assertNotEqual(bad, patches[2].read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:
             tree = Path(directory)
             run("git", "init", "--quiet", "--template=", cwd=tree)
             target = tree / "libavfilter/vf_libvmaf.c"
             target.parent.mkdir()
             shutil.copyfile(ROOT / "tests/fixtures/libvmaf_cuda/vf_libvmaf.c", target)
-            (tree / "bad.patch").write_text(bad)
+            (tree / "bad.patch").write_text(bad, encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "trailing whitespace"):
                 run(
                     "git",
@@ -292,7 +294,7 @@ class PatchWhitespaceTest(unittest.TestCase):
         """No patch in the series adds a line with trailing whitespace."""
         for path in sorted((ROOT / "patches").glob("*.patch")):
             with self.subTest(patch=path.name):
-                self.assert_added_whitespace(path.read_text())
+                self.assert_added_whitespace(path.read_text(encoding="utf-8"))
 
     def test_planted_trailing_space_and_tab_are_rejected(self) -> None:
         """The whitespace check refuses a trailing space and a trailing tab."""

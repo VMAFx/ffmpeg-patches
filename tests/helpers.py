@@ -297,8 +297,10 @@ def run_git(tree: Path, *args: str, preserve_config: bool = False) -> str:
 
 
 def write_base(root: Path, commit: str) -> None:
+    """Write fixture settings for the pinned upstream commit."""
     (root / "base.env").write_text(
-        f"FFMPEG_REMOTE=https://example.invalid/up.git\nFFMPEG_TAG=v1\nFFMPEG_COMMIT={commit}\n"
+        f"FFMPEG_REMOTE=https://example.invalid/up.git\nFFMPEG_TAG=v1\nFFMPEG_COMMIT={commit}\n",
+        encoding="utf-8",
     )
 
 

@@ -201,12 +201,13 @@ def git(
 
 
 def read_base(root: Path, findings: Findings) -> dict[str, str]:
+    """Read and validate the pinned upstream settings in base.env."""
     path = root / "base.env"
     if not path.is_file():
         findings.error("base.env", "missing")
         return {}
     values = {}
-    for number, raw in enumerate(path.read_text().splitlines(), 1):
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -224,12 +225,13 @@ def read_base(root: Path, findings: Findings) -> dict[str, str]:
 
 
 def read_series(root: Path, findings: Findings) -> list[str]:
+    """Read ordered patch names and report duplicate series entries."""
     path = root / "series.txt"
     if not path.is_file():
         findings.error("series.txt", "missing")
         return []
     names: list[str] = []
-    for number, line in enumerate(path.read_text().splitlines(), 1):
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         name = line.strip()
         if not name or name.startswith("#"):
             continue
@@ -250,7 +252,7 @@ def check_patch_name(name: str, position: int, findings: Findings) -> None:
 
 def check_patch_form(path: Path, findings: Findings) -> None:
     """Require `git format-patch` form: zero From line, headers, sign-off, diff."""
-    text = path.read_text(errors="replace")
+    text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     name = path.name
     if not lines or not FROM_LINE.match(lines[0]):
@@ -377,12 +379,13 @@ def check_exceptions_metadata(data: dict, name: str, findings: Findings, today: 
 
 
 def check_metadata(path: Path, findings: Findings, today: date | None = None) -> None:
+    """Validate one patch sidecar and record every metadata finding."""
     name = path.name
     if today is None:
         today = date.today()
     try:
-        data = tomllib.loads(path.read_text())
-    except tomllib.TOMLDecodeError as exc:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         findings.error(name, f"invalid TOML: {exc}")
         return
     for key in sorted(set(data) - METADATA_KEYS):
@@ -534,12 +537,13 @@ def refuse_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def read_contributions(root: Path, findings: Findings) -> dict | None:
+    """Read contribution JSON and report malformed data or duplicate keys."""
     path = root / CONTRIBUTIONS
     if not path.is_file():
         findings.error(CONTRIBUTIONS, "missing")
         return None
     try:
-        data = json.loads(path.read_text(), object_pairs_hook=refuse_duplicates)
+        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=refuse_duplicates)
     except ValueError as exc:
         findings.error(CONTRIBUTIONS, f"invalid JSON: {exc}")
         return None
@@ -602,15 +606,16 @@ def check_entry(entry: dict, findings: Findings) -> None:
         )
 
 
-def patch_links(root: Path, names: list[str]) -> dict[str, tuple[str, str]]:
+def patch_links(root: Path, names: list[str], findings: Findings) -> dict[str, tuple[str, str]]:
     """Map each listed patch that was sent upstream to (status, upstream link)."""
     links: dict[str, tuple[str, str]] = {}
     for name in names:
         sidecar = (root / "patches" / name).with_suffix(".toml")
         try:
-            data = tomllib.loads(sidecar.read_text())
-        except (OSError, tomllib.TOMLDecodeError):
-            continue  # check_metadata() reports it
+            data = tomllib.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            findings.error(str(sidecar), f"invalid metadata: {exc}")
+            continue
         status, link = data.get("status"), str(data.get("upstream", ""))
         if status in FORGE_STATES and link.startswith("https://"):
             links[name] = (status, link)
@@ -659,7 +664,7 @@ def checked_contributions(root: Path, names: list[str], findings: Findings) -> d
     numbers = [entry["number"] for entry in entries]
     if numbers != sorted(set(numbers)):
         findings.error(CONTRIBUTIONS, "numbers must be unique and ascending")
-    check_records(entries, patch_links(root, names), findings)
+    check_records(entries, patch_links(root, names, findings), findings)
     return data if len(findings.errors) == before else None
 
 
@@ -697,11 +702,12 @@ def readme_block(text: str) -> str | None:
 
 
 def check_contributions(root: Path, names: list[str], findings: Findings) -> None:
+    """Validate contribution records and their rendered README table."""
     data = checked_contributions(root, names, findings)
     if data is None:
         return
     readme = root / "README.md"
-    block = readme_block(readme.read_text()) if readme.is_file() else None
+    block = readme_block(readme.read_text(encoding="utf-8")) if readme.is_file() else None
     if block is None:
         findings.error("README.md", f"lacks one {TABLE_START} ... {TABLE_END} block")
     elif block != contributions_table(data):
@@ -725,12 +731,12 @@ def contributions(root: Path, write: bool) -> int:
         print(table)
         return 0
     readme = root / "README.md"
-    text = readme.read_text() if readme.is_file() else ""
+    text = readme.read_text(encoding="utf-8") if readme.is_file() else ""
     if readme_block(text) is None:
         raise SeriesError(f"README.md lacks one {TABLE_START} ... {TABLE_END} block")
     head, _, rest = text.partition(TABLE_START)
     tail = rest.partition(TABLE_END)[2]
-    readme.write_text(f"{head}{TABLE_START}\n{table}\n{TABLE_END}{tail}")
+    readme.write_text(f"{head}{TABLE_START}\n{table}\n{TABLE_END}{tail}", encoding="utf-8")
     return 0
 
 
@@ -800,12 +806,15 @@ def content_present(tree: Path, patch: Path) -> bool:
     neither a reverse apply nor a 3-way merge recognises it; the added
     lines themselves still match.
     """
-    runs = added_runs(patch.read_text(errors="replace"))
+    runs = added_runs(patch.read_text(encoding="utf-8", errors="replace"))
     for path, file_runs in runs.items():
         target = tree / path
         if not target.is_file():
             return False
-        lines = [line.rstrip() for line in target.read_text(errors="replace").splitlines()]
+        lines = [
+            line.rstrip()
+            for line in target.read_text(errors="replace", encoding="utf-8").splitlines()
+        ]
         if not all(contains_run(lines, run) for run in file_runs):
             return False
     return bool(runs)
@@ -859,6 +868,7 @@ def fetch_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
 
 
 def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -> str:
+    """Fetch and apply the recorded master form, returning its result."""
     fetch_master_form(tree, patch, url, form)
     base, head = form["base"], form["head"]
     diff = git(tree, "diff", "--binary", "--full-index", base, head).stdout
@@ -866,7 +876,7 @@ def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
         raise SeriesError(f"{patch.name}: empty master form {base}..{head} from {url}")
     with tempfile.TemporaryDirectory() as scratch:
         path = Path(scratch) / "master.patch"
-        path.write_text(diff)
+        path.write_text(diff, encoding="utf-8")
         applied = git(tree, "apply", "--3way", "--index", str(path), check=False)
     if applied.returncode:
         git(tree, "reset", "-q", "--hard", "HEAD")
@@ -953,10 +963,11 @@ def renamed_sidecars(patches: Path, new_names: list[str]) -> None:
 
 
 def write_series(root: Path, names: list[str]) -> None:
+    """Write ordered patch names while preserving series header comments."""
     path = root / "series.txt"
-    old = path.read_text().splitlines() if path.is_file() else []
+    old = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
     header = [line for line in old if line.startswith("#")]
-    path.write_text("\n".join([*header, *names]) + "\n")
+    path.write_text("\n".join([*header, *names]) + "\n", encoding="utf-8")
 
 
 def pinned_commit(root: Path) -> str:
@@ -1051,7 +1062,8 @@ def triage_warnings(lines: list[str], files: set[str]) -> tuple[list[str], int]:
 def warnings_gate(
     root: Path, tree: Path, log: Path, report: Path | None, base: str | None = None
 ) -> int:
-    lines = log.read_text(errors="replace").splitlines()
+    """Report build warnings in series files; return 1 when any is found."""
+    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
     own, other = triage_warnings(lines, series_files(root, tree, base))
     for line in own:
         print(line)
@@ -1095,7 +1107,8 @@ def coverage_report(files: set[str], lines: list[str]) -> tuple[int, list[str]]:
 def coverage_gate(
     root: Path, tree: Path, log: Path, report: Path | None, base: str | None = None
 ) -> int:
-    lines = log.read_text(errors="replace").splitlines()
+    """Report coverage of the compiled series files and return its status."""
+    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
     status, out = coverage_report(series_files(root, tree, base), lines)
     print("\n".join(out))
     if report is not None:
@@ -1106,7 +1119,7 @@ def coverage_gate(
 
 def patch_subject(path: Path) -> str:
     """The Subject header without its [PATCH] prefix, unfolded."""
-    header = path.read_text(errors="replace").split("\n\n", 1)[0]
+    header = path.read_text(encoding="utf-8", errors="replace").split("\n\n", 1)[0]
     match = re.search(r"^Subject: \[PATCH\] (.*(?:\n .*)*)", header, re.MULTILINE)
     return " ".join(match.group(1).split()) if match else path.name
 
@@ -1117,10 +1130,10 @@ def note_metadata(path: Path) -> dict:
     if not path.is_file():
         raise SeriesError(f"{path.name}: listed in series.txt but missing from patches/")
     try:
-        meta = tomllib.loads(sidecar.read_text())
+        meta = tomllib.loads(sidecar.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise SeriesError(f"{path.name}: no metadata file patches/{sidecar.name}") from None
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise SeriesError(f"patches/{sidecar.name}: {exc}") from exc
     if "status" not in meta:
         raise SeriesError(f"patches/{sidecar.name}: no status")
@@ -1432,6 +1445,7 @@ def triage_single_finding(
 
 
 def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]:
+    """Return a sidecar's length exceptions and whether its metadata had errors."""
     if not sidecar.is_file():
         return [], False
     meta_findings = Findings()
@@ -1442,8 +1456,8 @@ def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]
         for err in meta_findings.errors:
             print(f"error: {err}", file=sys.stderr)
     try:
-        data = tomllib.loads(sidecar.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        data = tomllib.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         # An unreadable sidecar excuses nothing and fails the gate.
         print(f"error: {sidecar.name}: {exc}", file=sys.stderr)
         return [], True
@@ -1573,6 +1587,7 @@ def scope_patch_paths(root: Path, changed: list[str], refs: tuple[str, str]) -> 
 def scope_reasons(
     root: Path, changed: list[str], targets: dict[str, set[str]]
 ) -> dict[str, list[str]]:
+    """Map changed paths and graph targets to the checks they require."""
     infra = {
         ".github/workflows/series.yml",
         ".github/actions/prepare-series/action.yml",
@@ -1586,7 +1601,11 @@ def scope_reasons(
     ffmpeg = tree | {"scripts/tonemap_parity.py"}
     sources = root / ".config/clang-tidy/sources.txt"
     if sources.is_file():
-        ffmpeg.update(line.strip() for line in sources.read_text().splitlines() if line.strip())
+        ffmpeg.update(
+            line.strip()
+            for line in sources.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
     reasons: dict[str, list[str]] = {"ffmpeg": [], "parity": [], "macos": []}
     for path in changed:
         gpu_test = path == "tests/helpers.py" or bool(

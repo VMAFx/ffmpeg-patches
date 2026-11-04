@@ -19,7 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def libvmaf_step() -> dict:
     """Locate the dependency build in the composite action."""
-    action = yaml.safe_load((ROOT / ".github/actions/prepare-series/action.yml").read_text())
+    action = yaml.safe_load(
+        (ROOT / ".github/actions/prepare-series/action.yml").read_text(encoding="utf-8")
+    )
     return next(step for step in action["runs"]["steps"] if "LIBVMAF_COMMIT" in step.get("env", {}))
 
 
@@ -34,7 +36,7 @@ def run_build(step: dict, actual: str) -> tuple[subprocess.CompletedProcess[str]
             "pkg-config": "echo 3.2.0\n",
         }.items():
             script = root / name
-            script.write_text("#!/bin/bash\n" + body)
+            script.write_text("#!/bin/bash\n" + body, encoding="utf-8")
             script.chmod(0o755)
         environment = dict(os.environ)
         environment.update(step["env"])
@@ -55,13 +57,15 @@ def run_build(step: dict, actual: str) -> tuple[subprocess.CompletedProcess[str]
             check=False,
         )
         commands = root / "commands"
-        return result, commands.read_text() if commands.exists() else ""
+        return result, commands.read_text(encoding="utf-8") if commands.exists() else ""
 
 
 class PrepareSeriesTest(unittest.TestCase):
     def test_linux_configuration_compiles_libvmaf(self) -> None:
         """The coverage job must explicitly enable the changed filter."""
-        workflow = yaml.safe_load((ROOT / ".github/workflows/series.yml").read_text())
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
+        )
         steps = workflow["jobs"]["apply-build"]["steps"]
         configure = next(step["run"] for step in steps if step.get("name") == "Configure FFmpeg")
         arguments = shlex.split(configure.split("../ffmpeg/configure", 1)[1])
