@@ -18,10 +18,17 @@ try:
 except ModuleNotFoundError:
     from scripts import forge_settings
 
-API = f"{forge_settings.api_base()}/repos/{forge_settings.REPO}"
-API_HOST = forge_settings.host()
-SETTINGS = f"{forge_settings.api_base()}/settings/api"
 PAGE_CACHE = {}
+
+
+def api_url():
+    """Resolve the configured repository API endpoint only when needed."""
+    return f"{forge_settings.api_base()}/repos/{forge_settings.repo()}"
+
+
+def settings_url():
+    """Resolve the configured API settings endpoint only when needed."""
+    return f"{forge_settings.api_base()}/settings/api"
 
 
 class RefusedURL(ValueError):
@@ -32,7 +39,7 @@ def check_url(url):
     """Reject URLs outside HTTPS on the allow-listed API host."""
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or forge_settings.authority(url) != forge_settings.authority(
-        API_HOST
+        forge_settings.host()
     ):
         raise RefusedURL(url)
 
@@ -60,7 +67,7 @@ def discover_page_size():
     """Discover and cache the forge API page size, bounded by 50."""
     if "page_size" in PAGE_CACHE:
         return PAGE_CACHE["page_size"]
-    settings = get(SETTINGS)
+    settings = get(settings_url())
     if not isinstance(settings, dict):
         raise ValueError("expected a dict from /settings/api")
     if "max_response_items" not in settings:
@@ -74,7 +81,7 @@ def discover_page_size():
 
 def get(path):
     """Decode an API GET with a deadline and allow-listed initial and redirect URLs."""
-    url = path if urllib.parse.urlsplit(path).scheme else API + path
+    url = path if urllib.parse.urlsplit(path).scheme else api_url() + path
     check_url(url)
     with OPENER.open(url, timeout=30) as r:
         return json.load(r)
@@ -315,13 +322,23 @@ def utc_now():
 
 
 def main(argv):
+    """Dispatch self-tests or validate settings before reading and reporting threads."""
+    if argv == ["--self-test"]:
+        return self_test()
+    try:
+        api_url()
+    except ValueError as error:
+        print(f"fairy_unanswered: {error}", file=sys.stderr)
+        return 1
+    return _read_and_report()
+
+
+def _read_and_report():
     """Read all review pages, print owed PR/issue counts, and return an exit status.
 
     Reads are not atomic. A reply posted between read_from and read_to may
     show as owed; a rerun clears it.
     """
-    if argv == ["--self-test"]:
-        return self_test()
     try:
         PAGE_CACHE.clear()
         discover_page_size()

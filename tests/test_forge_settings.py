@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib
 import io
 import json
 import os
 import subprocess  # nosec B404 - fixed ffmpeg-forgejo invocation in test fixtures.
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -194,15 +196,15 @@ class ForgeSettingsPositiveTest(ForgeSettingsTestCase):
 
     def test_dynamic_repo_attribute(self) -> None:
         """The dynamic REPO attribute and Fairy API use the configured repository."""
-        try:
-            with unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_REPO": "owner/project"}):
+        for repo in ("owner/project", "other/repo"):
+            with (
+                self.subTest(repo=repo),
+                unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_REPO": repo}),
+            ):
                 self.assertEqual(forge_settings.REPO, forge_settings.repo())
-                importlib.reload(fairy_unanswered)
                 self.assertEqual(
-                    fairy_unanswered.API, f"{forge_settings.api_base()}/repos/owner/project"
+                    fairy_unanswered.api_url(), f"{forge_settings.api_base()}/repos/{repo}"
                 )
-        finally:
-            importlib.reload(fairy_unanswered)
 
     def test_fixture_settings_isolation_and_restore(self) -> None:
         """Default fixtures clear four overrides and restore them during cleanup."""
@@ -454,7 +456,39 @@ class ForgeSettingsBoundaryTest(ForgeSettingsTestCase):
 
 
 class ForgeSettingsSourceScanTest(unittest.TestCase):
-    """Enforce absence of hard-coded forge literals across repository scripts."""
+    """Enforce shared forge configuration and deferred validation across scripts."""
+
+    def test_settings_consumers_import_with_invalid_environment(self) -> None:
+        """Every forge settings consumer defers validation until runtime."""
+        scripts_dir = ROOT / "scripts"
+        modules = []
+        for path in sorted(scripts_dir.glob("*.py")):
+            imports = set()
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    imports.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    imports.add(node.module)
+                    imports.update(f"{node.module}.{alias.name}" for alias in node.names)
+            if imports.intersection({"forge_settings", "scripts.forge_settings"}):
+                modules.append(path.stem)
+        self.assertIn("fairy_unanswered", modules)
+        for module in modules:
+            with self.subTest(module=module):
+                proc = subprocess.run(  # nosec B603 - local module found by AST scan.
+                    [sys.executable, "-c", f"import {module}"],
+                    cwd=scripts_dir,
+                    env=dict(
+                        os.environ,
+                        FFMPEG_FORGEJO_HOST="http://bad",
+                        FFMPEG_FORGEJO_REPO="bad",
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_source_scan_forbids_literals_in_scripts(self) -> None:
         """Every script outside forge_settings.py forbids hard-coded forge literals."""
