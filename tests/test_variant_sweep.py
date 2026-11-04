@@ -13,7 +13,6 @@ import tempfile
 import unittest
 from functools import partial
 from pathlib import Path
-from unittest import mock
 
 from scripts import variant_sweep
 from tests.helpers import run_git as fixture_git
@@ -356,7 +355,7 @@ int sibling(int x)
             foreign = Path(other)
             run_git(foreign, "init", "-q")
             run_git(foreign, "commit", "--allow-empty", "-qm", "foreign")
-            with mock.patch.dict(os.environ, {"GIT_DIR": str(foreign / ".git")}):
+            with unittest.mock.patch.dict(os.environ, {"GIT_DIR": str(foreign / ".git")}):
                 result = self.sweep("HEAD")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"head: {head}\n", self.output.read_text())
@@ -534,8 +533,8 @@ int sibling(int s) {
                 return BrokenWriter(stream) if "w" in mode else stream
 
             with (
-                mock.patch.object(variant_sweep, "sweep", return_value=new),
-                mock.patch.object(Path, "open", open_file),
+                unittest.mock.patch.object(variant_sweep, "sweep", return_value=new),
+                unittest.mock.patch.object(Path, "open", open_file),
                 contextlib.redirect_stderr(io.StringIO()) as errors,
             ):
                 status = variant_sweep.main(
@@ -564,8 +563,8 @@ int sibling(int s) {
                 return replace(source, destination)
 
             with (
-                mock.patch.object(variant_sweep, "sweep", return_value=new),
-                mock.patch("os.replace", side_effect=replace_file),
+                unittest.mock.patch.object(variant_sweep, "sweep", return_value=new),
+                unittest.mock.patch("os.replace", side_effect=replace_file),
             ):
                 status = variant_sweep.main(
                     ["--class", "unchecked-return", "base", "head", "-o", str(output)]
@@ -586,8 +585,8 @@ class SweepLimitTest(unittest.TestCase):
 
         head = self.commit_head(BASE.replace("    write(s);", "    return write(s);"))
         with (
-            mock.patch.object(variant_sweep, "MAX_SWEEP_SECONDS", 1, create=True),
-            mock.patch("time.monotonic", side_effect=[0, 0, 0, 0.75, 1.1]),
+            unittest.mock.patch.object(variant_sweep, "MAX_SWEEP_SECONDS", 1, create=True),
+            unittest.mock.patch("time.monotonic", side_effect=[0, 0, 0, 0.75, 1.1]),
             self.assertRaisesRegex(RuntimeError, "sweep deadline"),
         ):
             variant_sweep.sweep(str(self.repo), self.base, head)
@@ -607,7 +606,7 @@ class SweepLimitTest(unittest.TestCase):
         ):
             with (
                 self.subTest(limit=name),
-                mock.patch.object(variant_sweep, name, bound, create=True),
+                unittest.mock.patch.object(variant_sweep, name, bound, create=True),
             ):
                 self.assertEqual(variant_sweep.sweep(str(self.repo), self.base, head), expected)
 
@@ -625,7 +624,7 @@ class SweepLimitTest(unittest.TestCase):
         ):
             with (
                 self.subTest(limit=name),
-                mock.patch.object(variant_sweep, name, value, create=True),
+                unittest.mock.patch.object(variant_sweep, name, value, create=True),
                 self.assertRaisesRegex(RuntimeError, diagnostic),
             ):
                 variant_sweep.sweep(str(self.repo), self.base, head)
@@ -649,8 +648,8 @@ class SweepLimitTest(unittest.TestCase):
         ):
             with (
                 self.subTest(limit=name),
-                mock.patch.object(variant_sweep, name, bound, create=True),
-                mock.patch.object(variant_sweep, "git", side_effect=observe),
+                unittest.mock.patch.object(variant_sweep, name, bound, create=True),
+                unittest.mock.patch.object(variant_sweep, "git", side_effect=observe),
                 self.assertRaisesRegex(RuntimeError, diagnostic),
             ):
                 variant_sweep.sweep(str(self.repo), self.base, head)
