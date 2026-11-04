@@ -8,3 +8,7 @@ pylint==4.1.3
 numpy==2.5.4
 # PyYAML: tests read lefthook.yml and workflows.
 pyyaml==6.0.3
+# tree-sitter: scripts/series.py measures C function spans (HISS-04 lengths gate).
+tree-sitter==0.26.0
+# tree-sitter-c: scripts/series.py measures C function spans (HISS-04 lengths gate).
+tree-sitter-c==0.24.2

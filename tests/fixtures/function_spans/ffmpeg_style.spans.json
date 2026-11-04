@@ -1,0 +1,86 @@
+{
+  "init_context": [
+    [
+      32,
+      37,
+      6
+    ]
+  ],
+  "uninit_context": [
+    [
+      39,
+      43,
+      5
+    ]
+  ],
+  "multi_param": [
+    [
+      45,
+      50,
+      6
+    ]
+  ],
+  "nested_braces": [
+    [
+      52,
+      60,
+      9
+    ]
+  ],
+  "if_inside_body": [
+    [
+      62,
+      70,
+      9
+    ]
+  ],
+  "optional_feature_calc": [
+    [
+      73,
+      76,
+      4
+    ]
+  ],
+  "simple_helper": [
+    [
+      79,
+      82,
+      4
+    ]
+  ],
+  "clamp_val": [
+    [
+      84,
+      91,
+      8
+    ]
+  ],
+  "process_plane": [
+    [
+      93,
+      103,
+      11
+    ]
+  ],
+  "compute_sum": [
+    [
+      105,
+      112,
+      8
+    ]
+  ],
+  "filter_frame": [
+    [
+      114,
+      118,
+      5
+    ]
+  ],
+  "close_filter": [
+    [
+      120,
+      124,
+      5
+    ]
+  ]
+}
