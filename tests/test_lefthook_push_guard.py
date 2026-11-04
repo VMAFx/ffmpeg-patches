@@ -188,9 +188,42 @@ class LefthookPushGuardTest(unittest.TestCase):
             script.read_text(encoding="utf-8"),
         )
 
+    def test_contributions_table_regenerates_and_stages_readme(self) -> None:
+        """Regenerate and stage README only when contribution data is staged."""
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        command = config["pre-commit"]["commands"]["contributions-table"]
+        self.assertEqual(command["glob"], "upstream-contributions.json")
+        self.assertEqual(
+            command["run"],
+            "sh .config/lefthook/python.sh scripts/series.py contributions --write "
+            "&& git add README.md",
+        )
+
+    def test_planted_contributions_hook_omissions_are_refused(self) -> None:
+        """Refuse a missing trigger, generator, staging command or failure guard."""
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        command = config["pre-commit"]["commands"]["contributions-table"]
+        for field, value in (
+            ("glob", "README.md"),
+            ("run", "git add README.md"),
+            ("run", command["run"].partition(" && ")[0]),
+            ("run", command["run"].replace(" && ", " ; ")),
+        ):
+            with self.subTest(field=field, value=value):
+                planted = yaml.safe_load(yaml.safe_dump(config))
+                planted["pre-commit"]["commands"]["contributions-table"][field] = value
+                result = run_with_fixture(
+                    "test_contributions_table_regenerates_and_stages_readme",
+                    {"lefthook.yml": yaml.safe_dump(planted)},
+                )
+                self.assertEqual(len(result.failures), 1)
+                self.assertFalse(result.errors)
+
     def test_contributing_dependency_pins_match_ci(self) -> None:
         """CI jobs install the documented hashed lockfile before consuming dependencies."""
-        workflow = yaml.safe_load((ROOT / ".github/workflows/series.yml").read_text("utf-8"))
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
+        )
         self.assertEqual(_series_install_findings(workflow), [])
         prefix = "python3 -m pip install "
         documented_commands = [

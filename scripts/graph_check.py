@@ -62,12 +62,13 @@ def auto_filters(dump: dict) -> list[tuple[str, str]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Report unexpected automatically inserted filters in the graph dump."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("graphs", type=Path, help="JSON written by -print_graphs_file")
     parser.add_argument("--allow", action="append", default=[], metavar="FILTER")
     args = parser.parse_args(argv)
     try:
-        found = auto_filters(json.loads(args.graphs.read_text()))
+        found = auto_filters(json.loads(args.graphs.read_text(encoding="utf-8")))
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"graph_check: {args.graphs}: not a graph dump: {exc!r}", file=sys.stderr)
         return 2

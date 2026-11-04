@@ -220,7 +220,9 @@ def timed_run(ffmpeg: str, pre: list[str], clip: str, vf: str, work: Path) -> di
     if smi is not None:
         smi.terminate()
         smi.wait(timeout=PROBE_TIMEOUT_S)
-        peak = max((int(x) for x in log.read_text().split() if x.isdigit()), default=None)
+        peak = max(
+            (int(x) for x in log.read_text(encoding="utf-8").split() if x.isdigit()), default=None
+        )
     above = None if peak is None or idle is None else peak - idle
     return {
         "rc": rc,
@@ -300,6 +302,7 @@ def candidate(run: Session, name: str, vf: str, pre: list[str], ref: np.ndarray)
 
 
 def main(argv: list[str]) -> int:
+    """Compare reference and candidate tonemap paths; return 0 when all pass."""
     args = parse(argv)
     self_check()
     cands, pres = pairs(args.cand, "cand"), pairs(args.pre, "pre")
@@ -315,7 +318,7 @@ def main(argv: list[str]) -> int:
     for name, row in report["paths"].items():
         print(name, " ".join(f"{k}={v}" for k, v in row.items() if k not in ("vf", "pre")))
     if args.json:
-        Path(args.json).write_text(json.dumps(report, indent=2) + "\n")
+        Path(args.json).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return 0 if all(r.get("pass", True) for r in report["paths"].values()) else 1
 
 

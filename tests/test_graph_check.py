@@ -57,7 +57,8 @@ class GraphCheckTest(unittest.TestCase):
     def test_name_of_another_filter_is_not_auto(self) -> None:
         # An instance id that looks like auto_scale_0 on a filter that is not
         # scale did not come from the format negotiation.
-        dump = json.loads((FIXTURES / "auto-scale.json").read_text())
+        """Verify name of another filter is not auto."""
+        dump = json.loads((FIXTURES / "auto-scale.json").read_text(encoding="utf-8"))
         renamed = copy.deepcopy(dump)
         for flt in renamed["graphs"][0]["filters"]:
             if flt["filter_name"] == "scale":
@@ -66,11 +67,12 @@ class GraphCheckTest(unittest.TestCase):
         self.assertEqual(len(graph_check.auto_filters(dump)), 1)
 
     def test_unreadable_dump_is_an_error(self) -> None:
+        """Verify unreadable dump is an error."""
         with tempfile.TemporaryDirectory() as tmp:
             bad = Path(tmp) / "bad.json"
-            bad.write_text('{"graphs": [{"name": "no filters key"}]}')
+            bad.write_text('{"graphs": [{"name": "no filters key"}]}', encoding="utf-8")
             self.assertEqual(check(str(bad))[0], 2)
-            bad.write_text("not json")
+            bad.write_text("not json", encoding="utf-8")
             self.assertEqual(check(str(bad))[0], 2)
             self.assertEqual(check(str(Path(tmp) / "missing.json"))[0], 2)
 

@@ -42,12 +42,13 @@ class LengthFixture:
         self.base = init_upstream(
             self.tree, self.root, lambda: self.write_file("lib.c", build_c_function("f", 58))
         )
-        (self.root / "series.txt").write_text("# header\n")
+        (self.root / "series.txt").write_text("# header\n", encoding="utf-8")
 
     def write_file(self, relpath: str, lines: list[str]) -> None:
+        """Write the supplied source lines to the requested fixture path."""
         path = self.tree / relpath
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines) + "\n")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def commit_file(self, relpath: str, lines: list[str], msg: str) -> None:
         self.write_file(relpath, lines)
@@ -55,15 +56,17 @@ class LengthFixture:
         run_git(self.tree, "commit", "-q", "-s", "-m", msg)
 
     def export(self) -> list[str]:
+        """Export fixture patches and return their names."""
         with contextlib.redirect_stderr(io.StringIO()):
             names = series.export_series(self.root, self.tree)
         for name in names:
             sidecar = (self.root / "patches" / name).with_suffix(".toml")
             if not sidecar.exists():
-                sidecar.write_text('status = "unsubmitted"\nconsumers = ["a"]\n')
+                sidecar.write_text('status = "unsubmitted"\nconsumers = ["a"]\n', encoding="utf-8")
         return names
 
     def set_exception(self, patch_name: str, lines: int, **overrides: str) -> None:
+        """Write the requested function-length exception into fixture metadata."""
         path = overrides.get("path", "lib.c")
         function = overrides.get("function", "f")
         category = overrides.get("category", "B")
@@ -84,7 +87,7 @@ class LengthFixture:
             f'expires = "{expires}"\n'
             f'reason = "{reason}"\n'
         )
-        sidecar.write_text(content)
+        sidecar.write_text(content, encoding="utf-8")
 
 
 def run_series_cli(root: Path, *args: str) -> tuple[int, str, str]:
@@ -185,10 +188,11 @@ class TestFunctionLengths(unittest.TestCase):
         self.assertIn("without a live exception", out)
 
     def test_unreadable_metadata_fails(self) -> None:
+        """Verify unreadable metadata fails."""
         self.fx.commit_file("lib.c", build_c_function("f", 59), "grow f to 59")
         names = self.fx.export()
         sidecar = (self.fx.root / "patches" / names[0]).with_suffix(".toml")
-        sidecar.write_text("[[exceptions]\n")
+        sidecar.write_text("[[exceptions]\n", encoding="utf-8")
         rc, _, err = run_series_cli(
             self.fx.root, "lengths", str(self.fx.tree), "--today", "2026-10-18"
         )
@@ -265,12 +269,13 @@ class TestFunctionLengths(unittest.TestCase):
         self.assertIn("commit count 2 differs from series length 1", err)
 
     def test_metadata_validation_errors(self) -> None:
+        """Verify metadata validation errors."""
         sidecar = self.fx.root / "test.toml"
 
         def write_sidecar(exc_table: str) -> series.Findings:
             f = series.Findings()
             content = f'status = "unsubmitted"\nconsumers = ["a"]\n\n[[exceptions]]\n{exc_table}\n'
-            sidecar.write_text(content)
+            sidecar.write_text(content, encoding="utf-8")
             series.check_metadata(sidecar, f, today=date(2026, 10, 18))
             return f
 
@@ -304,10 +309,11 @@ class TestFunctionLengths(unittest.TestCase):
         self.assertTrue(any("'lines' must be > 60" in e for e in f.errors))
 
     def test_report_file_appends_summary(self) -> None:
+        """Verify report file appends summary."""
         self.fx.commit_file("lib.c", build_c_function("f", 60), "grow f to 60")
         self.fx.export()
         report_file = self.fx.root / "report.md"
-        report_file.write_text("# Initial Report\n\n")
+        report_file.write_text("# Initial Report\n\n", encoding="utf-8")
         rc, _, _ = run_series_cli(
             self.fx.root,
             "lengths",
@@ -318,7 +324,7 @@ class TestFunctionLengths(unittest.TestCase):
             "2026-10-18",
         )
         self.assertEqual(rc, 0)
-        content = report_file.read_text()
+        content = report_file.read_text(encoding="utf-8")
         expected = "# Initial Report\n\n0 function(s) over 60 lines, 0 excused, 0 failing\n"
         self.assertIn(expected, content)
 

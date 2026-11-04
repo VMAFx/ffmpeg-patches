@@ -27,14 +27,14 @@ def github_yaml_files() -> list[Path]:
 
 def load_base_action() -> dict:
     """Read the actual shared base-loading action."""
-    return yaml.safe_load(BASE_ACTION.read_text())
+    return yaml.safe_load(BASE_ACTION.read_text(encoding="utf-8"))
 
 
 def run_load_base(contents: str) -> tuple[subprocess.CompletedProcess[str], str]:
     """Execute the action's actual script with isolated input and output files."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / "base.env").write_text(contents)
+        (root / "base.env").write_text(contents, encoding="utf-8")
         github_env = root / "github-env"
         github_env.touch()
         result = subprocess.run(  # nosec B603 B607 - fixed bash, fixture-only local input.
@@ -54,7 +54,7 @@ def run_load_base(contents: str) -> tuple[subprocess.CompletedProcess[str], str]
             timeout=10,
             check=False,
         )
-        return result, github_env.read_text()
+        return result, github_env.read_text(encoding="utf-8")
 
 
 class WorkflowActionsTest(unittest.TestCase):
@@ -76,14 +76,14 @@ class WorkflowActionsTest(unittest.TestCase):
         for path in github_yaml_files():
             if path != PYTHON_ACTION:
                 with self.subTest(path=path.relative_to(ROOT)):
-                    self.assert_python_setup_is_shared(path.read_text())
+                    self.assert_python_setup_is_shared(path.read_text(encoding="utf-8"))
 
     def test_base_loading_has_single_owner(self) -> None:
         """Only load-base may export the pinned base inline."""
         for path in github_yaml_files():
             if path != BASE_ACTION:
                 with self.subTest(path=path.relative_to(ROOT)):
-                    self.assert_base_loading_is_shared(path.read_text())
+                    self.assert_base_loading_is_shared(path.read_text(encoding="utf-8"))
 
     def test_planted_raw_python_setup_is_rejected(self) -> None:
         """Reject planted raw setup-python steps in workflows and composites."""
