@@ -3,10 +3,15 @@
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 .PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings build test lint apply lengths lengths-local dist
+.PHONY: fairy-requests
 
 DOCSTRING_BASE ?= origin/main
 
 all: build
+
+# Optional live check; keep network access outside verify-all.
+fairy-requests:
+	@bash scripts/ffmpeg-forgejo fairy-requests --skip-unavailable
 
 verify-all: compile-context-verify caveman-sources audit docstrings test lengths-local
 

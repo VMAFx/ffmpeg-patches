@@ -13,7 +13,8 @@
 #                          --lease force-pushes only while the remote branch is still <sha>
 #   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
-#                          (exit 77); --overlap-ok permits exactly that PR; exits 3 when no reviewer was requested
+#                          (exit 77); --overlap-ok permits exactly that PR;
+#                          exits 3 when Fairy is missing or no human reviewer is requested
 #                          pr/push require a sweep for the local head; every row must be fold or follow-up: <reproducer path>
 #   ffmpeg-forgejo issue   <title> <body-file>
 #   ffmpeg-forgejo comment (--tested-head <sha> | --no-test-claims) <number> <body-file>
@@ -26,8 +27,10 @@
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
 #   ffmpeg-forgejo fairy-reviews [<number>...]        count submitted Fairy reviews; default: own open PRs
 #   ffmpeg-forgejo fairy-reviews --from-json <file>  offline count, newest state and 12-hex commit (tab separated)
+#   ffmpeg-forgejo fairy-requests [--skip-unavailable]  fail on own PRs older than 15 min without Fairy
 # Environment: FFMPEG_FORGEJO_REPO (default FFmpeg/FFmpeg), FFMPEG_FORGEJO_BASE (default master),
 #   FFMPEG_FORGEJO_API (API base override, for tests), FFMPEG_FORGEJO_GIT (upstream Git URL override).
+#   FFMPEG_FORGEJO_BOT_REVIEWER (default Forgejo_Fairy), FFMPEG_FORGEJO_OFFLINE=1 (skip optional check).
 set -euo pipefail
 
 HOST="https://code.ffmpeg.org"
@@ -36,6 +39,7 @@ REPO="${FFMPEG_FORGEJO_REPO:-FFmpeg/FFmpeg}"
 BASE="${FFMPEG_FORGEJO_BASE:-master}"
 GIT_URL="${FFMPEG_FORGEJO_GIT:-$HOST/$REPO.git}"
 page_size=""
+BOT_REVIEWER="${FFMPEG_FORGEJO_BOT_REVIEWER:-Forgejo_Fairy}"
 
 die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
 
@@ -49,11 +53,12 @@ token() {
 }
 
 # api METHOD PATH [JSON-BODY-FILE]; the token goes through a header file, not argv.
-api() {
+# The subshell keeps header cleanup local even when a function calls api directly.
+api() (
   local method="$1" path="$2" body="${3:-}" hdr tok
   tok="$(token)" || exit 1
   hdr="$(mktemp)"
-  trap 'rm -f "$hdr"' RETURN
+  trap 'rm -f "$hdr"' EXIT
   chmod 600 "$hdr"
   printf 'Authorization: token %s\n' "$tok" >"$hdr"
   if [ -n "$body" ]; then
@@ -62,7 +67,7 @@ api() {
   else
     curl -fsS --max-time 60 -X "$method" -H @"$hdr" "$API$path"
   fi
-}
+)
 
 login() {
   local out
@@ -354,7 +359,7 @@ for row in json.load(sys.stdin):
     print(number)' <<<"$out" || die "cannot parse own open pull numbers"
 }
 
-# fairy_review_summary: classify reviews JSON from stdin without accessing the API.
+# fairy_review_summary [LOGIN]: classify reviews JSON from stdin without accessing the API.
 fairy_review_summary() {
   python3 -c 'import json,re,sys
 from datetime import datetime
@@ -362,7 +367,7 @@ from datetime import datetime
 ALLOWED_STATES = {"APPROVED", "COMMENT", "REQUEST_CHANGES"}
 
 def summarize(reviews):
-    """Count submitted Fairy reviews and describe the newest submission.
+    """Count submitted reviews for the selected bot and describe the newest submission.
 
     Every review row must be a dict containing a state key (str or null).
     Rows without a state key, or rows that are not dicts, are malformed.
@@ -389,7 +394,7 @@ def summarize(reviews):
         if cid and re.fullmatch(r"[0-9a-fA-F]{40}", cid) is None:
             raise ValueError("invalid review commit_id")
     submitted = [row for row in reviews
-        if (row.get("user") or {}).get("login") == "Forgejo_Fairy"
+        if (row.get("user") or {}).get("login") == sys.argv[1]
         and row["state"] in ALLOWED_STATES
         and row.get("submitted_at")]
     if not submitted:
@@ -398,7 +403,101 @@ def summarize(reviews):
     commit = newest.get("commit_id") or ""
     return len(submitted), newest["state"], commit[:12] if commit else "-"
 
-print(*summarize(json.load(sys.stdin)), sep="\t")'
+print(*summarize(json.load(sys.stdin)), sep="\t")' "${1:-Forgejo_Fairy}"
+}
+
+# request_bot_review NUMBER: merge existing users with Fairy, POST, and verify read-back.
+request_bot_review() {
+  local number="$1" out body revs i
+  [[ "$BOT_REVIEWER" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $BOT_REVIEWER"
+  out="$(api GET "/repos/$REPO/pulls/$number")" || return 1
+  body="$(mktemp)"
+  if ! python3 -c 'import json,sys
+users = [user["login"] for user in json.load(sys.stdin).get("requested_reviewers") or []]
+print(json.dumps({"reviewers": list(dict.fromkeys(users + [sys.argv[1]]))}))' \
+    "$BOT_REVIEWER" <<<"$out" >"$body"; then
+    rm -f "$body"
+    return 1
+  fi
+  if ! api POST "/repos/$REPO/pulls/$number/requested_reviewers" "$body" >/dev/null; then
+    rm -f "$body"
+    return 1
+  fi
+  rm -f "$body"
+  for ((i = 1; i <= 3; i++)); do
+    out="$(api GET "/repos/$REPO/pulls/$number")" || return 1
+    revs="$(python3 -c 'import json,sys
+d = json.load(sys.stdin)
+users = [u["login"] for u in d.get("requested_reviewers") or []]
+teams = ["team:" + t["name"] for t in d.get("requested_reviewers_teams") or []]
+print(" ".join(users + teams))' <<<"$out")" || return 1
+    if [[ " $revs " == *" $BOT_REVIEWER "* ]]; then
+      echo "#$number requested reviewers: $revs"
+      return 0
+    fi
+    [ "$i" = 3 ] || sleep "${FFMPEG_FORGEJO_POLL:-15}"
+  done
+  printf 'ffmpeg-forgejo: #%s missing requested reviewer %s after POST; read back: %s\n' \
+    "$number" "$BOT_REVIEWER" "${revs:-none}" >&2
+  return 3
+}
+
+# fairy_request_candidates LOGIN: print own overdue PRs without the configured bot requested.
+fairy_request_candidates() {
+  python3 -c 'import datetime,json,sys
+now = datetime.datetime.now(datetime.UTC)
+for row in json.load(sys.stdin):
+    if row["user"]["login"] != sys.argv[1] or row["state"] != "open":
+        continue
+    number = row["number"]
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise ValueError("invalid pull number")
+    created = datetime.datetime.fromisoformat(row["created_at"])
+    age = (now - created).total_seconds() / 60
+    users = [user["login"] for user in row.get("requested_reviewers") or []]
+    if age > 15 and sys.argv[2] not in users:
+        title = " ".join(row["title"].split())
+        print(f"{number}\t{int(age)}\t{title}")' "$1" "$BOT_REVIEWER"
+}
+
+# fairy_requests [--skip-unavailable]: audit own open PRs using bounded API lists.
+fairy_requests() {
+  local optional="${1:-}" out me encoded_me rows row number reviews seen rc
+  local -a candidates results=()
+  [ $# -eq 0 ] || { [ $# -eq 1 ] && [ "$optional" = --skip-unavailable ]; } \
+    || usage_error "fairy-requests [--skip-unavailable]"
+  if [ "$optional" = --skip-unavailable ]; then
+    if [ "${FFMPEG_FORGEJO_OFFLINE:-0}" = 1 ]; then
+      echo 'fairy-requests: SKIPPED - offline (FFMPEG_FORGEJO_OFFLINE=1).' >&2
+      return 0
+    fi
+    if ! token >/dev/null 2>&1; then
+      echo 'fairy-requests: SKIPPED - no token available in keyring.' >&2
+      return 0
+    fi
+  fi
+  if out="$(api GET /user)"; then rc=0; else rc=$?; fi
+  if [ "$optional" = --skip-unavailable ] && [[ "$rc" =~ ^(6|7|28)$ ]]; then
+    echo "fairy-requests: SKIPPED - API offline (curl rc $rc)." >&2
+    return 0
+  fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
+  encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
+  discover_page_size
+  out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || return 1
+  rows="$(fairy_request_candidates "$me" <<<"$out")" || return 1
+  [ -n "$rows" ] || return 0
+  mapfile -t candidates <<<"$rows"
+  for row in "${candidates[@]}"; do
+    number="${row%%$'\t'*}"
+    reviews="$(api_list "/repos/$REPO/pulls/$number/reviews?")" || return 1
+    seen="$(fairy_review_summary "$BOT_REVIEWER" <<<"$reviews")" || return 1
+    [ "${seen%%$'\t'*}" -gt 0 ] || results+=("$row")
+  done
+  [ "${#results[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${results[@]}"
+  return 1
 }
 
 # require_sweep FILE BRANCH: validate reviewed dispositions against the local commit.
@@ -435,6 +534,9 @@ if [ $# -gt 0 ]; then shift; fi
 case "$cmd" in
   whoami)
     login
+    ;;
+  fairy-requests)
+    fairy_requests "$@"
     ;;
   fairy-reviews)
     if [ "${1:-}" = "--from-json" ]; then
@@ -529,6 +631,7 @@ for i in json.load(sys.stdin):
     [ $# -eq 3 ] || usage_error "$usage"
     require_sweep "$sweep" "$1"
     [ -f "$3" ] || die "no body file $3"
+    [[ "$BOT_REVIEWER" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $BOT_REVIEWER"
     me="$(login)"
     check_pr_overlap "$1" "$me" "$overlap_ok"
     body="$(mktemp)"
@@ -537,22 +640,21 @@ for i in json.load(sys.stdin):
     rm -f "$body"
     python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])' <<<"$out"
     n="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])' <<<"$out")"
-    # .forgejo/CODEOWNERS requests reviewers only for the paths it lists; a PR nobody is asked
-    # to review sits unseen. Read the field back (3 tries) and flag an empty list with exit 3.
+    request_bot_review "$n"
+    # CODEOWNERS may cover no touched paths; Fairy alone does not request human review.
     for ((i = 1; i <= 3; i++)); do
       revs="$(api GET "/repos/$REPO/pulls/$n" | python3 -c 'import json,sys
 d = json.load(sys.stdin)
-users = [u["login"] for u in d.get("requested_reviewers") or []]
+users = [u["login"] for u in d.get("requested_reviewers") or [] if u["login"] != sys.argv[1]]
 teams = ["team:" + t["name"] for t in d.get("requested_reviewers_teams") or []]
-print(" ".join(users + teams))')"
+print(" ".join(users + teams))' "$BOT_REVIEWER")"
       [ -z "$revs" ] || break
       [ "$i" = 3 ] || sleep "${FFMPEG_FORGEJO_POLL:-15}"
     done
     if [ -z "$revs" ]; then
-      printf 'ffmpeg-forgejo: #%s has no requested reviewer; pick from MAINTAINERS and git log on the touched files, then: ffmpeg-forgejo reviewers %s <login>...\n' "$n" "$n" >&2
+      printf 'ffmpeg-forgejo: #%s has no requested human reviewer; pick from MAINTAINERS and git log on the touched files, then: ffmpeg-forgejo reviewers %s <login>...\n' "$n" "$n" >&2
       exit 3
     fi
-    echo "#$n requested reviewers: $revs"
     ;;
   issue)
     [ $# -eq 2 ] || die "usage: issue <title> <body-file>"
