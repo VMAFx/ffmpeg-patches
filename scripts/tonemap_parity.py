@@ -300,6 +300,7 @@ def candidate(run: Session, name: str, vf: str, pre: list[str], ref: np.ndarray)
 
 
 def main(argv: list[str]) -> int:
+    """Compare reference and candidate tonemap paths; return 0 when all pass."""
     args = parse(argv)
     self_check()
     cands, pres = pairs(args.cand, "cand"), pairs(args.pre, "pre")
@@ -315,7 +316,7 @@ def main(argv: list[str]) -> int:
     for name, row in report["paths"].items():
         print(name, " ".join(f"{k}={v}" for k, v in row.items() if k not in ("vf", "pre")))
     if args.json:
-        Path(args.json).write_text(json.dumps(report, indent=2) + "\n")
+        Path(args.json).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return 0 if all(r.get("pass", True) for r in report["paths"].values()) else 1
 
 

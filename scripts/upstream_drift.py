@@ -82,6 +82,9 @@ def bounded_series(root: Path, findings: series.Findings, repairs: Repairs | Non
         raise DriftError(f"series entries exceed {MAX_SERIES_ENTRIES}")
     repair_path_limit(len(names) + 2)
     for name in names:
+        if not series.PATCH_NAME.fullmatch(name):
+            raise DriftError(f"{name}: name is not NNNN-slug.patch")
+    for name in names:
         path = (root / "patches" / name).with_suffix(".toml")
         original = path.read_bytes()
         bounded_lines(path, original, MAX_SIDECAR_LINES)
@@ -269,6 +272,17 @@ def table_drift(root: Path, data: dict, original: bytes | None = None) -> list[s
     return []
 
 
+def restore_originals(targets: set[Path], originals: dict[Path, bytes]) -> list[Path]:
+    """Attempt every restore and return paths whose writes failed."""
+    failed = []
+    for path in targets:
+        try:
+            path.write_bytes(originals[path])
+        except OSError:
+            failed.append(path)
+    return failed
+
+
 def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date | None) -> None:
     """Write repairs and the table together; restore original bytes on failure."""
     repair_path_limit(len(repairs.originals))
@@ -297,9 +311,11 @@ def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date
             path.write_bytes(content)
         if series.contributions(root, write=True) != 0:
             raise DriftError("cannot regenerate the contribution table")
-    except (OSError, DriftError, series.SeriesError):
-        for path in targets:
-            path.write_bytes(repairs.originals[path])
+    except (OSError, DriftError, series.SeriesError) as exc:
+        failed = restore_originals(targets, repairs.originals)
+        if failed:
+            paths = ", ".join(str(path) for path in failed)
+            raise DriftError(f"{exc}; failed to restore: {paths}") from exc
         raise
     repairs.lines.extend(stale)
 

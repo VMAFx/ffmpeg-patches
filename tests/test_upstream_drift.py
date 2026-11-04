@@ -69,24 +69,28 @@ class Fixture:
         self.root = scratch / "series"
         (self.root / "patches").mkdir(parents=True)
         self.names = ["0001-lib-change-one.patch", "0002-lib-change-two.patch"]
-        (self.root / "series.txt").write_text("\n".join(self.names) + "\n")
+        (self.root / "series.txt").write_text("\n".join(self.names) + "\n", encoding="utf-8")
         (self.root / "base.env").write_text(
-            f"FFMPEG_REMOTE=https://example.invalid/up.git\nFFMPEG_TAG=v1\nFFMPEG_COMMIT={BASE}\n"
+            f"FFMPEG_REMOTE=https://example.invalid/up.git\nFFMPEG_TAG=v1\nFFMPEG_COMMIT={BASE}\n",
+            encoding="utf-8",
         )
         for number, name in enumerate(self.names, 1):
             self.patch(number).write_text(
                 f"From {'0' * 40} Mon Sep 17 00:00:00 2001\n"
                 "From: Dev <dev@invalid>\nDate: Mon, 2 Nov 2026 00:00:00 +0000\n"
                 "Subject: [PATCH] lib: change\n\nSigned-off-by: Dev <dev@invalid>\n"
-                "---\ndiff --git a/lib.c b/lib.c\n"
+                "---\ndiff --git a/lib.c b/lib.c\n",
+                encoding="utf-8",
             )
             (self.root / "patches" / name).with_suffix(".toml").write_text(
                 'status = "submitted"\n'
-                f'upstream = "https://example.invalid/pulls/{number}"\nconsumers = ["a"]\n'
+                f'upstream = "https://example.invalid/pulls/{number}"\nconsumers = ["a"]\n',
+                encoding="utf-8",
             )
         (self.root / "README.md").write_text(
             f"# Fixture\n\n{upstream_drift.series.TABLE_START}\n"
-            f"{upstream_drift.series.TABLE_END}\n\nText after the table.\n"
+            f"{upstream_drift.series.TABLE_END}\n\nText after the table.\n",
+            encoding="utf-8",
         )
         self.write_records([self.record(1), self.record(2)])
 
@@ -102,7 +106,7 @@ class Fixture:
         """Write contribution records and regenerate the fixture table."""
         data = {"checked": "2026-01-02", "contributions": entries}
         (self.root / upstream_drift.series.CONTRIBUTIONS).write_text(
-            json.dumps(data, indent=2) + "\n"
+            json.dumps(data, indent=2) + "\n", encoding="utf-8"
         )
         upstream_drift.series.contributions(self.root, write=True)
 
@@ -113,14 +117,17 @@ class Fixture:
 
 class DriftTest(unittest.TestCase):
     def setUp(self) -> None:
+        """Build a fixture series whose records point at the fake forge."""
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.scratch = Path(scratch.name)
         self.fx = Fixture(self.scratch)
         for name in self.fx.names:
             metadata = self.fx.root / "patches" / Path(name).with_suffix(".toml")
-            text = metadata.read_text().replace("https://example.invalid/pulls/", FORGE)
-            metadata.write_text(text)
+            text = metadata.read_text(encoding="utf-8").replace(
+                "https://example.invalid/pulls/", FORGE
+            )
+            metadata.write_text(text, encoding="utf-8")
         self.write(self.record(1), self.record(2))
 
     def record(self, number: int, **changes: object) -> dict[str, object]:
@@ -137,9 +144,12 @@ class DriftTest(unittest.TestCase):
         return status, out.getvalue(), err.getvalue()
 
     def master_form(self) -> None:
+        """Give patch 1 a master_form record."""
         path = self.fx.patch(1).with_suffix(".toml")
         path.write_text(
-            path.read_text() + f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }}\n'
+            path.read_text(encoding="utf-8")
+            + f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }}\n',
+            encoding="utf-8",
         )
 
     def test_master_form_head_moved_is_one_drift(self) -> None:
@@ -156,9 +166,11 @@ class DriftTest(unittest.TestCase):
         self.assertIn("1 field(s) drifted.", out)
 
     def covered_by(self, number: int = 3) -> None:
+        """Mark patch 1 as covered by another pull request."""
         self.fx.patch(1).with_suffix(".toml").write_text(
             'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n'
-            f'covered_by = "{FORGE}{number}"\n'
+            f'covered_by = "{FORGE}{number}"\n',
+            encoding="utf-8",
         )
         self.write(self.record(2))
 
@@ -245,9 +257,10 @@ class DriftTest(unittest.TestCase):
                 self.assertTrue(err.startswith("error:"))
 
     def test_only_covering_pull_with_no_contributions_is_read(self) -> None:
+        """Read only the covering pull request when nothing else is recorded."""
         self.covered_by()
         self.fx.patch(2).with_suffix(".toml").write_text(
-            'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n'
+            'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n', encoding="utf-8"
         )
         self.write()
         forge = FakeForge({3: pull(3)})
@@ -265,10 +278,13 @@ class DriftTest(unittest.TestCase):
         self.assertEqual(forge.read, [f"{API}1", f"{API}2", f"{API}1", f"{API}2"])
 
     def test_covered_by_shared_with_contribution_and_master_form_is_read_once(self) -> None:
+        """Read a pull request once when several records name it."""
         self.covered_by(2)
         path = self.fx.patch(2).with_suffix(".toml")
         path.write_text(
-            path.read_text() + f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }}\n'
+            path.read_text(encoding="utf-8")
+            + f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }}\n',
+            encoding="utf-8",
         )
         forge = FakeForge({2: pull(2)})
         status, out, _ = self.run_main(forge)
@@ -277,15 +293,23 @@ class DriftTest(unittest.TestCase):
         self.assertIn("1 pull request(s) read from the forge, 0 field(s) drifted.", out)
 
     def test_unsound_master_metadata_is_a_tool_error(self) -> None:
+        """Fail as a tool error on a malformed master_form record."""
         path = self.fx.patch(1).with_suffix(".toml")
-        path.write_text(path.read_text() + 'master_form = { head = "short" }\n')
+        path.write_text(
+            path.read_text(encoding="utf-8") + 'master_form = { head = "short" }\n',
+            encoding="utf-8",
+        )
         status, _, err = self.run_main(FakeForge({1: pull(1), 2: pull(2)}))
         self.assertEqual(status, 2)
         self.assertIn("master_form must be a table", err)
 
     def test_unsound_covered_by_metadata_is_a_tool_error(self) -> None:
+        """Fail as a tool error on a malformed covered_by record."""
         path = self.fx.patch(1).with_suffix(".toml")
-        path.write_text(path.read_text() + 'covered_by = "https://example.invalid/pulls/3"\n')
+        path.write_text(
+            path.read_text(encoding="utf-8") + 'covered_by = "https://example.invalid/pulls/3"\n',
+            encoding="utf-8",
+        )
         status, _, err = self.run_main(FakeForge({1: pull(1), 2: pull(2)}))
         self.assertEqual(status, 2)
         self.assertIn("covered_by is allowed only", err)
@@ -389,9 +413,10 @@ class DriftTest(unittest.TestCase):
         self.assertIn("state must be one of", err)
 
     def test_fetch_refuses_an_answer_that_is_not_an_object(self) -> None:
+        """Refuse a forge answer that is not a JSON object or is missing."""
         for name, text in (("list.json", "[1]"), ("broken.json", "{")):
             path = self.scratch / name
-            path.write_text(text)
+            path.write_text(text, encoding="utf-8")
             with self.subTest(name=name), self.assertRaises(upstream_drift.DriftError):
                 upstream_drift.fetch_json(path.as_uri())
         with self.assertRaises(upstream_drift.DriftError):
@@ -400,9 +425,12 @@ class DriftTest(unittest.TestCase):
     # Boundary.
 
     def test_no_record_reads_nothing_and_passes(self) -> None:
+        """Read nothing and pass when no patch carries a record."""
         for name in self.fx.names:
             metadata = self.fx.root / "patches" / Path(name).with_suffix(".toml")
-            metadata.write_text('status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n')
+            metadata.write_text(
+                'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n', encoding="utf-8"
+            )
         self.write()
         forge = FakeForge({})
         status, out, _ = self.run_main(forge)
@@ -422,7 +450,7 @@ class FixTest(unittest.TestCase):
         self.name = fixture.names[0]
         for number in range(1, len(fixture.names) + 1):
             fixture.patch(number).with_suffix(".toml").write_text(
-                'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n'
+                'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n', encoding="utf-8"
             )
         self.sidecar = (self.root / "patches" / self.name).with_suffix(".toml")
         self.readme = self.root / "README.md"
@@ -435,7 +463,9 @@ class FixTest(unittest.TestCase):
 
     def write_data(self, *, ensure_ascii: bool = True) -> None:
         """Write contribution data and regenerate the README table."""
-        self.data_path.write_text(json.dumps(self.data, indent=2, ensure_ascii=ensure_ascii) + "\n")
+        self.data_path.write_text(
+            json.dumps(self.data, indent=2, ensure_ascii=ensure_ascii) + "\n", encoding="utf-8"
+        )
         self.assertEqual(upstream_drift.series.contributions(self.root, write=True), 0)
 
     def snapshot(self) -> dict[Path, bytes]:
@@ -457,14 +487,15 @@ class FixTest(unittest.TestCase):
             'status = "submitted"\n'
             f'upstream = "{FORGE}1"\nconsumers = ["a"]\n'
             f"# Commit elsewhere: {COMMIT}\n"
-            + (line or f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }}\n')
+            + (line or f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }}\n'),
+            encoding="utf-8",
         )
         self.data["contributions"][0]["patch"] = self.name
         self.write_data()
 
     def test_fix_merge_fields_and_regenerate_readme(self) -> None:
         """Repair merge fields and regenerate the README while preserving surrounding text."""
-        before = self.readme.read_text()
+        before = self.readme.read_text(encoding="utf-8")
         merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
         status, out, err = self.fix(merged)
         self.assertEqual((status, err), (0, ""))
@@ -480,7 +511,7 @@ class FixTest(unittest.TestCase):
         self.assertEqual(out.count("fixed: "), 3)
         self.assertNotIn("::error", out)
         self.assertIn("0 field(s) drifted.", out)
-        after = self.readme.read_text()
+        after = self.readme.read_text(encoding="utf-8")
         self.assertNotEqual(before, after)
         self.assertIn(f"State read from the FFmpeg forge on {TODAY.isoformat()}.", after)
         self.assertEqual(
@@ -525,7 +556,8 @@ class FixTest(unittest.TestCase):
         status, out, err = self.fix(pull(1, head={"sha": BASE}, merge_base=COMMIT))
         self.assertEqual((status, err), (0, ""))
         self.assertIn(
-            f'master_form = {{ base = "{COMMIT}", head = "{BASE}" }}', self.sidecar.read_text()
+            f'master_form = {{ base = "{COMMIT}", head = "{BASE}" }}',
+            self.sidecar.read_text(encoding="utf-8"),
         )
         self.assertEqual(out.count("fixed: "), 2)
 
@@ -578,7 +610,10 @@ class FixTest(unittest.TestCase):
 
     def test_fix_covered_by_drift_is_unfixed_and_changes_no_files(self) -> None:
         """Report covering-pull drift without repairing it or changing any files."""
-        self.sidecar.write_text(self.sidecar.read_text() + f'covered_by = "{FORGE}1"\n')
+        self.sidecar.write_text(
+            self.sidecar.read_text(encoding="utf-8") + f'covered_by = "{FORGE}1"\n',
+            encoding="utf-8",
+        )
         self.data["contributions"] = []
         self.write_data()
         for answer in (pull(1, state="closed"), pull(1, merged=True, merge_commit_sha=COMMIT)):
@@ -592,7 +627,10 @@ class FixTest(unittest.TestCase):
 
     def test_fix_keeps_repairs_when_covered_by_still_needs_review(self) -> None:
         """Keep completed repairs when covering-pull drift still needs review."""
-        self.sidecar.write_text(self.sidecar.read_text() + f'covered_by = "{FORGE}1"\n')
+        self.sidecar.write_text(
+            self.sidecar.read_text(encoding="utf-8") + f'covered_by = "{FORGE}1"\n',
+            encoding="utf-8",
+        )
         before = self.sidecar.read_bytes()
         status, out, err = self.fix(pull(1, state="closed", title="changed"))
         self.assertEqual((status, err), (1, ""))
@@ -653,7 +691,7 @@ class FixTest(unittest.TestCase):
 
     def test_fix_table_failure_restores_original_bytes(self) -> None:
         """Restore original bytes when README table regeneration fails."""
-        self.readme.write_text("# No table markers\n")
+        self.readme.write_text("# No table markers\n", encoding="utf-8")
         before = self.snapshot()
         status, out, err = self.fix(pull(1, title="changed"))
         self.assertEqual((status, out), (2, ""))
@@ -672,7 +710,7 @@ class FixTest(unittest.TestCase):
 
                 def fetch(url: str, target: Path = target, changed: bytes = changed) -> dict:
                     """Change a target after input reads, while the fake forge responds."""
-                    target.write_text(changed.decode())
+                    target.write_text(changed.decode(), encoding="utf-8")
                     return pull(1, title="changed", head={"sha": "0" * 40})
 
                 with (
@@ -719,7 +757,10 @@ class FixTest(unittest.TestCase):
 
     def test_plain_run_reports_stale_table_without_writing(self) -> None:
         """Report a stale table on a plain run even when every forge field matches."""
-        self.readme.write_text(self.readme.read_text().replace("lib: change 1", "obsolete"))
+        self.readme.write_text(
+            self.readme.read_text(encoding="utf-8").replace("lib: change 1", "obsolete"),
+            encoding="utf-8",
+        )
         before = self.snapshot()
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -733,7 +774,7 @@ class FixTest(unittest.TestCase):
         start, end = upstream_drift.series.TABLE_START, upstream_drift.series.TABLE_END
         for text in ("# Missing", f"{start}\n{start}\n{end}", f"{end}\n{start}"):
             with self.subTest(text=text):
-                self.readme.write_text(text)
+                self.readme.write_text(text, encoding="utf-8")
                 before = self.snapshot()
                 status, out, err = self.fix(pull(1))
                 self.assertEqual((status, out), (2, ""))
@@ -749,7 +790,7 @@ class FixTest(unittest.TestCase):
                 self.assertEqual((status, err), (0, ""))
                 self.assertIn(
                     f'{key} = {{ base = "{BASE}", head = "{"0" * 40}" }}',
-                    self.sidecar.read_text(),
+                    self.sidecar.read_text(encoding="utf-8"),
                 )
 
     def test_quoted_master_form_keeps_exactly_once_guard(self) -> None:
@@ -806,7 +847,7 @@ class FixTest(unittest.TestCase):
     def test_contribution_file_cap_refuses_before_record_validation(self) -> None:
         """Reject an oversized contribution file before traversing its records."""
         self.data["contributions"] *= 3
-        self.data_path.write_text(json.dumps(self.data))
+        self.data_path.write_text(json.dumps(self.data), encoding="utf-8")
         before = self.snapshot()
         with (
             patch.object(upstream_drift, "MAX_SERIES_ENTRIES", 2),
@@ -880,6 +921,81 @@ class FixTest(unittest.TestCase):
         self.assertIn("cannot regenerate", err)
         self.assertEqual(self.snapshot(), before)
 
+    def assert_invalid_series_name(self, name: str) -> None:
+        """Reject traversal entries before sidecar reads, forge access or repair writes."""
+        outside = self.root.parent / "outside.patch"
+        outside.write_text("untouched\n", encoding="utf-8")
+        (self.root / "series.txt").write_text(self.name + "\n" + name + "\n", encoding="utf-8")
+        before = self.snapshot()
+        forge = FakeForge({1: pull(1, title="changed")})
+        read_bytes = Path.read_bytes
+        reads = []
+
+        def read(path: Path) -> bytes:
+            """Record filesystem reads made while validating the series."""
+            reads.append(path)
+            return read_bytes(path)
+
+        with (
+            patch.object(upstream_drift.series, "note_metadata") as metadata,
+            patch.object(Path, "read_bytes", read),
+            patch.object(Path, "write_bytes") as write,
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            status = upstream_drift.main(["--root", str(self.root), "--fix"], forge)
+        self.assertEqual((status, out.getvalue()), (2, ""))
+        self.assertIn(f"{name}: name is not NNNN-slug.patch", err.getvalue())
+        metadata.assert_not_called()
+        write.assert_not_called()
+        self.assertEqual(forge.read, [])
+        self.assertTrue(all(path.suffix != ".toml" for path in reads), reads)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "untouched\n")
+
+    def test_fix_rejects_parent_series_entry(self) -> None:
+        """Reject a parent traversal entry without touching files outside the root."""
+        self.assert_invalid_series_name("../outside.patch")
+
+    def test_fix_rejects_nested_series_traversal(self) -> None:
+        """Reject a prefixed traversal entry without touching files outside the root."""
+        self.assert_invalid_series_name("0001-x/../../y.patch")
+
+    def test_restore_failure_still_restores_remaining_target(self) -> None:
+        """Restore remaining targets after one restore fails and preserve the original error."""
+        originals = {path: path.read_bytes() for path in (self.data_path, self.readme)}
+        repairs = upstream_drift.Repairs(originals=originals, lines=["changed"])
+        original = upstream_drift.DriftError("original table failure")
+        restored = []
+        write_bytes = Path.write_bytes
+
+        def fail_table(root: Path, *, write: bool) -> int:
+            """Change both targets before reporting a table failure."""
+            for path in originals:
+                write_bytes(path, b"partial repair")
+            raise original
+
+        def restore(path: Path, content: bytes) -> int:
+            """Fail the first restore and allow every later restore write."""
+            if content == originals[path]:
+                restored.append(path)
+                if len(restored) == 1:
+                    raise OSError("restore denied")
+            return write_bytes(path, content)
+
+        with (
+            patch.object(upstream_drift.series, "contributions", side_effect=fail_table),
+            patch.object(Path, "write_bytes", restore),
+            self.assertRaises(upstream_drift.DriftError) as caught,
+        ):
+            upstream_drift.write_repairs(self.root, self.data["contributions"], repairs, TODAY)
+        self.assertEqual(len(restored), 2)
+        self.assertEqual(set(restored), set(originals))
+        self.assertEqual(restored[1].read_bytes(), originals[restored[1]])
+        self.assertIn(str(original), str(caught.exception))
+        self.assertIn(str(restored[0]), str(caught.exception))
+        self.assertIs(caught.exception.__cause__, original)
+
     def test_repair_target_without_snapshot_refuses_all_writes(self) -> None:
         """Reject an unsnapshotted target before writing any prepared repair."""
         repairs = upstream_drift.Repairs(
@@ -901,7 +1017,7 @@ class ImportRationaleTest(unittest.TestCase):
 
     def test_subprocess_import_rationale_and_planted_omission(self) -> None:
         """Accept the targeted B404 rationale and reject its planted omission."""
-        source = Path(__file__).read_text()
+        source = Path(__file__).read_text(encoding="utf-8")
         self.assertEqual(find_subprocess_imports_without_nosec(source), [])
         planted = source.replace(source.splitlines()[10], "import subprocess")
         self.assertEqual(find_subprocess_imports_without_nosec(planted), [11])
@@ -913,7 +1029,7 @@ class WorkflowTest(unittest.TestCase):
     def setUp(self) -> None:
         """Load workflow steps and create isolated patch-output fixtures."""
         path = Path(__file__).resolve().parent.parent / ".github/workflows/upstream.yml"
-        self.workflow = yaml.safe_load(path.read_text())
+        self.workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
         self.steps = self.workflow["jobs"]["drift"]["steps"]
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
@@ -927,7 +1043,8 @@ class WorkflowTest(unittest.TestCase):
         git.write_text(
             '#!/bin/sh\nif [ "$*" = "diff --exit-code" ]; then\n'
             f"exit {int(changed)}\nfi\n"
-            "printf '%s\\n' 'diff --git a/README.md b/README.md' '-old' '+new'\n"
+            "printf '%s\\n' 'diff --git a/README.md b/README.md' '-old' '+new'\n",
+            encoding="utf-8",
         )
         git.chmod(0o755)
         step = next(step for step in self.steps if step.get("id") == "patch")
@@ -950,16 +1067,16 @@ class WorkflowTest(unittest.TestCase):
         """Produce a patch artifact and diff summary for a changed tree."""
         result = self.prepare_patch(changed=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        diff = (self.root / "upstream-drift.patch").read_text()
+        diff = (self.root / "upstream-drift.patch").read_text(encoding="utf-8")
         self.assertEqual(diff, "diff --git a/README.md b/README.md\n-old\n+new\n")
-        self.assertEqual(self.output.read_text(), "changed=true\n")
-        self.assertIn("```diff\n" + diff + "```", self.summary.read_text())
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "changed=true\n")
+        self.assertIn("```diff\n" + diff + "```", self.summary.read_text(encoding="utf-8"))
 
     def test_clean_tree_produces_no_patch(self) -> None:
         """Produce no patch or summary for a clean tree."""
         result = self.prepare_patch(changed=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.output.read_text(), "changed=false\n")
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "changed=false\n")
         self.assertFalse((self.root / "upstream-drift.patch").exists())
         self.assertFalse(self.summary.exists())
 

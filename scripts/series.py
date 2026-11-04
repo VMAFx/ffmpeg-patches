@@ -238,7 +238,7 @@ def check_patch_name(name: str, position: int, findings: Findings) -> None:
 
 def check_patch_form(path: Path, findings: Findings) -> None:
     """Require `git format-patch` form: zero From line, headers, sign-off, diff."""
-    text = path.read_text(errors="replace")
+    text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     name = path.name
     if not lines or not FROM_LINE.match(lines[0]):
@@ -364,11 +364,12 @@ def check_exceptions_metadata(data: dict, name: str, findings: Findings, today: 
 
 
 def check_metadata(path: Path, findings: Findings, today: date | None = None) -> None:
+    """Validate one patch sidecar and record every metadata finding."""
     name = path.name
     if today is None:
         today = date.today()
     try:
-        data = tomllib.loads(path.read_text())
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         findings.error(name, f"invalid TOML: {exc}")
         return
@@ -787,7 +788,7 @@ def content_present(tree: Path, patch: Path) -> bool:
     neither a reverse apply nor a 3-way merge recognises it; the added
     lines themselves still match.
     """
-    runs = added_runs(patch.read_text(errors="replace"))
+    runs = added_runs(patch.read_text(encoding="utf-8", errors="replace"))
     for path, file_runs in runs.items():
         target = tree / path
         if not target.is_file():
@@ -1038,7 +1039,8 @@ def triage_warnings(lines: list[str], files: set[str]) -> tuple[list[str], int]:
 def warnings_gate(
     root: Path, tree: Path, log: Path, report: Path | None, base: str | None = None
 ) -> int:
-    lines = log.read_text(errors="replace").splitlines()
+    """Report build warnings in series files; return 1 when any is found."""
+    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
     own, other = triage_warnings(lines, series_files(root, tree, base))
     for line in own:
         print(line)
@@ -1082,7 +1084,8 @@ def coverage_report(files: set[str], lines: list[str]) -> tuple[int, list[str]]:
 def coverage_gate(
     root: Path, tree: Path, log: Path, report: Path | None, base: str | None = None
 ) -> int:
-    lines = log.read_text(errors="replace").splitlines()
+    """Report coverage of the compiled series files and return its status."""
+    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
     status, out = coverage_report(series_files(root, tree, base), lines)
     print("\n".join(out))
     if report is not None:
@@ -1093,7 +1096,7 @@ def coverage_gate(
 
 def patch_subject(path: Path) -> str:
     """The Subject header without its [PATCH] prefix, unfolded."""
-    header = path.read_text(errors="replace").split("\n\n", 1)[0]
+    header = path.read_text(encoding="utf-8", errors="replace").split("\n\n", 1)[0]
     match = re.search(r"^Subject: \[PATCH\] (.*(?:\n .*)*)", header, re.MULTILINE)
     return " ".join(match.group(1).split()) if match else path.name
 
@@ -1367,6 +1370,7 @@ def triage_single_finding(
 
 
 def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]:
+    """Return a sidecar's length exceptions and whether its metadata had errors."""
     if not sidecar.is_file():
         return [], False
     meta_findings = Findings()
@@ -1377,7 +1381,7 @@ def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]
         for err in meta_findings.errors:
             print(f"error: {err}", file=sys.stderr)
     try:
-        data = tomllib.loads(sidecar.read_text())
+        data = tomllib.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         # An unreadable sidecar excuses nothing and fails the gate.
         print(f"error: {sidecar.name}: {exc}", file=sys.stderr)

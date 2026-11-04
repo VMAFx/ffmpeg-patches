@@ -574,7 +574,7 @@ int sibling(int s) {
             def replace_file(source, destination):
                 self.assertEqual(Path(source).parent, output.parent)
                 self.assertEqual(output.read_text(), "old complete report\n")
-                self.assertEqual(Path(source).read_text(), new)
+                self.assertEqual(Path(source).read_text(encoding="utf-8"), new)
                 seen.append(source)
                 return replace(source, destination)
 
