@@ -180,6 +180,8 @@ def _run(argv: list[str], cwd: Path, data: str | None = None, timeout: float = 6
     }
     environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
     with subprocess.Popen(  # nosec B603 - _validate_executable enforces the tool allow-list.
+        # semgrep-reason (expires 2026-11-14): allow-listed argv[0], verified refs, no shell
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args  # noqa: E501
         argv,
         cwd=cwd,
         env=environment,
