@@ -1564,12 +1564,36 @@ class PullRequestOverlapTest(ForgejoTest):
 
 
 MUTANTS = {
-    "guard removed": ('if [ "$state" = "done" ]; then', "if true; then"),
-    "head not rechecked": ('[ "$(head_sha "$1")" = "$sha" ] && break', "break"),
-    "first page only": ("page <= 20; page++", "page <= 1; page++"),
-    "terminal set narrowed": ('"warning", "skipped"}', "}"),
-    "wait ignored": ('if [ "$wait" = 0 ] || [ "$i" = 80 ]; then', "if true; then"),
-    "seq loop": ("for ((i = 1; i <= 80; i++)); do", "for i in $(seq 1 80); do"),
+    "guard removed": (
+        'if [ "$state" = "done" ]; then',
+        "if true; then",
+        "test_pending_and_none_are_refused",
+    ),
+    "head not rechecked": (
+        '[ "$(head_sha "$1")" = "$sha" ] && break',
+        "break",
+        "test_a_push_during_the_check_is_not_cleared_by_the_old_head",
+    ),
+    "first page only": (
+        "page <= 20; page++",
+        "page <= 1; page++",
+        "test_pending_context_on_a_later_page_is_seen",
+    ),
+    "terminal set narrowed": (
+        '"warning", "skipped"}',
+        "}",
+        "test_every_terminal_state_allows_the_edit",
+    ),
+    "wait ignored": (
+        'if [ "$wait" = 0 ] || [ "$i" = 80 ]; then',
+        "if true; then",
+        "test_wait_polls_until_autolabel_finishes",
+    ),
+    "seq loop": (
+        "for ((i = 1; i <= 80; i++)); do",
+        "for i in $(seq 1 80); do",
+        "test_a_failing_seq_does_not_skip_the_guard",
+    ),
 }
 
 
@@ -1593,16 +1617,15 @@ class MutantTest(unittest.TestCase):
     """Each planted defect in the guard must make at least one EditBodyTest case fail."""
 
     def test_every_mutant_is_caught(self) -> None:
-        """Every planted guard defect is killed by the edit-body suite."""
+        """Every planted guard defect is killed by its selected edit-body case."""
 
         source = HELPER.read_text()
-        for name, (old, new) in MUTANTS.items():
+        for name, (old, new, test_name) in MUTANTS.items():
             with self.subTest(mutant=name):
                 self.assertEqual(source.count(old), 1, "mutation site missing")
                 with mutant_case(source, old, new, EditBodyTest, "Mutated") as case:
-                    suite = unittest.defaultTestLoader.loadTestsFromTestCase(case)
                     result = unittest.TestResult()
-                    suite.run(result)
+                    case(test_name).run(result)
                     self.assertTrue(result.failures or result.errors, f"{name} survived")
 
 
