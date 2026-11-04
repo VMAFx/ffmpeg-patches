@@ -119,6 +119,18 @@ def _pylint_custom_manager(config: dict) -> dict:
     return managers[0]
 
 
+def _praetor_custom_manager(config: dict) -> dict:
+    """Require exactly one regex manager for the Praetor engine pin."""
+    managers = [
+        manager
+        for manager in config.get("customManagers", [])
+        if manager.get("customType") == "regex" and manager.get("depNameTemplate") == "praetor"
+    ]
+    if len(managers) != 1:
+        raise AssertionError("expected exactly one Praetor regex manager")
+    return managers[0]
+
+
 def run_with_fixture(method: str, files: dict[str, str]) -> unittest.TestResult:
     """Replay a policy check against planted files without touching the checkout."""
     with tempfile.TemporaryDirectory() as directory:
@@ -366,6 +378,75 @@ class LefthookPushGuardTest(unittest.TestCase):
         )
         self.assertEqual(len(result.failures), 1)
         self.assertFalse(result.errors)
+
+    def test_renovate_praetor_manager_matches_workflow(self) -> None:
+        """Renovate discovers the workflow's full Praetor digest exactly once."""
+        config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+        manager = _praetor_custom_manager(config)
+        self.assertEqual(manager["datasourceTemplate"], "git-refs")
+        self.assertEqual(manager["currentValueTemplate"], "main")
+        self.assertEqual(manager["packageNameTemplate"], "https://github.com/cordanaLLM/praetor")
+        self.assertEqual(len(manager["managerFilePatterns"]), 1)
+        workflow = ".github/workflows/series.yml"
+        self.assertRegex(workflow, manager["managerFilePatterns"][0].strip("/"))
+        self.assertEqual(len(manager["matchStrings"]), 1)
+        pattern = re.sub(r"\(\?<([A-Za-z_][A-Za-z_0-9]*)>", r"(?P<\1>", manager["matchStrings"][0])
+        content = (ROOT / workflow).read_text(encoding="utf-8")
+        matches = list(re.finditer(pattern, content))
+        self.assertEqual(len(matches), 1)
+        digest = matches[0].group("currentDigest")
+        self.assertEqual(digest, yaml.safe_load(content)["env"]["PRAETOR_REF"])
+        self.assertRegex(digest, r"\A[0-9a-f]{40}\Z")
+
+    def test_renovate_praetor_has_no_release_age(self) -> None:
+        """Renovate exempts the Praetor git digest from timestamp-based release age."""
+        config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+        manager = _praetor_custom_manager(config)
+        self.assertTrue(
+            any(
+                "minimumReleaseAge" in rule
+                and rule["minimumReleaseAge"] is None
+                and manager["packageNameTemplate"] in rule.get("matchPackageNames", [])
+                and "git-refs" in rule.get("matchDatasources", [])
+                for rule in config["packageRules"]
+            )
+        )
+
+    def test_planted_renovate_praetor_omissions_are_refused(self) -> None:
+        """Reject a missing or duplicate Praetor manager and missing release-age rule."""
+        config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+        manager = _praetor_custom_manager(config)
+        others = [item for item in config["customManagers"] if item != manager]
+        for managers in (others, [*others, manager, manager]):
+            with (
+                self.subTest(managers=managers),
+                self.assertRaisesRegex(AssertionError, "exactly one Praetor regex manager"),
+            ):
+                _praetor_custom_manager(dict(config, customManagers=managers))
+        without_rule = dict(
+            config,
+            packageRules=[
+                rule
+                for rule in config["packageRules"]
+                if manager["packageNameTemplate"] not in rule.get("matchPackageNames", [])
+            ],
+        )
+        result = run_with_fixture(
+            "test_renovate_praetor_has_no_release_age", {"renovate.json": json.dumps(without_rule)}
+        )
+        self.assertEqual(len(result.failures), 1)
+        self.assertFalse(result.errors)
+
+    def test_planted_renovate_praetor_invalid_refs_are_refused(self) -> None:
+        """Reject shortened, tagged, uppercase and overlong Praetor pins."""
+        config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+        manager = _praetor_custom_manager(config)
+        pattern = re.sub(r"\(\?<([A-Za-z_][A-Za-z_0-9]*)>", r"(?P<\1>", manager["matchStrings"][0])
+        content = (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
+        digest = yaml.safe_load(content)["env"]["PRAETOR_REF"]
+        for invalid in (digest[:7], "v1.0.0", digest.upper(), digest + "a"):
+            with self.subTest(ref=invalid):
+                self.assertEqual(list(re.finditer(pattern, content.replace(digest, invalid))), [])
 
     def test_development_lock_matches_input_pins(self) -> None:
         """Every development input pin has the same version and hashes in the lockfile."""
