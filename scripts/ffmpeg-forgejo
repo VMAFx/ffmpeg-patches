@@ -484,13 +484,13 @@ fairy_requests() {
   me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
   encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
   discover_page_size
-  out="$(api_list "/repos/FFmpeg/FFmpeg/pulls?state=open&poster=$encoded_me&")" || return 1
+  out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || return 1
   rows="$(fairy_request_candidates "$me" <<<"$out")" || return 1
   [ -n "$rows" ] || return 0
   mapfile -t candidates <<<"$rows"
   for row in "${candidates[@]}"; do
     number="${row%%$'\t'*}"
-    reviews="$(api_list "/repos/FFmpeg/FFmpeg/pulls/$number/reviews?")" || return 1
+    reviews="$(api_list "/repos/$REPO/pulls/$number/reviews?")" || return 1
     seen="$(python3 -c 'import json,sys
 print(int(any(row["user"]["login"] == sys.argv[1] for row in json.load(sys.stdin))))' \
       "$BOT_REVIEWER" <<<"$reviews")" || return 1
@@ -585,6 +585,7 @@ for i in json.load(sys.stdin):
     done
     [ $# -eq 3 ] || usage_error "$usage"
     [ -f "$3" ] || die "no body file $3"
+    [[ "$BOT_REVIEWER" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $BOT_REVIEWER"
     me="$(login)"
     check_pr_overlap "$1" "$me" "$overlap_ok"
     body="$(mktemp)"
