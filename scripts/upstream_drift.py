@@ -28,11 +28,10 @@ from pathlib import Path
 
 try:
     import forge_settings
+    import series
 except ModuleNotFoundError:
-    from scripts import forge_settings
-import series
+    from scripts import forge_settings, series
 
-PULL_URL = series.PULL_URL
 Fetch = Callable[[str], dict]
 
 
@@ -42,7 +41,7 @@ class DriftError(Exception):
 
 def api_url(url: str, number: int | None = None) -> str:
     """Return the Forgejo API URL for a pull request."""
-    match = PULL_URL.fullmatch(url) if isinstance(url, str) else None
+    match = series.pull_url_pattern().fullmatch(url) if isinstance(url, str) else None
     if not match or (number is not None and int(match.group(4)) != number):
         raise DriftError(f"{url}: not a pull request URL of {forge_settings.keyring_service()}")
     host, owner, repository, number = match.groups()
@@ -168,6 +167,7 @@ def main(argv: list[str], fetch: Fetch = fetch_json) -> int:
         return cache[url]
 
     try:
+        series.pull_url_pattern()
         entries = recorded_entries(args.root)
         lines = drift(entries, cached_fetch)
         lines.extend(patch_drift(args.root, cached_fetch))

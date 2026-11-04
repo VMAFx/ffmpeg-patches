@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import io
 import json
 import os
@@ -14,14 +16,17 @@ import unittest.mock
 import urllib.error
 from pathlib import Path
 
-from scripts import fairy_unanswered, forge_settings, series
+from scripts import fairy_unanswered, forge_settings, series, upstream_drift
 
 ROOT = Path(__file__).resolve().parent.parent
 FORBIDDEN_LITERALS = ("code.ffmpeg.org", "FFmpeg/FFmpeg", "Forgejo_Fairy", "lusoris")
 PERMITTED_SCRIPT_LINES = {
     (
         "scripts/fairy_unanswered.py",
-        '        if (actual := owed(comments, reviews, "lusoris", "Forgejo_Fairy")) != want',
+        (
+            "        if (actual := owed(comments, reviews, "
+            'login="lusoris", bot="Forgejo_Fairy")) != want'
+        ),
     ),
     (
         "scripts/fairy_unanswered.py",
@@ -91,7 +96,19 @@ def _run_ffmpeg_forgejo_host(host: str) -> subprocess.CompletedProcess[str]:
         )
 
 
-class ForgeSettingsPositiveTest(unittest.TestCase):
+class ForgeSettingsTestCase(unittest.TestCase):
+    """Isolate only the four forge settings and restore contributor overrides."""
+
+    def setUp(self) -> None:
+        """Clear forge overrides while preserving unrelated configuration."""
+        overrides = unittest.mock.patch.dict(os.environ)
+        overrides.start()
+        self.addCleanup(overrides.stop)
+        for name in ("HOST", "REPO", "BOT_REVIEWER", "LOGIN"):
+            os.environ.pop(f"FFMPEG_FORGEJO_{name}", None)
+
+
+class ForgeSettingsPositiveTest(ForgeSettingsTestCase):
     """Verify default configurations and environment overrides."""
 
     def test_defaults(self) -> None:
@@ -123,31 +140,89 @@ class ForgeSettingsPositiveTest(unittest.TestCase):
             self.assertEqual(forge_settings.api_base(), "https://custom.forge/api/v1")
             self.assertEqual(forge_settings.git_url(), "https://custom.forge/custom/repo.git")
             self.assertEqual(forge_settings.login(), "custom_user")
+            pattern = forge_settings.pull_url_pattern()
+            match = pattern.fullmatch("https://custom.forge/custom/repo/pulls/99")
+            self.assertIsNotNone(match)
+            self.assertEqual(match.groups(), ("https://custom.forge", "custom", "repo", "99"))
+            self.assertIsNone(pattern.fullmatch("https://custom.forge/FFmpeg/FFmpeg/pulls/99"))
+            self.assertEqual(
+                upstream_drift.api_url("https://custom.forge/custom/repo/pulls/99", 99),
+                "https://custom.forge/api/v1/repos/custom/repo/pulls/99",
+            )
 
     def test_series_pull_url_pattern_matches_host(self) -> None:
-        """Series PULL_URL matches pull URLs on the configured forge host."""
-        self.assertIsNotNone(series.PULL_URL)
+        """Series validates covered_by against the configured host and repository."""
         with unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_HOST": "https://custom.forge"}):
-            pat = forge_settings.pull_url_pattern()
-            self.assertIsNotNone(pat.fullmatch("https://custom.forge/owner/project/pulls/99"))
-            self.assertIsNone(pat.fullmatch("https://code.ffmpeg.org/owner/project/pulls/99"))
+            pat = series.pull_url_pattern()
+            self.assertIsNotNone(pat.fullmatch("https://custom.forge/FFmpeg/FFmpeg/pulls/99"))
+            self.assertIsNone(pat.fullmatch("https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/99"))
+            for host, expected_errors in (("custom.forge", 0), ("code.ffmpeg.org", 1)):
+                findings = series.Findings()
+                series.check_covered_by(
+                    {
+                        "status": "unsubmitted",
+                        "covered_by": f"https://{host}/FFmpeg/FFmpeg/pulls/99",
+                    },
+                    "fixture",
+                    findings,
+                )
+                self.assertEqual(len(findings.errors), expected_errors)
 
     def test_fairy_unanswered_discovery_uses_login(self) -> None:
         """Fairy unanswered thread queries use the configured login."""
         calls = []
 
         def fake_paginated(path: str, **kwargs: object) -> list[dict]:
+            """Record discovery paths without network access."""
             calls.append(path)
             return []
 
         with (
             unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_LOGIN": "other_user"}),
             unittest.mock.patch.object(fairy_unanswered, "paginated", side_effect=fake_paginated),
+            unittest.mock.patch.object(fairy_unanswered, "discover_page_size", return_value=50),
+            unittest.mock.patch.object(
+                fairy_unanswered, "discover_threads", wraps=fairy_unanswered.discover_threads
+            ) as discovery,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
         ):
-            threads = fairy_unanswered.discover_threads("other_user")
-            self.assertEqual(threads, {})
+            self.assertEqual(fairy_unanswered.main([]), 0)
+            discovery.assert_called_once_with("other_user")
             self.assertIn("/pulls?state=open&poster=other_user", calls)
             self.assertIn("/issues?type=issues&state=open&created_by=other_user", calls)
+
+    def test_dynamic_repo_attribute(self) -> None:
+        """The dynamic REPO attribute and Fairy API use the configured repository."""
+        try:
+            with unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_REPO": "owner/project"}):
+                self.assertEqual(forge_settings.REPO, forge_settings.repo())
+                importlib.reload(fairy_unanswered)
+                self.assertEqual(
+                    fairy_unanswered.API, f"{forge_settings.api_base()}/repos/owner/project"
+                )
+        finally:
+            importlib.reload(fairy_unanswered)
+
+    def test_fixture_settings_isolation_and_restore(self) -> None:
+        """Default fixtures clear four overrides and restore them during cleanup."""
+        overrides = {
+            "FFMPEG_FORGEJO_HOST": "https://fixture.forge",
+            "FFMPEG_FORGEJO_REPO": "fixture/project",
+            "FFMPEG_FORGEJO_BOT_REVIEWER": "FixtureBot",
+            "FFMPEG_FORGEJO_LOGIN": "fixture_user",
+        }
+        with unittest.mock.patch.dict(os.environ, overrides):
+            case = ForgeSettingsPositiveTest("test_defaults")
+            try:
+                case.setUp()
+                for key in overrides:
+                    self.assertFalse(key in os.environ, key)
+                case.test_defaults()
+            finally:
+                case.doCleanups()
+            for key, value in overrides.items():
+                self.assertEqual(os.environ[key], value)
 
     def test_ffmpeg_forgejo_host_env_override(self) -> None:
         """FFmpeg-forgejo accepts a valid host override without online discovery."""
@@ -156,8 +231,78 @@ class ForgeSettingsPositiveTest(unittest.TestCase):
         self.assertEqual(proc.stdout, "0\t-\t-\n")
 
 
-class ForgeSettingsNegativeTest(unittest.TestCase):
+class ForgeSettingsNegativeTest(ForgeSettingsTestCase):
     """Verify validation rejection of invalid configuration parameters."""
+
+    def test_other_repository_pull_url_rejected(self) -> None:
+        """Pull URL matching rejects other owners and repositories on the same host."""
+        pattern = forge_settings.pull_url_pattern()
+        for repo in ("other/FFmpeg", "FFmpeg/other", "other/project"):
+            with self.subTest(repo=repo):
+                self.assertIsNone(pattern.fullmatch(f"https://code.ffmpeg.org/{repo}/pulls/1"))
+
+    def test_keyring_nonzero_status_rejected(self) -> None:
+        """A failed lookup rejects stdout and reports only the service and return code."""
+        with (
+            unittest.mock.patch.object(
+                forge_settings.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 1, "x", "private-stderr"),
+            ),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            forge_settings._lookup_keyring_token("unit.forge")
+        message = str(caught.exception)
+        self.assertIn("unit.forge", message)
+        self.assertIn("1", message)
+        self.assertNotIn("x", message)
+        self.assertNotIn("private-stderr", message)
+
+    def test_login_redirect_handler_refuses_all_redirects(self) -> None:
+        """Login discovery refuses same-origin, foreign-origin, and HTTP redirects."""
+        request = forge_settings.urllib.request.Request("https://fixture.forge/api/v1/user")
+        handler = forge_settings.NoRedirectHandler()
+        for code in (301, 302, 303, 307, 308):
+            for target in (
+                "https://fixture.forge/x",
+                "https://other.forge/x",
+                "http://fixture.forge/x",
+            ):
+                with self.subTest(code=code, target=target):
+                    self.assertIsNone(
+                        handler.redirect_request(request, None, code, "Found", {}, target)
+                    )
+
+    def test_login_opener_refuses_redirect_before_second_request(self) -> None:
+        """A fake 302 becomes a tool error before any redirected request is sent."""
+        response = unittest.mock.Mock(code=302, status=302, msg="Found")
+        response.info.return_value = {"location": "https://other.forge/user"}
+        with (
+            unittest.mock.patch.object(
+                forge_settings.urllib.request.HTTPSHandler,
+                "https_open",
+                side_effect=[response, AssertionError("redirect followed")],
+            ) as transport,
+            self.assertRaisesRegex(RuntimeError, "failed to fetch /user"),
+        ):
+            forge_settings._fetch_user_login("https://fixture.forge/api/v1", "fixture-token")
+        transport.assert_called_once()
+        response.close.assert_called_once()
+
+    def test_invalid_host_imports_and_cli_errors(self) -> None:
+        """Invalid hosts permit imports and produce CLI errors without tracebacks."""
+        with unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_HOST": "http://invalid.forge"}):
+            importlib.reload(series)
+            importlib.reload(upstream_drift)
+            for module, args in ((series, ["check"]), (upstream_drift, [])):
+                errors = io.StringIO()
+                with (
+                    self.subTest(module=module.__name__),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(module.main(args), 2)
+                self.assertIn("FFMPEG_FORGEJO_HOST", errors.getvalue())
+                self.assertNotIn("Traceback", errors.getvalue())
 
     def test_invalid_host_scheme_rejected(self) -> None:
         """Non-HTTPS host URLs are rejected with variable name in error."""
@@ -200,7 +345,6 @@ class ForgeSettingsNegativeTest(unittest.TestCase):
     def test_user_failure_missing_keyring_token(self) -> None:
         """Missing keyring tokens fail naming FFMPEG_FORGEJO_LOGIN."""
         with (
-            unittest.mock.patch.dict(os.environ, {}, clear=True),
             unittest.mock.patch.object(
                 forge_settings.subprocess,
                 "run",
@@ -219,9 +363,10 @@ class ForgeSettingsNegativeTest(unittest.TestCase):
         """HTTP failures during /user discovery name FFMPEG_FORGEJO_LOGIN."""
         err = urllib.error.URLError("connection refused")
         with (
-            unittest.mock.patch.dict(os.environ, {}, clear=True),
             unittest.mock.patch.object(forge_settings, "_lookup_keyring_token", return_value="tok"),
-            unittest.mock.patch.object(forge_settings.urllib.request, "urlopen", side_effect=err),
+            unittest.mock.patch.object(
+                forge_settings.urllib.request.OpenerDirector, "open", side_effect=err
+            ),
         ):
             with self.assertRaises(RuntimeError) as ctx:
                 forge_settings.login()
@@ -231,9 +376,10 @@ class ForgeSettingsNegativeTest(unittest.TestCase):
         """Responses without login field name FFMPEG_FORGEJO_LOGIN."""
         bio = io.BytesIO(json.dumps({"id": 1}).encode("utf-8"))
         with (
-            unittest.mock.patch.dict(os.environ, {}, clear=True),
             unittest.mock.patch.object(forge_settings, "_lookup_keyring_token", return_value="tok"),
-            unittest.mock.patch.object(forge_settings.urllib.request, "urlopen", return_value=bio),
+            unittest.mock.patch.object(
+                forge_settings.urllib.request.OpenerDirector, "open", return_value=bio
+            ),
         ):
             with self.assertRaises(RuntimeError) as ctx:
                 forge_settings.login()
@@ -267,8 +413,8 @@ class ForgeSettingsNegativeTest(unittest.TestCase):
         """Programming errors from the mocked HTTP transport remain visible."""
         with (
             unittest.mock.patch.object(
-                forge_settings.urllib.request,
-                "urlopen",
+                forge_settings.urllib.request.OpenerDirector,
+                "open",
                 side_effect=TypeError("planted transport bug"),
             ) as request,
             self.assertRaisesRegex(TypeError, "planted transport bug"),
@@ -277,7 +423,7 @@ class ForgeSettingsNegativeTest(unittest.TestCase):
         request.assert_called_once()
 
 
-class ForgeSettingsBoundaryTest(unittest.TestCase):
+class ForgeSettingsBoundaryTest(ForgeSettingsTestCase):
     """Verify edge cases including port specifications and offline operation."""
 
     def test_boundary_host_with_port(self) -> None:

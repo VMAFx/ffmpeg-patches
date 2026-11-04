@@ -3,6 +3,7 @@
 """Network-free fixtures for Fairy turn detection and Forgejo discovery."""
 
 import contextlib
+import importlib
 import io
 import json
 import os
@@ -88,9 +89,20 @@ class FairyUnansweredTest(unittest.TestCase):
 
     def setUp(self):
         """Forbid network I/O through both global and restricted openers."""
-        login_env = unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_LOGIN": "lusoris"})
+        login_env = unittest.mock.patch.dict(os.environ)
         login_env.start()
         self.addCleanup(login_env.stop)
+        for name in ("HOST", "REPO", "BOT_REVIEWER", "LOGIN"):
+            os.environ.pop(f"FFMPEG_FORGEJO_{name}", None)
+        os.environ["FFMPEG_FORGEJO_LOGIN"] = "lusoris"
+        settings = unittest.mock.patch.multiple(
+            fairy,
+            API=f"{fairy.forge_settings.api_base()}/repos/{fairy.forge_settings.repo()}",
+            API_HOST=fairy.forge_settings.host(),
+            SETTINGS=f"{fairy.forge_settings.api_base()}/settings/api",
+        )
+        settings.start()
+        self.addCleanup(settings.stop)
         if hasattr(fairy, "PAGE_CACHE"):
             fairy.PAGE_CACHE.clear()
         network = unittest.mock.patch.object(
@@ -131,6 +143,53 @@ class FairyUnansweredTest(unittest.TestCase):
             with self.assertRaises(TypeError):
                 fairy.owed([], [], login="lusoris")
         login.assert_not_called()
+
+    def test_owed_rejects_positional_identities(self):
+        """Adjacent positional identities are refused instead of silently transposed."""
+        with self.assertRaises(TypeError):
+            fairy.owed([], [], "lusoris", "Forgejo_Fairy")
+        self.assertEqual(fairy.owed([], [], login="lusoris", bot="Forgejo_Fairy"), ("", "", False))
+
+    def test_check_url_normalizes_authority(self):
+        """Configured case and effective ports permit only the matching HTTPS authority."""
+        cases = (
+            ("https://CUSTOM.FORGE:8443", "https://custom.forge:8443/x", "https://custom.forge/x"),
+            ("https://CUSTOM.FORGE", "https://custom.forge:443/x", "https://custom.forge:8443/x"),
+            ("https://custom.forge:443", "https://CUSTOM.FORGE/x", "https://other.forge:443/x"),
+        )
+        try:
+            for host, accepted, refused in cases:
+                with (
+                    self.subTest(host=host),
+                    unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_HOST": host}),
+                ):
+                    importlib.reload(fairy)
+                    fairy.check_url(accepted)
+                    with self.assertRaises(fairy.RefusedURL):
+                        fairy.check_url(refused)
+        finally:
+            importlib.reload(fairy)
+
+    def test_fixture_settings_isolation_and_restore(self):
+        """Fixture setup pins defaults and restores all four contributor overrides."""
+        overrides = {
+            "FFMPEG_FORGEJO_HOST": "https://fixture.forge",
+            "FFMPEG_FORGEJO_REPO": "fixture/project",
+            "FFMPEG_FORGEJO_BOT_REVIEWER": "FixtureBot",
+            "FFMPEG_FORGEJO_LOGIN": "fixture_user",
+        }
+        with unittest.mock.patch.dict(os.environ, overrides):
+            case = FairyUnansweredTest("test_self_test")
+            try:
+                case.setUp()
+                self.assertEqual(fairy.forge_settings.host(), fairy.forge_settings.DEFAULT_HOST)
+                self.assertEqual(fairy.forge_settings.repo(), fairy.forge_settings.DEFAULT_REPO)
+                self.assertEqual(fairy.forge_settings.bot_reviewer(), "Forgejo_Fairy")
+                self.assertEqual(fairy.forge_settings.login(), "lusoris")
+            finally:
+                case.doCleanups()
+            for key, value in overrides.items():
+                self.assertEqual(os.environ[key], value)
 
     def test_discovery_requires_login(self):
         """Discovery helpers reject omitted logins before any external access."""
@@ -180,13 +239,15 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_pending_fairy_review_ignored(self):
         """An unsubmitted Fairy draft with a body creates no reply obligation."""
         review = dict(_word(), state="PENDING", submitted_at=None)
-        self.assertEqual(fairy.owed([], [review], "lusoris", "Forgejo_Fairy"), ("", "", False))
+        self.assertEqual(
+            fairy.owed([], [review], login="lusoris", bot="Forgejo_Fairy"), ("", "", False)
+        )
 
     def test_pending_lusoris_review_ignored(self):
         """An unsubmitted reply cannot clear an outstanding Fairy comment."""
         review = dict(_word("lusoris"), state="PENDING", submitted_at=None)
         self.assertEqual(
-            fairy.owed([_word()], [review], "lusoris", "Forgejo_Fairy"), (NEW, "", True)
+            fairy.owed([_word()], [review], login="lusoris", bot="Forgejo_Fairy"), (NEW, "", True)
         )
 
     def test_unknown_review_state_ignored(self):
@@ -195,7 +256,7 @@ class FairyUnansweredTest(unittest.TestCase):
             with self.subTest(state=state):
                 review = dict(_word(), state=state)
                 self.assertEqual(
-                    fairy.owed([], [review], "lusoris", "Forgejo_Fairy"), ("", "", False)
+                    fairy.owed([], [review], login="lusoris", bot="Forgejo_Fairy"), ("", "", False)
                 )
 
     def test_submitted_review_invalid_timestamp_reported(self):
@@ -206,7 +267,7 @@ class FairyUnansweredTest(unittest.TestCase):
                 with self.subTest(body=body, timestamp=timestamp):
                     review = dict(_word(), body=body, submitted_at=timestamp)
                     with self.assertRaises((TypeError, ValueError)):
-                        fairy.owed([], [review], "lusoris", "Forgejo_Fairy")
+                        fairy.owed([], [review], login="lusoris", bot="Forgejo_Fairy")
                     output, errors = io.StringIO(), io.StringIO()
                     with (
                         unittest.mock.patch.object(
@@ -228,10 +289,12 @@ class FairyUnansweredTest(unittest.TestCase):
             with self.subTest(state=state):
                 review = dict(_word(), state=state)
                 self.assertEqual(
-                    fairy.owed([], [review], "lusoris", "Forgejo_Fairy"), (NEW, "", True)
+                    fairy.owed([], [review], login="lusoris", bot="Forgejo_Fairy"), (NEW, "", True)
                 )
                 self.assertEqual(
-                    fairy.owed([], [dict(review, submitted_at="")], "lusoris", "Forgejo_Fairy"),
+                    fairy.owed(
+                        [], [dict(review, submitted_at="")], login="lusoris", bot="Forgejo_Fairy"
+                    ),
                     ("", "", False),
                 )
 
@@ -520,7 +583,7 @@ class FairyUnansweredTest(unittest.TestCase):
         fairy_word = _word("Forgejo_Fairy", "2026-11-03T10:00:00+02:00")
         mine_word = _word("lusoris", "2026-11-03T09:00:00Z")
         fairy_ts, mine_ts, owed = fairy.owed(
-            [fairy_word, mine_word], [], "lusoris", "Forgejo_Fairy"
+            [fairy_word, mine_word], [], login="lusoris", bot="Forgejo_Fairy"
         )
         self.assertEqual(fairy_ts, "2026-11-03T10:00:00+02:00")
         self.assertEqual(mine_ts, "2026-11-03T09:00:00Z")

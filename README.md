@@ -69,7 +69,7 @@ Both commands refuse a missing report, a head that differs from the local branch
 
 ### Forge settings
 
-The forge helper scripts share configuration through environment variables:
+The forge helper scripts share configuration through environment variables, implemented in [scripts/forge_settings.py](scripts/forge_settings.py) and verified by [tests/test_forge_settings.py](tests/test_forge_settings.py):
 
 - `FFMPEG_FORGEJO_HOST`: forge URL (default: `https://code.ffmpeg.org`).
 - `FFMPEG_FORGEJO_REPO`: repository path (default: `FFmpeg/FFmpeg`).

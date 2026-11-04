@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess  # nosec B404 - fixed secret-tool invocation to read token from keyring.
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -83,6 +84,15 @@ def keyring_service(target_host: str | None = None) -> str:
     return urllib.parse.urlsplit(h).netloc
 
 
+def authority(url: str) -> tuple[str | None, int | None]:
+    """Return a normalized hostname and effective HTTPS port for URL comparisons."""
+    parsed = urllib.parse.urlsplit(url)
+    port = parsed.port
+    if port is None and parsed.scheme == "https":
+        port = 443
+    return parsed.hostname, port
+
+
 def api_base(target_host: str | None = None) -> str:
     """Return the root v1 API URL for the configured forge host."""
     h = target_host if target_host is not None else host()
@@ -96,10 +106,13 @@ def git_url(target_host: str | None = None, target_repo: str | None = None) -> s
     return f"{h}/{r}.git"
 
 
-def pull_url_pattern(target_host: str | None = None) -> re.Pattern[str]:
-    """Compile a regular expression matching pull request URLs for the forge host."""
+def pull_url_pattern(
+    target_host: str | None = None, target_repo: str | None = None
+) -> re.Pattern[str]:
+    """Match configured repository pull URLs, capturing host, owner, name, and number."""
     h = target_host if target_host is not None else host()
-    return re.compile(rf"({re.escape(h)})/([^/]+)/([^/]+)/pulls/(\d+)")
+    owner, name = validate_repo(target_repo if target_repo is not None else repo()).split("/")
+    return re.compile(rf"({re.escape(h)})/({re.escape(owner)})/({re.escape(name)})/pulls/(\d+)")
 
 
 def _lookup_keyring_token(service: str) -> str:
@@ -112,16 +125,29 @@ def _lookup_keyring_token(service: str) -> str:
             timeout=10,
             check=False,
         )
-        token = proc.stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
             f"failed to read keyring token for {service} (set FFMPEG_FORGEJO_LOGIN): {exc}"
         ) from exc
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"keyring lookup for service {service!r} failed with return code {proc.returncode} "
+            "(set FFMPEG_FORGEJO_LOGIN)"
+        )
+    token = proc.stdout.strip()
     if not token:
         raise RuntimeError(
             f"no keyring token found for service {service!r} (set FFMPEG_FORGEJO_LOGIN)"
         )
     return token
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect when a request carries the forge token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913, PLR0917
+        """Let HTTP error processing reject every redirect without another request."""
+        return None
 
 
 def _fetch_user_login(base_url: str, token: str) -> str:
@@ -131,10 +157,13 @@ def _fetch_user_login(base_url: str, token: str) -> str:
         url,
         headers={"Authorization": f"token {token}", "Accept": "application/json"},
     )
+    opener = urllib.request.build_opener(NoRedirectHandler())
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:  # nosec B310 - forge API URL
+        with opener.open(req, timeout=10) as response:  # nosec B310 - forge API URL
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, ValueError) as exc:
+        if isinstance(exc, urllib.error.HTTPError):
+            exc.close()
         raise RuntimeError(
             f"failed to fetch /user from {url} (set FFMPEG_FORGEJO_LOGIN): {exc}"
         ) from exc

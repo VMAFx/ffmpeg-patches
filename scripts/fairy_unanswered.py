@@ -19,7 +19,7 @@ except ModuleNotFoundError:
     from scripts import forge_settings
 
 API = f"{forge_settings.api_base()}/repos/{forge_settings.REPO}"
-API_HOST = forge_settings.keyring_service()
+API_HOST = forge_settings.host()
 SETTINGS = f"{forge_settings.api_base()}/settings/api"
 PAGE_CACHE = {}
 
@@ -31,7 +31,9 @@ class RefusedURL(ValueError):
 def check_url(url):
     """Reject URLs outside HTTPS on the allow-listed API host."""
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname != API_HOST:
+    if parsed.scheme != "https" or forge_settings.authority(url) != forge_settings.authority(
+        API_HOST
+    ):
         raise RefusedURL(url)
 
 
@@ -215,7 +217,7 @@ def _submitted_review(review):
     return bool(timestamp)
 
 
-def owed(comments, reviews, login, bot):
+def owed(comments, reviews, *, login, bot):
     """Return the newest Fairy word, newest user word, and whether a reply is owed."""
     if not isinstance(comments, list):
         raise TypeError("expected a list of comments")
@@ -300,7 +302,7 @@ def self_test():
     owed_bad = [
         (want, actual)
         for comments, reviews, want in _owed_fixtures(head)
-        if (actual := owed(comments, reviews, "lusoris", "Forgejo_Fairy")) != want
+        if (actual := owed(comments, reviews, login="lusoris", bot="Forgejo_Fairy")) != want
     ]
     for want, actual in owed_bad:
         print(f"self-test FAIL owed want={want!r} actual={actual!r}", file=sys.stderr)
