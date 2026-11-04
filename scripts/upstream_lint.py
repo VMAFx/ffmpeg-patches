@@ -237,14 +237,10 @@ def _base_file(tree: Path, base: str, name: str, scratch: Path) -> Path:
 
 
 def _pre_commit() -> str:
-    """Resolve the explicit override or find pre-commit on PATH once per step."""
-    executable = os.environ.get("UPSTREAM_LINT_PRE_COMMIT")
-    if executable is None:
-        executable = shutil.which(PRE_COMMIT)
+    """Find pre-commit on PATH once per step."""
+    executable = shutil.which(PRE_COMMIT)
     if not executable:
-        raise RuntimeError(
-            "pre-commit not found: set UPSTREAM_LINT_PRE_COMMIT or install pre-commit on PATH"
-        )
+        raise RuntimeError("pre-commit not found: install pre-commit on PATH")
     return str(Path(executable).absolute())
 
 

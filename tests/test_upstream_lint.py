@@ -765,60 +765,52 @@ class RunnerTest(unittest.TestCase):
 class PreCommitResolutionTest(unittest.TestCase):
     """Resolve portable pre-commit paths without executing hooks."""
 
-    def test_environment_override_is_used(self) -> None:
-        """An explicit executable override wins over PATH discovery."""
+    def test_environment_override_is_ignored(self) -> None:
+        """An executable override cannot replace PATH discovery."""
         with (
             unittest.mock.patch.dict(
-                os.environ, {"UPSTREAM_LINT_PRE_COMMIT": "/fixture/venv/bin/pre-commit"}
+                os.environ, {"UPSTREAM_LINT_PRE_COMMIT": "/fixture/evil/pre-commit"}
             ),
-            unittest.mock.patch("shutil.which") as which,
-        ):
-            executable = upstream_lint._pre_commit()
-        self.assertEqual(executable, "/fixture/venv/bin/pre-commit")
-        which.assert_not_called()
-
-    def test_path_discovery_is_used_without_override(self) -> None:
-        """PATH discovery supports user, pipx and virtual environment installs."""
-        with (
-            unittest.mock.patch.dict(os.environ),
             unittest.mock.patch(
                 "shutil.which", return_value="/fixture/pipx/bin/pre-commit"
             ) as which,
         ):
-            os.environ.pop("UPSTREAM_LINT_PRE_COMMIT", None)
+            executable = upstream_lint._pre_commit()
+        self.assertEqual(executable, "/fixture/pipx/bin/pre-commit")
+        which.assert_called_once_with("pre-commit")
+
+    def test_path_discovery_is_used_without_override(self) -> None:
+        """PATH discovery supports user, pipx and virtual environment installs."""
+        with unittest.mock.patch(
+            "shutil.which", return_value="/fixture/pipx/bin/pre-commit"
+        ) as which:
             executable = upstream_lint._pre_commit()
         self.assertEqual(executable, "/fixture/pipx/bin/pre-commit")
         which.assert_called_once_with("pre-commit")
 
     def test_missing_executable_fails_precommit_step(self) -> None:
-        """Missing PATH and override produce a clear failing step before launch."""
+        """Missing pre-commit on PATH produces a clear failure before launch."""
         tree = Path.cwd()
         with (
-            unittest.mock.patch.dict(os.environ),
             unittest.mock.patch("shutil.which", return_value=None),
             unittest.mock.patch.object(upstream_lint, "_base_file", return_value=tree / "config"),
             unittest.mock.patch.object(upstream_lint, "_git", return_value=""),
             unittest.mock.patch.object(upstream_lint, "_run") as run,
         ):
-            os.environ.pop("UPSTREAM_LINT_PRE_COMMIT", None)
             run.return_value.returncode = 0
             run.return_value.stdout = ""
             step = upstream_lint._collect(
                 "pre-commit", lambda: upstream_lint._precommit(tree, "base", "head", tree)
             )
         self.assertNotEqual(step.rc, 0)
-        self.assertIn("UPSTREAM_LINT_PRE_COMMIT", step.output)
+        self.assertNotIn("UPSTREAM_LINT_PRE_COMMIT", step.output)
         self.assertIn("pre-commit", step.output)
         self.assertIn("PATH", step.output)
         run.assert_not_called()
 
     def test_resolved_absolute_path_is_allowed(self) -> None:
         """The executable allow-list accepts a discovered absolute path."""
-        with (
-            unittest.mock.patch.dict(os.environ),
-            unittest.mock.patch("shutil.which", return_value="/fixture/user/bin/pre-commit"),
-        ):
-            os.environ.pop("UPSTREAM_LINT_PRE_COMMIT", None)
+        with unittest.mock.patch("shutil.which", return_value="/fixture/user/bin/pre-commit"):
             executable = upstream_lint._pre_commit()
         upstream_lint._validate_executable([executable, "run"])
 
