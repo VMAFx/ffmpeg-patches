@@ -102,13 +102,29 @@ jobs:
       - name: Fetch the consumer stacks
         if: github.event.pull_request.draft != true
         run: |
-          read -r -a entries <<< "$CONSUMERS"
+          read -r -d '' -a entries < <(printf '%s\0' "$CONSUMERS")
+          if (( ${#entries[@]} == 0 || ${#entries[@]} > 16 )); then
+            echo "::error::consumer map must contain 1 to 16 entries"
+            exit 1
+          fi
+          declare -A seen=()
           for entry in "${entries[@]}"; do
             consumer=${entry%%:*}
             variable=${entry#*:}
             if ! [[ "$consumer" =~ ^[a-z][a-z0-9-]{0,38}$ ]] \
               || ! [[ "$variable" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]]; then
               echo "::error::invalid consumer map entry: $entry"
+              exit 1
+            fi
+            if [[ ${seen[$consumer]+present} ]]; then
+              echo "::error::duplicate consumer name: $consumer"
+              exit 1
+            fi
+            seen[$consumer]=1
+            key=${consumer^^}
+            key=${key//-/_}_SERIES_TAG
+            if [[ "$key" = GITHUB_* || "$key" = RUNNER_* ]]; then
+              echo "::error::reserved consumer environment key: $key"
               exit 1
             fi
           done
@@ -129,7 +145,7 @@ jobs:
       - name: Read the consumer series pins
         if: github.event.pull_request.draft != true
         run: |
-          read -r -a entries <<< "$CONSUMERS"
+          read -r -d '' -a entries < <(printf '%s\0' "$CONSUMERS")
           for entry in "${entries[@]}"; do
             consumer=${entry%%:*}
             variable=${entry#*:}
@@ -148,7 +164,7 @@ jobs:
       - name: Apply each consumer stack on top of the series
         if: github.event.pull_request.draft != true
         run: |
-          read -r -a entries <<< "$CONSUMERS"
+          read -r -d '' -a entries < <(printf '%s\0' "$CONSUMERS")
           stacks=()
           pins=()
           for entry in "${entries[@]}"; do

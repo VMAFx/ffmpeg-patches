@@ -444,6 +444,132 @@ class ConsumerMapWorkflowTest(ConsumerWorkflowFixture):
     pin_step = "Read the consumer series pins"
     apply_step = "Apply each consumer stack on top of the series"
 
+    def test_fetch_reads_consumers_after_blank_lines(self) -> None:
+        """A preserved newline in the folded map must not truncate the clones."""
+        self.stub_git()
+        done = self.run_step(
+            self.fetch_step, {"CONSUMERS": "alpha:PIN_A\n\n beta:PIN_B\tgamma:PIN_C\n"}
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        clones = [call for call in self.calls() if call[0] == "clone"]
+        self.assertEqual(
+            [call[-1] for call in clones],
+            ["consumers/alpha", "consumers/beta", "consumers/gamma"],
+        )
+
+    def test_pin_reader_reads_consumers_after_blank_lines(self) -> None:
+        """Every whitespace-separated entry supplies its pin, including later lines."""
+        for name, variable, tag in (
+            ("alpha", "PIN_A", "v1.2.3"),
+            ("beta", "PIN_B", "v4.5.6"),
+            ("gamma", "PIN_C", "v7.8.9"),
+        ):
+            root = self.root / "consumers" / name
+            root.mkdir(parents=True)
+            (root / "build-config.env").write_text(f"{variable}={tag}\n")
+        done = self.run_step(
+            self.pin_step, {"CONSUMERS": "alpha:PIN_A\n\n beta:PIN_B\tgamma:PIN_C\n"}
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            self.env_file.read_text(),
+            "ALPHA_SERIES_TAG=v1.2.3\nBETA_SERIES_TAG=v4.5.6\nGAMMA_SERIES_TAG=v7.8.9\n",
+        )
+
+    def test_apply_reads_consumers_after_blank_lines(self) -> None:
+        """Later lines reach the apply command as ordered stack and pin arguments."""
+        self.stub("python3")
+        done = self.run_step(
+            self.apply_step,
+            {
+                "CONSUMERS": "alpha:PIN_A\n\n beta:PIN_B\tgamma:PIN_C\n",
+                "ALPHA_SERIES_TAG": "v1.2.3",
+                "BETA_SERIES_TAG": "v4.5.6",
+                "GAMMA_SERIES_TAG": "v7.8.9",
+            },
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            self.calls(),
+            [
+                [
+                    "scripts/consumer_stacks.py",
+                    "ffmpeg",
+                    "alpha=consumers/alpha/ffmpeg-patches",
+                    "beta=consumers/beta/ffmpeg-patches",
+                    "gamma=consumers/gamma/ffmpeg-patches",
+                    "--series-dir",
+                    ".",
+                    "--pin",
+                    "alpha=v1.2.3",
+                    "--pin",
+                    "beta=v4.5.6",
+                    "--pin",
+                    "gamma=v7.8.9",
+                    "--report",
+                    str(self.summary),
+                ]
+            ],
+        )
+
+    def test_fetch_refuses_duplicate_names_before_any_git_call(self) -> None:
+        """Repeated names fail whether their pin variables match or differ."""
+        self.stub_git()
+        for entries in (
+            "alpha:PIN_A alpha:PIN_A",
+            "alpha:PIN_A beta:PIN_B alpha:OTHER_PIN",
+            "alpha:PIN_A\n\nalpha:OTHER_PIN",
+        ):
+            with self.subTest(entries=entries):
+                self.argv_log.unlink(missing_ok=True)
+                done = self.run_step(self.fetch_step, {"CONSUMERS": entries})
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::duplicate consumer name: alpha", done.stdout)
+                self.assertFalse(self.argv_log.exists())
+
+    def test_fetch_refuses_reserved_keys_before_any_git_call(self) -> None:
+        """Derived GITHUB_* and RUNNER_* environment keys cannot reach a clone."""
+        self.stub_git()
+        for name in ("github", "github-actions", "runner", "runner-cache"):
+            with self.subTest(name=name):
+                self.argv_log.unlink(missing_ok=True)
+                done = self.run_step(self.fetch_step, {"CONSUMERS": f"valid:PIN {name}:PIN"})
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::reserved consumer environment key:", done.stdout)
+                self.assertFalse(self.argv_log.exists())
+
+    def test_fetch_limits_map_to_sixteen_entries_before_any_git_call(self) -> None:
+        """One and sixteen entries pass; a seventeenth fails before any clone."""
+        self.stub_git()
+        names = ["githubx", "runnerx", *(f"consumer-{index}" for index in range(15))]
+        for count in (1, 16, 17):
+            with self.subTest(count=count):
+                self.argv_log.unlink(missing_ok=True)
+                entries = " ".join(f"{name}:PIN" for name in names[:count])
+                done = self.run_step(self.fetch_step, {"CONSUMERS": entries})
+                if count <= 16:
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    clones = [call for call in self.calls() if call[0] == "clone"]
+                    self.assertEqual(
+                        [call[-1] for call in clones],
+                        [f"consumers/{name}" for name in names[:count]],
+                    )
+                else:
+                    self.assertNotEqual(done.returncode, 0)
+                    self.assertIn("::error::consumer map must contain 1 to 16 entries", done.stdout)
+                    self.assertFalse(self.argv_log.exists())
+
+    def test_fetch_refuses_empty_map_before_any_git_call(self) -> None:
+        """Empty and whitespace-only maps must not silently pass the fetch step."""
+        self.stub_git()
+        for entries in ("", " \n\t "):
+            with self.subTest(entries=entries):
+                self.argv_log.unlink(missing_ok=True)
+                done = self.run_step(self.fetch_step, {"CONSUMERS": entries})
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::consumer map must contain 1 to 16 entries", done.stdout)
+                self.assertFalse(self.argv_log.exists())
+
     def test_hyphenated_consumer_pin_reaches_apply(self) -> None:
         """A hyphenated consumer shares a valid environment key across both steps."""
         root = self.root / "consumers" / "foo-bar"
