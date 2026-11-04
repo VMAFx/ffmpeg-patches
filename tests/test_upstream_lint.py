@@ -17,7 +17,10 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from dataclasses import FrozenInstanceError
 from pathlib import Path
+
+from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402
@@ -200,7 +203,7 @@ class FixtureTest(unittest.TestCase):
         self.hook_effect = lambda cwd: None
         self.hook_calls = []
 
-    def git(self, *args):
+    def git(self, *args: str) -> str:
         """Run bounded fixture Git commands with explicit author and signing settings."""
         result = subprocess.run(  # nosec B603 B607 - fixed Git, fixture-only arguments.
             [
@@ -214,6 +217,7 @@ class FixtureTest(unittest.TestCase):
                 *args,
             ],
             cwd=self.root,
+            env=isolated_git_environment(),
             capture_output=True,
             text=True,
             check=True,
@@ -232,18 +236,23 @@ class FixtureTest(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", subject)
 
-    def command(self, argv, cwd, data=None, timeout=60):
+    def command(
+        self, argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60
+    ) -> upstream_lint.RunResult:
         """Intercept only pre-commit; execute the real bounded runner otherwise."""
-        if argv[0] == upstream_lint.PRE_COMMIT:
+        if Path(argv[0]).name == upstream_lint.PRE_COMMIT:
             self.hook_calls.append((argv, Path(argv[3]).read_text()))
             self.hook_effect(Path(cwd))
-            return subprocess.CompletedProcess(argv, self.hook_rc, "fixture pre-commit\n")
+            return upstream_lint.RunResult(tuple(argv), self.hook_rc, "fixture pre-commit\n")
         return self.real_run(argv, cwd, data, timeout)
 
-    def check(self, *args):
+    def check(self, *args: str) -> tuple[int, str]:
         """Capture the complete gate report with a controlled pre-commit result."""
         output = io.StringIO()
         with (
+            unittest.mock.patch.object(
+                upstream_lint, "_pre_commit", return_value="/fixture/bin/pre-commit"
+            ),
             unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command),
             contextlib.redirect_stdout(output),
         ):
@@ -537,7 +546,7 @@ class RealToolsTest(FixtureTest):
     The dispatcher runs the real upstream gate, including remote hooks.
     """
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Copy upstream files at its pinned HEAD, or name the missing source."""
         if UPSTREAM is None:
             self.skipTest("UPSTREAM_TREE unset; real upstream fixtures require an FFmpeg checkout")
@@ -546,6 +555,7 @@ class RealToolsTest(FixtureTest):
         super().setUp()
         self.upstream_head = subprocess.run(  # nosec B603 B607 - read-only revision lookup.
             ["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"],
+            env=isolated_git_environment(),
             capture_output=True,
             text=True,
             check=True,
@@ -554,6 +564,7 @@ class RealToolsTest(FixtureTest):
         for name in (upstream_lint.CONFIG, "tools/check_commit_msg.sh", "tools/patcheck"):
             result = subprocess.run(  # nosec B603 B607 - read-only git show, fixed source paths.
                 ["git", "-C", str(UPSTREAM), "show", f"{self.upstream_head}:{name}"],
+                env=isolated_git_environment(),
                 capture_output=True,
                 text=True,
                 check=True,
@@ -609,7 +620,7 @@ class RealToolsTest(FixtureTest):
 class RunnerTest(unittest.TestCase):
     """Exercise real subprocess deadlines and byte-preserving Git output."""
 
-    def test_non_allow_listed_executable_refused(self):
+    def test_non_allow_listed_executable_refused(self) -> None:
         """Unknown executable basenames return rc 2 without invoking Popen."""
         with unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen:
             popen.return_value.__enter__.return_value.communicate.return_value = (b"", None)
@@ -617,6 +628,84 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("executable refused", result.stdout)
         popen.assert_not_called()
+        self.assertIsInstance(result, upstream_lint.RunResult)
+        self.assertEqual(result.args, ("/unused/not-allowed",))
+
+    def test_source_has_no_completed_process_token(self) -> None:
+        """The runner uses its own result type throughout its source."""
+        source = Path(upstream_lint.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("CompletedProcess", source)
+
+    def test_result_is_frozen_and_slotted(self) -> None:
+        """Command results cannot mutate or acquire arbitrary attributes."""
+        result = upstream_lint.RunResult(("git",), 0, "ok")
+        self.assertFalse(hasattr(result, "__dict__"))
+        with self.assertRaises(FrozenInstanceError):
+            result.returncode = 1
+
+    def test_descendant_pipe_timeout_is_reported(self) -> None:
+        """A second timeout retains partial output and returns rc 124."""
+        argv = ["git", "--version"]
+        for partial, expected in ((b"partial\xff", "partial\ufffd"), (None, "initial")):
+            with self.subTest(partial=partial):
+                process = unittest.mock.MagicMock()
+                process.communicate.side_effect = [
+                    subprocess.TimeoutExpired(argv, 1, output=b"initial"),
+                    subprocess.TimeoutExpired(argv, upstream_lint.REAP_TIMEOUT, output=partial),
+                ]
+                with (
+                    unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen,
+                    unittest.mock.patch.object(upstream_lint.os, "killpg") as killpg,
+                ):
+                    popen.return_value.__enter__.return_value = process
+                    result = upstream_lint._run(argv, Path.cwd(), timeout=1)
+                self.assertIsInstance(result, upstream_lint.RunResult)
+                self.assertEqual(result.returncode, 124)
+                self.assertEqual(result.args, tuple(argv))
+                self.assertIn(expected, result.stdout)
+                self.assertIn("command timed out (descendant kept the pipe open)", result.stdout)
+                self.assertEqual(process.communicate.call_count, 2)
+                self.assertEqual(
+                    process.communicate.call_args.kwargs["timeout"], upstream_lint.REAP_TIMEOUT
+                )
+                killpg.assert_called_once_with(process.pid, upstream_lint.signal.SIGKILL)
+
+    def test_child_environment_excludes_git_overrides(self) -> None:
+        """Caller Git overrides cannot redirect subprocess repositories or config."""
+        overrides = dict.fromkeys(GIT_ENVIRONMENT_NAMES, "planted repository override")
+        overrides |= dict.fromkeys(
+            ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"), "fixture"
+        )
+        overrides |= {"GIT_CONFIG_KEY_0": "fixture.key", "GIT_CONFIG_VALUE_0": "fixture"}
+        process = unittest.mock.MagicMock()
+        process.communicate.return_value = (b"ok\n", None)
+        process.returncode = 0
+        with (
+            unittest.mock.patch.dict(os.environ, overrides),
+            unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.__enter__.return_value = process
+            result = upstream_lint._run(["git", "--version"], Path.cwd())
+            environment = popen.call_args.kwargs["env"]
+            self.assertEqual(environment["PATH"], os.environ["PATH"])
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(overrides.keys().isdisjoint(environment))
+        self.assertEqual(environment["PRE_COMMIT_NO_CONCURRENCY"], "1")
+
+    def test_fixture_git_uses_isolated_environment(self) -> None:
+        """Fixture Git receives the shared isolation helper's environment."""
+        fixture = FixtureTest()
+        fixture.root = Path.cwd()
+        environment = {"PATH": os.environ["PATH"]}
+        with (
+            unittest.mock.patch(
+                __name__ + ".isolated_git_environment", return_value=environment
+            ) as isolated,
+            unittest.mock.patch.object(subprocess, "run") as run,
+        ):
+            fixture.git("status")
+        isolated.assert_called_once_with()
+        self.assertEqual(run.call_args.kwargs["env"], environment)
 
     def test_command_timeout_uses_remaining_overall_budget(self):
         """A later command shares the deadline rather than restarting its budget."""
@@ -671,6 +760,67 @@ class RunnerTest(unittest.TestCase):
                 Path(directory),
             )
         self.assertEqual(result.stdout, "line\r\n")
+
+
+class PreCommitResolutionTest(unittest.TestCase):
+    """Resolve portable pre-commit paths without executing hooks."""
+
+    def test_environment_override_is_used(self) -> None:
+        """An explicit executable override wins over PATH discovery."""
+        with (
+            unittest.mock.patch.dict(
+                os.environ, {"UPSTREAM_LINT_PRE_COMMIT": "/fixture/venv/bin/pre-commit"}
+            ),
+            unittest.mock.patch("shutil.which") as which,
+        ):
+            executable = upstream_lint._pre_commit()
+        self.assertEqual(executable, "/fixture/venv/bin/pre-commit")
+        which.assert_not_called()
+
+    def test_path_discovery_is_used_without_override(self) -> None:
+        """PATH discovery supports user, pipx and virtual environment installs."""
+        with (
+            unittest.mock.patch.dict(os.environ),
+            unittest.mock.patch(
+                "shutil.which", return_value="/fixture/pipx/bin/pre-commit"
+            ) as which,
+        ):
+            os.environ.pop("UPSTREAM_LINT_PRE_COMMIT", None)
+            executable = upstream_lint._pre_commit()
+        self.assertEqual(executable, "/fixture/pipx/bin/pre-commit")
+        which.assert_called_once_with("pre-commit")
+
+    def test_missing_executable_fails_precommit_step(self) -> None:
+        """Missing PATH and override produce a clear failing step before launch."""
+        tree = Path.cwd()
+        with (
+            unittest.mock.patch.dict(os.environ),
+            unittest.mock.patch("shutil.which", return_value=None),
+            unittest.mock.patch.object(upstream_lint, "_base_file", return_value=tree / "config"),
+            unittest.mock.patch.object(upstream_lint, "_git", return_value=""),
+            unittest.mock.patch.object(upstream_lint, "_run") as run,
+        ):
+            os.environ.pop("UPSTREAM_LINT_PRE_COMMIT", None)
+            run.return_value.returncode = 0
+            run.return_value.stdout = ""
+            step = upstream_lint._collect(
+                "pre-commit", lambda: upstream_lint._precommit(tree, "base", "head", tree)
+            )
+        self.assertNotEqual(step.rc, 0)
+        self.assertIn("UPSTREAM_LINT_PRE_COMMIT", step.output)
+        self.assertIn("pre-commit", step.output)
+        self.assertIn("PATH", step.output)
+        run.assert_not_called()
+
+    def test_resolved_absolute_path_is_allowed(self) -> None:
+        """The executable allow-list accepts a discovered absolute path."""
+        with (
+            unittest.mock.patch.dict(os.environ),
+            unittest.mock.patch("shutil.which", return_value="/fixture/user/bin/pre-commit"),
+        ):
+            os.environ.pop("UPSTREAM_LINT_PRE_COMMIT", None)
+            executable = upstream_lint._pre_commit()
+        upstream_lint._validate_executable([executable, "run"])
 
 
 if __name__ == "__main__":

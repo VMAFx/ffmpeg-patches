@@ -26,6 +26,7 @@ import argparse
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess  # nosec B404 - explicit argv, process-group cleanup, bounded deadlines.
 import sys
@@ -37,8 +38,33 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
-PRE_COMMIT = "/usr/bin/pre-commit"
+PRE_COMMIT = "pre-commit"
 ALLOWED_EXECUTABLES = frozenset({"git", "pre-commit", "bash"})
+# Match tests.helpers' repository isolation without importing test dependencies.
+GIT_ENVIRONMENT_NAMES = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+)
+GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 MAX_PATHS = 2000
 RUN_TIMEOUT = 1800
 CLEANUP_TIMEOUT = 30
@@ -83,6 +109,15 @@ PATCHECK_BLOCKING_CATEGORIES = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    """One bounded command's arguments, exit status and captured output."""
+
+    args: tuple[str, ...]
+    returncode: int
+    stdout: str
+
+
 @dataclass
 class Step:
     """One independently collected check, with an effective exit status."""
@@ -107,29 +142,43 @@ def _remaining(timeout: float) -> float:
     return min(timeout, remaining)
 
 
-def _reap_timeout(process: subprocess.Popen, argv: list[str]) -> subprocess.CompletedProcess[str]:
+def _reap_timeout(
+    process: subprocess.Popen[bytes], argv: list[str], partial_output: bytes | None = None
+) -> RunResult:
+    """Kill a timed-out process group and bound the remaining pipe drain."""
     # The process may have exited between communicate and killpg.
     with suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
-    output, _ = process.communicate(timeout=_remaining(REAP_TIMEOUT))
+    try:
+        output, _ = process.communicate(timeout=_remaining(REAP_TIMEOUT))
+    except subprocess.TimeoutExpired as error:
+        output = error.output if error.output is not None else partial_output
+        text = (output or b"").decode("utf-8", errors="replace")
+        return RunResult(
+            tuple(argv), 124, text + "\ncommand timed out (descendant kept the pipe open)\n"
+        )
     text = output.decode("utf-8", errors="replace")
     if process.returncode == -signal.SIGKILL:
-        return subprocess.CompletedProcess(argv, 124, text + "\ncommand timed out\n")
-    return subprocess.CompletedProcess(argv, process.returncode, text)
+        return RunResult(tuple(argv), 124, text + "\ncommand timed out\n")
+    return RunResult(tuple(argv), process.returncode, text)
 
 
-def _run(
-    argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60
-) -> subprocess.CompletedProcess[str]:
+def _run(argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60) -> RunResult:
+    """Run an allowed tool with isolated Git state and bounded communication."""
     try:
         _validate_executable(argv)
     except ValueError as error:
-        return subprocess.CompletedProcess(argv, 2, str(error))
+        return RunResult(tuple(argv), 2, str(error))
     if _DEADLINE.get() is not None:
         timeout = min(timeout, _remaining(timeout + REAP_TIMEOUT) - REAP_TIMEOUT)
         if timeout <= 0:
             raise RuntimeError("overall deadline exhausted (reap budget reserved)")
-    environment = os.environ | {"PRE_COMMIT_NO_CONCURRENCY": "1"}
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in GIT_ENVIRONMENT_NAMES and not name.startswith(GIT_CONFIG_PREFIXES)
+    }
+    environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
     with subprocess.Popen(  # nosec B603 - _validate_executable enforces the tool allow-list.
         argv,
         cwd=cwd,
@@ -144,15 +193,16 @@ def _run(
             output, _ = process.communicate(
                 None if data is None else data.encode("utf-8"), timeout=timeout
             )
-            return subprocess.CompletedProcess(
-                argv, process.returncode, output.decode("utf-8", errors="replace")
+            return RunResult(
+                tuple(argv), process.returncode, output.decode("utf-8", errors="replace")
             )
-        except subprocess.TimeoutExpired:
-            return _reap_timeout(process, argv)
+        except subprocess.TimeoutExpired as error:
+            return _reap_timeout(process, argv, error.output)
 
 
 def _git(tree: Path, *args: str) -> str:
-    result = _run(["git", *args], tree)
+    """Return Git output or raise an error with the command's captured result."""
+    result: RunResult = _run(["git", *args], tree)
     if result.returncode:
         raise RuntimeError(f"git {shlex.join(args)}: rc={result.returncode}\n{result.stdout}")
     return result.stdout
@@ -186,9 +236,23 @@ def _base_file(tree: Path, base: str, name: str, scratch: Path) -> Path:
     return target
 
 
+def _pre_commit() -> str:
+    """Resolve the explicit override or find pre-commit on PATH once per step."""
+    executable = os.environ.get("UPSTREAM_LINT_PRE_COMMIT")
+    if executable is None:
+        executable = shutil.which(PRE_COMMIT)
+    if not executable:
+        raise RuntimeError(
+            "pre-commit not found: set UPSTREAM_LINT_PRE_COMMIT or install pre-commit on PATH"
+        )
+    return str(Path(executable).absolute())
+
+
 def _precommit(tree: Path, base: str, head: str, scratch: Path) -> Step:
+    """Run the resolved pre-commit in a disposable worktree and discard edits."""
+    executable = _pre_commit()
     config = _base_file(tree, base, CONFIG, scratch)
-    argv = [PRE_COMMIT, "run", "-c", str(config), "--from-ref", base, "--to-ref", head]
+    argv = [executable, "run", "-c", str(config), "--from-ref", base, "--to-ref", head]
     worktree = scratch / "hook-tree"
     deadline = _DEADLINE.get()
     # Reserve part of the overall budget for removing the disposable worktree.
