@@ -41,6 +41,41 @@ Consumers apply this series first and their own feature patches on top:
 
 A fix lives here once. A consumer does not carry its own copy.
 
+## Pre-PR variant sweep
+
+Before pushing or opening a pull request, scan the committed fix and callers of its targets:
+
+```bash
+python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return master topic -o sweep.md
+```
+
+The report records full base and head commit IDs. Targets combine callees whose return values are consumed on added lines with functions whose bodies contain added lines. The scan covers touched C/header files and C files in the head revision mentioning those targets. It reports discarded calls and checks that normalize an error to `-1` or an `AVERROR_` value. Explicit `(void)` calls are intentional and excluded. This lexical scan supports review; inspect the surrounding control flow when deciding each row.
+
+Replace every `TODO` disposition with one of:
+
+- `fold`: same bug class and same file as the fix; fold the correction into this pull request.
+- `follow-up: <reproducer path>`: otherwise, record the ancestor reproducer path in the evidence and track the correction separately.
+
+Keep the PR body unchanged unless a variant is folded into the fix. After folding, regenerate the report for the new head and review its rows again. A report with no findings ends with `no hits`.
+
+Pass the reviewed report before positional arguments to both commands (run these inside the FFmpeg clone):
+
+```bash
+/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo push --sweep /path/to/sweep.md topic
+/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo pr --sweep /path/to/sweep.md topic "Fix title" /path/to/body.md
+```
+
+Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`.
+
+### Forge settings
+
+The forge helper scripts share configuration through environment variables, implemented in [scripts/forge_settings.py](scripts/forge_settings.py) and verified by [tests/test_forge_settings.py](tests/test_forge_settings.py):
+
+- `FFMPEG_FORGEJO_HOST`: forge URL (default: `https://code.ffmpeg.org`).
+- `FFMPEG_FORGEJO_REPO`: repository path (default: `FFmpeg/FFmpeg`).
+- `FFMPEG_FORGEJO_BOT_REVIEWER`: bot reviewer login (default: `Forgejo_Fairy`).
+- `FFMPEG_FORGEJO_LOGIN`: user login on the forge; when unset, discovered from `/user` with the keyring token.
+
 ## Upstream contributions
 
 Pull requests on the FFmpeg forge that came out of this series and its
@@ -85,6 +120,7 @@ without a series patch is a change the series does not carry.
 | [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Assume the predicted luma point bound | 0037 |
 | [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: bound reference corner extension | 0038 |
 | [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
+| [25708](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708) | `master` | open | avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes | 0040, 0041 |
 
 State read from the FFmpeg forge on 2026-10-28.
 <!-- upstream-contributions:end -->
@@ -93,7 +129,10 @@ A pull request against a release branch is a backport. It reaches a pinned
 base with the first release cut from that branch after the merge.
 
 The same facts are in `upstream-contributions.json`, one object per pull
-request, for other pages to read. The table is generated from that file:
+request, for other pages to read. Its `patch` field is a string of patch
+filenames separated by `, `, or an empty string when the series carries
+none. Every named patch must link to that pull request and match its state.
+The table lists all their series numbers and is generated from that file:
 edit the file, then run `python3 scripts/series.py contributions --write`.
 
 ## Layout
@@ -174,8 +213,10 @@ prints one result per patch:
 
 The checks cover:
 
-- `make test`: series check, ruff, REUSE and the unit tests of
+- `make test`: series check, ruff, mutable defaults and the unit tests of
   `scripts/series.py`
+- REUSE compliance runs in the [REUSE workflow](.github/workflows/reuse.yml); the local `reuse-lint` hook in `lefthook.yml` runs `reuse lint` when REUSE 6.x is installed.
+- `python3 scripts/lint_mutable_defaults.py` (also `make lint-mutable-defaults`): Pylint checks Python sources for `dangerous-default-value` (W0102), including defaults bound to identifiers that ruff B006 misses. The script's `PYLINT_VERSION` pins Pylint; it uses that exact version on PATH or fetches it with `uvx`.
 - inside the series check: every patch with an upstream link has a record
   in `upstream-contributions.json` with a matching state, and the table in
   this file equals the one generated from the records. The check does not

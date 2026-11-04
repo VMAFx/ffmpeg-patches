@@ -5,14 +5,32 @@
 import contextlib
 import io
 import json
+import os
+import subprocess  # nosec B404 - fixed local script invocation in CLI tests.
+import sys
 import unittest.mock
 import urllib.error
+import urllib.parse
+from pathlib import Path
 
 from scripts import fairy_unanswered as fairy
 
 FEED = "https://code.ffmpeg.org/api/v1/users/lusoris/activities/feeds"
 OLD = "2026-11-01T00:00:00Z"
 NEW = "2026-11-02T00:00:00Z"
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _run_cli(overrides, *args):
+    """Run the script with explicit forge settings and a bounded deadline."""
+    return subprocess.run(  # nosec B603 - fixed local script and test arguments.
+        [sys.executable, str(ROOT / "scripts" / "fairy_unanswered.py"), *args],
+        env=dict(os.environ, **overrides),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
 
 
 def _activity(number, op="comment_issue"):
@@ -38,6 +56,7 @@ def _word(who="Forgejo_Fairy", timestamp=NEW):
 def _routes():
     """Build mixed threads with paged reviews, stale rows, and missing rows."""
     return {
+        fairy.settings_url(): {"max_response_items": 50},
         "/pulls?state=open&poster=lusoris&limit=50&page=1": [
             {"number": 1, "user": {"login": "lusoris"}},
             {"number": 99, "user": {"login": "other"}},
@@ -65,11 +84,34 @@ def _routes():
     }
 
 
+def _settings_get(path):
+    """Answer settings discovery with a valid page size and every list with []."""
+    return {"max_response_items": 50} if path == fairy.settings_url() else []
+
+
+def _recording_get(payload, calls):
+    """Return a get stub that records paths and answers settings with payload."""
+
+    def fake_get(path):
+        calls.append(path)
+        return payload if path == fairy.settings_url() else []
+
+    return fake_get
+
+
 class FairyUnansweredTest(unittest.TestCase):
     """Exercise public behavior with network access forbidden."""
 
     def setUp(self):
         """Forbid network I/O through both global and restricted openers."""
+        login_env = unittest.mock.patch.dict(os.environ)
+        login_env.start()
+        self.addCleanup(login_env.stop)
+        for name in ("HOST", "REPO", "BOT_REVIEWER", "LOGIN"):
+            os.environ.pop(f"FFMPEG_FORGEJO_{name}", None)
+        os.environ["FFMPEG_FORGEJO_LOGIN"] = "lusoris"
+        if hasattr(fairy, "PAGE_CACHE"):
+            fairy.PAGE_CACHE.clear()
         network = unittest.mock.patch.object(
             fairy.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")
         )
@@ -88,6 +130,97 @@ class FairyUnansweredTest(unittest.TestCase):
         self.assertEqual(fairy.self_test(), 0)
         self.assertEqual(fairy.main(["--self-test"]), 0)
 
+    def test_self_test_with_invalid_environment(self):
+        """The CLI self-test imports and runs without validating forge settings."""
+        proc = _run_cli(
+            {"FFMPEG_FORGEJO_HOST": "http://bad", "FFMPEG_FORGEJO_REPO": "bad"},
+            "--self-test",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr, "")
+
+    def test_self_test_skips_settings_accessors(self):
+        """Both self-test entry points stay independent of runtime configuration."""
+        with unittest.mock.patch.multiple(
+            fairy.forge_settings,
+            host=unittest.mock.Mock(side_effect=AssertionError("host forbidden")),
+            repo=unittest.mock.Mock(side_effect=AssertionError("repo forbidden")),
+            api_base=unittest.mock.Mock(side_effect=AssertionError("API base forbidden")),
+            login=unittest.mock.Mock(side_effect=AssertionError("login forbidden")),
+            bot_reviewer=unittest.mock.Mock(side_effect=AssertionError("bot forbidden")),
+        ):
+            self.assertEqual(fairy.self_test(), 0)
+            self.assertEqual(fairy.main(["--self-test"]), 0)
+
+    def test_main_invalid_settings_reported_before_network(self):
+        """Bad host and repo settings fail before network or login discovery."""
+        for name, value in (("HOST", "http://bad"), ("REPO", "bad")):
+            output, errors = io.StringIO(), io.StringIO()
+            with (
+                self.subTest(setting=name),
+                unittest.mock.patch.dict(os.environ, {f"FFMPEG_FORGEJO_{name}": value}),
+                unittest.mock.patch.object(fairy, "discover_page_size") as discovery,
+                unittest.mock.patch.object(fairy.forge_settings, "login") as login,
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(errors),
+            ):
+                self.assertEqual(fairy.main([]), 1)
+                discovery.assert_not_called()
+                login.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertTrue(
+                    errors.getvalue().startswith(f"fairy_unanswered: invalid FFMPEG_FORGEJO_{name}")
+                )
+                self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_cli_invalid_settings_reported(self):
+        """Invalid host and repo produce one-line CLI errors without tracebacks."""
+        for name, value in (("HOST", "http://bad"), ("REPO", "bad")):
+            with self.subTest(setting=name):
+                proc = _run_cli({f"FFMPEG_FORGEJO_{name}": value})
+                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(proc.stdout, "")
+                self.assertEqual(len(proc.stderr.splitlines()), 1)
+                self.assertTrue(
+                    proc.stderr.startswith(f"fairy_unanswered: invalid FFMPEG_FORGEJO_{name}")
+                )
+                self.assertNotIn("Traceback", proc.stderr)
+
+    def test_main_uses_valid_environment(self):
+        """Valid overrides retain settings discovery, thread reads, and summary output."""
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "FFMPEG_FORGEJO_HOST": "https://custom.forge",
+                    "FFMPEG_FORGEJO_REPO": "owner/project",
+                },
+            ),
+            unittest.mock.patch.object(fairy, "discover_threads", return_value={1: "issue"}),
+            unittest.mock.patch.object(
+                fairy.OPENER,
+                "open",
+                side_effect=[io.BytesIO(b'{"max_response_items": 50}'), io.BytesIO(b"[]")],
+            ) as request,
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(fairy.main([]), 0)
+        self.assertEqual(
+            request.call_args_list,
+            [
+                unittest.mock.call("https://custom.forge/api/v1/settings/api", timeout=30),
+                unittest.mock.call(
+                    "https://custom.forge/api/v1/repos/owner/project/issues/1/comments", timeout=30
+                ),
+            ],
+        )
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("checked_prs=0 checked_issues=1 unanswered=0", errors.getvalue())
+
     def test_owed_always_false_mutation_fails(self):
         """Suppressing every owed thread must be detected by a planted fixture."""
         errors = io.StringIO()
@@ -98,22 +231,127 @@ class FairyUnansweredTest(unittest.TestCase):
             self.assertEqual(fairy.self_test(), 1)
         self.assertIn("self-test FAIL owed", errors.getvalue())
 
+    def test_owed_requires_login_and_bot(self):
+        """Omitting either identity raises TypeError without credential discovery."""
+        with unittest.mock.patch.object(
+            fairy.forge_settings, "login", side_effect=AssertionError("login forbidden")
+        ) as login:
+            with self.assertRaises(TypeError):
+                fairy.owed([], [], bot="Forgejo_Fairy")
+            with self.assertRaises(TypeError):
+                fairy.owed([], [], login="lusoris")
+        login.assert_not_called()
+
+    def test_owed_rejects_positional_identities(self):
+        """Adjacent positional identities are refused instead of silently transposed."""
+        with self.assertRaises(TypeError):
+            fairy.owed([], [], "lusoris", "Forgejo_Fairy")
+        self.assertEqual(fairy.owed([], [], login="lusoris", bot="Forgejo_Fairy"), ("", "", False))
+
+    def test_check_url_normalizes_authority(self):
+        """Configured case and effective ports permit only the matching HTTPS authority."""
+        cases = (
+            ("https://CUSTOM.FORGE:8443", "https://custom.forge:8443/x", "https://custom.forge/x"),
+            ("https://CUSTOM.FORGE", "https://custom.forge:443/x", "https://custom.forge:8443/x"),
+            ("https://custom.forge:443", "https://CUSTOM.FORGE/x", "https://other.forge:443/x"),
+        )
+        for host, accepted, refused in cases:
+            with (
+                self.subTest(host=host),
+                unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_HOST": host}),
+            ):
+                fairy.check_url(accepted)
+                with self.assertRaises(fairy.RefusedURL):
+                    fairy.check_url(refused)
+
+    def test_fixture_settings_isolation_and_restore(self):
+        """Fixture setup pins defaults and restores all four contributor overrides."""
+        overrides = {
+            "FFMPEG_FORGEJO_HOST": "https://fixture.forge",
+            "FFMPEG_FORGEJO_REPO": "fixture/project",
+            "FFMPEG_FORGEJO_BOT_REVIEWER": "FixtureBot",
+            "FFMPEG_FORGEJO_LOGIN": "fixture_user",
+        }
+        with unittest.mock.patch.dict(os.environ, overrides):
+            case = FairyUnansweredTest("test_self_test")
+            try:
+                case.setUp()
+                self.assertEqual(fairy.forge_settings.host(), fairy.forge_settings.DEFAULT_HOST)
+                self.assertEqual(fairy.forge_settings.repo(), fairy.forge_settings.DEFAULT_REPO)
+                self.assertEqual(fairy.forge_settings.bot_reviewer(), "Forgejo_Fairy")
+                self.assertEqual(fairy.forge_settings.login(), "lusoris")
+            finally:
+                case.doCleanups()
+            for key, value in overrides.items():
+                self.assertEqual(os.environ[key], value)
+
+    def test_discovery_requires_login(self):
+        """Discovery helpers reject omitted logins before any external access."""
+        with unittest.mock.patch.object(
+            fairy.forge_settings, "login", side_effect=AssertionError("login forbidden")
+        ) as login:
+            for discover in (fairy.discover_threads, fairy.commented_numbers):
+                with self.subTest(discover=discover.__name__), self.assertRaises(TypeError):
+                    discover()
+        login.assert_not_called()
+
+    def test_discovery_never_resolves_passed_login(self):
+        """Explicit identities bypass login, keyring and network discovery."""
+        with (
+            unittest.mock.patch.object(
+                fairy.forge_settings, "login", side_effect=AssertionError("login forbidden")
+            ) as login,
+            unittest.mock.patch.object(
+                fairy.forge_settings,
+                "_lookup_keyring_token",
+                side_effect=AssertionError("keyring forbidden"),
+            ) as keyring,
+            unittest.mock.patch.object(fairy, "paginated", return_value=[]),
+        ):
+            for who in ("other_user", ""):
+                with self.subTest(login=who):
+                    self.assertEqual(fairy.discover_threads(who), {})
+            login.assert_not_called()
+            keyring.assert_not_called()
+
+    def test_feed_uses_api_base_and_login_without_global_override(self):
+        """Activity feed URLs derive directly from the API base and explicit login."""
+        with (
+            unittest.mock.patch.object(
+                fairy.forge_settings, "api_base", return_value="https://custom.forge/api/v1"
+            ),
+            unittest.mock.patch.object(fairy, "paginated", return_value=[]) as pages,
+        ):
+            self.assertEqual(fairy.commented_numbers("other_user"), set())
+        pages.assert_called_once_with(
+            "https://custom.forge/api/v1/users/other_user/activities/feeds?only-performed-by=true",
+            max_pages=10,
+            older="comments",
+        )
+        self.assertFalse(hasattr(fairy, "FEED"))
+
     def test_pending_fairy_review_ignored(self):
         """An unsubmitted Fairy draft with a body creates no reply obligation."""
         review = dict(_word(), state="PENDING", submitted_at=None)
-        self.assertEqual(fairy.owed([], [review]), ("", "", False))
+        self.assertEqual(
+            fairy.owed([], [review], login="lusoris", bot="Forgejo_Fairy"), ("", "", False)
+        )
 
     def test_pending_lusoris_review_ignored(self):
         """An unsubmitted reply cannot clear an outstanding Fairy comment."""
         review = dict(_word("lusoris"), state="PENDING", submitted_at=None)
-        self.assertEqual(fairy.owed([_word()], [review]), (NEW, "", True))
+        self.assertEqual(
+            fairy.owed([_word()], [review], login="lusoris", bot="Forgejo_Fairy"), (NEW, "", True)
+        )
 
     def test_unknown_review_state_ignored(self):
         """Unknown and null review states are silent even with a timestamp."""
         for state in ("FOO", None, "REQUEST_REVIEW"):
             with self.subTest(state=state):
                 review = dict(_word(), state=state)
-                self.assertEqual(fairy.owed([], [review]), ("", "", False))
+                self.assertEqual(
+                    fairy.owed([], [review], login="lusoris", bot="Forgejo_Fairy"), ("", "", False)
+                )
 
     def test_submitted_review_invalid_timestamp_reported(self):
         """Counted states reject non-string timestamps, including approve-only bodies."""
@@ -123,13 +361,13 @@ class FairyUnansweredTest(unittest.TestCase):
                 with self.subTest(body=body, timestamp=timestamp):
                     review = dict(_word(), body=body, submitted_at=timestamp)
                     with self.assertRaises((TypeError, ValueError)):
-                        fairy.owed([], [review])
+                        fairy.owed([], [review], login="lusoris", bot="Forgejo_Fairy")
                     output, errors = io.StringIO(), io.StringIO()
                     with (
                         unittest.mock.patch.object(
                             fairy, "discover_threads", return_value={1: "pr"}
                         ),
-                        unittest.mock.patch.object(fairy, "get", return_value=[]),
+                        unittest.mock.patch.object(fairy, "get", side_effect=_settings_get),
                         unittest.mock.patch.object(fairy, "paginated", return_value=[review]),
                         contextlib.redirect_stdout(output),
                         contextlib.redirect_stderr(errors),
@@ -137,14 +375,22 @@ class FairyUnansweredTest(unittest.TestCase):
                         self.assertEqual(fairy.main([]), 1)
                     self.assertEqual(output.getvalue(), "")
                     self.assertIn("malformed API response", errors.getvalue())
+                    self.assertIn("review submitted_at must be str", errors.getvalue())
 
     def test_submitted_review_states_and_empty_timestamp(self):
         """Every counted state needs a non-empty submission timestamp."""
         for state in ("APPROVED", "COMMENT", "REQUEST_CHANGES"):
             with self.subTest(state=state):
                 review = dict(_word(), state=state)
-                self.assertEqual(fairy.owed([], [review]), (NEW, "", True))
-                self.assertEqual(fairy.owed([], [dict(review, submitted_at="")]), ("", "", False))
+                self.assertEqual(
+                    fairy.owed([], [review], login="lusoris", bot="Forgejo_Fairy"), (NEW, "", True)
+                )
+                self.assertEqual(
+                    fairy.owed(
+                        [], [dict(review, submitted_at="")], login="lusoris", bot="Forgejo_Fairy"
+                    ),
+                    ("", "", False),
+                )
 
     def test_mixed_thread_discovery(self):
         """Dedupe own and commented threads; skip closed/404; review only PRs."""
@@ -183,6 +429,7 @@ class FairyUnansweredTest(unittest.TestCase):
     def _review_pages_output(self, first, second):
         """Run a PR against a full default page and a final explicit review page."""
         routes = {
+            fairy.settings_url(): {"max_response_items": 50},
             "/issues/1/comments": [],
             "/pulls/1/reviews": first,
             "/pulls/1/reviews?limit=50&page=1": first,
@@ -213,8 +460,9 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_main_refused_feed_url_reported(self):
         """Refused feed URLs fail distinctly from malformed JSON before network I/O."""
         read_pages = fairy.paginated
-        for url in ("http://code.ffmpeg.org/activities", "https://evil.example/activities"):
-            with self.subTest(url=url):
+        for base in ("http://code.ffmpeg.org/api/v1", "https://evil.example/api/v1"):
+            with self.subTest(base=base):
+                url = f"{base}/users/lusoris/activities/feeds"
                 output, errors = io.StringIO(), io.StringIO()
 
                 def pages(path, feed_url=url, **kwargs):
@@ -222,7 +470,8 @@ class FairyUnansweredTest(unittest.TestCase):
                     return read_pages(path, **kwargs) if path.startswith(feed_url) else []
 
                 with (
-                    unittest.mock.patch.object(fairy, "FEED", url),
+                    unittest.mock.patch.object(fairy, "discover_page_size", return_value=50),
+                    unittest.mock.patch.object(fairy.forge_settings, "api_base", return_value=base),
                     unittest.mock.patch.object(fairy, "paginated", side_effect=pages),
                     unittest.mock.patch.object(fairy.urllib.request, "urlopen") as request,
                     contextlib.redirect_stdout(output),
@@ -250,6 +499,7 @@ class FairyUnansweredTest(unittest.TestCase):
                 with self.subTest(metadata=metadata, from_activity=from_activity):
                     issue = {"number": 3, "state": "open", **metadata}
                     routes = {
+                        fairy.settings_url(): {"max_response_items": 50},
                         "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
                         "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": []
                         if from_activity
@@ -260,7 +510,7 @@ class FairyUnansweredTest(unittest.TestCase):
                         "/issues/3": issue,
                     }
                     with unittest.mock.patch.object(fairy, "get", side_effect=routes.__getitem__):
-                        self.assertEqual(fairy.discover_threads(), {3: expected})
+                        self.assertEqual(fairy.discover_threads("lusoris"), {3: expected})
 
     def test_feed_page_boundary(self):
         """Only a full tenth page warns that older comments were not read."""
@@ -270,10 +520,11 @@ class FairyUnansweredTest(unittest.TestCase):
                 pages.append([_activity(4)] * last_size)
                 errors = io.StringIO()
                 with (
+                    unittest.mock.patch.dict(fairy.PAGE_CACHE, {"page_size": 50}),
                     unittest.mock.patch.object(fairy, "get", side_effect=pages) as request,
                     contextlib.redirect_stderr(errors),
                 ):
-                    self.assertEqual(fairy.commented_numbers(), {3, 4})
+                    self.assertEqual(fairy.commented_numbers("lusoris"), {3, 4})
                 self.assertEqual(request.call_count, 10)
                 expected_urls = [
                     f"{FEED}?only-performed-by=true&limit=50&page={page}" for page in range(1, 11)
@@ -297,10 +548,11 @@ class FairyUnansweredTest(unittest.TestCase):
         rows = bad + [unrelated, _activity(9, "create_issue"), _activity(4)]
         errors = io.StringIO()
         with (
+            unittest.mock.patch.dict(fairy.PAGE_CACHE, {"page_size": 50}),
             unittest.mock.patch.object(fairy, "get", return_value=rows),
             contextlib.redirect_stderr(errors),
         ):
-            self.assertEqual(fairy.commented_numbers(), {4})
+            self.assertEqual(fairy.commented_numbers("lusoris"), {4})
         for row in bad:
             self.assertIn(repr(row), errors.getvalue())
         self.assertEqual(len(errors.getvalue().splitlines()), len(bad))
@@ -328,7 +580,11 @@ class FairyUnansweredTest(unittest.TestCase):
 
     def test_get_timeout(self):
         """Every GET uses the restricted opener with a 30-second timeout."""
-        for path, url in (("/issues/3", fairy.API + "/issues/3"), (FEED, FEED)):
+        for path, url in (
+            ("/issues/3", fairy.api_url() + "/issues/3"),
+            (FEED, FEED),
+            (fairy.settings_url(), fairy.settings_url()),
+        ):
             with (
                 unittest.mock.patch.object(
                     fairy.OPENER, "open", return_value=io.BytesIO(b"[]")
@@ -420,7 +676,9 @@ class FairyUnansweredTest(unittest.TestCase):
         """Compare timestamps by UTC datetime rather than lexicographic string order."""
         fairy_word = _word("Forgejo_Fairy", "2026-11-03T10:00:00+02:00")
         mine_word = _word("lusoris", "2026-11-03T09:00:00Z")
-        fairy_ts, mine_ts, owed = fairy.owed([fairy_word, mine_word], [])
+        fairy_ts, mine_ts, owed = fairy.owed(
+            [fairy_word, mine_word], [], login="lusoris", bot="Forgejo_Fairy"
+        )
         self.assertEqual(fairy_ts, "2026-11-03T10:00:00+02:00")
         self.assertEqual(mine_ts, "2026-11-03T09:00:00Z")
         self.assertFalse(owed)
@@ -437,6 +695,7 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_malformed_comment_row_without_user(self):
         """A comment row missing 'user' exits 1 with malformed response message."""
         routes = {
+            fairy.settings_url(): {"max_response_items": 50},
             "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
             "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [{"number": 1}],
             FEED + "?only-performed-by=true&limit=50&page=1": [],
@@ -455,6 +714,7 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_malformed_reviews_payload_dict_not_list(self):
         """A reviews payload that is a dict instead of a list exits 1 with message."""
         routes = {
+            fairy.settings_url(): {"max_response_items": 50},
             "/pulls?state=open&poster=lusoris&limit=50&page=1": [
                 {"number": 1, "user": {"login": "lusoris"}}
             ],
@@ -476,6 +736,7 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_malformed_issue_row_missing_number(self):
         """An issue row missing 'number' exits 1 with malformed response message."""
         routes = {
+            fairy.settings_url(): {"max_response_items": 50},
             "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
             "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [
                 {"state": "open"}
@@ -491,6 +752,193 @@ class FairyUnansweredTest(unittest.TestCase):
             self.assertEqual(fairy.main([]), 1)
         self.assertEqual(output.getvalue(), "")
         self.assertIn("fairy_unanswered: malformed API response: 'number'", errors.getvalue())
+
+    def test_page_size_positive_max_50_unchanged_behaviour(self):
+        """A server setting of 50 retains 50-row pagination limit and stop test."""
+        routes = {
+            fairy.settings_url(): {"max_response_items": 50},
+            "/pulls?limit=50&page=1": [{"number": i} for i in range(50)],
+            "/pulls?limit=50&page=2": [{"number": 51}],
+        }
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            return routes[path]
+
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            rows = fairy.paginated("/pulls")
+            rows2 = fairy.paginated("/pulls")
+        self.assertEqual(len(rows), 51)
+        self.assertEqual(len(rows2), 51)
+        self.assertEqual(calls.count(fairy.settings_url()), 1)
+        self.assertEqual(
+            calls,
+            [
+                fairy.settings_url(),
+                "/pulls?limit=50&page=1",
+                "/pulls?limit=50&page=2",
+                "/pulls?limit=50&page=1",
+                "/pulls?limit=50&page=2",
+            ],
+        )
+
+    def test_page_size_regression_max_20_reads_all_over_three_pages(self):
+        """A server setting of 20 reads 45 items across 3 pages instead of stopping at 20."""
+        total_items = [{"id": i} for i in range(1, 46)]
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            if path == fairy.settings_url():
+                return {"max_response_items": 20}
+            parsed = urllib.parse.urlsplit(path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            limit = int(qs.get("limit", [50])[0])
+            page = int(qs.get("page", [1])[0])
+            effective_limit = min(limit, 20)
+            start = (page - 1) * effective_limit
+            return total_items[start : start + effective_limit]
+
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            rows = fairy.paginated("/items")
+        self.assertEqual(len(rows), 45)
+        self.assertEqual(
+            calls,
+            [
+                fairy.settings_url(),
+                "/items?limit=20&page=1",
+                "/items?limit=20&page=2",
+                "/items?limit=20&page=3",
+            ],
+        )
+
+    def test_page_size_boundary_max_1(self):
+        """A server setting of 1 reads single-row pages and stops on an empty page."""
+        routes = {
+            fairy.settings_url(): {"max_response_items": 1},
+            "/items?limit=1&page=1": [{"id": 1}],
+            "/items?limit=1&page=2": [{"id": 2}],
+            "/items?limit=1&page=3": [],
+        }
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            return routes[path]
+
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            self.assertEqual(fairy.discover_page_size(), 1)
+            rows = fairy.paginated("/items")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            calls,
+            [
+                fairy.settings_url(),
+                "/items?limit=1&page=1",
+                "/items?limit=1&page=2",
+                "/items?limit=1&page=3",
+            ],
+        )
+
+    def test_page_size_boundary_max_51_capped_at_50(self):
+        """A server setting of 51 is capped at the client maximum of 50."""
+        routes = {
+            fairy.settings_url(): {"max_response_items": 51},
+            "/items?limit=50&page=1": [{"id": i} for i in range(50)],
+            "/items?limit=50&page=2": [],
+        }
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            return routes[path]
+
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            self.assertEqual(fairy.discover_page_size(), 50)
+            rows = fairy.paginated("/items")
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(
+            calls,
+            [
+                fairy.settings_url(),
+                "/items?limit=50&page=1",
+                "/items?limit=50&page=2",
+            ],
+        )
+
+    def test_page_size_cleared_per_run_on_module_reuse(self):
+        """When the module is reused, a lowered page size is read fresh and all rows are read."""
+        run = 1
+        items_run2 = [{"number": i, "user": {"login": "lusoris"}} for i in range(1, 46)]
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            if path == fairy.settings_url():
+                return {"max_response_items": 50 if run == 1 else 20}
+            if path.startswith("/pulls?"):
+                server_max = 50 if run == 1 else 20
+                items = [] if run == 1 else items_run2
+                parsed = urllib.parse.urlsplit(path)
+                qs = urllib.parse.parse_qs(parsed.query)
+                limit = int(qs.get("limit", [50])[0])
+                page = int(qs.get("page", [1])[0])
+                effective_limit = min(limit, server_max)
+                start = (page - 1) * effective_limit
+                return items[start : start + effective_limit]
+            return []
+
+        errors_run1, errors_run2 = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(errors_run1),
+            ):
+                rc1 = fairy.main([])
+            run = 2
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(errors_run2),
+            ):
+                rc2 = fairy.main([])
+
+        self.assertEqual(rc1, 0)
+        self.assertEqual(rc2, 0)
+        self.assertEqual(calls.count(fairy.settings_url()), 2)
+        self.assertIn("checked_prs=45", errors_run2.getvalue())
+        self.assertIn("/pulls?state=open&poster=lusoris&limit=20&page=3", calls)
+
+    def test_page_size_negative_invalid_settings_reported(self):
+        """Invalid max_response_items values raise ValueError and exit 1 in main."""
+        cases = (
+            ("bool true", {"max_response_items": True}),
+            ("zero", {"max_response_items": 0}),
+            ("string", {"max_response_items": "50"}),
+            ("missing key", {}),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                fairy.PAGE_CACHE.clear()
+                with (
+                    unittest.mock.patch.object(fairy, "get", return_value=payload),
+                    self.assertRaises(ValueError),
+                ):
+                    fairy.discover_page_size()
+
+                calls = []
+                fake_get = _recording_get(payload, calls)
+
+                output, errors = io.StringIO(), io.StringIO()
+                with (
+                    unittest.mock.patch.object(fairy, "get", side_effect=fake_get),
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(fairy.main([]), 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("malformed API response", errors.getvalue())
+                self.assertEqual(calls, [fairy.settings_url()])
 
 
 if __name__ == "__main__":

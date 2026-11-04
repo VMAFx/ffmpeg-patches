@@ -2,11 +2,16 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings build test lint apply lengths lengths-local upstream-lint dist
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings build test lint lint-mutable-defaults apply lengths lengths-local upstream-lint dist
+.PHONY: fairy-requests
 
 DOCSTRING_BASE ?= origin/main
 
 all: build
+
+# Optional live check; keep network access outside verify-all.
+fairy-requests:
+	@bash scripts/ffmpeg-forgejo fairy-requests --skip-unavailable
 
 verify-all: compile-context-verify caveman-sources audit docstrings test lengths-local upstream-lint
 
@@ -32,10 +37,12 @@ build:
 test: build lint
 	@python3 -m unittest discover -s tests
 
-lint:
+lint: lint-mutable-defaults
 	@ruff check scripts tests
 	@ruff format --check scripts tests
-	@reuse lint --quiet
+
+lint-mutable-defaults:
+	@python3 scripts/lint_mutable_defaults.py
 
 # Apply the series onto a clean FFmpeg checkout at the pinned base:
 #   make apply FFMPEG_TREE=/path/to/ffmpeg

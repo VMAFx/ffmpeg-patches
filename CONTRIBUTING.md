@@ -18,8 +18,15 @@ running local verification. CI uses the version in `.python-version`.
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install ruff==0.16.8 reuse==6.2.0 numpy==2.5.4 pyyaml==6.0.3
+python3 -m pip install --require-hashes -r requirements-dev.txt
 ```
+
+Pins live in `requirements-dev.in`; after editing it, recompile from the repository root with `uv pip compile --universal --generate-hashes --python-version=3.12 requirements-dev.in --output-file=requirements-dev.txt`.
+
+Run the mutable-default check directly with `python3 scripts/lint_mutable_defaults.py`
+or through `make lint-mutable-defaults`. Its Pylint pin in `requirements-dev.in`
+must match the script's `PYLINT_VERSION`. The script
+uses that exact version on PATH, falling back to `uvx` to fetch the pinned version.
 
 ### Modernized NASA JPL Power-of-10 Rules
 

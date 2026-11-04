@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List own or commented open FFmpeg threads awaiting lusoris after Fairy's word.
+"""List own or commented open FFmpeg threads awaiting reply after Fairy's word.
 
 Reads are not atomic. A reply posted between read_from and read_to may
 show as owed; a rerun clears it.
@@ -13,9 +13,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-API = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg"
-API_HOST = "code.ffmpeg.org"
-FEED = "https://code.ffmpeg.org/api/v1/users/lusoris/activities/feeds"
+try:
+    import forge_settings
+except ModuleNotFoundError:
+    from scripts import forge_settings
+
+PAGE_CACHE = {}
+
+
+def api_url():
+    """Resolve the configured repository API endpoint only when needed."""
+    return f"{forge_settings.api_base()}/repos/{forge_settings.repo()}"
+
+
+def settings_url():
+    """Resolve the configured API settings endpoint only when needed."""
+    return f"{forge_settings.api_base()}/settings/api"
 
 
 class RefusedURL(ValueError):
@@ -25,7 +38,9 @@ class RefusedURL(ValueError):
 def check_url(url):
     """Reject URLs outside HTTPS on the allow-listed API host."""
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname != API_HOST:
+    if parsed.scheme != "https" or forge_settings.authority(url) != forge_settings.authority(
+        forge_settings.host()
+    ):
         raise RefusedURL(url)
 
 
@@ -48,24 +63,41 @@ OPENER.add_handler(urllib.request.HTTPErrorProcessor())
 OPENER.add_handler(urllib.request.UnknownHandler())
 
 
+def discover_page_size():
+    """Discover and cache the forge API page size, bounded by 50."""
+    if "page_size" in PAGE_CACHE:
+        return PAGE_CACHE["page_size"]
+    settings = get(settings_url())
+    if not isinstance(settings, dict):
+        raise ValueError("expected a dict from /settings/api")
+    if "max_response_items" not in settings:
+        raise ValueError("missing max_response_items in /settings/api")
+    size = settings["max_response_items"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("invalid max_response_items in /settings/api; expected a positive integer")
+    PAGE_CACHE["page_size"] = min(50, size)
+    return PAGE_CACHE["page_size"]
+
+
 def get(path):
     """Decode an API GET with a deadline and allow-listed initial and redirect URLs."""
-    url = path if urllib.parse.urlsplit(path).scheme else API + path
+    url = path if urllib.parse.urlsplit(path).scheme else api_url() + path
     check_url(url)
     with OPENER.open(url, timeout=30) as r:
         return json.load(r)
 
 
 def paginated(path, max_pages=1000, older="entries"):
-    """Read bounded 50-row pages, warning if the last permitted page is full."""
+    """Read bounded pages, warning if the last permitted page is full."""
     result = []
+    page_size = discover_page_size()
     separator = "&" if "?" in path else "?"
     for page in range(1, max_pages + 1):
-        batch = get(f"{path}{separator}limit=50&page={page}")
+        batch = get(f"{path}{separator}limit={page_size}&page={page}")
         if not isinstance(batch, list):
             raise ValueError(f"expected a list from {path}")
         result.extend(batch)
-        if len(batch) < 50:
+        if len(batch) < page_size:
             return result
     print(
         f"warning: older {older} were not read; {path} reached {max_pages} full pages",
@@ -79,7 +111,7 @@ def activity_number(row):
     try:
         if row["op_type"] not in {"comment_issue", "comment_pull"}:
             return None
-        if row["repo"]["full_name"] != "FFmpeg/FFmpeg":
+        if row["repo"]["full_name"] != forge_settings.REPO:
             return None
         content = json.loads(row["content"])
         if (
@@ -96,9 +128,10 @@ def activity_number(row):
         return None
 
 
-def commented_numbers():
-    """Return thread numbers from at most ten pages of lusoris' own activities."""
-    rows = paginated(FEED + "?only-performed-by=true", max_pages=10, older="comments")
+def commented_numbers(login):
+    """Return thread numbers from at most ten pages of own activities."""
+    feed = f"{forge_settings.api_base()}/users/{login}/activities/feeds"
+    rows = paginated(feed + "?only-performed-by=true", max_pages=10, older="comments")
     return {number for row in rows if (number := activity_number(row)) is not None}
 
 
@@ -121,21 +154,21 @@ def _open_issue_kind(number):
     return thread_kind(issue) if issue["state"] == "open" else None
 
 
-def discover_threads():
+def discover_threads(login):
     """Dedupe own open PRs/issues and open threads found through comment activity."""
-    pulls = paginated("/pulls?state=open&poster=lusoris")
+    pulls = paginated(f"/pulls?state=open&poster={login}")
     threads = {}
     for p in pulls:
         if not isinstance(p, dict):
             raise TypeError("expected a dict for pull")
-        if p["user"]["login"] == "lusoris":
+        if p["user"]["login"] == login:
             threads[p["number"]] = "pr"
-    issues = paginated("/issues?type=issues&state=open&created_by=lusoris")
+    issues = paginated(f"/issues?type=issues&state=open&created_by={login}")
     for issue in issues:
         if not isinstance(issue, dict):
             raise TypeError("expected a dict for issue")
         threads.setdefault(issue["number"], thread_kind(issue))
-    for number in sorted(commented_numbers() - threads.keys()):
+    for number in sorted(commented_numbers(login) - threads.keys()):
         if (kind := _open_issue_kind(number)) is not None:
             threads[number] = kind
     return threads
@@ -191,8 +224,8 @@ def _submitted_review(review):
     return bool(timestamp)
 
 
-def owed(comments, reviews):
-    """Return the newest Fairy word, newest lusoris word, and whether a reply is owed."""
+def owed(comments, reviews, *, login, bot):
+    """Return the newest Fairy word, newest user word, and whether a reply is owed."""
     if not isinstance(comments, list):
         raise TypeError("expected a list of comments")
     if not isinstance(reviews, list):
@@ -200,16 +233,15 @@ def owed(comments, reviews):
     words = [
         r
         for r in reviews
-        if _submitted_review(r)
-        and not (r["user"]["login"] == "Forgejo_Fairy" and approve_only(r.get("body")))
+        if _submitted_review(r) and not (r["user"]["login"] == bot and approve_only(r.get("body")))
     ]
     fairy = _newest_ts(
-        latest(words, "Forgejo_Fairy", lambda r: r["submitted_at"]),
-        latest(comments, "Forgejo_Fairy", lambda c: c["created_at"]),
+        latest(words, bot, lambda r: r["submitted_at"]),
+        latest(comments, bot, lambda c: c["created_at"]),
     )
     mine = _newest_ts(
-        latest(words, "lusoris", lambda r: r["submitted_at"]),
-        latest(comments, "lusoris", lambda c: c["created_at"]),
+        latest(words, login, lambda r: r["submitted_at"]),
+        latest(comments, login, lambda c: c["created_at"]),
     )
     unanswered = bool(fairy and (not mine or _parse_time(fairy) > _parse_time(mine)))
     return fairy, mine, unanswered
@@ -228,7 +260,7 @@ def _fixture_word(who, body, timestamp):
 
 def _owed_fixtures(head):
     """Return planted issue and PR turn-rule cases."""
-    fairy = _fixture_word("Forgejo_Fairy", "finding", "2026-11-02T00:00:00Z")
+    fairy = _fixture_word(forge_settings.DEFAULT_BOT_REVIEWER, "finding", "2026-11-02T00:00:00Z")
     mine = _fixture_word("lusoris", "reply", "2026-11-01T00:00:00Z")
     newer = dict(mine, created_at="2026-11-03T00:00:00Z")
     empty = dict(fairy, body=" \n")
@@ -275,9 +307,9 @@ def self_test():
     for b, want in bad:
         print(f"self-test FAIL want={want}: {b[:60]!r}", file=sys.stderr)
     owed_bad = [
-        (want, owed(comments, reviews))
+        (want, actual)
         for comments, reviews, want in _owed_fixtures(head)
-        if owed(comments, reviews) != want
+        if (actual := owed(comments, reviews, login="lusoris", bot="Forgejo_Fairy")) != want
     ]
     for want, actual in owed_bad:
         print(f"self-test FAIL owed want={want!r} actual={actual!r}", file=sys.stderr)
@@ -290,29 +322,47 @@ def utc_now():
 
 
 def main(argv):
+    """Dispatch self-tests or validate settings before reading and reporting threads."""
+    if argv == ["--self-test"]:
+        return self_test()
+    try:
+        api_url()
+    except ValueError as error:
+        print(f"fairy_unanswered: {error}", file=sys.stderr)
+        return 1
+    return _read_and_report()
+
+
+def _read_and_report():
     """Read all review pages, print owed PR/issue counts, and return an exit status.
 
     Reads are not atomic. A reply posted between read_from and read_to may
     show as owed; a rerun clears it.
     """
-    if argv == ["--self-test"]:
-        return self_test()
     try:
+        PAGE_CACHE.clear()
+        discover_page_size()
+        user_login = forge_settings.login()
         read_from = utc_now()
-        threads = discover_threads()
+        threads = discover_threads(user_login)
         out = []
         for number, kind in threads.items():
             comments = get(f"/issues/{number}/comments")
             reviews = paginated(f"/pulls/{number}/reviews") if kind == "pr" else []
-            fairy, mine, unanswered = owed(comments, reviews)
+            fairy, mine, unanswered = owed(
+                comments, reviews, login=user_login, bot=forge_settings.BOT_REVIEWER
+            )
             if unanswered:
-                out.append(f"{number}\t{kind}\tfairy={fairy}\tlusoris={mine or '-'}")
+                out.append(f"{number}\t{kind}\tfairy={fairy}\t{user_login}={mine or '-'}")
         read_to = utc_now()
     except RefusedURL as error:
         print(f"fairy_unanswered: refused URL: {error}", file=sys.stderr)
         return 1
     except (KeyError, TypeError, ValueError) as error:
         print(f"fairy_unanswered: malformed API response: {error}", file=sys.stderr)
+        return 1
+    except RuntimeError as error:
+        print(f"fairy_unanswered: {error}", file=sys.stderr)
         return 1
     except OSError as error:
         print(f"error: {error}", file=sys.stderr)

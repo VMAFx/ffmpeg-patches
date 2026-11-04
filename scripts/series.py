@@ -33,6 +33,8 @@
         Print the table of upstream pull requests rendered from
         upstream-contributions.json; --write puts it into README.md
         between its two marker comments. `check` compares the two.
+        One record per pull request; its `patch` string lists patch names
+        separated by ", ", or is empty when the series carries none.
     series.py scope [--base REF] [--head REF] [--full]
         Select FFmpeg, GPU parity and macOS CI work from the changed files.
         Append outputs with --github-output FILE and a summary with --report FILE.
@@ -53,13 +55,18 @@ import json
 import os
 import re
 import shlex
-import subprocess
+import subprocess  # nosec B404 - fixed git argv, no shell, explicit timeouts.
 import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+
+try:
+    import forge_settings
+except ModuleNotFoundError:
+    from scripts import forge_settings
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_KEYS = ("FFMPEG_REMOTE", "FFMPEG_TAG", "FFMPEG_COMMIT")
@@ -89,7 +96,6 @@ REQUIRED_EXCEPTION_KEYS = {
 VALID_CATEGORIES = {"A", "B", "C", "D"}
 CATEGORY_INTERVALS = {"B": 3, "C": 10, "D": 120}
 DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-PULL_URL = re.compile(r"(https://code\.ffmpeg\.org)/([^/]+)/([^/]+)/pulls/(\d+)")
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -135,6 +141,14 @@ Results = list[tuple[str, str]]
 
 class SeriesError(Exception):
     """The series or the FFmpeg checkout is unusable; main() exits 2."""
+
+
+def pull_url_pattern() -> re.Pattern[str]:
+    """Resolve forge settings lazily and report invalid settings as tool errors."""
+    try:
+        return forge_settings.pull_url_pattern()
+    except ValueError as exc:
+        raise SeriesError(str(exc)) from exc
 
 
 @dataclass
@@ -387,8 +401,10 @@ def check_covered_by(data: dict, name: str, findings: Findings) -> None:
     if data.get("status") != "unsubmitted":
         findings.error(name, "covered_by is allowed only with status unsubmitted")
     url = data["covered_by"]
-    if not isinstance(url, str) or not PULL_URL.fullmatch(url):
-        findings.error(name, "covered_by must be a pull request URL of code.ffmpeg.org")
+    if not isinstance(url, str) or not pull_url_pattern().fullmatch(url):
+        findings.error(
+            name, f"covered_by must be a pull request URL of {forge_settings.keyring_service()}"
+        )
 
 
 def check_master_form(form: object, name: str, findings: Findings) -> None:
@@ -588,24 +604,27 @@ def patch_links(root: Path, names: list[str]) -> dict[str, tuple[str, str]]:
     return links
 
 
+def contribution_patches(entry: dict) -> list[str]:
+    """Patch names separated by comma and space; an empty string names none."""
+    return entry["patch"].split(", ") if entry["patch"] else []
+
+
 def check_records(
     entries: list[dict], links: dict[str, tuple[str, str]], findings: Findings
 ) -> None:
-    """Each upstream link of the series has one record, each record's patch that link."""
+    """Check every patch in each record's comma-and-space-separated patch string."""
     recorded: set[str] = set()
     for entry in entries:
-        patch = entry["patch"]
-        if not patch:
-            continue
         where = f"{CONTRIBUTIONS}: {entry['number']}"
-        if patch in recorded:
-            findings.error(where, f"{patch} is recorded twice")
-        recorded.add(patch)
-        status, link = links.get(patch, ("", ""))
-        if link != entry["url"]:
-            findings.error(where, f"the metadata of {patch} does not link {entry['url']}")
-        elif FORGE_STATES[status] != entry["state"]:
-            findings.error(where, f"state {entry['state']!r} disagrees with status {status!r}")
+        for patch in contribution_patches(entry):
+            if patch in recorded:
+                findings.error(where, f"{patch} is recorded twice")
+            recorded.add(patch)
+            status, link = links.get(patch, ("", ""))
+            if link != entry["url"]:
+                findings.error(where, f"the metadata of {patch} does not link {entry['url']}")
+            elif FORGE_STATES[status] != entry["state"]:
+                findings.error(where, f"state {entry['state']!r} disagrees with status {status!r}")
     for name, (_, link) in links.items():
         if name not in recorded:
             findings.error(name, f"upstream link {link} has no record in {CONTRIBUTIONS}")
@@ -639,15 +658,16 @@ def contribution_state(entry: dict) -> str:
 
 
 def contributions_table(data: dict) -> str:
-    """The README block: one row per pull request and the day the forge was read."""
+    """One README row per pull request, listing all patch numbers and the read day."""
     lines = [
         "| Pull request | Target | State | Change | Series patch |",
         "| --- | --- | --- | --- | --- |",
     ]
     for entry in data["contributions"]:
+        patches = ", ".join(patch[:4] for patch in contribution_patches(entry)) or "none"
         lines.append(
             f"| [{entry['number']}]({entry['url']}) | `{entry['base']}` "
-            f"| {contribution_state(entry)} | {entry['title']} | {entry['patch'][:4] or 'none'} |"
+            f"| {contribution_state(entry)} | {entry['title']} | {patches} |"
         )
     lines += ["", f"State read from the FFmpeg forge on {data['checked']}."]
     return "\n".join(lines)
@@ -1594,6 +1614,7 @@ def main(argv: list[str]) -> int:
     """Exit 0 on success, 1 on findings or a failed apply, 2 when the tool cannot run."""
     args = parse_args(argv)
     try:
+        pull_url_pattern()
         return run(args)
     except (SeriesError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         detail = getattr(exc, "stderr", None) or ""

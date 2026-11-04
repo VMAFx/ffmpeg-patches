@@ -23,21 +23,47 @@ runs:
   steps:
     - uses: ./.github/actions/setup-python
       if: inputs.draft != 'true' && inputs.in-scope == 'true' && inputs.setup-python == 'true'
-    - name: Load the pinned base
+    - uses: ./.github/actions/load-base
       if: inputs.draft != 'true' && inputs.in-scope == 'true'
-      shell: bash
-      run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
     - name: Install the FFmpeg build toolchain
       if: inputs.draft != 'true' && inputs.in-scope == 'true' && inputs.toolchain == 'linux'
       shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          build-essential nasm pkg-config libvulkan-dev spirv-headers libffmpeg-nvenc-dev \
+          build-essential nasm pkg-config meson ninja-build xxd \
+          libvulkan-dev spirv-headers libffmpeg-nvenc-dev \
           libva-dev libdrm-dev libvpl-dev libzimg-dev ocl-icd-opencl-dev glslc clang-tidy cppcheck
         gcc --version | head -1
         glslc --version | head -1
         pkg-config --modversion vulkan ffnvcodec libva libdrm vpl zimg OpenCL
+    - name: Build the pinned libvmaf release
+      # Ubuntu has no libvmaf package. Upstream's Meson build needs C/C++,
+      # NASM and xxd for the built-in models; docs, tools and tests stay off.
+      if: inputs.draft != 'true' && inputs.in-scope == 'true' && inputs.toolchain == 'linux'
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        LIBVMAF_TAG: v3.2.1
+        LIBVMAF_COMMIT: f85a853692a8c730d0270cd733c8bb30b5b93b7c
+      run: |
+        git clone --depth 1 --branch "$LIBVMAF_TAG" https://github.com/Netflix/vmaf.git vmaf
+        actual=$(git -C vmaf rev-parse HEAD)
+        if [ "$actual" != "$LIBVMAF_COMMIT" ]; then
+          echo "::error::${LIBVMAF_TAG} resolves to ${actual}, expected ${LIBVMAF_COMMIT}"
+          exit 1
+        fi
+        prefix="$RUNNER_TEMP/libvmaf-prefix"
+        # Static linking keeps FATE and parity binaries independent of a loader path.
+        meson setup vmaf/libvmaf/build vmaf/libvmaf --buildtype=release \
+          -Denable_tests=false -Denable_docs=false -Denable_tools=false \
+          -Ddefault_library=static --libdir=lib --prefix="$prefix"
+        ninja -C vmaf/libvmaf/build -j4 install
+        export PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        export LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+        pkg-config --modversion libvmaf
     - name: Install the Metal toolchain
       # Xcode ships the Metal compiler as a separate component; without it
       # configure turns Metal off instead of failing.

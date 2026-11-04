@@ -10,7 +10,7 @@ import io
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 - fixed git and make argv in temporary test trees; result types for mocks.
 import tarfile
 import tempfile
 import unittest
@@ -1195,7 +1195,43 @@ class ContributionsTest(SeriesTestCase):
         twice = [self.fx.record(1), self.fx.record(2), self.fx.record(3), self.fx.record(3)]
         self.assert_error(self.check_with(twice, render=False), needle)
 
-    # Negative: records against the series metadata.
+    # Records against the series metadata: positive, negative and boundary.
+
+    def test_one_record_can_name_two_linked_patches(self) -> None:
+        """A pull request covers every named patch and renders both series numbers."""
+        self.fx.patch(2).with_suffix(".toml").write_text(METADATA)
+        entries = [self.fx.record(1, patch=", ".join(self.fx.names))]
+        self.assertEqual(self.check_with(entries).errors, [])
+        self.assertIn("| lib: change 1 | 0001, 0002 |", self.run_main()[1])
+
+    def test_each_named_patch_must_link_the_record(self) -> None:
+        """A second patch linked to another pull request fails the shared record."""
+        entries = [self.fx.record(1, patch=", ".join(self.fx.names))]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, f"the metadata of {self.fx.names[1]} does not link")
+
+    def test_patch_named_twice_in_one_record_fails(self) -> None:
+        """Repeating a patch inside one string triggers the duplicate check."""
+        entries = [
+            self.fx.record(1, patch=", ".join([self.fx.names[0]] * 2)),
+            self.fx.record(2),
+        ]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, f"{self.fx.names[0]} is recorded twice")
+
+    def test_linked_patch_omitted_from_shared_record_fails(self) -> None:
+        """A record for the shared URL still must name every linked patch."""
+        self.fx.patch(2).with_suffix(".toml").write_text(METADATA)
+        findings = self.check_with([self.fx.record(1)], render=False)
+        self.assert_error(findings, f"{self.fx.names[1]}: upstream link")
+        self.assert_error(findings, "pulls/1 has no record")
+
+    def test_each_named_patch_must_match_the_record_state(self) -> None:
+        """The second patch's status is checked even when both URLs match."""
+        self.fx.patch(2).with_suffix(".toml").write_text(METADATA.replace("submitted", "rejected"))
+        entries = [self.fx.record(1, patch=", ".join(self.fx.names))]
+        findings = self.check_with(entries, render=False)
+        self.assert_error(findings, "state 'open' disagrees with status 'rejected'")
 
     def test_upstream_link_without_record_fails(self) -> None:
         findings = self.check_with([self.fx.record(1)], render=False)
