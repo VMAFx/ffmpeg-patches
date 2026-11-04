@@ -25,7 +25,7 @@ tool cannot run (unclean tree, missing or empty series.txt, missing patch).
 from __future__ import annotations
 
 import argparse
-import subprocess
+import subprocess  # nosec B404 - SubprocessError type only, no process started here.
 import sys
 import tomllib
 from pathlib import Path

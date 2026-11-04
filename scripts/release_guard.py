@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
-import subprocess
+import subprocess  # nosec B404 - allow-listed cosign argv, no shell, bounded timeout.
 import sys
 from pathlib import Path
 

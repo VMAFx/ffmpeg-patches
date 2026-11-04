@@ -32,7 +32,7 @@ both variables they are skipped.
 
 from __future__ import annotations
 
-import subprocess
+import subprocess  # nosec B404 - explicit fixture tool paths and values, no shell.
 import unittest
 
 from tests import helpers

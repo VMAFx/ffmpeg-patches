@@ -8,7 +8,8 @@ import contextlib
 import http.server
 import json
 import os
-import subprocess
+import shutil
+import subprocess  # nosec B404 - fixed git and helper argv in temporary test repositories.
 import tempfile
 import threading
 import unittest
@@ -27,7 +28,7 @@ LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
-HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "fairy-reviews"})
+HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "push", "fairy-reviews"})
 
 
 def label(status: str, n: int = 0) -> dict:
@@ -64,7 +65,7 @@ def git(repo: Path, *args: str) -> None:
     subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
         ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=repo,
-        env=isolated_git_environment(),
+        env=isolated_git_environment(preserve_config=True),
         check=True,
         timeout=120,
     )
@@ -76,7 +77,7 @@ def git_output(repo: Path, *args: str) -> str:
     return subprocess.run(  # nosec B603 B607 - fixed git argv, temporary test repository, test literals
         ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=repo,
-        env=isolated_git_environment(),
+        env=isolated_git_environment(preserve_config=True),
         check=True,
         capture_output=True,
         text=True,
@@ -108,41 +109,14 @@ class GitEnvironmentTest(unittest.TestCase):
             self.assertFalse(bogus_index.exists())
 
     def test_git_ignores_global_hooks(self) -> None:
-        """Fixture Git commands bypass hooks from the caller's global config."""
+        """Fixture Git explicitly bypasses hooks without changing credential settings."""
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
-            repo.mkdir()
-            hooks = root / "hooks"
-            hooks.mkdir()
-            pre_commit = hooks / "pre-commit"
-            pre_commit.write_text("#!/bin/sh\nexit 1\n")
-            pre_commit.chmod(0o755)
-            global_config = root / "gitconfig"
-            global_config.write_text(f"[core]\n\thooksPath = {hooks}\n")
-            with unittest.mock.patch.dict(
-                os.environ,
-                {"HOME": str(root / "home"), "GIT_CONFIG_GLOBAL": str(global_config)},
-            ):
-                self.assertEqual(
-                    isolated_git_environment()["GIT_CONFIG_GLOBAL"], str(global_config)
-                )
-                git(repo, "init", "-q", "-b", "master")
-                repo.joinpath("tracked").write_text("content\n")
-                git(repo, "add", "tracked")
-                git(
-                    repo,
-                    "-c",
-                    "user.name=Test",
-                    "-c",
-                    "user.email=test@example.invalid",
-                    "-c",
-                    "commit.gpgSign=false",
-                    "commit",
-                    "-qm",
-                    "fixture",
-                )
+        with unittest.mock.patch("subprocess.run") as run:
+            git(Path("fixture"), "init", "-q")
+        self.assertEqual(run.call_args.args[0][:3], ["git", "-c", "core.hooksPath=/dev/null"])
+        self.assertEqual(
+            run.call_args.kwargs["env"], isolated_git_environment(preserve_config=True)
+        )
 
 
 class Stub:
@@ -189,6 +163,8 @@ class Stub:
         ]
         self.drop_reviewers = False
         self.request_status = 201
+        self.branch_head = kwargs.get("branch_head")
+        self.branch_status = int(kwargs.get("branch_status", 200))
 
     def head(self) -> object:
         """Return the next scripted pull head, repeating the last."""
@@ -367,20 +343,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         return False
 
+    def _route_branch(self, stub: Stub, parts: list[str]) -> bool:
+        """Return the scripted fork branch commit or a failed read."""
+
+        if len(parts) > 3 and parts[-2] == "branches":
+            self.reply(stub.branch_status, {"commit": {"id": stub.branch_head}})
+            return True
+        return False
+
     def _dispatch_get(self, stub: Stub, url: urllib.parse.SplitResult, parts: list[str]) -> bool:
         """Route settings and repository GET requests to the matching handler."""
 
-        if self._route_settings(stub, url):
-            return True
-        if self._route_user(stub, url):
-            return True
-        if self._route_pull(stub, url):
-            return True
-        if self._route_pull_files(stub, parts, url):
-            return True
-        if self._route_reviews(stub, parts, url):
-            return True
-        return self._route_status(stub, parts, url)
+        routes = (
+            lambda: self._route_settings(stub, url),
+            lambda: self._route_user(stub, url),
+            lambda: self._route_pull(stub, url),
+            lambda: self._route_pull_files(stub, parts, url),
+            lambda: self._route_reviews(stub, parts, url),
+            lambda: self._route_branch(stub, parts),
+            lambda: self._route_status(stub, parts, url),
+        )
+        return any(route() for route in routes)
 
     def do_GET(self) -> None:
         """Serve scripted user, pull, and commit-status reads."""
@@ -470,6 +453,9 @@ class ForgejoTest(unittest.TestCase):
         candidate.write_text("topic\n")
         git(self.repo, "add", OVERLAP_FILE)
         git(self.repo, *commit, "topic")
+        self.sweep = self.tmp / "sweep.md"
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n")
 
     def run_command(
         self,
@@ -482,9 +468,11 @@ class ForgejoTest(unittest.TestCase):
 
         if not args or args[0] not in HELPER_SUBCOMMANDS:
             raise ValueError(f"unsupported helper subcommand: {args[0] if args else '<missing>'}")
+        if args[0] == "pr" and stub.branch_head is None:
+            stub.branch_head = git_output(self.repo, "rev-parse", "topic")
         server = serve(stub)
         try:
-            env = isolated_git_environment()
+            env = isolated_git_environment(preserve_config=True)
             dirs = [str(p) for p in (path_first, self.bin_dir) if p]
             env.update(
                 PATH=os.pathsep.join(dirs + [env.get("PATH", "")]),
@@ -1175,6 +1163,9 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [])
 
 
+FAIRY_FIXTURE_HEAD = "f" * 40
+
+
 class FairyRequestTestBase(unittest.TestCase):
     """Use the existing HTTP stub with inert Git and keyring executables."""
 
@@ -1189,12 +1180,17 @@ class FairyRequestTestBase(unittest.TestCase):
         self.bin_dir.mkdir()
         for name, body in {
             "secret-tool": "printf 'fixture-token\\n'",
-            "git": 'case "$1" in fetch|diff) exit 0;; *) exit 97;; esac',
+            "git": (
+                'case "$1" in fetch|diff) exit 0;; '
+                f"rev-parse) echo {FAIRY_FIXTURE_HEAD};; *) exit 97;; esac"
+            ),
         }.items():
             tool = self.bin_dir / name
             tool.write_text("#!/bin/sh\n" + body + "\n")
             tool.chmod(0o755)
         (self.tmp / "body.md").write_text(BODY)
+        self.sweep = self.tmp / "sweep.md"
+        self.sweep.write_text(f"class: unchecked-return\nhead: {FAIRY_FIXTURE_HEAD}\nno hits\n")
 
     def run_command(
         self, stub: Stub, *args: str, env_updates: dict[str, str] | None = None
@@ -1202,6 +1198,10 @@ class FairyRequestTestBase(unittest.TestCase):
         """Run only request commands against localhost with the inherited environment."""
         if not args or args[0] not in {"pr", "fairy-requests"}:
             raise ValueError("unsupported fixture command")
+        if args[0] == "pr" and "--sweep" not in args:
+            args = ("pr", "--sweep", str(self.sweep), *args[1:])
+        if args[0] == "pr" and stub.branch_head is None:
+            stub.branch_head = FAIRY_FIXTURE_HEAD
         server = serve(stub)
         try:
             environment = os.environ.copy()
@@ -1229,12 +1229,61 @@ class FairyRequestTestBase(unittest.TestCase):
 
 
 class PullRequestReviewerTest(FairyRequestTestBase):
+    def test_pr_refuses_unswept_fork_head(self) -> None:
+        """A different fork head cannot create a pull for a validated local commit."""
+
+        stub = Stub(reviewers=[["alice"]], branch_head=A)
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(FAIRY_FIXTURE_HEAD, proc.stderr)
+        self.assertIn(A, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_pr_refuses_unreadable_swept_fork_branch(self) -> None:
+        """A missing or unavailable fork branch fails before any POST."""
+
+        for status in (404, 500):
+            with self.subTest(status=status):
+                stub = Stub(reviewers=[["alice"]], branch_status=status)
+                proc = self.pr(stub)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn("fork branch", proc.stderr)
+                self.assertIn(FAIRY_FIXTURE_HEAD, proc.stderr)
+                self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_pr_refuses_missing_fork_commit(self) -> None:
+        """A successful read without a commit ID still refuses creation."""
+
+        stub = Stub(reviewers=[["alice"]], branch_head="")
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(FAIRY_FIXTURE_HEAD, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_pr_accepts_matching_swept_fork_head(self) -> None:
+        """The encoded branch in the fork must match before pull creation."""
+
+        stub = Stub(reviewers=[["alice"]])
+        proc = self.run_command(stub, "pr", "fix/swept-head", "title", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        branch_read = ("GET", "/api/v1/repos/tester/FFmpeg/branches/fix%2Fswept-head", "")
+        self.assertIn(branch_read, stub.requests)
+        post_index = next(
+            index
+            for index, (method, path, _) in enumerate(stub.requests)
+            if method == "POST" and path.endswith("/pulls")
+        )
+        self.assertLess(stub.requests.index(branch_read), post_index)
+        self.assertEqual(json.loads(stub.requests[post_index][2])["head"], "tester:fix/swept-head")
+
     def pr(self, stub: Stub) -> subprocess.CompletedProcess[str]:
         """Create a pull request and read its requested reviewers back."""
 
         return self.run_command(
             stub,
             "pr",
+            "--sweep",
+            str(self.sweep),
             "topic",
             "title",
             str(self.tmp / "body.md"),
@@ -1470,6 +1519,8 @@ class PullRequestOverlapTest(ForgejoTest):
         return self.run_command(
             stub,
             "pr",
+            "--sweep",
+            str(self.sweep),
             *options,
             "topic",
             "title",
@@ -1588,6 +1639,8 @@ class PullRequestOverlapTest(ForgejoTest):
             "-qm",
             "new topic",
         )
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n")
         stub = overlap_stub(
             reviewers=[["alice"]], open_pulls=[open_pull()], pull_files={25612: ["upstream-file"]}
         )
@@ -1605,6 +1658,8 @@ class PullRequestOverlapTest(ForgejoTest):
         proc = self.run_command(
             stub,
             "pr",
+            "--sweep",
+            str(self.sweep),
             "topic",
             "title",
             str(self.tmp / "body.md"),
@@ -1670,6 +1725,202 @@ class PullRequestOverlapTest(ForgejoTest):
             any("/pulls/25612/files?" in path and "page=2" in path for _, path, _ in stub.requests)
         )
         self.assertEqual(self.pull_posts(stub), [])
+
+
+class SweepTest(ForgejoTest):
+    """Require a reviewed sweep before either outbound operation."""
+
+    helper = HELPER
+
+    def test_sweep_ignores_cwd_stdlib_decoys(self) -> None:
+        """Valid sweeps ignore checkout modules shadowing the Python standard library."""
+
+        marker = self.repo / "stdlib-decoy-executed"
+        decoy = f"open({str(marker)!r}, 'w').write('executed')\nraise SystemExit(99)\n"
+        for name in ("pathlib.py", "importlib.py"):
+            (self.repo / name).write_text(decoy)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertFalse(marker.exists(), "checkout-level standard library decoy executed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+
+    def test_push_uses_swept_sha_refspec(self) -> None:
+        """Push uses the validated commit ID and preserves its explicit lease."""
+
+        sha = git_output(self.repo, "rev-parse", "topic")
+        result = self.sweep_command("push", "--lease", A, "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = json.loads((self.tmp / "push-argv.json").read_text())
+        self.assertEqual(argv[-1], f"{sha}:refs/heads/topic")
+        self.assertIn(f"--force-with-lease=refs/heads/topic:{A}", argv)
+
+    def test_sweep_accepts_helper_symlink(self) -> None:
+        """A helper symlink outside scripts still imports the sweep validator."""
+
+        self.helper = self.bin_dir / "ffmpeg-forgejo"
+        self.helper.symlink_to(HELPER)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+
+    def test_sweep_names_missing_module(self) -> None:
+        """A helper missing its validator reports the module and refuses the push."""
+
+        self.helper = self.bin_dir / "ffmpeg-forgejo"
+        shutil.copyfile(HELPER, self.helper)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(
+            f"sweep: missing validator: {self.bin_dir / 'variant_sweep.py'}", result.stderr
+        )
+        self.assertEqual(self.sweep_requests, [])
+        self.assertNotIn("stub push", result.stdout)
+
+    def test_sweep_missing_sibling_rejects_cwd_decoy(self) -> None:
+        """A missing sibling fails by name without executing a checkout-level decoy."""
+
+        self.helper = self.bin_dir / "ffmpeg-forgejo"
+        shutil.copyfile(HELPER, self.helper)
+        marker = self.repo / "decoy-executed"
+        (self.repo / "variant_sweep.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('executed')\n"
+            "def validate_report(path, head):\n"
+            '    """Pretend every report is valid after recording decoy execution."""\n'
+            "    return True\n"
+        )
+        for command in ("push", "pr"):
+            with self.subTest(command=command):
+                result = self.sweep_command(command, "--sweep", str(self.sweep))
+                self.assertFalse(marker.exists(), "checkout-level decoy executed")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    f"sweep: missing validator: {self.bin_dir / 'variant_sweep.py'}", result.stderr
+                )
+                self.assertEqual(self.sweep_requests, [])
+                self.assertNotIn("stub push", result.stdout)
+
+    def test_sweep_rejects_non_table_findings(self) -> None:
+        """Malformed findings and unrecognized text cannot disappear during validation."""
+
+        original = self.sweep.read_text()
+        for line in (
+            "sibling.c:4 | play | discarded | no | TODO |",
+            "unexpected text",
+            "no hits trailing junk",
+            "| sibling.c:4 | play | discarded | no | TODO",
+        ):
+            with self.subTest(line=line):
+                self.sweep.write_text(original + line + "\n")
+                self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_rejects_metadata_only_prefix(self) -> None:
+        """A metadata-only prefix is incomplete rather than a reviewed empty report."""
+
+        self.sweep.write_text(self.sweep.read_text().replace("no hits\n", ""))
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_report_size_limit(self) -> None:
+        """An oversized report is refused by name before outbound operations."""
+
+        self.sweep.write_text(self.sweep.read_text() + " " * (4 * 1024 * 1024))
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertIn("report size limit", result.stderr)
+
+    def sweep_command(self, command: str, *options: str) -> subprocess.CompletedProcess[str]:
+        """Attempt an outbound operation with API and Git push stubbed."""
+
+        real_git = shutil.which("git")
+        if real_git is None:
+            raise RuntimeError("git missing")
+        fake = self.bin_dir / "git"
+        fake.write_text(
+            "#!/usr/bin/env python3\nimport json, os, sys\n"
+            'if "push" in sys.argv:\n'
+            f"    with open({str(self.tmp / 'push-argv.json')!r}, 'w') as record:\n"
+            "        json.dump(sys.argv[1:], record)\n"
+            '    print("stub push")\n    sys.exit(0)\n'
+            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+        )
+        fake.chmod(0o755)
+        stub = Stub(reviewers=[["alice"]])
+        positional = ["topic"]
+        if command == "pr":
+            positional += ["title", str(self.tmp / "body.md")]
+        result = self.run_command(stub, command, *options, *positional)
+        self.sweep_requests = stub.requests
+        return result
+
+    def assert_sweep_refused(self, *options: str) -> None:
+        """Both operations fail locally with a sweep-specific error."""
+
+        for command in ("pr", "push"):
+            with self.subTest(command=command):
+                result = self.sweep_command(command, *options)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("sweep", result.stderr)
+                self.assertEqual(self.sweep_requests, [])
+                self.assertNotIn("stub push", result.stdout)
+
+    def test_sweep_required(self) -> None:
+        """Missing sweep refuses both operations before API or push."""
+
+        self.assert_sweep_refused()
+
+    def test_sweep_missing_file(self) -> None:
+        """An absent report is never accepted."""
+
+        self.assert_sweep_refused("--sweep", str(self.tmp / "missing.md"))
+
+    def test_sweep_head_mismatch(self) -> None:
+        """A reviewed report for another commit is stale."""
+
+        self.sweep.write_text(f"class: unchecked-return\nhead: {A}\nno hits\n")
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_missing_class(self) -> None:
+        """A report without its bug class is refused."""
+
+        self.sweep.write_text(self.sweep.read_text().replace("class: unchecked-return\n", ""))
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_todo(self) -> None:
+        """An unresolved table disposition blocks outbound operations."""
+
+        self.add_sweep_rows("TODO")
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def test_sweep_bad_disposition(self) -> None:
+        """Only the two named disposition forms are accepted."""
+
+        for value in ("ignore", "", "follow-up:", "fold later", "TODO follow-up: x"):
+            with self.subTest(value=value):
+                self.sweep.write_text(self.sweep.read_text().split("|", 1)[0])
+                self.add_sweep_rows(value)
+                self.assert_sweep_refused("--sweep", str(self.sweep))
+
+    def add_sweep_rows(self, *values: str) -> None:
+        """Append table headers and planted disposition rows."""
+
+        with self.sweep.open("a") as report:
+            report.write("| file:line | callee | kind | same file as fix | disposition |\n")
+            report.write("| --- | --- | --- | --- | --- |\n")
+            for value in values:
+                report.write(f"| sibling.c:4 | play | discarded | no | {value} |\n")
+
+    def test_sweep_reviewed(self) -> None:
+        """Reviewed fold and follow-up rows allow PR and leased push."""
+
+        self.add_sweep_rows("fold", "follow-up: evidence/ancestor-reproducer.py")
+        for command in ("pr", "push"):
+            with self.subTest(command=command):
+                options = ["--sweep", str(self.sweep)]
+                if command == "push":
+                    options = ["--lease", A, *options]
+                result = self.sweep_command(command, *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.sweep_requests)
 
 
 MUTANTS = {
