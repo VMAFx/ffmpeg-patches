@@ -23,10 +23,8 @@ runs:
   steps:
     - uses: ./.github/actions/setup-python
       if: inputs.draft != 'true' && inputs.in-scope == 'true' && inputs.setup-python == 'true'
-    - name: Load the pinned base
+    - uses: ./.github/actions/load-base
       if: inputs.draft != 'true' && inputs.in-scope == 'true'
-      shell: bash
-      run: grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> "$GITHUB_ENV"
     - name: Install the FFmpeg build toolchain
       if: inputs.draft != 'true' && inputs.in-scope == 'true' && inputs.toolchain == 'linux'
       shell: bash
