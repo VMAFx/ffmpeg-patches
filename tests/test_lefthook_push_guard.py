@@ -20,15 +20,52 @@ from scripts.lint_mutable_defaults import PYLINT_VERSION
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _series_install_steps(root: Path) -> list[dict]:
-    """Load the series workflow and find its pinned dependency installation step."""
+def _series_steps(root: Path) -> list[dict]:
+    """Load all steps from the series workflow."""
     workflow = yaml.safe_load((root / ".github/workflows/series.yml").read_text(encoding="utf-8"))
+    return [step for job in workflow["jobs"].values() for step in job["steps"]]
+
+
+def _series_install_steps(root: Path) -> list[dict]:
+    """Find the series workflow's pinned dependency installation step."""
     return [
         step
-        for job in workflow["jobs"].values()
-        for step in job["steps"]
-        if step.get("name") == "Install ruff, reuse, pylint, numpy and PyYAML"
+        for step in _series_steps(root)
+        if step.get("name") == "Install the pinned development tools"
     ]
+
+
+def _normalize_package_name(name: str) -> str:
+    """Normalize package names according to PEP 503."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _development_pins(content: str) -> set[tuple[str, str]]:
+    """Parse exact development pins, refusing every other requirement shape."""
+    pins = set()
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][A-Za-z0-9.!+_-]*)", line)
+        if match is None:
+            raise ValueError(f"expected name==version: {line!r}")
+        name, version = match.groups()
+        pins.add((_normalize_package_name(name), version))
+    return pins
+
+
+def _hashed_lock_pins(content: str) -> set[tuple[str, str]]:
+    """Read lockfile pins immediately followed by a SHA-256 hash line."""
+    return {
+        (_normalize_package_name(name), version)
+        for name, version in re.findall(
+            r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s]+) \\\n"
+            r"[ \t]+--hash=sha256:[0-9a-f]{64}(?=\s|$)",
+            content,
+            re.MULTILINE,
+        )
+    }
 
 
 def run_with_fixture(method: str, files: dict[str, str]) -> unittest.TestResult:
@@ -36,6 +73,7 @@ def run_with_fixture(method: str, files: dict[str, str]) -> unittest.TestResult:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         for name, content in files.items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
             (root / name).write_text(content, encoding="utf-8")
         result = unittest.TestResult()
         with patch(f"{__name__}.ROOT", root):
@@ -88,31 +126,123 @@ class LefthookPushGuardTest(unittest.TestCase):
         )
 
     def test_contributing_dependency_pins_match_ci(self) -> None:
-        """Dependency pins in CONTRIBUTING.md match CI installation step."""
+        """CI and contributor instructions use exactly one hashed lockfile install."""
         install_steps = _series_install_steps(ROOT)
         self.assertEqual(len(install_steps), 1)
         prefix = "python3 -m pip install "
-        ci_command = install_steps[0]["run"]
-        self.assertTrue(ci_command.startswith(prefix))
+        expected = f"{prefix}--require-hashes -r requirements-dev.txt"
+        self.assertEqual(install_steps[0]["run"], expected)
+        ci_commands = [
+            line.strip()
+            for step in _series_steps(ROOT)
+            for line in step.get("run", "").splitlines()
+            if line.strip().startswith(prefix)
+        ]
+        self.assertEqual(ci_commands, [expected])
         documented_commands = [
             line
             for line in (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8").splitlines()
             if line.startswith(prefix)
         ]
-        self.assertEqual(len(documented_commands), 1)
-        ci_pins = set(ci_command.removeprefix(prefix).split())
-        self.assertTrue(ci_pins)
-        self.assertTrue(all("==" in pin for pin in ci_pins))
-        self.assertEqual(set(documented_commands[0].removeprefix(prefix).split()), ci_pins)
+        self.assertEqual(documented_commands, [expected])
+
+    def test_planted_install_command_drift_is_refused(self) -> None:
+        """Reject altered or duplicate installation commands in CI and documentation."""
+        expected = "python3 -m pip install --require-hashes -r requirements-dev.txt"
+        for commands, document in (
+            ([expected + " --no-deps"], expected),
+            ([expected], expected + " --no-deps"),
+            ([expected], expected + "\n" + expected),
+            ([expected, expected], expected),
+        ):
+            with self.subTest(commands=commands, document=document):
+                steps = [
+                    {
+                        "name": "Install the pinned development tools" if index == 0 else "Other",
+                        "run": command,
+                    }
+                    for index, command in enumerate(commands)
+                ]
+                result = run_with_fixture(
+                    "test_contributing_dependency_pins_match_ci",
+                    {
+                        ".github/workflows/series.yml": yaml.safe_dump(
+                            {"jobs": {"check": {"steps": steps}}}
+                        ),
+                        "CONTRIBUTING.md": document,
+                    },
+                )
+                self.assertEqual(len(result.failures), 1)
+                self.assertFalse(result.errors)
 
     def test_series_pylint_pin_matches_script(self) -> None:
-        """The series.yml workflow Pylint pin matches the gate's PYLINT_VERSION."""
-        install_steps = _series_install_steps(ROOT)
-        self.assertEqual(len(install_steps), 1)
-        prefix = "python3 -m pip install "
-        ci_command = install_steps[0]["run"]
-        ci_pins = set(ci_command.removeprefix(prefix).split())
-        self.assertIn(f"pylint=={PYLINT_VERSION}", ci_pins)
+        """The development Pylint pin matches the gate's PYLINT_VERSION."""
+        pins = _development_pins((ROOT / "requirements-dev.in").read_text(encoding="utf-8"))
+        self.assertIn(("pylint", PYLINT_VERSION), pins)
+
+    def test_development_lock_matches_input_pins(self) -> None:
+        """Every development input pin has the same version and hashes in the lockfile."""
+        pins = _development_pins((ROOT / "requirements-dev.in").read_text(encoding="utf-8"))
+        self.assertTrue(pins)
+        locked = _hashed_lock_pins((ROOT / "requirements-dev.txt").read_text(encoding="utf-8"))
+        for pin in sorted(pins):
+            with self.subTest(pin=pin):
+                self.assertIn(pin, locked)
+
+    def test_development_pin_parser_boundaries(self) -> None:
+        """Accept comments and normalized exact pins while refusing ranges and bare names."""
+        self.assertEqual(_development_pins("\n # comment\n"), set())
+        self.assertEqual(
+            _development_pins("PyYAML==6.0.3\nSome._Name==1.0\n"),
+            {("pyyaml", "6.0.3"), ("some-name", "1.0")},
+        )
+        for requirement in ("ruff>=0.16", "ruff", "ruff==", "ruff==0.16.*"):
+            with self.subTest(requirement=requirement), self.assertRaises(ValueError):
+                _development_pins(requirement)
+
+    def test_planted_lock_drift_and_missing_hashes_are_refused(self) -> None:
+        """Reject changed versions, absent pins, missing hashes and malformed hashes."""
+        hash_line = f"    --hash=sha256:{'a' * 64}\n"
+        for locked in (
+            "",
+            "ruff==0.16.8\n",
+            f"ruff==0.16.7 \\\n{hash_line}",
+            "ruff==0.16.8 \\\n    --hash=sha256:abc\n",
+        ):
+            with self.subTest(locked=locked):
+                result = run_with_fixture(
+                    "test_development_lock_matches_input_pins",
+                    {"requirements-dev.in": "ruff==0.16.8\n", "requirements-dev.txt": locked},
+                )
+                self.assertEqual(len(result.failures), 1)
+                self.assertFalse(result.errors)
+
+    def test_lock_pin_names_are_normalized(self) -> None:
+        """Match mixed-case lockfile names and collapsed punctuation in package names."""
+        locked = f"PyYAML==6.0.3 \\\n    --hash=sha256:{'a' * 64}\n"
+        locked += f"some._Name==1.0 \\\n    --hash=sha256:{'b' * 64}\n"
+        self.assertEqual(_hashed_lock_pins(locked), {("pyyaml", "6.0.3"), ("some-name", "1.0")})
+
+    def test_series_pip_installs_have_no_inline_pins(self) -> None:
+        """Every series workflow pip install keeps version pins in requirements files."""
+        for step in _series_steps(ROOT):
+            command = step.get("run", "")
+            if re.search(r"\bpip(?:3)?\s+install\b", command):
+                with self.subTest(step=step.get("name")):
+                    self.assertNotIn("==", command)
+
+    def test_planted_inline_pip_pins_are_refused(self) -> None:
+        """Reject inline pip pins in any job, including multiline run commands."""
+        workflow = (
+            "jobs:\n  other:\n    steps:\n      - run: |\n"
+            "          python3 -m pip install ruff==0.16.8\n"
+        )
+        result = run_with_fixture(
+            "test_series_pip_installs_have_no_inline_pins",
+            {".github/workflows/series.yml": workflow},
+        )
+        self.assertEqual(len(result.failures), 1)
+        self.assertFalse(result.errors)
 
     def test_hook_jobs_never_interpolate_git_arguments(self) -> None:
         """No lefthook run/args field contains a {N} positional git-argument placeholder."""
@@ -123,11 +253,12 @@ class LefthookPushGuardTest(unittest.TestCase):
                     self.assertNotRegex(str(job.get(field, "")), r"\{\d+\}")
 
     def test_contributing_python_minimum_supports_installed_pins(self) -> None:
+        """The documented Python minimum supports all pinned development tools."""
         document = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
         minimum = re.search(r"Python (\d+)\.(\d+) or newer", document)
         self.assertIsNotNone(minimum)
         documented = tuple(map(int, minimum.groups()))
-        pins = re.findall(r"([A-Za-z0-9_.-]+)==([^\s`]+)", document)
+        pins = _development_pins((ROOT / "requirements-dev.in").read_text(encoding="utf-8"))
         self.assertTrue(pins)
         for name, version in pins:
             with self.subTest(pin=f"{name}=={version}"):
@@ -154,10 +285,14 @@ class LefthookPushGuardTest(unittest.TestCase):
                 self.assertFalse(result.errors)
 
     def test_planted_python_minimum_is_refused(self) -> None:
+        """A documented Python minimum below a pin's Requires-Python fails the check."""
         with patch.object(metadata, "metadata", return_value={"Requires-Python": ">=3.12"}):
             result = run_with_fixture(
                 "test_contributing_python_minimum_supports_installed_pins",
-                {"CONTRIBUTING.md": "Python 3.10 or newer\npython3 -m pip install numpy==2.5.4\n"},
+                {
+                    "CONTRIBUTING.md": "Python 3.10 or newer\n",
+                    "requirements-dev.in": "numpy==2.5.4\n",
+                },
             )
         self.assertEqual(len(result.failures), 1)
         self.assertFalse(result.errors)

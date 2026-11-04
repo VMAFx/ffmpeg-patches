@@ -3,12 +3,28 @@
   "extends": [
     "github>plurano/horistes"
   ],
+  "pip-compile": {
+    "managerFilePatterns": [
+      "/(^|/)requirements-dev\\.txt$/"
+    ]
+  },
   "packageRules": [
     {
       "description": "praetor-managed files: praetorctl adopt ships their updates and praetorctl audit locks them byte for byte",
       "matchFileNames": [
         ".devcontainer/devcontainer.json",
         ".devcontainer/Dockerfile.praetor"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Development pins and lockfile are updated together by pip-compile",
+      "matchManagers": [
+        "pip_requirements"
+      ],
+      "matchFileNames": [
+        "requirements-dev.in",
+        "requirements-dev.txt"
       ],
       "enabled": false
     }
