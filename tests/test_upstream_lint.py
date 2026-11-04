@@ -241,7 +241,7 @@ class FixtureTest(unittest.TestCase):
     ) -> upstream_lint.RunResult:
         """Intercept only pre-commit; execute the real bounded runner otherwise."""
         if Path(argv[0]).name == upstream_lint.PRE_COMMIT:
-            self.hook_calls.append((argv, Path(argv[3]).read_text()))
+            self.hook_calls.append((argv, Path(argv[3]).read_text(encoding="utf-8")))
             self.hook_effect(Path(cwd))
             return upstream_lint.RunResult(tuple(argv), self.hook_rc, "fixture pre-commit\n")
         return self.real_run(argv, cwd, data, timeout)
@@ -401,15 +401,15 @@ class PipelineTest(FixtureTest):
         """A zero-exit fixer still fails and leaves the original clean checkout."""
 
         def modify(cwd):
-            (cwd / "libavfilter/vf_x.c").write_text("changed\n")
-            (cwd / "new-file.txt").write_text("generated\n")
+            (cwd / "libavfilter/vf_x.c").write_text("changed\n", encoding="utf-8")
+            (cwd / "new-file.txt").write_text("generated\n", encoding="utf-8")
             self.git("-C", str(cwd), "add", "libavfilter/vf_x.c")
 
         self.hook_effect = modify
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("fixer modified files", output)
-        self.assertEqual((self.root / "libavfilter/vf_x.c").read_text(), SOURCE)
+        self.assertEqual((self.root / "libavfilter/vf_x.c").read_text(encoding="utf-8"), SOURCE)
         self.assertFalse((self.root / "new-file.txt").exists())
         self.assertEqual(self.git("status", "--porcelain"), "")
 
@@ -417,7 +417,7 @@ class PipelineTest(FixtureTest):
         """The finally path discards files if launching or waiting for a hook fails."""
 
         def modify(cwd):
-            (cwd / "libavfilter/vf_x.c").write_text("changed\n")
+            (cwd / "libavfilter/vf_x.c").write_text("changed\n", encoding="utf-8")
             raise OSError("planted hook error")
 
         self.hook_effect = modify
@@ -436,7 +436,7 @@ class PipelineTest(FixtureTest):
 
         def modify(cwd):
             hook_trees.append(cwd)
-            (cwd / "ignored.out").write_text("generated\n")
+            (cwd / "ignored.out").write_text("generated\n", encoding="utf-8")
 
         self.hook_effect = modify
         rc, output = self.check()
@@ -514,7 +514,7 @@ class PipelineTest(FixtureTest):
                 self.assertEqual(rc, 2, output)
                 self.assertIn("dirty tree refused", output)
                 self.assertEqual(self.hook_calls, [])
-                self.assertEqual((self.root / name).read_text(), "user edit\n")
+                self.assertEqual((self.root / name).read_text(encoding="utf-8"), "user edit\n")
 
     def test_different_head_is_refused_before_hooks(self):
         """Hooks cannot inspect a checkout that differs from the requested head."""
@@ -535,7 +535,7 @@ class PipelineTest(FixtureTest):
         self.assertEqual(rc, 1)
         self.assertIn("step: patcheck rc: 2", output)
         self.assertIn("step: developer.texi rc: 0", output)
-        self.assertEqual(report.read_text(), output)
+        self.assertEqual(report.read_text(encoding="utf-8"), output)
 
 
 class RealToolsTest(FixtureTest):
