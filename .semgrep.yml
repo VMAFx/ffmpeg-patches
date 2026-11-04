@@ -37,6 +37,31 @@ rules:
               - pattern: subprocess.check_output($ARGV, ...)
           - focus-metavariable: $ARGV
 
+  - id: executable-from-environment
+    languages: [python]
+    severity: ERROR
+    message: >-
+      executables come from PATH via shutil.which or a fixed allow-list,
+      never an environment override.
+    patterns:
+      - pattern-inside: |
+          def $F(...):
+            ...
+            $X = $ENV
+            ...
+      - metavariable-pattern:
+          metavariable: $ENV
+          pattern-either:
+            - pattern: os.environ.get(...)
+            - pattern: os.getenv(...)
+            - pattern: os.environ[$KEY]
+      - pattern-inside: |
+          def $F(...):
+            ...
+            shutil.which(...)
+            ...
+      - pattern: return <... $X ...>
+
   - id: subprocess-without-timeout
     languages: [python]
     severity: ERROR
