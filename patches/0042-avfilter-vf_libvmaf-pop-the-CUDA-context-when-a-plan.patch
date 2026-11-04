@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lusoris <lusoris@proton.me>
+Date: Tue, 3 Nov 2026 23:43:03 +0100
+Subject: [PATCH] avfilter/vf_libvmaf: pop the CUDA context when a plane copy
+ fails
+
+A failed cuMemcpy2D returns before cuCtxPopCurrent, leaving the CUDA
+context current on the calling thread. This error path also exists in
+upstream master at 200a98d5ba4a.
+
+Send plane-copy failures to shared cleanup and pop once after a
+successful push. Keep the copy result across a successful pop, and
+return AVERROR_EXTERNAL if copying or popping fails.
+
+Mocked CUDA-driver tests inject copy errors on each of the three planes,
+plus allocation, push and pop errors. They check return values and the
+context stack; successful copies at 8, 10, 12 and 16 bits check each
+plane's byte width and pitch. Restoring the early return makes the
+regression assertion fail. No CUDA device is required.
+
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavfilter/vf_libvmaf.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/libavfilter/vf_libvmaf.c b/libavfilter/vf_libvmaf.c
+index 72145d2df5bc11b06377dcd9e1c0c0939b28dfac..eafb8b5671c54c9791f82bd430b367db020afd88 100644
+--- a/libavfilter/vf_libvmaf.c
++++ b/libavfilter/vf_libvmaf.c
+@@ -751,14 +751,14 @@ static int copy_picture_data_cuda(VmafContext* vmaf,
+ 
+         err = cu->cuMemcpy2D(&m);
+         if (err)
+-            return AVERROR_EXTERNAL;
++            goto fail;
+     }
+ 
+-    err = cu->cuCtxPopCurrent(NULL);
+-    if (err)
++fail:
++    if (cu->cuCtxPopCurrent(NULL))
+         return AVERROR_EXTERNAL;
+ 
+-    return 0;
++    return err ? AVERROR_EXTERNAL : 0;
+ }
+ 
+ static int do_vmaf_cuda(FFFrameSync* fs)

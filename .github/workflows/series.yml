@@ -163,9 +163,15 @@ jobs:
           # encoders and filters that compile shaders, such as ffv1enc_vulkan.c (0007).
           # --enable-libzimg builds vf_zscale.c, which 0014 changes; --enable-opencl
           # builds vf_tonemap_opencl.c and its kernels, which 0015 and 0017 change.
+          # --enable-libvmaf builds vf_libvmaf.c, which 0040/0041 change. The
+          # toolchain action builds a pinned upstream release because Ubuntu has
+          # no libvmaf package. Its static .pc exports libm/pthread, but omits
+          # the C++ runtime used by libsvm; --extra-libs supplies that runtime.
+          # CONFIG_LIBVMAF_CUDA_FILTER stays off on hosted runners without nvcc;
+          # the CUDA block in vf_libvmaf.c needs a separate CUDA-enabled build.
           ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl --enable-vulkan \
             --enable-nvenc --enable-vaapi --enable-libdrm --enable-libvpl --enable-libzimg \
-            --enable-opencl \
+            --enable-opencl --enable-libvmaf --extra-libs=-lstdc++ \
             || { tail -40 ffbuild/config.log; exit 1; }
       - name: Lint the C sources of this repository with clang-tidy and cppcheck
         # The list is the clang_tidy lane of .standards.yaml. The DV5 fixture
