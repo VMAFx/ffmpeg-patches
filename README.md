@@ -213,8 +213,9 @@ prints one result per patch:
 
 The checks cover:
 
-- `make test`: series check, ruff, REUSE and the unit tests of
+- `make test`: series check, ruff, REUSE, mutable defaults and the unit tests of
   `scripts/series.py`
+- `python3 scripts/lint_mutable_defaults.py` (also `make lint-mutable-defaults`): Pylint checks Python sources for `dangerous-default-value` (W0102), including defaults bound to identifiers that ruff B006 misses. The script's `PYLINT_VERSION` pins Pylint; it uses that exact version on PATH or fetches it with `uvx`.
 - inside the series check: every patch with an upstream link has a record
   in `upstream-contributions.json` with a matching state, and the table in
   this file equals the one generated from the records. The check does not
