@@ -80,14 +80,14 @@ without a series patch is a change the series does not carry.
 | [25479](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25479) | `master` | open | avcodec: fix GCC 14 and 16 warnings in a64multienc, h264dec, vlc and wmadec | none |
 | [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
 | [25481](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25481) | `master` | open | tests/checkasm: move large scratch buffers to the heap | none |
-| [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | open | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
+| [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | merged 2026-11-02 (`f675c507e20a`), in no release yet | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
 | [25533](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25533) | `master` | open | checkasm/snowdsp: Include intmath before public headers | 0036 |
 | [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Assume the predicted luma point bound | 0037 |
 | [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: bound reference corner extension | 0038 |
 | [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
 | [25708](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708) | `master` | open | avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes | 0040, 0041 |
 
-State read from the FFmpeg forge on 2026-10-28.
+State read from the FFmpeg forge on 2026-11-04.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned
@@ -99,6 +99,19 @@ filenames separated by `, `, or an empty string when the series carries
 none. Every named patch must link to that pull request and match its state.
 The table lists all their series numbers and is generated from that file:
 edit the file, then run `python3 scripts/series.py contributions --write`.
+
+Run `python3 scripts/upstream_drift.py` to compare recorded fields and
+`master_form` commits with the FFmpeg forge. Add `--fix` to update changed
+fields, set the checked date to today in UTC and regenerate the table.
+Unchanged files keep their bytes and checked date. A merged or closed
+`covered_by` pull request still needs human review before dropping its patch;
+`--fix` reports it and exits 1. Tool errors exit 2.
+
+The daily upstream workflow runs `--fix` with read-only repository permissions.
+Changes appear in its job summary and the `upstream-drift` artifact as
+`upstream-drift.patch`; the job fails whenever changes need review or drift
+remains. Apply the downloaded patch with `git apply upstream-drift.patch`,
+review it and submit the update through the usual pull request process.
 
 ## Layout
 

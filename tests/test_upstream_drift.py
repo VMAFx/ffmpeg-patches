@@ -6,21 +6,28 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import UTC, date, datetime
 from pathlib import Path
+from unittest.mock import patch
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import upstream_drift  # noqa: E402
-from test_series import Fixture  # noqa: E402
 
 FORGE = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/"
 API = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg/pulls/"
 COMMIT = "7e93014c5bbb61e7c22afebb478bf92f7a08d59a"
 BASE = "1" * 40
 MERGED_AT = "2026-10-12T03:43:42Z"
+TODAY = date(2026, 11, 4)
 
 
 def pull(number: int, **changes: object) -> dict:
@@ -51,6 +58,55 @@ class FakeForge:
         if url not in self.answers:
             raise upstream_drift.DriftError(f"{url}: HTTP Error 404: Not Found")
         return self.answers[url]
+
+
+class Fixture:
+    """Two patches and their contribution records; no Git or credential settings."""
+
+    def __init__(self, scratch: Path) -> None:
+        self.root = scratch / "series"
+        (self.root / "patches").mkdir(parents=True)
+        self.names = ["0001-lib-change-one.patch", "0002-lib-change-two.patch"]
+        (self.root / "series.txt").write_text("\n".join(self.names) + "\n")
+        (self.root / "base.env").write_text(
+            f"FFMPEG_REMOTE=https://example.invalid/up.git\nFFMPEG_TAG=v1\nFFMPEG_COMMIT={BASE}\n"
+        )
+        for number, name in enumerate(self.names, 1):
+            self.patch(number).write_text(
+                f"From {'0' * 40} Mon Sep 17 00:00:00 2001\n"
+                "From: Dev <dev@invalid>\nDate: Mon, 2 Nov 2026 00:00:00 +0000\n"
+                "Subject: [PATCH] lib: change\n\nSigned-off-by: Dev <dev@invalid>\n"
+                "---\ndiff --git a/lib.c b/lib.c\n"
+            )
+            (self.root / "patches" / name).with_suffix(".toml").write_text(
+                'status = "submitted"\n'
+                f'upstream = "https://example.invalid/pulls/{number}"\nconsumers = ["a"]\n'
+            )
+        (self.root / "README.md").write_text(
+            f"# Fixture\n\n{upstream_drift.series.TABLE_START}\n"
+            f"{upstream_drift.series.TABLE_END}\n\nText after the table.\n"
+        )
+        self.write_records([self.record(1), self.record(2)])
+
+    def record(self, number: int, **changes: object) -> dict[str, object]:
+        """Return a contribution record with the requested field overrides."""
+        entry = dict.fromkeys(upstream_drift.series.CONTRIBUTION_KEYS, "")
+        entry.update(number=number, url=f"https://example.invalid/pulls/{number}")
+        entry.update(title=f"lib: change {number}", base="master", state="open", project="a")
+        entry["patch"] = self.names[number - 1] if number <= len(self.names) else ""
+        return entry | changes
+
+    def write_records(self, entries: list[dict]) -> None:
+        """Write contribution records and regenerate the fixture table."""
+        data = {"checked": "2026-01-02", "contributions": entries}
+        (self.root / upstream_drift.series.CONTRIBUTIONS).write_text(
+            json.dumps(data, indent=2) + "\n"
+        )
+        upstream_drift.series.contributions(self.root, write=True)
+
+    def patch(self, number: int) -> Path:
+        """Return the path of the numbered fixture patch."""
+        return self.root / "patches" / self.names[number - 1]
 
 
 class DriftTest(unittest.TestCase):
@@ -350,6 +406,335 @@ class DriftTest(unittest.TestCase):
         status, out, _ = self.run_main(forge)
         self.assertEqual((status, forge.read), (0, []))
         self.assertIn("0 pull request(s) read from the forge, 0 field(s) drifted.", out)
+
+
+class FixTest(unittest.TestCase):
+    """Fix fixtures need only files: no Git commands or credential configuration."""
+
+    def setUp(self) -> None:
+        """Create file-only fixtures for drift repair tests."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        fixture = Fixture(Path(scratch.name))
+        self.root = fixture.root
+        self.name = fixture.names[0]
+        for number in range(1, len(fixture.names) + 1):
+            fixture.patch(number).with_suffix(".toml").write_text(
+                'status = "unsubmitted"\nupstream = ""\nconsumers = ["a"]\n'
+            )
+        self.sidecar = (self.root / "patches" / self.name).with_suffix(".toml")
+        self.readme = self.root / "README.md"
+        self.data_path = self.root / upstream_drift.series.CONTRIBUTIONS
+        entry = fixture.record(
+            1, url=f"{FORGE}1", patch="", note="caf\N{LATIN SMALL LETTER E WITH ACUTE}"
+        )
+        self.data = {"checked": "2026-01-02", "contributions": [entry]}
+        self.write_data()
+
+    def write_data(self, *, ensure_ascii: bool = True) -> None:
+        """Write contribution data and regenerate the README table."""
+        self.data_path.write_text(json.dumps(self.data, indent=2, ensure_ascii=ensure_ascii) + "\n")
+        self.assertEqual(upstream_drift.series.contributions(self.root, write=True), 0)
+
+    def snapshot(self) -> dict[Path, bytes]:
+        """Return every fixture file and its original bytes."""
+        return {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+
+    def fix(self, answer: dict, today: date | None = TODAY) -> tuple[int, str, str]:
+        """Return repair status, standard output, and standard error for a forge answer."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = upstream_drift.main(
+                ["--root", str(self.root), "--fix"], FakeForge({1: answer}), today=today
+            )
+        return status, out.getvalue(), err.getvalue()
+
+    def master_form(self, line: str | None = None) -> None:
+        """Configure a submitted patch with a master-form commit pair."""
+        self.sidecar.write_text(
+            'status = "submitted"\n'
+            f'upstream = "{FORGE}1"\nconsumers = ["a"]\n'
+            f"# Commit elsewhere: {COMMIT}\n"
+            + (line or f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }}\n')
+        )
+        self.data["contributions"][0]["patch"] = self.name
+        self.write_data()
+
+    def test_fix_merge_fields_and_regenerate_readme(self) -> None:
+        """Repair merge fields and regenerate the README while preserving surrounding text."""
+        before = self.readme.read_text()
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, err), (0, ""))
+        actual = json.loads(self.data_path.read_bytes())
+        expected = self.data["contributions"][0] | {
+            "state": "merged",
+            "merged_at": MERGED_AT,
+            "merged_commit": COMMIT,
+        }
+        self.assertEqual(
+            actual, self.data | {"checked": TODAY.isoformat(), "contributions": [expected]}
+        )
+        self.assertEqual(out.count("fixed: "), 3)
+        self.assertNotIn("::error", out)
+        self.assertIn("0 field(s) drifted.", out)
+        after = self.readme.read_text()
+        self.assertNotEqual(before, after)
+        self.assertIn(f"State read from the FFmpeg forge on {TODAY.isoformat()}.", after)
+        self.assertEqual(
+            after.split(upstream_drift.series.TABLE_END)[1], "\n\nText after the table.\n"
+        )
+        self.assertEqual(upstream_drift.series.check(self.root).errors, [])
+
+    def test_fix_title_and_base_preserves_json_format_and_key_order(self) -> None:
+        """Repair title and base while preserving JSON formatting and key order."""
+        title = "lib: caf\N{LATIN SMALL LETTER E WITH ACUTE} update"
+        for ensure_ascii in (True, False):
+            with self.subTest(ensure_ascii=ensure_ascii):
+                self.write_data(ensure_ascii=ensure_ascii)
+                status, out, err = self.fix(pull(1, title=title, base={"ref": "release/9.0"}))
+                expected = self.data["contributions"][0] | {"title": title, "base": "release/9.0"}
+                data = self.data | {"checked": TODAY.isoformat(), "contributions": [expected]}
+                self.assertEqual((status, err), (0, ""))
+                self.assertEqual(
+                    self.data_path.read_bytes(),
+                    (json.dumps(data, indent=2, ensure_ascii=ensure_ascii) + "\n").encode(),
+                )
+                self.assertEqual(out.count("fixed: "), 2)
+                self.assertNotIn("::error", out)
+
+    def test_fix_master_head_rewrites_only_its_line(self) -> None:
+        """Repair only the master-form head line while preserving CRLF endings."""
+        self.master_form()
+        before = self.sidecar.read_bytes().replace(b"\n", b"\r\n")
+        self.sidecar.write_bytes(before)
+        status, out, err = self.fix(pull(1, head={"sha": "0" * 40}))
+        old = f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }}'.encode()
+        new = old.replace(COMMIT.encode(), b"0" * 40)
+        self.assertEqual((status, err), (0, ""))
+        self.assertEqual(self.sidecar.read_bytes(), before.replace(old, new))
+        self.assertIn("fixed: " + self.name + ": master_form head", out)
+        self.assertNotIn("::error", out)
+        self.assertEqual(json.loads(self.data_path.read_bytes())["checked"], TODAY.isoformat())
+
+    def test_fix_master_commits_can_swap_without_cascading_replacements(self) -> None:
+        """Swap master-form commits without cascading replacements."""
+        self.master_form()
+        status, out, err = self.fix(pull(1, head={"sha": BASE}, merge_base=COMMIT))
+        self.assertEqual((status, err), (0, ""))
+        self.assertIn(
+            f'master_form = {{ base = "{COMMIT}", head = "{BASE}" }}', self.sidecar.read_text()
+        )
+        self.assertEqual(out.count("fixed: "), 2)
+
+    def test_fix_absent_old_sha_refuses_all_writes(self) -> None:
+        """Reject a missing literal old SHA without writing any files."""
+        escaped = COMMIT[:1] + "\\u0065" + COMMIT[2:]
+        self.master_form(f'master_form = {{ base = "{BASE}", head = "{escaped}" }}\n')
+        before = self.snapshot()
+        status, out, err = self.fix(pull(1, title="changed", head={"sha": "0" * 40}))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("old head SHA must occur exactly once on master_form line", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_escaped_sha_substring_is_not_a_literal_value(self) -> None:
+        """Reject an escaped SHA substring as a literal value without writing any files."""
+        escaped = "\\u0037" + COMMIT[1:]
+        self.master_form(f'master_form = {{ base = "{BASE}", head = "{escaped}" }}\n')
+        before = self.snapshot()
+        status, out, err = self.fix(pull(1, head={"sha": "0" * 40}))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("exactly once", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_duplicate_old_sha_refuses_all_writes(self) -> None:
+        """Reject duplicate old SHA occurrences without writing any files."""
+        self.master_form(f'master_form = {{ base = "{BASE}", head = "{COMMIT}" }} # {COMMIT}\n')
+        before = self.snapshot()
+        status, out, err = self.fix(pull(1, head={"sha": "0" * 40}))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("exactly once", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_non_inline_master_form_refuses_all_writes(self) -> None:
+        """Reject a non-inline master-form table without writing any files."""
+        self.master_form(f'[master_form]\nbase = "{BASE}"\nhead = "{COMMIT}"\n')
+        before = self.snapshot()
+        status, out, err = self.fix(pull(1, head={"sha": "0" * 40}))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("expected exactly one inline master_form line", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_invalid_forge_sha_refuses_all_writes(self) -> None:
+        """Reject an invalid forge SHA without writing any files."""
+        self.master_form()
+        before = self.snapshot()
+        status, out, err = self.fix(pull(1, head={"sha": "not-a-sha"}))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("full 40-hex commits", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_covered_by_drift_is_unfixed_and_changes_no_files(self) -> None:
+        """Report covering-pull drift without repairing it or changing any files."""
+        self.sidecar.write_text(self.sidecar.read_text() + f'covered_by = "{FORGE}1"\n')
+        self.data["contributions"] = []
+        self.write_data()
+        for answer in (pull(1, state="closed"), pull(1, merged=True, merge_commit_sha=COMMIT)):
+            with self.subTest(answer=answer):
+                before = self.snapshot()
+                status, out, err = self.fix(answer)
+                self.assertEqual((status, err), (1, ""))
+                self.assertIn("::error title=Upstream drift::" + self.name + ": covered_by", out)
+                self.assertNotIn("fixed:", out)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_fix_keeps_repairs_when_covered_by_still_needs_review(self) -> None:
+        """Keep completed repairs when covering-pull drift still needs review."""
+        self.sidecar.write_text(self.sidecar.read_text() + f'covered_by = "{FORGE}1"\n')
+        before = self.sidecar.read_bytes()
+        status, out, err = self.fix(pull(1, state="closed", title="changed"))
+        self.assertEqual((status, err), (1, ""))
+        self.assertEqual(self.sidecar.read_bytes(), before)
+        self.assertEqual(out.count("fixed: "), 2)
+        self.assertIn("::error title=Upstream drift::" + self.name + ": covered_by", out)
+        self.assertIn("1 field(s) drifted.", out)
+        self.assertEqual(
+            json.loads(self.data_path.read_bytes())["contributions"][0]["state"], "closed"
+        )
+
+    def test_fix_closed_record_clears_previous_merge_fields(self) -> None:
+        """Clear stale merge fields when repairing a closed contribution record."""
+        self.data["contributions"][0].update(
+            state="merged", merged_at=MERGED_AT, merged_commit=COMMIT
+        )
+        self.write_data()
+        status, out, err = self.fix(pull(1, state="closed"))
+        self.assertEqual((status, err), (0, ""))
+        actual = json.loads(self.data_path.read_bytes())["contributions"][0]
+        self.assertEqual(
+            (actual["state"], actual["merged_at"], actual["merged_commit"]), ("closed", "", "")
+        )
+        self.assertEqual(out.count("fixed: "), 3)
+
+    def test_fix_unreachable_forge_changes_no_files(self) -> None:
+        """Leave all files unchanged when the forge is unreachable."""
+        before = self.snapshot()
+        with patch.object(
+            upstream_drift, "forge_record", side_effect=upstream_drift.DriftError("offline")
+        ):
+            status, out, err = self.fix(pull(1))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("offline", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_no_drift_keeps_all_bytes_and_checked_date(self) -> None:
+        """Preserve every byte and the checked date when no drift exists."""
+        self.master_form()
+        for ensure_ascii in (True, False):
+            with self.subTest(ensure_ascii=ensure_ascii):
+                self.write_data(ensure_ascii=ensure_ascii)
+                before = self.snapshot()
+                status, out, err = self.fix(pull(1))
+                self.assertEqual((status, err), (0, ""))
+                self.assertNotIn("fixed:", out)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_fix_uses_utc_day_when_not_injected(self) -> None:
+        """Use the current UTC day when no date is injected."""
+        instant = datetime(2026, 11, 3, 23, 30, tzinfo=UTC)
+        with patch.object(upstream_drift, "datetime") as clock:
+            clock.now.return_value = instant
+            status, _, err = self.fix(pull(1, title="changed"), today=None)
+        self.assertEqual((status, err), (0, ""))
+        clock.now.assert_called_once_with(UTC)
+        self.assertEqual(json.loads(self.data_path.read_bytes())["checked"], "2026-11-03")
+
+    def test_fix_table_failure_restores_original_bytes(self) -> None:
+        """Restore original bytes when README table regeneration fails."""
+        self.readme.write_text("# No table markers\n")
+        before = self.snapshot()
+        status, out, err = self.fix(pull(1, title="changed"))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("README.md lacks one", err)
+        self.assertEqual(self.snapshot(), before)
+
+
+class WorkflowTest(unittest.TestCase):
+    """Exercise the patch-producing shell with an inert Git stub."""
+
+    def setUp(self) -> None:
+        """Load workflow steps and create isolated patch-output fixtures."""
+        path = Path(__file__).resolve().parent.parent / ".github/workflows/upstream.yml"
+        self.workflow = yaml.safe_load(path.read_text())
+        self.steps = self.workflow["jobs"]["drift"]["steps"]
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.output = self.root / "output"
+        self.summary = self.root / "summary"
+
+    def prepare_patch(self, *, changed: bool) -> subprocess.CompletedProcess[str]:
+        """Return the patch-producing workflow result using an inert Git stub."""
+        git = self.root / "git"
+        git.write_text(
+            '#!/bin/sh\nif [ "$*" = "diff --exit-code" ]; then\n'
+            f"exit {int(changed)}\nfi\n"
+            "printf '%s\\n' 'diff --git a/README.md b/README.md' '-old' '+new'\n"
+        )
+        git.chmod(0o755)
+        step = next(step for step in self.steps if step.get("id") == "patch")
+        environment = os.environ | {
+            "PATH": str(self.root) + os.pathsep + os.defpath,
+            "GITHUB_OUTPUT": str(self.output),
+            "GITHUB_STEP_SUMMARY": str(self.summary),
+        }
+        return subprocess.run(  # nosec B603 B607 - workflow shell with inert fixture Git.
+            ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+            cwd=self.root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_changed_tree_produces_patch_and_summary(self) -> None:
+        """Produce a patch artifact and diff summary for a changed tree."""
+        result = self.prepare_patch(changed=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        diff = (self.root / "upstream-drift.patch").read_text()
+        self.assertEqual(diff, "diff --git a/README.md b/README.md\n-old\n+new\n")
+        self.assertEqual(self.output.read_text(), "changed=true\n")
+        self.assertIn("```diff\n" + diff + "```", self.summary.read_text())
+
+    def test_clean_tree_produces_no_patch(self) -> None:
+        """Produce no patch or summary for a clean tree."""
+        result = self.prepare_patch(changed=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "changed=false\n")
+        self.assertFalse((self.root / "upstream-drift.patch").exists())
+        self.assertFalse(self.summary.exists())
+
+    def test_failures_still_publish_before_final_failure_with_read_only_permissions(self) -> None:
+        """Publish drift artifacts before final failure with read-only workflow permissions."""
+        drift = next(step for step in self.steps if step.get("id") == "drift")
+        prepare = next(step for step in self.steps if step.get("id") == "patch")
+        upload = next(
+            step for step in self.steps if "actions/upload-artifact@" in step.get("uses", "")
+        )
+        fail = self.steps[-1]
+        self.assertEqual(drift["run"], "python3 scripts/upstream_drift.py --fix")
+        self.assertFalse(drift.get("continue-on-error", False))
+        self.assertIn("failure()", prepare["if"])
+        self.assertIn("!cancelled()", upload["if"])
+        self.assertIn("steps.patch.outputs.changed == 'true'", upload["if"])
+        self.assertRegex(upload["uses"], r"^actions/upload-artifact@[0-9a-f]{40}$")
+        self.assertEqual(upload["with"]["path"], "upstream-drift.patch")
+        self.assertIn("steps.patch.outputs.changed == 'true'", fail["if"])
+        self.assertIn("steps.drift.outcome == 'failure'", fail["if"])
+        self.assertEqual(fail["run"], "exit 1")
+        self.assertLess(self.steps.index(upload), self.steps.index(fail))
+        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
 
 
 if __name__ == "__main__":
