@@ -69,6 +69,16 @@ def _hashed_lock_pins(content: str) -> set[tuple[str, str]]:
     }
 
 
+def _reuse_ci_findings(makefile: str, requirements: str) -> list[str]:
+    """Find duplicate REUSE recipes and development dependency pins."""
+    findings = []
+    if re.search(r"(?m)^\t[@+-]*[ \t]*reuse[ \t]+lint\b", makefile):
+        findings.append("Makefile runs reuse lint outside the REUSE workflow")
+    if any(name == "reuse" for name, _ in _development_pins(requirements)):
+        findings.append("requirements-dev.in pins reuse outside the REUSE workflow")
+    return findings
+
+
 def _pylint_custom_manager(config: dict) -> dict:
     """Require exactly one regex manager for the Pylint script pin."""
     managers = [
@@ -192,6 +202,53 @@ class LefthookPushGuardTest(unittest.TestCase):
         """The development Pylint pin matches the gate's PYLINT_VERSION."""
         pins = _development_pins((ROOT / "requirements-dev.in").read_text(encoding="utf-8"))
         self.assertIn(("pylint", PYLINT_VERSION), pins)
+
+    def test_reuse_ci_has_no_makefile_or_development_pin(self) -> None:
+        """Keep REUSE CI lint exclusively in the REUSE workflow."""
+        self.assertEqual(
+            _reuse_ci_findings(
+                (ROOT / "Makefile").read_text(encoding="utf-8"),
+                (ROOT / "requirements-dev.in").read_text(encoding="utf-8"),
+            ),
+            [],
+        )
+
+    def test_planted_duplicate_reuse_paths_are_refused(self) -> None:
+        """Reject a planted REUSE recipe or development pin independently."""
+        self.assertEqual(_reuse_ci_findings("lint:\n\t@ruff check scripts tests\n", ""), [])
+        for makefile, requirements in (
+            ("lint:\n\t@reuse lint\n", ""),
+            ("", "reuse==6.2.0\n"),
+        ):
+            with self.subTest(makefile=makefile, requirements=requirements):
+                self.assertEqual(len(_reuse_ci_findings(makefile, requirements)), 1)
+
+    def test_reuse_workflow_action_is_sha_pinned(self) -> None:
+        """Require exactly one REUSE action pinned to a full commit SHA."""
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/reuse.yml").read_text(encoding="utf-8")
+        )
+        actions = [
+            step["uses"]
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("uses", "").startswith("fsfe/reuse-action@")
+        ]
+        self.assertEqual(len(actions), 1)
+        self.assertRegex(actions[0], r"\Afsfe/reuse-action@[0-9a-fA-F]{40}\Z")
+
+    def test_planted_reuse_workflow_action_refs_are_refused(self) -> None:
+        """Reject missing, duplicate, floating and shortened REUSE action refs."""
+        pinned = "fsfe/reuse-action@" + "a" * 40
+        for actions in ([], [pinned, pinned], ["fsfe/reuse-action@v6.0.0"], [pinned[:-1]]):
+            with self.subTest(actions=actions):
+                workflow = {"jobs": {"reuse": {"steps": [{"uses": ref} for ref in actions]}}}
+                result = run_with_fixture(
+                    "test_reuse_workflow_action_is_sha_pinned",
+                    {".github/workflows/reuse.yml": yaml.safe_dump(workflow)},
+                )
+                self.assertEqual(len(result.failures), 1)
+                self.assertFalse(result.errors)
 
     def test_renovate_pylint_manager_matches_script(self) -> None:
         """Renovate discovers the script pin exactly once with its current version."""
