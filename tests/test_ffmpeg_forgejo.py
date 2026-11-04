@@ -1407,6 +1407,26 @@ class SweepTest(ForgejoTest):
 
     helper = HELPER
 
+    def test_sweep_accepts_helper_symlink(self) -> None:
+        """A helper symlink outside scripts still imports the sweep validator."""
+
+        self.helper = self.bin_dir / "ffmpeg-forgejo"
+        self.helper.symlink_to(HELPER)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+
+    def test_sweep_names_missing_module(self) -> None:
+        """A helper missing its validator reports the module and refuses the push."""
+
+        self.helper = self.bin_dir / "ffmpeg-forgejo"
+        shutil.copyfile(HELPER, self.helper)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("sweep: No module named 'variant_sweep'", result.stderr)
+        self.assertEqual(self.sweep_requests, [])
+        self.assertNotIn("stub push", result.stdout)
+
     def test_sweep_rejects_non_table_findings(self) -> None:
         """Malformed findings and unrecognized text cannot disappear during validation."""
 

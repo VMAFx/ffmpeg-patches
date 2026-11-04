@@ -114,6 +114,22 @@ class VariantSweepTest(unittest.TestCase):
         self.assertIn("| callers.c:9 | play | normalized | no | TODO |", report)
         self.assertEqual(report.count("| TODO |"), 2)
 
+    def test_git_color_always_preserves_targets_and_callers(self) -> None:
+        """Forced Git colors cannot hide diff targets or corrupt grep file names."""
+
+        for setting in ("color.ui", "color.diff", "color.grep"):
+            run_git(self.repo, "config", setting, "always")
+        with (self.repo / "callers.c").open("a") as callers:
+            callers.write("int sibling(int s) { send_cmd(s); return s; }\n")
+        self.base = self.commit_head(BASE)
+        head = self.commit_head(BASE.replace("    write(s);", "    return write(s);"))
+        result = self.sweep(head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.output.read_text()
+        self.assertIn("targets: send_cmd\n", report)
+        self.assertIn("| send_cmd | discarded | no | TODO |", report)
+        self.assertNotIn("\x1b", report)
+
     def test_no_hits(self) -> None:
         """An unchanged head with no added checks has no sweep targets."""
 

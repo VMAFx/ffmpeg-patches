@@ -407,16 +407,17 @@ require_sweep() {
   [ -n "$report" ] || die "--sweep <file> required"
   [ -f "$report" ] || die "no sweep file $report"
   sha="$(git rev-parse --verify --end-of-options "$branch^{commit}")" || die "sweep: no local branch $branch"
-  python3 - "$report" "$sha" "${BASH_SOURCE[0]%/*}" <<'PY' || die "sweep rejected: $report"
+  python3 - "$report" "$sha" "${BASH_SOURCE[0]}" <<'PY' || die "sweep rejected: $report"
 import pathlib
 import sys
 
-sys.path.insert(0, sys.argv[3])
-from variant_sweep import validate_report
+sys.path.insert(0, str(pathlib.Path(sys.argv[3]).resolve().parent))
 
 try:
+    from variant_sweep import validate_report
+
     valid = validate_report(pathlib.Path(sys.argv[1]), sys.argv[2])
-except (OSError, UnicodeError, RuntimeError) as error:
+except (ImportError, OSError, UnicodeError, RuntimeError) as error:
     print(f"sweep: {error}", file=sys.stderr)
     valid = False
 sys.exit(0 if valid else 1)
