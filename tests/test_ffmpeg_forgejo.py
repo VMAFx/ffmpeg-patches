@@ -1423,9 +1423,35 @@ class SweepTest(ForgejoTest):
         shutil.copyfile(HELPER, self.helper)
         result = self.sweep_command("push", "--sweep", str(self.sweep))
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("sweep: No module named 'variant_sweep'", result.stderr)
+        self.assertIn(
+            f"sweep: missing validator: {self.bin_dir / 'variant_sweep.py'}", result.stderr
+        )
         self.assertEqual(self.sweep_requests, [])
         self.assertNotIn("stub push", result.stdout)
+
+    def test_sweep_missing_sibling_rejects_cwd_decoy(self) -> None:
+        """A missing sibling fails by name without executing a checkout-level decoy."""
+
+        self.helper = self.bin_dir / "ffmpeg-forgejo"
+        shutil.copyfile(HELPER, self.helper)
+        marker = self.repo / "decoy-executed"
+        (self.repo / "variant_sweep.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('executed')\n"
+            "def validate_report(path, head):\n"
+            '    """Pretend every report is valid after recording decoy execution."""\n'
+            "    return True\n"
+        )
+        for command in ("push", "pr"):
+            with self.subTest(command=command):
+                result = self.sweep_command(command, "--sweep", str(self.sweep))
+                self.assertFalse(marker.exists(), "checkout-level decoy executed")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    f"sweep: missing validator: {self.bin_dir / 'variant_sweep.py'}", result.stderr
+                )
+                self.assertEqual(self.sweep_requests, [])
+                self.assertNotIn("stub push", result.stdout)
 
     def test_sweep_rejects_non_table_findings(self) -> None:
         """Malformed findings and unrecognized text cannot disappear during validation."""

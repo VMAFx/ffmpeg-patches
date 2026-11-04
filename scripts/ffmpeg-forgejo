@@ -408,16 +408,22 @@ require_sweep() {
   [ -f "$report" ] || die "no sweep file $report"
   sha="$(git rev-parse --verify --end-of-options "$branch^{commit}")" || die "sweep: no local branch $branch"
   python3 - "$report" "$sha" "${BASH_SOURCE[0]}" <<'PY' || die "sweep rejected: $report"
+import importlib.util
 import pathlib
 import sys
 
-sys.path.insert(0, str(pathlib.Path(sys.argv[3]).resolve().parent))
-
 try:
-    from variant_sweep import validate_report
+    validator_path = pathlib.Path(sys.argv[3]).resolve().parent / "variant_sweep.py"
+    if not validator_path.is_file():
+        raise ImportError(f"missing validator: {validator_path}")
+    spec = importlib.util.spec_from_file_location("_ffmpeg_variant_sweep", validator_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load validator: {validator_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
 
-    valid = validate_report(pathlib.Path(sys.argv[1]), sys.argv[2])
-except (ImportError, OSError, UnicodeError, RuntimeError) as error:
+    valid = module.validate_report(pathlib.Path(sys.argv[1]), sys.argv[2])
+except (AttributeError, ImportError, OSError, UnicodeError, RuntimeError) as error:
     print(f"sweep: {error}", file=sys.stderr)
     valid = False
 sys.exit(0 if valid else 1)

@@ -19,7 +19,10 @@ SUBPROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_outpu
 BLOCKING_CALLS = SUBPROCESS_CALLS - {"Popen"}
 PROCESS_WAIT_METHODS = frozenset({"wait", "communicate"})
 POSITIONAL_TIMEOUT = {"wait": 0, "communicate": 1}
-NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b(?P<ids>.*?)\s-\s+\S")
+NOSEC_RATIONALE = re.compile(r"^#\s*nosec\b(?=[^#]*\s-\s+\S)(?P<ids>[^#]*)")
+# Bandit 1.7.10 scans selectors through the rationale, up to a second '#':
+# https://github.com/PyCQA/bandit/blob/1.7.10/bandit/core/manager.py#L439-L459
+NOSEC_SELECTORS = re.compile(r"\b(?:B\d+|[a-z\d]+(?:_[a-z\d]+)+)\b")
 
 
 def subprocess_calls(tree: ast.AST) -> list[tuple[ast.Call, str]]:
@@ -83,14 +86,14 @@ def comments_by_line(source: str) -> dict[int, list[str]]:
 def has_rationale(
     comments: dict[int, list[str]], node: ast.stmt | ast.expr, *, required_test: str | None = None
 ) -> bool:
-    """Return whether a node's lines carry a nosec comment with a rationale."""
+    """Require a rationale and read test selectors across the full nosec comment."""
 
     for line in range(node.lineno, (node.end_lineno or node.lineno) + 1):
         for comment in comments.get(line, ()):
             match = NOSEC_RATIONALE.match(comment)
             if match is None:
                 continue
-            selectors = set(re.split(r"[,\s]+", match["ids"].strip())) - {""}
+            selectors = set(NOSEC_SELECTORS.findall(match["ids"]))
             if required_test is None or not selectors or required_test in selectors:
                 return True
             if required_test == "B404" and "import_subprocess" in selectors:
@@ -168,6 +171,18 @@ def has_deadline(node: ast.Call) -> bool:
 
 
 class SubprocessNosecTest(unittest.TestCase):
+    def test_rationale_ids_do_not_blanket_suppress_b404(self) -> None:
+        """An ID after the separator still selects tests instead of suppressing all."""
+
+        for selectors in ("B603", "B603 B607", "B4040", "subprocess_popen_with_shell_equals_true"):
+            with self.subTest(selectors=selectors):
+                source = f"import subprocess  # nosec - {selectors} is checked at call sites\n"
+                self.assertEqual(find_subprocess_imports_without_nosec(source), [1])
+        for selectors in ("B404", "B603, B404", "import_subprocess", "fixed argv only"):
+            with self.subTest(selectors=selectors):
+                source = f"import subprocess  # nosec - {selectors} is checked at call sites\n"
+                self.assertEqual(find_subprocess_imports_without_nosec(source), [])
+
     def test_unrelated_suppression_does_not_cover_b404(self) -> None:
         """Selective call suppressions cannot justify a subprocess import."""
 
