@@ -67,6 +67,21 @@ def _routes():
     }
 
 
+def _settings_get(path):
+    """Answer settings discovery with a valid page size and every list with []."""
+    return {"max_response_items": 50} if path == fairy.SETTINGS else []
+
+
+def _recording_get(payload, calls):
+    """Return a get stub that records paths and answers settings with payload."""
+
+    def fake_get(path):
+        calls.append(path)
+        return payload if path == fairy.SETTINGS else []
+
+    return fake_get
+
+
 class FairyUnansweredTest(unittest.TestCase):
     """Exercise public behavior with network access forbidden."""
 
@@ -133,7 +148,7 @@ class FairyUnansweredTest(unittest.TestCase):
                         unittest.mock.patch.object(
                             fairy, "discover_threads", return_value={1: "pr"}
                         ),
-                        unittest.mock.patch.object(fairy, "get", return_value=[]),
+                        unittest.mock.patch.object(fairy, "get", side_effect=_settings_get),
                         unittest.mock.patch.object(fairy, "paginated", return_value=[review]),
                         contextlib.redirect_stdout(output),
                         contextlib.redirect_stderr(errors),
@@ -141,6 +156,7 @@ class FairyUnansweredTest(unittest.TestCase):
                         self.assertEqual(fairy.main([]), 1)
                     self.assertEqual(output.getvalue(), "")
                     self.assertIn("malformed API response", errors.getvalue())
+                    self.assertIn("review submitted_at must be str", errors.getvalue())
 
     def test_submitted_review_states_and_empty_timestamp(self):
         """Every counted state needs a non-empty submission timestamp."""
@@ -682,12 +698,7 @@ class FairyUnansweredTest(unittest.TestCase):
                     fairy.discover_page_size()
 
                 calls = []
-
-                def fake_get(path, payload=payload, calls=calls):
-                    calls.append(path)
-                    if path == fairy.SETTINGS:
-                        return payload
-                    return []
+                fake_get = _recording_get(payload, calls)
 
                 output, errors = io.StringIO(), io.StringIO()
                 with (
