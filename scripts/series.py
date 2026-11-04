@@ -63,6 +63,11 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
+try:
+    import forge_settings
+except ModuleNotFoundError:
+    from scripts import forge_settings
+
 ROOT = Path(__file__).resolve().parent.parent
 BASE_KEYS = ("FFMPEG_REMOTE", "FFMPEG_TAG", "FFMPEG_COMMIT")
 STATUSES = ("unsubmitted", "submitted", "merged", "rejected")
@@ -91,7 +96,7 @@ REQUIRED_EXCEPTION_KEYS = {
 VALID_CATEGORIES = {"A", "B", "C", "D"}
 CATEGORY_INTERVALS = {"B": 3, "C": 10, "D": 120}
 DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-PULL_URL = re.compile(r"(https://code\.ffmpeg\.org)/([^/]+)/([^/]+)/pulls/(\d+)")
+PULL_URL = forge_settings.pull_url_pattern()
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -390,7 +395,9 @@ def check_covered_by(data: dict, name: str, findings: Findings) -> None:
         findings.error(name, "covered_by is allowed only with status unsubmitted")
     url = data["covered_by"]
     if not isinstance(url, str) or not PULL_URL.fullmatch(url):
-        findings.error(name, "covered_by must be a pull request URL of code.ffmpeg.org")
+        findings.error(
+            name, f"covered_by must be a pull request URL of {forge_settings.keyring_service()}"
+        )
 
 
 def check_master_form(form: object, name: str, findings: Findings) -> None:

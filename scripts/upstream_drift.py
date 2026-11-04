@@ -26,6 +26,10 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
+try:
+    import forge_settings
+except ModuleNotFoundError:
+    from scripts import forge_settings
 import series
 
 PULL_URL = series.PULL_URL
@@ -37,9 +41,10 @@ class DriftError(Exception):
 
 
 def api_url(url: str, number: int | None = None) -> str:
+    """Return the Forgejo API URL for a pull request."""
     match = PULL_URL.fullmatch(url) if isinstance(url, str) else None
     if not match or (number is not None and int(match.group(4)) != number):
-        raise DriftError(f"{url}: not a pull request URL of code.ffmpeg.org")
+        raise DriftError(f"{url}: not a pull request URL of {forge_settings.keyring_service()}")
     host, owner, repository, number = match.groups()
     return f"{host}/api/v1/repos/{owner}/{repository}/pulls/{number}"
 

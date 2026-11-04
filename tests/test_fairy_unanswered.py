@@ -5,6 +5,7 @@
 import contextlib
 import io
 import json
+import os
 import unittest.mock
 import urllib.error
 import urllib.parse
@@ -87,6 +88,9 @@ class FairyUnansweredTest(unittest.TestCase):
 
     def setUp(self):
         """Forbid network I/O through both global and restricted openers."""
+        login_env = unittest.mock.patch.dict(os.environ, {"FFMPEG_FORGEJO_LOGIN": "lusoris"})
+        login_env.start()
+        self.addCleanup(login_env.stop)
         if hasattr(fairy, "PAGE_CACHE"):
             fairy.PAGE_CACHE.clear()
         network = unittest.mock.patch.object(

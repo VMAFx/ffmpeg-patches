@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# ffmpeg-forgejo: file issues and pull requests on code.ffmpeg.org (Forgejo).
+# ffmpeg-forgejo: file issues and pull requests on a Forgejo forge.
 #
 # The access token lives in the desktop keyring (Secret Service), stored once with
-#   secret-tool store --label='code.ffmpeg.org API token' service code.ffmpeg.org
+#   secret-tool store --label='<host> API token' service <host>
 # and is never printed or placed on a command line.
 #
 # Usage:
@@ -28,12 +28,28 @@
 #   ffmpeg-forgejo fairy-reviews [<number>...]        count submitted Fairy reviews; default: own open PRs
 #   ffmpeg-forgejo fairy-reviews --from-json <file>  offline count, newest state and 12-hex commit (tab separated)
 #   ffmpeg-forgejo fairy-requests [--skip-unavailable]  fail on own PRs older than 15 min without Fairy
-# Environment: FFMPEG_FORGEJO_REPO (default FFmpeg/FFmpeg), FFMPEG_FORGEJO_BASE (default master),
-#   FFMPEG_FORGEJO_API (API base override, for tests), FFMPEG_FORGEJO_GIT (upstream Git URL override).
+# Environment: FFMPEG_FORGEJO_HOST (default https://code.ffmpeg.org),
+#   FFMPEG_FORGEJO_REPO (default FFmpeg/FFmpeg), FFMPEG_FORGEJO_BASE (default master),
+#   FFMPEG_FORGEJO_API (API base override, for tests), FFMPEG_FORGEJO_GIT (upstream Git URL override),
 #   FFMPEG_FORGEJO_BOT_REVIEWER (default Forgejo_Fairy), FFMPEG_FORGEJO_OFFLINE=1 (skip optional check).
 set -euo pipefail
 
-HOST="https://code.ffmpeg.org"
+# die MSG...: print error message to stderr and exit with code 1.
+die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
+
+# usage_error MSG: print usage message to stderr and exit with code 64.
+usage_error() { printf 'ffmpeg-forgejo: usage: %s\n' "$*" >&2; exit 64; }
+
+HOST="${FFMPEG_FORGEJO_HOST:-https://code.ffmpeg.org}"
+case "$HOST" in
+  https://*/*) die "invalid FFMPEG_FORGEJO_HOST (path or trailing slash forbidden): $HOST" ;;
+  https://*)   ;;
+  *)           die "invalid FFMPEG_FORGEJO_HOST (scheme must be https): $HOST" ;;
+esac
+[ -n "${HOST#https://}" ] || die "invalid FFMPEG_FORGEJO_HOST (missing host): $HOST"
+KEYRING_SERVICE="${HOST#https://}"
+KEYRING_SERVICE="${KEYRING_SERVICE%%/*}"
+
 API="${FFMPEG_FORGEJO_API:-$HOST/api/v1}"
 REPO="${FFMPEG_FORGEJO_REPO:-FFmpeg/FFmpeg}"
 BASE="${FFMPEG_FORGEJO_BASE:-master}"
@@ -42,14 +58,11 @@ page_size=""
 BOT_REVIEWER="${FFMPEG_FORGEJO_BOT_REVIEWER:-Forgejo_Fairy}"
 SWEPT_SHA=""
 
-die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
-
-usage_error() { printf 'ffmpeg-forgejo: usage: %s\n' "$*" >&2; exit 64; }
-
+# token: retrieve API token from desktop Secret Service keyring.
 token() {
   local t
-  if ! t="$(secret-tool lookup service code.ffmpeg.org 2>/dev/null)"; then t=""; fi
-  [ -n "$t" ] || die "no token in the keyring; store it with: secret-tool store --label='code.ffmpeg.org API token' service code.ffmpeg.org"
+  if ! t="$(secret-tool lookup service "$KEYRING_SERVICE" 2>/dev/null)"; then t=""; fi
+  [ -n "$t" ] || die "no token in the keyring; store it with: secret-tool store --label='$KEYRING_SERVICE API token' service $KEYRING_SERVICE"
   printf '%s' "$t"
 }
 
@@ -404,7 +417,7 @@ def summarize(reviews):
     commit = newest.get("commit_id") or ""
     return len(submitted), newest["state"], commit[:12] if commit else "-"
 
-print(*summarize(json.load(sys.stdin)), sep="\t")' "${1:-Forgejo_Fairy}"
+print(*summarize(json.load(sys.stdin)), sep="\t")' "${1:-$BOT_REVIEWER}"
 }
 
 # request_bot_review NUMBER: merge existing users with Fairy, POST, and verify read-back.
@@ -622,7 +635,7 @@ for i in json.load(sys.stdin):
     # The credential helper reads the keyring at push time; nothing lands in argv or config.
     # --lease rewrites the remote branch only while it still points at the expected sha.
     git -c credential.helper= \
-        -c "credential.$HOST.helper=!f() { echo username=$me; printf 'password='; secret-tool lookup service code.ffmpeg.org; echo; }; f" \
+        -c "credential.$HOST.helper=!f() { echo username=$me; printf 'password='; secret-tool lookup service $KEYRING_SERVICE; echo; }; f" \
         push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$SWEPT_SHA:refs/heads/$rb"
     ;;
   pr)

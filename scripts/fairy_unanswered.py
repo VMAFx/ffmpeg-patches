@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List own or commented open FFmpeg threads awaiting lusoris after Fairy's word.
+"""List own or commented open FFmpeg threads awaiting reply after Fairy's word.
 
 Reads are not atomic. A reply posted between read_from and read_to may
 show as owed; a rerun clears it.
@@ -13,10 +13,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-API = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg"
-API_HOST = "code.ffmpeg.org"
-FEED = "https://code.ffmpeg.org/api/v1/users/lusoris/activities/feeds"
-SETTINGS = "https://code.ffmpeg.org/api/v1/settings/api"
+try:
+    import forge_settings
+except ModuleNotFoundError:
+    from scripts import forge_settings
+
+API = f"{forge_settings.api_base()}/repos/{forge_settings.REPO}"
+API_HOST = forge_settings.keyring_service()
+SETTINGS = f"{forge_settings.api_base()}/settings/api"
+FEED = None
 PAGE_CACHE = {}
 
 
@@ -98,7 +103,7 @@ def activity_number(row):
     try:
         if row["op_type"] not in {"comment_issue", "comment_pull"}:
             return None
-        if row["repo"]["full_name"] != "FFmpeg/FFmpeg":
+        if row["repo"]["full_name"] != forge_settings.REPO:
             return None
         content = json.loads(row["content"])
         if (
@@ -115,9 +120,11 @@ def activity_number(row):
         return None
 
 
-def commented_numbers():
-    """Return thread numbers from at most ten pages of lusoris' own activities."""
-    rows = paginated(FEED + "?only-performed-by=true", max_pages=10, older="comments")
+def commented_numbers(login=None):
+    """Return thread numbers from at most ten pages of own activities."""
+    who = login or forge_settings.login()
+    feed = FEED if FEED is not None else f"{forge_settings.api_base()}/users/{who}/activities/feeds"
+    rows = paginated(feed + "?only-performed-by=true", max_pages=10, older="comments")
     return {number for row in rows if (number := activity_number(row)) is not None}
 
 
@@ -140,21 +147,22 @@ def _open_issue_kind(number):
     return thread_kind(issue) if issue["state"] == "open" else None
 
 
-def discover_threads():
+def discover_threads(login=None):
     """Dedupe own open PRs/issues and open threads found through comment activity."""
-    pulls = paginated("/pulls?state=open&poster=lusoris")
+    who = login or forge_settings.login()
+    pulls = paginated(f"/pulls?state=open&poster={who}")
     threads = {}
     for p in pulls:
         if not isinstance(p, dict):
             raise TypeError("expected a dict for pull")
-        if p["user"]["login"] == "lusoris":
+        if p["user"]["login"] == who:
             threads[p["number"]] = "pr"
-    issues = paginated("/issues?type=issues&state=open&created_by=lusoris")
+    issues = paginated(f"/issues?type=issues&state=open&created_by={who}")
     for issue in issues:
         if not isinstance(issue, dict):
             raise TypeError("expected a dict for issue")
         threads.setdefault(issue["number"], thread_kind(issue))
-    for number in sorted(commented_numbers() - threads.keys()):
+    for number in sorted(commented_numbers(who) - threads.keys()):
         if (kind := _open_issue_kind(number)) is not None:
             threads[number] = kind
     return threads
@@ -210,25 +218,30 @@ def _submitted_review(review):
     return bool(timestamp)
 
 
-def owed(comments, reviews):
-    """Return the newest Fairy word, newest lusoris word, and whether a reply is owed."""
+def owed(comments, reviews, login=None, bot=None):
+    """Return the newest Fairy word, newest user word, and whether a reply is owed."""
     if not isinstance(comments, list):
         raise TypeError("expected a list of comments")
     if not isinstance(reviews, list):
         raise TypeError("expected a list of reviews")
+    bot_login = bot or forge_settings.BOT_REVIEWER
+    try:
+        user_login = login or forge_settings.login()
+    except Exception:
+        user_login = "lusoris"
     words = [
         r
         for r in reviews
         if _submitted_review(r)
-        and not (r["user"]["login"] == "Forgejo_Fairy" and approve_only(r.get("body")))
+        and not (r["user"]["login"] == bot_login and approve_only(r.get("body")))
     ]
     fairy = _newest_ts(
-        latest(words, "Forgejo_Fairy", lambda r: r["submitted_at"]),
-        latest(comments, "Forgejo_Fairy", lambda c: c["created_at"]),
+        latest(words, bot_login, lambda r: r["submitted_at"]),
+        latest(comments, bot_login, lambda c: c["created_at"]),
     )
     mine = _newest_ts(
-        latest(words, "lusoris", lambda r: r["submitted_at"]),
-        latest(comments, "lusoris", lambda c: c["created_at"]),
+        latest(words, user_login, lambda r: r["submitted_at"]),
+        latest(comments, user_login, lambda c: c["created_at"]),
     )
     unanswered = bool(fairy and (not mine or _parse_time(fairy) > _parse_time(mine)))
     return fairy, mine, unanswered
@@ -247,7 +260,7 @@ def _fixture_word(who, body, timestamp):
 
 def _owed_fixtures(head):
     """Return planted issue and PR turn-rule cases."""
-    fairy = _fixture_word("Forgejo_Fairy", "finding", "2026-11-02T00:00:00Z")
+    fairy = _fixture_word(forge_settings.DEFAULT_BOT_REVIEWER, "finding", "2026-11-02T00:00:00Z")
     mine = _fixture_word("lusoris", "reply", "2026-11-01T00:00:00Z")
     newer = dict(mine, created_at="2026-11-03T00:00:00Z")
     empty = dict(fairy, body=" \n")
@@ -319,21 +332,27 @@ def main(argv):
     try:
         PAGE_CACHE.clear()
         discover_page_size()
+        user_login = forge_settings.login()
         read_from = utc_now()
-        threads = discover_threads()
+        threads = discover_threads(user_login)
         out = []
         for number, kind in threads.items():
             comments = get(f"/issues/{number}/comments")
             reviews = paginated(f"/pulls/{number}/reviews") if kind == "pr" else []
-            fairy, mine, unanswered = owed(comments, reviews)
+            fairy, mine, unanswered = owed(
+                comments, reviews, login=user_login, bot=forge_settings.BOT_REVIEWER
+            )
             if unanswered:
-                out.append(f"{number}\t{kind}\tfairy={fairy}\tlusoris={mine or '-'}")
+                out.append(f"{number}\t{kind}\tfairy={fairy}\t{user_login}={mine or '-'}")
         read_to = utc_now()
     except RefusedURL as error:
         print(f"fairy_unanswered: refused URL: {error}", file=sys.stderr)
         return 1
     except (KeyError, TypeError, ValueError) as error:
         print(f"fairy_unanswered: malformed API response: {error}", file=sys.stderr)
+        return 1
+    except RuntimeError as error:
+        print(f"fairy_unanswered: {error}", file=sys.stderr)
         return 1
     except OSError as error:
         print(f"error: {error}", file=sys.stderr)
