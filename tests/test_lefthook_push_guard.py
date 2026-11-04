@@ -221,7 +221,9 @@ class LefthookPushGuardTest(unittest.TestCase):
 
     def test_contributing_dependency_pins_match_ci(self) -> None:
         """CI jobs install the documented hashed lockfile before consuming dependencies."""
-        workflow = yaml.safe_load((ROOT / ".github/workflows/series.yml").read_text("utf-8"))
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/series.yml").read_text("utf-8", encoding="utf-8")
+        )
         self.assertEqual(_series_install_findings(workflow), [])
         prefix = "python3 -m pip install "
         documented_commands = [

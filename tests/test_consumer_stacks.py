@@ -65,27 +65,29 @@ class StackFixture:
 
     def handover(self, scratch: Path, *, two_files: bool = False) -> Path:
         """Publish a consumer fix in the series after its old pin, with a new pin too."""
-        lines = (self.tree / "lib.c").read_text().splitlines()
+        lines = (self.tree / "lib.c").read_text(encoding="utf-8").splitlines()
         lines[14:16] = ["int line_15 = 150;", "int line_16 = 160;"]
-        (self.tree / "lib.c").write_text("\n".join(lines) + "\n")
+        (self.tree / "lib.c").write_text("\n".join(lines) + "\n", encoding="utf-8")
         if two_files:
-            (self.tree / "other.c").write_text("int line_15 = 150;\nint line_16 = 160;\n")
+            (self.tree / "other.c").write_text(
+                "int line_15 = 150;\nint line_16 = 160;\n", encoding="utf-8"
+            )
         git(self.tree, "add", ".")
         git(self.tree, "commit", "-q", "-m", "shared consumer fix")
         patch = git(self.tree, "format-patch", "-1", "--stdout") + "\n"
-        (self.stack / self.names[0]).write_text(patch)
+        (self.stack / self.names[0]).write_text(patch, encoding="utf-8")
         self.tip = git(self.tree, "rev-parse", "HEAD")
         root = scratch / "series"
         root.mkdir()
         git(root, "init", "-q")
-        (root / "README").write_text("shared series\n")
+        (root / "README").write_text("shared series\n", encoding="utf-8")
         git(root, "add", ".")
         git(root, "commit", "-q", "-m", "before handover")
         git(root, "tag", "v0.1.0")
         (root / "patches").mkdir()
         shared = root / "patches" / "0001-shared.patch"
-        shared.write_text(patch)
-        shared.with_suffix(".toml").write_text('consumers = ["vmafx"]\n')
+        shared.write_text(patch, encoding="utf-8")
+        shared.with_suffix(".toml").write_text('consumers = ["vmafx"]\n', encoding="utf-8")
         git(root, "add", ".")
         git(root, "commit", "-q", "-m", "take consumer fix")
         git(root, "tag", "v0.2.0")
@@ -131,13 +133,14 @@ class ConsumerStacksTest(unittest.TestCase):
         self.assertEqual(self.head(), self.fx.tip)
 
     def test_declared_handover_before_pin_continues_stack(self) -> None:
+        """Verify declared handover before pin continues stack."""
         shared = self.fx.handover(self.scratch)
         report = self.scratch / "summary.md"
         status, out, err = self.run_handover(report=report)
         self.assertEqual((status, err), (0, ""))
         label = f"{self.fx.names[0]} -> {shared.name}"
         self.assertIn(f"vmafx: handed-over {label}", out)
-        self.assertIn(f"| vmafx | `{label}` | handed-over |", report.read_text())
+        self.assertIn(f"| vmafx | `{label}` | handed-over |", report.read_text(encoding="utf-8"))
         self.assertIn(f"vmafx: applied    {self.fx.names[1]}", out)
         self.assertEqual(out.count("::warning::"), 1)
         self.assertIn("vmafx must drop", out)
@@ -146,13 +149,18 @@ class ConsumerStacksTest(unittest.TestCase):
         self.assertEqual(git(self.fx.tree, "status", "--porcelain"), "")
 
     def test_handover_requires_declared_consumer(self) -> None:
+        """Verify handover requires declared consumer."""
         shared = self.fx.handover(self.scratch)
-        shared.with_suffix(".toml").write_text('consumers = ["pelorus"]\n')
+        shared.with_suffix(".toml").write_text('consumers = ["pelorus"]\n', encoding="utf-8")
         self.assert_in_series()
 
     def test_handover_requires_every_added_line(self) -> None:
+        """Verify handover requires every added line."""
         shared = self.fx.handover(self.scratch)
-        shared.write_text(shared.read_text().replace("+int line_16 = 160;", "+int other = 1;"))
+        shared.write_text(
+            shared.read_text(encoding="utf-8").replace("+int line_16 = 160;", "+int other = 1;"),
+            encoding="utf-8",
+        )
         self.assert_in_series()
 
     def test_handover_expires_when_pin_contains_patch(self) -> None:
@@ -160,6 +168,7 @@ class ConsumerStacksTest(unittest.TestCase):
         self.assert_in_series("v0.2.0")
 
     def test_handover_rejects_run_across_separate_hunks(self) -> None:
+        """Verify handover rejects run across separate hunks."""
         shared = self.fx.handover(self.scratch)
         shared.write_text(
             "diff --git a/lib.c b/lib.c\n"
@@ -169,10 +178,13 @@ class ConsumerStacksTest(unittest.TestCase):
             "+int line_14 = 140;\n+int line_15 = 150;\n"
             "@@ -30,2 +30,2 @@\n"
             "-int line_30 = 30;\n-int line_31 = 31;\n"
-            "+int line_16 = 160;\n+int line_31 = 310;\n"
+            "+int line_16 = 160;\n+int line_31 = 310;\n",
+            encoding="utf-8",
         )
-        added = series.added_runs(shared.read_text())["lib.c"]
-        consumer_runs = series.added_runs((self.fx.stack / self.fx.names[0]).read_text())
+        added = series.added_runs(shared.read_text(encoding="utf-8"))["lib.c"]
+        consumer_runs = series.added_runs(
+            (self.fx.stack / self.fx.names[0]).read_text(encoding="utf-8")
+        )
         self.assertEqual(len(added), 2)
         self.assertEqual(consumer_runs["lib.c"], [[added[0][-1], added[1][0]]])
         self.assert_in_series()
@@ -195,8 +207,11 @@ class ConsumerStacksTest(unittest.TestCase):
         self.assertEqual(self.head(), self.fx.tip)
 
     def test_handover_requires_matching_additions_in_every_file(self) -> None:
+        """Verify handover requires matching additions in every file."""
         shared = self.fx.handover(self.scratch, two_files=True)
-        shared.write_text(shared.read_text().split("diff --git a/other.c")[0])
+        shared.write_text(
+            shared.read_text(encoding="utf-8").split("diff --git a/other.c")[0], encoding="utf-8"
+        )
         self.assert_in_series()
 
     def test_handover_requires_sidecar(self) -> None:
@@ -205,13 +220,17 @@ class ConsumerStacksTest(unittest.TestCase):
         self.assert_in_series()
 
     def test_handover_requires_consumers_list_not_string(self) -> None:
+        """Verify handover requires consumers list not string."""
         shared = self.fx.handover(self.scratch)
-        shared.with_suffix(".toml").write_text('consumers = "vmafx"\n')
+        shared.with_suffix(".toml").write_text('consumers = "vmafx"\n', encoding="utf-8")
         self.assert_in_series()
 
     def test_repeated_pins_are_specific_to_each_consumer(self) -> None:
+        """Verify repeated pins are specific to each consumer."""
         shared = self.fx.handover(self.scratch)
-        shared.with_suffix(".toml").write_text('consumers = ["vmafx", "pelorus"]\n')
+        shared.with_suffix(".toml").write_text(
+            'consumers = ["vmafx", "pelorus"]\n', encoding="utf-8"
+        )
         status, out, err = self.run_main(
             f"vmafx={self.fx.stack}",
             f"pelorus={self.fx.stack}",
@@ -231,6 +250,7 @@ class ConsumerStacksTest(unittest.TestCase):
     # Positive.
 
     def test_stacks_apply_each_from_the_tip_and_leave_the_tree_there(self) -> None:
+        """Verify stacks apply each from the tip and leave the tree there."""
         report = self.scratch / "summary.md"
         status, out, _ = self.run_main(f"a={self.fx.stack}", f"b={self.fx.stack}", report=report)
         self.assertEqual(status, 0)
@@ -239,7 +259,7 @@ class ConsumerStacksTest(unittest.TestCase):
                 self.assertIn(f"{name}: applied    {patch}", out)
         self.assertEqual(self.head(), self.fx.tip)
         self.assertEqual(git(self.fx.tree, "status", "--porcelain"), "")
-        self.assertIn(f"| b | `{self.fx.names[1]}` | applied |", report.read_text())
+        self.assertIn(f"| b | `{self.fx.names[1]}` | applied |", report.read_text(encoding="utf-8"))
 
     # Negative.
 
@@ -330,7 +350,7 @@ class ConsumerWorkflowFixture(unittest.TestCase):
         self.root = Path(scratch.name)
         self.env_file = self.root / "env"
         workflow = Path(__file__).resolve().parent.parent / ".github/workflows/consumers.yml"
-        self.job = yaml.safe_load(workflow.read_text())["jobs"]["consumers"]
+        self.job = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]["consumers"]
         self.steps = {step["name"]: step["run"] for step in self.job["steps"] if "run" in step}
         self.workflow_env = self.job.get("env", {})
         self.summary = self.root / "step summary.md"
@@ -351,13 +371,18 @@ class ConsumerWorkflowFixture(unittest.TestCase):
         """Record each invocation as NUL-separated arguments without executing it."""
         path = self.bin / name
         path.write_text(
-            '#!/bin/bash\nprintf "%s\\0" "$@" >> "$ARGV_LOG"\nprintf "\\0" >> "$ARGV_LOG"\n' + body
+            '#!/bin/bash\nprintf "%s\\0" "$@" >> "$ARGV_LOG"\nprintf "\\0" >> "$ARGV_LOG"\n' + body,
+            encoding="utf-8",
         )
         path.chmod(0o755)
 
     def calls(self) -> list[list[str]]:
         """Read all stub invocations, preserving spaces and argument order."""
-        return [call.split("\0") for call in self.argv_log.read_text().split("\0\0") if call]
+        return [
+            call.split("\0")
+            for call in self.argv_log.read_text(encoding="utf-8").split("\0\0")
+            if call
+        ]
 
     def run_step(
         self, name: str, environment: dict[str, str] | None = None
@@ -386,20 +411,25 @@ class ConsumerPinWorkflowTest(ConsumerWorkflowFixture):
     def read_pins(self, vmafx: str, pelorus: str) -> subprocess.CompletedProcess[str]:
         """Write both consumer configurations and execute the pin reader."""
         for name, value in (("vmafx", vmafx), ("pelorus", pelorus)):
-            (self.root / "consumers" / name / "build-config.env").write_text(value)
-        self.env_file.write_text("")
+            (self.root / "consumers" / name / "build-config.env").write_text(
+                value, encoding="utf-8"
+            )
+        self.env_file.write_text("", encoding="utf-8")
         return self.run_step("Read the consumer series pins")
 
     def test_pin_reader_uses_added_consumers_variable(self) -> None:
         """An added map entry supplies its own pin variable without a case branch."""
         root = self.root / "consumers" / "third"
         root.mkdir()
-        (root / "build-config.env").write_text("UNRELATED=v9.9.9\nTHIRD_PIN=v7.8.9\n")
+        (root / "build-config.env").write_text(
+            "UNRELATED=v9.9.9\nTHIRD_PIN=v7.8.9\n", encoding="utf-8"
+        )
         done = self.run_step("Read the consumer series pins", {"CONSUMERS": "third:THIRD_PIN"})
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.env_file.read_text(), "THIRD_SERIES_TAG=v7.8.9\n")
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), "THIRD_SERIES_TAG=v7.8.9\n")
 
     def test_pin_reader_keeps_each_consumers_value_and_strips_quotes(self) -> None:
+        """Verify pin reader keeps each consumers value and strips quotes."""
         for quote in ('"', "'", ""):
             with self.subTest(quote=quote):
                 done = self.read_pins(
@@ -408,11 +438,12 @@ class ConsumerPinWorkflowTest(ConsumerWorkflowFixture):
                 )
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(
-                    self.env_file.read_text(),
+                    self.env_file.read_text(encoding="utf-8"),
                     "VMAFX_SERIES_TAG=v1.2.3\nPELORUS_SERIES_TAG=v4.5.6\n",
                 )
 
     def test_pin_reader_refuses_planted_invalid_or_missing_values(self) -> None:
+        """Verify pin reader refuses planted invalid or missing values."""
         bad = (
             "",
             "v1.2",
@@ -429,7 +460,7 @@ class ConsumerPinWorkflowTest(ConsumerWorkflowFixture):
                     f"FFMPEG_FIX_SERIES_TAG={value}\n", "FFMPEG_SERIES_TAG=v4.5.6\n"
                 )
                 self.assertNotEqual(done.returncode, 0)
-                self.assertEqual(self.env_file.read_text(), "")
+                self.assertEqual(self.env_file.read_text(encoding="utf-8"), "")
                 self.assertFalse((self.root / "injected").exists())
         for missing in ("", "# FFMPEG_SERIES_TAG=v4.5.6\n", "OTHER_FFMPEG_SERIES_TAG=v4.5.6\n"):
             with self.subTest(missing=missing):
@@ -466,13 +497,13 @@ class ConsumerMapWorkflowTest(ConsumerWorkflowFixture):
         ):
             root = self.root / "consumers" / name
             root.mkdir(parents=True)
-            (root / "build-config.env").write_text(f"{variable}={tag}\n")
+            (root / "build-config.env").write_text(f"{variable}={tag}\n", encoding="utf-8")
         done = self.run_step(
             self.pin_step, {"CONSUMERS": "alpha:PIN_A\n\n beta:PIN_B\tgamma:PIN_C\n"}
         )
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(
-            self.env_file.read_text(),
+            self.env_file.read_text(encoding="utf-8"),
             "ALPHA_SERIES_TAG=v1.2.3\nBETA_SERIES_TAG=v4.5.6\nGAMMA_SERIES_TAG=v7.8.9\n",
         )
 
@@ -574,12 +605,14 @@ class ConsumerMapWorkflowTest(ConsumerWorkflowFixture):
         """A hyphenated consumer shares a valid environment key across both steps."""
         root = self.root / "consumers" / "foo-bar"
         root.mkdir(parents=True)
-        (root / "build-config.env").write_text("FOO_TAG=v1.2.3\n")
+        (root / "build-config.env").write_text("FOO_TAG=v1.2.3\n", encoding="utf-8")
         environment = {"CONSUMERS": "foo-bar:FOO_TAG"}
         pinned = self.run_step(self.pin_step, environment)
         self.assertEqual(pinned.returncode, 0, pinned.stderr)
-        self.assertEqual(self.env_file.read_text(), "FOO_BAR_SERIES_TAG=v1.2.3\n")
-        environment.update(line.split("=", 1) for line in self.env_file.read_text().splitlines())
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), "FOO_BAR_SERIES_TAG=v1.2.3\n")
+        environment.update(
+            line.split("=", 1) for line in self.env_file.read_text(encoding="utf-8").splitlines()
+        )
         self.stub("python3")
         applied = self.run_step(self.apply_step, environment)
         self.assertEqual(applied.returncode, 0, applied.stderr)

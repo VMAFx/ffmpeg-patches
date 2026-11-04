@@ -60,7 +60,10 @@ class Repairs:
 
 def bounded_lines(path: Path, content: bytes, limit: int) -> list[str]:
     """Reject oversized input before traversing its lines."""
-    lines = content.decode("utf-8").splitlines(keepends=True)
+    try:
+        lines = content.decode("utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError as exc:
+        raise DriftError(f"{path}: {exc}") from exc
     if len(lines) > limit:
         raise DriftError(f"{path}: exceeds {limit} lines")
     return lines
@@ -263,8 +266,12 @@ def recorded_entries(root: Path, repairs: Repairs | None = None) -> list[dict]:
 
 def table_drift(root: Path, data: dict, original: bytes | None = None) -> list[str]:
     """Compare the README block with the shared contribution table renderer."""
-    content = (root / "README.md").read_bytes() if original is None else original
-    block = series.readme_block(content.decode("utf-8"))
+    path = root / "README.md"
+    content = path.read_bytes() if original is None else original
+    try:
+        block = series.readme_block(content.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise DriftError(f"{path}: {exc}") from exc
     if block is None:
         raise DriftError("README.md lacks one contribution table block")
     if block != series.contributions_table(data):

@@ -220,7 +220,9 @@ def timed_run(ffmpeg: str, pre: list[str], clip: str, vf: str, work: Path) -> di
     if smi is not None:
         smi.terminate()
         smi.wait(timeout=PROBE_TIMEOUT_S)
-        peak = max((int(x) for x in log.read_text().split() if x.isdigit()), default=None)
+        peak = max(
+            (int(x) for x in log.read_text(encoding="utf-8").split() if x.isdigit()), default=None
+        )
     above = None if peak is None or idle is None else peak - idle
     return {
         "rc": rc,

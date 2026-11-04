@@ -60,8 +60,8 @@ class VariantSweepTest(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.repo = Path(self.directory.name)
         run_git(self.repo, "init", "-q")
-        (self.repo / "fix.c").write_text(BASE)
-        (self.repo / "callers.c").write_text(CALLERS)
+        (self.repo / "fix.c").write_text(BASE, encoding="utf-8")
+        (self.repo / "callers.c").write_text(CALLERS, encoding="utf-8")
         run_git(self.repo, "add", ".")
         run_git(self.repo, "commit", "-qm", "base")
         self.base = run_git(self.repo, "rev-parse", "HEAD")
@@ -70,7 +70,7 @@ class VariantSweepTest(unittest.TestCase):
     def commit_head(self, source: str) -> str:
         """Commit the changed fix file and return its full object ID."""
 
-        (self.repo / "fix.c").write_text(source)
+        (self.repo / "fix.c").write_text(source, encoding="utf-8")
         run_git(self.repo, "add", ".")
         run_git(self.repo, "commit", "--allow-empty", "-qm", "head")
         return run_git(self.repo, "rev-parse", "HEAD")
@@ -107,7 +107,7 @@ class VariantSweepTest(unittest.TestCase):
         head = self.commit_head(source)
         result = self.sweep(head)
         self.assertEqual(result.returncode, 0, result.stderr)
-        report = self.output.read_text()
+        report = self.output.read_text(encoding="utf-8")
         self.assertIn(f"base: {self.base}\nhead: {head}\n", report)
         self.assertIn("targets: play, send_cmd, write", report)
         self.assertIn("| callers.c:4 | play | discarded | no | TODO |", report)
@@ -125,7 +125,7 @@ class VariantSweepTest(unittest.TestCase):
         head = self.commit_head(BASE.replace("    write(s);", "    return write(s);"))
         result = self.sweep(head)
         self.assertEqual(result.returncode, 0, result.stderr)
-        report = self.output.read_text()
+        report = self.output.read_text(encoding="utf-8")
         self.assertIn("targets: send_cmd\n", report)
         self.assertIn("| send_cmd | discarded | no | TODO |", report)
         self.assertNotIn("\x1b", report)
@@ -135,7 +135,7 @@ class VariantSweepTest(unittest.TestCase):
 
         head = self.commit_head(BASE)
         self.assertEqual(self.sweep(head).returncode, 0)
-        self.assertIn("no hits\n", self.output.read_text())
+        self.assertIn("no hits\n", self.output.read_text(encoding="utf-8"))
 
     def test_multiline_and_same_file(self) -> None:
         """Multiline statements report their first line and touched-file membership."""
@@ -144,7 +144,10 @@ class VariantSweepTest(unittest.TestCase):
         source += "int sibling(int s)\n{\n    send_cmd (\n        s\n    );\n    return 0;\n}\n"
         head = self.commit_head(source)
         self.assertEqual(self.sweep(head).returncode, 0)
-        self.assertIn("| fix.c:13 | send_cmd | discarded | yes | TODO |", self.output.read_text())
+        self.assertIn(
+            "| fix.c:13 | send_cmd | discarded | yes | TODO |",
+            self.output.read_text(encoding="utf-8"),
+        )
 
     def test_unknown_class(self) -> None:
         """Class parsing rejects every value outside the allow-list."""
@@ -154,10 +157,12 @@ class VariantSweepTest(unittest.TestCase):
     def test_touched_leaf_without_added_check(self) -> None:
         """A touched leaf with no callers and no consumed call yields no hits."""
 
-        (self.repo / "callers.c").write_text("int unrelated(void) { return 0; }\n")
+        (self.repo / "callers.c").write_text(
+            "int unrelated(void) { return 0; }\n", encoding="utf-8"
+        )
         head = self.commit_head("int leaf(void) { return 1; }\n")
         self.assertEqual(self.sweep(head).returncode, 0)
-        self.assertIn("no hits\n", self.output.read_text())
+        self.assertIn("no hits\n", self.output.read_text(encoding="utf-8"))
 
     def test_consumed_forms_and_lexical_noise(self) -> None:
         """Error-tested assignments and direct conditions seed checked callees."""
@@ -187,7 +192,7 @@ int sibling(int s)
         head = self.commit_head(source)
         result = self.sweep(head)
         self.assertEqual(result.returncode, 0, result.stderr)
-        report = self.output.read_text()
+        report = self.output.read_text(encoding="utf-8")
         self.assertIn("targets: assign, changed, different, less, sibling, wrapped", report)
         self.assertEqual(report.count("| discarded |"), 4)
         self.assertEqual(report.count("| normalized |"), 2)
@@ -212,7 +217,7 @@ int consume(int ret)
         head = self.commit_head(source)
         result = self.sweep(head)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("no hits\n", self.output.read_text())
+        self.assertIn("no hits\n", self.output.read_text(encoding="utf-8"))
 
     def test_macro_not_target(self) -> None:
         """Neither returns nor checked assignments promote uppercase macro names."""
@@ -227,7 +232,7 @@ int consume(int ret)
 """
         head = self.commit_head(source)
         self.assertEqual(self.sweep(head).returncode, 0)
-        self.assertIn("targets: changed\n", self.output.read_text())
+        self.assertIn("targets: changed\n", self.output.read_text(encoding="utf-8"))
 
     def test_offset_assignment_not_target(self) -> None:
         """Arithmetic expressions remain consumed even when their result is tested."""
@@ -244,7 +249,7 @@ int consume(int ret)
 """
         head = self.commit_head(source)
         self.assertEqual(self.sweep(head).returncode, 0)
-        self.assertIn("targets: changed\n", self.output.read_text())
+        self.assertIn("targets: changed\n", self.output.read_text(encoding="utf-8"))
 
     def test_assignment_checked_across_added_lines(self) -> None:
         """Checks within three added lines promote only the tested variable's callee."""
@@ -286,7 +291,7 @@ int sibling(int x)
 """
         head = self.commit_head(source)
         self.assertEqual(self.sweep(head).returncode, 0)
-        report = self.output.read_text()
+        report = self.output.read_text(encoding="utf-8")
         self.assertIn(
             "targets: boundary, changed, f, false_check, inline_check, same_line, sibling\n",
             report,
@@ -319,7 +324,7 @@ int sibling(int x)
         )
         head = self.commit_head(source)
         self.assertEqual(self.sweep(head).returncode, 0)
-        report = self.output.read_text()
+        report = self.output.read_text(encoding="utf-8")
         self.assertEqual(report.count("| discarded |"), 6)
         self.assertEqual(report.count("| TODO |"), 6)
 
@@ -328,7 +333,8 @@ int sibling(int x)
 
         (self.repo / "callers.c").write_text(
             "static int send_cmd(int s) { return s; }\n"
-            "int other(int s) { send_cmd(s); return s; }\n"
+            "int other(int s) { send_cmd(s); return s; }\n",
+            encoding="utf-8",
         )
         self.base = self.commit_head(
             BASE.replace("int send_cmd(int s)", "static int send_cmd(int s)")
@@ -341,7 +347,7 @@ int sibling(int x)
         )
         result = self.sweep(head)
         self.assertEqual(result.returncode, 0, result.stderr)
-        report = self.output.read_text()
+        report = self.output.read_text(encoding="utf-8")
         self.assertIn("| fix.c:11 | send_cmd | discarded | yes | TODO |", report)
         self.assertNotIn("| callers.c:2 | send_cmd |", report)
 
@@ -350,16 +356,17 @@ int sibling(int x)
 
         (self.repo / "callers.c").write_text(
             "static int send_cmd(int s) { return s; }\n"
-            "int other(int s) { send_cmd(s); return s; }\n"
+            "int other(int s) { send_cmd(s); return s; }\n",
+            encoding="utf-8",
         )
         (self.repo / "external.c").write_text(
-            "int send_cmd(int s);\nint other(int s) { send_cmd(s); return s; }\n"
+            "int send_cmd(int s);\nint other(int s) { send_cmd(s); return s; }\n", encoding="utf-8"
         )
         self.base = self.commit_head(BASE)
         head = self.commit_head(BASE.replace("    write(s);", "    return write(s);"))
         result = self.sweep(head)
         self.assertEqual(result.returncode, 0, result.stderr)
-        report = self.output.read_text()
+        report = self.output.read_text(encoding="utf-8")
         self.assertIn("| external.c:2 | send_cmd | discarded | no | TODO |", report)
         self.assertNotIn("| callers.c:2 | send_cmd |", report)
 
@@ -374,7 +381,7 @@ int sibling(int x)
             with unittest.mock.patch.dict(os.environ, {"GIT_DIR": str(foreign / ".git")}):
                 result = self.sweep("HEAD")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"head: {head}\n", self.output.read_text())
+        self.assertIn(f"head: {head}\n", self.output.read_text(encoding="utf-8"))
 
     def test_git_decodes_invalid_source_bytes(self) -> None:
         """Non-UTF-8 comments do not cause a traceback or hide a caller."""
@@ -386,7 +393,8 @@ int sibling(int x)
         result = self.sweep(head)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "| callers.c:2 | send_cmd | discarded | yes | TODO |", self.output.read_text()
+            "| callers.c:2 | send_cmd | discarded | yes | TODO |",
+            self.output.read_text(encoding="utf-8"),
         )
 
     def test_git_failure(self) -> None:
@@ -525,7 +533,7 @@ int sibling(int s) {
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "sweep.md"
-            output.write_text("old complete report\n")
+            output.write_text("old complete report\n", encoding="utf-8")
             new = "class: unchecked-return\nhead: new\n| unresolved |\n"
             real_open = Path.open
 
@@ -558,7 +566,7 @@ int sibling(int s) {
                 )
             self.assertEqual(status, 1)
             self.assertIn("planted write failure", errors.getvalue())
-            self.assertEqual(output.read_text(), "old complete report\n")
+            self.assertEqual(output.read_text(encoding="utf-8"), "old complete report\n")
             self.assertEqual(list(Path(directory).iterdir()), [output])
 
     def test_atomic_report_is_published_only_when_complete(self) -> None:
@@ -566,14 +574,14 @@ int sibling(int s) {
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "sweep.md"
-            output.write_text("old complete report\n")
+            output.write_text("old complete report\n", encoding="utf-8")
             new = "new complete report\n"
             replace = os.replace
             seen = []
 
             def replace_file(source, destination):
                 self.assertEqual(Path(source).parent, output.parent)
-                self.assertEqual(output.read_text(), "old complete report\n")
+                self.assertEqual(output.read_text(encoding="utf-8"), "old complete report\n")
                 self.assertEqual(Path(source).read_text(encoding="utf-8"), new)
                 seen.append(source)
                 return replace(source, destination)
@@ -587,7 +595,7 @@ int sibling(int s) {
                 )
             self.assertEqual(status, 0)
             self.assertEqual(len(seen), 1)
-            self.assertEqual(output.read_text(), new)
+            self.assertEqual(output.read_text(encoding="utf-8"), new)
 
 
 class SweepLimitTest(unittest.TestCase):

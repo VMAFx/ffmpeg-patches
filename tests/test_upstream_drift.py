@@ -115,6 +115,31 @@ class Fixture:
         return self.root / "patches" / self.names[number - 1]
 
 
+class Utf8ReadTest(unittest.TestCase):
+    """Invalid UTF-8 includes the input path and preserves the decode cause."""
+
+    def test_bounded_lines_invalid_utf8_names_sidecar(self) -> None:
+        """Wrap an undecodable sidecar in a path-specific drift error."""
+        path = Path("patches/0001-change.toml")
+        with self.assertRaises(upstream_drift.DriftError) as caught:
+            upstream_drift.bounded_lines(path, b"\xff", upstream_drift.MAX_SIDECAR_LINES)
+        self.assertIn(str(path), str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+
+    def test_table_drift_invalid_utf8_names_readme(self) -> None:
+        """Wrap undecodable README bytes from disk or snapshot with the full path."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            path = root / "README.md"
+            path.write_bytes(b"\xff")
+            for original in (None, b"\xff"):
+                with self.subTest(original=original):
+                    with self.assertRaises(upstream_drift.DriftError) as caught:
+                        upstream_drift.table_drift(root, {}, original)
+                    self.assertIn(str(path), str(caught.exception))
+                    self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+
+
 class DriftTest(unittest.TestCase):
     def setUp(self) -> None:
         """Build a fixture series whose records point at the fake forge."""

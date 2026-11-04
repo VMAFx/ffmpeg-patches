@@ -425,16 +425,16 @@ class ForgejoTest(unittest.TestCase):
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
         tool = bin_dir / "secret-tool"
-        tool.write_text("#!/bin/sh\necho testtoken\n")
+        tool.write_text("#!/bin/sh\necho testtoken\n", encoding="utf-8")
         tool.chmod(0o755)
         self.bin_dir = bin_dir
-        (self.tmp / "body.md").write_text(BODY)
+        (self.tmp / "body.md").write_text(BODY, encoding="utf-8")
         self.repo = self.tmp / "ffmpeg"
         self.repo.mkdir()
         git(self.repo, "init", "-q", "-b", "master")
         candidate = self.repo / OVERLAP_FILE
         candidate.parent.mkdir(parents=True)
-        candidate.write_text("base\n")
+        candidate.write_text("base\n", encoding="utf-8")
         git(self.repo, "add", OVERLAP_FILE)
         commit = [
             "-c",
@@ -450,12 +450,12 @@ class ForgejoTest(unittest.TestCase):
         self.upstream = self.tmp / "upstream.git"
         git(self.tmp, "clone", "-q", "--bare", str(self.repo), str(self.upstream))
         git(self.repo, "checkout", "-qb", "topic")
-        candidate.write_text("topic\n")
+        candidate.write_text("topic\n", encoding="utf-8")
         git(self.repo, "add", OVERLAP_FILE)
         git(self.repo, *commit, "topic")
         self.sweep = self.tmp / "sweep.md"
         sha = git_output(self.repo, "rev-parse", "topic")
-        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
 
     def run_command(
         self,
@@ -770,7 +770,9 @@ class FairyReviewsTest(ForgejoTest):
         """Offline JSON classification needs no API or keyring request."""
 
         path = self.tmp / "reviews.json"
-        path.write_text(json.dumps([fairy_review(), fairy_review("REQUEST_REVIEW", "")]))
+        path.write_text(
+            json.dumps([fairy_review(), fairy_review("REQUEST_REVIEW", "")]), encoding="utf-8"
+        )
         stub = Stub()
         proc = self.run_command(stub, "fairy-reviews", "--from-json", str(path))
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -782,7 +784,7 @@ class FairyReviewsTest(ForgejoTest):
 
         path = self.tmp / "reviews.json"
         for rows in ({}, [fairy_review(commit_id="invalid")]):
-            path.write_text(json.dumps(rows))
+            path.write_text(json.dumps(rows), encoding="utf-8")
             with self.subTest(rows=rows):
                 proc = self.run_command(Stub(), "fairy-reviews", "--from-json", str(path))
                 self.assertNotEqual(proc.returncode, 0)
@@ -913,7 +915,7 @@ class EditBodyTest(ForgejoTest):
         broken = self.tmp / "broken"
         broken.mkdir()
         seq = broken / "seq"
-        seq.write_text("#!/bin/sh\nexit 1\n")
+        seq.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         seq.chmod(0o755)
         stub = Stub([A], {A: [[label("pending")]]})
         self.assertEqual(self.run_helper(stub, path_first=broken), 75)
@@ -998,7 +1000,7 @@ class TestClaimHeadTest(ForgejoTest):
     def test_curlrc_fail_keeps_a_missing_pull_as_exit_76(self) -> None:
         """A curlrc fail option cannot turn a missing pull into a curl failure."""
 
-        (self.tmp / ".curlrc").write_text("fail\n")
+        (self.tmp / ".curlrc").write_text("fail\n", encoding="utf-8")
         stub = Stub(pull_status=404)
         proc = self.comment_body(
             stub, env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)}
@@ -1015,7 +1017,9 @@ class TestClaimHeadTest(ForgejoTest):
         fake_bin.mkdir()
         log = self.tmp / "curl.log"
         curl = fake_bin / "curl"
-        curl.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >>"$CURL_LOG"\nexit 7\n')
+        curl.write_text(
+            '#!/bin/sh\nprintf \'%s\\n\' "$*" >>"$CURL_LOG"\nexit 7\n', encoding="utf-8"
+        )
         curl.chmod(0o755)
         stub = Stub()
         proc = self.comment_body(
@@ -1025,14 +1029,14 @@ class TestClaimHeadTest(ForgejoTest):
         )
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("curl rc 7", proc.stderr)
-        invocations = log.read_text().splitlines()
+        invocations = log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(invocations), 1)
         self.assertIn("-X GET", invocations[0])
 
     def test_curlrc_header_reaches_the_pull_read(self) -> None:
         """The tested-head pull read preserves headers configured in curlrc."""
 
-        (self.tmp / ".curlrc").write_text('header = "X-Curlrc: 1"\n')
+        (self.tmp / ".curlrc").write_text('header = "X-Curlrc: 1"\n', encoding="utf-8")
         stub = Stub()
         proc = self.comment_body(
             stub, env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)}
@@ -1186,11 +1190,13 @@ class FairyRequestTestBase(unittest.TestCase):
             ),
         }.items():
             tool = self.bin_dir / name
-            tool.write_text("#!/bin/sh\n" + body + "\n")
+            tool.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
             tool.chmod(0o755)
-        (self.tmp / "body.md").write_text(BODY)
+        (self.tmp / "body.md").write_text(BODY, encoding="utf-8")
         self.sweep = self.tmp / "sweep.md"
-        self.sweep.write_text(f"class: unchecked-return\nhead: {FAIRY_FIXTURE_HEAD}\nno hits\n")
+        self.sweep.write_text(
+            f"class: unchecked-return\nhead: {FAIRY_FIXTURE_HEAD}\nno hits\n", encoding="utf-8"
+        )
 
     def run_command(
         self, stub: Stub, *args: str, env_updates: dict[str, str] | None = None
@@ -1607,7 +1613,7 @@ class PullRequestOverlapTest(ForgejoTest):
 
         upstream_work = self.tmp / "upstream-work"
         git(self.tmp, "clone", "-q", str(self.upstream), str(upstream_work))
-        upstream_work.joinpath("upstream-file").write_text("upstream\n")
+        upstream_work.joinpath("upstream-file").write_text("upstream\n", encoding="utf-8")
         git(upstream_work, "add", "upstream-file")
         git(
             upstream_work,
@@ -1625,7 +1631,7 @@ class PullRequestOverlapTest(ForgejoTest):
         master = git_output(self.repo, "rev-parse", "master")
         git(self.repo, "fetch", "-q", str(self.upstream), "refs/heads/master")
         git(self.repo, "reset", "--hard", "-q", "FETCH_HEAD")
-        self.repo.joinpath(OVERLAP_FILE).write_text("topic on upstream\n")
+        self.repo.joinpath(OVERLAP_FILE).write_text("topic on upstream\n", encoding="utf-8")
         git(self.repo, "add", OVERLAP_FILE)
         git(
             self.repo,
@@ -1640,7 +1646,7 @@ class PullRequestOverlapTest(ForgejoTest):
             "new topic",
         )
         sha = git_output(self.repo, "rev-parse", "topic")
-        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
         stub = overlap_stub(
             reviewers=[["alice"]], open_pulls=[open_pull()], pull_files={25612: ["upstream-file"]}
         )
@@ -1738,7 +1744,7 @@ class SweepTest(ForgejoTest):
         marker = self.repo / "stdlib-decoy-executed"
         decoy = f"open({str(marker)!r}, 'w').write('executed')\nraise SystemExit(99)\n"
         for name in ("pathlib.py", "importlib.py"):
-            (self.repo / name).write_text(decoy)
+            (self.repo / name).write_text(decoy, encoding="utf-8")
         result = self.sweep_command("push", "--sweep", str(self.sweep))
         self.assertFalse(marker.exists(), "checkout-level standard library decoy executed")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1750,7 +1756,7 @@ class SweepTest(ForgejoTest):
         sha = git_output(self.repo, "rev-parse", "topic")
         result = self.sweep_command("push", "--lease", A, "--sweep", str(self.sweep))
         self.assertEqual(result.returncode, 0, result.stderr)
-        argv = json.loads((self.tmp / "push-argv.json").read_text())
+        argv = json.loads((self.tmp / "push-argv.json").read_text(encoding="utf-8"))
         self.assertEqual(argv[-1], f"{sha}:refs/heads/topic")
         self.assertIn(f"--force-with-lease=refs/heads/topic:{A}", argv)
 
@@ -1787,7 +1793,8 @@ class SweepTest(ForgejoTest):
             f"Path({str(marker)!r}).write_text('executed')\n"
             "def validate_report(path, head):\n"
             '    """Pretend every report is valid after recording decoy execution."""\n'
-            "    return True\n"
+            "    return True\n",
+            encoding="utf-8",
         )
         for command in ("push", "pr"):
             with self.subTest(command=command):
@@ -1803,7 +1810,7 @@ class SweepTest(ForgejoTest):
     def test_sweep_rejects_non_table_findings(self) -> None:
         """Malformed findings and unrecognized text cannot disappear during validation."""
 
-        original = self.sweep.read_text()
+        original = self.sweep.read_text(encoding="utf-8")
         for line in (
             "sibling.c:4 | play | discarded | no | TODO |",
             "unexpected text",
@@ -1811,19 +1818,23 @@ class SweepTest(ForgejoTest):
             "| sibling.c:4 | play | discarded | no | TODO",
         ):
             with self.subTest(line=line):
-                self.sweep.write_text(original + line + "\n")
+                self.sweep.write_text(original + line + "\n", encoding="utf-8")
                 self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def test_sweep_rejects_metadata_only_prefix(self) -> None:
         """A metadata-only prefix is incomplete rather than a reviewed empty report."""
 
-        self.sweep.write_text(self.sweep.read_text().replace("no hits\n", ""))
+        self.sweep.write_text(
+            self.sweep.read_text(encoding="utf-8").replace("no hits\n", ""), encoding="utf-8"
+        )
         self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def test_sweep_report_size_limit(self) -> None:
         """An oversized report is refused by name before outbound operations."""
 
-        self.sweep.write_text(self.sweep.read_text() + " " * (4 * 1024 * 1024))
+        self.sweep.write_text(
+            self.sweep.read_text(encoding="utf-8") + " " * (4 * 1024 * 1024), encoding="utf-8"
+        )
         self.assert_sweep_refused("--sweep", str(self.sweep))
         result = self.sweep_command("push", "--sweep", str(self.sweep))
         self.assertIn("report size limit", result.stderr)
@@ -1841,7 +1852,8 @@ class SweepTest(ForgejoTest):
             f"    with open({str(self.tmp / 'push-argv.json')!r}, 'w') as record:\n"
             "        json.dump(sys.argv[1:], record)\n"
             '    print("stub push")\n    sys.exit(0)\n'
-            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
+            encoding="utf-8",
         )
         fake.chmod(0o755)
         stub = Stub(reviewers=[["alice"]])
@@ -1876,13 +1888,16 @@ class SweepTest(ForgejoTest):
     def test_sweep_head_mismatch(self) -> None:
         """A reviewed report for another commit is stale."""
 
-        self.sweep.write_text(f"class: unchecked-return\nhead: {A}\nno hits\n")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {A}\nno hits\n", encoding="utf-8")
         self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def test_sweep_missing_class(self) -> None:
         """A report without its bug class is refused."""
 
-        self.sweep.write_text(self.sweep.read_text().replace("class: unchecked-return\n", ""))
+        self.sweep.write_text(
+            self.sweep.read_text(encoding="utf-8").replace("class: unchecked-return\n", ""),
+            encoding="utf-8",
+        )
         self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def test_sweep_todo(self) -> None:
@@ -1896,7 +1911,9 @@ class SweepTest(ForgejoTest):
 
         for value in ("ignore", "", "follow-up:", "fold later", "TODO follow-up: x"):
             with self.subTest(value=value):
-                self.sweep.write_text(self.sweep.read_text().split("|", 1)[0])
+                self.sweep.write_text(
+                    self.sweep.read_text(encoding="utf-8").split("|", 1)[0], encoding="utf-8"
+                )
                 self.add_sweep_rows(value)
                 self.assert_sweep_refused("--sweep", str(self.sweep))
 
@@ -1969,7 +1986,7 @@ def mutant_case(
 
     with tempfile.TemporaryDirectory() as tmp:
         mutant = Path(tmp) / "ffmpeg-forgejo"
-        mutant.write_text(source.replace(old, new))
+        mutant.write_text(source.replace(old, new), encoding="utf-8")
         yield type(name, (base,), {"helper": mutant})
 
 
@@ -1979,7 +1996,7 @@ class MutantTest(unittest.TestCase):
     def test_every_mutant_is_caught(self) -> None:
         """Every planted guard defect is killed by its selected edit-body case."""
 
-        source = HELPER.read_text()
+        source = HELPER.read_text(encoding="utf-8")
         for name, (old, new, test_name) in MUTANTS.items():
             with self.subTest(mutant=name):
                 self.assertEqual(source.count(old), 1, "mutation site missing")
@@ -1994,7 +2011,7 @@ class FairyReviewsMutantTest(unittest.TestCase):
         """The requested-only negative kills a counter accepting every Fairy row."""
 
         old = '        and row["state"] in ALLOWED_STATES\n        and row.get("submitted_at")'
-        source = HELPER.read_text()
+        source = HELPER.read_text(encoding="utf-8")
         self.assertEqual(source.count(old), 1, "mutation site missing")
         source = source.replace(
             'key=lambda row: datetime.fromisoformat(row["submitted_at"])',
@@ -2014,7 +2031,7 @@ class PullOverlapMutantTest(unittest.TestCase):
     def test_overlap_mutants_are_caught(self) -> None:
         """Each planted pagination or base defect fails at least one overlap case."""
 
-        source = HELPER.read_text()
+        source = HELPER.read_text(encoding="utf-8")
         mutations = (
             (
                 "if rows is None and int(sys.argv[2]) >= 2: rows = []",
