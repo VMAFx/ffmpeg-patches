@@ -2,7 +2,7 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings build test lint lint-mutable-defaults apply lengths lengths-local dist
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings build test lint lint-mutable-defaults apply lengths lengths-local upstream-lint dist
 .PHONY: fairy-requests
 
 DOCSTRING_BASE ?= origin/main
@@ -13,7 +13,7 @@ all: build
 fairy-requests:
 	@bash scripts/ffmpeg-forgejo fairy-requests --skip-unavailable
 
-verify-all: compile-context-verify caveman-sources audit docstrings test lengths-local
+verify-all: compile-context-verify caveman-sources audit docstrings test lengths-local upstream-lint
 
 compile-context:
 	@$(PRAETORCTL) compile-context
@@ -73,6 +73,21 @@ lengths-local:
 		  echo '    make verify-all FFMPEG_TREE=<applied FFmpeg tree>'; \
 		  echo '  (see "Apply the series" in README.md). CI enforces this gate'; \
 		  echo '  unconditionally, so a tree-less local run cannot catch it.'; \
+		} >&2; \
+	fi
+
+# Pre-POST checks using the upstream base's own policy and developer.texi rules:
+# Only allow-listed patcheck categories block; other added-line hints need review.
+#   make upstream-lint UPSTREAM_TREE=/path/to/ffmpeg UPSTREAM_BASE=<revision>
+# This optional checkout is distinct from the applied-series length checkout.
+upstream-lint:
+	@if [ -n "$(UPSTREAM_TREE)" ] && [ -n "$(UPSTREAM_BASE)" ]; then \
+		python3 scripts/upstream_lint.py --tree "$(UPSTREAM_TREE)" --base "$(UPSTREAM_BASE)"; \
+	else \
+		{ \
+		  echo 'upstream-lint: SKIPPED - both UPSTREAM_TREE and UPSTREAM_BASE required.'; \
+		  echo '  Before posting upstream, run:'; \
+		  echo '    make upstream-lint UPSTREAM_TREE=<clean FFmpeg tree> UPSTREAM_BASE=<revision>'; \
 		} >&2; \
 	fi
 
