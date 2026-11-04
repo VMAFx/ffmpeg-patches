@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import random
 import shutil
-import subprocess
+import subprocess  # nosec B404 - compiler and test binary argv in a temporary test directory.
 import tempfile
 import unittest
 from pathlib import Path

@@ -7,7 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import subprocess
+import subprocess  # nosec B404 - fixed bash argv runs a test fixture script.
 import sys
 import tempfile
 import textwrap
