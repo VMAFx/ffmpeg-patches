@@ -33,9 +33,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-import series
+try:
+    import forge_settings
+    import series
+except ModuleNotFoundError:
+    from scripts import forge_settings, series
 
-PULL_URL = series.PULL_URL
 Fetch = Callable[[str], dict]
 MAX_SERIES_ENTRIES = 4096
 MAX_SIDECAR_LINES = 4096
@@ -88,9 +91,10 @@ def bounded_series(root: Path, findings: series.Findings, repairs: Repairs | Non
 
 
 def api_url(url: str, number: int | None = None) -> str:
-    match = PULL_URL.fullmatch(url) if isinstance(url, str) else None
+    """Return the Forgejo API URL for a pull request."""
+    match = series.pull_url_pattern().fullmatch(url) if isinstance(url, str) else None
     if not match or (number is not None and int(match.group(4)) != number):
-        raise DriftError(f"{url}: not a pull request URL of code.ffmpeg.org")
+        raise DriftError(f"{url}: not a pull request URL of {forge_settings.keyring_service()}")
     host, owner, repository, number = match.groups()
     return f"{host}/api/v1/repos/{owner}/{repository}/pulls/{number}"
 
@@ -331,6 +335,7 @@ def main(argv: list[str], fetch: Fetch = fetch_json, today: date | None = None) 
         return cache[url]
 
     try:
+        series.pull_url_pattern()
         fixed = []
         if args.fix:
             lines, fixed = fix_drift(args.root, cached_fetch, today)

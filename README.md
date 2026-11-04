@@ -67,6 +67,15 @@ Pass the reviewed report before positional arguments to both commands (run these
 
 Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`.
 
+### Forge settings
+
+The forge helper scripts share configuration through environment variables, implemented in [scripts/forge_settings.py](scripts/forge_settings.py) and verified by [tests/test_forge_settings.py](tests/test_forge_settings.py):
+
+- `FFMPEG_FORGEJO_HOST`: forge URL (default: `https://code.ffmpeg.org`).
+- `FFMPEG_FORGEJO_REPO`: repository path (default: `FFmpeg/FFmpeg`).
+- `FFMPEG_FORGEJO_BOT_REVIEWER`: bot reviewer login (default: `Forgejo_Fairy`).
+- `FFMPEG_FORGEJO_LOGIN`: user login on the forge; when unset, discovered from `/user` with the keyring token.
+
 ## Upstream contributions
 
 Pull requests on the FFmpeg forge that came out of this series and its
@@ -222,8 +231,10 @@ prints one result per patch:
 
 The checks cover:
 
-- `make test`: series check, ruff, REUSE and the unit tests of
+- `make test`: series check, ruff, mutable defaults and the unit tests of
   `scripts/series.py`
+- REUSE compliance runs in the [REUSE workflow](.github/workflows/reuse.yml); the local `reuse-lint` hook in `lefthook.yml` runs `reuse lint` when REUSE 6.x is installed.
+- `python3 scripts/lint_mutable_defaults.py` (also `make lint-mutable-defaults`): Pylint checks Python sources for `dangerous-default-value` (W0102), including defaults bound to identifiers that ruff B006 misses. The script's `PYLINT_VERSION` pins Pylint; it uses that exact version on PATH or fetches it with `uvx`.
 - inside the series check: every patch with an upstream link has a record
   in `upstream-contributions.json` with a matching state, and the table in
   this file equals the one generated from the records. The check does not
