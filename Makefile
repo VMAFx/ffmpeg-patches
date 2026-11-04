@@ -2,14 +2,6 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-PYLINT_VERSION := 4.1.3
-PYLINT ?= $(shell \
-	if command -v pylint >/dev/null 2>&1 && pylint --version 2>/dev/null | grep -qE '^pylint $(PYLINT_VERSION)($$|[^0-9])'; then \
-		echo "pylint"; \
-	elif command -v uvx >/dev/null 2>&1; then \
-		echo "uvx --from pylint==$(PYLINT_VERSION) pylint"; \
-	fi)
-PYLINT_FLAGS := --disable=all --enable=dangerous-default-value --score=n --persistent=n
 .PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings build test lint lint-mutable-defaults apply lengths lengths-local dist
 .PHONY: fairy-requests
 
@@ -51,16 +43,7 @@ lint: lint-mutable-defaults
 	@reuse lint --quiet
 
 lint-mutable-defaults:
-	@if [ -z "$(PYLINT)" ]; then \
-		echo "lint-mutable-defaults: neither pylint==$(PYLINT_VERSION) nor uvx found on PATH" >&2; \
-		exit 1; \
-	fi
-	@echo "lint-mutable-defaults: using $(PYLINT)"
-	@if [ -n "$(FILES)" ]; then \
-		$(PYLINT) $(PYLINT_FLAGS) $(FILES); \
-	else \
-		git ls-files -c -o --exclude-standard -z -- '*.py' | xargs -0 -r $(PYLINT) $(PYLINT_FLAGS); \
-	fi
+	@python3 scripts/lint_mutable_defaults.py
 
 # Apply the series onto a clean FFmpeg checkout at the pinned base:
 #   make apply FFMPEG_TREE=/path/to/ffmpeg
