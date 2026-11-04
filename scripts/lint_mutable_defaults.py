@@ -31,6 +31,8 @@ def resolve_pylint() -> list[str] | None:
             if version.stdout.splitlines()[:1] == [f"pylint {PYLINT_VERSION}"]:
                 return [pylint]
         except (OSError, subprocess.SubprocessError):
+            # A Pylint on PATH that cannot report its version is not the pinned
+            # one; fall through to the uvx-fetched pinned version below.
             pass
     uvx = shutil.which("uvx")
     if uvx:
