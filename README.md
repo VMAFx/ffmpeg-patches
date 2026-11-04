@@ -125,11 +125,16 @@ filenames separated by `, `, or an empty string when the series carries
 none. Every named patch must link to that pull request and match its state.
 The table lists all their series numbers and is generated from that file:
 edit the file, then run `python3 scripts/series.py contributions --write`.
+The pre-commit hook also regenerates and stages `README.md` whenever
+`upstream-contributions.json` is staged.
 
 Run `python3 scripts/upstream_drift.py` to compare recorded fields and
 `master_form` commits with the FFmpeg forge. Add `--fix` to update changed
 fields, set the checked date to today in UTC and regenerate the table.
-Unchanged files keep their bytes and checked date. A merged or closed
+Unchanged files keep their bytes and checked date. The README table is checked
+even when the forge records match; `--fix` repairs a stale table without changing
+the checked date. Concurrent edits detected before writing abort the repair
+without changing any files. A merged or closed
 `covered_by` pull request still needs human review before dropping its patch;
 `--fix` reports it and exits 1. Tool errors exit 2.
 

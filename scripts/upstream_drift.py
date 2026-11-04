@@ -37,6 +37,9 @@ import series
 
 PULL_URL = series.PULL_URL
 Fetch = Callable[[str], dict]
+MAX_SERIES_ENTRIES = 4096
+MAX_SIDECAR_LINES = 4096
+MAX_REPAIR_PATHS = MAX_SERIES_ENTRIES + 2
 
 
 class DriftError(Exception):
@@ -48,7 +51,40 @@ class Repairs:
     """Pending writes and their diagnostics, collected before changing files."""
 
     files: dict[Path, bytes] = field(default_factory=dict)
+    originals: dict[Path, bytes] = field(default_factory=dict)
     lines: list[str] = field(default_factory=list)
+
+
+def bounded_lines(path: Path, content: bytes, limit: int) -> list[str]:
+    """Reject oversized input before traversing its lines."""
+    lines = content.decode("utf-8").splitlines(keepends=True)
+    if len(lines) > limit:
+        raise DriftError(f"{path}: exceeds {limit} lines")
+    return lines
+
+
+def repair_path_limit(count: int) -> None:
+    """Reject oversized repair or snapshot sets before filesystem traversal."""
+    if count > MAX_REPAIR_PATHS:
+        raise DriftError(f"repair paths exceed {MAX_REPAIR_PATHS}")
+
+
+def bounded_series(root: Path, findings: series.Findings, repairs: Repairs | None) -> list[str]:
+    """Bound series and sidecar scans; snapshot their bytes before validation."""
+    path = root / "series.txt"
+    if path.is_file():
+        bounded_lines(path, path.read_bytes(), MAX_SERIES_ENTRIES)
+    names = series.read_series(root, findings)
+    if len(names) > MAX_SERIES_ENTRIES:
+        raise DriftError(f"series entries exceed {MAX_SERIES_ENTRIES}")
+    repair_path_limit(len(names) + 2)
+    for name in names:
+        path = (root / "patches" / name).with_suffix(".toml")
+        original = path.read_bytes()
+        bounded_lines(path, original, MAX_SIDECAR_LINES)
+        if repairs is not None:
+            repairs.originals.setdefault(path, original)
+    return names
 
 
 def api_url(url: str, number: int | None = None) -> str:
@@ -92,6 +128,8 @@ def forge_record(pull: dict) -> dict[str, str]:
 
 def drift(entries: list[dict], fetch: Fetch, *, fix: bool = False) -> list[str]:
     """One line per field that differs between a record and the forge."""
+    if len(entries) > MAX_SERIES_ENTRIES:
+        raise DriftError(f"contribution entries exceed {MAX_SERIES_ENTRIES}")
     lines = []
     for entry in entries:
         actual = forge_record(fetch(api_url(entry["url"], entry["number"])))
@@ -128,14 +166,17 @@ def master_form_drift(name: str, form: dict, pull: dict) -> list[str]:
     ]
 
 
-def master_form_fix(path: Path, form: dict, pull: dict) -> bytes:
+def master_form_fix(path: Path, form: dict, pull: dict, original: bytes | None = None) -> bytes:
     """Replace each old SHA exactly once on the single inline master_form line."""
     actual = master_form_record(pull)
     if not all(series.COMMIT.fullmatch(value) for value in actual.values()):
         raise DriftError(f"{path}: forge master_form commits must be full 40-hex commits")
-    lines = path.read_bytes().decode("utf-8").splitlines(keepends=True)
-    matches = [i for i, line in enumerate(lines) if re.match(r"^\s*master_form\s*=", line)]
-    if len(matches) != 1 or not re.match(r"^\s*master_form\s*=\s*\{", lines[matches[0]]):
+    lines = bounded_lines(
+        path, path.read_bytes() if original is None else original, MAX_SIDECAR_LINES
+    )
+    key = r'^\s*(?:master_form|"master_form"|\'master_form\')\s*='
+    matches = [i for i, line in enumerate(lines) if re.match(key, line)]
+    if len(matches) != 1 or not re.match(key + r"\s*\{", lines[matches[0]]):
         raise DriftError(f"{path}: expected exactly one inline master_form line")
     index = matches[0]
     line = lines[index]
@@ -173,7 +214,7 @@ def covered_by_drift(name: str, url: str, pull: dict) -> list[str]:
 def patch_drift(root: Path, fetch: Fetch, repairs: Repairs | None = None) -> list[str]:
     """Compare the series' master forms and covering pull requests with the forge."""
     findings = series.Findings()
-    names = series.read_series(root, findings)
+    names = bounded_series(root, findings, repairs)
     lines = []
     for name in names:
         meta = series.note_metadata(root / "patches" / name)
@@ -186,7 +227,9 @@ def patch_drift(root: Path, fetch: Fetch, repairs: Repairs | None = None) -> lis
             moved = master_form_drift(name, meta["master_form"], pull)
             if repairs is not None and moved:
                 path = (root / "patches" / name).with_suffix(".toml")
-                repairs.files[path] = master_form_fix(path, meta["master_form"], pull)
+                repairs.files[path] = master_form_fix(
+                    path, meta["master_form"], pull, repairs.originals[path]
+                )
                 repairs.lines.extend(moved)
             else:
                 lines.extend(moved)
@@ -198,43 +241,72 @@ def patch_drift(root: Path, fetch: Fetch, repairs: Repairs | None = None) -> lis
     return lines
 
 
-def recorded_entries(root: Path) -> list[dict]:
+def recorded_entries(root: Path, repairs: Repairs | None = None) -> list[dict]:
+    """Validate bounded inputs, retaining pre-fetch bytes for repair guards."""
     findings = series.Findings()
-    data = series.checked_contributions(root, series.read_series(root, findings), findings)
+    names = bounded_series(root, findings, repairs)
+    data = series.read_contributions(root, findings)
+    if data is not None and len(data["contributions"]) > MAX_SERIES_ENTRIES:
+        raise DriftError(f"contribution entries exceed {MAX_SERIES_ENTRIES}")
+    data = series.checked_contributions(root, names, findings)
     if data is None or findings.errors:
         raise DriftError("; ".join(findings.errors) or f"{series.CONTRIBUTIONS} is unsound")
     return data["contributions"]
 
 
+def table_drift(root: Path, data: dict, original: bytes | None = None) -> list[str]:
+    """Compare the README block with the shared contribution table renderer."""
+    content = (root / "README.md").read_bytes() if original is None else original
+    block = series.readme_block(content.decode("utf-8"))
+    if block is None:
+        raise DriftError("README.md lacks one contribution table block")
+    if block != series.contributions_table(data):
+        return [f"README.md: contribution table differs from {series.CONTRIBUTIONS}"]
+    return []
+
+
 def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date | None) -> None:
     """Write repairs and the table together; restore original bytes on failure."""
-    if not repairs.lines:
-        return
+    repair_path_limit(len(repairs.originals))
+    repair_path_limit(len(repairs.files))
+    repair_path_limit(len(repairs.files.keys() | {root / series.CONTRIBUTIONS, root / "README.md"}))
     path = root / series.CONTRIBUTIONS
-    original = path.read_bytes()
+    original = repairs.originals[path]
     data = json.loads(original)
-    data["contributions"] = entries
-    data["checked"] = (today or datetime.now(UTC).date()).isoformat()
-    repairs.files[path] = (
-        json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n"
-    ).encode("utf-8")
-    originals = {path: path.read_bytes() for path in [*repairs.files, root / "README.md"]}
+    stale = table_drift(root, data, repairs.originals[root / "README.md"])
+    if not repairs.lines and not stale:
+        return
+    if repairs.lines:
+        data["contributions"] = entries
+        data["checked"] = (today or datetime.now(UTC).date()).isoformat()
+        repairs.files[path] = (
+            json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n"
+        ).encode("utf-8")
+    targets = repairs.files.keys() | {root / "README.md"}
+    if not targets <= repairs.originals.keys():
+        raise DriftError("repair target lacks an original snapshot")
+    for path, content in repairs.originals.items():
+        if path.read_bytes() != content:
+            raise DriftError(f"{path}: changed since read; no repairs written")
     try:
         for path, content in repairs.files.items():
             path.write_bytes(content)
         if series.contributions(root, write=True) != 0:
             raise DriftError("cannot regenerate the contribution table")
     except (OSError, DriftError, series.SeriesError):
-        for path, content in originals.items():
-            path.write_bytes(content)
+        for path in targets:
+            path.write_bytes(repairs.originals[path])
         raise
+    repairs.lines.extend(stale)
 
 
 def fix_drift(root: Path, fetch: Fetch, today: date | None) -> tuple[list[str], list[str]]:
     """Repair supported drift; return unfixed and fixed field diagnostics."""
     repairs = Repairs()
     try:
-        entries = recorded_entries(root)
+        for path in (root / series.CONTRIBUTIONS, root / "README.md"):
+            repairs.originals[path] = path.read_bytes()
+        entries = recorded_entries(root, repairs)
         repairs.lines.extend(drift(entries, fetch, fix=True))
         lines = patch_drift(root, fetch, repairs)
         write_repairs(root, entries, repairs, today)
@@ -266,7 +338,9 @@ def main(argv: list[str], fetch: Fetch = fetch_json, today: date | None = None) 
             entries = recorded_entries(args.root)
             lines = drift(entries, cached_fetch)
             lines.extend(patch_drift(args.root, cached_fetch))
-    except (DriftError, series.SeriesError) as exc:
+            data = json.loads((args.root / series.CONTRIBUTIONS).read_bytes())
+            lines.extend(table_drift(args.root, data))
+    except (DriftError, series.SeriesError, OSError, UnicodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     for line in fixed:

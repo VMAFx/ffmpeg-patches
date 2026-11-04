@@ -8,7 +8,7 @@ import contextlib
 import io
 import json
 import os
-import subprocess
+import subprocess  # nosec B404 - fixed bash workflow command with inert Git and a timeout.
 import sys
 import tempfile
 import unittest
@@ -17,6 +17,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import yaml
+
+from tests.test_subprocess_nosec import find_subprocess_imports_without_nosec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -657,6 +659,252 @@ class FixTest(unittest.TestCase):
         self.assertEqual((status, out), (2, ""))
         self.assertIn("README.md lacks one", err)
         self.assertEqual(self.snapshot(), before)
+
+    def test_fix_concurrent_edits_abort_before_any_write(self) -> None:
+        """Preserve intervening JSON, sidecar and README edits without any repair writes."""
+        self.master_form()
+        baseline = self.snapshot()
+        for target in (self.data_path, self.sidecar, self.readme):
+            with self.subTest(target=target):
+                for path, content in baseline.items():
+                    path.write_bytes(content)
+                changed = baseline[target] + b"\n"
+
+                def fetch(url: str, target: Path = target, changed: bytes = changed) -> dict:
+                    """Change a target after input reads, while the fake forge responds."""
+                    target.write_text(changed.decode())
+                    return pull(1, title="changed", head={"sha": "0" * 40})
+
+                with (
+                    patch.object(Path, "write_bytes") as write,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()) as err,
+                ):
+                    status = upstream_drift.main(["--root", str(self.root), "--fix"], fetch)
+                self.assertEqual(status, 2)
+                self.assertIn("changed since read", err.getvalue())
+                write.assert_not_called()
+                self.assertEqual(self.snapshot(), baseline | {target: changed})
+
+    def test_fix_deleted_target_aborts_before_any_write(self) -> None:
+        """A deleted README target aborts without overwriting other repair files."""
+        before = self.snapshot()
+
+        def fetch(url: str) -> dict:
+            """Remove a target between input reads and repair writes."""
+            self.readme.unlink()
+            return pull(1, title="changed")
+
+        with (
+            patch.object(Path, "write_bytes") as write,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            status = upstream_drift.main(["--root", str(self.root), "--fix"], fetch)
+        self.assertEqual(status, 2)
+        write.assert_not_called()
+        self.assertEqual(self.snapshot(), {p: b for p, b in before.items() if p != self.readme})
+
+    def test_fix_stale_table_without_forge_drift_preserves_data(self) -> None:
+        """Recover an interrupted table update without changing data or its checked date."""
+        expected = self.readme.read_bytes()
+        original_data = self.data_path.read_bytes()
+        self.readme.write_bytes(expected.replace(b"lib: change 1", b"obsolete title"))
+        status, out, err = self.fix(pull(1))
+        self.assertEqual((status, err), (0, ""))
+        self.assertIn("fixed: README.md: contribution table differs", out)
+        self.assertEqual(self.readme.read_bytes(), expected)
+        self.assertEqual(self.data_path.read_bytes(), original_data)
+        self.assertNotIn("fixed:", self.fix(pull(1))[1])
+
+    def test_plain_run_reports_stale_table_without_writing(self) -> None:
+        """Report a stale table on a plain run even when every forge field matches."""
+        self.readme.write_text(self.readme.read_text().replace("lib: change 1", "obsolete"))
+        before = self.snapshot()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = upstream_drift.main(["--root", str(self.root)], FakeForge({1: pull(1)}))
+        self.assertEqual((status, err.getvalue()), (1, ""))
+        self.assertIn("README.md: contribution table differs", out.getvalue())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_stale_table_missing_or_duplicate_markers_refuses_writes(self) -> None:
+        """Reject missing, duplicated or reversed table markers before any repair write."""
+        start, end = upstream_drift.series.TABLE_START, upstream_drift.series.TABLE_END
+        for text in ("# Missing", f"{start}\n{start}\n{end}", f"{end}\n{start}"):
+            with self.subTest(text=text):
+                self.readme.write_text(text)
+                before = self.snapshot()
+                status, out, err = self.fix(pull(1))
+                self.assertEqual((status, out), (2, ""))
+                self.assertIn("README.md lacks one", err)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_fix_quoted_master_form_keys(self) -> None:
+        """Repair bare, basic-quoted and literal-quoted TOML master-form keys."""
+        for key in ("master_form", '"master_form"', "'master_form'"):
+            with self.subTest(key=key):
+                self.master_form(f'{key} = {{ base = "{BASE}", head = "{COMMIT}" }}\n')
+                status, _, err = self.fix(pull(1, head={"sha": "0" * 40}))
+                self.assertEqual((status, err), (0, ""))
+                self.assertIn(
+                    f'{key} = {{ base = "{BASE}", head = "{"0" * 40}" }}',
+                    self.sidecar.read_text(),
+                )
+
+    def test_quoted_master_form_keeps_exactly_once_guard(self) -> None:
+        """Reject duplicated or escaped old SHAs for quoted master-form keys."""
+        escaped = COMMIT[:1] + "\\u0065" + COMMIT[2:]
+        for value, suffix in ((COMMIT, f" # {COMMIT}"), (escaped, "")):
+            with self.subTest(value=value):
+                self.master_form(
+                    f'"master_form" = {{ base = "{BASE}", head = "{value}" }}{suffix}\n'
+                )
+                before = self.snapshot()
+                status, out, err = self.fix(pull(1, head={"sha": "0" * 40}))
+                self.assertEqual((status, out), (2, ""))
+                self.assertIn("exactly once", err)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_series_entry_cap_boundary_passes(self) -> None:
+        """Accept a series exactly at the configured entry cap."""
+        with patch.object(upstream_drift, "MAX_SERIES_ENTRIES", 2):
+            self.assertEqual(self.fix(pull(1, title="changed"))[0], 0)
+
+    def test_series_entry_cap_refuses_before_metadata_or_forge_reads(self) -> None:
+        """Reject an oversized series before sidecar traversal or forge access."""
+        before = self.snapshot()
+        with (
+            patch.object(upstream_drift, "MAX_SERIES_ENTRIES", 1),
+            patch.object(upstream_drift.series, "note_metadata") as metadata,
+            patch.object(upstream_drift, "drift") as forge,
+        ):
+            status, out, err = self.fix(pull(1, title="changed"))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("exceeds 1 lines", err)
+        metadata.assert_not_called()
+        forge.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_contribution_entry_cap_refuses_before_forge_reads(self) -> None:
+        """Reject too many contribution records before comparison traversal."""
+        forge = FakeForge({1: pull(1)})
+        with (
+            patch.object(upstream_drift, "MAX_SERIES_ENTRIES", 1),
+            self.assertRaisesRegex(upstream_drift.DriftError, "contribution entries exceed 1"),
+        ):
+            upstream_drift.drift(self.data["contributions"] * 2, forge, fix=True)
+        self.assertEqual(forge.read, [])
+
+    def test_contribution_entry_cap_boundary_passes(self) -> None:
+        """Compare contribution records exactly at the configured entry cap."""
+        with patch.object(upstream_drift, "MAX_SERIES_ENTRIES", 1):
+            self.assertEqual(
+                upstream_drift.drift(self.data["contributions"], FakeForge({1: pull(1)})), []
+            )
+
+    def test_contribution_file_cap_refuses_before_record_validation(self) -> None:
+        """Reject an oversized contribution file before traversing its records."""
+        self.data["contributions"] *= 3
+        self.data_path.write_text(json.dumps(self.data))
+        before = self.snapshot()
+        with (
+            patch.object(upstream_drift, "MAX_SERIES_ENTRIES", 2),
+            patch.object(upstream_drift.series, "checked_contributions") as validate,
+        ):
+            status, out, err = self.fix(pull(1))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("contribution entries exceed 2", err)
+        validate.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_sidecar_line_cap_boundary_passes(self) -> None:
+        """Accept a sidecar exactly at the line cap and repair its master form."""
+        self.master_form()
+        limit = len(self.sidecar.read_bytes().splitlines())
+        with patch.object(upstream_drift, "MAX_SIDECAR_LINES", limit):
+            self.assertEqual(self.fix(pull(1, head={"sha": "0" * 40}))[0], 0)
+
+    def test_sidecar_line_cap_refuses_before_traversal_or_writes(self) -> None:
+        """Reject a sidecar one line over the cap before parsing or repair scans."""
+        self.master_form()
+        before = self.snapshot()
+        limit = len(self.sidecar.read_bytes().splitlines()) - 1
+        with patch.object(upstream_drift, "MAX_SIDECAR_LINES", limit):
+            status, out, err = self.fix(pull(1, head={"sha": "0" * 40}))
+            with self.assertRaisesRegex(upstream_drift.DriftError, f"exceeds {limit} lines"):
+                upstream_drift.master_form_fix(
+                    self.sidecar, {"base": BASE, "head": COMMIT}, pull(1, head={"sha": "0" * 40})
+                )
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn(f"exceeds {limit} lines", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_repair_path_cap_boundary_passes(self) -> None:
+        """Accept a snapshot set exactly at the repair-path cap."""
+        with patch.object(upstream_drift, "MAX_REPAIR_PATHS", 4):
+            self.assertEqual(self.fix(pull(1, title="changed"))[0], 0)
+
+    def test_repair_path_cap_refuses_before_filesystem_traversal(self) -> None:
+        """Reject oversized snapshot and target sets before reading or writing paths."""
+        originals = {
+            path: path.read_bytes() for path in (self.sidecar, self.data_path, self.readme)
+        }
+        sets = (
+            upstream_drift.Repairs(originals=originals),
+            upstream_drift.Repairs(
+                originals={path: data for path, data in originals.items() if path != self.sidecar},
+                files={self.sidecar: b""},
+                lines=["changed"],
+            ),
+        )
+        for repairs in sets:
+            with (
+                self.subTest(repairs=repairs),
+                patch.object(upstream_drift, "MAX_REPAIR_PATHS", 2),
+                patch.object(Path, "read_bytes") as read,
+                patch.object(Path, "write_bytes") as write,
+                self.assertRaisesRegex(upstream_drift.DriftError, "repair paths exceed 2"),
+            ):
+                upstream_drift.write_repairs(self.root, [], repairs, TODAY)
+            read.assert_not_called()
+            write.assert_not_called()
+
+    def test_fix_table_failure_after_writes_rolls_back(self) -> None:
+        """Restore all original target bytes when table generation fails after writes."""
+        self.master_form()
+        before = self.snapshot()
+        with patch.object(upstream_drift.series, "contributions", return_value=1):
+            status, out, err = self.fix(pull(1, title="changed", head={"sha": "0" * 40}))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("cannot regenerate", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_repair_target_without_snapshot_refuses_all_writes(self) -> None:
+        """Reject an unsnapshotted target before writing any prepared repair."""
+        repairs = upstream_drift.Repairs(
+            originals={
+                self.data_path: self.data_path.read_bytes(),
+                self.readme: self.readme.read_bytes(),
+            },
+            files={self.sidecar: b"replacement"},
+            lines=["changed"],
+        )
+        before = self.snapshot()
+        with self.assertRaisesRegex(upstream_drift.DriftError, "lacks an original snapshot"):
+            upstream_drift.write_repairs(self.root, self.data["contributions"], repairs, TODAY)
+        self.assertEqual(self.snapshot(), before)
+
+
+class ImportRationaleTest(unittest.TestCase):
+    """Check this module's suppression with positive and planted negative source."""
+
+    def test_subprocess_import_rationale_and_planted_omission(self) -> None:
+        """Accept the targeted B404 rationale and reject its planted omission."""
+        source = Path(__file__).read_text()
+        self.assertEqual(find_subprocess_imports_without_nosec(source), [])
+        planted = source.replace(source.splitlines()[10], "import subprocess")
+        self.assertEqual(find_subprocess_imports_without_nosec(planted), [11])
 
 
 class WorkflowTest(unittest.TestCase):
