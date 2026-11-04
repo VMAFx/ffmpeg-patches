@@ -204,8 +204,9 @@ prints one result per patch:
 
 The checks cover:
 
-- `make test`: series check, ruff, REUSE and the unit tests of
+- `make test`: series check, ruff, REUSE, mutable defaults and the unit tests of
   `scripts/series.py`
+- a mutable-default gate: pylint checks Python sources for `dangerous-default-value` (W0102) to catch mutable defaults bound to identifiers (a gap in ruff B006)
 - inside the series check: every patch with an upstream link has a record
   in `upstream-contributions.json` with a matching state, and the table in
   this file equals the one generated from the records. The check does not

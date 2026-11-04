@@ -18,7 +18,7 @@ running local verification. CI uses the version in `.python-version`.
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install ruff==0.16.8 reuse==6.2.0 numpy==2.5.4 pyyaml==6.0.3
+python3 -m pip install ruff==0.16.8 reuse==6.2.0 pylint==4.1.3 numpy==2.5.4 pyyaml==6.0.3
 ```
 
 ### Modernized NASA JPL Power-of-10 Rules

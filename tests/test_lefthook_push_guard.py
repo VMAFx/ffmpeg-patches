@@ -75,6 +75,7 @@ class LefthookPushGuardTest(unittest.TestCase):
         )
 
     def test_contributing_dependency_pins_match_ci(self) -> None:
+        """Dependency pins in CONTRIBUTING.md match CI installation step."""
         workflow = yaml.safe_load(
             (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
         )
@@ -82,7 +83,7 @@ class LefthookPushGuardTest(unittest.TestCase):
             step
             for job in workflow["jobs"].values()
             for step in job["steps"]
-            if step.get("name") == "Install ruff, reuse, numpy and PyYAML"
+            if step.get("name") == "Install ruff, reuse, pylint, numpy and PyYAML"
         ]
         self.assertEqual(len(install_steps), 1)
         prefix = "python3 -m pip install "
@@ -98,6 +99,28 @@ class LefthookPushGuardTest(unittest.TestCase):
         self.assertTrue(ci_pins)
         self.assertTrue(all("==" in pin for pin in ci_pins))
         self.assertEqual(set(documented_commands[0].removeprefix(prefix).split()), ci_pins)
+
+    def test_series_pylint_pin_matches_makefile(self) -> None:
+        """The series.yml workflow pylint pin matches PYLINT_VERSION in Makefile."""
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        match = re.search(r"^PYLINT_VERSION\s*:=\s*(\S+)", makefile, re.MULTILINE)
+        self.assertIsNotNone(match, "Makefile missing PYLINT_VERSION")
+        makefile_pin = f"pylint=={match.group(1)}"
+
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
+        )
+        install_steps = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("name") == "Install ruff, reuse, pylint, numpy and PyYAML"
+        ]
+        self.assertEqual(len(install_steps), 1)
+        prefix = "python3 -m pip install "
+        ci_command = install_steps[0]["run"]
+        ci_pins = set(ci_command.removeprefix(prefix).split())
+        self.assertIn(makefile_pin, ci_pins)
 
     def test_hook_jobs_never_interpolate_git_arguments(self) -> None:
         """No lefthook run/args field contains a {N} positional git-argument placeholder."""
