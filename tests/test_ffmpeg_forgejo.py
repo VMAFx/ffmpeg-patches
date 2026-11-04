@@ -1407,6 +1407,37 @@ class PullRequestReviewerTest(FairyRequestTestBase):
 
 
 class FairyRequestsTest(FairyRequestTestBase):
+    def test_pending_fairy_review_keeps_candidate_listed(self) -> None:
+        """A pending Fairy review without a submission cannot clear an overdue pull."""
+
+        stub = Stub()
+        pull = open_pull(number=2)
+        pull.update(created_at="2000-01-01T00:00:00Z", title="fixture", requested_reviewers=[])
+        stub.open_pulls = [pull]
+        stub.reviews[2] = [fairy_review("PENDING", submitted_at="")]
+        proc = self.run_command(stub, "fairy-requests")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        number, age, title = proc.stdout.strip().split("\t")
+        self.assertEqual(number, "2")
+        self.assertGreater(int(age), 15)
+        self.assertEqual(title, "fixture")
+
+    def test_submitted_configured_bot_reviews_clear_candidate(self) -> None:
+        """Multiple submitted reviews from the configured bot clear an overdue pull."""
+
+        stub = Stub()
+        pull = open_pull(number=2)
+        pull.update(created_at="2000-01-01T00:00:00Z", title="fixture", requested_reviewers=[])
+        stub.open_pulls = [pull]
+        stub.reviews[2] = [fairy_review(login="Other_Bot")] * 2
+        proc = self.run_command(
+            stub,
+            "fairy-requests",
+            env_updates={"FFMPEG_FORGEJO_BOT_REVIEWER": "Other_Bot"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
     def test_configured_repository_is_used_for_pulls_and_reviews(self) -> None:
         """The audit lists pulls and their reviews only in the configured repository."""
 

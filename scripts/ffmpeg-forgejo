@@ -358,7 +358,7 @@ for row in json.load(sys.stdin):
     print(number)' <<<"$out" || die "cannot parse own open pull numbers"
 }
 
-# fairy_review_summary: classify reviews JSON from stdin without accessing the API.
+# fairy_review_summary [LOGIN]: classify reviews JSON from stdin without accessing the API.
 fairy_review_summary() {
   python3 -c 'import json,re,sys
 from datetime import datetime
@@ -366,7 +366,7 @@ from datetime import datetime
 ALLOWED_STATES = {"APPROVED", "COMMENT", "REQUEST_CHANGES"}
 
 def summarize(reviews):
-    """Count submitted Fairy reviews and describe the newest submission.
+    """Count submitted reviews for the selected bot and describe the newest submission.
 
     Every review row must be a dict containing a state key (str or null).
     Rows without a state key, or rows that are not dicts, are malformed.
@@ -393,7 +393,7 @@ def summarize(reviews):
         if cid and re.fullmatch(r"[0-9a-fA-F]{40}", cid) is None:
             raise ValueError("invalid review commit_id")
     submitted = [row for row in reviews
-        if (row.get("user") or {}).get("login") == "Forgejo_Fairy"
+        if (row.get("user") or {}).get("login") == sys.argv[1]
         and row["state"] in ALLOWED_STATES
         and row.get("submitted_at")]
     if not submitted:
@@ -402,7 +402,7 @@ def summarize(reviews):
     commit = newest.get("commit_id") or ""
     return len(submitted), newest["state"], commit[:12] if commit else "-"
 
-print(*summarize(json.load(sys.stdin)), sep="\t")'
+print(*summarize(json.load(sys.stdin)), sep="\t")' "${1:-Forgejo_Fairy}"
 }
 
 # request_bot_review NUMBER: merge existing users with Fairy, POST, and verify read-back.
@@ -491,10 +491,8 @@ fairy_requests() {
   for row in "${candidates[@]}"; do
     number="${row%%$'\t'*}"
     reviews="$(api_list "/repos/$REPO/pulls/$number/reviews?")" || return 1
-    seen="$(python3 -c 'import json,sys
-print(int(any(row["user"]["login"] == sys.argv[1] for row in json.load(sys.stdin))))' \
-      "$BOT_REVIEWER" <<<"$reviews")" || return 1
-    [ "$seen" = 1 ] || results+=("$row")
+    seen="$(fairy_review_summary "$BOT_REVIEWER" <<<"$reviews")" || return 1
+    [ "${seen%%$'\t'*}" -gt 0 ] || results+=("$row")
   done
   [ "${#results[@]}" -gt 0 ] || return 0
   printf '%s\n' "${results[@]}"
