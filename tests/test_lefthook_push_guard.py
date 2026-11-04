@@ -15,7 +15,20 @@ from unittest.mock import patch
 
 import yaml
 
+from scripts.lint_mutable_defaults import PYLINT_VERSION
+
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _series_install_steps(root: Path) -> list[dict]:
+    """Load the series workflow and find its pinned dependency installation step."""
+    workflow = yaml.safe_load((root / ".github/workflows/series.yml").read_text(encoding="utf-8"))
+    return [
+        step
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        if step.get("name") == "Install ruff, reuse, pylint, numpy and PyYAML"
+    ]
 
 
 def run_with_fixture(method: str, files: dict[str, str]) -> unittest.TestResult:
@@ -75,15 +88,8 @@ class LefthookPushGuardTest(unittest.TestCase):
         )
 
     def test_contributing_dependency_pins_match_ci(self) -> None:
-        workflow = yaml.safe_load(
-            (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
-        )
-        install_steps = [
-            step
-            for job in workflow["jobs"].values()
-            for step in job["steps"]
-            if step.get("name") == "Install ruff, reuse, numpy and PyYAML"
-        ]
+        """Dependency pins in CONTRIBUTING.md match CI installation step."""
+        install_steps = _series_install_steps(ROOT)
         self.assertEqual(len(install_steps), 1)
         prefix = "python3 -m pip install "
         ci_command = install_steps[0]["run"]
@@ -98,6 +104,15 @@ class LefthookPushGuardTest(unittest.TestCase):
         self.assertTrue(ci_pins)
         self.assertTrue(all("==" in pin for pin in ci_pins))
         self.assertEqual(set(documented_commands[0].removeprefix(prefix).split()), ci_pins)
+
+    def test_series_pylint_pin_matches_script(self) -> None:
+        """The series.yml workflow Pylint pin matches the gate's PYLINT_VERSION."""
+        install_steps = _series_install_steps(ROOT)
+        self.assertEqual(len(install_steps), 1)
+        prefix = "python3 -m pip install "
+        ci_command = install_steps[0]["run"]
+        ci_pins = set(ci_command.removeprefix(prefix).split())
+        self.assertIn(f"pylint=={PYLINT_VERSION}", ci_pins)
 
     def test_hook_jobs_never_interpolate_git_arguments(self) -> None:
         """No lefthook run/args field contains a {N} positional git-argument placeholder."""
