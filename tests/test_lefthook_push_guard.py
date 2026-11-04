@@ -19,6 +19,7 @@ import yaml
 from scripts.lint_mutable_defaults import PYLINT_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
+SERIES_INSTALL_COMMAND = "python3 -m pip install --require-hashes -r requirements-dev.txt"
 
 
 def _series_steps(root: Path) -> list[dict]:
@@ -27,13 +28,40 @@ def _series_steps(root: Path) -> list[dict]:
     return [step for job in workflow["jobs"].values() for step in job["steps"]]
 
 
-def _series_install_steps(root: Path) -> list[dict]:
-    """Find the series workflow's pinned dependency installation step."""
+def _series_install_steps(workflow: dict) -> list[dict]:
+    """Find all pinned dependency installation steps in the series workflow."""
     return [
         step
-        for step in _series_steps(root)
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
         if step.get("name") == "Install the pinned development tools"
     ]
+
+
+def _series_install_findings(workflow: dict) -> list[str]:
+    """Require pinned installs before each job's dependency-consuming steps."""
+    install_steps = _series_install_steps(workflow)
+    findings = [] if install_steps else ["workflow has no pinned development tools install"]
+    for step in install_steps:
+        if step.get("run") != SERIES_INSTALL_COMMAND:
+            findings.append("install step must run the pinned command")
+    for job_name, job in workflow["jobs"].items():
+        installed = False
+        for step in job.get("steps", []):
+            command = step.get("run", "")
+            for line in command.splitlines():
+                if (
+                    line.strip().startswith("python3 -m pip install ")
+                    and line.strip() != SERIES_INSTALL_COMMAND
+                ):
+                    findings.append(f"{job_name}: pip install must use the pinned command")
+            if not installed and re.search(
+                r"\bscripts/series\.py\s+lengths\b|\bmake\s+test\b", command
+            ):
+                findings.append(f"{job_name}: install pinned development tools before {command}")
+            if step in install_steps and command == SERIES_INSTALL_COMMAND:
+                installed = True
+    return findings
 
 
 def _normalize_package_name(name: str) -> str:
@@ -149,34 +177,85 @@ class LefthookPushGuardTest(unittest.TestCase):
         )
 
     def test_contributing_dependency_pins_match_ci(self) -> None:
-        """CI and contributor instructions use exactly one hashed lockfile install."""
-        install_steps = _series_install_steps(ROOT)
-        self.assertEqual(len(install_steps), 1)
+        """CI jobs install the documented hashed lockfile before consuming dependencies."""
+        workflow = yaml.safe_load((ROOT / ".github/workflows/series.yml").read_text("utf-8"))
+        self.assertEqual(_series_install_findings(workflow), [])
         prefix = "python3 -m pip install "
-        expected = f"{prefix}--require-hashes -r requirements-dev.txt"
-        self.assertEqual(install_steps[0]["run"], expected)
-        ci_commands = [
-            line.strip()
-            for step in _series_steps(ROOT)
-            for line in step.get("run", "").splitlines()
-            if line.strip().startswith(prefix)
-        ]
-        self.assertEqual(ci_commands, [expected])
         documented_commands = [
             line
             for line in (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8").splitlines()
             if line.startswith(prefix)
         ]
-        self.assertEqual(documented_commands, [expected])
+        self.assertEqual(documented_commands, [SERIES_INSTALL_COMMAND])
+
+    def test_planted_missing_or_late_job_install_is_refused(self) -> None:
+        """Reject missing or late installs even when another job installs dependencies."""
+        install = {
+            "name": "Install the pinned development tools",
+            "run": SERIES_INSTALL_COMMAND,
+        }
+        for command in ("python3 scripts/series.py lengths ffmpeg", "make test"):
+            for steps in ([{"run": command}], [{"run": command}, install]):
+                with self.subTest(command=command, steps=steps):
+                    workflow = {
+                        "jobs": {
+                            "check": {"steps": [install, {"run": "make test"}]},
+                            "apply-build": {"steps": steps},
+                        }
+                    }
+                    self.assertEqual(
+                        _series_install_findings(workflow),
+                        [f"apply-build: install pinned development tools before {command}"],
+                    )
+
+    def test_planted_second_install_command_drift_is_refused(self) -> None:
+        """Reject any named install step whose command differs from the pinned install."""
+        for command in (SERIES_INSTALL_COMMAND + " --no-deps", "echo skipped install"):
+            with self.subTest(command=command):
+                workflow = {
+                    "jobs": {
+                        "check": {
+                            "steps": [
+                                {
+                                    "name": "Install the pinned development tools",
+                                    "run": SERIES_INSTALL_COMMAND,
+                                },
+                                {"name": "Install the pinned development tools", "run": command},
+                            ]
+                        }
+                    }
+                }
+                self.assertIn(
+                    "install step must run the pinned command", _series_install_findings(workflow)
+                )
+
+    def test_job_without_dependency_consumers_needs_no_install(self) -> None:
+        """Allow jobs without lengths or make test to omit dependency installation."""
+        workflow = {
+            "jobs": {
+                "check": {
+                    "steps": [
+                        {
+                            "name": "Install the pinned development tools",
+                            "run": SERIES_INSTALL_COMMAND,
+                        },
+                        {"run": "make test"},
+                    ]
+                },
+                "other": {"steps": [{"run": "echo no dependencies"}]},
+                "reusable": {"uses": "./.github/workflows/reuse.yml"},
+            }
+        }
+        self.assertEqual(_series_install_findings(workflow), [])
 
     def test_planted_install_command_drift_is_refused(self) -> None:
-        """Reject altered or duplicate installation commands in CI and documentation."""
+        """Reject altered installation commands in CI and altered or duplicate documentation."""
         expected = "python3 -m pip install --require-hashes -r requirements-dev.txt"
         for commands, document in (
             ([expected + " --no-deps"], expected),
             ([expected], expected + " --no-deps"),
             ([expected], expected + "\n" + expected),
-            ([expected, expected], expected),
+            ([expected, expected + " --no-deps"], expected),
         ):
             with self.subTest(commands=commands, document=document):
                 steps = [

@@ -104,6 +104,26 @@ reason = "upstream function, 133 lines before the patch; the change inside it is
 
 [[exceptions]]
 rule = "HISS-04"
+path = "libavcodec/tests/cabac.c"
+function = "main"
+lines = 61
+category = "D"
+entered = "2026-11-04"
+expires = "2027-03-04"
+reason = "the patch takes the upstream function from 52 to 61 lines; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavcodec/tests/snowenc.c"
+function = "main"
+lines = 126
+category = "D"
+entered = "2026-11-04"
+expires = "2027-03-04"
+reason = "upstream function, 124 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
 path = "libavcodec/wmadec.c"
 function = "wma_decode_block"
 lines = 347
@@ -115,7 +135,7 @@ reason = "upstream function, 344 lines before the patch; the change inside it is
 [[exceptions]]
 rule = "HISS-04"
 path = "libavfilter/median_template.c"
-function = "fn"
+function = "fn(filter_plane)"
 lines = 112
 category = "D"
 entered = "2026-10-18"
@@ -141,6 +161,16 @@ category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
 reason = "upstream function, 88 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libavformat/dashenc.c"
+function = "write_hls_media_playlist"
+lines = 82
+category = "D"
+entered = "2026-11-04"
+expires = "2027-03-04"
+reason = "upstream function, 78 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -221,6 +251,16 @@ category = "D"
 entered = "2026-10-18"
 expires = "2027-02-15"
 reason = "upstream function, 83 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
+
+[[exceptions]]
+rule = "HISS-04"
+path = "libswresample/tests/swresample.c"
+function = "main"
+lines = 208
+category = "D"
+entered = "2026-11-04"
+expires = "2027-03-04"
+reason = "upstream function, 184 lines before the patch; the change inside it is part of the FFmpeg pull requests split from PR 25111, and splitting the function would change that form"
 
 [[exceptions]]
 rule = "HISS-04"
