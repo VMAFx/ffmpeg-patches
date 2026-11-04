@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -66,6 +67,18 @@ def _hashed_lock_pins(content: str) -> set[tuple[str, str]]:
             re.MULTILINE,
         )
     }
+
+
+def _pylint_custom_manager(config: dict) -> dict:
+    """Require exactly one regex manager for the Pylint script pin."""
+    managers = [
+        manager
+        for manager in config.get("customManagers", [])
+        if manager.get("customType") == "regex" and manager.get("depNameTemplate") == "pylint"
+    ]
+    if len(managers) != 1:
+        raise AssertionError("expected exactly one Pylint regex manager")
+    return managers[0]
 
 
 def run_with_fixture(method: str, files: dict[str, str]) -> unittest.TestResult:
@@ -179,6 +192,44 @@ class LefthookPushGuardTest(unittest.TestCase):
         """The development Pylint pin matches the gate's PYLINT_VERSION."""
         pins = _development_pins((ROOT / "requirements-dev.in").read_text(encoding="utf-8"))
         self.assertIn(("pylint", PYLINT_VERSION), pins)
+
+    def test_renovate_pylint_manager_matches_script(self) -> None:
+        """Renovate discovers the script pin exactly once with its current version."""
+        config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+        manager = _pylint_custom_manager(config)
+        self.assertEqual(manager["datasourceTemplate"], "pypi")
+        self.assertEqual(len(manager["managerFilePatterns"]), 1)
+        script = "scripts/lint_mutable_defaults.py"
+        self.assertRegex(script, manager["managerFilePatterns"][0].strip("/"))
+        self.assertEqual(len(manager["matchStrings"]), 1)
+        pattern = re.sub(r"\(\?<([A-Za-z_][A-Za-z_0-9]*)>", r"(?P<\1>", manager["matchStrings"][0])
+        matches = list(re.finditer(pattern, (ROOT / script).read_text(encoding="utf-8")))
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].group("currentValue"), PYLINT_VERSION)
+
+    def test_renovate_groups_pylint_updates(self) -> None:
+        """Renovate groups the Pylint script pin and development lock updates."""
+        config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+        self.assertEqual(_pylint_custom_manager(config)["depNameTemplate"], "pylint")
+        self.assertTrue(
+            any(
+                rule.get("matchPackageNames") == ["pylint"] and rule.get("groupName") == "pylint"
+                for rule in config["packageRules"]
+            )
+        )
+
+    def test_planted_renovate_pylint_omissions_are_refused(self) -> None:
+        """Reject a missing Pylint manager or package grouping rule."""
+        config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+        without_manager = {key: value for key, value in config.items() if key != "customManagers"}
+        with self.assertRaisesRegex(AssertionError, "exactly one Pylint regex manager"):
+            _pylint_custom_manager(without_manager)
+        without_group = dict(config, packageRules=[])
+        result = run_with_fixture(
+            "test_renovate_groups_pylint_updates", {"renovate.json": json.dumps(without_group)}
+        )
+        self.assertEqual(len(result.failures), 1)
+        self.assertFalse(result.errors)
 
     def test_development_lock_matches_input_pins(self) -> None:
         """Every development input pin has the same version and hashes in the lockfile."""
