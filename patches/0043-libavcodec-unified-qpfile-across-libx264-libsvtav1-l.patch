@@ -14,12 +14,12 @@ Offsets are x264 QP units. SVT-AV1 seg_qp and libaom delta_q are AV1 qindex delt
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
  libavcodec/Makefile        |   4 +-
- libavcodec/libaomenc.c     | 240 ++++++++++++++++++++++++++
- libavcodec/libsvtav1.c     | 329 +++++++++++++++++++++++++++++++++++
- libavcodec/libx264.c       |  73 ++++++++
- libavcodec/qpfile_parser.c | 343 +++++++++++++++++++++++++++++++++++++
- libavcodec/qpfile_parser.h |  61 +++++++
- 6 files changed, 1049 insertions(+), 1 deletion(-)
+ libavcodec/libaomenc.c     | 250 +++++++++++++++++++++++++
+ libavcodec/libsvtav1.c     | 339 ++++++++++++++++++++++++++++++++++
+ libavcodec/libx264.c       |  69 +++++++
+ libavcodec/qpfile_parser.c | 363 +++++++++++++++++++++++++++++++++++++
+ libavcodec/qpfile_parser.h |  63 +++++++
+ 6 files changed, 1087 insertions(+), 1 deletion(-)
  create mode 100644 libavcodec/qpfile_parser.c
  create mode 100644 libavcodec/qpfile_parser.h
 
@@ -39,7 +39,7 @@ index 95ba308504d2c022a94293cafbb510e7d20e673c..00d07477384157b4fe715ae22847d707
  OBJS-$(CONFIG_LIBXAVS_ENCODER)            += libxavs.o
  OBJS-$(CONFIG_LIBXAVS2_ENCODER)           += libxavs2.o
 diff --git a/libavcodec/libaomenc.c b/libavcodec/libaomenc.c
-index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..cfb1070518192bb5d727b5032576966fc24a83e3 100644
+index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..44bf61c1cef545f6c9552323777cb3f8de2e123b 100644
 --- a/libavcodec/libaomenc.c
 +++ b/libavcodec/libaomenc.c
 @@ -50,6 +50,10 @@
@@ -112,7 +112,29 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..cfb1070518192bb5d727b5032576966f
      av_freep(&ctx->twopass_stats.buf);
      av_freep(&avctx->stats_out);
      free_frame_list(ctx->coded_frame_list);
-@@ -1042,6 +1084,46 @@ static av_cold int aom_init(AVCodecContext *avctx,
+@@ -795,6 +837,21 @@ static const struct {
+     { AV1E_SET_ENABLE_SMOOTH_INTERINTRA,  OFFSET(enable_smooth_interintra) },
+ };
+ 
++static av_cold int load_qpfile(AVCodecContext *avctx)
++{
++    AOMContext *ctx = avctx->priv_data;
++    int ret = ff_qpfile_load(ctx->qpfile_path, &ctx->qpfile);
++
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR, "libaom: qpfile=%s parse failed (%d).\n",
++               ctx->qpfile_path, ret);
++        return ret;
++    }
++    ctx->qpfile_loaded = 1;
++    return ff_qpfile_check_grid(avctx, "libaom", &ctx->qpfile,
++                                avctx->width, avctx->height);
++}
++
+ static av_cold int aom_init(AVCodecContext *avctx,
+                             const struct aom_codec_iface *iface)
+ {
+@@ -1042,6 +1099,41 @@ static av_cold int aom_init(AVCodecContext *avctx,
      }
  #endif
  
@@ -129,13 +151,8 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..cfb1070518192bb5d727b5032576966f
 +                   "-cpu-used 7 or 8; libaom ignores ROI maps otherwise.\n");
 +            return AVERROR(EINVAL);
 +        }
-+        int qret = ff_qpfile_load(ctx->qpfile_path, &ctx->qpfile);
-+        if (qret < 0) {
-+            av_log(avctx, AV_LOG_ERROR, "libaom: qpfile=%s parse failed (%d).\n",
-+                   ctx->qpfile_path, qret);
-+            return qret;
-+        }
-+        ctx->qpfile_loaded = 1;
++        if ((res = load_qpfile(avctx)) < 0)
++            return res;
 +        /* libaom's segmentation map is sized at the mode-info grid:
 +         * size_in_mi(x) == ALIGN_POWER_OF_TWO(x, 3) >> MI_SIZE_LOG2,
 +         * i.e. each dim aligned up to a multiple of 8 px and divided
@@ -159,7 +176,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..cfb1070518192bb5d727b5032576966f
      // provide dummy value to initialize wrapper, values will be updated each _encode()
      aom_img_wrap(&ctx->rawimg, img_fmt, avctx->width, avctx->height, 1,
                   (unsigned char*)1);
-@@ -1301,6 +1383,157 @@ static enum AVPixelFormat aomfmt_to_pixfmt(struct aom_image *img)
+@@ -1301,6 +1393,157 @@ static enum AVPixelFormat aomfmt_to_pixfmt(struct aom_image *img)
      return AV_PIX_FMT_NONE;
  }
  
@@ -317,7 +334,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..cfb1070518192bb5d727b5032576966f
  static int aom_encode(AVCodecContext *avctx, AVPacket *pkt,
                        const AVFrame *frame, int *got_packet)
  {
-@@ -1375,6 +1608,12 @@ static int aom_encode(AVCodecContext *avctx, AVPacket *pkt,
+@@ -1375,6 +1618,12 @@ static int aom_encode(AVCodecContext *avctx, AVPacket *pkt,
              return res;
      }
  
@@ -330,7 +347,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..cfb1070518192bb5d727b5032576966f
      res = aom_codec_encode(&ctx->encoder, rawimg, timestamp, duration, flags);
      if (res != AOM_CODEC_OK) {
          log_encoder_error(avctx, "Error encoding frame");
-@@ -1568,6 +1807,7 @@ static const AVOption options[] = {
+@@ -1568,6 +1817,7 @@ static const AVOption options[] = {
      { "tune",            "The metric that the encoder tunes for. Automatically chosen by the encoder by default", OFFSET(tune), AV_OPT_TYPE_INT, {.i64 = -1}, -1, AOM_TUNE_SSIM, VE, .unit = "tune"},
      { "psnr",            NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_PSNR}, 0, 0, VE, .unit = "tune"},
      { "ssim",            NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_SSIM}, 0, 0, VE, .unit = "tune"},
@@ -339,7 +356,7 @@ index 7cabea30034bc9f232d496d8cdf5bd0ad28adf75..cfb1070518192bb5d727b5032576966f
      { "still-picture", "Encode in single frame mode (typically used for still AVIF images).", OFFSET(still_picture), AV_OPT_TYPE_BOOL, {.i64 = 0}, -1, 1, VE },
      { "dolbyvision",     "Enable Dolby Vision RPU coding", OFFSET(dovi.enable), AV_OPT_TYPE_BOOL, {.i64 = FF_DOVI_AUTOMATIC }, -1, 1, VE, .unit = "dovi" },
 diff --git a/libavcodec/libsvtav1.c b/libavcodec/libsvtav1.c
-index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787cc608e851 100644
+index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..8a56ad948150558281384613009ca75143eb634b 100644
 --- a/libavcodec/libsvtav1.c
 +++ b/libavcodec/libsvtav1.c
 @@ -20,6 +20,8 @@
@@ -359,7 +376,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
  
  typedef enum eos_status {
      EOS_NOT_REACHED = 0,
-@@ -75,6 +78,32 @@ typedef struct SvtContext {
+@@ -75,6 +78,31 @@ typedef struct SvtContext {
      int enc_mode;
      int crf;
      int qp;
@@ -370,8 +387,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
 +     * eb_send_frame(), released in eb_enc_close().
 +     * The ROI bridge requires the versioned ROI ABI and is
 +     * gated on the SVT-AV1 1.6.0+ ROI ABI (enable_roi_map flag and
-+     * the ROI_MAP_EVENT priv-data type); on older releases the
-+     * adapter falls back to log-and-continue.
++     * the ROI_MAP_EVENT priv-data type); older releases reject qpfile.
 +     *
 +     * roi_evts / roi_seg_maps are heap-owned arrays parallel to
 +     * qpfile.frames; SVT-AV1 keeps the ROI-map pointer alive across
@@ -392,7 +408,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
  } SvtContext;
  
  static const struct {
-@@ -482,6 +511,10 @@ static int read_in_data(EbSvtAv1EncConfiguration *param, const AVFrame *frame,
+@@ -482,6 +510,25 @@ static int read_in_data(EbSvtAv1EncConfiguration *param, const AVFrame *frame,
      return 0;
  }
  
@@ -400,21 +416,31 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
 +static int build_all_roi_evts(AVCodecContext *avctx, SvtContext *svt_enc);
 +#endif
 +
++static av_cold int load_qpfile(AVCodecContext *avctx)
++{
++    SvtContext *svt_enc = avctx->priv_data;
++    int ret = ff_qpfile_load(svt_enc->qpfile_path, &svt_enc->qpfile);
++
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR, "libsvtav1: qpfile=%s parse failed (%d).\n",
++               svt_enc->qpfile_path, ret);
++        return ret;
++    }
++    svt_enc->qpfile_loaded = 1;
++    return ff_qpfile_check_grid(avctx, "libsvtav1", &svt_enc->qpfile,
++                                avctx->width, avctx->height);
++}
++
  static av_cold int eb_enc_init(AVCodecContext *avctx)
  {
      SvtContext   *svt_enc = avctx->priv_data;
-@@ -505,11 +538,47 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
+@@ -505,11 +552,43 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
          return ret;
      }
  
 +    if (svt_enc->qpfile_path && *svt_enc->qpfile_path) {
-+        int qret = ff_qpfile_load(svt_enc->qpfile_path, &svt_enc->qpfile);
-+        if (qret < 0) {
-+            av_log(avctx, AV_LOG_ERROR, "libsvtav1: qpfile=%s parse failed (%d).\n",
-+                   svt_enc->qpfile_path, qret);
-+            return qret;
-+        }
-+        svt_enc->qpfile_loaded = 1;
++        if ((ret = load_qpfile(avctx)) < 0)
++            return ret;
 +#if SVT_AV1_CHECK_VERSION(1, 6, 0)
 +        /* Build all per-frame ROI map events upfront. SVT-AV1 reads
 +         * ROI_MAP_EVENT data via shallow-copied pointers on async
@@ -423,9 +449,9 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
 +         * before set_parameter so the encoder allocates segmentation
 +         * state.
 +         */
-+        qret = build_all_roi_evts(avctx, svt_enc);
-+        if (qret < 0)
-+            return qret;
++        ret = build_all_roi_evts(avctx, svt_enc);
++        if (ret < 0)
++            return ret;
 +        svt_enc->enc_params.enable_roi_map = true;
 +        av_log(avctx, AV_LOG_INFO,
 +               "libsvtav1: qpfile=%s loaded (frames=%u, %ux%u qpfile blocks "
@@ -434,11 +460,12 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
 +               svt_enc->qpfile.block_cols, svt_enc->qpfile.block_rows,
 +               svt_enc->roi_b64_cols, svt_enc->roi_b64_rows);
 +#else
-+        av_log(avctx, AV_LOG_WARNING,
++        av_log(avctx, AV_LOG_ERROR,
 +               "libsvtav1: qpfile=%s parsed but SVT-AV1 < 1.6.0 lacks the "
-+               "ROI ABI; encoding without ROI bias. Upgrade SVT-AV1 to "
++               "ROI ABI. Upgrade SVT-AV1 to "
 +               "activate the bridge.\n",
 +               svt_enc->qpfile_path);
++        return AVERROR(ENOSYS);
 +#endif
 +    }
 +
@@ -451,7 +478,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
      svt_ret = svt_av1_enc_init(svt_enc->svt_handle);
      if (svt_ret != EB_ErrorNone) {
          return svt_print_error(avctx, svt_ret, "Error initializing encoder");
-@@ -551,6 +620,216 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
+@@ -551,6 +630,216 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
      return alloc_buffer(&svt_enc->enc_params, svt_enc);
  }
  
@@ -668,7 +695,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
  static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
  {
      SvtContext           *svt_enc = avctx->priv_data;
-@@ -613,8 +892,40 @@ static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
+@@ -613,8 +902,40 @@ static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
          return AVERROR_INVALIDDATA;
      }
  
@@ -709,7 +736,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
      if (svt_ret != EB_ErrorNone)
          return svt_print_error(avctx, svt_ret, "Error sending a frame to encoder");
  
-@@ -784,6 +1095,23 @@ static av_cold int eb_enc_close(AVCodecContext *avctx)
+@@ -784,6 +1105,23 @@ static av_cold int eb_enc_close(AVCodecContext *avctx)
      ff_dovi_ctx_unref(&svt_enc->dovi);
      av_freep(&svt_enc->stats_buf);
  
@@ -733,7 +760,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
      return 0;
  }
  
-@@ -828,6 +1156,7 @@ static const AVOption options[] = {
+@@ -828,6 +1166,7 @@ static const AVOption options[] = {
      { "qp", "Initial Quantizer level value", OFFSET(qp),
        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 63, VE },
      { "svtav1-params", "Set the SVT-AV1 configuration using a :-separated list of key=value parameters", OFFSET(svtav1_opts), AV_OPT_TYPE_DICT, { 0 }, 0, 0, VE },
@@ -742,7 +769,7 @@ index 0bcc176243d4a810f8c3b0885928dd3c8a97b0d5..94e5ed6e34c0efc8e67134c6b817787c
      { "dolbyvision", "Enable Dolby Vision RPU coding", OFFSET(dovi.enable), AV_OPT_TYPE_BOOL, {.i64 = FF_DOVI_AUTOMATIC }, -1, 1, VE, .unit = "dovi" },
      {   "auto", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = FF_DOVI_AUTOMATIC}, .flags = VE, .unit = "dovi" },
 diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
-index b688d4f3218414b4b572438c455625f7e4ce8e72..2936b93f2a64755bab576268b52a5c3670d69528 100644
+index b688d4f3218414b4b572438c455625f7e4ce8e72..9ea127dd3565c45a33846a6385639ffa47c5a4e3 100644
 --- a/libavcodec/libx264.c
 +++ b/libavcodec/libx264.c
 @@ -39,6 +39,8 @@
@@ -823,7 +850,7 @@ index b688d4f3218414b4b572438c455625f7e4ce8e72..2936b93f2a64755bab576268b52a5c36
  
      for (int i = 0; i < x4->nb_reordered_opaque; i++)
          opaque_uninit(&x4->reordered_opaque[i]);
-@@ -1395,6 +1438,35 @@ static av_cold int X264_init(AVCodecContext *avctx)
+@@ -1395,6 +1438,31 @@ static av_cold int X264_init(AVCodecContext *avctx)
  
      x4->params.analyse.b_mb_info = x4->mb_info;
  
@@ -844,13 +871,9 @@ index b688d4f3218414b4b572438c455625f7e4ce8e72..2936b93f2a64755bab576268b52a5c36
 +                   "x264 applies per-macroblock offsets through it.\n");
 +            return AVERROR(EINVAL);
 +        }
-+        if (x4->qpf.block_cols != mbx || x4->qpf.block_rows != mby) {
-+            av_log(avctx, AV_LOG_ERROR,
-+                   "libx264: the qpfile has %ux%u blocks per frame, the %dx%d video has %ux%u "
-+                   "macroblocks.\n", x4->qpf.block_cols, x4->qpf.block_rows, avctx->width,
-+                   avctx->height, mbx, mby);
-+            return AVERROR(EINVAL);
-+        }
++        if ((ret = ff_qpfile_check_grid(avctx, "libx264", &x4->qpf,
++                                        avctx->width, avctx->height)) < 0)
++            return ret;
 +        av_log(avctx, AV_LOG_INFO, "libx264: qpfile=%s loaded (%u frames, %ux%u macroblocks); "
 +               "offsets applied as quant_offsets.\n", x4->qpfile_path, x4->qpf.frame_count,
 +               mbx, mby);
@@ -859,7 +882,7 @@ index b688d4f3218414b4b572438c455625f7e4ce8e72..2936b93f2a64755bab576268b52a5c36
      // update AVCodecContext with x264 parameters
      avctx->has_b_frames = x4->params.i_bframe ?
          x4->params.i_bframe_pyramid ? 2 : 1 : 0;
-@@ -1570,6 +1642,7 @@ static const AVOption options[] = {
+@@ -1570,6 +1638,7 @@ static const AVOption options[] = {
      { "udu_sei",      "Use user data unregistered SEI if available",      OFFSET(udu_sei),  AV_OPT_TYPE_BOOL,   { .i64 = 0 }, 0, 1, VE },
      { "x264-params",  "Override the x264 configuration using a :-separated list of key=value parameters", OFFSET(x264_params), AV_OPT_TYPE_DICT, { 0 }, 0, 0, VE },
      { "mb_info",      "Set mb_info data through AVSideData, only useful when used from the API", OFFSET(mb_info), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
@@ -869,10 +892,10 @@ index b688d4f3218414b4b572438c455625f7e4ce8e72..2936b93f2a64755bab576268b52a5c36
  
 diff --git a/libavcodec/qpfile_parser.c b/libavcodec/qpfile_parser.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..bdb70056ddf402ff1594f54dd1810b1c79e49739
+index 0000000000000000000000000000000000000000..85cea712bf93999a22ff5e4d624dc88fed0e8132
 --- /dev/null
 +++ b/libavcodec/qpfile_parser.c
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,363 @@
 +/*
 + * Copyright 2026 Lusoris
 + *
@@ -1189,6 +1212,22 @@ index 0000000000000000000000000000000000000000..bdb70056ddf402ff1594f54dd1810b1c
 +    return ret;
 +}
 +
++int ff_qpfile_check_grid(void *log_ctx, const char *encoder, const FFQpFile *qf,
++                         int width, int height)
++{
++    const unsigned mbx = (width  + 15) / 16;
++    const unsigned mby = (height + 15) / 16;
++
++    if (qf->block_cols != mbx || qf->block_rows != mby) {
++        av_log(log_ctx, AV_LOG_ERROR,
++               "%s: the qpfile has %ux%u blocks per frame, the %dx%d video has %ux%u "
++               "macroblocks.\n", encoder, qf->block_cols, qf->block_rows,
++               width, height, mbx, mby);
++        return AVERROR(EINVAL);
++    }
++    return 0;
++}
++
 +void ff_qpfile_free(FFQpFile *qpf)
 +{
 +    if (!qpf) return;
@@ -1205,23 +1244,27 @@ index 0000000000000000000000000000000000000000..bdb70056ddf402ff1594f54dd1810b1c
 +const FFQpFrame *ff_qpfile_frame_for_index(const FFQpFile *qf,
 +                                           unsigned frame_index)
 +{
-+    const FFQpFrame *match = NULL;
++    unsigned low = 0, high;
 +
-+    if (!qf)
++    if (!qf || !qf->frame_count)
 +        return NULL;
-+    for (unsigned i = 0; i < qf->frame_count; i++) {
-+        if (qf->frames[i].frame_index > frame_index)
-+            break;
-+        match = &qf->frames[i];
++    high = qf->frame_count;
++    while (low < high) {
++        unsigned mid = low + (high - low) / 2;
++
++        if (qf->frames[mid].frame_index <= frame_index)
++            low = mid + 1;
++        else
++            high = mid;
 +    }
-+    return match;
++    return low ? &qf->frames[low - 1] : NULL;
 +}
 diff --git a/libavcodec/qpfile_parser.h b/libavcodec/qpfile_parser.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ee25f176691bf7db87a49248b183dfb8a5d72ec7
+index 0000000000000000000000000000000000000000..cc521464b2b389343cb159632ea93e4df65c20be
 --- /dev/null
 +++ b/libavcodec/qpfile_parser.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,63 @@
 +/*
 + * Copyright 2026 Lusoris
 + *
@@ -1278,6 +1321,8 @@ index 0000000000000000000000000000000000000000..ee25f176691bf7db87a49248b183dfb8
 +} FFQpFile;
 +
 +int  ff_qpfile_load(const char *path, FFQpFile *out);
++int ff_qpfile_check_grid(void *log_ctx, const char *encoder, const FFQpFile *qf,
++                         int width, int height);
 +void ff_qpfile_free(FFQpFile *qpf);
 +const FFQpFrame *ff_qpfile_frame_for_index(const FFQpFile *qf,
 +                                           unsigned frame_index);
