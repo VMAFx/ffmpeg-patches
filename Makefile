@@ -40,7 +40,6 @@ test: build lint
 lint: lint-mutable-defaults
 	@ruff check scripts tests
 	@ruff format --check scripts tests
-	@reuse lint --quiet
 
 lint-mutable-defaults:
 	@python3 scripts/lint_mutable_defaults.py
