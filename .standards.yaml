@@ -25,6 +25,11 @@ clang_tidy:
     # series.yml (apply-build) runs clang-tidy and cppcheck on this list.
     - name: "fixtures"
       files: ".config/clang-tidy/sources.txt"
+exceptions:
+  - rule: "clang-tidy-coverage"
+    path: "tests/fixtures/libvmaf_cuda/vf_libvmaf.c"
+    reason: "category A, 90 days: pinned FFmpeg excerpt without includes, read only through the mocked-driver harness in tests/test_libvmaf_patches.py that includes it after the CUDA stubs"
+    expires: "2027-02-01"
 register:
   sources:
     expected: 13

@@ -455,6 +455,19 @@
       "patch": "0039-avcodec-wmalosslessdec-Clear-subframe-flags-as-an-ar.patch",
       "project": "vmafx",
       "note": "Master form of the issue 107 fix, one pull request per area."
+    },
+    {
+      "number": 25708,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708",
+      "title": "avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0040-avfilter-vf_libvmaf-accept-more-planar-pixel-formats.patch, 0041-avfilter-vf_libvmaf-copy-all-planes-of-CUDA-hardware.patch",
+      "project": "vmafx",
+      "note": "By luoye-cpu, not from this series (VMAFx/vmafx#3274); the series carries it ahead of review. 25708 stacks on 24973, which the series does not carry; the conflict was context only."
     }
   ]
 }

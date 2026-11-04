@@ -1,0 +1,9 @@
+status = "submitted"
+upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708"
+consumers = ["vmafx"]
+origin = "VMAFx/vmafx#3274 (luoye-cpu), FFmpeg PR 25708 commit cfa0bbc4bb86bb483b42a1e173516c20e2008c3e"
+notes = """
+Removes the break after the first successful cuMemcpy2D in copy_picture_data_cuda so the loop copies every plane, including chroma, for the supported planar formats.
+25708 stacks on 24973, which the series does not carry; the conflict was context only, the change is identical.
+GPU before/after: see PR
+"""
