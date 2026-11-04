@@ -16,6 +16,8 @@ import urllib.request
 API = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg"
 API_HOST = "code.ffmpeg.org"
 FEED = "https://code.ffmpeg.org/api/v1/users/lusoris/activities/feeds"
+SETTINGS = "https://code.ffmpeg.org/api/v1/settings/api"
+PAGE_CACHE = {}
 
 
 class RefusedURL(ValueError):
@@ -48,6 +50,22 @@ OPENER.add_handler(urllib.request.HTTPErrorProcessor())
 OPENER.add_handler(urllib.request.UnknownHandler())
 
 
+def discover_page_size():
+    """Discover and cache the forge API page size, bounded by 50."""
+    if "page_size" in PAGE_CACHE:
+        return PAGE_CACHE["page_size"]
+    settings = get(SETTINGS)
+    if not isinstance(settings, dict):
+        raise ValueError("expected a dict from /settings/api")
+    if "max_response_items" not in settings:
+        raise ValueError("missing max_response_items in /settings/api")
+    size = settings["max_response_items"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("invalid max_response_items in /settings/api; expected a positive integer")
+    PAGE_CACHE["page_size"] = min(50, size)
+    return PAGE_CACHE["page_size"]
+
+
 def get(path):
     """Decode an API GET with a deadline and allow-listed initial and redirect URLs."""
     url = path if urllib.parse.urlsplit(path).scheme else API + path
@@ -57,15 +75,16 @@ def get(path):
 
 
 def paginated(path, max_pages=1000, older="entries"):
-    """Read bounded 50-row pages, warning if the last permitted page is full."""
+    """Read bounded pages, warning if the last permitted page is full."""
     result = []
+    page_size = discover_page_size()
     separator = "&" if "?" in path else "?"
     for page in range(1, max_pages + 1):
-        batch = get(f"{path}{separator}limit=50&page={page}")
+        batch = get(f"{path}{separator}limit={page_size}&page={page}")
         if not isinstance(batch, list):
             raise ValueError(f"expected a list from {path}")
         result.extend(batch)
-        if len(batch) < 50:
+        if len(batch) < page_size:
             return result
     print(
         f"warning: older {older} were not read; {path} reached {max_pages} full pages",
@@ -298,6 +317,8 @@ def main(argv):
     if argv == ["--self-test"]:
         return self_test()
     try:
+        PAGE_CACHE.clear()
+        discover_page_size()
         read_from = utc_now()
         threads = discover_threads()
         out = []
