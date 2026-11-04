@@ -50,7 +50,9 @@ is applied or exported.
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
+import functools
 import json
 import os
 import re
@@ -62,6 +64,10 @@ import tomllib
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tree_sitter import Node, Parser
 
 try:
     import forge_settings
@@ -99,6 +105,12 @@ DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+FUNCTION_NAME = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*"
+    r"(?: ?\( ?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)"
+    r"(?: ?, ?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+))* ?\))?",
+    re.ASCII,
+)
 CONTRIBUTIONS = "upstream-contributions.json"
 CONTRIBUTION_KEYS = (
     "number",
@@ -294,6 +306,7 @@ def check_exception_dates(entry: dict, name: str, findings: Findings, today: dat
 
 
 def check_exception_fields(entry: dict, name: str, findings: Findings) -> tuple[str, str] | None:
+    """Validate one HISS-04 exception entry and return its (path, function) key."""
     rule = entry.get("rule")
     if not isinstance(rule, str) or rule != "HISS-04":
         findings.error(name, "rule must be 'HISS-04'")
@@ -303,8 +316,8 @@ def check_exception_fields(entry: dict, name: str, findings: Findings) -> tuple[
         findings.error(name, "path must be a repo-relative file path")
 
     func = entry.get("function")
-    if not isinstance(func, str) or not func.isascii() or not func.isidentifier():
-        findings.error(name, "function must be a C identifier")
+    if not isinstance(func, str) or not FUNCTION_NAME.fullmatch(func):
+        findings.error(name, "function must be a C identifier or a macro call such as FUNC(name)")
 
     lines = entry.get("lines")
     if type(lines) is not int:
@@ -1175,69 +1188,121 @@ class LengthFinding:
     new_length: int
 
 
-def is_signature_line(line: str) -> bool:
-    if not line or not (line[0].isalpha() or line[0] == "_"):
-        return False
-    if line.startswith("#") or line.startswith("typedef"):
-        return False
-    if line.rstrip().endswith(";"):
-        return False
-    return "(" in line
+@functools.cache
+def _get_c_parser() -> Parser:
+    """Return the cached tree-sitter C parser singleton."""
+    try:
+        import tree_sitter_c  # noqa: PLC0415 - optional parser dependency.
+        from tree_sitter import Language, Parser  # noqa: PLC0415 - optional parser dependency.
+    except ModuleNotFoundError as error:
+        package = (error.name or "tree_sitter").replace("_", "-")
+        raise SeriesError(
+            f"Missing package {package}; run pip install --require-hashes -r requirements-dev.txt"
+        ) from error
+    return Parser(Language(tree_sitter_c.language()))
 
 
-def signature_name(line: str) -> str | None:
-    before = line.split("(", 1)[0].rstrip()
-    match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", before)
-    return match.group(1) if match else None
+def _collect_function_definitions(root: Node, max_steps: int = 1_000_000) -> list[Node]:
+    """Collect function_definition nodes at any depth without entering their bodies."""
+    nodes: list[Node] = []
+    stack: list[Node] = [root]
+    for _ in range(max_steps):
+        if not stack:
+            return nodes
+        node = stack.pop()
+        if node.type == "function_definition":
+            nodes.append(node)
+            continue
+        for child in reversed(node.children):
+            stack.append(child)
+    raise SeriesError(f"tree traversal exceeded limit of {max_steps} nodes")
 
 
-def update_signature_state(
-    line: str,
-    lineno: int,
-    state: tuple[int | None, int | None, str | None],
-) -> tuple[int | None, int | None, str | None]:
-    first_sig, last_sig, sig_name = state
-    if line.rstrip().endswith(";"):
-        return None, None, None
-    if is_signature_line(line):
-        name = signature_name(line)
-        if name is not None:
-            if last_sig is not None and (lineno - last_sig) <= 8:
-                return first_sig, lineno, sig_name
-            return lineno, lineno, name
-    return state
+def _find_declarator_child(node: Node) -> Node | None:
+    """Return the first declarator-typed child of a node."""
+    for child in node.children:
+        if "declarator" in child.type:
+            return child
+    return None
+
+
+def _find_function_declarator(node: Node) -> Node | None:
+    """Find the function_declarator child in a declarator chain."""
+    curr = node.child_by_field_name("declarator")
+    for _ in range(32):
+        if curr is None or curr.type == "function_declarator":
+            return curr
+        next_decl = curr.child_by_field_name("declarator")
+        if next_decl is None and curr.type == "parenthesized_declarator":
+            next_decl = _find_declarator_child(curr)
+        curr = next_decl
+    return None
+
+
+def _unwrap_parentheses(node: Node | None) -> Node | None:
+    """Unwrap parenthesized_declarator wrappers down to the inner declarator."""
+    curr = node
+    for _ in range(8):
+        if curr is None or curr.type != "parenthesized_declarator":
+            return curr
+        curr = next((c for c in curr.children if c.type not in ("(", ")")), None)
+    return curr
+
+
+def _extract_function_name(node: Node) -> str | None:
+    """Extract the function name from a function_definition node."""
+    fn_decl = _find_function_declarator(node)
+    if fn_decl is None:
+        return None
+    inner = _unwrap_parentheses(fn_decl.child_by_field_name("declarator"))
+    if inner is None or inner.text is None:
+        return None
+    text = inner.text.decode("utf-8", errors="replace")
+    name = " ".join(text.split())
+    return name if name else None
+
+
+def _newline_byte_offsets(source: bytes) -> list[int]:
+    """Index newline byte offsets in one bounded pass over the parser input."""
+    return [offset for offset in range(len(source)) if source[offset] == 10]
+
+
+def _byte_row(newlines: list[int], offset: int) -> int:
+    """Return the zero-based row by counting newlines strictly before offset."""
+    # Avoid Point's borrowed-reference getters: https://github.com/tree-sitter/py-tree-sitter/issues/505
+    return bisect.bisect_right(newlines, offset - 1)
 
 
 def parse_function_spans(
     text: str,
 ) -> tuple[dict[str, FunctionSpan], dict[str, list[FunctionSpan]]]:
+    """Parse C function spans using tree-sitter."""
     longest: dict[str, FunctionSpan] = {}
     all_spans: dict[str, list[FunctionSpan]] = {}
-    in_body = False
-    first_sig: int | None = None
-    last_sig: int | None = None
-    sig_name: str | None = None
+    if not text:
+        return longest, all_spans
 
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if in_body:
-            if line.startswith("}"):
-                if first_sig is not None and sig_name is not None:
-                    length = lineno - first_sig + 1
-                    span = FunctionSpan(sig_name, first_sig, lineno, length)
-                    all_spans.setdefault(sig_name, []).append(span)
-                    if sig_name not in longest or length > longest[sig_name].length:
-                        longest[sig_name] = span
-                in_body = False
-                first_sig, last_sig, sig_name = None, None, None
-        elif line.startswith("{"):
-            if last_sig is not None and (lineno - last_sig) <= 8:
-                in_body = True
-            else:
-                first_sig, last_sig, sig_name = None, None, None
-        else:
-            first_sig, last_sig, sig_name = update_signature_state(
-                line, lineno, (first_sig, last_sig, sig_name)
-            )
+    parser = _get_c_parser()
+    source = text.encode("utf-8")
+    newlines = _newline_byte_offsets(source)
+    tree = parser.parse(source)
+    function_nodes = _collect_function_definitions(tree.root_node)
+
+    for node in function_nodes:
+        name = _extract_function_name(node)
+        if name is None:
+            continue
+        start = _byte_row(newlines, node.start_byte) + 1
+        end_offset = node.end_byte
+        # A missing closing brace can leave the exclusive end just after a newline.
+        if end_offset > node.start_byte and source[end_offset - 1] != 10:
+            end_offset -= 1
+        end = _byte_row(newlines, end_offset) + 1
+        length = end - start + 1
+        span = FunctionSpan(name, start, end, length)
+        all_spans.setdefault(name, []).append(span)
+        if name not in longest or length > longest[name].length:
+            longest[name] = span
 
     return longest, all_spans
 
