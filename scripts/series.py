@@ -312,7 +312,7 @@ def check_added_posix_types(path: Path, findings: Findings) -> None:
     file_name: str | None = None
     in_hunk = False
     in_block_comment = False
-    for diff_line in path.read_text(errors="replace").splitlines():
+    for diff_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if diff_line.startswith("diff --git "):
             file_name = None
             in_hunk = False
