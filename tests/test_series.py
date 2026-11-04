@@ -518,6 +518,27 @@ class CheckTest(SeriesTestCase):
         self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
         self.assert_error(series.check(self.fx.root), "ssize_t line_5 = 50;")
 
+    def test_added_spliced_ssize_t_fails(self) -> None:
+        """A spliced ssize_t is refused once, citing its first physical line."""
+        path = self.fx.patch(1)
+        first_line = "ssize_\\"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", f"+{first_line}\n+t n;"),
+            encoding="utf-8",
+        )
+        findings = series.check(self.fx.root)
+        self.assertEqual(len(findings.errors), 1)
+        self.assert_error(findings, f"lib.c: added line {first_line!r}: POSIX type; MSVC lacks it")
+
+    def test_added_spliced_non_ssize_t_passes(self) -> None:
+        """Splicing a different identifier does not create an ssize_t finding."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", "+ssize_\\\n+total n;"),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
     def test_added_ssize_t_in_block_comment_passes(self) -> None:
         """An added ssize_t in a block comment is ignored."""
         path = self.fx.patch(1)

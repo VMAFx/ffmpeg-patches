@@ -61,6 +61,7 @@ import subprocess  # nosec B404 - fixed git argv, no shell, explicit timeouts.
 import sys
 import tempfile
 import tomllib
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -307,12 +308,31 @@ def _code_line(line: str, in_block_comment: bool) -> tuple[str, bool]:
     return "".join(code), in_block_comment
 
 
+def _spliced_diff_lines(text: str) -> Iterator[tuple[str, str]]:
+    """Join continued added/context lines, retaining the first physical line."""
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        first_line = line = lines[index]
+        index += 1
+        while (
+            line.startswith((" ", "+"))
+            and line.endswith("\\")
+            and index < len(lines)
+            and lines[index].startswith((" ", "+"))
+        ):
+            line = line[:-1] + lines[index][1:]
+            index += 1
+        yield first_line, line
+
+
 def check_added_posix_types(path: Path, findings: Findings) -> None:
     """Reject added `ssize_t` in C sources because MSVC lacks the POSIX type."""
     file_name: str | None = None
     in_hunk = False
     in_block_comment = False
-    for diff_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for diff_line, spliced_line in _spliced_diff_lines(text):
         if diff_line.startswith("diff --git "):
             file_name = None
             in_hunk = False
@@ -333,7 +353,7 @@ def check_added_posix_types(path: Path, findings: Findings) -> None:
             continue
         if not diff_line.startswith((" ", "+")):
             continue
-        code, in_block_comment = _code_line(diff_line[1:], in_block_comment)
+        code, in_block_comment = _code_line(spliced_line[1:], in_block_comment)
         if diff_line.startswith("+") and re.search(r"\bssize_t\b", code):
             line = diff_line[1:].rstrip()
             findings.error(
