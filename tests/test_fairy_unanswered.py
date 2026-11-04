@@ -7,6 +7,7 @@ import io
 import json
 import unittest.mock
 import urllib.error
+import urllib.parse
 
 from scripts import fairy_unanswered as fairy
 
@@ -38,6 +39,7 @@ def _word(who="Forgejo_Fairy", timestamp=NEW):
 def _routes():
     """Build mixed threads with paged reviews, stale rows, and missing rows."""
     return {
+        fairy.SETTINGS: {"max_response_items": 50},
         "/pulls?state=open&poster=lusoris&limit=50&page=1": [
             {"number": 1, "user": {"login": "lusoris"}},
             {"number": 99, "user": {"login": "other"}},
@@ -70,6 +72,8 @@ class FairyUnansweredTest(unittest.TestCase):
 
     def setUp(self):
         """Forbid network I/O through both global and restricted openers."""
+        if hasattr(fairy, "PAGE_CACHE"):
+            fairy.PAGE_CACHE.clear()
         network = unittest.mock.patch.object(
             fairy.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")
         )
@@ -183,6 +187,7 @@ class FairyUnansweredTest(unittest.TestCase):
     def _review_pages_output(self, first, second):
         """Run a PR against a full default page and a final explicit review page."""
         routes = {
+            fairy.SETTINGS: {"max_response_items": 50},
             "/issues/1/comments": [],
             "/pulls/1/reviews": first,
             "/pulls/1/reviews?limit=50&page=1": first,
@@ -222,6 +227,7 @@ class FairyUnansweredTest(unittest.TestCase):
                     return read_pages(path, **kwargs) if path.startswith(feed_url) else []
 
                 with (
+                    unittest.mock.patch.dict(fairy.PAGE_CACHE, {"page_size": 50}),
                     unittest.mock.patch.object(fairy, "FEED", url),
                     unittest.mock.patch.object(fairy, "paginated", side_effect=pages),
                     unittest.mock.patch.object(fairy.urllib.request, "urlopen") as request,
@@ -250,6 +256,7 @@ class FairyUnansweredTest(unittest.TestCase):
                 with self.subTest(metadata=metadata, from_activity=from_activity):
                     issue = {"number": 3, "state": "open", **metadata}
                     routes = {
+                        fairy.SETTINGS: {"max_response_items": 50},
                         "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
                         "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": []
                         if from_activity
@@ -270,6 +277,7 @@ class FairyUnansweredTest(unittest.TestCase):
                 pages.append([_activity(4)] * last_size)
                 errors = io.StringIO()
                 with (
+                    unittest.mock.patch.dict(fairy.PAGE_CACHE, {"page_size": 50}),
                     unittest.mock.patch.object(fairy, "get", side_effect=pages) as request,
                     contextlib.redirect_stderr(errors),
                 ):
@@ -297,6 +305,7 @@ class FairyUnansweredTest(unittest.TestCase):
         rows = bad + [unrelated, _activity(9, "create_issue"), _activity(4)]
         errors = io.StringIO()
         with (
+            unittest.mock.patch.dict(fairy.PAGE_CACHE, {"page_size": 50}),
             unittest.mock.patch.object(fairy, "get", return_value=rows),
             contextlib.redirect_stderr(errors),
         ):
@@ -328,7 +337,11 @@ class FairyUnansweredTest(unittest.TestCase):
 
     def test_get_timeout(self):
         """Every GET uses the restricted opener with a 30-second timeout."""
-        for path, url in (("/issues/3", fairy.API + "/issues/3"), (FEED, FEED)):
+        for path, url in (
+            ("/issues/3", fairy.API + "/issues/3"),
+            (FEED, FEED),
+            (fairy.SETTINGS, fairy.SETTINGS),
+        ):
             with (
                 unittest.mock.patch.object(
                     fairy.OPENER, "open", return_value=io.BytesIO(b"[]")
@@ -437,6 +450,7 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_malformed_comment_row_without_user(self):
         """A comment row missing 'user' exits 1 with malformed response message."""
         routes = {
+            fairy.SETTINGS: {"max_response_items": 50},
             "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
             "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [{"number": 1}],
             FEED + "?only-performed-by=true&limit=50&page=1": [],
@@ -455,6 +469,7 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_malformed_reviews_payload_dict_not_list(self):
         """A reviews payload that is a dict instead of a list exits 1 with message."""
         routes = {
+            fairy.SETTINGS: {"max_response_items": 50},
             "/pulls?state=open&poster=lusoris&limit=50&page=1": [
                 {"number": 1, "user": {"login": "lusoris"}}
             ],
@@ -476,6 +491,7 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_malformed_issue_row_missing_number(self):
         """An issue row missing 'number' exits 1 with malformed response message."""
         routes = {
+            fairy.SETTINGS: {"max_response_items": 50},
             "/pulls?state=open&poster=lusoris&limit=50&page=1": [],
             "/issues?type=issues&state=open&created_by=lusoris&limit=50&page=1": [
                 {"state": "open"}
@@ -491,6 +507,148 @@ class FairyUnansweredTest(unittest.TestCase):
             self.assertEqual(fairy.main([]), 1)
         self.assertEqual(output.getvalue(), "")
         self.assertIn("fairy_unanswered: malformed API response: 'number'", errors.getvalue())
+
+    def test_page_size_positive_max_50_unchanged_behaviour(self):
+        """A server setting of 50 retains 50-row pagination limit and stop test."""
+        routes = {
+            fairy.SETTINGS: {"max_response_items": 50},
+            "/pulls?limit=50&page=1": [{"number": i} for i in range(50)],
+            "/pulls?limit=50&page=2": [{"number": 51}],
+        }
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            return routes[path]
+
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            rows = fairy.paginated("/pulls")
+            rows2 = fairy.paginated("/pulls")
+        self.assertEqual(len(rows), 51)
+        self.assertEqual(len(rows2), 51)
+        self.assertEqual(calls.count(fairy.SETTINGS), 1)
+        self.assertEqual(
+            calls,
+            [
+                fairy.SETTINGS,
+                "/pulls?limit=50&page=1",
+                "/pulls?limit=50&page=2",
+                "/pulls?limit=50&page=1",
+                "/pulls?limit=50&page=2",
+            ],
+        )
+
+    def test_page_size_regression_max_20_reads_all_over_three_pages(self):
+        """A server setting of 20 reads 45 items across 3 pages instead of stopping at 20."""
+        total_items = [{"id": i} for i in range(1, 46)]
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            if path == fairy.SETTINGS:
+                return {"max_response_items": 20}
+            parsed = urllib.parse.urlsplit(path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            limit = int(qs.get("limit", [50])[0])
+            page = int(qs.get("page", [1])[0])
+            effective_limit = min(limit, 20)
+            start = (page - 1) * effective_limit
+            return total_items[start : start + effective_limit]
+
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            rows = fairy.paginated("/items")
+        self.assertEqual(len(rows), 45)
+        self.assertEqual(
+            calls,
+            [
+                fairy.SETTINGS,
+                "/items?limit=20&page=1",
+                "/items?limit=20&page=2",
+                "/items?limit=20&page=3",
+            ],
+        )
+
+    def test_page_size_boundary_max_1(self):
+        """A server setting of 1 reads single-row pages and stops on an empty page."""
+        routes = {
+            fairy.SETTINGS: {"max_response_items": 1},
+            "/items?limit=1&page=1": [{"id": 1}],
+            "/items?limit=1&page=2": [{"id": 2}],
+            "/items?limit=1&page=3": [],
+        }
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            return routes[path]
+
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            self.assertEqual(fairy.discover_page_size(), 1)
+            rows = fairy.paginated("/items")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            calls,
+            [
+                fairy.SETTINGS,
+                "/items?limit=1&page=1",
+                "/items?limit=1&page=2",
+                "/items?limit=1&page=3",
+            ],
+        )
+
+    def test_page_size_boundary_max_51_capped_at_50(self):
+        """A server setting of 51 is capped at the client maximum of 50."""
+        routes = {
+            fairy.SETTINGS: {"max_response_items": 51},
+            "/items?limit=50&page=1": [{"id": i} for i in range(50)],
+            "/items?limit=50&page=2": [],
+        }
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            return routes[path]
+
+        with unittest.mock.patch.object(fairy, "get", side_effect=fake_get):
+            self.assertEqual(fairy.discover_page_size(), 50)
+            rows = fairy.paginated("/items")
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(
+            calls,
+            [
+                fairy.SETTINGS,
+                "/items?limit=50&page=1",
+                "/items?limit=50&page=2",
+            ],
+        )
+
+    def test_page_size_negative_invalid_settings_reported(self):
+        """Invalid max_response_items values raise ValueError and exit 1 in main."""
+        cases = (
+            ("bool true", {"max_response_items": True}),
+            ("zero", {"max_response_items": 0}),
+            ("string", {"max_response_items": "50"}),
+            ("missing key", {}),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                fairy.PAGE_CACHE.clear()
+                with (
+                    unittest.mock.patch.object(fairy, "get", return_value=payload),
+                    self.assertRaises(ValueError),
+                ):
+                    fairy.discover_page_size()
+
+                fairy.PAGE_CACHE.clear()
+                output, errors = io.StringIO(), io.StringIO()
+                with (
+                    unittest.mock.patch.object(fairy, "get", return_value=payload),
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(fairy.main([]), 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("malformed API response", errors.getvalue())
 
 
 if __name__ == "__main__":
