@@ -88,7 +88,7 @@ without a series patch is a change the series does not carry.
 | [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0035 |
 | [24835](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835) | `master` | merged 2026-10-19 (`fd9a8f25a07b`), in no release yet | avfilter/vf_tonemap_opencl: zero the peak detection buffer | 0016 |
 | [24970](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970) | `master` | open | avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED | 0001 |
-| [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | none |
+| [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | 0042 |
 | [24974](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974) | `master` | merged 2026-10-20 (`2a8c6d30b934`), in no release yet | avcodec/av1dec: remove the coding bias from exported chroma grain params | none |
 | [24975](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975) | `release/9.0` | merged 2026-10-12 (`7e93014c5bbb`), in no release yet | [release/9.0] hwcontext_vulkan: only originate host image layout transitions from copyable layouts | none |
 | [24977](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24977) | `master` | open | avcodec/vaapi_encode_h265: enable cu_qp_delta for ROI in CQP mode | none |
