@@ -9,12 +9,13 @@
 #   ffmpeg-forgejo whoami
 #   ffmpeg-forgejo search  <text>                    open issues and PRs matching text
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
-#   ffmpeg-forgejo push    [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
+#   ffmpeg-forgejo push    --sweep <file> [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#   ffmpeg-forgejo pr      [--overlap-ok <number>]... <branch> <title> <body-file>
+#   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
 #                          (exit 77); --overlap-ok permits exactly that PR;
 #                          exits 3 when Fairy is missing or no human reviewer is requested
+#                          pr/push require a sweep for the local head; every row must be fold or follow-up: <reproducer path>
 #   ffmpeg-forgejo issue   <title> <body-file>
 #   ffmpeg-forgejo comment (--tested-head <sha> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head
@@ -39,6 +40,7 @@ BASE="${FFMPEG_FORGEJO_BASE:-master}"
 GIT_URL="${FFMPEG_FORGEJO_GIT:-$HOST/$REPO.git}"
 page_size=""
 BOT_REVIEWER="${FFMPEG_FORGEJO_BOT_REVIEWER:-Forgejo_Fairy}"
+SWEPT_SHA=""
 
 die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
 
@@ -499,6 +501,49 @@ fairy_requests() {
   return 1
 }
 
+# require_sweep FILE BRANCH: validate reviewed dispositions against the local commit.
+require_sweep() {
+  local report="$1" branch="$2" sha
+  [ -n "$report" ] || die "--sweep <file> required"
+  [ -f "$report" ] || die "no sweep file $report"
+  sha="$(git rev-parse --verify --end-of-options "$branch^{commit}")" || die "sweep: no local branch $branch"
+  python3 -I - "$report" "$sha" "${BASH_SOURCE[0]}" <<'PY' || die "sweep rejected: $report"
+import importlib.util
+import pathlib
+import sys
+
+try:
+    validator_path = pathlib.Path(sys.argv[3]).resolve().parent / "variant_sweep.py"
+    if not validator_path.is_file():
+        raise ImportError(f"missing validator: {validator_path}")
+    spec = importlib.util.spec_from_file_location("_ffmpeg_variant_sweep", validator_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load validator: {validator_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    valid = module.validate_report(pathlib.Path(sys.argv[1]), sys.argv[2])
+except (AttributeError, ImportError, OSError, UnicodeError, RuntimeError) as error:
+    print(f"sweep: {error}", file=sys.stderr)
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+  SWEPT_SHA="$sha"
+}
+
+# require_swept_fork_head LOGIN BRANCH: bind PR creation to the reviewed commit.
+require_swept_fork_head() {
+  local me="$1" branch="$2" encoded out remote_sha
+  encoded="$(python3 -I -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$branch")" \
+    || die "sweep: cannot encode fork branch $branch (swept $SWEPT_SHA)"
+  out="$(api GET "/repos/$me/${REPO#*/}/branches/$encoded")" \
+    || die "sweep: cannot read fork branch $me:$branch (swept $SWEPT_SHA)"
+  remote_sha="$(python3 -I -c 'import json,sys; print(json.load(sys.stdin)["commit"]["id"])' <<<"$out")" \
+    || die "sweep: cannot read fork branch commit $me:$branch (swept $SWEPT_SHA)"
+  [ "$remote_sha" = "$SWEPT_SHA" ] \
+    || die "sweep: fork branch $me:$branch has $remote_sha; swept $SWEPT_SHA"
+}
+
 cmd="${1:-}"
 if [ $# -gt 0 ]; then shift; fi
 case "$cmd" in
@@ -554,38 +599,56 @@ for i in json.load(sys.stdin):
     fi
     ;;
   push)
-    lease=""
-    if [ "${1:-}" = "--lease" ]; then
-      [ $# -ge 3 ] || die "usage: push --lease <expected-remote-sha> <local-branch> [<remote-branch>]"
-      [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die "--lease takes the full 40-hex sha the remote branch has now: $2"
-      lease="$2"; shift 2
-    fi
-    [ $# -ge 1 ] || die "usage: push [--lease <expected-remote-sha>] <local-branch> [<remote-branch>]"
+    usage='push --sweep <file> [--lease <expected-remote-sha>] <local-branch> [<remote-branch>]'
+    lease=""; sweep=""
+    push_argc=$#
+    for ((push_i = 0; push_i < push_argc; push_i++)); do
+      case "${1:-}" in
+        --sweep)
+          [ $# -ge 2 ] && [ -z "$sweep" ] || die "usage: $usage"
+          sweep="$2"; shift 2 ;;
+        --lease)
+          [ $# -ge 2 ] && [ -z "$lease" ] || die "usage: $usage"
+          [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die "--lease takes the full 40-hex sha the remote branch has now: $2"
+          lease="$2"; shift 2 ;;
+        --*) die "usage: $usage" ;;
+        *) break ;;
+      esac
+    done
+    [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: $usage"
+    require_sweep "$sweep" "$1"
     me="$(login)"
-    git rev-parse --verify --quiet "$1^{commit}" >/dev/null || die "no local branch $1"
     rb="${2:-$1}"
     # The credential helper reads the keyring at push time; nothing lands in argv or config.
     # --lease rewrites the remote branch only while it still points at the expected sha.
     git -c credential.helper= \
         -c "credential.$HOST.helper=!f() { echo username=$me; printf 'password='; secret-tool lookup service code.ffmpeg.org; echo; }; f" \
-        push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$1:refs/heads/$rb"
+        push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$SWEPT_SHA:refs/heads/$rb"
     ;;
   pr)
-    usage='pr [--overlap-ok <number>]... <branch> <title> <body-file>'
-    overlap_ok=""
+    usage='pr --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>'
+    overlap_ok=""; sweep=""
     pr_argc=$#
     for ((pr_i = 0; pr_i < pr_argc; pr_i++)); do
-      [ "${1:-}" = "--overlap-ok" ] || break
-      [ $# -ge 2 ] || usage_error "$usage"
-      [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage_error "$usage"
-      overlap_ok+=" $2"
-      shift 2
+      case "${1:-}" in
+        --sweep)
+          [ $# -ge 2 ] && [ -z "$sweep" ] || die "usage: $usage"
+          sweep="$2"; shift 2 ;;
+        --overlap-ok)
+          [ $# -ge 2 ] || usage_error "$usage"
+          [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage_error "$usage"
+          overlap_ok+=" $2"; shift 2 ;;
+        --*) usage_error "$usage" ;;
+        *) break ;;
+      esac
     done
     [ $# -eq 3 ] || usage_error "$usage"
+    require_sweep "$sweep" "$1"
     [ -f "$3" ] || die "no body file $3"
     [[ "$BOT_REVIEWER" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $BOT_REVIEWER"
     me="$(login)"
     check_pr_overlap "$1" "$me" "$overlap_ok"
+    require_swept_fork_head "$me" "$1"
     body="$(mktemp)"
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
     out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
