@@ -3,6 +3,25 @@
   "extends": [
     "github>plurano/horistes"
   ],
+  "pip-compile": {
+    "managerFilePatterns": [
+      "/(^|/)requirements-dev\\.txt$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update the Pylint version pinned by the mutable-defaults checker",
+      "managerFilePatterns": [
+        "/^scripts/lint_mutable_defaults\\.py$/"
+      ],
+      "matchStrings": [
+        "PYLINT_VERSION = \"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "pylint",
+      "datasourceTemplate": "pypi"
+    }
+  ],
   "packageRules": [
     {
       "description": "praetor-managed files: praetorctl adopt ships their updates and praetorctl audit locks them byte for byte",
@@ -11,6 +30,24 @@
         ".devcontainer/Dockerfile.praetor"
       ],
       "enabled": false
+    },
+    {
+      "description": "Development pins and lockfile are updated together by pip-compile",
+      "matchManagers": [
+        "pip_requirements"
+      ],
+      "matchFileNames": [
+        "requirements-dev.in",
+        "requirements-dev.txt"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Update the Pylint development lock and script pin together",
+      "matchPackageNames": [
+        "pylint"
+      ],
+      "groupName": "pylint"
     }
   ]
 }
