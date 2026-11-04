@@ -33,6 +33,8 @@
         Print the table of upstream pull requests rendered from
         upstream-contributions.json; --write puts it into README.md
         between its two marker comments. `check` compares the two.
+        One record per pull request; its `patch` string lists patch names
+        separated by ", ", or is empty when the series carries none.
     series.py scope [--base REF] [--head REF] [--full]
         Select FFmpeg, GPU parity and macOS CI work from the changed files.
         Append outputs with --github-output FILE and a summary with --report FILE.
@@ -588,24 +590,27 @@ def patch_links(root: Path, names: list[str]) -> dict[str, tuple[str, str]]:
     return links
 
 
+def contribution_patches(entry: dict) -> list[str]:
+    """Patch names separated by comma and space; an empty string names none."""
+    return entry["patch"].split(", ") if entry["patch"] else []
+
+
 def check_records(
     entries: list[dict], links: dict[str, tuple[str, str]], findings: Findings
 ) -> None:
-    """Each upstream link of the series has one record, each record's patch that link."""
+    """Check every patch in each record's comma-and-space-separated patch string."""
     recorded: set[str] = set()
     for entry in entries:
-        patch = entry["patch"]
-        if not patch:
-            continue
         where = f"{CONTRIBUTIONS}: {entry['number']}"
-        if patch in recorded:
-            findings.error(where, f"{patch} is recorded twice")
-        recorded.add(patch)
-        status, link = links.get(patch, ("", ""))
-        if link != entry["url"]:
-            findings.error(where, f"the metadata of {patch} does not link {entry['url']}")
-        elif FORGE_STATES[status] != entry["state"]:
-            findings.error(where, f"state {entry['state']!r} disagrees with status {status!r}")
+        for patch in contribution_patches(entry):
+            if patch in recorded:
+                findings.error(where, f"{patch} is recorded twice")
+            recorded.add(patch)
+            status, link = links.get(patch, ("", ""))
+            if link != entry["url"]:
+                findings.error(where, f"the metadata of {patch} does not link {entry['url']}")
+            elif FORGE_STATES[status] != entry["state"]:
+                findings.error(where, f"state {entry['state']!r} disagrees with status {status!r}")
     for name, (_, link) in links.items():
         if name not in recorded:
             findings.error(name, f"upstream link {link} has no record in {CONTRIBUTIONS}")
@@ -639,15 +644,16 @@ def contribution_state(entry: dict) -> str:
 
 
 def contributions_table(data: dict) -> str:
-    """The README block: one row per pull request and the day the forge was read."""
+    """One README row per pull request, listing all patch numbers and the read day."""
     lines = [
         "| Pull request | Target | State | Change | Series patch |",
         "| --- | --- | --- | --- | --- |",
     ]
     for entry in data["contributions"]:
+        patches = ", ".join(patch[:4] for patch in contribution_patches(entry)) or "none"
         lines.append(
             f"| [{entry['number']}]({entry['url']}) | `{entry['base']}` "
-            f"| {contribution_state(entry)} | {entry['title']} | {entry['patch'][:4] or 'none'} |"
+            f"| {contribution_state(entry)} | {entry['title']} | {patches} |"
         )
     lines += ["", f"State read from the FFmpeg forge on {data['checked']}."]
     return "\n".join(lines)

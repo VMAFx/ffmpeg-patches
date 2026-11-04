@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: luoye-cpu <3412829159@qq.com>
+Date: Tue, 3 Nov 2026 18:30:05 +0800
+Subject: [PATCH] avfilter/vf_libvmaf: copy all planes of CUDA hardware frames
+
+copy_picture_data_cuda() loops over the planes of the source pixel format
+but breaks out after the first cuMemcpy2D(), so only the luma plane is
+copied into the VmafPicture. Chroma-based features then read zeroed
+memory: with feature=name=speed_chroma the pooled speed_chroma_uv score
+is 0 on the CUDA path while the CPU path reports about 19.65 for the same
+input, measured against upstream libvmaf.
+
+The accepted formats are fully planar, with one component per plane.
+Therefore, iterating over nb_components copies all planes for the formats
+supported by this filter.
+
+Depends on the error-path series ("avfilter/vf_libvmaf: fix error paths",
+hunk context builds on; the two series touch adjacent lines of the same
+loop.
+
+Signed-off-by: luoye-cpu <3412829159@qq.com>
+---
+ libavfilter/vf_libvmaf.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/libavfilter/vf_libvmaf.c b/libavfilter/vf_libvmaf.c
+index 6400168f40b764599a57053b15d0685f809b7e6f..72145d2df5bc11b06377dcd9e1c0c0939b28dfac 100644
+--- a/libavfilter/vf_libvmaf.c
++++ b/libavfilter/vf_libvmaf.c
+@@ -752,7 +752,6 @@ static int copy_picture_data_cuda(VmafContext* vmaf,
+         err = cu->cuMemcpy2D(&m);
+         if (err)
+             return AVERROR_EXTERNAL;
+-        break;
+     }
+ 
+     err = cu->cuCtxPopCurrent(NULL);
