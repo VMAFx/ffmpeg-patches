@@ -49,9 +49,9 @@
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
-      "patch": "",
-      "project": "pelorus",
-      "note": "Four commits. The series carries none of them."
+      "patch": "0042-avfilter-vf_libvmaf-pop-the-CUDA-context-when-a-plan.patch",
+      "project": "pelorus, vmafx",
+      "note": "Four commits. The series carries the CUDA context fix (95aa7b1c4052) as 0042 in its n9.0.2 form, on top of the multi-plane copy from 0040/0041; it carries none of the other three."
     },
     {
       "number": 24974,
