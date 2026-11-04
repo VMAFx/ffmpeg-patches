@@ -143,6 +143,12 @@ def binding_errors(
     return [*errors, *expiry_errors(reason["expiry"], today)]
 
 
+def source_rows(source: str) -> list[str]:
+    """Split only at token-counted newlines, removing the CR in CRLF endings."""
+
+    return [row.removesuffix("\r") for row in source.split("\n")]
+
+
 def find_nosemgrep_offenders(
     source: str,
     local_ids: set[str],
@@ -153,7 +159,7 @@ def find_nosemgrep_offenders(
     """Return path:line:rule diagnostics for malformed or unbound suppressions."""
 
     current_date = date.today() if today is None else today
-    lines = source.splitlines()
+    lines = source_rows(source)
     comments = comment_tokens(source, filename)
     suppressions = {
         line: comment
@@ -260,6 +266,52 @@ class NosemgrepBindingTest(unittest.TestCase):
         for planted in variants:
             with self.subTest(source=planted):
                 self.assert_rule(planted, "R3")
+
+    def test_form_feeds_preserve_valid_binding(self) -> None:
+        """Form feeds before a bound block cannot create misplaced suppressions."""
+
+        for filename, marker in (("planted.py", "#"), ("planted.txt", "//")):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(filename=filename, newline=newline):
+                    source = "x = 1\f\f\f\n" + bound_source(marker=marker)
+                    self.assertEqual(
+                        find_nosemgrep_offenders(
+                            source.replace("\n", newline), set(), filename=filename, today=TODAY
+                        ),
+                        [],
+                    )
+
+    def test_form_feed_preserves_misplaced_suppression(self) -> None:
+        """A form feed cannot hide a blank line between suppression and code."""
+
+        for filename, marker in (("planted.py", "#"), ("planted.txt", "//")):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(filename=filename, newline=newline):
+                    source = "x = 1\f\n" + bound_source(marker=marker)
+                    source = source.replace("\nrun()", "\n\nrun()")
+                    self.assertEqual(
+                        find_nosemgrep_offenders(
+                            source.replace("\n", newline), set(), filename=filename, today=TODAY
+                        ),
+                        [
+                            f"{filename}:3: R3 misplaced suppression: "
+                            "standalone line immediately before code required"
+                        ],
+                    )
+
+    def test_unicode_separator_preserves_valid_binding(self) -> None:
+        """Unicode line separators before a bound block cannot shift comment rows."""
+
+        for filename, marker in (("planted.py", "#"), ("planted.txt", "//")):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(filename=filename, newline=newline):
+                    source = "x = 1\u2028\u2028\u2028\n" + bound_source(marker=marker)
+                    self.assertEqual(
+                        find_nosemgrep_offenders(
+                            source.replace("\n", newline), set(), filename=filename, today=TODAY
+                        ),
+                        [],
+                    )
 
     def test_expired_reason(self) -> None:
         """Yesterday's reason is expired against the caller's fixed date."""
