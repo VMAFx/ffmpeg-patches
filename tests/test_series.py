@@ -15,9 +15,11 @@ import tarfile
 import tempfile
 import unittest
 import unittest.mock
+from datetime import date
+from importlib import import_module
 from pathlib import Path
 
-from scripts import series
+from scripts import release_guard, series
 from tests.helpers import init_upstream, run_git
 
 LINES = [f"int line_{n} = {n};" for n in range(1, 41)]
@@ -112,6 +114,73 @@ class SeriesTestCase(unittest.TestCase):
         self.assertTrue(
             any(needle in line for line in findings.errors), f"{needle!r} not in {findings.errors}"
         )
+
+
+class Utf8ReadTest(unittest.TestCase):
+    """Invalid UTF-8 follows each reader's existing contextual error contract."""
+
+    def setUp(self) -> None:
+        """Create file-only inputs for strict UTF-8 readers."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        (self.root / "patches").mkdir()
+        self.patch = self.root / "patches" / "0001-change.patch"
+        self.patch.touch()
+        self.sidecar = self.patch.with_suffix(".toml")
+        self.sidecar.write_bytes(b"\xff")
+
+    def test_check_metadata_invalid_utf8(self) -> None:
+        """Record invalid sidecar encoding as an invalid TOML finding."""
+        findings = series.Findings()
+        series.check_metadata(self.sidecar, findings)
+        self.assertEqual(len(findings.errors), 1)
+        self.assertIn(f"{self.sidecar.name}: invalid TOML:", findings.errors[0])
+
+    def test_patch_links_invalid_utf8(self) -> None:
+        """Skip undecodable sidecars while preserving links from valid sidecars."""
+        valid = self.root / "patches" / "0002-valid.toml"
+        valid.write_text(METADATA, encoding="utf-8")
+        self.assertEqual(
+            series.patch_links(self.root, [self.patch.name, valid.with_suffix(".patch").name]),
+            {"0002-valid.patch": ("submitted", "https://example.invalid/pulls/1")},
+        )
+
+    def test_note_metadata_invalid_utf8(self) -> None:
+        """Wrap undecodable note metadata in a sidecar-specific tool error."""
+        with self.assertRaises(series.SeriesError) as caught:
+            series.note_metadata(self.patch)
+        self.assertIn(f"patches/{self.sidecar.name}:", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+
+    def test_load_patch_exceptions_invalid_utf8(self) -> None:
+        """Excuse nothing and report metadata errors for undecodable sidecars."""
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result = series.load_patch_exceptions(self.sidecar, date(2026, 11, 4))
+        self.assertEqual(result, ([], True))
+        self.assertIn(f"{self.sidecar.name}: invalid TOML:", err.getvalue())
+        self.assertIn(f"error: {self.sidecar.name}: 'utf-8'", err.getvalue())
+
+    def test_consumer_stack_invalid_utf8(self) -> None:
+        """Wrap an undecodable consumer listing with its path and decode error."""
+        with unittest.mock.patch.dict("sys.modules", {"series": series}):
+            consumer_stacks = import_module("scripts.consumer_stacks")
+
+        listing = self.root / "series.txt"
+        listing.write_bytes(b"\xff")
+        with self.assertRaises(series.SeriesError) as caught:
+            consumer_stacks.stack(self.root)
+        self.assertIn(f"{listing}:", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+
+    def test_release_sums_invalid_utf8(self) -> None:
+        """Wrap an undecodable checksum listing with its path and decode error."""
+        sums = self.root / "SHA256SUMS"
+        sums.write_bytes(b"\xff")
+        with self.assertRaises(release_guard.GuardError) as caught:
+            release_guard.read_sums(sums)
+        self.assertIn(f"{sums}:", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
 
 
 class ScopeTest(unittest.TestCase):

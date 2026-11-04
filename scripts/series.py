@@ -383,7 +383,7 @@ def check_metadata(path: Path, findings: Findings, today: date | None = None) ->
         today = date.today()
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as exc:
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         findings.error(name, f"invalid TOML: {exc}")
         return
     for key in sorted(set(data) - METADATA_KEYS):
@@ -610,7 +610,7 @@ def patch_links(root: Path, names: list[str]) -> dict[str, tuple[str, str]]:
         sidecar = (root / "patches" / name).with_suffix(".toml")
         try:
             data = tomllib.loads(sidecar.read_text())
-        except (OSError, tomllib.TOMLDecodeError):
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
             continue  # check_metadata() reports it
         status, link = data.get("status"), str(data.get("upstream", ""))
         if status in FORGE_STATES and link.startswith("https://"):
@@ -1123,7 +1123,7 @@ def note_metadata(path: Path) -> dict:
         meta = tomllib.loads(sidecar.read_text())
     except FileNotFoundError:
         raise SeriesError(f"{path.name}: no metadata file patches/{sidecar.name}") from None
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise SeriesError(f"patches/{sidecar.name}: {exc}") from exc
     if "status" not in meta:
         raise SeriesError(f"patches/{sidecar.name}: no status")
@@ -1447,7 +1447,7 @@ def load_patch_exceptions(sidecar: Path, today: date) -> tuple[list[dict], bool]
             print(f"error: {err}", file=sys.stderr)
     try:
         data = tomllib.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         # An unreadable sidecar excuses nothing and fails the gate.
         print(f"error: {sidecar.name}: {exc}", file=sys.stderr)
         return [], True
