@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
 #
-# The consumers apply their own FFmpeg patch stacks on top of this series:
-# VMAFx/vmafx and VMAFx/pelorus, each from ffmpeg-patches/series.txt on its
-# default branch. This run applies the series on the pinned base, then each
+# The consumers apply their own FFmpeg patch stacks on top of this series,
+# each from ffmpeg-patches/series.txt on its default branch. The job's
+# CONSUMERS map is the one place to add a consumer; the owner follows this
+# repository's owner, so forks use their own consumers.
+# This run applies the series on the pinned base, then each
 # consumer stack on top, the way their builds do. A handed-over patch passes
 # only when a series patch declares its consumer and covers all its added
 # lines, and the consumer's pinned tag does not yet contain that series patch;
@@ -47,6 +49,10 @@ jobs:
     name: consumer stacks (vmafx · pelorus) on the series
     runs-on: ubuntu-26.04
     timeout-minutes: 20
+    env:
+      CONSUMER_OWNER: ${{ github.repository_owner }}
+      CONSUMERS: >-
+        vmafx:FFMPEG_FIX_SERIES_TAG pelorus:FFMPEG_SERIES_TAG
     steps:
       - name: Stop on a draft pull request
         if: github.event.pull_request.draft == true
@@ -96,13 +102,24 @@ jobs:
       - name: Fetch the consumer stacks
         if: github.event.pull_request.draft != true
         run: |
-          for consumer in vmafx pelorus; do
+          read -r -a entries <<< "$CONSUMERS"
+          for entry in "${entries[@]}"; do
+            consumer=${entry%%:*}
+            variable=${entry#*:}
+            if ! [[ "$consumer" =~ ^[a-z][a-z0-9-]{0,38}$ ]] \
+              || ! [[ "$variable" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]]; then
+              echo "::error::invalid consumer map entry: $entry"
+              exit 1
+            fi
+          done
+          for entry in "${entries[@]}"; do
+            consumer=${entry%%:*}
             branch=()
             if [ "$consumer" = pelorus ] && [ -n "$PELORUS_REF" ]; then
               branch=(--branch "$PELORUS_REF")
             fi
             git clone -q --depth=1 --filter=blob:none --sparse "${branch[@]}" \
-              "https://github.com/VMAFx/${consumer}.git" "consumers/${consumer}"
+              "https://github.com/${CONSUMER_OWNER}/${consumer}.git" "consumers/${consumer}"
             git -C "consumers/${consumer}" sparse-checkout set ffmpeg-patches
             # Cone mode keeps root files, including the consumer's series pin.
             test -f "consumers/${consumer}/build-config.env"
@@ -112,11 +129,10 @@ jobs:
       - name: Read the consumer series pins
         if: github.event.pull_request.draft != true
         run: |
-          for consumer in vmafx pelorus; do
-            case "$consumer" in
-              vmafx) variable=FFMPEG_FIX_SERIES_TAG ;;
-              pelorus) variable=FFMPEG_SERIES_TAG ;;
-            esac
+          read -r -a entries <<< "$CONSUMERS"
+          for entry in "${entries[@]}"; do
+            consumer=${entry%%:*}
+            variable=${entry#*:}
             tag=$(grep -E "^${variable}=" "consumers/${consumer}/build-config.env")
             tag=${tag#*=}
             tag=${tag//\"/}
@@ -125,14 +141,24 @@ jobs:
               echo "::error::${consumer} series pin is not a vMAJOR.MINOR.PATCH tag"
               exit 1
             fi
-            printf '%s_SERIES_TAG=%s\n' "${consumer^^}" "$tag" >> "$GITHUB_ENV"
+            key=${consumer^^}
+            key=${key//-/_}_SERIES_TAG
+            printf '%s=%s\n' "$key" "$tag" >> "$GITHUB_ENV"
           done
       - name: Apply each consumer stack on top of the series
         if: github.event.pull_request.draft != true
         run: |
-          python3 scripts/consumer_stacks.py ffmpeg \
-            vmafx=consumers/vmafx/ffmpeg-patches \
-            pelorus=consumers/pelorus/ffmpeg-patches \
-            --series-dir . \
-            --pin "vmafx=$VMAFX_SERIES_TAG" --pin "pelorus=$PELORUS_SERIES_TAG" \
+          read -r -a entries <<< "$CONSUMERS"
+          stacks=()
+          pins=()
+          for entry in "${entries[@]}"; do
+            consumer=${entry%%:*}
+            key=${consumer^^}
+            key=${key//-/_}_SERIES_TAG
+            tag=${!key}
+            stacks+=("${consumer}=consumers/${consumer}/ffmpeg-patches")
+            pins+=(--pin "${consumer}=$tag")
+          done
+          python3 scripts/consumer_stacks.py ffmpeg "${stacks[@]}" \
+            --series-dir . "${pins[@]}" \
             --report "$GITHUB_STEP_SUMMARY"

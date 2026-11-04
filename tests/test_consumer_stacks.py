@@ -10,9 +10,10 @@ import os
 import subprocess  # nosec B404 - fixed bash argv runs a test fixture script.
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -319,33 +320,84 @@ class ConsumerStacksTest(unittest.TestCase):
         self.assertEqual(out.count("applied"), 1)
 
 
-class ConsumerPinWorkflowTest(unittest.TestCase):
-    """Execute the workflow's pin-reader shell verbatim against local consumer files."""
+class ConsumerWorkflowFixture(unittest.TestCase):
+    """Run workflow scripts verbatim with local files and inert command stubs."""
 
     def setUp(self) -> None:
+        """Load workflow steps and prepare local files and command stubs."""
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
         self.env_file = self.root / "env"
         workflow = Path(__file__).resolve().parent.parent / ".github/workflows/consumers.yml"
-        step = workflow.read_text().split("      - name: Read the consumer series pins\n")[1]
-        self.script = textwrap.dedent(step.split("        run: |\n")[1].split("      - ")[0])
-        for name in ("vmafx", "pelorus"):
-            (self.root / "consumers" / name).mkdir(parents=True)
+        self.job = yaml.safe_load(workflow.read_text())["jobs"]["consumers"]
+        self.steps = {step["name"]: step["run"] for step in self.job["steps"] if "run" in step}
+        self.workflow_env = self.job.get("env", {})
+        self.summary = self.root / "step summary.md"
+        self.argv_log = self.root / "argv"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.environment = {
+            **os.environ,
+            **self.workflow_env,
+            "GITHUB_ENV": str(self.env_file),
+            "GITHUB_STEP_SUMMARY": str(self.summary),
+            "ARGV_LOG": str(self.argv_log),
+            "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+            "PELORUS_REF": "",
+        }
 
-    def read_pins(self, vmafx: str, pelorus: str) -> subprocess.CompletedProcess[str]:
-        for name, value in (("vmafx", vmafx), ("pelorus", pelorus)):
-            (self.root / "consumers" / name / "build-config.env").write_text(value)
-        self.env_file.write_text("")
-        return subprocess.run(  # nosec B603 B607 - fixed bash argv executes a test fixture script.
-            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.script],
+    def stub(self, name: str, body: str = "") -> None:
+        """Record each invocation as NUL-separated arguments without executing it."""
+        path = self.bin / name
+        path.write_text(
+            '#!/bin/bash\nprintf "%s\\0" "$@" >> "$ARGV_LOG"\nprintf "\\0" >> "$ARGV_LOG"\n' + body
+        )
+        path.chmod(0o755)
+
+    def calls(self) -> list[list[str]]:
+        """Read all stub invocations, preserving spaces and argument order."""
+        return [call.split("\0") for call in self.argv_log.read_text().split("\0\0") if call]
+
+    def run_step(
+        self, name: str, environment: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute one extracted step with a deadline and fixture-only overrides."""
+        return subprocess.run(  # nosec B603 B607 - fixed bash executes the local workflow script.
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.steps[name]],
             cwd=self.root,
-            env={**os.environ, "GITHUB_ENV": str(self.env_file)},
+            env={**self.environment, **(environment or {})},
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
         )
+
+
+class ConsumerPinWorkflowTest(ConsumerWorkflowFixture):
+    """Execute the workflow's pin-reader shell verbatim against local consumer files."""
+
+    def setUp(self) -> None:
+        """Prepare directories for both default consumers' pin files."""
+        super().setUp()
+        for name in ("vmafx", "pelorus"):
+            (self.root / "consumers" / name).mkdir(parents=True)
+
+    def read_pins(self, vmafx: str, pelorus: str) -> subprocess.CompletedProcess[str]:
+        """Write both consumer configurations and execute the pin reader."""
+        for name, value in (("vmafx", vmafx), ("pelorus", pelorus)):
+            (self.root / "consumers" / name / "build-config.env").write_text(value)
+        self.env_file.write_text("")
+        return self.run_step("Read the consumer series pins")
+
+    def test_pin_reader_uses_added_consumers_variable(self) -> None:
+        """An added map entry supplies its own pin variable without a case branch."""
+        root = self.root / "consumers" / "third"
+        root.mkdir()
+        (root / "build-config.env").write_text("UNRELATED=v9.9.9\nTHIRD_PIN=v7.8.9\n")
+        done = self.run_step("Read the consumer series pins", {"CONSUMERS": "third:THIRD_PIN"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.env_file.read_text(), "THIRD_SERIES_TAG=v7.8.9\n")
 
     def test_pin_reader_keeps_each_consumers_value_and_strips_quotes(self) -> None:
         for quote in ('"', "'", ""):
@@ -383,6 +435,156 @@ class ConsumerPinWorkflowTest(unittest.TestCase):
             with self.subTest(missing=missing):
                 done = self.read_pins("FFMPEG_FIX_SERIES_TAG=v1.2.3\n", missing)
                 self.assertNotEqual(done.returncode, 0)
+
+
+class ConsumerMapWorkflowTest(ConsumerWorkflowFixture):
+    """Keep consumer configuration centralized and execute the fetch/apply contracts."""
+
+    fetch_step = "Fetch the consumer stacks"
+    pin_step = "Read the consumer series pins"
+    apply_step = "Apply each consumer stack on top of the series"
+
+    def test_hyphenated_consumer_pin_reaches_apply(self) -> None:
+        """A hyphenated consumer shares a valid environment key across both steps."""
+        root = self.root / "consumers" / "foo-bar"
+        root.mkdir(parents=True)
+        (root / "build-config.env").write_text("FOO_TAG=v1.2.3\n")
+        environment = {"CONSUMERS": "foo-bar:FOO_TAG"}
+        pinned = self.run_step(self.pin_step, environment)
+        self.assertEqual(pinned.returncode, 0, pinned.stderr)
+        self.assertEqual(self.env_file.read_text(), "FOO_BAR_SERIES_TAG=v1.2.3\n")
+        environment.update(line.split("=", 1) for line in self.env_file.read_text().splitlines())
+        self.stub("python3")
+        applied = self.run_step(self.apply_step, environment)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(
+            self.calls(),
+            [
+                [
+                    "scripts/consumer_stacks.py",
+                    "ffmpeg",
+                    "foo-bar=consumers/foo-bar/ffmpeg-patches",
+                    "--series-dir",
+                    ".",
+                    "--pin",
+                    "foo-bar=v1.2.3",
+                    "--report",
+                    str(self.summary),
+                ]
+            ],
+        )
+
+    def test_owner_defaults_to_repository_owner(self) -> None:
+        """Forks resolve consumer repositories under their own owner by default."""
+        self.assertEqual(self.workflow_env.get("CONSUMER_OWNER"), "${{ github.repository_owner }}")
+
+    def test_consumer_steps_share_the_job_map(self) -> None:
+        """All three scripts use the map without a fixed owner or consumer loop."""
+        self.assertTrue(self.workflow_env.get("CONSUMERS"))
+        for name in (self.fetch_step, self.pin_step, self.apply_step):
+            with self.subTest(step=name):
+                script = self.steps[name]
+                self.assertRegex(script, r"\$(?:CONSUMERS\b|\{CONSUMERS\})")
+                self.assertNotIn("VMAFx/", script)
+                self.assertNotIn("vmafx pelorus", script)
+
+    def test_apply_preserves_map_order_and_argument_boundaries(self) -> None:
+        """One and three consumers each produce ordered stack and pin arguments."""
+        self.stub("python3")
+        consumers = (("delta", "v1.2.3"), ("alpha", "v4.5.6"), ("omega", "v7.8.9"))
+        for count in (1, 3):
+            with self.subTest(count=count):
+                self.argv_log.unlink(missing_ok=True)
+                selected = consumers[:count]
+                environment = {f"{name.upper()}_SERIES_TAG": tag for name, tag in selected}
+                environment["CONSUMERS"] = " ".join(
+                    f"{name}:PIN_{name.upper()}" for name, _ in selected
+                )
+                done = self.run_step(self.apply_step, environment)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                expected = ["scripts/consumer_stacks.py", "ffmpeg"]
+                expected += [f"{name}=consumers/{name}/ffmpeg-patches" for name, _ in selected]
+                expected += ["--series-dir", "."]
+                expected += [arg for name, tag in selected for arg in ("--pin", f"{name}={tag}")]
+                expected += ["--report", str(self.summary)]
+                self.assertEqual(self.calls(), [expected])
+
+    def stub_git(self) -> None:
+        """Create only the checkout root and pin file needed by the fetch script."""
+        self.stub(
+            "git",
+            'if [ "$1" = clone ]; then\n'
+            '  mkdir -p "${@: -1}"\n'
+            '  : > "${@: -1}/build-config.env"\n'
+            "fi\n",
+        )
+
+    def test_fetch_refuses_malformed_map_before_any_git_call(self) -> None:
+        """Malformed entries fail even after a valid entry, before Git executes."""
+        self.stub_git()
+        malformed = (
+            "Vmafx:X",
+            "vmafx",
+            "vmafx:lower",
+            "a;b:X",
+            ":X",
+            "vmafx:",
+            f"{'a' * 40}:X",
+            f"a:{'A' * 65}",
+            "a:X:Y",
+        )
+        for entry in malformed:
+            for prefix in ("", "valid:PIN "):
+                with self.subTest(entry=entry, prefix=prefix):
+                    self.argv_log.unlink(missing_ok=True)
+                    done = self.run_step(self.fetch_step, {"CONSUMERS": prefix + entry})
+                    self.assertNotEqual(done.returncode, 0)
+                    self.assertIn("::error::", done.stdout)
+                    self.assertFalse(self.argv_log.exists())
+
+    def test_fetch_uses_owner_and_keeps_pelorus_dispatch_ref(self) -> None:
+        """Clone URLs follow the owner and only Pelorus receives the dispatch ref."""
+        self.stub_git()
+        for ref in ("", "ci/consumer"):
+            with self.subTest(ref=ref):
+                self.argv_log.unlink(missing_ok=True)
+                done = self.run_step(
+                    self.fetch_step, {"CONSUMER_OWNER": "example-fork", "PELORUS_REF": ref}
+                )
+                self.assertEqual(done.returncode, 0, done.stderr)
+                clones = [call for call in self.calls() if call[0] == "clone"]
+                names = [entry.split(":")[0] for entry in self.workflow_env["CONSUMERS"].split()]
+                expected = []
+                for name in names:
+                    branch = ["--branch", ref] if name == "pelorus" and ref else []
+                    expected.append(
+                        [
+                            "clone",
+                            "-q",
+                            "--depth=1",
+                            "--filter=blob:none",
+                            "--sparse",
+                            *branch,
+                            f"https://github.com/example-fork/{name}.git",
+                            f"consumers/{name}",
+                        ]
+                    )
+                self.assertEqual(clones, expected)
+
+    def test_fetch_accepts_name_and_variable_length_boundaries(self) -> None:
+        """Minimal and maximum-length map fields pass validation and reach Git."""
+        self.stub_git()
+        for name, variable in (("a", "X"), ("a" + "b" * 38, "A" + "B" * 63)):
+            with self.subTest(name=name, variable=variable):
+                self.argv_log.unlink(missing_ok=True)
+                done = self.run_step(
+                    self.fetch_step,
+                    {"CONSUMERS": f"{name}:{variable}", "CONSUMER_OWNER": "boundary-fork"},
+                )
+                self.assertEqual(done.returncode, 0, done.stderr)
+                clones = [call for call in self.calls() if call[0] == "clone"]
+                self.assertEqual(len(clones), 1)
+                self.assertEqual(clones[0][-2], f"https://github.com/boundary-fork/{name}.git")
 
 
 if __name__ == "__main__":
