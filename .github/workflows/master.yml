@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
-      FFMPEG_FORGE: https://code.ffmpeg.org/FFmpeg/FFmpeg.git
+      FFMPEG_FORGE: ${{ vars.FFMPEG_FORGEJO_HOST || 'https://code.ffmpeg.org' }}/${{ vars.FFMPEG_FORGEJO_REPO || 'FFmpeg/FFmpeg' }}.git
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

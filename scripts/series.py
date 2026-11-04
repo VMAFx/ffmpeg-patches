@@ -63,6 +63,11 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
+try:
+    import forge_settings
+except ModuleNotFoundError:
+    from scripts import forge_settings
+
 ROOT = Path(__file__).resolve().parent.parent
 BASE_KEYS = ("FFMPEG_REMOTE", "FFMPEG_TAG", "FFMPEG_COMMIT")
 STATUSES = ("unsubmitted", "submitted", "merged", "rejected")
@@ -91,7 +96,6 @@ REQUIRED_EXCEPTION_KEYS = {
 VALID_CATEGORIES = {"A", "B", "C", "D"}
 CATEGORY_INTERVALS = {"B": 3, "C": 10, "D": 120}
 DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-PULL_URL = re.compile(r"(https://code\.ffmpeg\.org)/([^/]+)/([^/]+)/pulls/(\d+)")
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -137,6 +141,14 @@ Results = list[tuple[str, str]]
 
 class SeriesError(Exception):
     """The series or the FFmpeg checkout is unusable; main() exits 2."""
+
+
+def pull_url_pattern() -> re.Pattern[str]:
+    """Resolve forge settings lazily and report invalid settings as tool errors."""
+    try:
+        return forge_settings.pull_url_pattern()
+    except ValueError as exc:
+        raise SeriesError(str(exc)) from exc
 
 
 @dataclass
@@ -389,8 +401,10 @@ def check_covered_by(data: dict, name: str, findings: Findings) -> None:
     if data.get("status") != "unsubmitted":
         findings.error(name, "covered_by is allowed only with status unsubmitted")
     url = data["covered_by"]
-    if not isinstance(url, str) or not PULL_URL.fullmatch(url):
-        findings.error(name, "covered_by must be a pull request URL of code.ffmpeg.org")
+    if not isinstance(url, str) or not pull_url_pattern().fullmatch(url):
+        findings.error(
+            name, f"covered_by must be a pull request URL of {forge_settings.keyring_service()}"
+        )
 
 
 def check_master_form(form: object, name: str, findings: Findings) -> None:
@@ -1600,6 +1614,7 @@ def main(argv: list[str]) -> int:
     """Exit 0 on success, 1 on findings or a failed apply, 2 when the tool cannot run."""
     args = parse_args(argv)
     try:
+        pull_url_pattern()
         return run(args)
     except (SeriesError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         detail = getattr(exc, "stderr", None) or ""

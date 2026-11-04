@@ -14,7 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import upstream_drift  # noqa: E402
-from test_series import Fixture  # noqa: E402
+
+from tests.test_series import Fixture  # noqa: E402
 
 FORGE = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/"
 API = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg/pulls/"
