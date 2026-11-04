@@ -113,7 +113,7 @@ def _lookup_keyring_token(service: str) -> str:
             check=False,
         )
         token = proc.stdout.strip()
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
             f"failed to read keyring token for {service} (set FFMPEG_FORGEJO_LOGIN): {exc}"
         ) from exc
@@ -134,7 +134,7 @@ def _fetch_user_login(base_url: str, token: str) -> str:
     try:
         with urllib.request.urlopen(req, timeout=10) as response:  # nosec B310 - forge API URL
             payload = json.loads(response.read().decode("utf-8"))
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         raise RuntimeError(
             f"failed to fetch /user from {url} (set FFMPEG_FORGEJO_LOGIN): {exc}"
         ) from exc

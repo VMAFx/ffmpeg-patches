@@ -121,22 +121,82 @@ class FairyUnansweredTest(unittest.TestCase):
             self.assertEqual(fairy.self_test(), 1)
         self.assertIn("self-test FAIL owed", errors.getvalue())
 
+    def test_owed_requires_login_and_bot(self):
+        """Omitting either identity raises TypeError without credential discovery."""
+        with unittest.mock.patch.object(
+            fairy.forge_settings, "login", side_effect=AssertionError("login forbidden")
+        ) as login:
+            with self.assertRaises(TypeError):
+                fairy.owed([], [], bot="Forgejo_Fairy")
+            with self.assertRaises(TypeError):
+                fairy.owed([], [], login="lusoris")
+        login.assert_not_called()
+
+    def test_discovery_requires_login(self):
+        """Discovery helpers reject omitted logins before any external access."""
+        with unittest.mock.patch.object(
+            fairy.forge_settings, "login", side_effect=AssertionError("login forbidden")
+        ) as login:
+            for discover in (fairy.discover_threads, fairy.commented_numbers):
+                with self.subTest(discover=discover.__name__), self.assertRaises(TypeError):
+                    discover()
+        login.assert_not_called()
+
+    def test_discovery_never_resolves_passed_login(self):
+        """Explicit identities bypass login, keyring and network discovery."""
+        with (
+            unittest.mock.patch.object(
+                fairy.forge_settings, "login", side_effect=AssertionError("login forbidden")
+            ) as login,
+            unittest.mock.patch.object(
+                fairy.forge_settings,
+                "_lookup_keyring_token",
+                side_effect=AssertionError("keyring forbidden"),
+            ) as keyring,
+            unittest.mock.patch.object(fairy, "paginated", return_value=[]),
+        ):
+            for who in ("other_user", ""):
+                with self.subTest(login=who):
+                    self.assertEqual(fairy.discover_threads(who), {})
+            login.assert_not_called()
+            keyring.assert_not_called()
+
+    def test_feed_uses_api_base_and_login_without_global_override(self):
+        """Activity feed URLs derive directly from the API base and explicit login."""
+        with (
+            unittest.mock.patch.object(
+                fairy.forge_settings, "api_base", return_value="https://custom.forge/api/v1"
+            ),
+            unittest.mock.patch.object(fairy, "paginated", return_value=[]) as pages,
+        ):
+            self.assertEqual(fairy.commented_numbers("other_user"), set())
+        pages.assert_called_once_with(
+            "https://custom.forge/api/v1/users/other_user/activities/feeds?only-performed-by=true",
+            max_pages=10,
+            older="comments",
+        )
+        self.assertFalse(hasattr(fairy, "FEED"))
+
     def test_pending_fairy_review_ignored(self):
         """An unsubmitted Fairy draft with a body creates no reply obligation."""
         review = dict(_word(), state="PENDING", submitted_at=None)
-        self.assertEqual(fairy.owed([], [review]), ("", "", False))
+        self.assertEqual(fairy.owed([], [review], "lusoris", "Forgejo_Fairy"), ("", "", False))
 
     def test_pending_lusoris_review_ignored(self):
         """An unsubmitted reply cannot clear an outstanding Fairy comment."""
         review = dict(_word("lusoris"), state="PENDING", submitted_at=None)
-        self.assertEqual(fairy.owed([_word()], [review]), (NEW, "", True))
+        self.assertEqual(
+            fairy.owed([_word()], [review], "lusoris", "Forgejo_Fairy"), (NEW, "", True)
+        )
 
     def test_unknown_review_state_ignored(self):
         """Unknown and null review states are silent even with a timestamp."""
         for state in ("FOO", None, "REQUEST_REVIEW"):
             with self.subTest(state=state):
                 review = dict(_word(), state=state)
-                self.assertEqual(fairy.owed([], [review]), ("", "", False))
+                self.assertEqual(
+                    fairy.owed([], [review], "lusoris", "Forgejo_Fairy"), ("", "", False)
+                )
 
     def test_submitted_review_invalid_timestamp_reported(self):
         """Counted states reject non-string timestamps, including approve-only bodies."""
@@ -146,7 +206,7 @@ class FairyUnansweredTest(unittest.TestCase):
                 with self.subTest(body=body, timestamp=timestamp):
                     review = dict(_word(), body=body, submitted_at=timestamp)
                     with self.assertRaises((TypeError, ValueError)):
-                        fairy.owed([], [review])
+                        fairy.owed([], [review], "lusoris", "Forgejo_Fairy")
                     output, errors = io.StringIO(), io.StringIO()
                     with (
                         unittest.mock.patch.object(
@@ -167,8 +227,13 @@ class FairyUnansweredTest(unittest.TestCase):
         for state in ("APPROVED", "COMMENT", "REQUEST_CHANGES"):
             with self.subTest(state=state):
                 review = dict(_word(), state=state)
-                self.assertEqual(fairy.owed([], [review]), (NEW, "", True))
-                self.assertEqual(fairy.owed([], [dict(review, submitted_at="")]), ("", "", False))
+                self.assertEqual(
+                    fairy.owed([], [review], "lusoris", "Forgejo_Fairy"), (NEW, "", True)
+                )
+                self.assertEqual(
+                    fairy.owed([], [dict(review, submitted_at="")], "lusoris", "Forgejo_Fairy"),
+                    ("", "", False),
+                )
 
     def test_mixed_thread_discovery(self):
         """Dedupe own and commented threads; skip closed/404; review only PRs."""
@@ -238,8 +303,9 @@ class FairyUnansweredTest(unittest.TestCase):
     def test_main_refused_feed_url_reported(self):
         """Refused feed URLs fail distinctly from malformed JSON before network I/O."""
         read_pages = fairy.paginated
-        for url in ("http://code.ffmpeg.org/activities", "https://evil.example/activities"):
-            with self.subTest(url=url):
+        for base in ("http://code.ffmpeg.org/api/v1", "https://evil.example/api/v1"):
+            with self.subTest(base=base):
+                url = f"{base}/users/lusoris/activities/feeds"
                 output, errors = io.StringIO(), io.StringIO()
 
                 def pages(path, feed_url=url, **kwargs):
@@ -248,7 +314,7 @@ class FairyUnansweredTest(unittest.TestCase):
 
                 with (
                     unittest.mock.patch.object(fairy, "discover_page_size", return_value=50),
-                    unittest.mock.patch.object(fairy, "FEED", url),
+                    unittest.mock.patch.object(fairy.forge_settings, "api_base", return_value=base),
                     unittest.mock.patch.object(fairy, "paginated", side_effect=pages),
                     unittest.mock.patch.object(fairy.urllib.request, "urlopen") as request,
                     contextlib.redirect_stdout(output),
@@ -287,7 +353,7 @@ class FairyUnansweredTest(unittest.TestCase):
                         "/issues/3": issue,
                     }
                     with unittest.mock.patch.object(fairy, "get", side_effect=routes.__getitem__):
-                        self.assertEqual(fairy.discover_threads(), {3: expected})
+                        self.assertEqual(fairy.discover_threads("lusoris"), {3: expected})
 
     def test_feed_page_boundary(self):
         """Only a full tenth page warns that older comments were not read."""
@@ -301,7 +367,7 @@ class FairyUnansweredTest(unittest.TestCase):
                     unittest.mock.patch.object(fairy, "get", side_effect=pages) as request,
                     contextlib.redirect_stderr(errors),
                 ):
-                    self.assertEqual(fairy.commented_numbers(), {3, 4})
+                    self.assertEqual(fairy.commented_numbers("lusoris"), {3, 4})
                 self.assertEqual(request.call_count, 10)
                 expected_urls = [
                     f"{FEED}?only-performed-by=true&limit=50&page={page}" for page in range(1, 11)
@@ -329,7 +395,7 @@ class FairyUnansweredTest(unittest.TestCase):
             unittest.mock.patch.object(fairy, "get", return_value=rows),
             contextlib.redirect_stderr(errors),
         ):
-            self.assertEqual(fairy.commented_numbers(), {4})
+            self.assertEqual(fairy.commented_numbers("lusoris"), {4})
         for row in bad:
             self.assertIn(repr(row), errors.getvalue())
         self.assertEqual(len(errors.getvalue().splitlines()), len(bad))
@@ -453,7 +519,9 @@ class FairyUnansweredTest(unittest.TestCase):
         """Compare timestamps by UTC datetime rather than lexicographic string order."""
         fairy_word = _word("Forgejo_Fairy", "2026-11-03T10:00:00+02:00")
         mine_word = _word("lusoris", "2026-11-03T09:00:00Z")
-        fairy_ts, mine_ts, owed = fairy.owed([fairy_word, mine_word], [])
+        fairy_ts, mine_ts, owed = fairy.owed(
+            [fairy_word, mine_word], [], "lusoris", "Forgejo_Fairy"
+        )
         self.assertEqual(fairy_ts, "2026-11-03T10:00:00+02:00")
         self.assertEqual(mine_ts, "2026-11-03T09:00:00Z")
         self.assertFalse(owed)

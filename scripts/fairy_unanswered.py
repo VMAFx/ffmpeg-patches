@@ -21,7 +21,6 @@ except ModuleNotFoundError:
 API = f"{forge_settings.api_base()}/repos/{forge_settings.REPO}"
 API_HOST = forge_settings.keyring_service()
 SETTINGS = f"{forge_settings.api_base()}/settings/api"
-FEED = None
 PAGE_CACHE = {}
 
 
@@ -120,10 +119,9 @@ def activity_number(row):
         return None
 
 
-def commented_numbers(login=None):
+def commented_numbers(login):
     """Return thread numbers from at most ten pages of own activities."""
-    who = login or forge_settings.login()
-    feed = FEED if FEED is not None else f"{forge_settings.api_base()}/users/{who}/activities/feeds"
+    feed = f"{forge_settings.api_base()}/users/{login}/activities/feeds"
     rows = paginated(feed + "?only-performed-by=true", max_pages=10, older="comments")
     return {number for row in rows if (number := activity_number(row)) is not None}
 
@@ -147,22 +145,21 @@ def _open_issue_kind(number):
     return thread_kind(issue) if issue["state"] == "open" else None
 
 
-def discover_threads(login=None):
+def discover_threads(login):
     """Dedupe own open PRs/issues and open threads found through comment activity."""
-    who = login or forge_settings.login()
-    pulls = paginated(f"/pulls?state=open&poster={who}")
+    pulls = paginated(f"/pulls?state=open&poster={login}")
     threads = {}
     for p in pulls:
         if not isinstance(p, dict):
             raise TypeError("expected a dict for pull")
-        if p["user"]["login"] == who:
+        if p["user"]["login"] == login:
             threads[p["number"]] = "pr"
-    issues = paginated(f"/issues?type=issues&state=open&created_by={who}")
+    issues = paginated(f"/issues?type=issues&state=open&created_by={login}")
     for issue in issues:
         if not isinstance(issue, dict):
             raise TypeError("expected a dict for issue")
         threads.setdefault(issue["number"], thread_kind(issue))
-    for number in sorted(commented_numbers(who) - threads.keys()):
+    for number in sorted(commented_numbers(login) - threads.keys()):
         if (kind := _open_issue_kind(number)) is not None:
             threads[number] = kind
     return threads
@@ -218,30 +215,24 @@ def _submitted_review(review):
     return bool(timestamp)
 
 
-def owed(comments, reviews, login=None, bot=None):
+def owed(comments, reviews, login, bot):
     """Return the newest Fairy word, newest user word, and whether a reply is owed."""
     if not isinstance(comments, list):
         raise TypeError("expected a list of comments")
     if not isinstance(reviews, list):
         raise TypeError("expected a list of reviews")
-    bot_login = bot or forge_settings.BOT_REVIEWER
-    try:
-        user_login = login or forge_settings.login()
-    except Exception:
-        user_login = "lusoris"
     words = [
         r
         for r in reviews
-        if _submitted_review(r)
-        and not (r["user"]["login"] == bot_login and approve_only(r.get("body")))
+        if _submitted_review(r) and not (r["user"]["login"] == bot and approve_only(r.get("body")))
     ]
     fairy = _newest_ts(
-        latest(words, bot_login, lambda r: r["submitted_at"]),
-        latest(comments, bot_login, lambda c: c["created_at"]),
+        latest(words, bot, lambda r: r["submitted_at"]),
+        latest(comments, bot, lambda c: c["created_at"]),
     )
     mine = _newest_ts(
-        latest(words, user_login, lambda r: r["submitted_at"]),
-        latest(comments, user_login, lambda c: c["created_at"]),
+        latest(words, login, lambda r: r["submitted_at"]),
+        latest(comments, login, lambda c: c["created_at"]),
     )
     unanswered = bool(fairy and (not mine or _parse_time(fairy) > _parse_time(mine)))
     return fairy, mine, unanswered
@@ -307,9 +298,9 @@ def self_test():
     for b, want in bad:
         print(f"self-test FAIL want={want}: {b[:60]!r}", file=sys.stderr)
     owed_bad = [
-        (want, owed(comments, reviews))
+        (want, actual)
         for comments, reviews, want in _owed_fixtures(head)
-        if owed(comments, reviews) != want
+        if (actual := owed(comments, reviews, "lusoris", "Forgejo_Fairy")) != want
     ]
     for want, actual in owed_bad:
         print(f"self-test FAIL owed want={want!r} actual={actual!r}", file=sys.stderr)

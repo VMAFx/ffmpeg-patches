@@ -42,6 +42,7 @@ usage_error() { printf 'ffmpeg-forgejo: usage: %s\n' "$*" >&2; exit 64; }
 
 HOST="${FFMPEG_FORGEJO_HOST:-https://code.ffmpeg.org}"
 case "$HOST" in
+  *\?*|*\#*) die "invalid FFMPEG_FORGEJO_HOST (query/fragment forbidden): $HOST" ;;
   https://*/*) die "invalid FFMPEG_FORGEJO_HOST (path or trailing slash forbidden): $HOST" ;;
   https://*)   ;;
   *)           die "invalid FFMPEG_FORGEJO_HOST (scheme must be https): $HOST" ;;

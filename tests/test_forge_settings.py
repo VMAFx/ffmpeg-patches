@@ -8,6 +8,7 @@ import io
 import json
 import os
 import subprocess  # nosec B404 - fixed ffmpeg-forgejo invocation in test fixtures.
+import tempfile
 import unittest
 import unittest.mock
 import urllib.error
@@ -20,7 +21,7 @@ FORBIDDEN_LITERALS = ("code.ffmpeg.org", "FFmpeg/FFmpeg", "Forgejo_Fairy", "luso
 PERMITTED_SCRIPT_LINES = {
     (
         "scripts/fairy_unanswered.py",
-        '        user_login = "lusoris"',
+        '        if (actual := owed(comments, reviews, "lusoris", "Forgejo_Fairy")) != want',
     ),
     (
         "scripts/fairy_unanswered.py",
@@ -54,6 +55,40 @@ PERMITTED_SCRIPT_LINES = {
         'BOT_REVIEWER="${FFMPEG_FORGEJO_BOT_REVIEWER:-Forgejo_Fairy}"',
     ),
 }
+
+
+def setUpModule() -> None:
+    """Reject unmocked network access throughout the forge settings fixtures."""
+    for target, name in (
+        (forge_settings.urllib.request, "urlopen"),
+        (forge_settings.urllib.request.AbstractHTTPHandler, "do_open"),
+    ):
+        guard = unittest.mock.patch.object(
+            target, name, side_effect=AssertionError("network forbidden")
+        )
+        guard.start()
+        unittest.addModuleCleanup(guard.stop)
+
+
+def _run_ffmpeg_forgejo_host(host: str) -> subprocess.CompletedProcess[str]:
+    """Run host validation through the offline review-summary entry point."""
+    with tempfile.TemporaryDirectory() as scratch:
+        reviews = Path(scratch) / "reviews.json"
+        reviews.write_text("[]", encoding="utf-8")
+        return subprocess.run(  # nosec B603 B607 - fixed offline helper invocation in test.
+            [
+                "bash",
+                str(ROOT / "scripts" / "ffmpeg-forgejo"),
+                "fairy-reviews",
+                "--from-json",
+                str(reviews),
+            ],
+            env=dict(os.environ, FFMPEG_FORGEJO_HOST=host),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
 
 
 class ForgeSettingsPositiveTest(unittest.TestCase):
@@ -115,17 +150,10 @@ class ForgeSettingsPositiveTest(unittest.TestCase):
             self.assertIn("/issues?type=issues&state=open&created_by=other_user", calls)
 
     def test_ffmpeg_forgejo_host_env_override(self) -> None:
-        """FFmpeg-forgejo bash helper adopts FFMPEG_FORGEJO_HOST."""
-        env = dict(os.environ, FFMPEG_FORGEJO_HOST="https://custom.forge")
-        proc = subprocess.run(  # nosec B603 B607 - fixed helper invocation in test.
-            ["bash", str(ROOT / "scripts" / "ffmpeg-forgejo"), "fairy-reviews"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        self.assertIn("custom.forge", proc.stderr)
+        """FFmpeg-forgejo accepts a valid host override without online discovery."""
+        proc = _run_ffmpeg_forgejo_host("https://custom.forge")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "0\t-\t-\n")
 
 
 class ForgeSettingsNegativeTest(unittest.TestCase):
@@ -173,11 +201,19 @@ class ForgeSettingsNegativeTest(unittest.TestCase):
         """Missing keyring tokens fail naming FFMPEG_FORGEJO_LOGIN."""
         with (
             unittest.mock.patch.dict(os.environ, {}, clear=True),
-            unittest.mock.patch.object(forge_settings, "_lookup_keyring_token", return_value=""),
+            unittest.mock.patch.object(
+                forge_settings.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+            unittest.mock.patch.object(
+                forge_settings, "_fetch_user_login", side_effect=AssertionError("fetch forbidden")
+            ) as fetch,
         ):
             with self.assertRaises(RuntimeError) as ctx:
                 forge_settings.login()
             self.assertIn("FFMPEG_FORGEJO_LOGIN", str(ctx.exception))
+        fetch.assert_not_called()
 
     def test_user_failure_http_error(self) -> None:
         """HTTP failures during /user discovery name FFMPEG_FORGEJO_LOGIN."""
@@ -205,18 +241,40 @@ class ForgeSettingsNegativeTest(unittest.TestCase):
 
     def test_ffmpeg_forgejo_invalid_host_rejected(self) -> None:
         """FFmpeg-forgejo exits non-zero naming FFMPEG_FORGEJO_HOST on bad URL."""
-        for bad in ("http://insecure.forge", "https://slash.forge/"):
+        for bad in (
+            "http://insecure.forge",
+            "https://slash.forge/",
+            "https://query.forge?x",
+            "https://fragment.forge#x",
+        ):
             with self.subTest(bad=bad):
-                proc = subprocess.run(  # nosec B603 B607 - fixed helper invocation in test.
-                    ["bash", str(ROOT / "scripts" / "ffmpeg-forgejo"), "whoami"],
-                    env=dict(os.environ, FFMPEG_FORGEJO_HOST=bad),
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
+                proc = _run_ffmpeg_forgejo_host(bad)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("FFMPEG_FORGEJO_HOST", proc.stderr)
+
+    def test_keyring_unexpected_errors_propagate(self) -> None:
+        """Programming errors from the mocked keyring subprocess remain visible."""
+        with (
+            unittest.mock.patch.object(
+                forge_settings.subprocess, "run", side_effect=TypeError("planted keyring bug")
+            ) as lookup,
+            self.assertRaisesRegex(TypeError, "planted keyring bug"),
+        ):
+            forge_settings._lookup_keyring_token("forge.invalid")
+        lookup.assert_called_once()
+
+    def test_fetch_unexpected_errors_propagate(self) -> None:
+        """Programming errors from the mocked HTTP transport remain visible."""
+        with (
+            unittest.mock.patch.object(
+                forge_settings.urllib.request,
+                "urlopen",
+                side_effect=TypeError("planted transport bug"),
+            ) as request,
+            self.assertRaisesRegex(TypeError, "planted transport bug"),
+        ):
+            forge_settings._fetch_user_login("https://forge.invalid/api/v1", "fixture-token")
+        request.assert_called_once()
 
 
 class ForgeSettingsBoundaryTest(unittest.TestCase):
