@@ -67,6 +67,15 @@ Pass the reviewed report before positional arguments to both commands (run these
 
 Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`.
 
+### Forge settings
+
+The forge helper scripts share configuration through environment variables, implemented in [scripts/forge_settings.py](scripts/forge_settings.py) and verified by [tests/test_forge_settings.py](tests/test_forge_settings.py):
+
+- `FFMPEG_FORGEJO_HOST`: forge URL (default: `https://code.ffmpeg.org`).
+- `FFMPEG_FORGEJO_REPO`: repository path (default: `FFmpeg/FFmpeg`).
+- `FFMPEG_FORGEJO_BOT_REVIEWER`: bot reviewer login (default: `Forgejo_Fairy`).
+- `FFMPEG_FORGEJO_LOGIN`: user login on the forge; when unset, discovered from `/user` with the keyring token.
+
 ## Upstream contributions
 
 Pull requests on the FFmpeg forge that came out of this series and its
