@@ -14,10 +14,11 @@ import argparse
 import io
 import os
 import re
+import selectors
 import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
-import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -169,30 +170,61 @@ def render_brief(args: argparse.Namespace) -> int:
     return 0
 
 
+def read_runner_output(process: subprocess.Popen[bytes], deadline: float) -> bytes:
+    """Read runner output within the byte limit and monotonic deadline."""
+    if process.stdout is None:
+        raise OSError("runner stdout pipe unavailable")
+    output = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        for _ in range(RUNNER_OUTPUT_LIMIT + 2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise subprocess.TimeoutExpired(process.args, RUNNER_TIMEOUT)
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, RUNNER_TIMEOUT)
+                process.wait(timeout=remaining)
+                return bytes(output)
+            output.extend(chunk)
+            if len(output) > RUNNER_OUTPUT_LIMIT:
+                raise ValueError("output exceeds RUNNER_OUTPUT_LIMIT bytes")
+    raise ValueError("output exceeds RUNNER_OUTPUT_LIMIT bytes")
+
+
+def run_runner(argv: list[str]) -> tuple[bytes, int]:
+    """Run and reap a runner while collecting bounded combined output."""
+    process = subprocess.Popen(  # nosec B603 - configured runner path, explicit argv, no shell.
+        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL
+    )
+    try:
+        output = read_runner_output(process, time.monotonic() + RUNNER_TIMEOUT)
+        return output, process.returncode
+    finally:
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=5)
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+
 def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
     """Run the lane runner precheck and report its output and result."""
     try:
-        with tempfile.TemporaryFile() as output:
-            result = subprocess.run(  # nosec B603 - configured runner path, explicit argv, no shell.
-                [str(runner), "--check-brief", str(brief), str(worktree)],
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                timeout=RUNNER_TIMEOUT,
-                check=False,
-            )
-            if os.fstat(output.fileno()).st_size > RUNNER_OUTPUT_LIMIT:
-                print(
-                    "lane_brief: runner failed: output exceeds RUNNER_OUTPUT_LIMIT bytes",
-                    file=sys.stderr,
-                )
-                return 2
-            output.seek(0)
-            sys.stderr.write(output.read().decode("utf-8", errors="replace"))
-    except (OSError, subprocess.TimeoutExpired) as error:
+        output, returncode = run_runner([str(runner), "--check-brief", str(brief), str(worktree)])
+    except subprocess.TimeoutExpired:
+        print("lane_brief: runner failed: timed out after RUNNER_TIMEOUT seconds", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as error:
         print(f"lane_brief: runner failed: {error}", file=sys.stderr)
         return 2
-    if result.returncode:
-        print(f"lane_brief: runner refused brief (rc {result.returncode})", file=sys.stderr)
+    sys.stderr.write(output.decode("utf-8", errors="replace"))
+    if returncode:
+        print(f"lane_brief: runner refused brief (rc {returncode})", file=sys.stderr)
         return 1
     return 0
 

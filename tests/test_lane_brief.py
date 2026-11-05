@@ -9,8 +9,10 @@ import io
 import os
 import signal
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import lane_brief
@@ -89,6 +91,12 @@ class LaneBriefTest(unittest.TestCase):
         (self.root / "rc").write_text("0", encoding="utf-8")
         return brief, runner, self.root / "args"
 
+    def test_runner_output_missing_stdout(self) -> None:
+        """Reject a runner without a stdout pipe."""
+        process = SimpleNamespace(stdout=None)
+        with self.assertRaisesRegex(OSError, "runner stdout pipe unavailable"):
+            lane_brief.read_runner_output(process, 0.0)
+
     def test_runner_success_and_arguments(self) -> None:
         """Forward the brief and worktree as exact runner arguments."""
         brief, runner, calls = self.runner_fixture()
@@ -128,6 +136,28 @@ class LaneBriefTest(unittest.TestCase):
         self.assertEqual(
             error, "lane_brief: runner failed: output exceeds RUNNER_OUTPUT_LIMIT bytes\n"
         )
+
+    def test_runner_output_stopped_and_reaped(self) -> None:
+        """Stop and reap a runner as soon as its output exceeds the limit."""
+        brief, runner, _ = self.runner_fixture()
+        pid_file = self.root / "pid"
+        runner.write_text(
+            "#!/bin/sh\n"
+            f"echo $$ > '{pid_file}'\n"
+            "for i in $(seq 1 1000); do printf '%01024d' 0; done\n"
+            "sleep 30\n",
+            encoding="utf-8",
+        )
+        started = time.monotonic()
+        with patch.object(lane_brief, "RUNNER_TIMEOUT", 12):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(rc, 2)
+        self.assertEqual(
+            error, "lane_brief: runner failed: output exceeds RUNNER_OUTPUT_LIMIT bytes\n"
+        )
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text(encoding="utf-8")), 0)
 
     def test_runner_combined_output_over_limit(self) -> None:
         """Count stdout and stderr together against the output limit."""
@@ -195,7 +225,9 @@ class LaneBriefTest(unittest.TestCase):
         with patch.object(lane_brief, "RUNNER_TIMEOUT", 1):
             rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
         self.assertEqual(rc, 2)
-        self.assertIn("lane_brief: runner failed:", error)
+        self.assertEqual(
+            error, "lane_brief: runner failed: timed out after RUNNER_TIMEOUT seconds\n"
+        )
 
     def test_runner_from_environment(self) -> None:
         """Use the environment runner and default worktree when unspecified."""
