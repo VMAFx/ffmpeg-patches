@@ -4,18 +4,23 @@
 """Render or check a lane brief against repository standards.
 
 Usage: lane_brief.py render --branch B --task T --finding F --fix X --tests S --paths P --modules M
-       lane_brief.py check BRIEF [--config FILE]
+       lane_brief.py check BRIEF [--config FILE] [--runner PATH] [--worktree DIR]
 Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import os
 import re
+import selectors
+import signal
 import stat
+import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +31,8 @@ PLACEHOLDERS = re.compile(r"<(task|branch|n|r|finding|fix|tests|paths|modules)>"
 MAX_SIZE = 1024 * 1024
 MAX_LINES = 10000
 MAX_LINE_SIZE = 65536
+RUNNER_TIMEOUT = 120
+RUNNER_OUTPUT_LIMIT = 65536
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -134,7 +141,9 @@ def parser_for_cli() -> argparse.ArgumentParser:
     render.add_argument("-o", type=Path)
     verify = commands.add_parser("check")
     verify.add_argument("brief", type=Path)
-    verify.add_argument("--config", type=Path, default=CONFIG)
+    verify.add_argument("--config", type=Path, default=None)
+    verify.add_argument("--runner", type=Path, default=os.environ.get("LANE_BRIEF_RUNNER") or None)
+    verify.add_argument("--worktree", type=Path, default=ROOT)
     return parser
 
 
@@ -163,14 +172,96 @@ def render_brief(args: argparse.Namespace) -> int:
     return 0
 
 
+def read_runner_output(process: subprocess.Popen[bytes], deadline: float) -> bytes:
+    """Read runner output within the byte limit and monotonic deadline."""
+    if process.stdout is None:
+        raise OSError("runner stdout pipe unavailable")
+    output = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        for _ in range(RUNNER_OUTPUT_LIMIT + 2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise subprocess.TimeoutExpired(process.args, RUNNER_TIMEOUT)
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, RUNNER_TIMEOUT)
+                process.wait(timeout=remaining)
+                return bytes(output)
+            output.extend(chunk)
+            if len(output) > RUNNER_OUTPUT_LIMIT:
+                raise ValueError(f"output exceeds {RUNNER_OUTPUT_LIMIT} bytes")
+    raise ValueError(f"output exceeds {RUNNER_OUTPUT_LIMIT} bytes")
+
+
+def run_runner(argv: list[str]) -> tuple[bytes, int]:
+    """Run and reap a runner while collecting bounded combined output."""
+    process = subprocess.Popen(  # nosec B603 - configured runner path, explicit argv, no shell.
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    completed = False
+    try:
+        output = read_runner_output(process, time.monotonic() + RUNNER_TIMEOUT)
+        completed = True
+        return output, process.returncode
+    finally:
+        if not completed or process.poll() != 0:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        try:
+            process.wait(timeout=5)
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
+    """Run the lane runner precheck and report its output and result."""
+    try:
+        output, returncode = run_runner([str(runner), "--check-brief", str(brief), str(worktree)])
+    except subprocess.TimeoutExpired:
+        print(
+            f"lane_brief: runner failed: timed out after {RUNNER_TIMEOUT} seconds", file=sys.stderr
+        )
+        return 2
+    except (OSError, ValueError) as error:
+        print(f"lane_brief: runner failed: {error}", file=sys.stderr)
+        return 2
+    sys.stderr.write(output.decode("utf-8", errors="replace"))
+    if returncode:
+        print(f"lane_brief: runner refused brief (rc {returncode})", file=sys.stderr)
+        return 1
+    return 0
+
+
+def check_brief(args: argparse.Namespace) -> int:
+    """Validate the brief locally and run the configured runner precheck."""
+    content = "".join(bounded_lines(args.brief))
+    config = (
+        args.config if args.config is not None else args.worktree / ".config" / "lane-brief.yaml"
+    )
+    result = check(content, str(args.brief), read_required(config))
+    if result:
+        return result
+    if not args.runner:
+        print("lane_brief: runner check skipped: LANE_BRIEF_RUNNER unset", file=sys.stderr)
+        return result
+    return check_runner(args.runner, args.brief, args.worktree)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the selected command and report input errors."""
     args = parser_for_cli().parse_args(argv)
     try:
         if args.command == "render":
             return render_brief(args)
-        content = "".join(bounded_lines(args.brief))
-        return check(content, str(args.brief), read_required(args.config))
+        return check_brief(args)
     except (OSError, UnicodeError, ValueError) as error:
         print(f"lane_brief: {error}", file=sys.stderr)
         return 2

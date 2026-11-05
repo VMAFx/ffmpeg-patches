@@ -4,13 +4,18 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import os
+import re
 import signal
+import subprocess  # nosec B404 - Fixed argv is used for the zombie regression test.
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import lane_brief
@@ -41,6 +46,20 @@ ARGS = [
 ]
 
 
+def process_alive(pid: int) -> bool:
+    """Return whether a process exists and has not exited."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    try:
+        state = stat.read_text(encoding="utf-8").rpartition(")")[2].split()[0]
+    except FileNotFoundError:
+        return True
+    return state not in {"Z", "X"}
+
+
 class LaneBriefTest(unittest.TestCase):
     """Check the CLI against real declarations and temporary briefs."""
 
@@ -49,6 +68,10 @@ class LaneBriefTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("LANE_BRIEF_RUNNER", None)
 
     def run_cli(self, *args: str) -> tuple[int, str, str]:
         """Capture the command result and both output streams."""
@@ -65,6 +88,283 @@ class LaneBriefTest(unittest.TestCase):
         rc, output, error = self.run_cli(*ARGS)
         self.assertEqual(rc, 0, error)
         return output
+
+    def runner_fixture(self) -> tuple[Path, Path, Path]:
+        """Create a brief and a configurable runner that records its arguments."""
+        brief = self.root / "brief.md"
+        brief.write_text(self.rendered(), encoding="utf-8")
+        runner = self.root / "runner.sh"
+        runner.write_text(
+            "#!/bin/sh\n"
+            'dir=$(dirname "$0")\n'
+            'printf "%s\\n" "$@" >> "$dir/args"\n'
+            'if [ -f "$dir/sleep" ]; then sleep 3; fi\n'
+            'printf "runner stdout\\n"\n'
+            'printf "runner stderr\\n" >&2\n'
+            'exit "$(cat "$dir/rc")"\n',
+            encoding="utf-8",
+        )
+        runner.chmod(0o755)
+        (self.root / "rc").write_text("0", encoding="utf-8")
+        return brief, runner, self.root / "args"
+
+    def assert_child_gone(self, pid_file: Path) -> None:
+        """Check the child disappears, cleaning it up if the check fails."""
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        for _ in range(200):
+            if not process_alive(pid):
+                return
+            time.sleep(0.01)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        self.fail(f"child process {pid} still exists")
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "requires procfs")
+    def test_assert_child_gone_accepts_zombie(self) -> None:
+        """Accept a killed child that has not yet been reaped."""
+        child = subprocess.Popen(["sleep", "30"])  # nosec B603 B607 - Fixed test command.
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+            pid_file = self.root / "zombie_pid"
+            pid_file.write_text(str(child.pid), encoding="utf-8")
+            self.assert_child_gone(pid_file)
+        finally:
+            child.wait(timeout=5)
+
+    def test_process_alive_states(self) -> None:
+        """Distinguish live, exited, missing, and unavailable procfs states."""
+        with patch("os.kill"), patch.object(Path, "read_text") as read_stat:
+            for state, expected in (("R", True), ("Z", False), ("X", False)):
+                with self.subTest(state=state):
+                    read_stat.return_value = f"123 (command with ) parentheses) {state} 1"
+                    self.assertEqual(process_alive(123), expected)
+            read_stat.side_effect = FileNotFoundError
+            self.assertTrue(process_alive(123))
+        with patch("os.kill", side_effect=ProcessLookupError):
+            self.assertFalse(process_alive(123))
+
+    def constant_names(self, tree: ast.Module) -> set[str]:
+        """Collect module-level constant names from assignments."""
+        return {
+            target.id
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name) and re.fullmatch(r"[A-Z][A-Z0-9_]*", target.id)
+        }
+
+    def excluded_strings(self, tree: ast.Module) -> set[int]:
+        """Exclude formatted string components and module and function docstrings."""
+        excluded = {
+            id(child)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.JoinedStr)
+            for child in ast.walk(node)
+        }
+        excluded.update(
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef))
+            and ast.get_docstring(node) is not None
+        )
+        return excluded
+
+    def test_constant_names_not_in_plain_strings(self) -> None:
+        """Reject constant names accidentally left unformatted in string literals."""
+        tree = ast.parse((ROOT / "scripts" / "lane_brief.py").read_text(encoding="utf-8"))
+        names = self.constant_names(tree)
+        excluded = self.excluded_strings(tree)
+        pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, sorted(names))) + r")\b")
+        matches = [
+            (node.lineno, match.group())
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in excluded
+            if (match := pattern.search(node.value))
+        ]
+        self.assertEqual(matches, [])
+
+    def test_runner_output_missing_stdout(self) -> None:
+        """Reject a runner without a stdout pipe."""
+        process = SimpleNamespace(stdout=None)
+        with self.assertRaisesRegex(OSError, "runner stdout pipe unavailable"):
+            lane_brief.read_runner_output(process, 0.0)
+
+    def test_runner_success_and_arguments(self) -> None:
+        """Forward the brief and worktree as exact runner arguments."""
+        brief, runner, calls = self.runner_fixture()
+        rc, _, error = self.run_cli(
+            "check",
+            str(brief),
+            "--runner",
+            str(runner),
+            "--worktree",
+            str(self.root),
+            "--config",
+            str(CONFIG),
+        )
+        self.assertEqual(rc, 0, error)
+        self.assertEqual(error, "runner stdout\nrunner stderr\n")
+        self.assertEqual(
+            calls.read_text(encoding="utf-8").splitlines(),
+            ["--check-brief", str(brief), str(self.root)],
+        )
+
+    def test_runner_output_boundary(self) -> None:
+        """Forward output exactly at the byte limit."""
+        brief, runner, _ = self.runner_fixture()
+        runner.write_text("#!/bin/sh\nprintf 1234567890123456\n", encoding="utf-8")
+        with patch.object(lane_brief, "RUNNER_OUTPUT_LIMIT", 16, create=True):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 0)
+        self.assertEqual(error, "1234567890123456")
+
+    def test_runner_output_over_limit(self) -> None:
+        """Reject output one byte above the limit even on runner success."""
+        brief, runner, _ = self.runner_fixture()
+        runner.write_text("#!/bin/sh\nprintf 12345678901234567\n", encoding="utf-8")
+        with patch.object(lane_brief, "RUNNER_OUTPUT_LIMIT", 16, create=True):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 2)
+        self.assertEqual(error, "lane_brief: runner failed: output exceeds 16 bytes\n")
+
+    def test_runner_output_stopped_and_reaped(self) -> None:
+        """Stop and reap a runner as soon as its output exceeds the limit."""
+        brief, runner, _ = self.runner_fixture()
+        pid_file = self.root / "pid"
+        child_file = self.root / "child_pid"
+        runner.write_text(
+            "#!/bin/sh\n"
+            f"echo $$ > '{pid_file}'\n"
+            "sleep 30 &\n"
+            f"echo $! > '{child_file}'\n"
+            "for i in $(seq 1 1000); do printf '%01024d' 0; done\n"
+            "sleep 30\n",
+            encoding="utf-8",
+        )
+        started = time.monotonic()
+        with patch.object(lane_brief, "RUNNER_TIMEOUT", 12):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(rc, 2)
+        self.assert_child_gone(child_file)
+        self.assertEqual(
+            error,
+            f"lane_brief: runner failed: output exceeds {lane_brief.RUNNER_OUTPUT_LIMIT} bytes\n",
+        )
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text(encoding="utf-8")), 0)
+
+    def test_runner_combined_output_over_limit(self) -> None:
+        """Count stdout and stderr together against the output limit."""
+        brief, runner, _ = self.runner_fixture()
+        runner.write_text("#!/bin/sh\nprintf 123456789\nprintf 12345678 >&2\n", encoding="utf-8")
+        with patch.object(lane_brief, "RUNNER_OUTPUT_LIMIT", 16, create=True):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 2)
+        self.assertIn("output exceeds 16 bytes", error)
+
+    def test_worktree_config_rejects_before_runner(self) -> None:
+        """Check the selected worktree requirements before invoking the runner."""
+        brief, runner, calls = self.runner_fixture()
+        config = self.root / ".config" / "lane-brief.yaml"
+        config.parent.mkdir()
+        config.write_text("required:\n  - worktree only requirement\n", encoding="utf-8")
+        rc, _, error = self.run_cli(
+            "check", str(brief), "--runner", str(runner), "--worktree", str(self.root)
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("missing required line: worktree only requirement", error)
+        self.assertFalse(calls.exists())
+
+    def test_explicit_config_overrides_worktree(self) -> None:
+        """Prefer an explicit config over the selected worktree config."""
+        brief, runner, calls = self.runner_fixture()
+        config = self.root / ".config" / "lane-brief.yaml"
+        config.parent.mkdir()
+        config.write_text("required:\n  - worktree only requirement\n", encoding="utf-8")
+        rc, _, error = self.run_cli(
+            "check",
+            str(brief),
+            "--runner",
+            str(runner),
+            "--worktree",
+            str(self.root),
+            "--config",
+            str(CONFIG),
+        )
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(calls.exists())
+
+    def test_runner_refusal(self) -> None:
+        """Map a runner refusal to invalid brief status."""
+        brief, runner, _ = self.runner_fixture()
+        (self.root / "rc").write_text("2", encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 1)
+        self.assertIn("lane_brief: runner refused brief (rc 2)", error)
+
+    def test_runner_missing_and_not_executable(self) -> None:
+        """Report missing and non-executable runners as input errors."""
+        brief, runner, _ = self.runner_fixture()
+        runner.chmod(0o644)
+        for path in (self.root / "missing", runner):
+            with self.subTest(path=path):
+                rc, _, error = self.run_cli("check", str(brief), "--runner", str(path))
+                self.assertEqual(rc, 2)
+                self.assertIn("lane_brief: runner failed:", error)
+
+    def test_runner_timeout(self) -> None:
+        """Report a runner exceeding the timeout as an input error."""
+        brief, runner, _ = self.runner_fixture()
+        child_file = self.root / "child_pid"
+        runner.write_text(
+            f"#!/bin/sh\nsleep 30 &\necho $! > '{child_file}'\nwait\n",
+            encoding="utf-8",
+        )
+        with patch.object(lane_brief, "RUNNER_TIMEOUT", 1):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 2)
+        self.assert_child_gone(child_file)
+        self.assertEqual(error, "lane_brief: runner failed: timed out after 1 seconds\n")
+
+    def test_runner_from_environment(self) -> None:
+        """Use the environment runner and default worktree when unspecified."""
+        brief, runner, calls = self.runner_fixture()
+        with patch.dict(os.environ, {"LANE_BRIEF_RUNNER": str(runner)}):
+            rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 0, error)
+        self.assertEqual(
+            calls.read_text(encoding="utf-8").splitlines(), ["--check-brief", str(brief), str(ROOT)]
+        )
+
+    def test_runner_unset(self) -> None:
+        """Explain when a valid brief skips the runner check."""
+        brief, _, _ = self.runner_fixture()
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 0)
+        self.assertEqual(error, "lane_brief: runner check skipped: LANE_BRIEF_RUNNER unset\n")
+
+    def test_runner_empty_environment(self) -> None:
+        """Treat an empty runner environment value as unset."""
+        brief, _, _ = self.runner_fixture()
+        with patch.dict(os.environ, {"LANE_BRIEF_RUNNER": ""}):
+            rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 0)
+        self.assertEqual(error, "lane_brief: runner check skipped: LANE_BRIEF_RUNNER unset\n")
+
+    def test_local_failure_does_not_call_runner(self) -> None:
+        """Reject a locally invalid brief before invoking the runner."""
+        brief, runner, calls = self.runner_fixture()
+        content = brief.read_text(encoding="utf-8")
+        brief.write_text(content.replace(lane_brief.read_required(CONFIG)[0], ""), encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 1, error)
+        self.assertIn("missing required line", error)
+        self.assertFalse(calls.exists())
 
     @unittest.skipUnless(
         hasattr(os, "mkfifo") and hasattr(signal, "SIGALRM"), "FIFO alarm unavailable"
