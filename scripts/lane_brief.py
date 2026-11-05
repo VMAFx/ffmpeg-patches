@@ -4,7 +4,7 @@
 """Render or check a lane brief against repository standards.
 
 Usage: lane_brief.py render --branch B --task T --finding F --fix X --tests S --paths P --modules M
-       lane_brief.py check BRIEF [--config FILE]
+       lane_brief.py check BRIEF [--config FILE] [--runner PATH] [--worktree DIR]
 Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
 """
 
@@ -15,6 +15,7 @@ import io
 import os
 import re
 import stat
+import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
 from pathlib import Path
 
@@ -26,6 +27,7 @@ PLACEHOLDERS = re.compile(r"<(task|branch|n|r|finding|fix|tests|paths|modules)>"
 MAX_SIZE = 1024 * 1024
 MAX_LINES = 10000
 MAX_LINE_SIZE = 65536
+RUNNER_TIMEOUT = 120
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -135,6 +137,8 @@ def parser_for_cli() -> argparse.ArgumentParser:
     verify = commands.add_parser("check")
     verify.add_argument("brief", type=Path)
     verify.add_argument("--config", type=Path, default=CONFIG)
+    verify.add_argument("--runner", type=Path, default=os.environ.get("LANE_BRIEF_RUNNER") or None)
+    verify.add_argument("--worktree", type=Path, default=ROOT)
     return parser
 
 
@@ -163,14 +167,47 @@ def render_brief(args: argparse.Namespace) -> int:
     return 0
 
 
+def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
+    """Run the lane runner precheck and report its output and result."""
+    try:
+        result = subprocess.run(  # nosec B603 - configured runner path, explicit argv, no shell.
+            [str(runner), "--check-brief", str(brief), str(worktree)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=RUNNER_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"lane_brief: runner failed: {error}", file=sys.stderr)
+        return 2
+    sys.stderr.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    if result.returncode:
+        print(f"lane_brief: runner refused brief (rc {result.returncode})", file=sys.stderr)
+        return 1
+    return 0
+
+
+def check_brief(args: argparse.Namespace) -> int:
+    """Validate the brief locally and run the configured runner precheck."""
+    content = "".join(bounded_lines(args.brief))
+    result = check(content, str(args.brief), read_required(args.config))
+    if result:
+        return result
+    if not args.runner:
+        print("lane_brief: runner check skipped: LANE_BRIEF_RUNNER unset", file=sys.stderr)
+        return result
+    return check_runner(args.runner, args.brief, args.worktree)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the selected command and report input errors."""
     args = parser_for_cli().parse_args(argv)
     try:
         if args.command == "render":
             return render_brief(args)
-        content = "".join(bounded_lines(args.brief))
-        return check(content, str(args.brief), read_required(args.config))
+        return check_brief(args)
     except (OSError, UnicodeError, ValueError) as error:
         print(f"lane_brief: {error}", file=sys.stderr)
         return 2
