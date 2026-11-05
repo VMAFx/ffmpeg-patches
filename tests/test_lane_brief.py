@@ -10,6 +10,7 @@ import io
 import os
 import re
 import signal
+import subprocess  # nosec B404 - Fixed argv is used for the zombie regression test.
 import tempfile
 import time
 import unittest
@@ -43,6 +44,20 @@ ARGS = [
     "--round",
     "2",
 ]
+
+
+def process_alive(pid: int) -> bool:
+    """Return whether a process exists and has not exited."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    try:
+        state = stat.read_text(encoding="utf-8").rpartition(")")[2].split()[0]
+    except FileNotFoundError:
+        return True
+    return state not in {"Z", "X"}
 
 
 class LaneBriefTest(unittest.TestCase):
@@ -97,9 +112,7 @@ class LaneBriefTest(unittest.TestCase):
         """Check the child disappears, cleaning it up if the check fails."""
         pid = int(pid_file.read_text(encoding="utf-8"))
         for _ in range(200):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not process_alive(pid):
                 return
             time.sleep(0.01)
         try:
@@ -107,6 +120,30 @@ class LaneBriefTest(unittest.TestCase):
         except ProcessLookupError:
             return
         self.fail(f"child process {pid} still exists")
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "requires procfs")
+    def test_assert_child_gone_accepts_zombie(self) -> None:
+        """Accept a killed child that has not yet been reaped."""
+        child = subprocess.Popen(["sleep", "30"])  # nosec B603 B607 - Fixed test command.
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+            pid_file = self.root / "zombie_pid"
+            pid_file.write_text(str(child.pid), encoding="utf-8")
+            self.assert_child_gone(pid_file)
+        finally:
+            child.wait(timeout=5)
+
+    def test_process_alive_states(self) -> None:
+        """Distinguish live, exited, missing, and unavailable procfs states."""
+        with patch("os.kill"), patch.object(Path, "read_text") as read_stat:
+            for state, expected in (("R", True), ("Z", False), ("X", False)):
+                with self.subTest(state=state):
+                    read_stat.return_value = f"123 (command with ) parentheses) {state} 1"
+                    self.assertEqual(process_alive(123), expected)
+            read_stat.side_effect = FileNotFoundError
+            self.assertTrue(process_alive(123))
+        with patch("os.kill", side_effect=ProcessLookupError):
+            self.assertFalse(process_alive(123))
 
     def constant_names(self, tree: ast.Module) -> set[str]:
         """Collect module-level constant names from assignments."""
