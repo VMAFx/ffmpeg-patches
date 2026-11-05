@@ -17,6 +17,7 @@ import re
 import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,7 @@ MAX_SIZE = 1024 * 1024
 MAX_LINES = 10000
 MAX_LINE_SIZE = 65536
 RUNNER_TIMEOUT = 120
+RUNNER_OUTPUT_LIMIT = 65536
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -136,7 +138,7 @@ def parser_for_cli() -> argparse.ArgumentParser:
     render.add_argument("-o", type=Path)
     verify = commands.add_parser("check")
     verify.add_argument("brief", type=Path)
-    verify.add_argument("--config", type=Path, default=CONFIG)
+    verify.add_argument("--config", type=Path, default=None)
     verify.add_argument("--runner", type=Path, default=os.environ.get("LANE_BRIEF_RUNNER") or None)
     verify.add_argument("--worktree", type=Path, default=ROOT)
     return parser
@@ -170,19 +172,25 @@ def render_brief(args: argparse.Namespace) -> int:
 def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
     """Run the lane runner precheck and report its output and result."""
     try:
-        result = subprocess.run(  # nosec B603 - configured runner path, explicit argv, no shell.
-            [str(runner), "--check-brief", str(brief), str(worktree)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=RUNNER_TIMEOUT,
-            check=False,
-        )
+        with tempfile.TemporaryFile() as output:
+            result = subprocess.run(  # nosec B603 - configured runner path, explicit argv, no shell.
+                [str(runner), "--check-brief", str(brief), str(worktree)],
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=RUNNER_TIMEOUT,
+                check=False,
+            )
+            if os.fstat(output.fileno()).st_size > RUNNER_OUTPUT_LIMIT:
+                print(
+                    "lane_brief: runner failed: output exceeds RUNNER_OUTPUT_LIMIT bytes",
+                    file=sys.stderr,
+                )
+                return 2
+            output.seek(0)
+            sys.stderr.write(output.read().decode("utf-8", errors="replace"))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lane_brief: runner failed: {error}", file=sys.stderr)
         return 2
-    sys.stderr.write(result.stdout)
-    sys.stderr.write(result.stderr)
     if result.returncode:
         print(f"lane_brief: runner refused brief (rc {result.returncode})", file=sys.stderr)
         return 1
@@ -192,7 +200,10 @@ def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
 def check_brief(args: argparse.Namespace) -> int:
     """Validate the brief locally and run the configured runner precheck."""
     content = "".join(bounded_lines(args.brief))
-    result = check(content, str(args.brief), read_required(args.config))
+    config = (
+        args.config if args.config is not None else args.worktree / ".config" / "lane-brief.yaml"
+    )
+    result = check(content, str(args.brief), read_required(config))
     if result:
         return result
     if not args.runner:

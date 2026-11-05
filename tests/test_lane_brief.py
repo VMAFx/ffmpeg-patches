@@ -93,7 +93,14 @@ class LaneBriefTest(unittest.TestCase):
         """Forward the brief and worktree as exact runner arguments."""
         brief, runner, calls = self.runner_fixture()
         rc, _, error = self.run_cli(
-            "check", str(brief), "--runner", str(runner), "--worktree", str(self.root)
+            "check",
+            str(brief),
+            "--runner",
+            str(runner),
+            "--worktree",
+            str(self.root),
+            "--config",
+            str(CONFIG),
         )
         self.assertEqual(rc, 0, error)
         self.assertEqual(error, "runner stdout\nrunner stderr\n")
@@ -101,6 +108,67 @@ class LaneBriefTest(unittest.TestCase):
             calls.read_text(encoding="utf-8").splitlines(),
             ["--check-brief", str(brief), str(self.root)],
         )
+
+    def test_runner_output_boundary(self) -> None:
+        """Forward output exactly at the byte limit."""
+        brief, runner, _ = self.runner_fixture()
+        runner.write_text("#!/bin/sh\nprintf 1234567890123456\n", encoding="utf-8")
+        with patch.object(lane_brief, "RUNNER_OUTPUT_LIMIT", 16, create=True):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 0)
+        self.assertEqual(error, "1234567890123456")
+
+    def test_runner_output_over_limit(self) -> None:
+        """Reject output one byte above the limit even on runner success."""
+        brief, runner, _ = self.runner_fixture()
+        runner.write_text("#!/bin/sh\nprintf 12345678901234567\n", encoding="utf-8")
+        with patch.object(lane_brief, "RUNNER_OUTPUT_LIMIT", 16, create=True):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 2)
+        self.assertEqual(
+            error, "lane_brief: runner failed: output exceeds RUNNER_OUTPUT_LIMIT bytes\n"
+        )
+
+    def test_runner_combined_output_over_limit(self) -> None:
+        """Count stdout and stderr together against the output limit."""
+        brief, runner, _ = self.runner_fixture()
+        runner.write_text("#!/bin/sh\nprintf 123456789\nprintf 12345678 >&2\n", encoding="utf-8")
+        with patch.object(lane_brief, "RUNNER_OUTPUT_LIMIT", 16, create=True):
+            rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 2)
+        self.assertIn("output exceeds RUNNER_OUTPUT_LIMIT bytes", error)
+
+    def test_worktree_config_rejects_before_runner(self) -> None:
+        """Check the selected worktree requirements before invoking the runner."""
+        brief, runner, calls = self.runner_fixture()
+        config = self.root / ".config" / "lane-brief.yaml"
+        config.parent.mkdir()
+        config.write_text("required:\n  - worktree only requirement\n", encoding="utf-8")
+        rc, _, error = self.run_cli(
+            "check", str(brief), "--runner", str(runner), "--worktree", str(self.root)
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("missing required line: worktree only requirement", error)
+        self.assertFalse(calls.exists())
+
+    def test_explicit_config_overrides_worktree(self) -> None:
+        """Prefer an explicit config over the selected worktree config."""
+        brief, runner, calls = self.runner_fixture()
+        config = self.root / ".config" / "lane-brief.yaml"
+        config.parent.mkdir()
+        config.write_text("required:\n  - worktree only requirement\n", encoding="utf-8")
+        rc, _, error = self.run_cli(
+            "check",
+            str(brief),
+            "--runner",
+            str(runner),
+            "--worktree",
+            str(self.root),
+            "--config",
+            str(CONFIG),
+        )
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(calls.exists())
 
     def test_runner_refusal(self) -> None:
         """Map a runner refusal to invalid brief status."""
