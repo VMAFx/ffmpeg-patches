@@ -1235,6 +1235,29 @@ class TestClaimHeadTest(ForgejoTest):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(self.posts(stub), [BODY])
 
+    def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
+        """Both writes reject a different full head sharing the tested prefix."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        for command, method in ((self.comment, "POST"), (self.edit_body, "PATCH")):
+            for evidence_head, expected in ((other, 76), (LIVE, 0), (LIVE[:7], 0)):
+                with self.subTest(command=command.__name__, evidence_head=evidence_head):
+                    stub = Stub([LIVE], {LIVE: [[label("success")]]})
+                    proc = command(
+                        stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(evidence_head)
+                    )
+                    self.assertEqual(proc.returncode, expected, proc.stderr)
+                    self.assertEqual(self.sent_bodies(stub, method), [] if expected else [BODY])
+
+    def test_edit_body_rechecks_evidence_after_autolabel(self) -> None:
+        """A new head with the same tested prefix cannot authorize a body edit."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        stub = Stub([LIVE, LIVE, LIVE, other], {LIVE: [[label("success")]]})
+        proc = self.edit_body(stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
     def test_invalid_tested_heads_are_usage_errors(self) -> None:
         """Short and nonhex tested heads are usage errors without writes."""
 
