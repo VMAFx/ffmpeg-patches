@@ -11,6 +11,7 @@ Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import stat
@@ -22,6 +23,19 @@ TEMPLATE = ROOT / "scripts" / "lane_brief_template.md"
 CONFIG = ROOT / ".config" / "lane-brief.yaml"
 NAMES = ("task", "branch", "n", "r", "finding", "fix", "tests", "paths", "modules")
 PLACEHOLDERS = re.compile(r"<(task|branch|n|r|finding|fix|tests|paths|modules)>")
+MAX_SIZE = 1024 * 1024
+MAX_LINES = 10000
+MAX_LINE_SIZE = 65536
+
+
+def validate_lines(lines: list[bytes], label: str) -> None:
+    """Reject content exceeding the byte size, line count, or line length limits."""
+    if sum(map(len, lines)) > MAX_SIZE:
+        raise ValueError(f"{label}: size exceeds 1 MiB")
+    if len(lines) > MAX_LINES:
+        raise ValueError(f"{label}: exceeds 10000 lines")
+    if any(len(line) > MAX_LINE_SIZE for line in lines):
+        raise ValueError(f"{label}: line exceeds 65536 bytes")
 
 
 def bounded_lines(path: Path) -> list[str]:
@@ -29,18 +43,10 @@ def bounded_lines(path: Path) -> list[str]:
     info = os.stat(path)
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"{path}: not a regular file")
-    if info.st_size > 1024 * 1024:
-        raise ValueError(f"{path}: size exceeds 1 MiB")
-    lines = []
     with path.open("rb") as source:
-        for _ in range(10000):
-            line = source.readline(65537)
-            if not line:
-                return lines
-            if len(line) > 65536:
-                raise ValueError(f"{path}: line exceeds 65536 bytes")
-            lines.append(line.decode("utf-8"))
-    raise ValueError(f"{path}: exceeds 10000 lines")
+        lines = io.BytesIO(source.read(MAX_SIZE + 1)).readlines()
+    validate_lines(lines, str(path))
+    return [line.decode("utf-8") for line in lines]
 
 
 def required_item(path: Path, text: str) -> str:
@@ -58,6 +64,7 @@ def required_item(path: Path, text: str) -> str:
 def read_required(path: Path) -> list[str]:
     """Read the bounded required list from a lane brief config file."""
     required = False
+    seen_required = False
     items: list[str] = []
     for line in bounded_lines(path):
         stripped = line.strip()
@@ -65,9 +72,10 @@ def read_required(path: Path) -> list[str]:
             continue
         indent = len(line) - len(line.lstrip(" "))
         if indent == 0:
-            if required:
-                break
             required = stripped == "required:"
+            if required and seen_required:
+                raise ValueError(f"{path}: duplicate required key")
+            seen_required |= required
         elif required and indent == 2 and stripped.startswith("- "):
             items.append(required_item(path, stripped))
             if len(items) > 32:
@@ -111,9 +119,14 @@ def render_brief(args: argparse.Namespace) -> int:
         for name in ("task", "branch", "finding", "fix", "tests", "paths", "modules")
     }
     values.update(n=args.issue, r=args.round)
+    for name, value in values.items():
+        if len(value) > 8192:
+            argument = {"n": "issue", "r": "round"}.get(name, name)
+            raise ValueError(f"--{argument}: exceeds 8192 characters")
     content = PLACEHOLDERS.sub(
         lambda match: values[match.group(1)], TEMPLATE.read_text(encoding="utf-8")
     )
+    validate_lines(io.BytesIO(content.encode("utf-8")).readlines(), str(args.o or "stdout"))
     result = check(content, str(args.o) if args.o else "stdout", read_required(CONFIG))
     if result:
         return result

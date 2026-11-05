@@ -11,6 +11,7 @@ import signal
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import lane_brief
 
@@ -222,6 +223,89 @@ class LaneBriefTest(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertFalse(destination.exists())
         self.assertIn("unfilled placeholder <task>", error)
+
+    def test_line_count_boundaries_for_brief_and_config(self) -> None:
+        """Accept 10000 lines and reject 10001 lines in both inputs."""
+        brief = self.root / "brief.md"
+        config = self.root / "config.yaml"
+        for target in (brief, config):
+            with self.subTest(target=target.name):
+                for count in (10000, 10001):
+                    brief.write_text("present\n", encoding="utf-8")
+                    config.write_text("required:\n  - present\n", encoding="utf-8")
+                    prefix = "present\n" if target == brief else "required:\n  - present\n"
+                    target.write_text(
+                        prefix + "\n" * (count - prefix.count("\n")), encoding="utf-8"
+                    )
+                    rc, _, error = self.run_cli("check", str(brief), "--config", str(config))
+                    self.assertEqual(rc, 0 if count == 10000 else 2, error)
+                    if count == 10001:
+                        self.assertIn("exceeds 10000 lines", error)
+
+    def test_duplicate_required_block_rejected(self) -> None:
+        """Reject a second required block even after another section."""
+        brief = self.root / "brief.md"
+        config = self.root / "config.yaml"
+        brief.write_text("first\n", encoding="utf-8")
+        config.write_text(
+            "required:\n  - first\nother: value\nrequired:\n  - second\n", encoding="utf-8"
+        )
+        rc, output, error = self.run_cli("check", str(brief), "--config", str(config))
+        self.assertEqual(rc, 2)
+        self.assertEqual(output, "")
+        self.assertIn("duplicate required key", error)
+
+    def test_render_line_limit_refuses_file_and_stdout(self) -> None:
+        """Reject combined render values exceeding the output line limit."""
+        destination = self.root / "out.md"
+        args = [*ARGS, "--finding", "\n" * 4000, "--fix", "\n" * 4000, "--tests", "\n" * 4000]
+        for extra in ([], ["-o", str(destination)]):
+            with self.subTest(extra=extra):
+                rc, output, error = self.run_cli(*args, *extra)
+                self.assertEqual(rc, 2)
+                self.assertEqual(output, "")
+                self.assertFalse(destination.exists())
+                self.assertIn("exceeds 10000 lines", error)
+
+    def test_render_argument_character_boundaries(self) -> None:
+        """Accept 8192 characters and reject 8193 for every render value."""
+        for name in (
+            "branch",
+            "task",
+            "finding",
+            "fix",
+            "tests",
+            "paths",
+            "modules",
+            "issue",
+            "round",
+        ):
+            for count in (8192, 8193):
+                with self.subTest(name=name, count=count):
+                    rc, output, error = self.run_cli(*ARGS, f"--{name}", "x" * count)
+                    self.assertEqual(rc, 0 if count == 8192 else 2, error)
+                    if count == 8193:
+                        self.assertEqual(output, "")
+                        self.assertIn(f"--{name}", error)
+
+    def test_render_byte_limits_refuse_output(self) -> None:
+        """Reject oversized rendered lines and content before writing output."""
+        template = self.root / "template.md"
+        destination = self.root / "out.md"
+        for content, reason in (
+            ("<finding>" * 3, "line exceeds"),
+            ("<finding>\n" * 33, "size exceeds"),
+        ):
+            with self.subTest(reason=reason):
+                template.write_text(content, encoding="utf-8")
+                with patch.object(lane_brief, "TEMPLATE", template):
+                    rc, output, error = self.run_cli(
+                        *ARGS, "--finding", "😀" * 8192, "-o", str(destination)
+                    )
+                self.assertEqual(rc, 2)
+                self.assertEqual(output, "")
+                self.assertFalse(destination.exists())
+                self.assertIn(reason, error)
 
 
 if __name__ == "__main__":
