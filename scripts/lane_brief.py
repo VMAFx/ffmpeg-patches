@@ -40,58 +40,71 @@ def validate_lines(lines: list[bytes], label: str) -> None:
 
 def bounded_lines(path: Path) -> list[str]:
     """Read bounded lines from a regular file of at most 1 MiB."""
-    info = os.stat(path)
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError(f"{path}: not a regular file")
-    with path.open("rb") as source:
-        lines = io.BytesIO(source.read(MAX_SIZE + 1)).readlines()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{path}: not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            lines = io.BytesIO(source.read(MAX_SIZE + 1)).readlines()
+    finally:
+        os.close(descriptor)
     validate_lines(lines, str(path))
     return [line.decode("utf-8") for line in lines]
 
 
-def required_item(path: Path, text: str) -> str:
-    """Decode a nonempty bare or double-quoted required item."""
-    value = text[2:].strip()
-    if value.startswith('"') and value.endswith('"'):
-        value = value[1:-1]
-    if not value:
-        raise ValueError(f"{path}: empty required item")
-    if len(value) > 200:
-        raise ValueError(f"{path}: required item exceeds 200 characters")
-    return value
-
-
-def append_required_child(path: Path, text: str, indent: int, items: list[str]) -> None:
-    """Validate and append a required list child within the item limit."""
-    if indent != 2 or (text != "-" and not text.startswith("- ")):
-        raise ValueError(f"{path}: malformed required line: {text}")
-    items.append(required_item(path, text))
-    if len(items) > 32:
-        raise ValueError(f"{path}: required list exceeds 32 items")
-
-
 def read_required(path: Path) -> list[str]:
-    """Read the bounded required list from a lane brief config file."""
-    required = False
-    seen_required = False
-    items: list[str] = []
-    for line in bounded_lines(path):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        if indent == 0:
-            if stripped == "---":
-                continue
-            required = stripped == "required:"
-            if required and seen_required:
-                raise ValueError(f"{path}: duplicate required key")
-            seen_required |= required
-        elif required:
-            append_required_child(path, stripped, indent, items)
+    """Read and validate the required substrings from a bounded YAML document."""
+    try:
+        import yaml  # noqa: PLC0415 - optional parser dependency.
+    except ImportError as error:
+        raise ValueError(f"{path}: missing pyyaml; install requirements-dev.txt") from error
+
+    class UniqueLoader(yaml.SafeLoader):
+        """Reject duplicate mapping keys while loading safe YAML."""
+
+        def construct_mapping(self, node: object, deep: bool = False) -> dict:
+            """Construct a mapping only when each key is unique."""
+            self.flatten_mapping(node)
+            seen: set = set()
+            for key_node, _ in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in seen
+                    seen.add(key)
+                except TypeError as error:
+                    raise ValueError(f"{path}: invalid YAML: unhashable key") from error
+                if duplicate:
+                    message = (
+                        "duplicate required key" if key == "required" else f"duplicate key {key}"
+                    )
+                    raise ValueError(f"{path}: {message}")
+            return super().construct_mapping(node, deep=deep)
+
+    try:
+        document = yaml.load("".join(bounded_lines(path)), Loader=UniqueLoader)
+    except yaml.YAMLError as error:
+        raise ValueError(f"{path}: invalid YAML: {error}") from error
+    return validate_required(path, document)
+
+
+def validate_required(path: Path, document: object) -> list[str]:
+    """Validate and normalize the required list in a YAML document."""
+    if not isinstance(document, dict) or not isinstance(document.get("required"), list):
+        raise ValueError(f"{path}: missing or invalid required list")
+    items = document["required"]
     if not items:
         raise ValueError(f"{path}: missing or empty required list")
-    return items
+    if len(items) > 32:
+        raise ValueError(f"{path}: required list exceeds 32 items")
+    result: list[str] = []
+    for item in items:
+        if not isinstance(item, str) or not item.strip() or "\n" in item or "\r" in item:
+            raise ValueError(f"{path}: invalid required item")
+        value = item.strip()
+        if len(value) > 200:
+            raise ValueError(f"{path}: required item exceeds 200 characters")
+        result.append(value)
+    return result
 
 
 def check(content: str, label: str, required: list[str]) -> int:

@@ -176,6 +176,83 @@ class LaneBriefTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("not a regular file", error)
 
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(signal, "SIGALRM"), "FIFO alarm unavailable"
+    )
+    def test_config_swapped_to_fifo_rejected(self) -> None:
+        """Reject a FIFO substituted after a path-based regular-file check."""
+        config = self.root / "config.yaml"
+        config.write_text("required:\n  - present\n", encoding="utf-8")
+        brief = self.root / "brief.md"
+        brief.write_text("present\n", encoding="utf-8")
+        original_open = os.open
+
+        def swap(path: object, *args: object, **kwargs: object) -> int:
+            """Replace the config with a FIFO immediately before opening it."""
+            if path == config:
+                config.unlink()
+                os.mkfifo(config)
+            return original_open(path, *args, **kwargs)
+
+        previous = signal.signal(signal.SIGALRM, self._alarm_handler)
+        try:
+            with patch.object(lane_brief.os, "open", side_effect=swap):
+                signal.alarm(2)
+                rc, _, error = self.run_cli("check", str(brief), "--config", str(config))
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        self.assertEqual(rc, 2)
+        self.assertIn("not a regular file", error)
+
+    def test_invalid_yaml_required_items(self) -> None:
+        """Reject comments, unindented list items, and non-string values."""
+        config = self.root / "config.yaml"
+        brief = self.root / "brief.md"
+        brief.write_text("first\n# TODO\n3\n", encoding="utf-8")
+        for document in (
+            "required:\n  - # TODO\n",
+            "required:\n  - first\n- second\n",
+            "required:\n  - 3\n",
+        ):
+            with self.subTest(document=document):
+                config.write_text(document, encoding="utf-8")
+                self.assertEqual(self.run_cli("check", str(brief), "--config", str(config))[0], 2)
+
+    def test_yaml_mapping_validation(self) -> None:
+        """Reject duplicate keys and invalid document or required-list shapes."""
+        config = self.root / "config.yaml"
+        brief = self.root / "brief.md"
+        brief.write_text("first\n", encoding="utf-8")
+        for document, reason in (
+            ("required: [first]\nother: 1\nother: 2\n", "duplicate key other"),
+            ("required: [first]\nrequired: [second]\n", "duplicate required key"),
+            ("- first\n", "required list"),
+            ("required: first\n", "required list"),
+            ('required: ["line\\nbreak"]\n', "invalid required item"),
+            ("required: [{}]\n", "invalid required item"),
+        ):
+            with self.subTest(document=document):
+                config.write_text(document, encoding="utf-8")
+                rc, _, error = self.run_cli("check", str(brief), "--config", str(config))
+                self.assertEqual(rc, 2, error)
+                self.assertIn(reason, error)
+                self.assertIn(str(config), error)
+
+    def test_repository_required_values(self) -> None:
+        """Preserve every requirement in the repository declaration."""
+        self.assertEqual(
+            lane_brief.read_required(CONFIG),
+            [
+                "docstrings: every public function you add OR touch",
+                "one-line docstring on every new test function",
+                "ruff check scripts tests",
+                "ruff format --check scripts tests",
+                "docstring_diff.py --cached",
+                "no commit, no push",
+            ],
+        )
+
     def test_config_item_boundaries(self) -> None:
         """Accept maximum list and item lengths and reject values above them."""
         config = self.root / "config.yaml"
@@ -256,29 +333,32 @@ class LaneBriefTest(unittest.TestCase):
         self.assertIn("duplicate required key", error)
 
     def test_invalid_required_children_rejected(self) -> None:
-        """Reject empty items and malformed children in the required section."""
+        """Reject empty and malformed values in the required section."""
         brief = self.root / "brief.md"
         config = self.root / "config.yaml"
         brief.write_text("Task:\n", encoding="utf-8")
-        for child, reason in (
-            ("  -", "empty required item"),
-            ("  -   ", "empty required item"),
-            ("  -x", "malformed required line: -x"),
-            ("    - nested", "malformed required line: - nested"),
-            ("  foo", "malformed required line: foo"),
-        ):
+        for child in ("  -", "  -   ", "  -x", "  foo"):
             with self.subTest(child=child):
-                config.write_text(f"required:\n  - Task:\n{child}\n", encoding="utf-8")
+                config.write_text(f'required:\n  - "Task:"\n{child}\n', encoding="utf-8")
                 rc, _, error = self.run_cli("check", str(brief), "--config", str(config))
                 self.assertEqual(rc, 2, error)
-                self.assertIn(f"{config}: {reason}", error)
+                self.assertIn(str(config), error)
+
+    def test_nested_scalar_continuation(self) -> None:
+        """Require text that YAML folds into a preceding scalar."""
+        brief = self.root / "brief.md"
+        config = self.root / "config.yaml"
+        brief.write_text("Task\n", encoding="utf-8")
+        config.write_text("required:\n  - Task\n    - nested\n", encoding="utf-8")
+        self.assertEqual(lane_brief.read_required(config), ["Task - nested"])
+        self.assertEqual(self.run_cli("check", str(brief), "--config", str(config))[0], 1)
 
     def test_other_section_child_ignored(self) -> None:
-        """Ignore malformed children of another top-level section."""
+        """Ignore valid content under another top-level section."""
         brief = self.root / "brief.md"
         config = self.root / "config.yaml"
         brief.write_text("Task:\n", encoding="utf-8")
-        config.write_text("required:\n  - Task:\nother:\n    - nested\n  foo\n", encoding="utf-8")
+        config.write_text('required:\n  - "Task:"\nother:\n  - nested\n', encoding="utf-8")
         rc, _, error = self.run_cli("check", str(brief), "--config", str(config))
         self.assertEqual(rc, 0, error)
 
