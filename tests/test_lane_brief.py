@@ -255,6 +255,33 @@ class LaneBriefTest(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertIn("duplicate required key", error)
 
+    def test_invalid_required_children_rejected(self) -> None:
+        """Reject empty items and malformed children in the required section."""
+        brief = self.root / "brief.md"
+        config = self.root / "config.yaml"
+        brief.write_text("Task:\n", encoding="utf-8")
+        for child, reason in (
+            ("  -", "empty required item"),
+            ("  -   ", "empty required item"),
+            ("  -x", "malformed required line: -x"),
+            ("    - nested", "malformed required line: - nested"),
+            ("  foo", "malformed required line: foo"),
+        ):
+            with self.subTest(child=child):
+                config.write_text(f"required:\n  - Task:\n{child}\n", encoding="utf-8")
+                rc, _, error = self.run_cli("check", str(brief), "--config", str(config))
+                self.assertEqual(rc, 2, error)
+                self.assertIn(f"{config}: {reason}", error)
+
+    def test_other_section_child_ignored(self) -> None:
+        """Ignore malformed children of another top-level section."""
+        brief = self.root / "brief.md"
+        config = self.root / "config.yaml"
+        brief.write_text("Task:\n", encoding="utf-8")
+        config.write_text("required:\n  - Task:\nother:\n    - nested\n  foo\n", encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief), "--config", str(config))
+        self.assertEqual(rc, 0, error)
+
     def test_render_line_limit_refuses_file_and_stdout(self) -> None:
         """Reject combined render values exceeding the output line limit."""
         destination = self.root / "out.md"

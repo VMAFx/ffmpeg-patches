@@ -61,6 +61,15 @@ def required_item(path: Path, text: str) -> str:
     return value
 
 
+def append_required_child(path: Path, text: str, indent: int, items: list[str]) -> None:
+    """Validate and append a required list child within the item limit."""
+    if indent != 2 or (text != "-" and not text.startswith("- ")):
+        raise ValueError(f"{path}: malformed required line: {text}")
+    items.append(required_item(path, text))
+    if len(items) > 32:
+        raise ValueError(f"{path}: required list exceeds 32 items")
+
+
 def read_required(path: Path) -> list[str]:
     """Read the bounded required list from a lane brief config file."""
     required = False
@@ -68,18 +77,18 @@ def read_required(path: Path) -> list[str]:
     items: list[str] = []
     for line in bounded_lines(path):
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped == "---":
+        if not stripped or stripped.startswith("#"):
             continue
         indent = len(line) - len(line.lstrip(" "))
         if indent == 0:
+            if stripped == "---":
+                continue
             required = stripped == "required:"
             if required and seen_required:
                 raise ValueError(f"{path}: duplicate required key")
             seen_required |= required
-        elif required and indent == 2 and stripped.startswith("- "):
-            items.append(required_item(path, stripped))
-            if len(items) > 32:
-                raise ValueError(f"{path}: required list exceeds 32 items")
+        elif required:
+            append_required_child(path, stripped, indent, items)
     if not items:
         raise ValueError(f"{path}: missing or empty required list")
     return items
