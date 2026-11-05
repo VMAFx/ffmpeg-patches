@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import os
+import re
 import signal
 import tempfile
 import time
@@ -91,6 +93,63 @@ class LaneBriefTest(unittest.TestCase):
         (self.root / "rc").write_text("0", encoding="utf-8")
         return brief, runner, self.root / "args"
 
+    def assert_child_gone(self, pid_file: Path) -> None:
+        """Check the child disappears, cleaning it up if the check fails."""
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        for _ in range(200):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.01)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        self.fail(f"child process {pid} still exists")
+
+    def constant_names(self, tree: ast.Module) -> set[str]:
+        """Collect module-level constant names from assignments."""
+        return {
+            target.id
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name) and re.fullmatch(r"[A-Z][A-Z0-9_]*", target.id)
+        }
+
+    def excluded_strings(self, tree: ast.Module) -> set[int]:
+        """Exclude formatted string components and module and function docstrings."""
+        excluded = {
+            id(child)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.JoinedStr)
+            for child in ast.walk(node)
+        }
+        excluded.update(
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef))
+            and ast.get_docstring(node) is not None
+        )
+        return excluded
+
+    def test_constant_names_not_in_plain_strings(self) -> None:
+        """Reject constant names accidentally left unformatted in string literals."""
+        tree = ast.parse((ROOT / "scripts" / "lane_brief.py").read_text(encoding="utf-8"))
+        names = self.constant_names(tree)
+        excluded = self.excluded_strings(tree)
+        pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, sorted(names))) + r")\b")
+        matches = [
+            (node.lineno, match.group())
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in excluded
+            if (match := pattern.search(node.value))
+        ]
+        self.assertEqual(matches, [])
+
     def test_runner_output_missing_stdout(self) -> None:
         """Reject a runner without a stdout pipe."""
         process = SimpleNamespace(stdout=None)
@@ -133,17 +192,18 @@ class LaneBriefTest(unittest.TestCase):
         with patch.object(lane_brief, "RUNNER_OUTPUT_LIMIT", 16, create=True):
             rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
         self.assertEqual(rc, 2)
-        self.assertEqual(
-            error, "lane_brief: runner failed: output exceeds RUNNER_OUTPUT_LIMIT bytes\n"
-        )
+        self.assertEqual(error, "lane_brief: runner failed: output exceeds 16 bytes\n")
 
     def test_runner_output_stopped_and_reaped(self) -> None:
         """Stop and reap a runner as soon as its output exceeds the limit."""
         brief, runner, _ = self.runner_fixture()
         pid_file = self.root / "pid"
+        child_file = self.root / "child_pid"
         runner.write_text(
             "#!/bin/sh\n"
             f"echo $$ > '{pid_file}'\n"
+            "sleep 30 &\n"
+            f"echo $! > '{child_file}'\n"
             "for i in $(seq 1 1000); do printf '%01024d' 0; done\n"
             "sleep 30\n",
             encoding="utf-8",
@@ -153,8 +213,10 @@ class LaneBriefTest(unittest.TestCase):
             rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(rc, 2)
+        self.assert_child_gone(child_file)
         self.assertEqual(
-            error, "lane_brief: runner failed: output exceeds RUNNER_OUTPUT_LIMIT bytes\n"
+            error,
+            f"lane_brief: runner failed: output exceeds {lane_brief.RUNNER_OUTPUT_LIMIT} bytes\n",
         )
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pid_file.read_text(encoding="utf-8")), 0)
@@ -166,7 +228,7 @@ class LaneBriefTest(unittest.TestCase):
         with patch.object(lane_brief, "RUNNER_OUTPUT_LIMIT", 16, create=True):
             rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
         self.assertEqual(rc, 2)
-        self.assertIn("output exceeds RUNNER_OUTPUT_LIMIT bytes", error)
+        self.assertIn("output exceeds 16 bytes", error)
 
     def test_worktree_config_rejects_before_runner(self) -> None:
         """Check the selected worktree requirements before invoking the runner."""
@@ -221,13 +283,16 @@ class LaneBriefTest(unittest.TestCase):
     def test_runner_timeout(self) -> None:
         """Report a runner exceeding the timeout as an input error."""
         brief, runner, _ = self.runner_fixture()
-        (self.root / "sleep").touch()
+        child_file = self.root / "child_pid"
+        runner.write_text(
+            f"#!/bin/sh\nsleep 30 &\necho $! > '{child_file}'\nwait\n",
+            encoding="utf-8",
+        )
         with patch.object(lane_brief, "RUNNER_TIMEOUT", 1):
             rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
         self.assertEqual(rc, 2)
-        self.assertEqual(
-            error, "lane_brief: runner failed: timed out after RUNNER_TIMEOUT seconds\n"
-        )
+        self.assert_child_gone(child_file)
+        self.assertEqual(error, "lane_brief: runner failed: timed out after 1 seconds\n")
 
     def test_runner_from_environment(self) -> None:
         """Use the environment runner and default worktree when unspecified."""

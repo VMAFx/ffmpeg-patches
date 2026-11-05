@@ -11,10 +11,12 @@ Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import os
 import re
 import selectors
+import signal
 import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
@@ -190,21 +192,28 @@ def read_runner_output(process: subprocess.Popen[bytes], deadline: float) -> byt
                 return bytes(output)
             output.extend(chunk)
             if len(output) > RUNNER_OUTPUT_LIMIT:
-                raise ValueError("output exceeds RUNNER_OUTPUT_LIMIT bytes")
-    raise ValueError("output exceeds RUNNER_OUTPUT_LIMIT bytes")
+                raise ValueError(f"output exceeds {RUNNER_OUTPUT_LIMIT} bytes")
+    raise ValueError(f"output exceeds {RUNNER_OUTPUT_LIMIT} bytes")
 
 
 def run_runner(argv: list[str]) -> tuple[bytes, int]:
     """Run and reap a runner while collecting bounded combined output."""
     process = subprocess.Popen(  # nosec B603 - configured runner path, explicit argv, no shell.
-        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
     )
+    completed = False
     try:
         output = read_runner_output(process, time.monotonic() + RUNNER_TIMEOUT)
+        completed = True
         return output, process.returncode
     finally:
-        if process.poll() is None:
-            process.kill()
+        if not completed or process.poll() != 0:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
         try:
             process.wait(timeout=5)
         finally:
@@ -217,7 +226,9 @@ def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
     try:
         output, returncode = run_runner([str(runner), "--check-brief", str(brief), str(worktree)])
     except subprocess.TimeoutExpired:
-        print("lane_brief: runner failed: timed out after RUNNER_TIMEOUT seconds", file=sys.stderr)
+        print(
+            f"lane_brief: runner failed: timed out after {RUNNER_TIMEOUT} seconds", file=sys.stderr
+        )
         return 2
     except (OSError, ValueError) as error:
         print(f"lane_brief: runner failed: {error}", file=sys.stderr)
