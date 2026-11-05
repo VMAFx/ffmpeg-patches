@@ -923,6 +923,8 @@ class EditBodyTest(ForgejoTest):
 
 
 class TestClaimHeadTest(ForgejoTest):
+    """Validate evidence before accepting claims about a tested head."""
+
     def evidence(self, head: str = A, content: str | None = None) -> str:
         """Write evidence for a tested head."""
 
@@ -1007,6 +1009,78 @@ class TestClaimHeadTest(ForgejoTest):
                 self.assertIn(evidence, proc.stderr)
                 self.assertIn(reason, proc.stderr)
                 self.assertEqual(stub.requests, [])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs unavailable")
+    def test_fifo_evidence_is_refused(self) -> None:
+        """A FIFO is refused without waiting for a writer or contacting the API."""
+
+        path = self.tmp / "fifo"
+        os.mkfifo(path)
+        stub = Stub()
+        proc = self.comment(stub, "--tested-head", A, "--evidence", str(path))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(f"{path}: evidence is not a regular file", proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_evidence_size_boundary(self) -> None:
+        """Evidence at one MiB is accepted and larger evidence is refused."""
+
+        claim = f"- test: fate tree=/w head={A}\n"
+        padding = "#" * 200 + "\n"
+        remainder = 1048576 - len(claim)
+        content = claim + padding * (remainder // len(padding)) + "#" * (remainder % len(padding))
+        for extra in ("", "x"):
+            with self.subTest(extra=extra):
+                stub = Stub([A])
+                evidence = self.evidence(content=content + extra)
+                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 76 if extra else 0, proc.stderr)
+                if extra:
+                    self.assertIn(f"{evidence}: evidence larger than 1 MiB", proc.stderr)
+                    self.assertEqual(stub.requests, [])
+                else:
+                    self.assertEqual(self.posts(stub), [BODY])
+
+    def test_directory_evidence_is_refused(self) -> None:
+        """A directory is refused without contacting the API."""
+
+        stub = Stub()
+        proc = self.comment(stub, "--tested-head", A, "--evidence", str(self.tmp))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(f"{self.tmp}: evidence is not a regular file", proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_evidence_line_count_boundary(self) -> None:
+        """Ten thousand lines are accepted and an extra line is refused."""
+
+        claim = f"- test: fate tree=/w head={A}\n"
+        for count in (10000, 10001):
+            with self.subTest(count=count):
+                stub = Stub([A])
+                evidence = self.evidence(content=claim + "#\n" * (count - 1))
+                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 0 if count == 10000 else 76, proc.stderr)
+                if count == 10001:
+                    self.assertIn(f"{evidence}:10001: too many lines", proc.stderr)
+                    self.assertEqual(stub.requests, [])
+                else:
+                    self.assertEqual(self.posts(stub), [BODY])
+
+    def test_evidence_line_length_boundary(self) -> None:
+        """A 65536-byte line is accepted and a longer line is refused."""
+
+        claim = f"- test: fate tree=/w head={A}\n"
+        for length in (65536, 65537):
+            with self.subTest(length=length):
+                stub = Stub([A])
+                evidence = self.evidence(content=claim + "#" * (length - 1) + "\n")
+                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 0 if length == 65536 else 76, proc.stderr)
+                if length == 65537:
+                    self.assertIn(f"{evidence}:2: line longer than 65536 bytes", proc.stderr)
+                    self.assertEqual(stub.requests, [])
+                else:
+                    self.assertEqual(self.posts(stub), [BODY])
 
     def test_missing_evidence_file_is_refused(self) -> None:
         """A missing evidence file exits 1 without any request."""
