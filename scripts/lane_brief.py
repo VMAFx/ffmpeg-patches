@@ -81,7 +81,11 @@ def read_required(path: Path) -> list[str]:
             return super().construct_mapping(node, deep=deep)
 
     try:
-        document = yaml.load("".join(bounded_lines(path)), Loader=UniqueLoader)
+        loader = UniqueLoader("".join(bounded_lines(path)))
+        try:
+            document = loader.get_single_data()
+        finally:
+            loader.dispose()
     except yaml.YAMLError as error:
         raise ValueError(f"{path}: invalid YAML: {error}") from error
     return validate_required(path, document)
