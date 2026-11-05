@@ -923,6 +923,16 @@ class EditBodyTest(ForgejoTest):
 
 
 class TestClaimHeadTest(ForgejoTest):
+    def evidence(self, head: str = A, content: str | None = None) -> str:
+        """Write evidence for a tested head."""
+
+        path = self.tmp / "evidence.md"
+        path.write_text(
+            content if content is not None else f"- test: fate tree=/w head={head}\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
     def comment(self, stub: Stub, *args: str) -> subprocess.CompletedProcess[str]:
         """Run a comment command with the shared issue and body arguments."""
 
@@ -942,6 +952,8 @@ class TestClaimHeadTest(ForgejoTest):
             "comment",
             "--tested-head",
             A,
+            "--evidence",
+            self.evidence(),
             "1",
             str(self.tmp / "body.md"),
             path_first=path_first,
@@ -963,11 +975,75 @@ class TestClaimHeadTest(ForgejoTest):
 
         return self.sent_bodies(stub, "PATCH")
 
+    def test_stale_evidence_is_refused_before_network(self) -> None:
+        """A test on another head cannot authorize either write."""
+
+        for command in (self.comment, self.edit_body):
+            with self.subTest(command=command.__name__):
+                stub = Stub([A], {A: [[label("success")]]})
+                evidence = self.evidence(
+                    content=f"- test: fate-source rc 0 tree=/x/.lane/build head={STALE}\n"
+                )
+                proc = command(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 76, proc.stderr)
+                self.assertIn(f"{evidence}:1", proc.stderr)
+                self.assertEqual(stub.requests, [])
+
+    def test_evidence_validation(self) -> None:
+        """Invalid or absent evidence cannot reach the API."""
+
+        cases = (
+            (f"- test: fate head={A}\n", "tree"),
+            ("test: fate tree=/w\n", "head"),
+            ("- control: red run\n", "test"),
+            ("- test: fate tree=/w head=aaaaaa\n", "head"),
+        )
+        for content, reason in cases:
+            with self.subTest(content=content):
+                stub = Stub()
+                evidence = self.evidence(content=content)
+                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 76, proc.stderr)
+                self.assertIn(evidence, proc.stderr)
+                self.assertIn(reason, proc.stderr)
+                self.assertEqual(stub.requests, [])
+
+    def test_missing_evidence_file_is_refused(self) -> None:
+        """A missing evidence file exits 1 without any request."""
+
+        stub = Stub()
+        path = str(self.tmp / "missing")
+        proc = self.comment(stub, "--tested-head", A, "--evidence", path)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(path, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_evidence_prefix_and_control_are_accepted(self) -> None:
+        """A matching short head with a control line on another head posts."""
+
+        stub = Stub([A])
+        evidence = self.evidence(
+            content=f"- control: red run head={STALE}\n  test: fate tree=/w head={A[:12].upper()}\n"
+        )
+        proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_tested_head_without_evidence_is_usage_error(self) -> None:
+        """--tested-head without --evidence is a usage error without any request."""
+
+        for command in (self.comment, self.edit_body):
+            with self.subTest(command=command.__name__):
+                stub = Stub()
+                proc = command(stub, "--tested-head", A)
+                self.assertEqual(proc.returncode, 64, proc.stderr)
+                self.assertEqual(stub.requests, [])
+
     def test_stale_tested_head_is_refused_without_post(self) -> None:
         """A stale tested head exits 76 without posting a comment."""
 
         stub = Stub([LIVE])
-        proc = self.comment(stub, "--tested-head", STALE)
+        proc = self.comment(stub, "--tested-head", STALE, "--evidence", self.evidence(STALE))
         self.assertEqual(proc.returncode, 76)
         self.assertIn(STALE, proc.stderr)
         self.assertIn(LIVE, proc.stderr)
@@ -977,7 +1053,7 @@ class TestClaimHeadTest(ForgejoTest):
         """A pull HTTP 500 exits 1 with its status and never posts a comment."""
 
         stub = Stub(pull_status=500)
-        proc = self.comment(stub, "--tested-head", A)
+        proc = self.comment(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 1)
         self.assertIn(
             f"cannot read the head of #1 (HTTP 500); tested head {A} not checked",
@@ -989,7 +1065,7 @@ class TestClaimHeadTest(ForgejoTest):
         """A pull HTTP 401 exits 1 with its status and never patches the body."""
 
         stub = Stub(pull_status=401)
-        proc = self.edit_body(stub, "--tested-head", A)
+        proc = self.edit_body(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 1)
         self.assertIn(
             f"cannot read the head of #1 (HTTP 401); tested head {A} not checked",
@@ -1048,7 +1124,7 @@ class TestClaimHeadTest(ForgejoTest):
         """Assert that an unreadable live head prevents a comment."""
 
         stub = Stub([live])
-        proc = self.comment(stub, "--tested-head", A)
+        proc = self.comment(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("cannot read the head", proc.stderr)
         self.assertEqual(self.posts(stub), [])
@@ -1068,7 +1144,7 @@ class TestClaimHeadTest(ForgejoTest):
 
         short = LIVE[:7]
         stub = Stub([short])
-        proc = self.comment(stub, "--tested-head", short)
+        proc = self.comment(stub, "--tested-head", short, "--evidence", self.evidence(short))
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("cannot read the head", proc.stderr)
         self.assertEqual(self.posts(stub), [])
@@ -1079,7 +1155,9 @@ class TestClaimHeadTest(ForgejoTest):
         for tested in (LIVE[:12], LIVE):
             with self.subTest(tested=tested):
                 stub = Stub([LIVE])
-                proc = self.comment(stub, "--tested-head", tested)
+                proc = self.comment(
+                    stub, "--tested-head", tested, "--evidence", self.evidence(tested)
+                )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(self.posts(stub), [BODY])
 
@@ -1089,7 +1167,9 @@ class TestClaimHeadTest(ForgejoTest):
         for tested in (LIVE[:6], "not-hex"):
             with self.subTest(tested=tested):
                 stub = Stub([LIVE])
-                proc = self.comment(stub, "--tested-head", tested)
+                proc = self.comment(
+                    stub, "--tested-head", tested, "--evidence", self.evidence(tested)
+                )
                 self.assertEqual(proc.returncode, 64)
                 self.assertIn("usage: comment", proc.stderr)
                 self.assertEqual(self.posts(stub), [])
@@ -1097,7 +1177,10 @@ class TestClaimHeadTest(ForgejoTest):
     def test_missing_or_conflicting_claim_options_are_usage_errors(self) -> None:
         """Missing or conflicting claim modes are rejected without writes."""
 
-        for args in ((), ("--tested-head", LIVE, "--no-test-claims")):
+        for args in (
+            (),
+            ("--tested-head", LIVE, "--evidence", self.evidence(LIVE), "--no-test-claims"),
+        ):
             with self.subTest(args=args):
                 stub = Stub([LIVE])
                 proc = self.comment(stub, *args)
@@ -1118,7 +1201,7 @@ class TestClaimHeadTest(ForgejoTest):
         """The final tested-head check rejects a push made during Autolabel checks."""
 
         stub = Stub([A, A, A, B], {A: [[label("success")]]})
-        proc = self.edit_body(stub, "--tested-head", A)
+        proc = self.edit_body(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 76)
         self.assertIn(A, proc.stderr)
         self.assertIn(B, proc.stderr)
@@ -1128,14 +1211,14 @@ class TestClaimHeadTest(ForgejoTest):
         """A matching tested-head prefix authorizes the body PATCH."""
 
         stub = Stub([A], {A: [[label("success")]]})
-        proc = self.edit_body(stub, "--tested-head", A[:12])
+        proc = self.edit_body(stub, "--tested-head", A[:12], "--evidence", self.evidence(A[:12]))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.patches(stub), [BODY])
 
     def test_edit_body_requires_exactly_one_claim_option(self) -> None:
         """Body edits require exactly one claim mode and make no invalid PATCH."""
 
-        for args in ((), ("--tested-head", A, "--no-test-claims")):
+        for args in ((), ("--tested-head", A, "--evidence", self.evidence(A), "--no-test-claims")):
             with self.subTest(args=args):
                 stub = Stub([A], {A: [[label("success")]]})
                 proc = self.edit_body(stub, *args)
@@ -1147,7 +1230,7 @@ class TestClaimHeadTest(ForgejoTest):
         """Issue comments reject tested-head claims but accept no-test claims."""
 
         stub = Stub(pull_status=404)
-        proc = self.comment(stub, "--tested-head", A)
+        proc = self.comment(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 76)
         self.assertIn("not a pull request", proc.stderr)
         self.assertEqual(self.posts(stub), [])
@@ -1161,7 +1244,7 @@ class TestClaimHeadTest(ForgejoTest):
         """An issue body edit exits 76 before status reads and never PATCHes."""
 
         stub = Stub(pull_status=404)
-        proc = self.edit_body(stub, "--tested-head", A)
+        proc = self.edit_body(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 76)
         self.assertIn(f"#1 is not a pull request; tested head {A} cannot be checked", proc.stderr)
         self.assertEqual(self.patches(stub), [])
