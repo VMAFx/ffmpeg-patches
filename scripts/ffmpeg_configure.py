@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
+import signal
 import subprocess  # nosec B404 - configure is a fixed path, no shell, with timeout.
 import sys
 from collections.abc import Mapping, Sequence
@@ -48,6 +50,7 @@ KEEPABLE: tuple[str, ...] = (
 )
 MAX_KEEP = 32
 TIMEOUT_S = 1800
+REAP_TIMEOUT_S = 10
 
 
 def allowed_environment(environ: Mapping[str, str], keep: Sequence[str]) -> dict[str, str]:
@@ -58,6 +61,30 @@ def allowed_environment(environ: Mapping[str, str], keep: Sequence[str]) -> dict
         raise ValueError(f"--keep accepts only: {', '.join(KEEPABLE)}")
     names = (*ALLOWED, *keep)
     return {name: environ[name] for name in names if name in environ}
+
+
+def _run_configure(command: Sequence[str], build: Path, environment: Mapping[str, str]) -> int:
+    """Run configure with a deadline and terminate its process group on timeout."""
+    process = subprocess.Popen(  # nosec B603 - fixed configure path and argument list.
+        command,
+        cwd=build,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        process.wait(timeout=TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        else:
+            # HISS-21: non-POSIX platforms can terminate only the direct child here.
+            process.kill()
+        process.wait(timeout=REAP_TIMEOUT_S)
+        print(f"configure exceeded the {TIMEOUT_S} s deadline", file=sys.stderr)
+        return 124
+    return process.returncode
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -79,19 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     build = Path(parsed.build)
     build.mkdir(parents=True, exist_ok=True)
-    try:
-        result = subprocess.run(  # nosec B603 - fixed configure path, argument list, timeout.
-            [str(Path(parsed.source).resolve() / "configure"), *args[separator + 1 :]],
-            cwd=build,
-            env=environment,
-            timeout=TIMEOUT_S,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"configure exceeded the {TIMEOUT_S} s deadline", file=sys.stderr)
-        return 124
-    return result.returncode
+    command = [str(Path(parsed.source).resolve() / "configure"), *args[separator + 1 :]]
+    return _run_configure(command, build, environment)
 
 
 if __name__ == "__main__":

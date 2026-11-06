@@ -7,12 +7,14 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import signal
 import subprocess  # nosec B404 - temporary shell fixture, fixed argv and deadline.
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import ffmpeg_configure
 
@@ -25,6 +27,30 @@ CONTROL_ENV = {
     "DUMMY_PLANT_TOKEN": PLANT,
     "DUMMY_OTHER": "other-value",
 }
+
+
+def process_exists(pid: int) -> bool:
+    """Return whether a process still accepts a signal probe."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def kill_process_if_running(pid: int) -> None:
+    """Kill a fixture process if it survived a failed assertion."""
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+
+
+def process_exits_within(pid: int, attempts: int = 20) -> bool:
+    """Poll for process exit with a bounded 0.1-second interval."""
+    for _ in range(attempts):
+        if not process_exists(pid):
+            return True
+        time.sleep(0.1)
+    return not process_exists(pid)
 
 
 def set_dump_value(log: str, name: str) -> str | None:
@@ -59,7 +85,11 @@ class FFmpegConfigureTest(unittest.TestCase):
         """Invoke the wrapper with the fixture and controlled planted names."""
         with (
             patch.dict(os.environ, CONTROL_ENV),
-            patch.object(ffmpeg_configure, "os", SimpleNamespace(environ=CONTROL_ENV)),
+            patch.object(
+                ffmpeg_configure,
+                "os",
+                SimpleNamespace(environ=CONTROL_ENV, killpg=os.killpg, name=os.name),
+            ),
         ):
             return ffmpeg_configure.main(
                 [*options, str(self.source), str(self.build), "--", "--disable-everything"]
@@ -144,17 +174,49 @@ class FFmpegConfigureTest(unittest.TestCase):
     def test_configure_timeout_returns_deadline_code(self) -> None:
         """Return 124 and report the deadline when configure times out."""
         error = io.StringIO()
+        process = SimpleNamespace(
+            pid=123,
+            returncode=None,
+            wait=Mock(side_effect=(subprocess.TimeoutExpired("configure", 1800), 0)),
+        )
         with (
             patch.object(
                 ffmpeg_configure.subprocess,
-                "run",
-                side_effect=subprocess.TimeoutExpired("configure", 1800),
+                "Popen",
+                return_value=process,
             ),
+            patch.object(ffmpeg_configure.os, "killpg") as killpg,
             contextlib.redirect_stderr(error),
         ):
             result = self.run_wrapper()
         self.assertEqual(result, 124)
         self.assertIn("1800", error.getvalue())
+        killpg.assert_called_once_with(123, signal.SIGKILL)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_configure_timeout_kills_child_process(self) -> None:
+        """Kill configure descendants before returning the deadline code."""
+        (self.source / "configure").write_text(
+            "#!/bin/sh\n"
+            "(sleep 30 & echo $! > sleep.pid; wait; echo late > late.txt) &\n"
+            "echo $! > child.pid\n"
+            "wait\n",
+            encoding="utf-8",
+        )
+        error = io.StringIO()
+        with (
+            patch.object(ffmpeg_configure, "TIMEOUT_S", 0.1),
+            contextlib.redirect_stderr(error),
+        ):
+            result = self.run_wrapper()
+        child_pid = int((self.build / "child.pid").read_text(encoding="utf-8"))
+        sleep_pid = int((self.build / "sleep.pid").read_text(encoding="utf-8"))
+        self.addCleanup(kill_process_if_running, child_pid)
+        self.addCleanup(kill_process_if_running, sleep_pid)
+        self.assertEqual(result, 124)
+        self.assertIn("0.1", error.getvalue())
+        self.assertTrue(process_exits_within(child_pid))
+        self.assertFalse((self.build / "late.txt").exists())
 
     def test_configure_return_code_propagates(self) -> None:
         """Return the configure process exit code unchanged."""
