@@ -22,6 +22,7 @@
 #   ffmpeg-forgejo edit-body [--wait] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          replace a PR body; test claims must match the live PR head; refuses (exit 75) while the
 #                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
+#                          Without Autolabel, edit-body requires at least one terminal status and the newest status to be at least 30 minutes old.
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
 # Evidence test claims start with `- test:` or `test:` after optional whitespace.
@@ -259,27 +260,50 @@ print(sha)' \
   [ -z "$evidence" ] || require_claim_evidence "$evidence" "$live"
 }
 
-# autolabel_state SHA: prints done, pending, none or unknown for the Autolabel contexts on that
-# commit. The status list is paged (X-Total-Count; the body's total_count counts one page only),
-# so it reads pages until an empty one; more than 20 pages, or a status outside Forgejo's
-# CommitStatusState values, is unknown.
+# autolabel_state SHA: classify Autolabel contexts or an aged, settled head without one.
+# Read at most 20 status pages; a full final page remains unknown.
 autolabel_state() {
-  local out page rows=""
+  local out page rows="" absent_age="${FFMPEG_FORGEJO_AUTOLABEL_ABSENT_AGE-1800}"
+  [[ "$absent_age" =~ ^[0-9]+$ ]] || die "FFMPEG_FORGEJO_AUTOLABEL_ABSENT_AGE must be an integer"
   for ((page = 1; page <= 20; page++)); do
     out="$(api GET "/repos/$REPO/commits/$1/status?limit=50&page=$page")" || exit 1
     out="$(python3 -c 'import json,sys
 st = json.load(sys.stdin).get("statuses") or []
 print(len(st))
 for s in st:
-    if s["context"].startswith("Autolabel"): print(s["status"])' <<<"$out")" || exit 1
+    print(json.dumps({"context": s["context"], "status": s["status"],
+                      "updated_at": s.get("updated_at") or s.get("created_at")}))' <<<"$out")" || exit 1
     if [ "${out%%$'\n'*}" = 0 ]; then
-      python3 -c 'import sys
-st = sys.argv[1].split()
+      python3 -c 'import datetime,json,os,re,sys
+rows = [json.loads(line) for line in sys.argv[1].splitlines() if line]
+st = [row["status"] for row in rows if row["context"].startswith("Autolabel")]
 terminal = {"success", "error", "failure", "warning", "skipped"}
-print("none" if not st else "pending" if "pending" in st else "done" if set(st) <= terminal else "unknown")' "$rows"
+if st:
+    print("pending" if "pending" in st else "done" if set(st) <= terminal else "unknown")
+    raise SystemExit(0)
+def timestamp(value: object) -> datetime.datetime | None:
+    """Parse an RFC3339 timestamp with an explicit UTC offset."""
+    if not isinstance(value, str) or re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", value
+    ) is None:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+now_text = os.environ.get("FFMPEG_FORGEJO_NOW")
+now = timestamp(now_text) if now_text is not None else datetime.datetime.now(datetime.UTC)
+if now is None:
+    raise SystemExit("invalid FFMPEG_FORGEJO_NOW")
+times = [timestamp(row["updated_at"]) for row in rows]
+settled = bool(rows) and all(row["status"] in terminal for row in rows)
+aged = bool(times) and all(item is not None for item in times) and (
+    now - max(times) >= datetime.timedelta(seconds=int(sys.argv[2]))
+)
+print("done" if settled and aged else "none")' "$rows" "$absent_age"
       return
     fi
-    [[ "$out" != *$'\n'* ]] || rows+=" ${out#*$'\n'}"
+    [[ "$out" != *$'\n'* ]] || rows+=$'\n'"${out#*$'\n'}"
   done
   echo unknown
 }
