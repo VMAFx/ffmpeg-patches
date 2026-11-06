@@ -27,6 +27,19 @@ CONTROL_ENV = {
 }
 
 
+def set_dump_value(log: str, name: str) -> str | None:
+    """Return a named value from bash or dash set output."""
+    prefix = f"{name}="
+    for line in log.splitlines():
+        if not line.startswith(prefix):
+            continue
+        value = line[len(prefix) :]
+        if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
+            return value[1:-1].replace("'\\''", "'")
+        return value
+    return None
+
+
 class FFmpegConfigureTest(unittest.TestCase):
     """Exercise environment selection and a real shell configure fixture."""
 
@@ -63,7 +76,7 @@ class FFmpegConfigureTest(unittest.TestCase):
         """Prove the configure set dump excludes planted and unlisted names."""
         self.assertEqual(self.run_wrapper(), 0)
         log = (self.build / "config.log").read_text(encoding="utf-8")
-        self.assertIn("PATH=", log)
+        self.assertEqual(set_dump_value(log, "PATH"), "/usr/bin:/bin")
         self.assertNotIn("DUMMY_PLANT_TOKEN", log)
         self.assertNotIn(PLANT, log)
         self.assertNotIn("DUMMY_OTHER", log)
@@ -86,11 +99,22 @@ class FFmpegConfigureTest(unittest.TestCase):
         """Pass an explicitly kept configure input to configure."""
         self.assertEqual(self.run_wrapper("--keep", "CPPFLAGS"), 0)
         log = (self.build / "config.log").read_text(encoding="utf-8")
-        self.assertIn("CPPFLAGS=-DPLANTED_CPPFLAG", log)
+        self.assertEqual(set_dump_value(log, "CPPFLAGS"), "-DPLANTED_CPPFLAG")
+
+    def test_set_dump_value_reads_bash_and_dash(self) -> None:
+        """Read equivalent bash and dash set dumps, including quoted values."""
+        bash_log = "CPPFLAGS=-DX\nPATH=/usr/bin\n"
+        dash_log = "CPPFLAGS='-DX'\nPATH='/usr/bin'\n"
+        dash_quote_log = "V='a'\\''b'\n"
+        for log in (bash_log, dash_log):
+            with self.subTest(log=log):
+                self.assertEqual(set_dump_value(log, "CPPFLAGS"), "-DX")
+                self.assertEqual(set_dump_value(log, "PATH"), "/usr/bin")
+        self.assertEqual(set_dump_value(dash_quote_log, "V"), "a'b")
+        self.assertIsNone(set_dump_value(bash_log, "ABSENT"))
 
     def test_keep_refuses_unlisted_names(self) -> None:
         """Reject every unlisted keep name before starting configure."""
-        error = io.StringIO()
         names = (
             "LD_PRELOAD",
             "BASH_ENV",
@@ -101,10 +125,12 @@ class FFmpegConfigureTest(unittest.TestCase):
             "DUMMY_OTHER",
         )
         for name in names:
-            with self.subTest(name=name), contextlib.redirect_stderr(error):
-                self.assertEqual(self.run_wrapper("--keep", name), 2)
-            self.assertIn("--keep accepts only:", error.getvalue())
-            self.assertFalse((self.build / "config.log").exists())
+            with self.subTest(name=name):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    self.assertEqual(self.run_wrapper("--keep", name), 2)
+                self.assertIn("--keep accepts only:", error.getvalue())
+                self.assertFalse((self.build / "config.log").exists())
 
     def test_keep_rejects_too_many_options(self) -> None:
         """Reject more than the maximum number of keep options."""
