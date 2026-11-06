@@ -944,6 +944,33 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [])
         self.assertTrue(any("page=2" in path for _, path, _ in stub.requests))
 
+    def test_twenty_full_status_pages_without_autolabel_are_refused(self) -> None:
+        """Twenty full status pages leave Autolabel unknown and forbid an edit."""
+
+        rows = [other_status("success", "2026-11-06T07:00:00Z", n) for n in range(1000)]
+        stub = Stub([A], {A: [rows]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+        pages = [
+            path for method, path, _ in stub.requests if method == "GET" and "/status?" in path
+        ]
+        self.assertEqual(len(pages), 20)
+        self.assertTrue(pages[-1].endswith("page=20"))
+        self.assertFalse(any("page=21" in path for path in pages))
+
+    def test_empty_twentieth_status_page_without_autolabel_allows_edit(self) -> None:
+        """An empty twentieth page proves aged terminal statuses are complete."""
+
+        rows = [other_status("success", "2026-11-06T07:00:00Z", n) for n in range(950)]
+        stub = Stub([A], {A: [rows]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 0)
+        self.assertEqual(self.patches(stub), [BODY])
+        pages = [
+            path for method, path, _ in stub.requests if method == "GET" and "/status?" in path
+        ]
+        self.assertEqual(len(pages), 20)
+        self.assertTrue(pages[-1].endswith("page=20"))
+
     def test_absent_autolabel_age_override_and_invalid_value(self) -> None:
         """A 60-second override permits the edit and a noninteger value fails."""
 
