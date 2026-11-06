@@ -27,6 +27,7 @@ B = "b" * 40
 LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
+NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "push", "fairy-reviews"})
 
@@ -34,7 +35,17 @@ HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "push", "
 def label(status: str, n: int = 0) -> dict:
     """Build an Autolabel status payload."""
 
-    return {"context": f"Autolabel / Labeler {n} (pull_request_target)", "status": status}
+    return {
+        "context": f"Autolabel / Labeler {n} (pull_request_target)",
+        "status": status,
+        "updated_at": "2026-11-06T08:00:00Z",
+    }
+
+
+def other_status(state: str, updated_at: str, n: int = 0) -> dict:
+    """Build a non-Autolabel commit status with a fixed timestamp."""
+
+    return {"context": f"Test / job {n}", "status": state, "updated_at": updated_at}
 
 
 def open_pull(number: int = 25612, login: str = "tester") -> dict:
@@ -85,7 +96,7 @@ def git_output(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-OTHER = {"context": "Test / Fate", "status": "pending"}
+OTHER = other_status("pending", "2026-11-06T08:00:00Z")
 ChangedFile = str | dict[str, str]
 
 
@@ -816,7 +827,15 @@ class FairyReviewsTest(ForgejoTest):
 
 
 class EditBodyTest(ForgejoTest):
-    def run_helper(self, stub: Stub, *args: str, path_first: Path | None = None) -> int:
+    """Exercise body-edit decisions against scripted commit statuses."""
+
+    def run_helper(
+        self,
+        stub: Stub,
+        *args: str,
+        path_first: Path | None = None,
+        env_updates: dict[str, str] | None = None,
+    ) -> int:
         """Run an unclaimed body edit and return its status."""
 
         proc = self.run_command(
@@ -827,6 +846,7 @@ class EditBodyTest(ForgejoTest):
             "1",
             str(self.tmp / "body.md"),
             path_first=path_first,
+            env_updates=env_updates,
         )
         return proc.returncode
 
@@ -848,10 +868,92 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [BODY])
 
     def test_pending_and_none_are_refused(self) -> None:
-        """Pending or absent Autolabel statuses refuse a body edit."""
+        """Pending Autolabel and fresh non-Autolabel statuses refuse an edit."""
 
         self.assert_refused(Stub([A], {A: [[label("pending"), OTHER]]}))
-        self.assert_refused(Stub([A], {A: [[OTHER]]}))
+        stub = Stub([A], {A: [[other_status("success", NOW)]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_fresh_head_without_autolabel_is_refused(self) -> None:
+        """A successful status only five minutes old cannot clear the edit."""
+
+        stub = Stub([A], {A: [[other_status("success", "2026-11-06T08:55:00Z")]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_aged_head_without_autolabel_is_edited(self) -> None:
+        """Ten settled statuses permit an edit when the newest is 31 minutes old."""
+
+        rows = [other_status("success", "2026-11-06T08:29:00Z", n) for n in range(10)]
+        stub = Stub([A], {A: [rows]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 0)
+        self.assertEqual(self.patches(stub), [BODY])
+
+    def test_absent_autolabel_uses_created_at_and_offset(self) -> None:
+        """A missing update time falls back to a created time with an offset."""
+
+        row = {
+            "context": "Test / created",
+            "status": "warning",
+            "created_at": "2026-11-06T09:29:00+01:00",
+        }
+        stub = Stub([A], {A: [[row]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 0)
+        self.assertEqual(self.patches(stub), [BODY])
+
+    def test_absent_autolabel_age_boundary(self) -> None:
+        """Exactly 1800 seconds qualifies while 1799 seconds does not."""
+
+        for timestamp, expected in (("08:30:00Z", 0), ("08:30:01Z", 75)):
+            with self.subTest(timestamp=timestamp):
+                stub = Stub([A], {A: [[other_status("success", f"2026-11-06T{timestamp}")]]})
+                self.assertEqual(
+                    self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), expected
+                )
+                self.assertEqual(self.patches(stub), [BODY] if expected == 0 else [])
+
+    def test_zero_statuses_without_autolabel_are_refused(self) -> None:
+        """No statuses cannot prove an absent Autolabel run has settled."""
+
+        stub = Stub([A], {A: [[]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_old_pending_status_without_autolabel_is_refused(self) -> None:
+        """An old pending status still blocks a body edit."""
+
+        stub = Stub([A], {A: [[other_status("pending", "2026-11-06T07:00:00Z")]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_unparseable_status_time_without_autolabel_is_refused(self) -> None:
+        """An invalid update time fails closed."""
+
+        stub = Stub([A], {A: [[other_status("success", "yesterday")]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_fresh_status_on_second_page_without_autolabel_is_refused(self) -> None:
+        """The newest status on page two determines the age of the head."""
+
+        rows = [other_status("success", "2026-11-06T07:00:00Z", n) for n in range(50)]
+        rows.append(other_status("success", "2026-11-06T08:55:00Z", 50))
+        stub = Stub([A], {A: [rows]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+        self.assertTrue(any("page=2" in path for _, path, _ in stub.requests))
+
+    def test_absent_autolabel_age_override_and_invalid_value(self) -> None:
+        """A 60-second override permits the edit and a noninteger value fails."""
+
+        row = other_status("success", "2026-11-06T08:59:00Z")
+        for age, expected in (("60", 0), ("sixty", 1)):
+            with self.subTest(age=age):
+                stub = Stub([A], {A: [[row]]})
+                env = {"FFMPEG_FORGEJO_NOW": NOW, "FFMPEG_FORGEJO_AUTOLABEL_ABSENT_AGE": age}
+                self.assertEqual(self.run_helper(stub, env_updates=env), expected)
+                self.assertEqual(self.patches(stub), [BODY] if expected == 0 else [])
 
     def test_every_terminal_state_allows_the_edit(self) -> None:
         """Every Forgejo terminal status permits a body edit."""
