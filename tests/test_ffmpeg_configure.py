@@ -14,8 +14,10 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 from scripts import ffmpeg_configure
@@ -273,6 +275,74 @@ class FFmpegConfigureTest(unittest.TestCase):
         descendant_exited = process_exits_within(descendant_pid)
 
         self.assertEqual((returncode, configure_exited, descendant_exited), (143, True, True))
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signals")
+    def test_run_configure_signal_during_launch_kills_and_reaps(self) -> None:
+        """Defer launch cancellation until configure can be killed and reaped."""
+        (self.source / "configure").write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+        self.build.mkdir()
+        real_popen = subprocess.Popen
+        real_killpg = os.killpg
+        signals = (signal.SIGTERM, signal.SIGHUP)
+        original_handlers = {signum: signal.getsignal(signum) for signum in signals}
+        launched: list[subprocess.Popen[bytes]] = []
+        for signum in signals:
+            with self.subTest(signum=signum):
+
+                def launch(
+                    command: Sequence[str],
+                    *,
+                    cancel_signal: int = signum,
+                    **kwargs: Any,
+                ) -> subprocess.Popen[bytes]:
+                    """Deliver cancellation after spawning but before returning the child."""
+                    process = real_popen(command, **kwargs)
+                    self.addCleanup(process.wait, timeout=5)
+                    self.addCleanup(kill_process_if_running, process.pid)
+                    launched.append(process)
+                    handler = signal.getsignal(cancel_signal)
+                    self.assertTrue(callable(handler), "cancel handler missing during launch")
+                    if callable(handler):
+                        handler(cancel_signal, None)
+                    return process
+
+                with (
+                    patch.object(ffmpeg_configure.subprocess, "Popen", side_effect=launch),
+                    patch.object(ffmpeg_configure.os, "killpg", wraps=real_killpg) as killpg,
+                    self.assertRaises(SystemExit) as cancelled,
+                ):
+                    ffmpeg_configure._run_configure(
+                        [str(self.source / "configure")], self.build, {}
+                    )
+                self.assertEqual(cancelled.exception.code, 128 + signum)
+                self.assertEqual(launched[-1].returncode, -signal.SIGKILL)
+                killpg.assert_called_once_with(launched[-1].pid, signal.SIGKILL)
+                self.assertEqual(
+                    {number: signal.getsignal(number) for number in signals}, original_handlers
+                )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signals")
+    def test_run_configure_launch_error_restores_handlers(self) -> None:
+        """Restore installed handlers and propagate a launch error without cleanup."""
+        signals = (signal.SIGTERM, signal.SIGHUP)
+        original_handlers = {signum: signal.getsignal(signum) for signum in signals}
+        error = OSError("configure missing")
+        real_signal = signal.signal
+        with (
+            patch.object(ffmpeg_configure.subprocess, "Popen", side_effect=error),
+            patch.object(ffmpeg_configure.signal, "signal", wraps=real_signal) as set_handler,
+            patch.object(ffmpeg_configure, "_kill_configure") as kill,
+            patch.object(ffmpeg_configure, "_reap_configure") as reap,
+            self.assertRaises(OSError) as raised,
+        ):
+            ffmpeg_configure._run_configure(["configure"], self.build, {})
+        self.assertIs(raised.exception, error)
+        self.assertEqual(
+            {signum: signal.getsignal(signum) for signum in signals}, original_handlers
+        )
+        self.assertEqual(set_handler.call_count, 4)
+        kill.assert_not_called()
+        reap.assert_not_called()
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX signals")
     def test_run_configure_restores_handlers_after_normal_exit(self) -> None:

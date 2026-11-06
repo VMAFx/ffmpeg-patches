@@ -92,35 +92,54 @@ def _exit_on_cancel_signal(signum: int, _frame: FrameType | None) -> NoReturn:
     raise SystemExit(128 + signum)
 
 
-def _run_configure(command: Sequence[str], build: Path, environment: Mapping[str, str]) -> int:
-    """Run configure with a deadline and terminate its process group on timeout."""
-    process = subprocess.Popen(  # nosec B603 - fixed configure path and argument list.
-        command,
-        cwd=build,
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        start_new_session=os.name == "posix",
-    )
-    previous_handlers = {}
+def _wait_configure(process: subprocess.Popen[bytes]) -> int:
+    """Wait with a deadline and kill and reap the configure group on timeout."""
     try:
-        # HISS-21: Python permits signal handler installation only in the main thread.
-        if os.name == "posix" and threading.current_thread() is threading.main_thread():
-            for signum in (signal.SIGTERM, signal.SIGHUP):
-                previous_handlers[signum] = signal.signal(signum, _exit_on_cancel_signal)
         process.wait(timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
         _kill_configure(process)
         _reap_configure(process)
         print(f"configure exceeded the {TIMEOUT_S} s deadline", file=sys.stderr)
         return 124
+    return process.returncode
+
+
+def _run_configure(command: Sequence[str], build: Path, environment: Mapping[str, str]) -> int:
+    """Run configure with a deadline and terminate its process group on timeout."""
+    process: subprocess.Popen[bytes] | None = None
+    pending_signal: int | None = None
+
+    def cancel(signum: int, frame: FrameType | None) -> None:
+        """Record launch cancellation until a process is available for cleanup."""
+        nonlocal pending_signal
+        pending_signal = signum
+        if process is not None:
+            _exit_on_cancel_signal(signum, frame)
+
+    previous_handlers = {}
+    try:
+        # HISS-21: Python permits signal handler installation only in the main thread.
+        if os.name == "posix" and threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGHUP):
+                previous_handlers[signum] = signal.signal(signum, cancel)
+        process = subprocess.Popen(  # nosec B603 - fixed configure path and argument list.
+            command,
+            cwd=build,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            start_new_session=os.name == "posix",
+        )
+        if pending_signal is not None:
+            _exit_on_cancel_signal(pending_signal, None)
+        return _wait_configure(process)
     except BaseException:
-        _kill_configure(process)
-        _reap_configure(process)
+        if process is not None:
+            _kill_configure(process)
+            _reap_configure(process)
         raise
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-    return process.returncode
 
 
 def main(argv: list[str] | None = None) -> int:
