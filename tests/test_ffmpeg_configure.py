@@ -193,6 +193,42 @@ class FFmpegConfigureTest(unittest.TestCase):
         self.assertIn("1800", error.getvalue())
         killpg.assert_called_once_with(123, signal.SIGKILL)
 
+    def test_configure_timeout_reap_timeout_returns_deadline_code(self) -> None:
+        """Return 124 when configure remains unreaped after group termination."""
+        error = io.StringIO()
+        timeout = subprocess.TimeoutExpired("configure", ffmpeg_configure.TIMEOUT_S)
+        reap_timeout = subprocess.TimeoutExpired("configure", ffmpeg_configure.REAP_TIMEOUT_S)
+        process = SimpleNamespace(
+            pid=123,
+            returncode=None,
+            wait=Mock(side_effect=(timeout, reap_timeout)),
+        )
+        with (
+            patch.object(ffmpeg_configure.subprocess, "Popen", return_value=process),
+            patch.object(ffmpeg_configure.os, "killpg") as killpg,
+            contextlib.redirect_stderr(error),
+        ):
+            result = self.run_wrapper()
+        self.assertEqual(result, 124)
+        self.assertIn(str(ffmpeg_configure.TIMEOUT_S), error.getvalue())
+        self.assertIn(str(ffmpeg_configure.REAP_TIMEOUT_S), error.getvalue())
+        killpg.assert_called_once_with(123, signal.SIGKILL)
+
+    def test_configure_keyboard_interrupt_kills_process_group(self) -> None:
+        """Kill configure descendants and re-raise an interrupted wait."""
+        process = SimpleNamespace(
+            pid=123,
+            returncode=None,
+            wait=Mock(side_effect=(KeyboardInterrupt(), 0)),
+        )
+        with (
+            patch.object(ffmpeg_configure.subprocess, "Popen", return_value=process),
+            patch.object(ffmpeg_configure.os, "killpg") as killpg,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.run_wrapper()
+        killpg.assert_called_once_with(123, signal.SIGKILL)
+
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_configure_timeout_kills_child_process(self) -> None:
         """Kill configure descendants before returning the deadline code."""
@@ -205,7 +241,7 @@ class FFmpegConfigureTest(unittest.TestCase):
         )
         error = io.StringIO()
         with (
-            patch.object(ffmpeg_configure, "TIMEOUT_S", 0.1),
+            patch.object(ffmpeg_configure, "TIMEOUT_S", 2.0),
             contextlib.redirect_stderr(error),
         ):
             result = self.run_wrapper()
@@ -214,8 +250,9 @@ class FFmpegConfigureTest(unittest.TestCase):
         self.addCleanup(kill_process_if_running, child_pid)
         self.addCleanup(kill_process_if_running, sleep_pid)
         self.assertEqual(result, 124)
-        self.assertIn("0.1", error.getvalue())
+        self.assertIn("2.0", error.getvalue())
         self.assertTrue(process_exits_within(child_pid))
+        self.assertTrue(process_exits_within(sleep_pid))
         self.assertFalse((self.build / "late.txt").exists())
 
     def test_configure_return_code_propagates(self) -> None:

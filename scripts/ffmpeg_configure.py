@@ -63,6 +63,27 @@ def allowed_environment(environ: Mapping[str, str], keep: Sequence[str]) -> dict
     return {name: environ[name] for name in names if name in environ}
 
 
+def _kill_configure(process: subprocess.Popen[bytes]) -> None:
+    """Terminate configure and its descendants where process groups are available."""
+    if os.name == "posix":
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    else:
+        # HISS-21: non-POSIX platforms can terminate only the direct child here.
+        process.kill()
+
+
+def _reap_configure(process: subprocess.Popen[bytes]) -> None:
+    """Reap terminated configure without leaking a second timeout."""
+    try:
+        process.wait(timeout=REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(
+            f"configure did not exit within {REAP_TIMEOUT_S} s after termination",
+            file=sys.stderr,
+        )
+
+
 def _run_configure(command: Sequence[str], build: Path, environment: Mapping[str, str]) -> int:
     """Run configure with a deadline and terminate its process group on timeout."""
     process = subprocess.Popen(  # nosec B603 - fixed configure path and argument list.
@@ -75,15 +96,14 @@ def _run_configure(command: Sequence[str], build: Path, environment: Mapping[str
     try:
         process.wait(timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-        else:
-            # HISS-21: non-POSIX platforms can terminate only the direct child here.
-            process.kill()
-        process.wait(timeout=REAP_TIMEOUT_S)
+        _kill_configure(process)
+        _reap_configure(process)
         print(f"configure exceeded the {TIMEOUT_S} s deadline", file=sys.stderr)
         return 124
+    except BaseException:
+        _kill_configure(process)
+        _reap_configure(process)
+        raise
     return process.returncode
 
 
