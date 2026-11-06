@@ -27,6 +27,7 @@ B = "b" * 40
 LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
+NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "push", "fairy-reviews"})
 
@@ -34,7 +35,17 @@ HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "push", "
 def label(status: str, n: int = 0) -> dict:
     """Build an Autolabel status payload."""
 
-    return {"context": f"Autolabel / Labeler {n} (pull_request_target)", "status": status}
+    return {
+        "context": f"Autolabel / Labeler {n} (pull_request_target)",
+        "status": status,
+        "updated_at": "2026-11-06T08:00:00Z",
+    }
+
+
+def other_status(state: str, updated_at: str, n: int = 0) -> dict:
+    """Build a non-Autolabel commit status with a fixed timestamp."""
+
+    return {"context": f"Test / job {n}", "status": state, "updated_at": updated_at}
 
 
 def open_pull(number: int = 25612, login: str = "tester") -> dict:
@@ -85,7 +96,7 @@ def git_output(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-OTHER = {"context": "Test / Fate", "status": "pending"}
+OTHER = other_status("pending", "2026-11-06T08:00:00Z")
 ChangedFile = str | dict[str, str]
 
 
@@ -816,7 +827,15 @@ class FairyReviewsTest(ForgejoTest):
 
 
 class EditBodyTest(ForgejoTest):
-    def run_helper(self, stub: Stub, *args: str, path_first: Path | None = None) -> int:
+    """Exercise body-edit decisions against scripted commit statuses."""
+
+    def run_helper(
+        self,
+        stub: Stub,
+        *args: str,
+        path_first: Path | None = None,
+        env_updates: dict[str, str] | None = None,
+    ) -> int:
         """Run an unclaimed body edit and return its status."""
 
         proc = self.run_command(
@@ -827,6 +846,7 @@ class EditBodyTest(ForgejoTest):
             "1",
             str(self.tmp / "body.md"),
             path_first=path_first,
+            env_updates=env_updates,
         )
         return proc.returncode
 
@@ -848,10 +868,119 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [BODY])
 
     def test_pending_and_none_are_refused(self) -> None:
-        """Pending or absent Autolabel statuses refuse a body edit."""
+        """Pending Autolabel and fresh non-Autolabel statuses refuse an edit."""
 
         self.assert_refused(Stub([A], {A: [[label("pending"), OTHER]]}))
-        self.assert_refused(Stub([A], {A: [[OTHER]]}))
+        stub = Stub([A], {A: [[other_status("success", NOW)]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_fresh_head_without_autolabel_is_refused(self) -> None:
+        """A successful status only five minutes old cannot clear the edit."""
+
+        stub = Stub([A], {A: [[other_status("success", "2026-11-06T08:55:00Z")]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_aged_head_without_autolabel_is_edited(self) -> None:
+        """Ten settled statuses permit an edit when the newest is 31 minutes old."""
+
+        rows = [other_status("success", "2026-11-06T08:29:00Z", n) for n in range(10)]
+        stub = Stub([A], {A: [rows]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 0)
+        self.assertEqual(self.patches(stub), [BODY])
+
+    def test_absent_autolabel_uses_created_at_and_offset(self) -> None:
+        """A missing update time falls back to a created time with an offset."""
+
+        row = {
+            "context": "Test / created",
+            "status": "warning",
+            "created_at": "2026-11-06T09:29:00+01:00",
+        }
+        stub = Stub([A], {A: [[row]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 0)
+        self.assertEqual(self.patches(stub), [BODY])
+
+    def test_absent_autolabel_age_boundary(self) -> None:
+        """Exactly 1800 seconds qualifies while 1799 seconds does not."""
+
+        for timestamp, expected in (("08:30:00Z", 0), ("08:30:01Z", 75)):
+            with self.subTest(timestamp=timestamp):
+                stub = Stub([A], {A: [[other_status("success", f"2026-11-06T{timestamp}")]]})
+                self.assertEqual(
+                    self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), expected
+                )
+                self.assertEqual(self.patches(stub), [BODY] if expected == 0 else [])
+
+    def test_zero_statuses_without_autolabel_are_refused(self) -> None:
+        """No statuses cannot prove an absent Autolabel run has settled."""
+
+        stub = Stub([A], {A: [[]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_old_pending_status_without_autolabel_is_refused(self) -> None:
+        """An old pending status still blocks a body edit."""
+
+        stub = Stub([A], {A: [[other_status("pending", "2026-11-06T07:00:00Z")]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_unparseable_status_time_without_autolabel_is_refused(self) -> None:
+        """An invalid update time fails closed."""
+
+        stub = Stub([A], {A: [[other_status("success", "yesterday")]]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_fresh_status_on_second_page_without_autolabel_is_refused(self) -> None:
+        """The newest status on page two determines the age of the head."""
+
+        rows = [other_status("success", "2026-11-06T07:00:00Z", n) for n in range(50)]
+        rows.append(other_status("success", "2026-11-06T08:55:00Z", 50))
+        stub = Stub([A], {A: [rows]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+        self.assertTrue(any("page=2" in path for _, path, _ in stub.requests))
+
+    def test_twenty_full_status_pages_without_autolabel_are_refused(self) -> None:
+        """Twenty full status pages leave Autolabel unknown and forbid an edit."""
+
+        rows = [other_status("success", "2026-11-06T07:00:00Z", n) for n in range(1000)]
+        stub = Stub([A], {A: [rows]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+        pages = [
+            path for method, path, _ in stub.requests if method == "GET" and "/status?" in path
+        ]
+        self.assertEqual(len(pages), 20)
+        self.assertTrue(pages[-1].endswith("page=20"))
+        self.assertFalse(any("page=21" in path for path in pages))
+
+    def test_empty_twentieth_status_page_without_autolabel_allows_edit(self) -> None:
+        """An empty twentieth page proves aged terminal statuses are complete."""
+
+        rows = [other_status("success", "2026-11-06T07:00:00Z", n) for n in range(950)]
+        stub = Stub([A], {A: [rows]})
+        self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 0)
+        self.assertEqual(self.patches(stub), [BODY])
+        pages = [
+            path for method, path, _ in stub.requests if method == "GET" and "/status?" in path
+        ]
+        self.assertEqual(len(pages), 20)
+        self.assertTrue(pages[-1].endswith("page=20"))
+
+    def test_absent_autolabel_age_override_and_invalid_value(self) -> None:
+        """A 60-second override permits the edit and a noninteger value fails."""
+
+        row = other_status("success", "2026-11-06T08:59:00Z")
+        for age, expected in (("60", 0), ("sixty", 1)):
+            with self.subTest(age=age):
+                stub = Stub([A], {A: [[row]]})
+                env = {"FFMPEG_FORGEJO_NOW": NOW, "FFMPEG_FORGEJO_AUTOLABEL_ABSENT_AGE": age}
+                self.assertEqual(self.run_helper(stub, env_updates=env), expected)
+                self.assertEqual(self.patches(stub), [BODY] if expected == 0 else [])
 
     def test_every_terminal_state_allows_the_edit(self) -> None:
         """Every Forgejo terminal status permits a body edit."""
@@ -923,6 +1052,18 @@ class EditBodyTest(ForgejoTest):
 
 
 class TestClaimHeadTest(ForgejoTest):
+    """Validate evidence before accepting claims about a tested head."""
+
+    def evidence(self, head: str = A, content: str | None = None) -> str:
+        """Write evidence for a tested head."""
+
+        path = self.tmp / "evidence.md"
+        path.write_text(
+            content if content is not None else f"- test: fate tree=/w head={head}\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
     def comment(self, stub: Stub, *args: str) -> subprocess.CompletedProcess[str]:
         """Run a comment command with the shared issue and body arguments."""
 
@@ -942,6 +1083,8 @@ class TestClaimHeadTest(ForgejoTest):
             "comment",
             "--tested-head",
             A,
+            "--evidence",
+            self.evidence(),
             "1",
             str(self.tmp / "body.md"),
             path_first=path_first,
@@ -963,11 +1106,147 @@ class TestClaimHeadTest(ForgejoTest):
 
         return self.sent_bodies(stub, "PATCH")
 
+    def test_stale_evidence_is_refused_before_network(self) -> None:
+        """A test on another head cannot authorize either write."""
+
+        for command in (self.comment, self.edit_body):
+            with self.subTest(command=command.__name__):
+                stub = Stub([A], {A: [[label("success")]]})
+                evidence = self.evidence(
+                    content=f"- test: fate-source rc 0 tree=/x/.lane/build head={STALE}\n"
+                )
+                proc = command(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 76, proc.stderr)
+                self.assertIn(f"{evidence}:1", proc.stderr)
+                self.assertEqual(stub.requests, [])
+
+    def test_evidence_validation(self) -> None:
+        """Invalid or absent evidence cannot reach the API."""
+
+        cases = (
+            (f"- test: fate head={A}\n", "tree"),
+            ("test: fate tree=/w\n", "head"),
+            ("- control: red run\n", "test"),
+            ("- test: fate tree=/w head=aaaaaa\n", "head"),
+        )
+        for content, reason in cases:
+            with self.subTest(content=content):
+                stub = Stub()
+                evidence = self.evidence(content=content)
+                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 76, proc.stderr)
+                self.assertIn(evidence, proc.stderr)
+                self.assertIn(reason, proc.stderr)
+                self.assertEqual(stub.requests, [])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs unavailable")
+    def test_fifo_evidence_is_refused(self) -> None:
+        """A FIFO is refused without waiting for a writer or contacting the API."""
+
+        path = self.tmp / "fifo"
+        os.mkfifo(path)
+        stub = Stub()
+        proc = self.comment(stub, "--tested-head", A, "--evidence", str(path))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(f"{path}: evidence is not a regular file", proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_evidence_size_boundary(self) -> None:
+        """Evidence at one MiB is accepted and larger evidence is refused."""
+
+        claim = f"- test: fate tree=/w head={A}\n"
+        padding = "#" * 200 + "\n"
+        remainder = 1048576 - len(claim)
+        content = claim + padding * (remainder // len(padding)) + "#" * (remainder % len(padding))
+        for extra in ("", "x"):
+            with self.subTest(extra=extra):
+                stub = Stub([A])
+                evidence = self.evidence(content=content + extra)
+                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 76 if extra else 0, proc.stderr)
+                if extra:
+                    self.assertIn(f"{evidence}: evidence larger than 1 MiB", proc.stderr)
+                    self.assertEqual(stub.requests, [])
+                else:
+                    self.assertEqual(self.posts(stub), [BODY])
+
+    def test_directory_evidence_is_refused(self) -> None:
+        """A directory is refused without contacting the API."""
+
+        stub = Stub()
+        proc = self.comment(stub, "--tested-head", A, "--evidence", str(self.tmp))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(f"{self.tmp}: evidence is not a regular file", proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_evidence_line_count_boundary(self) -> None:
+        """Ten thousand lines are accepted and an extra line is refused."""
+
+        claim = f"- test: fate tree=/w head={A}\n"
+        for count in (10000, 10001):
+            with self.subTest(count=count):
+                stub = Stub([A])
+                evidence = self.evidence(content=claim + "#\n" * (count - 1))
+                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 0 if count == 10000 else 76, proc.stderr)
+                if count == 10001:
+                    self.assertIn(f"{evidence}:10001: too many lines", proc.stderr)
+                    self.assertEqual(stub.requests, [])
+                else:
+                    self.assertEqual(self.posts(stub), [BODY])
+
+    def test_evidence_line_length_boundary(self) -> None:
+        """A 65536-byte line is accepted and a longer line is refused."""
+
+        claim = f"- test: fate tree=/w head={A}\n"
+        for length in (65536, 65537):
+            with self.subTest(length=length):
+                stub = Stub([A])
+                evidence = self.evidence(content=claim + "#" * (length - 1) + "\n")
+                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                self.assertEqual(proc.returncode, 0 if length == 65536 else 76, proc.stderr)
+                if length == 65537:
+                    self.assertIn(f"{evidence}:2: line longer than 65536 bytes", proc.stderr)
+                    self.assertEqual(stub.requests, [])
+                else:
+                    self.assertEqual(self.posts(stub), [BODY])
+
+    def test_missing_evidence_file_is_refused(self) -> None:
+        """A missing evidence file exits 1 without any request."""
+
+        stub = Stub()
+        path = str(self.tmp / "missing")
+        proc = self.comment(stub, "--tested-head", A, "--evidence", path)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(path, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_evidence_prefix_and_control_are_accepted(self) -> None:
+        """A matching short head with a control line on another head posts."""
+
+        stub = Stub([A])
+        evidence = self.evidence(
+            content=f"- control: red run head={STALE}\n  test: fate tree=/w head={A[:12].upper()}\n"
+        )
+        proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_tested_head_without_evidence_is_usage_error(self) -> None:
+        """--tested-head without --evidence is a usage error without any request."""
+
+        for command in (self.comment, self.edit_body):
+            with self.subTest(command=command.__name__):
+                stub = Stub()
+                proc = command(stub, "--tested-head", A)
+                self.assertEqual(proc.returncode, 64, proc.stderr)
+                self.assertEqual(stub.requests, [])
+
     def test_stale_tested_head_is_refused_without_post(self) -> None:
         """A stale tested head exits 76 without posting a comment."""
 
         stub = Stub([LIVE])
-        proc = self.comment(stub, "--tested-head", STALE)
+        proc = self.comment(stub, "--tested-head", STALE, "--evidence", self.evidence(STALE))
         self.assertEqual(proc.returncode, 76)
         self.assertIn(STALE, proc.stderr)
         self.assertIn(LIVE, proc.stderr)
@@ -977,7 +1256,7 @@ class TestClaimHeadTest(ForgejoTest):
         """A pull HTTP 500 exits 1 with its status and never posts a comment."""
 
         stub = Stub(pull_status=500)
-        proc = self.comment(stub, "--tested-head", A)
+        proc = self.comment(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 1)
         self.assertIn(
             f"cannot read the head of #1 (HTTP 500); tested head {A} not checked",
@@ -989,7 +1268,7 @@ class TestClaimHeadTest(ForgejoTest):
         """A pull HTTP 401 exits 1 with its status and never patches the body."""
 
         stub = Stub(pull_status=401)
-        proc = self.edit_body(stub, "--tested-head", A)
+        proc = self.edit_body(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 1)
         self.assertIn(
             f"cannot read the head of #1 (HTTP 401); tested head {A} not checked",
@@ -1048,7 +1327,7 @@ class TestClaimHeadTest(ForgejoTest):
         """Assert that an unreadable live head prevents a comment."""
 
         stub = Stub([live])
-        proc = self.comment(stub, "--tested-head", A)
+        proc = self.comment(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("cannot read the head", proc.stderr)
         self.assertEqual(self.posts(stub), [])
@@ -1068,7 +1347,7 @@ class TestClaimHeadTest(ForgejoTest):
 
         short = LIVE[:7]
         stub = Stub([short])
-        proc = self.comment(stub, "--tested-head", short)
+        proc = self.comment(stub, "--tested-head", short, "--evidence", self.evidence(short))
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("cannot read the head", proc.stderr)
         self.assertEqual(self.posts(stub), [])
@@ -1079,9 +1358,34 @@ class TestClaimHeadTest(ForgejoTest):
         for tested in (LIVE[:12], LIVE):
             with self.subTest(tested=tested):
                 stub = Stub([LIVE])
-                proc = self.comment(stub, "--tested-head", tested)
+                proc = self.comment(
+                    stub, "--tested-head", tested, "--evidence", self.evidence(tested)
+                )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(self.posts(stub), [BODY])
+
+    def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
+        """Both writes reject a different full head sharing the tested prefix."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        for command, method in ((self.comment, "POST"), (self.edit_body, "PATCH")):
+            for evidence_head, expected in ((other, 76), (LIVE, 0), (LIVE[:7], 0)):
+                with self.subTest(command=command.__name__, evidence_head=evidence_head):
+                    stub = Stub([LIVE], {LIVE: [[label("success")]]})
+                    proc = command(
+                        stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(evidence_head)
+                    )
+                    self.assertEqual(proc.returncode, expected, proc.stderr)
+                    self.assertEqual(self.sent_bodies(stub, method), [] if expected else [BODY])
+
+    def test_edit_body_rechecks_evidence_after_autolabel(self) -> None:
+        """A new head with the same tested prefix cannot authorize a body edit."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        stub = Stub([LIVE, LIVE, LIVE, other], {LIVE: [[label("success")]]})
+        proc = self.edit_body(stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
 
     def test_invalid_tested_heads_are_usage_errors(self) -> None:
         """Short and nonhex tested heads are usage errors without writes."""
@@ -1089,7 +1393,9 @@ class TestClaimHeadTest(ForgejoTest):
         for tested in (LIVE[:6], "not-hex"):
             with self.subTest(tested=tested):
                 stub = Stub([LIVE])
-                proc = self.comment(stub, "--tested-head", tested)
+                proc = self.comment(
+                    stub, "--tested-head", tested, "--evidence", self.evidence(tested)
+                )
                 self.assertEqual(proc.returncode, 64)
                 self.assertIn("usage: comment", proc.stderr)
                 self.assertEqual(self.posts(stub), [])
@@ -1097,7 +1403,10 @@ class TestClaimHeadTest(ForgejoTest):
     def test_missing_or_conflicting_claim_options_are_usage_errors(self) -> None:
         """Missing or conflicting claim modes are rejected without writes."""
 
-        for args in ((), ("--tested-head", LIVE, "--no-test-claims")):
+        for args in (
+            (),
+            ("--tested-head", LIVE, "--evidence", self.evidence(LIVE), "--no-test-claims"),
+        ):
             with self.subTest(args=args):
                 stub = Stub([LIVE])
                 proc = self.comment(stub, *args)
@@ -1118,7 +1427,7 @@ class TestClaimHeadTest(ForgejoTest):
         """The final tested-head check rejects a push made during Autolabel checks."""
 
         stub = Stub([A, A, A, B], {A: [[label("success")]]})
-        proc = self.edit_body(stub, "--tested-head", A)
+        proc = self.edit_body(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 76)
         self.assertIn(A, proc.stderr)
         self.assertIn(B, proc.stderr)
@@ -1128,14 +1437,14 @@ class TestClaimHeadTest(ForgejoTest):
         """A matching tested-head prefix authorizes the body PATCH."""
 
         stub = Stub([A], {A: [[label("success")]]})
-        proc = self.edit_body(stub, "--tested-head", A[:12])
+        proc = self.edit_body(stub, "--tested-head", A[:12], "--evidence", self.evidence(A[:12]))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.patches(stub), [BODY])
 
     def test_edit_body_requires_exactly_one_claim_option(self) -> None:
         """Body edits require exactly one claim mode and make no invalid PATCH."""
 
-        for args in ((), ("--tested-head", A, "--no-test-claims")):
+        for args in ((), ("--tested-head", A, "--evidence", self.evidence(A), "--no-test-claims")):
             with self.subTest(args=args):
                 stub = Stub([A], {A: [[label("success")]]})
                 proc = self.edit_body(stub, *args)
@@ -1147,7 +1456,7 @@ class TestClaimHeadTest(ForgejoTest):
         """Issue comments reject tested-head claims but accept no-test claims."""
 
         stub = Stub(pull_status=404)
-        proc = self.comment(stub, "--tested-head", A)
+        proc = self.comment(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 76)
         self.assertIn("not a pull request", proc.stderr)
         self.assertEqual(self.posts(stub), [])
@@ -1161,7 +1470,7 @@ class TestClaimHeadTest(ForgejoTest):
         """An issue body edit exits 76 before status reads and never PATCHes."""
 
         stub = Stub(pull_status=404)
-        proc = self.edit_body(stub, "--tested-head", A)
+        proc = self.edit_body(stub, "--tested-head", A, "--evidence", self.evidence(A))
         self.assertEqual(proc.returncode, 76)
         self.assertIn(f"#1 is not a pull request; tested head {A} cannot be checked", proc.stderr)
         self.assertEqual(self.patches(stub), [])

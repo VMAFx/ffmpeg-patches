@@ -1,0 +1,13 @@
+---
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+# Fixed substrings every lane brief must hold (at most 32, each at most 200 characters).
+# scripts/lane_brief.py checks this list and can invoke the lane runner precheck;
+# the lane wrapper refuses a brief that lacks a required substring at launch.
+required:
+  - "docstrings: every public function you add OR touch"
+  - "one-line docstring on every new test function"
+  - "ruff check scripts tests"
+  - "ruff format --check scripts tests"
+  - "docstring_diff.py --cached"
+  - "no commit, no push"
