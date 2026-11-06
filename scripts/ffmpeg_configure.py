@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import subprocess  # nosec B404 - configure is a fixed path, no shell, with timeout.
 import sys
 from collections.abc import Mapping, Sequence
@@ -33,17 +32,30 @@ ALLOWED = (
     "SOURCE_DATE_EPOCH",
     "CCACHE_DIR",
 )
+KEEPABLE: tuple[str, ...] = (
+    "CPPFLAGS",
+    "ASFLAGS",
+    "OBJCFLAGS",
+    "HOSTCFLAGS",
+    "HOSTLDFLAGS",
+    "HOSTCPPFLAGS",
+    "LC_CTYPE",
+    "TZ",
+    "CCACHE_BASEDIR",
+    "CCACHE_NOHASHDIR",
+    "CCACHE_SLOPPINESS",
+    "CCACHE_MAXSIZE",
+)
 MAX_KEEP = 32
-SENSITIVE_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL", re.IGNORECASE)
+TIMEOUT_S = 1800
 
 
 def allowed_environment(environ: Mapping[str, str], keep: Sequence[str]) -> dict[str, str]:
-    """Select bounded, approved names and reject sensitive keep requests."""
+    """Select bounded, explicitly approved environment names."""
     if len(keep) > MAX_KEEP:
         raise ValueError(f"at most {MAX_KEEP} --keep options are allowed")
-    for name in keep:
-        if SENSITIVE_NAME.search(name):
-            raise ValueError(f"--keep refuses sensitive name {name!r}")
+    if any(name not in KEEPABLE for name in keep):
+        raise ValueError(f"--keep accepts only: {', '.join(KEEPABLE)}")
     names = (*ALLOWED, *keep)
     return {name: environ[name] for name in names if name in environ}
 
@@ -67,14 +79,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     build = Path(parsed.build)
     build.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(  # nosec B603 - fixed configure path, argument list, timeout.
-        [str(Path(parsed.source).resolve() / "configure"), *args[separator + 1 :]],
-        cwd=build,
-        env=environment,
-        timeout=1800,
-        check=False,
-        stdin=subprocess.DEVNULL,
-    )
+    try:
+        result = subprocess.run(  # nosec B603 - fixed configure path, argument list, timeout.
+            [str(Path(parsed.source).resolve() / "configure"), *args[separator + 1 :]],
+            cwd=build,
+            env=environment,
+            timeout=TIMEOUT_S,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"configure exceeded the {TIMEOUT_S} s deadline", file=sys.stderr)
+        return 124
     return result.returncode
 
 

@@ -21,6 +21,7 @@ CONTROL_ENV = {
     "PATH": "/usr/bin:/bin",
     "HOME": "/nonexistent",
     "CC": "cc",
+    "CPPFLAGS": "-DPLANTED_CPPFLAG",
     "DUMMY_PLANT_TOKEN": PLANT,
     "DUMMY_OTHER": "other-value",
 }
@@ -81,18 +82,53 @@ class FFmpegConfigureTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn(PLANT, (self.build / "config.log").read_text(encoding="utf-8"))
 
-    def test_keep_passes_unlisted_name(self) -> None:
-        """Pass an explicitly kept, nonsensitive variable to configure."""
-        self.assertEqual(self.run_wrapper("--keep", "DUMMY_OTHER"), 0)
-        self.assertIn("DUMMY_OTHER=", (self.build / "config.log").read_text(encoding="utf-8"))
+    def test_keep_passes_listed_name(self) -> None:
+        """Pass an explicitly kept configure input to configure."""
+        self.assertEqual(self.run_wrapper("--keep", "CPPFLAGS"), 0)
+        log = (self.build / "config.log").read_text(encoding="utf-8")
+        self.assertIn("CPPFLAGS=-DPLANTED_CPPFLAG", log)
 
-    def test_keep_refuses_sensitive_name(self) -> None:
-        """Reject a credential-like keep name before starting configure."""
+    def test_keep_refuses_unlisted_names(self) -> None:
+        """Reject every unlisted keep name before starting configure."""
+        error = io.StringIO()
+        names = (
+            "LD_PRELOAD",
+            "BASH_ENV",
+            "PYTHONPATH",
+            "DOCKER_AUTH_CONFIG",
+            "SSH_AUTH_SOCK",
+            "MY_API_KEY",
+            "DUMMY_OTHER",
+        )
+        for name in names:
+            with self.subTest(name=name), contextlib.redirect_stderr(error):
+                self.assertEqual(self.run_wrapper("--keep", name), 2)
+            self.assertIn("--keep accepts only:", error.getvalue())
+            self.assertFalse((self.build / "config.log").exists())
+
+    def test_keep_rejects_too_many_options(self) -> None:
+        """Reject more than the maximum number of keep options."""
+        options = sum((("--keep", "CPPFLAGS") for _ in range(ffmpeg_configure.MAX_KEEP + 1)), ())
         error = io.StringIO()
         with contextlib.redirect_stderr(error):
-            self.assertEqual(self.run_wrapper("--keep", "MY_API_KEY"), 2)
-        self.assertIn("MY_API_KEY", error.getvalue())
+            self.assertEqual(self.run_wrapper(*options), 2)
+        self.assertIn(str(ffmpeg_configure.MAX_KEEP), error.getvalue())
         self.assertFalse((self.build / "config.log").exists())
+
+    def test_configure_timeout_returns_deadline_code(self) -> None:
+        """Return 124 and report the deadline when configure times out."""
+        error = io.StringIO()
+        with (
+            patch.object(
+                ffmpeg_configure.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired("configure", 1800),
+            ),
+            contextlib.redirect_stderr(error),
+        ):
+            result = self.run_wrapper()
+        self.assertEqual(result, 124)
+        self.assertIn("1800", error.getvalue())
 
     def test_configure_return_code_propagates(self) -> None:
         """Return the configure process exit code unchanged."""
