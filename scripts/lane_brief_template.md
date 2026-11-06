@@ -2,6 +2,7 @@ task: <task>
 repo: VMAFx/ffmpeg-patches, worktree = cwd, branch <branch>. issue #<n>, round <r>.
 finding / problem: <finding>
 fix: <fix>; HISS: no recursion, bounded loops, functions <= 60 LOC, typed, timeout on every I/O call.
+Configure FFmpeg builds only through `scripts/ffmpeg_configure.py`.
 docstrings: every public function you add OR touch (even a one-line change inside it) carries a one-line docstring; add one when the function has none.
 tests: <tests>; positive, negative, boundary; one-line docstring on every new test function, class and helper.
 planted red: run the new tests against the unfixed code first; record rc + failure line.
