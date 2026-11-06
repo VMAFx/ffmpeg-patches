@@ -11,8 +11,11 @@ import os
 import signal
 import subprocess  # nosec B404 - configure is a fixed path, no shell, with timeout.
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import FrameType
+from typing import NoReturn
 
 ALLOWED = (
     "PATH",
@@ -84,6 +87,11 @@ def _reap_configure(process: subprocess.Popen[bytes]) -> None:
         )
 
 
+def _exit_on_cancel_signal(signum: int, _frame: FrameType | None) -> NoReturn:
+    """Raise a shell-compatible status so configure cleanup can run."""
+    raise SystemExit(128 + signum)
+
+
 def _run_configure(command: Sequence[str], build: Path, environment: Mapping[str, str]) -> int:
     """Run configure with a deadline and terminate its process group on timeout."""
     process = subprocess.Popen(  # nosec B603 - fixed configure path and argument list.
@@ -93,7 +101,12 @@ def _run_configure(command: Sequence[str], build: Path, environment: Mapping[str
         stdin=subprocess.DEVNULL,
         start_new_session=os.name == "posix",
     )
+    previous_handlers = {}
     try:
+        # HISS-21: Python permits signal handler installation only in the main thread.
+        if os.name == "posix" and threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGHUP):
+                previous_handlers[signum] = signal.signal(signum, _exit_on_cancel_signal)
         process.wait(timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
         _kill_configure(process)
@@ -104,6 +117,9 @@ def _run_configure(command: Sequence[str], build: Path, environment: Mapping[str
         _kill_configure(process)
         _reap_configure(process)
         raise
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     return process.returncode
 
 

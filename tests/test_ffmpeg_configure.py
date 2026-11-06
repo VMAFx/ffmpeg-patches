@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import io
 import os
 import signal
 import subprocess  # nosec B404 - temporary shell fixture, fixed argv and deadline.
+import sys
 import tempfile
 import time
 import unittest
@@ -51,6 +53,16 @@ def process_exits_within(pid: int, attempts: int = 20) -> bool:
             return True
         time.sleep(0.1)
     return not process_exists(pid)
+
+
+def read_pid_within(path: Path, attempts: int = 50) -> int:
+    """Read a fixture PID after bounded polling for its file."""
+    for _ in range(attempts):
+        try:
+            return int(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            time.sleep(0.1)
+    raise AssertionError(f"PID file did not appear: {path}")
 
 
 def set_dump_value(log: str, name: str) -> str | None:
@@ -228,6 +240,84 @@ class FFmpegConfigureTest(unittest.TestCase):
         ):
             self.run_wrapper()
         killpg.assert_called_once_with(123, signal.SIGKILL)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signals and process groups")
+    def test_sigterm_kills_configure_process_group(self) -> None:
+        """Convert SIGTERM to status 143 after killing configure descendants."""
+        (self.source / "configure").write_text(
+            "#!/bin/sh\necho $$ > configure.pid\nsleep 30 &\necho $! > descendant.pid\nwait\n",
+            encoding="utf-8",
+        )
+        wrapper = subprocess.Popen(  # nosec B603 - fixed local wrapper and fixture paths.
+            [
+                sys.executable,
+                str(Path(ffmpeg_configure.__file__).resolve()),
+                str(self.source),
+                str(self.build),
+                "--",
+            ],
+            env=CONTROL_ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(wrapper.kill)
+        configure_pid = read_pid_within(self.build / "configure.pid")
+        descendant_pid = read_pid_within(self.build / "descendant.pid")
+        self.addCleanup(kill_process_if_running, configure_pid)
+        self.addCleanup(kill_process_if_running, descendant_pid)
+
+        os.kill(wrapper.pid, signal.SIGTERM)
+        returncode = wrapper.wait(timeout=5)
+        configure_exited = process_exits_within(configure_pid)
+        descendant_exited = process_exits_within(descendant_pid)
+
+        self.assertEqual((returncode, configure_exited, descendant_exited), (143, True, True))
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signals")
+    def test_run_configure_restores_handlers_after_normal_exit(self) -> None:
+        """Restore both previous handlers and return configure's normal status."""
+        signals = (signal.SIGTERM, signal.SIGHUP)
+        original_handlers = {signum: signal.getsignal(signum) for signum in signals}
+        for signum in signals:
+            signal.signal(signum, signal.SIG_IGN)
+            self.addCleanup(signal.signal, signum, original_handlers[signum])
+        process = SimpleNamespace(pid=123, returncode=7, wait=Mock(return_value=7))
+        real_signal = signal.signal
+        with (
+            patch.object(ffmpeg_configure.subprocess, "Popen", return_value=process),
+            patch.object(ffmpeg_configure.signal, "signal", wraps=real_signal) as set_handler,
+        ):
+            result = ffmpeg_configure._run_configure(["configure"], self.build, {})
+
+        self.assertEqual(result, 7)
+        self.assertEqual(
+            tuple(signal.getsignal(signum) for signum in signals), (signal.SIG_IGN,) * 2
+        )
+        self.assertEqual(set_handler.call_count, 4)
+        self.assertEqual(tuple(call.args[0] for call in set_handler.call_args_list), signals * 2)
+        self.assertEqual(
+            tuple(call.args[1] for call in set_handler.call_args_list[-2:]), (signal.SIG_IGN,) * 2
+        )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signals")
+    def test_run_configure_skips_handlers_in_worker_thread(self) -> None:
+        """Skip main-thread-only signal setup while preserving the return code."""
+        process = SimpleNamespace(pid=123, returncode=9, wait=Mock(return_value=9))
+        with (
+            patch.object(ffmpeg_configure.subprocess, "Popen", return_value=process),
+            patch.object(ffmpeg_configure.signal, "signal") as set_handler,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            result = executor.submit(
+                ffmpeg_configure._run_configure,
+                ["configure"],
+                self.build,
+                {},
+            ).result(timeout=5)
+
+        self.assertEqual(result, 9)
+        set_handler.assert_not_called()
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_configure_timeout_kills_child_process(self) -> None:
