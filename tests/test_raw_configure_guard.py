@@ -53,9 +53,14 @@ class RawConfigureGuardTest(unittest.TestCase):
         arguments = {} if command is None else {"command": command}
         return {"tool_name": tool, "tool_input": arguments, "cwd": str(cwd)}
 
-    def run_guard(self, client: str, payload: object) -> subprocess.CompletedProcess[str]:
+    def run_guard(
+        self, client: str, payload: object, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """Run only the guard with JSON on stdin and a short deadline."""
         data = payload if isinstance(payload, str) else json.dumps(payload)
+        base_env = os.environ.copy()
+        base_env.pop("CDPATH", None)
+        run_env = base_env if env is None else env
         return subprocess.run(  # nosec B603 - fixed guard argv with explicit interpreter.
             [sys.executable, "-I", str(GUARD), "--client", client],
             input=data,
@@ -64,14 +69,19 @@ class RawConfigureGuardTest(unittest.TestCase):
             cwd=ROOT,
             timeout=5,
             check=False,
+            env=run_env,
         )
 
-    def _assert_refused(self, cases: tuple[tuple[str, Path], ...]) -> None:
+    def _assert_refused(
+        self,
+        cases: tuple[tuple[str, Path], ...],
+        env: dict[str, str] | None = None,
+    ) -> None:
         """Verify the guard refuses raw configure invocations across clients."""
         for client in CLIENTS:
             for command, cwd in cases:
                 with self.subTest(client=client, command=command):
-                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    result = self.run_guard(client, self.payload(client, command, cwd), env=env)
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("configure", result.stderr)
                     self.assertIn("python3 scripts/ffmpeg_configure.py", result.stderr)
@@ -156,6 +166,48 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("(cd /tmp; (cd /var)); ./configure", self.tree),
         )
         self._assert_refused(cases)
+
+    def test_refuses_subshell_and_cd_resolution_fail_opens(self) -> None:
+        """Refuse background cd, pipe-and, failed cd, lexical dots, and CDPATH lookups."""
+        plain_file = self.root / "plain_file"
+        plain_file.write_text("x", encoding="utf-8")
+        symlink = self.tree / "l"
+        symlink.symlink_to(self.other)
+        cases = (
+            ("cd /tmp & ./configure", self.tree),
+            ("cd /tmp &\n./configure", self.tree),
+            ("cd /tmp |& true; ./configure", self.tree),
+            ("cd /tmp && true & ./configure", self.tree),
+            ("true && cd /tmp & ./configure", self.tree),
+            ("cd /nonexistent-rcg9; ./configure", self.tree),
+            ("cd /nonexistent-rcg9 || true; ./configure", self.tree),
+            (f"cd {plain_file}; ./configure", self.tree),
+            ("cd l/..; ./configure", self.tree),
+        )
+        self._assert_refused(cases)
+        other_tree = self.other / "tree"
+        other_tree.mkdir()
+        cdpath_cases = (("cd tree; ./configure", self.other),)
+        self._assert_refused(cdpath_cases, env={**os.environ, "CDPATH": str(self.root)})
+
+    def test_allows_background_symlink_and_cdpath_forms(self) -> None:
+        """Allow background lists, symlink destinations, and CDPATH ignores."""
+        symlink = self.tree / "l"
+        if not symlink.exists():
+            symlink.symlink_to(self.other)
+        cases = (
+            (f"cd {self.other}; ./configure", self.tree, None),
+            (f"(cd {self.other} && ./configure)", self.tree, None),
+            (f"cd {self.other} && ./configure &", self.tree, None),
+            ("cd l; ./configure", self.tree, None),
+            (f"cd {self.other}; ./configure", self.tree, {**os.environ, "CDPATH": str(self.root)}),
+        )
+        for client in CLIENTS:
+            for command, cwd, env in cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd), env=env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
 
     def test_allows_unrelated_commands(self) -> None:
         """Keep wrapper use, inspection, other trees, and ordinary builds available."""

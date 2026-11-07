@@ -9,7 +9,9 @@ subcommands that do not execute their path arguments, and only without the refus
 options.
 
 Known limitation: words assembled from variables (e.g. `p=con; ./${p}figure`)
-are not expanded across assignments.
+are not expanded across assignments; directory existence is read when the hook
+runs; a command that removes or creates the target before its cd runs is judged
+by the state at hook time.
 """
 
 from __future__ import annotations
@@ -146,6 +148,9 @@ def _tokens(command: str) -> list[str] | None:
                     break
                 if token[pos : pos + 2] in ("&&", "||"):
                     tokens.append(token[pos : pos + 2])
+                    pos += 2
+                elif token[pos : pos + 2] == "|&":
+                    tokens.append("|")
                     pos += 2
                 else:
                     tokens.append(token[pos])
@@ -328,6 +333,19 @@ def _subshell_step(token: str, directory: Path | None, subshells: list[Path | No
     return directory
 
 
+def _separator_step(
+    token: str, directory: Path | None, list_start: Path | None, subshells: list[Path | None]
+) -> tuple[Path | None, Path | None]:
+    """Update effective directory and list start on shell separator tokens."""
+    if token == "&":
+        directory = list_start
+    elif token in ("(", ")"):
+        directory = _subshell_step(token, directory, subshells)
+    if token in (";", "\n", "&", "(", ")"):
+        list_start = directory
+    return directory, list_start
+
+
 def _inspect_tokens(
     tokens: list[str],
     directory: Path | None,
@@ -338,6 +356,7 @@ def _inspect_tokens(
     pipeline: list[list[str]] = []
     simple: list[str] = []
     subshells: list[Path | None] = []
+    list_start = directory
     for token in [*tokens, ";"]:
         if token == "|":
             if simple:
@@ -353,8 +372,7 @@ def _inspect_tokens(
                 if blocked is not None:
                     return blocked
                 pipeline = []
-            if token in ("(", ")"):
-                directory = _subshell_step(token, directory, subshells)
+            directory, list_start = _separator_step(token, directory, list_start, subshells)
             continue
         simple.append(token)
     return None
@@ -393,7 +411,14 @@ def _step(
         target = "~" if words == ["cd"] else words[1] if len(words) == 2 else ""
         if not target or target == "-" or "$" in target or "`" in target or cwd is None:
             return blocked, None
-        return blocked, (cwd / os.path.expanduser(target)).resolve()
+        if os.environ.get("CDPATH") and not (
+            target.startswith(("/", "./", "../", "~")) or target in (".", "..")
+        ):
+            return blocked, None
+        resolved = Path(os.path.normpath(cwd / os.path.expanduser(target))).resolve()
+        if not resolved.is_dir():
+            return blocked, cwd
+        return blocked, resolved
     return blocked, cwd
 
 
