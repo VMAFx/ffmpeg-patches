@@ -5,7 +5,8 @@ target-version = "py311"
 
 [lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "C90", "PL"]
-extend-select = ["PLW1514"]
+# S506 mirrors the Codacy Bandit B506 check.
+extend-select = ["PLW1514", "S101", "S506"]
 preview = true
 explicit-preview-rules = true
 ignore = ["PLR2004"]
