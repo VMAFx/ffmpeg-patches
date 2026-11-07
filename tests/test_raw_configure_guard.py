@@ -245,6 +245,33 @@ class RawConfigureGuardTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(self.marker.exists())
 
+    def test_refuses_digit_directory_redirect_ambiguities(self) -> None:
+        """Refuse digit directory cd redirect ambiguities while keeping valid targets allowed."""
+        digit_tree = self.root / "2"
+        digit_tree.mkdir()
+        (digit_tree / "libavcodec").mkdir()
+        script = digit_tree / "configure"
+        script.write_text(f"#!/bin/sh\ntouch '{self.marker}'\n", encoding="utf-8")
+        script.chmod(0o755)
+        refuse_cases = (
+            ("cd 2 >&1; ./configure", self.root),
+            ("cd 2 2>&1; ./configure", self.root),
+            ("cd 2>&1 2; ./configure", self.root),
+            ("cd 2>&1; ./configure", self.root),
+            ("pushd 2 >&1; ./configure", self.root),
+        )
+        self._assert_refused(refuse_cases)
+        allow_cases = (
+            (f"cd {self.other} >&2 && ./configure", self.tree),
+            (f"cd {self.other} 2>&1; ./configure", self.tree),
+        )
+        for client in CLIENTS:
+            for command, cwd in allow_cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
+
     def test_allows_unrelated_commands(self) -> None:
         """Keep wrapper use, inspection, other trees, and ordinary builds available."""
         cases = (

@@ -40,6 +40,7 @@ INTERPRETERS = re.compile(r"^(?:python|perl|ruby|node|gawk|mawk|awk|php)(?:\d+(?
 GLOB_CHARS = frozenset(("*", "?", "["))
 REDIRECT_OP = re.compile(r"^(?:&>>?|\d*>>?|\d*<<?|\d*>[&|]?|\d*<&)$")
 REDIRECT_FULL = re.compile(r"^(?:&>>?|\d*>>?|\d*<<?|\d*>[&|]?|\d*<&)[^<>&|].*$")
+DIGITS_REDIRECT = re.compile(r"^\d+(?:&>>?|>>?|<<?|>[&|]?|<&)")
 READERS = frozenset(
     (
         "cat",
@@ -469,7 +470,16 @@ def _step(
         return blocked, None
     if words[0] in ("cd", "pushd"):
         target = "~" if words == ["cd"] else words[1] if _valid_cd_words(words) else ""
-        if not target or target == "-" or "$" in target or "`" in target or cwd is None:
+        if (
+            not target
+            or target == "-"
+            or "$" in target
+            or "`" in target
+            or cwd is None
+            or REDIRECT_FULL.match(target)
+            or REDIRECT_OP.match(target)
+            or DIGITS_REDIRECT.match(target)
+        ):
             return blocked, None
         if os.environ.get("CDPATH") and not (
             target.startswith(("/", "./", "../", "~")) or target in (".", "..")
