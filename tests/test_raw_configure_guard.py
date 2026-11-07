@@ -539,12 +539,38 @@ class RawConfigureGuardTest(unittest.TestCase):
         refuse_cases = (
             (f"cd {self.tree} && ./conf${{e}}igure", self.root),
             (f"cd {self.tree} && ./${{e}}con${{e}}figure", self.root),
+            ("./co$'n'figure", self.tree),
+            ("./conf$eigure", self.tree),
         )
         self._assert_refused(refuse_cases)
         allow_cases = (
-            ("./conf$eigure", self.tree),
+            ("./conf$eigure", self.root),
             ("echo conf${e}igure", self.tree),
+        )
+        for client in CLIENTS:
+            for command, cwd in allow_cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
+
+    def test_undecidable_configure_refusal_and_benign_allow(self) -> None:
+        """Refuse undecidable dynamic commands in trees while allowing benign commands."""
+        (self.tree / "tools").mkdir(exist_ok=True)
+        refuse_cases = (
             ("./co$'n'figure", self.tree),
+            (r"./co$'\x6e'figure", self.tree),
+            ("./$X", self.tree),
+            (f"cd {self.tree} && ./co$'n'figure", self.root),
+        )
+        self._assert_refused(refuse_cases)
+        allow_cases = (
+            ("./conf$eigure", self.root),
+            ("echo co$'n'figure", self.tree),
+            ("echo $PATH", self.tree),
+            ("$HOME/bin/tool", self.tree),
+            ("tools/$X", self.tree),
+            ("ls $PWD", self.tree),
         )
         for client in CLIENTS:
             for command, cwd in allow_cases:

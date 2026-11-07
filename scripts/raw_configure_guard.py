@@ -261,11 +261,26 @@ def _clean_word(word: str) -> str:
     return word.lstrip("+!|")
 
 
+def _undecidable_in_tree(cleaned: str, cwd: Path | None) -> bool:
+    """Identify an undecidable command targeting an FFmpeg tree."""
+    if "/" not in cleaned or "$" not in os.path.basename(cleaned):
+        return False
+    dirname = os.path.dirname(cleaned) or "."
+    if "$" in dirname or "`" in dirname:
+        return False
+    if cwd is None:
+        return True
+    parent = (cwd / os.path.expanduser(dirname)).resolve()
+    return (parent / "libavcodec").is_dir()
+
+
 def _configure_path(word: str, cwd: Path | None) -> Path | None:
     """Identify a configure word in an FFmpeg tree or unknown directory."""
     cleaned = _clean_word(word)
     if "$" in cleaned or "`" in cleaned:
-        return Path(word) if _dynamic_configure(cleaned) else None
+        if _dynamic_configure(cleaned) or _undecidable_in_tree(cleaned, cwd):
+            return Path(word)
+        return None
     base = os.path.basename(cleaned)
     is_glob = bool(GLOB_CHARS.intersection(base)) and fnmatch.fnmatchcase("configure", base)
     if base != "configure" and not is_glob:
