@@ -218,6 +218,8 @@ class LibvmafPatchesTest(unittest.TestCase):
     def assert_cuda_formats(self, source: str) -> None:
         """Assert the CUDA supported_formats array holds exactly FORMATS."""
         array = source.split("supported_formats[] = {", 1)[1].split("};", 1)[0]
+        array = re.sub(r"/\*.*?\*/", "", array, flags=re.S)
+        array = re.sub(r"//.*", "", array)
         self.assertEqual(set(re.findall(r"AV_PIX_FMT_\w+", array)), FORMATS)
 
     def test_formats_preserve_third_party_entries(self) -> None:
@@ -237,6 +239,19 @@ class LibvmafPatchesTest(unittest.TestCase):
                         "",
                     )
                 )
+
+    def test_planted_commented_entry_is_detected(self) -> None:
+        """Commented-out supported_formats entries fail the format check."""
+        with self.subTest(style="block"):
+            mutant = self.source.replace("AV_PIX_FMT_YUV444P12LE,", "/* AV_PIX_FMT_YUV444P12LE, */")
+            with self.assertRaises(AssertionError):
+                self.assert_cuda_formats(mutant)
+        with self.subTest(style="line"):
+            mutant = self.source.replace(
+                "AV_PIX_FMT_YUV444P12LE,\n", "// AV_PIX_FMT_YUV444P12LE,\n"
+            )
+            with self.assertRaises(AssertionError):
+                self.assert_cuda_formats(mutant)
 
     def test_planted_early_return_is_detected(self) -> None:
         """Restoring the early return leaves the context pushed and is detected."""

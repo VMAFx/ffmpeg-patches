@@ -1,10 +1,9 @@
 {
   "version": 1,
-  "generated_at": "2026-11-07T04:49:31Z",
+  "generated_at": "2026-11-07T19:40:32Z",
   "repository": "VMAFx/ffmpeg-patches",
-  "commit_sha": "e271acd719adbd6e163fcabead9af0cd5eeab6bd",
-  "total_infractions": 4,
-  "increase_rationale": "adoption baseline",
+  "commit_sha": "798e7bd8f7b5180966794ba7fa0cd100100bcf9a",
+  "total_infractions": 1,
   "infractions": [
     {
       "rule_id": "RELEASE-TEST-LEVEL",
@@ -13,30 +12,6 @@
       "message": "missing release test level integration for profile native-gpu-systems: no tracked file matches paths [**/*_integration_test.go **/integration/** **/tests/integration/** **/test/integration/** **/*.integration.ts **/*.integration.js **/test_*_integration.py]",
       "anchor": "level:native-gpu-systems:integration",
       "fingerprint": ".standards.yaml:RELEASE-TEST-LEVEL:level:native-gpu-systems:integration#1"
-    },
-    {
-      "rule_id": "HISS-08",
-      "file_path": "scripts/ffmpeg_configure.py",
-      "line_number": 73,
-      "message": "Signal call os.killpg with target process.pid must be guarded; add guard: if not isinstance(process.pid, int) or isinstance(process.pid, bool) or process.pid \u003c= 1 or process.pid == os.getpgrp(): ...",
-      "anchor": "fn:_kill_configure",
-      "fingerprint": "scripts/ffmpeg_configure.py:HISS-08:fn:_kill_configure#1"
-    },
-    {
-      "rule_id": "HISS-08",
-      "file_path": "scripts/lane_brief.py",
-      "line_number": 216,
-      "message": "Signal call os.killpg with target process.pid must be guarded; add guard: if not isinstance(process.pid, int) or isinstance(process.pid, bool) or process.pid \u003c= 1 or process.pid == os.getpgrp(): ...",
-      "anchor": "fn:run_runner",
-      "fingerprint": "scripts/lane_brief.py:HISS-08:fn:run_runner#1"
-    },
-    {
-      "rule_id": "HISS-08",
-      "file_path": "scripts/upstream_lint.py",
-      "line_number": 151,
-      "message": "Signal call os.killpg with target process.pid must be guarded; add guard: if not isinstance(process.pid, int) or isinstance(process.pid, bool) or process.pid \u003c= 1 or process.pid == os.getpgrp(): ...",
-      "anchor": "fn:_reap_timeout",
-      "fingerprint": "scripts/upstream_lint.py:HISS-08:fn:_reap_timeout#1"
     }
   ]
 }
