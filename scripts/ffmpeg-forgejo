@@ -89,7 +89,27 @@ api() (
   fi
 )
 
+# is_login VALUE: return 0 when VALUE is a valid Forgejo login, 1 otherwise.
+is_login() {
+  [[ "${1-}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]
+}
+
+# validate_login [LOGIN]: validate and print LOGIN (default: FFMPEG_FORGEJO_LOGIN); die if invalid.
+validate_login() {
+  local val="${1-${FFMPEG_FORGEJO_LOGIN:-}}"
+  if is_login "$val"; then
+    printf '%s\n' "$val"
+    return 0
+  fi
+  die "invalid FFMPEG_FORGEJO_LOGIN: $val"
+}
+
+# login: print the authenticated Forgejo username or configured override.
 login() {
+  if [ "${FFMPEG_FORGEJO_LOGIN+set}" = set ]; then
+    validate_login "$FFMPEG_FORGEJO_LOGIN"
+    return
+  fi
   local out
   out="$(api GET /user)" || exit 1
   python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out"
@@ -417,16 +437,21 @@ print(*numbers, sep="\n")' <<<"$out" 2>/dev/null)"; then
   rm -f "$candidates"
 }
 
+# parse_page_size: parse max_response_items from /settings/api JSON on stdin.
+parse_page_size() {
+  python3 -c 'import json,sys
+size = json.load(sys.stdin)["max_response_items"]
+if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+    raise SystemExit(1)
+print(min(50, size))' 2>/dev/null
+}
+
 # discover_page_size: cache API settings in the parent shell before listing subshells.
 discover_page_size() {
   [ -z "$page_size" ] || return 0
   local out
   out="$(api GET /settings/api)" || die "cannot read /settings/api"
-  page_size="$(python3 -c 'import json,sys
-size = json.load(sys.stdin)["max_response_items"]
-if isinstance(size, bool) or not isinstance(size, int) or size < 1:
-    raise SystemExit(1)
-print(min(50, size))' <<<"$out" 2>/dev/null)" \
+  page_size="$(parse_page_size <<<"$out")" \
     || die "invalid max_response_items in /settings/api; expected a positive integer"
 }
 
@@ -522,7 +547,7 @@ print(*summarize(json.load(sys.stdin)), sep="\t")' "${1:-$BOT_REVIEWER}"
 # request_bot_review NUMBER: merge existing users with Fairy, POST, and verify read-back.
 request_bot_review() {
   local number="$1" out body revs i
-  [[ "$BOT_REVIEWER" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $BOT_REVIEWER"
+  is_login "$BOT_REVIEWER" || die "not a login: $BOT_REVIEWER"
   out="$(api GET "/repos/$REPO/pulls/$number")" || return 1
   body="$(mktemp)"
   if ! python3 -c 'import json,sys
@@ -589,13 +614,27 @@ fairy_requests() {
       return 0
     fi
   fi
-  if out="$(api GET /user)"; then rc=0; else rc=$?; fi
-  if [ "$optional" = --skip-unavailable ] && [[ "$rc" =~ ^(6|7|28)$ ]]; then
-    echo "fairy-requests: SKIPPED - API offline (curl rc $rc)." >&2
-    return 0
+  if [ "${FFMPEG_FORGEJO_LOGIN+set}" = set ]; then
+    me="$(validate_login "$FFMPEG_FORGEJO_LOGIN")" || exit 1
+  else
+    if out="$(api GET /user)"; then rc=0; else rc=$?; fi
+    if [ "$optional" = --skip-unavailable ] && [[ "$rc" =~ ^(6|7|28)$ ]]; then
+      echo "fairy-requests: SKIPPED - API offline (curl rc $rc)." >&2
+      return 0
+    fi
+    [ "$rc" -eq 0 ] || return "$rc"
+    me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
   fi
-  [ "$rc" -eq 0 ] || return "$rc"
-  me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
+  if [ "$optional" = --skip-unavailable ] && [ -z "$page_size" ]; then
+    if out="$(api GET /settings/api)"; then rc=0; else rc=$?; fi
+    if [[ "$rc" =~ ^(6|7|28)$ ]]; then
+      echo "fairy-requests: SKIPPED - API offline (curl rc $rc)." >&2
+      return 0
+    fi
+    [ "$rc" -eq 0 ] || return "$rc"
+    page_size="$(parse_page_size <<<"$out")" \
+      || die "invalid max_response_items in /settings/api; expected a positive integer"
+  fi
   discover_page_size
   out="$(own_open_pulls "$me")" || return 1
   rows="$(fairy_request_candidates "$me" <<<"$out")" || return 1
@@ -950,7 +989,7 @@ for i in json.load(sys.stdin):
     [ $# -eq 3 ] || usage_error "$usage"
     require_sweep "$sweep" "$1"
     [ -f "$3" ] || die "no body file $3"
-    [[ "$BOT_REVIEWER" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $BOT_REVIEWER"
+    is_login "$BOT_REVIEWER" || die "not a login: $BOT_REVIEWER"
     me="$(login)"
     check_pr_overlap "$1" "$me" "$overlap_ok"
     require_swept_fork_head "$me" "$1"
@@ -1036,7 +1075,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
     n="$1"; shift
     if [ $# -gt 0 ]; then
-      for u in "$@"; do [[ "$u" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a login: $u"; done
+      for u in "$@"; do is_login "$u" || die "not a login: $u"; done
       body="$(mktemp)"
       python3 -c 'import json,sys; print(json.dumps({"reviewers": sys.argv[1:]}))' "$@" >"$body"
       api POST "/repos/$REPO/pulls/$n/requested_reviewers" "$body" >/dev/null

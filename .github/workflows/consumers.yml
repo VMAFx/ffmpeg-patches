@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: EUPL-1.2
 #
 # The consumers apply their own FFmpeg patch stacks on top of this series,
-# each from ffmpeg-patches/series.txt on its default branch. The job's
+# each from ffmpeg-patches/series.txt on its default branch unless a dispatch
+# names a Pelorus or vmafx branch. The job's
 # CONSUMERS map is the one place to add a consumer; the owner follows this
 # repository's owner, so forks use their own consumers.
 # This run applies the series on the pinned base, then each
@@ -28,6 +29,13 @@ name: consumer stacks
       pelorus_ref:
         description: >-
           Pelorus branch whose stack to apply; empty takes the Pelorus
+          default branch
+        type: string
+        required: false
+        default: ''
+      vmafx_ref:
+        description: >-
+          vmafx branch whose stack to apply; empty takes the vmafx
           default branch
         type: string
         required: false
@@ -73,23 +81,31 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-python
         if: github.event.pull_request.draft != true
-      # A dispatch may name the Pelorus branch to test, for a Pelorus change
-      # that has to fit a series branch before either lands. The name only
-      # reaches the shell through the environment, and only branch-name
+      # A dispatch may name the Pelorus or vmafx branch to test a consumer
+      # change against a series branch before either lands. The names only
+      # reach the shell through the environment, and only branch-name
       # characters pass; everything else stops the run before any clone.
-      - name: Check the Pelorus ref
+      - name: Check the consumer refs
         if: github.event.pull_request.draft != true
         env:
           PELORUS_REF: ${{ inputs.pelorus_ref }}
+          VMAFX_REF: ${{ inputs.vmafx_ref }}
         run: |
-          if [ -n "$PELORUS_REF" ]; then
-            if ! [[ "$PELORUS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
-              || ! git check-ref-format --branch "$PELORUS_REF" > /dev/null; then
-              echo "::error::pelorus_ref is not a plain branch name"
-              exit 1
+          for input in pelorus_ref vmafx_ref; do
+            case "$input" in
+              pelorus_ref) ref=$PELORUS_REF ;;
+              vmafx_ref) ref=$VMAFX_REF ;;
+            esac
+            if [ -n "$ref" ]; then
+              if ! [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
+                || ! timeout 10s git check-ref-format --branch "$ref" > /dev/null; then
+                echo "::error::$input is not a plain branch name"
+                exit 1
+              fi
             fi
-          fi
+          done
           echo "PELORUS_REF=$PELORUS_REF" >> "$GITHUB_ENV"
+          echo "VMAFX_REF=$VMAFX_REF" >> "$GITHUB_ENV"
       - name: Prepare the pinned source
         if: github.event.pull_request.draft != true
         uses: ./.github/actions/prepare-series
@@ -131,8 +147,13 @@ jobs:
           for entry in "${entries[@]}"; do
             consumer=${entry%%:*}
             branch=()
-            if [ "$consumer" = pelorus ] && [ -n "$PELORUS_REF" ]; then
-              branch=(--branch "$PELORUS_REF")
+            case "$consumer" in
+              pelorus) ref=$PELORUS_REF ;;
+              vmafx) ref=$VMAFX_REF ;;
+              *) ref= ;;
+            esac
+            if [ -n "$ref" ]; then
+              branch=(--branch "$ref")
             fi
             git clone -q --depth=1 --filter=blob:none --sparse "${branch[@]}" \
               "https://github.com/${CONSUMER_OWNER}/${consumer}.git" "consumers/${consumer}"

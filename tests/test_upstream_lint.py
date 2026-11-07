@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import signal
 import subprocess  # nosec B404 - fixed commands in disposable Git repositories.
 import sys
 import tempfile
@@ -648,7 +649,7 @@ class RunnerTest(unittest.TestCase):
         argv = ["git", "--version"]
         for partial, expected in ((b"partial\xff", "partial\ufffd"), (None, "initial")):
             with self.subTest(partial=partial):
-                process = unittest.mock.MagicMock()
+                process = unittest.mock.MagicMock(pid=123)
                 process.communicate.side_effect = [
                     subprocess.TimeoutExpired(argv, 1, output=b"initial"),
                     subprocess.TimeoutExpired(argv, upstream_lint.REAP_TIMEOUT, output=partial),
@@ -725,7 +726,7 @@ class RunnerTest(unittest.TestCase):
 
     def test_timeout_exit_race_preserves_real_status(self):
         """A process gone before killpg is reaped with its actual return code."""
-        process = unittest.mock.MagicMock()
+        process = unittest.mock.MagicMock(pid=123)
         process.communicate.side_effect = [
             subprocess.TimeoutExpired(["git"], 1),
             (b"finished\n", None),
@@ -760,6 +761,45 @@ class RunnerTest(unittest.TestCase):
                 Path(directory),
             )
         self.assertEqual(result.stdout, "line\r\n")
+
+    def test_reap_timeout_pid_guards(self) -> None:
+        """Prove _reap_timeout guards against invalid and current-group PIDs."""
+
+        def run_with(pid: int | bool) -> tuple[unittest.mock.Mock, unittest.mock.Mock]:
+            mock_killpg = unittest.mock.Mock()
+            fake_process = unittest.mock.Mock(
+                pid=pid,
+                communicate=unittest.mock.Mock(return_value=(b"", None)),
+                returncode=0,
+            )
+            with (
+                unittest.mock.patch.object(upstream_lint, "_remaining", return_value=1.0),
+                unittest.mock.patch.object(upstream_lint.os, "killpg", mock_killpg),
+            ):
+                result = upstream_lint._reap_timeout(fake_process, ["x"])
+            self.assertEqual(result.returncode, 0)
+            return mock_killpg, fake_process.kill
+
+        for bad_pid in (0, 1, True):
+            with self.subTest(bad_pid=bad_pid):
+                mock_killpg, kill = run_with(bad_pid)
+                mock_killpg.assert_not_called()
+                kill.assert_not_called()
+
+        with self.subTest(bad_pid=os.getpgrp()):
+            mock_killpg, kill = run_with(os.getpgrp())
+            mock_killpg.assert_not_called()
+            kill.assert_called_once_with()
+
+        good_pid = 4242 if os.getpgrp() != 4242 else 4243
+        mock_killpg, kill = run_with(good_pid)
+        mock_killpg.assert_called_once_with(good_pid, signal.SIGKILL)
+        kill.assert_not_called()
+
+        boundary_pid = 2
+        mock_killpg, kill = run_with(boundary_pid)
+        mock_killpg.assert_called_once_with(boundary_pid, signal.SIGKILL)
+        kill.assert_not_called()
 
 
 class PreCommitResolutionTest(unittest.TestCase):

@@ -102,7 +102,12 @@ class FFmpegConfigureTest(unittest.TestCase):
             patch.object(
                 ffmpeg_configure,
                 "os",
-                SimpleNamespace(environ=CONTROL_ENV, killpg=os.killpg, name=os.name),
+                SimpleNamespace(
+                    environ=CONTROL_ENV,
+                    getpgrp=os.getpgrp,
+                    killpg=os.killpg,
+                    name=os.name,
+                ),
             ),
         ):
             return ffmpeg_configure.main(
@@ -419,3 +424,39 @@ class FFmpegConfigureTest(unittest.TestCase):
         """Return the configure process exit code unchanged."""
         (self.source / "configure").write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
         self.assertEqual(self.run_wrapper(), 3)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_kill_configure_pid_guards(self) -> None:
+        """Prove _kill_configure guards against invalid and current-group PIDs."""
+        for bad_pid in (0, 1, True):
+            with self.subTest(bad_pid=bad_pid):
+                mock_killpg = Mock()
+                fake_process = SimpleNamespace(pid=bad_pid, kill=Mock())
+                with patch.object(ffmpeg_configure.os, "killpg", mock_killpg):
+                    ffmpeg_configure._kill_configure(fake_process)
+                mock_killpg.assert_not_called()
+                fake_process.kill.assert_not_called()
+
+        with self.subTest(bad_pid=os.getpgrp()):
+            mock_killpg = Mock()
+            fake_process = SimpleNamespace(pid=os.getpgrp(), kill=Mock())
+            with patch.object(ffmpeg_configure.os, "killpg", mock_killpg):
+                ffmpeg_configure._kill_configure(fake_process)
+            mock_killpg.assert_not_called()
+            fake_process.kill.assert_called_once_with()
+
+        good_pid = 4242 if os.getpgrp() != 4242 else 4243
+        mock_killpg = Mock()
+        fake_process = SimpleNamespace(pid=good_pid, kill=Mock())
+        with patch.object(ffmpeg_configure.os, "killpg", mock_killpg):
+            ffmpeg_configure._kill_configure(fake_process)
+        mock_killpg.assert_called_once_with(good_pid, signal.SIGKILL)
+        fake_process.kill.assert_not_called()
+
+        boundary_pid = 2
+        mock_killpg = Mock()
+        fake_process = SimpleNamespace(pid=boundary_pid, kill=Mock())
+        with patch.object(ffmpeg_configure.os, "killpg", mock_killpg):
+            ffmpeg_configure._kill_configure(fake_process)
+        mock_killpg.assert_called_once_with(boundary_pid, signal.SIGKILL)
+        fake_process.kill.assert_not_called()

@@ -1,31 +1,50 @@
-# ffmpeg-patches
+<!-- markdownlint-disable MD013 MD023 MD033 MD036 MD041 -->
+<!-- A centred header needs inline HTML, a banner image, indented headings and
+     badge lines past 80 columns, so those five rules are off for this file.
+     Same directive style as docs/adr/0000-template.md. The prose below still
+     wraps at 80. -->
+<div align="center">
 
-[![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/VMAFx/ffmpeg-patches?utm_source=oss&utm_medium=github&utm_campaign=VMAFx%2Fffmpeg-patches&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
-[![Codacy Badge](https://app.codacy.com/project/badge/Grade/59284a64ef65425eb779b400aa2b624c)](https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard)
+  <img src="docs/assets/ffmpeg-patches-readme-banner.svg" alt="ffmpeg-patches — shared FFmpeg patch series for VMAFx and Pelorus" height="120" />
 
-One shared FFmpeg patch series for VMAFx projects: fixes tracked against FFmpeg master and sent upstream; consumers carry only their own feature patches.
+  <!-- README-STANDARD badge block: one group, fixed order (docs/README-STANDARD.md) -->
+  <!-- 1 release/version -->
+  [![Release](https://img.shields.io/badge/Release-Releases-3b82f6?style=for-the-badge&labelColor=111a35)](https://github.com/VMAFx/ffmpeg-patches/releases)
+  <!-- 2 CI/build -->
+  [![Series](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml)
+  [![Consumers](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml)
+  [![FFmpeg Master](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml)
+  [![Upstream Drift](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml)
+  [![Release](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml/badge.svg)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml)
+  <!-- 3 security/scorecard -->
+  [![Scanners](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml)
+  [![OpenSSF Scorecard](https://img.shields.io/badge/OpenSSF-Scorecard-06b6d4?style=for-the-badge&labelColor=111a35)](https://scorecard.dev/viewer/?uri=github.com/VMAFx/ffmpeg-patches)
+  [![Codacy](https://app.codacy.com/project/badge/Grade/59284a64ef65425eb779b400aa2b624c)](https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard)
+  [![CodeRabbit](https://img.shields.io/badge/Reviews-CodeRabbit-8b5cf6?style=for-the-badge&logo=coderabbit&logoColor=white&labelColor=111a35)](https://coderabbit.ai)
+  <!-- 4 standards -->
+  [![HISS-21](https://img.shields.io/badge/Standards-HISS--21-06b6d4?style=for-the-badge&logo=nasa&labelColor=111a35)](AGENTS.md)
+  [![Power of 10](https://img.shields.io/badge/NASA_JPL-Power_of_10-3b82f6?style=for-the-badge&logo=nasa&labelColor=111a35)](CONTRIBUTING.md#modernized-nasa-jpl-power-of-10-rules)
+  [![Conventional Commits](https://img.shields.io/badge/Commits-Conventional-8b5cf6?style=for-the-badge&logo=conventionalcommits&logoColor=white&labelColor=111a35)](CONTRIBUTING.md)
+  <!-- 5 licence -->
+  [![License](https://img.shields.io/badge/License-EUPL--1.2_·_LGPL--2.1--or--later-3b82f6?style=for-the-badge&labelColor=111a35)](#licence)
+  <!-- 6 support -->
+  [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-8b5cf6?style=for-the-badge&logo=githubsponsors&logoColor=white&labelColor=111a35)](https://github.com/sponsors/lusoris)
 
-<!-- praetor:readme-governance:start -->
-[![HISS Adopted][praetor-hiss-badge]][praetor-hiss-agents]
+  **Shared FFmpeg fix patch series for VMAFx projects, tracked against FFmpeg master ([`series.txt`](series.txt)) and [sent upstream](upstream-contributions.json)**
 
-Praetor manages this repository's declared governance policy. This managed
-block records adoption state; it is not a verification certificate.
+  *Consumers [`apply`](scripts/series.py) this series first and carry only their own feature patches*
 
-**Verification**: `make verify-all` runs the repository's configured
-verification cascade.
+</div>
 
-**HISS Audit**: `praetorctl audit` enforces policy, generated-surface
-integrity, and the debt ratchet.
+ffmpeg-patches is one shared FFmpeg patch series for VMAFx projects: fixes
+are tracked against FFmpeg master ([`series.txt`](series.txt)) and
+[sent upstream](upstream-contributions.json); consumers
+[`apply`](scripts/series.py) this series first and carry only their own
+feature patches.
 
-**Context Sync**: `praetorctl compile-context --verify` verifies every
-generated agent context against `AGENTS.md`.
+**[📖 Architectural Decision Records](docs/adr/README.md)** · [ADR-0001: Shared Fix Series](docs/adr/0001-shared-fix-series.md)
 
-**Debt Baseline**: `.standards-baseline.json` anchors the debt ratchet at
-0 recorded infractions; audit forbids growth.
-
-[praetor-hiss-badge]: https://img.shields.io/badge/Standards-HISS%20Adopted-blue
-[praetor-hiss-agents]: https://github.com/VMAFx/ffmpeg-patches/blob/HEAD/AGENTS.md
-<!-- praetor:readme-governance:end -->
+---
 
 ## How it works
 
@@ -41,117 +60,25 @@ Consumers apply this series first and their own feature patches on top:
 
 A fix lives here once. A consumer does not carry its own copy.
 
-## Pre-PR variant sweep
-
-Before pushing or opening a pull request, scan the committed fix and callers of its targets:
+## Apply the series
 
 ```bash
-python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return master topic -o sweep.md
+. ./base.env
+git clone --branch "$FFMPEG_TAG" --depth 1 "$FFMPEG_REMOTE" ffmpeg
+test "$(git -C ffmpeg rev-parse HEAD)" = "$FFMPEG_COMMIT"
+python3 scripts/series.py apply --expect-base ffmpeg
 ```
 
-The report records full base and head commit IDs. Targets combine callees whose return values are consumed on added lines with functions whose bodies contain added lines. The scan covers touched C/header files and C files in the head revision mentioning those targets. It reports discarded calls and checks that normalize an error to `-1` or an `AVERROR_` value. Explicit `(void)` calls are intentional and excluded. This lexical scan supports review; inspect the surrounding control flow when deciding each row.
+`apply` checks each patch and prints one result per patch. It runs
+`git am --3way` without your git configuration only when the patch does not
+already apply and its added lines are not in the tree:
 
-Replace every `TODO` disposition with one of:
-
-- `fold`: same bug class and same file as the fix; fold the correction into this pull request.
-- `follow-up: <reproducer path>`: otherwise, record the ancestor reproducer path in the evidence and track the correction separately.
-
-Keep the PR body unchanged unless a variant is folded into the fix. After folding, regenerate the report for the new head and review its rows again. A report with no findings ends with `no hits`.
-
-Pass the reviewed report before positional arguments to both commands (run these inside the FFmpeg clone):
-
-```bash
-/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo push --sweep /path/to/sweep.md topic
-/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo pr --sweep /path/to/sweep.md topic "Fix title" /path/to/body.md
-```
-
-Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`.
-
-### Forge settings
-
-The forge helper scripts share configuration through environment variables, implemented in [scripts/forge_settings.py](scripts/forge_settings.py) and verified by [tests/test_forge_settings.py](tests/test_forge_settings.py):
-
-- `FFMPEG_FORGEJO_HOST`: forge URL (default: `https://code.ffmpeg.org`).
-- `FFMPEG_FORGEJO_REPO`: repository path (default: `FFmpeg/FFmpeg`).
-- `FFMPEG_FORGEJO_BOT_REVIEWER`: bot reviewer login (default: `Forgejo_Fairy`).
-- `FFMPEG_FORGEJO_LOGIN`: user login on the forge; when unset, discovered from `/user` with the keyring token.
-
-## Upstream contributions
-
-Pull requests on the FFmpeg forge that came out of this series and its
-consumers, and those of other authors that the series backports. A row
-without a series patch is a change the series does not carry.
-
-<!-- upstream-contributions:start -->
-| Pull request | Target | State | Change | Series patch |
-| --- | --- | --- | --- | --- |
-| [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0035 |
-| [24835](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835) | `master` | merged 2026-10-19 (`fd9a8f25a07b`), in no release yet | avfilter/vf_tonemap_opencl: zero the peak detection buffer | 0016 |
-| [24970](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970) | `master` | open | avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED | 0001 |
-| [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | 0042 |
-| [24974](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974) | `master` | merged 2026-10-20 (`2a8c6d30b934`), in no release yet | avcodec/av1dec: remove the coding bias from exported chroma grain params | none |
-| [24975](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975) | `release/9.0` | merged 2026-10-12 (`7e93014c5bbb`), in no release yet | [release/9.0] hwcontext_vulkan: only originate host image layout transitions from copyable layouts | none |
-| [24977](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24977) | `master` | open | avcodec/vaapi_encode_h265: enable cu_qp_delta for ROI in CQP mode | none |
-| [24978](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24978) | `master` | open | avfilter/vf_libvmaf: add max pool method, reject unknown ones | none |
-| [24993](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993) | `master` | closed | avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit | none |
-| [24994](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994) | `master` | merged 2026-10-24 (`96b7f8281a5f`), in no release yet | avcodec/nvenc: drop hevc_nvenc SEI above a fixed size | 0003 |
-| [25053](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25053) | `master` | open | hwcontext_vulkan: import a frame again when the CUDA context changes | 0008 |
-| [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | merged 2026-10-14 (`669f5ab083c7`), in no release yet | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0007 |
-| [25109](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109) | `master` | open | avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import | 0004 |
-| [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | closed | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0006 |
-| [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | closed | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat and tests | 0002 |
-| [25112](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25112) | `master` | merged 2026-10-16 (`30b16e57ff3d`), in no release yet | ffbuild/library.mak: add the devprogs target | none |
-| [25189](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25189) | `master` | merged 2026-10-18 (`ffb15c94c286`), in no release yet | avfilter/Makefile: link cuda/load_helper.o into three CUDA filters | none |
-| [25468](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25468) | `master` | merged 2026-10-27 (`fa4daf630eb5`), in no release yet | avcodec/rv60dec: validate angular prediction buffer bounds | none |
-| [25469](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25469) | `master` | open | swresample/tests/swresample: allocate sample buffers and test indices | none |
-| [25470](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25470) | `master` | open | avcodec/tests: give large test buffers static storage | none |
-| [25471](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25471) | `master` | open | tools/ismindex: allocate output paths and report manifest errors | none |
-| [25473](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25473) | `master` | open | avfilter/vf_find_rect: assert the mipmap search pass bounds | none |
-| [25474](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25474) | `master` | open | avfilter: fix GCC 14 and 16 warnings in vf_median, af_firequalizer and af_afftfilt | none |
-| [25475](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25475) | `master` | open | avformat: fix GCC 14 and 16 -Wformat-truncation warnings in dashenc, matroskaenc and smoothstreamingenc | none |
-| [25476](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25476) | `master` | open | avformat: fix GCC 14 and 16 warnings in mpegts, nspdec and rtsp | none |
-| [25477](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477) | `master` | open | avcodec/ffv1enc: move float remap scratch off the stack | none |
-| [25478](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25478) | `master` | open | avcodec/aac: fix GCC 14 and 16 -Wstringop-overflow warnings in aacenc and aacsbr | none |
-| [25479](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25479) | `master` | open | avcodec: fix GCC 14 and 16 warnings in a64multienc, h264dec, vlc and wmadec | none |
-| [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
-| [25481](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25481) | `master` | open | tests/checkasm: move large scratch buffers to the heap | none |
-| [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | merged 2026-11-02 (`f675c507e20a`), in no release yet | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
-| [25533](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25533) | `master` | open | checkasm/snowdsp: Include intmath before public headers | 0036 |
-| [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Assume the predicted luma point bound | 0037 |
-| [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: bound reference corner extension | 0038 |
-| [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
-| [25708](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708) | `master` | open | avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes | 0040, 0041 |
-
-State read from the FFmpeg forge on 2026-11-04.
-<!-- upstream-contributions:end -->
-
-A pull request against a release branch is a backport. It reaches a pinned
-base with the first release cut from that branch after the merge.
-
-The same facts are in `upstream-contributions.json`, one object per pull
-request, for other pages to read. Its `patch` field is a string of patch
-filenames separated by `, `, or an empty string when the series carries
-none. Every named patch must link to that pull request and match its state.
-The table lists all their series numbers and is generated from that file:
-edit the file, then run `python3 scripts/series.py contributions --write`.
-The pre-commit hook also regenerates and stages `README.md` whenever
-`upstream-contributions.json` is staged.
-
-Run `python3 scripts/upstream_drift.py` to compare recorded fields and
-`master_form` commits with the FFmpeg forge. Add `--fix` to update changed
-fields, set the checked date to today in UTC and regenerate the table.
-Unchanged files keep their bytes and checked date. The README table is checked
-even when the forge records match; `--fix` repairs a stale table without changing
-the checked date. Concurrent edits detected before writing abort the repair
-without changing any files. A merged or closed
-`covered_by` pull request still needs human review before dropping its patch;
-`--fix` reports it and exits 1. Tool errors exit 2.
-
-The daily upstream workflow runs `--fix` with read-only repository permissions.
-Changes appear in its job summary and the `upstream-drift` artifact as
-`upstream-drift.patch`; the job fails whenever changes need review or drift
-remains. Apply the downloaded patch with `git apply upstream-drift.patch`,
-review it and submit the update through the usual pull request process.
+- `applied`: the patch applied
+- `conflict`: it did not; the run stops unless `--keep-going` is given
+- `upstream`: its added lines are already in the tree, so it is a drop
+  candidate; on the pinned release this is an error
+- `not-tried`: the patch was not attempted because a preceding patch
+  conflicted and `--keep-going` was not given
 
 ## Layout
 
@@ -161,7 +88,7 @@ review it and submit the update through the usual pull request process.
 | `series.txt` | Patch order; the series is cumulative |
 | `patches/NNNN-slug.patch` | One fix, generated by `git format-patch` |
 | `patches/NNNN-slug.toml` | Its metadata: status, upstream link, consumers, origin |
-| `upstream-contributions.json` | Every upstream pull request with its state; source of the table above |
+| `upstream-contributions.json` | Every upstream pull request with its state; source of the contributions table |
 | `scripts/series.py` | `check`, `apply`, `export`, the `coverage` and `warnings` gates, the `contributions` table and release `notes` |
 | `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
 | `scripts/consumer_stacks.py` | Applies each consumer's patch stack on top of the applied series |
@@ -194,24 +121,50 @@ fix travels in another author's PR records it as
 `covered_by = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/<number>"`; the
 daily check fails once that PR merges or closes.
 
-## Apply the series
+## Guides and reference
+
+### Pre-PR variant sweep
+
+Before pushing or opening a pull request, scan the committed fix and callers of its targets:
 
 ```bash
-. ./base.env
-git clone --branch "$FFMPEG_TAG" --depth 1 "$FFMPEG_REMOTE" ffmpeg
-test "$(git -C ffmpeg rev-parse HEAD)" = "$FFMPEG_COMMIT"
-python3 scripts/series.py apply --expect-base ffmpeg
+# Fetch the upstream base so both master and topic resolve as local refs:
+git -C /path/to/FFmpeg fetch origin master:master
+# A shallow clone needs enough history for the merge base; deepen it if merge-base fails:
+git -C /path/to/FFmpeg fetch --unshallow origin  # or: fetch --deepen=<commits> origin
+# Sweep from the merge base so upstream-only changes are excluded:
+python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return \
+  "$(git -C /path/to/FFmpeg merge-base master topic)" topic -o sweep.md
 ```
 
-`apply` runs `git am --3way` per patch without your git configuration and
-prints one result per patch:
+The report records full base and head commit IDs. Targets combine callees whose return values appear in recognized error checks on added lines with functions whose bodies contain added lines. The scan covers touched C/header files and C files in the head revision mentioning those targets. It reports discarded calls and checks that normalize an error to `-1` or an `AVERROR_` value. Explicit `(void)` calls are intentional and excluded. This lexical scan supports review; inspect the surrounding control flow when deciding each row.
 
-- `applied`: the patch applied
-- `conflict`: it did not; the run stops unless `--keep-going` is given
-- `upstream`: its added lines are already in the tree, so it is a drop
-  candidate; on the pinned release this is an error
+Replace every `TODO` disposition with one of:
 
-## Change a patch
+- `fold`: same bug class and same file as the fix; fold the correction into this pull request.
+- `follow-up: <reproducer path>`: otherwise, record the ancestor reproducer path in the evidence and track the correction separately.
+
+Keep the PR body unchanged unless a variant is folded into the fix. After folding, regenerate the report for the new head and review its rows again. A report with no findings ends with `no hits`.
+
+Pass the reviewed report before positional arguments to both commands (run these inside the FFmpeg clone):
+
+```bash
+/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo push --sweep /path/to/sweep.md topic
+/path/to/ffmpeg-patches/scripts/ffmpeg-forgejo pr --sweep /path/to/sweep.md topic "Fix title" /path/to/body.md
+```
+
+Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`.
+
+#### Forge settings
+
+The forge helper scripts share configuration through environment variables, implemented in [scripts/forge_settings.py](scripts/forge_settings.py) and verified by [tests/test_forge_settings.py](tests/test_forge_settings.py):
+
+- `FFMPEG_FORGEJO_HOST`: forge URL (default: `https://code.ffmpeg.org`).
+- `FFMPEG_FORGEJO_REPO`: repository path (default: `FFmpeg/FFmpeg`).
+- `FFMPEG_FORGEJO_BOT_REVIEWER`: bot reviewer login (default: `Forgejo_Fairy`).
+- `FFMPEG_FORGEJO_LOGIN`: user login on the forge; when unset, discovered from `/user` with the keyring token.
+
+### Change a patch
 
 1. Apply the series onto the pinned release, as above.
 2. Commit, amend or reorder in that checkout. Keep FFmpeg's commit message
@@ -225,7 +178,7 @@ prints one result per patch:
    changes, update its record in `upstream-contributions.json` and
    regenerate the table; `check` names a record that no longer fits.
 
-## Checks
+### Checks
 
 `series.yml` always runs the series check, lint and unit tests on pull requests. Its `scope` job compares the pull request head with its merge base: `ffmpeg` selects the pinned-base apply, regeneration, clang-tidy, build, FATE, coverage and warning gates; `parity` selects the GPU parity step within that job; `macos` selects the Metal build and warning gate and runs for every change to the patches, `series.txt`, `base.env` or the gate itself, because that job refuses clang warnings in every file the series changes. Both heavy jobs always start, so they stay required checks; outside the scope of a change they skip every step, so a docs-only change finishes them in seconds. When the `scope` job itself fails, both heavy jobs run in full, and the `scope` job is a required check of its own. Pushes to `main` and release calls run the full set (`scope --full`); draft pull requests still fail the check job until marked ready for review.
 
@@ -292,7 +245,7 @@ The gate warns that the consumer must drop the patch on its next pin bump
 and continues its stack; a missing pin, an expired handover, or incomplete
 coverage still fails, and an unknown tag is a tool error.
 
-## Graph check
+### Graph check
 
 When two linked filters share no pixel or sample format, libavfilter inserts
 a converter named `auto_<filter>_<n>` without asking. On a hardware path
@@ -310,7 +263,7 @@ python3 scripts/graph_check.py graphs.json --allow aresample
 `tests/test_graph_check.py` runs it on two real dumps, one with an
 `auto_scale_0` and one without.
 
-## Tone-map parity
+### Tone-map parity
 
 [ADR-0002](docs/adr/0002-dovi-reshape-and-tone-mapping.md) lets a tone-map path
 land only when its mean CIEDE2000 against `vf_libplacebo` stays at or below
@@ -342,7 +295,7 @@ the same RPUs, so no inverse is needed. `tests/test_tonemap_parity.py` checks
 the colour difference against the published CIEDE2000 test pairs and the
 gate's pass and fail decisions without FFmpeg.
 
-## GPU parity in CI
+### GPU parity in CI
 
 The hosted runners have no GPU. The pinned-base job of `series.yml` runs the
 GPU filters on Mesa software devices instead: lavapipe for Vulkan and rusticl
@@ -364,6 +317,21 @@ Two gaps remain:
 - The Metal (VideoToolbox) filters are built and checked for warnings on the
   macOS job, but their output is not compared with the CPU filters until an
   Apple host can run the parity tests.
+
+## Contribute
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding
+standards (HISS-21, NASA JPL Power of 10), and local verification instructions.
+
+## Support ffmpeg-patches
+
+**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [36 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 10 merged, 23 open.
+
+**What support funds.**
+- Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
+- Cloud test time on an Apple host to compare the Metal (VideoToolbox) filters with the CPU filters.
+
+Sponsor on [GitHub Sponsors](https://github.com/sponsors/lusoris), any amount; no support or priority is sold. Open Collective: pending.
 
 ## Releases
 
@@ -391,17 +359,105 @@ Versions follow SemVer and start below 1.0.0:
   (consumers rebase their own patches), MINOR when a patch is added or
   dropped, PATCH for metadata or tooling
 
-## Support ffmpeg-patches
+## Upstream and licence
 
-**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [35 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 9 merged, 23 open.
+### Upstream contributions
 
-**What support funds.**
-- Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
-- Cloud test time on an Apple host to compare the Metal (VideoToolbox) filters with the CPU filters.
+Pull requests on the FFmpeg forge that came out of this series and its
+consumers, and those of other authors that the series backports. A row
+without a series patch is a change the series does not carry.
 
-Sponsor on [GitHub Sponsors](https://github.com/sponsors/lusoris), any amount; no support or priority is sold. Open Collective: pending.
+<!-- upstream-contributions:start -->
+| Pull request | Target | State | Change | Series patch |
+| --- | --- | --- | --- | --- |
+| [24045](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24045) | `master` | merged 2026-08-07 (`63d0237033cc`), in no release yet | avutil/hwcontext_vulkan: Query export support with the real image flags | 0035 |
+| [24835](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24835) | `master` | merged 2026-10-19 (`fd9a8f25a07b`), in no release yet | avfilter/vf_tonemap_opencl: zero the peak detection buffer | 0016 |
+| [24970](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24970) | `master` | open | avutil/vulkan: don't release frames to VK_QUEUE_FAMILY_IGNORED | 0001 |
+| [24973](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24973) | `master` | open | avfilter/vf_libvmaf: fix error paths (frame leak, frame count, uninitialized score, CUDA context) | 0042 |
+| [24974](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24974) | `master` | merged 2026-10-20 (`2a8c6d30b934`), in no release yet | avcodec/av1dec: remove the coding bias from exported chroma grain params | none |
+| [24975](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24975) | `release/9.0` | merged 2026-10-12 (`7e93014c5bbb`), in no release yet | [release/9.0] hwcontext_vulkan: only originate host image layout transitions from copyable layouts | none |
+| [24977](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24977) | `master` | open | avcodec/vaapi_encode_h265: enable cu_qp_delta for ROI in CQP mode | none |
+| [24978](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24978) | `master` | open | avfilter/vf_libvmaf: add max pool method, reject unknown ones | none |
+| [24993](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24993) | `master` | closed | avcodec/nvenc: keep hevc_nvenc user data SEI within the picture limit | none |
+| [24994](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24994) | `master` | merged 2026-10-24 (`96b7f8281a5f`), in no release yet | avcodec/nvenc: drop hevc_nvenc SEI above a fixed size | 0003 |
+| [25053](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25053) | `master` | open | hwcontext_vulkan: import a frame again when the CUDA context changes | 0008 |
+| [25060](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25060) | `release/9.0` | merged 2026-10-14 (`669f5ab083c7`), in no release yet | [release/9.0] vulkan: de-phase queue rotation and pin video pools to a single queue | 0007 |
+| [25109](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25109) | `master` | open | avutil/hwcontext_vaapi: accept GR1616 for P010/P012 DRM import | 0004 |
+| [25110](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25110) | `master` | closed | avutil/hwcontext_vulkan: wait on the CPU before RADV DRM mapping | 0006 |
+| [25111](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25111) | `master` | closed | Fix GCC 14 and 16 warnings in libavcodec, libavfilter, libavformat and tests | 0002 |
+| [25112](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25112) | `master` | merged 2026-10-16 (`30b16e57ff3d`), in no release yet | ffbuild/library.mak: add the devprogs target | none |
+| [25189](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25189) | `master` | merged 2026-10-18 (`ffb15c94c286`), in no release yet | avfilter/Makefile: link cuda/load_helper.o into three CUDA filters | none |
+| [25468](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25468) | `master` | merged 2026-10-27 (`fa4daf630eb5`), in no release yet | avcodec/rv60dec: validate angular prediction buffer bounds | none |
+| [25469](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25469) | `master` | open | swresample/tests/swresample: allocate sample buffers and test indices | none |
+| [25470](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25470) | `master` | open | avcodec/tests: give large test buffers static storage | none |
+| [25471](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25471) | `master` | open | tools/ismindex: allocate output paths and report manifest errors | none |
+| [25473](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25473) | `master` | open | avfilter/vf_find_rect: assert the mipmap search pass bounds | none |
+| [25474](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25474) | `master` | open | avfilter: fix GCC 14 and 16 warnings in vf_median, af_firequalizer and af_afftfilt | none |
+| [25475](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25475) | `master` | open | avformat: fix GCC 14 and 16 -Wformat-truncation warnings in dashenc, matroskaenc and smoothstreamingenc | none |
+| [25476](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25476) | `master` | open | avformat: fix GCC 14 and 16 warnings in mpegts, nspdec and rtsp | none |
+| [25477](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477) | `master` | open | avcodec/ffv1enc: move float remap scratch off the stack | none |
+| [25478](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25478) | `master` | open | avcodec/aac: fix GCC 14 and 16 -Wstringop-overflow warnings in aacenc and aacsbr | none |
+| [25479](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25479) | `master` | open | avcodec: fix GCC 14 and 16 warnings in a64multienc, h264dec, vlc and wmadec | none |
+| [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
+| [25481](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25481) | `master` | open | tests/checkasm: move large scratch buffers to the heap | none |
+| [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | merged 2026-11-02 (`f675c507e20a`), in no release yet | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
+| [25533](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25533) | `master` | open | checkasm/snowdsp: Include intmath before public headers | 0036 |
+| [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Assume the predicted luma point bound | 0037 |
+| [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: bound reference corner extension | 0038 |
+| [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
+| [25708](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708) | `master` | open | avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes | 0040, 0041 |
 
-## Licence
+State read from the FFmpeg forge on 2026-11-04.
+<!-- upstream-contributions:end -->
+
+A pull request against a release branch is a backport. It reaches a pinned
+base with the first release cut from that branch after the merge.
+
+The same facts are in `upstream-contributions.json`, one object per pull
+request, for other pages to read. Its `patch` field is a string of patch
+filenames separated by a comma and a space, or an empty string when the series carries
+none. Every named patch must link to that pull request and match its state.
+The table lists all their series numbers and is generated from that file:
+edit the file, then run `python3 scripts/series.py contributions --write`.
+The pre-commit hook also regenerates and stages `README.md` whenever
+`upstream-contributions.json` is staged.
+
+Run `python3 scripts/upstream_drift.py` to compare recorded fields and
+`master_form` commits with the FFmpeg forge. Add `--fix` to update changed
+fields, set the checked date to today in UTC and regenerate the table.
+Unchanged files keep their bytes and checked date. The README table is checked
+even when the forge records match; `--fix` repairs a stale table without changing
+the checked date. Concurrent edits detected before writing abort the repair
+without changing any files. A merged or closed
+`covered_by` pull request still needs human review before dropping its patch;
+`--fix` reports it and exits 1. Tool errors exit 2.
+
+The daily upstream workflow runs `--fix` with read-only repository permissions.
+Changes appear in its job summary and the `upstream-drift` artifact as
+`upstream-drift.patch`; the job fails whenever changes need review or drift
+remains. Apply the downloaded patch with `git apply upstream-drift.patch`,
+review it and submit the update through the usual pull request process.
+
+### Licence
 
 The patches change FFmpeg's sources and keep FFmpeg's LGPL-2.1-or-later. The
 tooling and documentation are EUPL-1.2. `REUSE.toml` records both.
+
+## Standards & Governance
+
+<!-- praetor:readme-governance:start -->
+Praetor manages this repository's declared governance policy. This managed
+block records adoption state; it is not a verification certificate.
+
+**Verification**: `make verify-all` runs the repository's configured
+verification cascade.
+
+**HISS Audit**: `praetorctl audit` enforces policy, generated-surface
+integrity, and the debt ratchet.
+
+**Context Sync**: `praetorctl compile-context --verify` verifies every
+generated agent context against `AGENTS.md`.
+
+**Debt Baseline**: `.standards-baseline.json` anchors the debt ratchet at
+1 recorded infraction; audit forbids growth.
+<!-- praetor:readme-governance:end -->

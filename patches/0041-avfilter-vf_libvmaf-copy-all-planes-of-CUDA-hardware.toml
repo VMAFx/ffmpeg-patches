@@ -5,5 +5,6 @@ origin = "VMAFx/vmafx#3274 (luoye-cpu), FFmpeg PR 25708 commit cfa0bbc4bb86bb483
 notes = """
 Removes the break after the first successful cuMemcpy2D in copy_picture_data_cuda so the loop copies every plane, including chroma, for the supported planar formats.
 25708 stacks on 24973, which the series does not carry; the conflict was context only, the change is identical.
+Prerequisite: a libvmaf whose CUDA-to-host download copies every plane for CPU extractors; vmafx carries it (core/src/libvmaf.c translate_picture_device, plane mask 0x7). With an older libvmaf, CPU chroma metrics on CUDA input read planes that were never downloaded.
 GPU before/after: see PR
 """

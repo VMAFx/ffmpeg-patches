@@ -365,6 +365,7 @@ class ConsumerWorkflowFixture(unittest.TestCase):
             "ARGV_LOG": str(self.argv_log),
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "PELORUS_REF": "",
+            "VMAFX_REF": "",
         }
 
     def stub(self, name: str, body: str = "") -> None:
@@ -466,6 +467,58 @@ class ConsumerPinWorkflowTest(ConsumerWorkflowFixture):
             with self.subTest(missing=missing):
                 done = self.read_pins("FFMPEG_FIX_SERIES_TAG=v1.2.3\n", missing)
                 self.assertNotEqual(done.returncode, 0)
+
+
+class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
+    """Validate both dispatch refs before either reaches the GitHub environment."""
+
+    ref_step = "Check the consumer refs"
+
+    def test_invalid_refs_write_neither_environment_line(self) -> None:
+        """Reject planted invalid branch names for each dispatch input."""
+        invalid = ("-x", "a..b", "a b", "a;b", "$(id)", "x.lock", "/x", "x/", "@{u", "a" * 201)
+        for name in ("pelorus_ref", "vmafx_ref"):
+            for ref in invalid:
+                with self.subTest(name=name, ref=ref):
+                    self.env_file.unlink(missing_ok=True)
+                    done = self.run_step(self.ref_step, {name.upper(): ref})
+                    self.assertNotEqual(done.returncode, 0)
+                    self.assertIn(f"::error::{name} is not a plain branch name", done.stdout)
+                    self.assertEqual(
+                        self.env_file.read_text(encoding="utf-8") if self.env_file.exists() else "",
+                        "",
+                    )
+
+    def test_valid_refs_write_exactly_both_environment_lines(self) -> None:
+        """Accept empty, named, and maximum-length refs for both consumers."""
+        valid = ("", "chore/ffmpeg-drop-qpfile-loopback", "a", "a" * 200)
+        for pelorus, vmafx in ((ref, ref) for ref in valid):
+            with self.subTest(pelorus=pelorus, vmafx=vmafx):
+                self.env_file.unlink(missing_ok=True)
+                done = self.run_step(self.ref_step, {"PELORUS_REF": pelorus, "VMAFX_REF": vmafx})
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(
+                    self.env_file.read_text(encoding="utf-8"),
+                    f"PELORUS_REF={pelorus}\nVMAFX_REF={vmafx}\n",
+                )
+
+    def test_bad_vmafx_ref_rejects_good_pelorus_ref_without_writing(self) -> None:
+        """Validate the complete pair before writing either ref."""
+        done = self.run_step(self.ref_step, {"PELORUS_REF": "ci/consumer", "VMAFX_REF": "a..b"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("::error::vmafx_ref is not a plain branch name", done.stdout)
+        self.assertFalse(self.env_file.exists())
+
+    def test_dispatch_declares_optional_vmafx_ref(self) -> None:
+        """Expose an optional string input with an empty default."""
+        workflow = Path(__file__).resolve().parent.parent / ".github/workflows/consumers.yml"
+        inputs = yaml.safe_load(workflow.read_text(encoding="utf-8"))["on"]["workflow_dispatch"][
+            "inputs"
+        ]
+        self.assertEqual(
+            {key: inputs["vmafx_ref"][key] for key in ("type", "required", "default")},
+            {"type": "string", "required": False, "default": ""},
+        )
 
 
 class ConsumerMapWorkflowTest(ConsumerWorkflowFixture):
@@ -701,21 +754,35 @@ class ConsumerMapWorkflowTest(ConsumerWorkflowFixture):
                     self.assertIn("::error::", done.stdout)
                     self.assertFalse(self.argv_log.exists())
 
-    def test_fetch_uses_owner_and_keeps_pelorus_dispatch_ref(self) -> None:
-        """Clone URLs follow the owner and only Pelorus receives the dispatch ref."""
+    def test_fetch_uses_owner_and_keeps_each_dispatch_ref(self) -> None:
+        """Clone each named consumer at its own ref and no other consumer at a ref."""
         self.stub_git()
-        for ref in ("", "ci/consumer"):
-            with self.subTest(ref=ref):
+        for pelorus, vmafx in (
+            ("", ""),
+            ("ci/consumer", ""),
+            ("", "chore/ffmpeg-drop-qpfile-loopback"),
+            ("p/x", "v/y"),
+        ):
+            with self.subTest(pelorus=pelorus, vmafx=vmafx):
                 self.argv_log.unlink(missing_ok=True)
                 done = self.run_step(
-                    self.fetch_step, {"CONSUMER_OWNER": "example-fork", "PELORUS_REF": ref}
+                    self.fetch_step,
+                    {
+                        "CONSUMER_OWNER": "example-fork",
+                        "CONSUMERS": self.workflow_env["CONSUMERS"] + " other:OTHER_PIN",
+                        "PELORUS_REF": pelorus,
+                        "VMAFX_REF": vmafx,
+                        "GITHUB_REF": "refs/heads/poison",
+                        "OTHER_REF": "poison",
+                    },
                 )
                 self.assertEqual(done.returncode, 0, done.stderr)
                 clones = [call for call in self.calls() if call[0] == "clone"]
-                names = [entry.split(":")[0] for entry in self.workflow_env["CONSUMERS"].split()]
+                names = ["vmafx", "pelorus", "other"]
                 expected = []
                 for name in names:
-                    branch = ["--branch", ref] if name == "pelorus" and ref else []
+                    ref = {"pelorus": pelorus, "vmafx": vmafx}.get(name, "")
+                    branch = ["--branch", ref] if ref else []
                     expected.append(
                         [
                             "clone",
