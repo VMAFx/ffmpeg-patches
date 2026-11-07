@@ -69,8 +69,24 @@ def allowed_environment(environ: Mapping[str, str], keep: Sequence[str]) -> dict
 def _kill_configure(process: subprocess.Popen[bytes]) -> None:
     """Terminate configure and its descendants where process groups are available."""
     if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+        # HISS-08: never signal pid 0/1 or our own process group.
+        if (
+            not isinstance(process.pid, int)
+            or isinstance(process.pid, bool)
+            or process.pid <= 1
+            or process.pid == os.getpgrp()
+        ):
+            with contextlib.suppress(ProcessLookupError):
+                # pid 0/1/bool: Popen.kill() would reach os.kill(0|1); signal nothing.
+                if (
+                    isinstance(process.pid, int)
+                    and not isinstance(process.pid, bool)
+                    and process.pid > 1
+                ):
+                    process.kill()
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
     else:
         # HISS-21: non-POSIX platforms can terminate only the direct child here.
         process.kill()

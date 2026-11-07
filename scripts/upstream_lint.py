@@ -146,9 +146,24 @@ def _reap_timeout(
     process: subprocess.Popen[bytes], argv: list[str], partial_output: bytes | None = None
 ) -> RunResult:
     """Kill a timed-out process group and bound the remaining pipe drain."""
-    # The process may have exited between communicate and killpg.
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
+    # HISS-08: never signal pid 0/1 or our own process group.
+    if (
+        not isinstance(process.pid, int)
+        or isinstance(process.pid, bool)
+        or process.pid <= 1
+        or process.pid == os.getpgrp()
+    ):
+        with suppress(ProcessLookupError):
+            # pid 0/1/bool: Popen.kill() would reach os.kill(0|1); signal nothing.
+            if (
+                isinstance(process.pid, int)
+                and not isinstance(process.pid, bool)
+                and process.pid > 1
+            ):
+                process.kill()
+    else:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
     try:
         output, _ = process.communicate(timeout=_remaining(REAP_TIMEOUT))
     except subprocess.TimeoutExpired as error:
