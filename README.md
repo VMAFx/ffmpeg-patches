@@ -15,7 +15,7 @@
   [![Consumers](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml)
   [![FFmpeg Master](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml)
   [![Upstream Drift](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml)
-  [![Release Build](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release-build.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release-build.yml)
+  [![Release](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml/badge.svg)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml)
   <!-- 3 security/scorecard -->
   [![Scanners](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml)
   [![OpenSSF Scorecard](https://img.shields.io/badge/OpenSSF-Scorecard-06b6d4?style=for-the-badge&labelColor=111a35)](https://scorecard.dev/viewer/?uri=github.com/VMAFx/ffmpeg-patches)
@@ -130,8 +130,9 @@ Before pushing or opening a pull request, scan the committed fix and callers of 
 ```bash
 # Fetch the upstream base so both master and topic resolve as local refs:
 git -C /path/to/FFmpeg fetch origin master:master
-# Then run the sweep against the local refs:
-python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return master topic -o sweep.md
+# Sweep from the merge base so upstream-only changes are excluded:
+python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return \
+  "$(git -C /path/to/FFmpeg merge-base master topic)" topic -o sweep.md
 ```
 
 The report records full base and head commit IDs. Targets combine callees whose return values appear in recognized error checks on added lines with functions whose bodies contain added lines. The scan covers touched C/header files and C files in the head revision mentioning those targets. It reports discarded calls and checks that normalize an error to `-1` or an `AVERROR_` value. Explicit `(void)` calls are intentional and excluded. This lexical scan supports review; inspect the surrounding control flow when deciding each row.

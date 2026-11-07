@@ -597,6 +597,14 @@ fairy_requests() {
     me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
   fi
   encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
+  if [ "$optional" = --skip-unavailable ] && [ -z "$page_size" ]; then
+    if out="$(api GET /settings/api)"; then rc=0; else rc=$?; fi
+    if [[ "$rc" =~ ^(6|7|28)$ ]]; then
+      echo "fairy-requests: SKIPPED - API offline (curl rc $rc)." >&2
+      return 0
+    fi
+    [ "$rc" -eq 0 ] || return "$rc"
+  fi
   discover_page_size
   out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || return 1
   rows="$(fairy_request_candidates "$me" <<<"$out")" || return 1
