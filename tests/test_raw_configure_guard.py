@@ -36,6 +36,7 @@ class RawConfigureGuardTest(unittest.TestCase):
         (self.tree / "libavcodec").mkdir()
         self.build = self.root / "build"
         self.build.mkdir()
+        (self.root / "BUILD").mkdir()
         self.other = self.root / "other"
         self.other.mkdir()
         self.marker = self.root / "ran"
@@ -65,8 +66,19 @@ class RawConfigureGuardTest(unittest.TestCase):
             check=False,
         )
 
-    def test_refuses_raw_configure_forms(self) -> None:
-        """Block direct, wrapped, nested, and relocated FFmpeg configure calls."""
+    def _assert_refused(self, cases: tuple[tuple[str, Path], ...]) -> None:
+        """Verify the guard refuses raw configure invocations across clients."""
+        for client in CLIENTS:
+            for command, cwd in cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("configure", result.stderr)
+                    self.assertIn("python3 scripts/ffmpeg_configure.py", result.stderr)
+                    self.assertFalse(self.marker.exists())
+
+    def test_refuses_wrapper_and_relocation_forms(self) -> None:
+        """Block direct, wrapped, and relocated FFmpeg configure calls."""
         cases = (
             ("./configure --prefix=/x", self.tree),
             ("bash configure", self.tree),
@@ -75,7 +87,6 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("env FOO=1 nice -n 10 ./configure", self.tree),
             (str(self.tree / "configure"), self.root),
             ("cd BUILD && ../tree/configure", self.root),
-            ("bash -c './configure'", self.tree),
             ("systemd-run --user --scope -p MemoryHigh=8G -- ./configure", self.tree),
             ("praetorctl admit -label x -- ./configure", self.tree),
             ('"$SRC"/configure', self.tree),
@@ -99,29 +110,52 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("popd; ./configure", self.tree),
             ("sudo ./configure", self.tree),
             ("flock /tmp/l ./configure", self.tree),
-            ("xargs ./configure", self.tree),
-            ("echo ./configure | bash", self.tree),
             ("f=./configure; $f", self.tree),
             ("source ./configure", self.tree),
             (". ./configure", self.tree),
+            ("./conf*", self.tree),
+        )
+        self._assert_refused(cases)
+
+    def test_refuses_interpreter_and_reader_abuse_forms(self) -> None:
+        """Block interpreter one-liners and reader-abuse configure invocations."""
+        cases = (
+            ("bash -c './configure'", self.tree),
+            ("bash -c 'sudo ./configure'", self.tree),
+            ("xargs ./configure", self.tree),
+            ("echo ./configure | bash", self.tree),
             ("find . -name configure -exec sh {} \\;", self.tree),
             ("echo $(./configure)", self.tree),
             ("echo `./configure`", self.tree),
-            ("bash -c 'sudo ./configure'", self.tree),
             ("python3 -c \"import os; os.system('./configure')\"", self.tree),
             ("perl -e 'system q(./configure)'", self.tree),
             ('awk "BEGIN{system(\\"./configure\\")}"', self.tree),
-            ("./conf*", self.tree),
+            ("sed -n '1e ./configure' README", self.tree),
+            ("less +'!./configure' x", self.tree),
+            ("rg --pre ./configure x .", self.tree),
+            ("git -c alias.x='!./configure' x", self.tree),
+            ("git -c core.pager=./configure log", self.tree),
+            ("git rebase -x ./configure HEAD~1", self.tree),
+            ("git bisect run ./configure", self.tree),
+            ("git submodule foreach ./configure", self.tree),
+            ("LESSOPEN='|./configure %s' less README", self.tree),
+            ("GIT_PAGER=./configure git log", self.tree),
+            ("GIT_EXTERNAL_DIFF=./configure git diff", self.tree),
+            ("cat configure | sh", self.tree),
+            ("sed -n 1p configure", self.tree),
+            ("less configure", self.tree),
         )
-        (self.root / "BUILD").mkdir()
-        for client in CLIENTS:
-            for command, cwd in cases:
-                with self.subTest(client=client, command=command):
-                    result = self.run_guard(client, self.payload(client, command, cwd))
-                    self.assertEqual(result.returncode, 2, result.stderr)
-                    self.assertIn("configure", result.stderr)
-                    self.assertIn("python3 scripts/ffmpeg_configure.py", result.stderr)
-                    self.assertFalse(self.marker.exists())
+        self._assert_refused(cases)
+
+    def test_refuses_subshell_and_pipeline_directory_leaks(self) -> None:
+        """Refuse subshell and pipeline forms leaking directory state to configure."""
+        cases = (
+            ("(cd /tmp); ./configure", self.tree),
+            ("(cd /tmp) && ./configure", self.tree),
+            ("cd /tmp | true; ./configure", self.tree),
+            ("(cd /tmp; (cd /var)); ./configure", self.tree),
+        )
+        self._assert_refused(cases)
 
     def test_allows_unrelated_commands(self) -> None:
         """Keep wrapper use, inspection, other trees, and ordinary builds available."""
@@ -138,16 +172,22 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("git diff -- configure", self.tree),
             ("./configure", self.other),
             ("make -j4", self.tree),
-            ("sed -n 1,20p configure", self.tree),
             ("head -50 configure", self.tree),
             ("git log -- configure", self.tree),
             (f"ls {self.tree}/configure", self.root),
-            ("rg -n foo configure", self.tree),
             ('cd "$X" && make -j4', self.tree),
             (f"python3 -I scripts/ffmpeg_configure.py {self.tree} {self.build}", self.root),
             ("sudo ./configure", self.other),
             ("echo hello", self.tree),
             (f"bash -c 'cd {self.tree} && make'", self.root),
+            ("git diff configure", self.tree),
+            ("git add configure", self.tree),
+            ("git show HEAD:configure", self.tree),
+            ("tail -f config.log", self.tree),
+            ("grep -n foo configure | head -5", self.tree),
+            ("git status", self.tree),
+            (f"(cd {self.other} && ./configure)", self.tree),
+            (f"cd {self.other} && ./configure", self.tree),
         )
         for client in CLIENTS:
             for command, cwd in cases:

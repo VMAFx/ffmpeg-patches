@@ -3,6 +3,11 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Refuse raw FFmpeg configure before a shell can write its environment to config.log.
 
+Commands such as sed, less, more, and rg are not treated as readers because they
+can execute arbitrary commands or preprocessors. Git passes only for allow-listed
+subcommands that do not execute their path arguments, and only without the refused
+options.
+
 Known limitation: words assembled from variables (e.g. `p=con; ./${p}figure`)
 are not expanded across assignments.
 """
@@ -23,6 +28,7 @@ MAX_INPUT = 1024 * 1024
 MAX_COMMAND = 65536
 MAX_TOKENS = 4000
 MAX_DEPTH = 4
+MAX_SUBSHELL_DEPTH = 64
 SEPARATORS = frozenset((";", "&&", "||", "|", "&", "\n", "(", ")"))
 SHELLS = frozenset(("bash", "sh"))
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.DOTALL)
@@ -35,14 +41,11 @@ READERS = frozenset(
         "cat",
         "head",
         "tail",
-        "less",
-        "more",
         "wc",
         "nl",
         "grep",
         "egrep",
         "fgrep",
-        "rg",
         "diff",
         "cmp",
         "file",
@@ -50,8 +53,47 @@ READERS = frozenset(
         "ls",
         "sha256sum",
         "md5sum",
-        "sed",
-        "git",
+    )
+)
+GIT_READER_SUBCOMMANDS = frozenset(
+    (
+        "log",
+        "show",
+        "diff",
+        "status",
+        "add",
+        "rm",
+        "mv",
+        "restore",
+        "blame",
+        "grep",
+        "ls-files",
+        "cat-file",
+        "commit",
+        "format-patch",
+        "am",
+        "apply",
+        "stash",
+    )
+)
+GIT_DISALLOWED_OPTIONS = frozenset(
+    (
+        "--config-env",
+        "--exec-path",
+        "-O",
+        "--open-files-in-pager",
+        "--ext-diff",
+        "-x",
+        "--exec",
+    )
+)
+GIT_GLOBAL_OPTS_WITH_ARG = frozenset(
+    (
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
     )
 )
 
@@ -92,9 +134,24 @@ def _tokens(command: str) -> list[str] | None:
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
-        tokens = list(lexer)
+        raw_tokens = list(lexer)
     except ValueError:
         return None
+    tokens: list[str] = []
+    for token in raw_tokens[: MAX_TOKENS + 1]:
+        if token not in ("&&", "||") and all(c in ";&|()\n" for c in token):
+            pos = 0
+            for _ in range(len(token)):
+                if pos >= len(token):
+                    break
+                if token[pos : pos + 2] in ("&&", "||"):
+                    tokens.append(token[pos : pos + 2])
+                    pos += 2
+                else:
+                    tokens.append(token[pos])
+                    pos += 1
+            continue
+        tokens.append(token)
     return tokens if len(tokens) <= MAX_TOKENS else None
 
 
@@ -124,19 +181,27 @@ def _dynamic_configure(word: str) -> bool:
     return last == "configure"
 
 
+def _clean_word(word: str) -> str:
+    """Strip assignments, shell command prefixes, and whitespace from a word."""
+    if "=" in word:
+        word = word.split("=", 1)[1]
+    if " " in word:
+        word = word.split()[-1]
+    return word.lstrip("+!|")
+
+
 def _configure_path(word: str, cwd: Path | None) -> Path | None:
     """Identify a configure word in an FFmpeg tree or unknown directory."""
-    if ASSIGNMENT.fullmatch(word):
-        word = word.split("=", 1)[1]
-    if "$" in word or "`" in word:
-        return Path(word) if _dynamic_configure(word) else None
-    base = os.path.basename(word)
+    cleaned = _clean_word(word)
+    if "$" in cleaned or "`" in cleaned:
+        return Path(word) if _dynamic_configure(cleaned) else None
+    base = os.path.basename(cleaned)
     is_glob = bool(GLOB_CHARS.intersection(base)) and fnmatch.fnmatchcase("configure", base)
     if base != "configure" and not is_glob:
         return None
     if cwd is None:
         return Path(word)
-    parent = (cwd / os.path.expanduser(os.path.dirname(word) or ".")).resolve()
+    parent = (cwd / os.path.expanduser(os.path.dirname(cleaned) or ".")).resolve()
     return (parent / base) if (parent / "libavcodec").is_dir() else None
 
 
@@ -160,21 +225,65 @@ def _find_configure_path(words: list[str], cwd: Path | None) -> Path | None:
     return None
 
 
+def _is_git_reader(words: list[str], index: int) -> bool:
+    """Check whether a git command invokes only safe reader subcommands."""
+    for word in words[index + 1 : index + 1 + MAX_TOKENS]:
+        if word.startswith("-c"):
+            return False
+        opt = word.split("=", 1)[0]
+        if opt in GIT_DISALLOWED_OPTIONS or word.startswith(("-x", "-O")):
+            return False
+    subcommand: str | None = None
+    arg_idx = index + 1
+    for _ in range(MAX_TOKENS + 1):
+        if arg_idx >= len(words):
+            break
+        word = words[arg_idx]
+        if word in GIT_GLOBAL_OPTS_WITH_ARG:
+            arg_idx += 2
+            continue
+        if not word.startswith("-"):
+            subcommand = word
+            break
+        arg_idx += 1
+    return subcommand in GIT_READER_SUBCOMMANDS
+
+
+def _is_reader(words: list[str]) -> bool:
+    """Classify whether a simple command is an allowed read-only utility."""
+    index = 0
+    for word in words[: MAX_TOKENS + 1]:
+        if not ASSIGNMENT.fullmatch(word):
+            break
+        index += 1
+    if index >= len(words):
+        return False
+    name = os.path.basename(words[index])
+    if name in READERS:
+        return True
+    if name == "git":
+        return _is_git_reader(words, index)
+    return False
+
+
 def _inspect_simple(words: list[str], cwd: Path | None) -> tuple[Path | None, str | None]:
     """Classify a simple command and return an inline program when present."""
     index = 0
     for word in words[: MAX_TOKENS + 1]:
         if not ASSIGNMENT.fullmatch(word):
             break
+        _, value = word.split("=", 1)
+        if CONFIGURE_WORD.search(value) and (cwd is None or (cwd / "libavcodec").is_dir()):
+            return Path(word), None
         index += 1
     blocked = _inspect_interpreter(words, index, cwd)
     if blocked is not None:
         return blocked, None
-    name = os.path.basename(words[index]) if index < len(words) else ""
-    if name not in READERS:
+    if not _is_reader(words):
         blocked = _find_configure_path(words, cwd)
         if blocked is not None:
             return blocked, None
+    name = os.path.basename(words[index]) if index < len(words) else ""
     if name == "eval":
         return None, " ".join(words[index + 1 :])
     if name in SHELLS:
@@ -182,6 +291,73 @@ def _inspect_simple(words: list[str], cwd: Path | None) -> tuple[Path | None, st
         if inline:
             return None, target
     return None, None
+
+
+def _inspect_pipeline(
+    pipeline: list[list[str]],
+    directory: Path | None,
+    depth: int,
+    pending: list[tuple[str, Path | None, int]],
+) -> tuple[Path | None, Path | None]:
+    """Inspect each stage of a pipeline and refuse unsafe configure feeds."""
+    if len(pipeline) == 1:
+        return _step(pipeline[0], directory, depth, pending)
+    for stage in pipeline:
+        blocked, _ = _step(stage, directory, depth, pending)
+        if blocked is not None:
+            return blocked, directory
+    if any(not _is_reader(stage) for stage in pipeline):
+        for stage in pipeline:
+            if _is_reader(stage):
+                blocked = _find_configure_path(stage, directory)
+                if blocked is not None:
+                    return blocked, directory
+    return None, directory
+
+
+def _subshell_step(token: str, directory: Path | None, subshells: list[Path | None]) -> Path | None:
+    """Update subshell stack and effective directory on grouping tokens."""
+    if token == "(":
+        if len(subshells) < MAX_SUBSHELL_DEPTH:
+            subshells.append(directory)
+            return directory
+        subshells.append(None)
+        return None
+    if token == ")":
+        return subshells.pop() if subshells else None
+    return directory
+
+
+def _inspect_tokens(
+    tokens: list[str],
+    directory: Path | None,
+    depth: int,
+    pending: list[tuple[str, Path | None, int]],
+) -> Path | None:
+    """Walk tokens of one shell source, feeding pipelines and updating directory."""
+    pipeline: list[list[str]] = []
+    simple: list[str] = []
+    subshells: list[Path | None] = []
+    for token in [*tokens, ";"]:
+        if token == "|":
+            if simple:
+                pipeline.append(simple)
+                simple = []
+            continue
+        if token in SEPARATORS:
+            if simple:
+                pipeline.append(simple)
+                simple = []
+            if pipeline:
+                blocked, directory = _inspect_pipeline(pipeline, directory, depth, pending)
+                if blocked is not None:
+                    return blocked
+                pipeline = []
+            if token in ("(", ")"):
+                directory = _subshell_step(token, directory, subshells)
+            continue
+        simple.append(token)
+    return None
 
 
 def _inspect(command: str, cwd: Path) -> Path | None:
@@ -198,16 +374,9 @@ def _inspect(command: str, cwd: Path) -> Path | None:
             if "configure" in source:
                 return Path("configure (parse or size limit)")
             continue
-        simple: list[str] = []
-        for token in [*tokens, ";"]:
-            if token in SEPARATORS:
-                if simple:
-                    blocked, directory = _step(simple, directory, depth, pending)
-                    if blocked is not None:
-                        return blocked
-                    simple = []
-                continue
-            simple.append(token)
+        blocked = _inspect_tokens(tokens, directory, depth, pending)
+        if blocked is not None:
+            return blocked
     return Path("configure (worklist limit)")
 
 
