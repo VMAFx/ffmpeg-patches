@@ -30,15 +30,17 @@
   <!-- 6 support -->
   [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-8b5cf6?style=for-the-badge&logo=githubsponsors&logoColor=white&labelColor=111a35)](https://github.com/sponsors/lusoris)
 
-  **Shared FFmpeg fix patch series for VMAFx projects, tracked against FFmpeg master and sent upstream**
+  **Shared FFmpeg fix patch series for VMAFx projects, tracked against FFmpeg master ([`series.txt`](series.txt)) and [sent upstream](upstream-contributions.json)**
 
-  *Consumers apply this series first and carry only their own feature patches*
+  *Consumers [`apply`](scripts/series.py) this series first and carry only their own feature patches*
 
 </div>
 
 ffmpeg-patches is one shared FFmpeg patch series for VMAFx projects: fixes
-are tracked against FFmpeg master and sent upstream; consumers carry only
-their own feature patches.
+are tracked against FFmpeg master ([`series.txt`](series.txt)) and
+[sent upstream](upstream-contributions.json); consumers
+[`apply`](scripts/series.py) this series first and carry only their own
+feature patches.
 
 **[📖 Architectural Decision Records](docs/adr/README.md)** · [ADR-0001: Shared Fix Series](docs/adr/0001-shared-fix-series.md)
 
@@ -67,13 +69,16 @@ test "$(git -C ffmpeg rev-parse HEAD)" = "$FFMPEG_COMMIT"
 python3 scripts/series.py apply --expect-base ffmpeg
 ```
 
-`apply` runs `git am --3way` per patch without your git configuration and
-prints one result per patch:
+`apply` checks each patch and prints one result per patch. It runs
+`git am --3way` without your git configuration only when the patch does not
+already apply and its added lines are not in the tree:
 
 - `applied`: the patch applied
 - `conflict`: it did not; the run stops unless `--keep-going` is given
 - `upstream`: its added lines are already in the tree, so it is a drop
   candidate; on the pinned release this is an error
+- `not-tried`: the patch was not attempted because a preceding patch
+  conflicted and `--keep-going` was not given
 
 ## Layout
 
@@ -126,7 +131,7 @@ Before pushing or opening a pull request, scan the committed fix and callers of 
 python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return master topic -o sweep.md
 ```
 
-The report records full base and head commit IDs. Targets combine callees whose return values are consumed on added lines with functions whose bodies contain added lines. The scan covers touched C/header files and C files in the head revision mentioning those targets. It reports discarded calls and checks that normalize an error to `-1` or an `AVERROR_` value. Explicit `(void)` calls are intentional and excluded. This lexical scan supports review; inspect the surrounding control flow when deciding each row.
+The report records full base and head commit IDs. Targets combine callees whose return values appear in recognized error checks on added lines with functions whose bodies contain added lines. The scan covers touched C/header files and C files in the head revision mentioning those targets. It reports discarded calls and checks that normalize an error to `-1` or an `AVERROR_` value. Explicit `(void)` calls are intentional and excluded. This lexical scan supports review; inspect the surrounding control flow when deciding each row.
 
 Replace every `TODO` disposition with one of:
 
@@ -404,7 +409,7 @@ base with the first release cut from that branch after the merge.
 
 The same facts are in `upstream-contributions.json`, one object per pull
 request, for other pages to read. Its `patch` field is a string of patch
-filenames separated by `, `, or an empty string when the series carries
+filenames separated by a comma and a space, or an empty string when the series carries
 none. Every named patch must link to that pull request and match its state.
 The table lists all their series numbers and is generated from that file:
 edit the file, then run `python3 scripts/series.py contributions --write`.
@@ -435,8 +440,6 @@ tooling and documentation are EUPL-1.2. `REUSE.toml` records both.
 ## Standards & Governance
 
 <!-- praetor:readme-governance:start -->
-[![HISS Adopted][praetor-hiss-badge]][praetor-hiss-agents]
-
 Praetor manages this repository's declared governance policy. This managed
 block records adoption state; it is not a verification certificate.
 
@@ -450,8 +453,5 @@ integrity, and the debt ratchet.
 generated agent context against `AGENTS.md`.
 
 **Debt Baseline**: `.standards-baseline.json` anchors the debt ratchet at
-0 recorded infractions; audit forbids growth.
-
-[praetor-hiss-badge]: https://img.shields.io/badge/Standards-HISS%20Adopted-blue
-[praetor-hiss-agents]: https://github.com/VMAFx/ffmpeg-patches/blob/HEAD/AGENTS.md
+4 recorded infractions; audit forbids growth.
 <!-- praetor:readme-governance:end -->
