@@ -583,6 +583,47 @@ class TestParseFunctionSpans(unittest.TestCase):
         longest, _ = series.parse_function_spans(snippet)
         self.assertIn("nested", longest)
 
+    def test_two_macro_function_pointers_stay_distinct(self) -> None:
+        """Two macro-named functions returning function pointers stay distinct keys."""
+        snippet = (
+            "void (*FUNC(a)(int x))(void)\n"
+            "{\n"
+            "    return;\n"
+            "}\n\n"
+            "void (*FUNC(b)(int x))(void)\n"
+            "{\n"
+            "    return;\n"
+            "}\n"
+        )
+        longest, all_spans = series.parse_function_spans(snippet)
+        self.assertIn("FUNC(a)", longest)
+        self.assertIn("FUNC(b)", longest)
+        self.assertNotIn("FUNC", longest)
+        self.assertEqual(longest["FUNC(a)"].length, 4)
+        self.assertEqual(longest["FUNC(b)"].length, 4)
+        self.assertIn("FUNC(a)", all_spans)
+        self.assertIn("FUNC(b)", all_spans)
+
+    def test_macro_function_pointer_length_increase_reported_under_own_key(self) -> None:
+        """A length increase in one macro-named function pointer is reported under its own key."""
+        snippet = (
+            "void (*FUNC(a)(int x))(void)\n"
+            "{\n"
+            "    return;\n"
+            "}\n\n"
+            "void (*FUNC(b)(int x))(void)\n"
+            "{\n"
+            "    int y = 1;\n"
+            "    int z = 2;\n"
+            "    return;\n"
+            "}\n"
+        )
+        longest, all_spans = series.parse_function_spans(snippet)
+        self.assertIn("FUNC(a)", longest)
+        self.assertIn("FUNC(b)", longest)
+        self.assertEqual(longest["FUNC(a)"].length, 4)
+        self.assertEqual(longest["FUNC(b)"].length, 6)
+
     def test_pointer_return_boundary(self) -> None:
         """Single and multiple pointer return types preserve the function name."""
         for snippet, expected in (

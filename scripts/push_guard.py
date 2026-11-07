@@ -49,6 +49,7 @@ MAX_CONFIG_ENTRIES = 1000
 CONFIG_DEADLINE = 10
 CONFIG_TOTAL_DEADLINE = 30
 STDIN_DEADLINE = 10
+READ_DEADLINE = 30.0
 # Budget 4096 UTF-8 bytes per update across the complete input.
 MAX_STDIN_BYTES = MAX_UPDATES * 4096
 SCP_REMOTE = re.compile(r"(?:[^/@:\s]+@)?([A-Za-z0-9_.-]+):(.+)")
@@ -194,11 +195,11 @@ def config_repositories(reader: ConfigReader) -> list[str]:
     return repositories
 
 
-def _gh_api(endpoint: str) -> str:
+def _gh_api(endpoint: str, timeout: float = 20.0) -> str:
     """Run a gh api call with fixed timeout and argument shape."""
     result = subprocess.run(  # nosec B603 B607 - fixed gh command; encoded head query, no shell.
         ["gh", "api", endpoint, "--hostname", GH_HOSTNAME],
-        timeout=20,
+        timeout=timeout,
         check=False,
         capture_output=True,
         text=True,
@@ -209,13 +210,13 @@ def _gh_api(endpoint: str) -> str:
     return result.stdout
 
 
-def _pulls_query(repository: str, owner: str, branch: str) -> str:
+def _pulls_query(repository: str, owner: str, branch: str, timeout: float = 20.0) -> str:
     """Query the newest pull request for a repository and head."""
     endpoint = (
         f"repos/{repository}/pulls?head={owner}:{quote(branch, safe='/')}"
         "&state=all&sort=created&direction=desc&per_page=1"
     )
-    return _gh_api(endpoint)
+    return _gh_api(endpoint, timeout=timeout)
 
 
 def _fork_parent(repository: str, payload: dict) -> str:
@@ -231,21 +232,37 @@ def _fork_parent(repository: str, payload: dict) -> str:
 
 def read_pull_requests(repository: str, branch: str) -> str:
     """Read the newest PR for this head, checking fork parent repositories first."""
+    deadline = time.monotonic() + READ_DEADLINE
+
+    def call_timeout(target: str) -> float:
+        """Return the per-call timeout bounded by remaining deadline budget."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(target, READ_DEADLINE)
+        return min(remaining, 20)
+
     owner = repository.split("/", 1)[0]
-    meta_raw = _gh_api(f"repos/{repository}")
+    meta_endpoint = f"repos/{repository}"
+    meta_raw = _gh_api(meta_endpoint, timeout=call_timeout(meta_endpoint))
     meta = json.loads(meta_raw)
     if not isinstance(meta, dict) or not isinstance(meta.get("fork"), bool):
         raise ValueError(f"repository {repository} has no valid fork field")
     if not meta["fork"]:
-        return _pulls_query(repository, owner, branch)
+        return _pulls_query(
+            repository, owner, branch, timeout=call_timeout(f"repos/{repository}/pulls")
+        )
     parent = _fork_parent(repository, meta)
-    parent_stdout = _pulls_query(parent, owner, branch)
+    parent_stdout = _pulls_query(
+        parent, owner, branch, timeout=call_timeout(f"repos/{parent}/pulls")
+    )
     parent_list = json.loads(parent_stdout)
     if not isinstance(parent_list, list):
         raise ValueError("expected a pull request list")
     if parent_list:
         return parent_stdout
-    return _pulls_query(repository, owner, branch)
+    return _pulls_query(
+        repository, owner, branch, timeout=call_timeout(f"repos/{repository}/pulls")
+    )
 
 
 def newest_pull_request(raw: str) -> PullRequest | None:

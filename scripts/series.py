@@ -1272,8 +1272,14 @@ def _extract_function_name(node: Node) -> str | None:
         for _ in range(32):
             if inner is None:
                 break
-            if inner.type in ("pointer_declarator", "function_declarator"):
+            if inner.type == "pointer_declarator":
                 inner = _unwrap_parentheses(inner.child_by_field_name("declarator"))
+            elif inner.type == "function_declarator":
+                nxt = _unwrap_parentheses(inner.child_by_field_name("declarator"))
+                if nxt is not None and nxt.type == "function_declarator":
+                    inner = nxt
+                    break
+                inner = nxt
             else:
                 break
     if inner is None or inner.text is None:

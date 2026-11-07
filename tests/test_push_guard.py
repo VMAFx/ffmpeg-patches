@@ -1001,6 +1001,109 @@ class APIReaderTest(unittest.TestCase):
                 self.assertIn(stderr or "gh api exited 1", err)
                 self.assertIn("refusing (fail closed)", err)
 
+    def test_positive_non_fork_and_fork_paths_within_deadline(self) -> None:
+        """Non-fork and fork paths return pull request payloads within the deadline."""
+        pr_payload = pull_request()
+        meta_non_fork = subprocess.CompletedProcess([], 0, stdout='{"fork": false}', stderr="")
+        pulls = subprocess.CompletedProcess([], 0, stdout=pr_payload, stderr="")
+        with unittest.mock.patch(
+            "scripts.push_guard.subprocess.run", side_effect=[meta_non_fork, pulls]
+        ):
+            self.assertEqual(push_guard.read_pull_requests(REPOSITORY, BRANCH), pr_payload)
+
+        meta_fork = subprocess.CompletedProcess(
+            [], 0, stdout='{"fork": true, "parent": {"full_name": "upstream/repo"}}', stderr=""
+        )
+        parent_pulls = subprocess.CompletedProcess([], 0, stdout=pr_payload, stderr="")
+        with unittest.mock.patch(
+            "scripts.push_guard.subprocess.run", side_effect=[meta_fork, parent_pulls]
+        ):
+            self.assertEqual(push_guard.read_pull_requests("forkowner/repo", BRANCH), pr_payload)
+
+    def test_read_deadline_exhausted_before_subsequent_call_fails_closed(self) -> None:
+        """Exhausted read deadline before next query raises TimeoutExpired and fails closed."""
+        deadline = getattr(push_guard, "READ_DEADLINE", 30.0)
+        meta = subprocess.CompletedProcess([], 0, stdout='{"fork": false}', stderr="")
+        pulls = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        with (
+            unittest.mock.patch(
+                "time.monotonic", side_effect=[0.0, deadline + 1.0, deadline + 1.0]
+            ),
+            unittest.mock.patch("scripts.push_guard.subprocess.run", side_effect=[meta, pulls]),
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            push_guard.read_pull_requests(REPOSITORY, BRANCH)
+
+        with (
+            unittest.mock.patch(
+                "time.monotonic", side_effect=[0.0, deadline + 1.0, deadline + 1.0]
+            ),
+            unittest.mock.patch("scripts.push_guard.subprocess.run", side_effect=[meta, pulls]),
+            unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as err,
+        ):
+            rc = push_guard.check_branch(REPOSITORY, BRANCH, ZERO, push_guard.read_pull_requests)
+            self.assertEqual(rc, 2)
+            self.assertIn("refusing (fail closed)", err.getvalue())
+
+        meta_fork = subprocess.CompletedProcess(
+            [], 0, stdout='{"fork": true, "parent": {"full_name": "upstream/repo"}}', stderr=""
+        )
+        parent_empty = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        fork_pulls = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        with (
+            unittest.mock.patch(
+                "time.monotonic", side_effect=[0.0, 10.0, deadline + 1.0, deadline + 1.0]
+            ),
+            unittest.mock.patch(
+                "scripts.push_guard.subprocess.run",
+                side_effect=[meta_fork, parent_empty, fork_pulls],
+            ),
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            push_guard.read_pull_requests("forkowner/repo", BRANCH)
+
+        with (
+            unittest.mock.patch(
+                "time.monotonic", side_effect=[0.0, 10.0, deadline + 1.0, deadline + 1.0]
+            ),
+            unittest.mock.patch(
+                "scripts.push_guard.subprocess.run",
+                side_effect=[meta_fork, parent_empty, fork_pulls],
+            ),
+            unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as err,
+        ):
+            rc = push_guard.check_branch(
+                "forkowner/repo", BRANCH, ZERO, push_guard.read_pull_requests
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("refusing (fail closed)", err.getvalue())
+
+    def test_per_call_timeout_budget_bounded(self) -> None:
+        """Each API call receives a timeout bounded by 20 and the remaining deadline budget."""
+        meta_fork = subprocess.CompletedProcess(
+            [], 0, stdout='{"fork": true, "parent": {"full_name": "upstream/repo"}}', stderr=""
+        )
+        parent_empty = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        fork_pr = pull_request(state="open", merged=False)
+        fork_pulls = subprocess.CompletedProcess([], 0, stdout=fork_pr, stderr="")
+
+        with (
+            unittest.mock.patch("time.monotonic", side_effect=[0.0, 0.0, 15.0, 25.0]),
+            unittest.mock.patch(
+                "scripts.push_guard.subprocess.run",
+                side_effect=[meta_fork, parent_empty, fork_pulls],
+            ) as run,
+        ):
+            result = push_guard.read_pull_requests("forkowner/repo", BRANCH)
+            self.assertEqual(result, fork_pr)
+            self.assertEqual(run.call_count, 3)
+            timeouts = [c.kwargs["timeout"] for c in run.call_args_list]
+            self.assertEqual(timeouts[0], 20)
+            self.assertEqual(timeouts[1], 15.0)
+            self.assertEqual(timeouts[2], 5.0)
+            for t in timeouts:
+                self.assertLessEqual(t, 20)
+
 
 if __name__ == "__main__":
     unittest.main()
