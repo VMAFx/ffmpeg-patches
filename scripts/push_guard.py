@@ -194,13 +194,8 @@ def config_repositories(reader: ConfigReader) -> list[str]:
     return repositories
 
 
-def read_pull_requests(repository: str, branch: str) -> str:
-    """Read only the newest PR for this head, with a twenty-second deadline."""
-    owner = repository.split("/", 1)[0]
-    endpoint = (
-        f"repos/{repository}/pulls?head={owner}:{quote(branch, safe='/')}"
-        "&state=all&sort=created&direction=desc&per_page=1"
-    )
+def _gh_api(endpoint: str) -> str:
+    """Run a gh api call with fixed timeout and argument shape."""
     result = subprocess.run(  # nosec B603 B607 - fixed gh command; encoded head query, no shell.
         ["gh", "api", endpoint, "--hostname", GH_HOSTNAME],
         timeout=20,
@@ -212,6 +207,45 @@ def read_pull_requests(repository: str, branch: str) -> str:
     if result.returncode:
         raise ValueError(result.stderr.strip() or f"gh api exited {result.returncode}")
     return result.stdout
+
+
+def _pulls_query(repository: str, owner: str, branch: str) -> str:
+    """Query the newest pull request for a repository and head."""
+    endpoint = (
+        f"repos/{repository}/pulls?head={owner}:{quote(branch, safe='/')}"
+        "&state=all&sort=created&direction=desc&per_page=1"
+    )
+    return _gh_api(endpoint)
+
+
+def _fork_parent(repository: str, payload: dict) -> str:
+    """Extract and validate the parent repository name from a fork payload."""
+    parent = payload.get("parent")
+    if not isinstance(parent, dict):
+        raise ValueError(f"fork {repository} has no readable parent repository")
+    full_name = parent.get("full_name")
+    if not isinstance(full_name, str) or not REPOSITORY_PATH.fullmatch(full_name):
+        raise ValueError(f"fork {repository} has no readable parent repository")
+    return full_name
+
+
+def read_pull_requests(repository: str, branch: str) -> str:
+    """Read the newest PR for this head, checking fork parent repositories first."""
+    owner = repository.split("/", 1)[0]
+    meta_raw = _gh_api(f"repos/{repository}")
+    meta = json.loads(meta_raw)
+    if not isinstance(meta, dict) or not isinstance(meta.get("fork"), bool):
+        raise ValueError(f"repository {repository} has no valid fork field")
+    if not meta["fork"]:
+        return _pulls_query(repository, owner, branch)
+    parent = _fork_parent(repository, meta)
+    parent_stdout = _pulls_query(parent, owner, branch)
+    parent_list = json.loads(parent_stdout)
+    if not isinstance(parent_list, list):
+        raise ValueError("expected a pull request list")
+    if parent_list:
+        return parent_stdout
+    return _pulls_query(repository, owner, branch)
 
 
 def newest_pull_request(raw: str) -> PullRequest | None:

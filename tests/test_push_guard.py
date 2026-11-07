@@ -863,33 +863,135 @@ class RemoteTest(unittest.TestCase):
 
 class APIReaderTest(unittest.TestCase):
     def test_newest_head_query_hostname_and_timeout(self) -> None:
-        done = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
-        with unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done) as run:
+        """The API reader queries repository metadata and newest head pull requests."""
+        meta = subprocess.CompletedProcess([], 0, stdout='{"fork": false}', stderr="")
+        pulls = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        with unittest.mock.patch(
+            "scripts.push_guard.subprocess.run", side_effect=[meta, pulls]
+        ) as run:
             self.assertEqual(push_guard.read_pull_requests(REPOSITORY, BRANCH), "[]")
-        run.assert_called_once_with(
+        self.assertEqual(run.call_count, 2)
+        run.assert_has_calls(
             [
-                "gh",
-                "api",
-                f"repos/{REPOSITORY}/pulls?head=VMAFx:{BRANCH}"
-                "&state=all&sort=created&direction=desc&per_page=1",
-                "--hostname",
-                "github.com",
-            ],
-            timeout=20,
-            check=False,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
+                unittest.mock.call(
+                    ["gh", "api", f"repos/{REPOSITORY}", "--hostname", "github.com"],
+                    timeout=20,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                ),
+                unittest.mock.call(
+                    [
+                        "gh",
+                        "api",
+                        f"repos/{REPOSITORY}/pulls?head=VMAFx:{BRANCH}"
+                        "&state=all&sort=created&direction=desc&per_page=1",
+                        "--hostname",
+                        "github.com",
+                    ],
+                    timeout=20,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                ),
+            ]
         )
 
     def test_branch_query_characters_are_encoded(self) -> None:
-        done = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
-        with unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done) as run:
+        """Branch characters in the query parameter are URL-encoded."""
+        meta = subprocess.CompletedProcess([], 0, stdout='{"fork": false}', stderr="")
+        pulls = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        with unittest.mock.patch(
+            "scripts.push_guard.subprocess.run", side_effect=[meta, pulls]
+        ) as run:
             push_guard.read_pull_requests(REPOSITORY, "fix/a&state=open#b+c")
-        endpoint = run.call_args.args[0][2]
+        self.assertEqual(run.call_count, 2)
+        endpoint = run.call_args_list[1].args[0][2]
         self.assertIn("head=VMAFx:fix/a%26state%3Dopen%23b%2Bc&state=all", endpoint)
 
+    def test_fork_with_pr_in_parent(self) -> None:
+        """A fork with a PR in its parent returns the parent PR response."""
+        meta = subprocess.CompletedProcess(
+            [], 0, stdout='{"fork": true, "parent": {"full_name": "upstream/repo"}}', stderr=""
+        )
+        parent_pr = pull_request()
+        parent_pulls = subprocess.CompletedProcess([], 0, stdout=parent_pr, stderr="")
+        with unittest.mock.patch(
+            "scripts.push_guard.subprocess.run", side_effect=[meta, parent_pulls]
+        ) as run:
+            self.assertEqual(push_guard.read_pull_requests("forkowner/repo", BRANCH), parent_pr)
+        self.assertEqual(run.call_count, 2)
+        endpoint = run.call_args_list[1].args[0][2]
+        self.assertEqual(
+            endpoint,
+            f"repos/upstream/repo/pulls?head=forkowner:{BRANCH}"
+            "&state=all&sort=created&direction=desc&per_page=1",
+        )
+
+    def test_fork_with_empty_parent_list(self) -> None:
+        """A fork with no parent PR queries and returns the fork PR response."""
+        meta = subprocess.CompletedProcess(
+            [], 0, stdout='{"fork": true, "parent": {"full_name": "upstream/repo"}}', stderr=""
+        )
+        parent_pulls = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        fork_pr = pull_request(state="open", merged=False)
+        fork_pulls = subprocess.CompletedProcess([], 0, stdout=fork_pr, stderr="")
+        with unittest.mock.patch(
+            "scripts.push_guard.subprocess.run", side_effect=[meta, parent_pulls, fork_pulls]
+        ) as run:
+            self.assertEqual(push_guard.read_pull_requests("forkowner/repo", BRANCH), fork_pr)
+        self.assertEqual(run.call_count, 3)
+        endpoint = run.call_args_list[2].args[0][2]
+        self.assertEqual(
+            endpoint,
+            f"repos/forkowner/repo/pulls?head=forkowner:{BRANCH}"
+            "&state=all&sort=created&direction=desc&per_page=1",
+        )
+
+    def test_fork_without_valid_parent_fails_closed(self) -> None:
+        """A fork with missing or invalid parent repository fails closed."""
+        cases = (
+            '{"fork": true}',
+            '{"fork": true, "parent": null}',
+            '{"fork": true, "parent": {"full_name": "a/b/c"}}',
+            '{"fork": true, "parent": {"full_name": 5}}',
+        )
+        for stdout in cases:
+            with self.subTest(stdout=stdout):
+                done = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+                with unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done):
+                    status, _, err = guard(push_guard.read_pull_requests, update())
+                self.assertEqual(status, 2)
+                self.assertIn("refusing (fail closed)", err)
+
+    def test_metadata_failure_fails_closed(self) -> None:
+        """A non-zero exit status on the metadata call fails closed."""
+        done = subprocess.CompletedProcess([], 1, stdout="", stderr="API rate limit exceeded")
+        with unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done):
+            status, _, err = guard(push_guard.read_pull_requests, update())
+        self.assertEqual(status, 2)
+        self.assertIn("refusing (fail closed)", err)
+
+    def test_metadata_fork_not_bool_fails_closed(self) -> None:
+        """A repository metadata response with non-boolean fork field fails closed."""
+        cases = (
+            "{}",
+            '{"fork": "true"}',
+            '{"fork": 1}',
+            '{"fork": null}',
+        )
+        for stdout in cases:
+            with self.subTest(stdout=stdout):
+                done = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+                with unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done):
+                    status, _, err = guard(push_guard.read_pull_requests, update())
+                self.assertEqual(status, 2)
+                self.assertIn("refusing (fail closed)", err)
+
     def test_api_failure_fails_closed(self) -> None:
+        """An API error response on pull request queries fails closed."""
         for stderr in ("API unavailable", ""):
             with self.subTest(stderr=stderr):
                 done = subprocess.CompletedProcess([], 1, stdout="[]", stderr=stderr)
