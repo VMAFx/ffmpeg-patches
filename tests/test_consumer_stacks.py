@@ -474,6 +474,15 @@ class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
 
     ref_step = "Check the consumer refs"
 
+    def _write_ref_file(self, consumer: str, text: str) -> Path:
+        """Write consumer ref text to .github/consumer-refs and return the file path."""
+        ref_dir = self.root / ".github" / "consumer-refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        path = ref_dir / consumer
+        path.unlink(missing_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
     def test_invalid_refs_write_neither_environment_line(self) -> None:
         """Reject planted invalid branch names for each dispatch input."""
         invalid = ("-x", "a..b", "a b", "a;b", "$(id)", "x.lock", "/x", "x/", "@{u", "a" * 201)
@@ -524,7 +533,6 @@ class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
         """Accept valid branch names from consumer ref files and emit warnings."""
         branch = "chore/ffmpeg-drop-qpfile-loopback"
         ref_dir = self.root / ".github" / "consumer-refs"
-        ref_dir.mkdir(parents=True, exist_ok=True)
         for consumer in ("vmafx", "pelorus"):
             for newline in ("", "\n"):
                 with self.subTest(consumer=consumer, newline=bool(newline)):
@@ -532,7 +540,7 @@ class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
                     (ref_dir / "pelorus").unlink(missing_ok=True)
                     self.env_file.unlink(missing_ok=True)
                     self.summary.unlink(missing_ok=True)
-                    (ref_dir / consumer).write_text(f"{branch}{newline}", encoding="utf-8")
+                    self._write_ref_file(consumer, f"{branch}{newline}")
                     done = self.run_step(self.ref_step)
                     self.assertEqual(done.returncode, 0, done.stderr)
                     expected_env = (
@@ -565,13 +573,10 @@ class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
             " ",
             "a" * 300,
         )
-        ref_dir = self.root / ".github" / "consumer-refs"
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        ref_file = ref_dir / "vmafx"
         for value in invalid:
             with self.subTest(value=value):
                 self.env_file.unlink(missing_ok=True)
-                ref_file.write_text(value, encoding="utf-8")
+                self._write_ref_file("vmafx", value)
                 done = self.run_step(self.ref_step)
                 self.assertNotEqual(done.returncode, 0)
                 self.assertIn("::error::vmafx_ref is not a plain branch name", done.stdout)
@@ -607,9 +612,7 @@ class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
 
     def test_dispatch_input_precedes_ref_file(self) -> None:
         """Dispatch input takes precedence over a committed consumer ref file."""
-        ref_dir = self.root / ".github" / "consumer-refs"
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        (ref_dir / "vmafx").write_text("ci/y\n", encoding="utf-8")
+        self._write_ref_file("vmafx", "ci/y\n")
         self.env_file.unlink(missing_ok=True)
         self.summary.unlink(missing_ok=True)
         done = self.run_step(self.ref_step, {"VMAFX_REF": "ci/x"})
@@ -623,10 +626,7 @@ class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
 
     def test_valid_input_ignores_invalid_ref_file(self) -> None:
         """Non-empty dispatch input skips reading an invalid consumer ref file."""
-        ref_dir = self.root / ".github" / "consumer-refs"
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        (ref_dir / "vmafx").write_text("a..b\n", encoding="utf-8")
-        self.env_file.unlink(missing_ok=True)
+        self._write_ref_file("vmafx", "a..b\n")
         done = self.run_step(self.ref_step, {"VMAFX_REF": "ci/x"})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(

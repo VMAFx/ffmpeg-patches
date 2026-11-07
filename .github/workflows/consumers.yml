@@ -95,6 +95,11 @@ jobs:
           PELORUS_REF: ${{ inputs.pelorus_ref }}
           VMAFX_REF: ${{ inputs.vmafx_ref }}
         run: |
+          # Validate a branch name against character set, length, and Git formatting rules.
+          plain_branch() {
+            [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
+              && timeout 10s git check-ref-format --branch "$1" > /dev/null
+          }
           warnings=()
           for input in pelorus_ref vmafx_ref; do
             consumer=${input%_ref}
@@ -102,13 +107,8 @@ jobs:
               pelorus_ref) ref=$PELORUS_REF ;;
               vmafx_ref) ref=$VMAFX_REF ;;
             esac
-            if [ -n "$ref" ]; then
-              if ! [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
-                || ! timeout 10s git check-ref-format --branch "$ref" > /dev/null; then
-                echo "::error::$input is not a plain branch name"
-                exit 1
-              fi
-            else
+            from_file=0
+            if [ -z "$ref" ]; then
               file=".github/consumer-refs/$consumer"
               if [ -e "$file" ] || [ -L "$file" ]; then
                 if [ -L "$file" ] || ! [ -f "$file" ]; then
@@ -116,11 +116,15 @@ jobs:
                   exit 1
                 fi
                 ref=$(head -c 256 -- "$file")
-                if ! [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
-                  || ! timeout 10s git check-ref-format --branch "$ref" > /dev/null; then
-                  echo "::error::$input is not a plain branch name"
-                  exit 1
-                fi
+                from_file=1
+              fi
+            fi
+            if [ -n "$ref" ] || [ "$from_file" = 1 ]; then
+              if ! plain_branch "$ref"; then
+                echo "::error::$input is not a plain branch name"
+                exit 1
+              fi
+              if [ "$from_file" = 1 ]; then
                 warnings+=("::warning::${consumer} consumer ref ${ref} comes from .github/consumer-refs/${consumer}; reset it after the consumer lands")
               fi
             fi
