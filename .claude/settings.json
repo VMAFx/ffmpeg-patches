@@ -8,6 +8,11 @@
             "type": "command",
             "command": "praetorctl hook claude pre-tool",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "python3 -I \"$CLAUDE_PROJECT_DIR/scripts/raw_configure_guard.py\" --client claude",
+            "timeout": 15
           }
         ]
       }

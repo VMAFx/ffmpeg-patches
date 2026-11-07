@@ -8,6 +8,11 @@
             "type": "command",
             "command": "praetorctl hook codex pre-tool",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "python3 -I scripts/raw_configure_guard.py --client codex",
+            "timeout": 15
           }
         ]
       }

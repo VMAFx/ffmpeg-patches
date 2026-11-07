@@ -8,6 +8,11 @@
             "type": "command",
             "command": "praetorctl hook gemini pre-tool",
             "timeout": 15000
+          },
+          {
+            "type": "command",
+            "command": "python3 -I scripts/raw_configure_guard.py --client gemini",
+            "timeout": 15000
           }
         ]
       }
