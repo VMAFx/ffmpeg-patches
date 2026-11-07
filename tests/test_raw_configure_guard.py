@@ -523,6 +523,36 @@ class RawConfigureGuardTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.marker.exists())
 
+    def test_oversized_quote_and_backslash_configure_refusal(self) -> None:
+        """Refuse oversized configure invocations split by quotes and backslashes."""
+        padding = " # " + "x" * 65536
+        cases = (
+            (f"cd {self.tree} && ./con''figure{padding}", self.root),
+            (f'cd {self.tree} && ./con""figure{padding}', self.root),
+            (f"cd {self.tree} && ./conf\\igure{padding}", self.root),
+            (f"./con''figure{padding}", self.tree),
+        )
+        self._assert_refused(cases)
+
+    def test_midword_expansion_configure_refusal_and_benign_allow(self) -> None:
+        """Refuse mid-word configure expansions while allowing benign variants."""
+        refuse_cases = (
+            (f"cd {self.tree} && ./conf${{e}}igure", self.root),
+            (f"cd {self.tree} && ./${{e}}con${{e}}figure", self.root),
+        )
+        self._assert_refused(refuse_cases)
+        allow_cases = (
+            ("./conf$eigure", self.tree),
+            ("echo conf${e}igure", self.tree),
+            ("./co$'n'figure", self.tree),
+        )
+        for client in CLIENTS:
+            for command, cwd in allow_cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
+
     def test_hook_start_failure_exits_two(self) -> None:
         """Fail closed with returncode 2 when python3 is missing or fails on startup."""
         git_bin = shutil.which("git")

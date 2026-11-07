@@ -36,6 +36,9 @@ SHELLS = frozenset(("bash", "sh"))
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.DOTALL)
 CONFIGURE_WORD = re.compile(r"(?<![A-Za-z0-9_])configure(?![A-Za-z0-9_])")
 DYNAMIC_VARIABLE = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*")
+BRACED_VARIABLE = re.compile(r"\$\{[^{}]*\}")
+NAMED_VARIABLE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+STRIP_CHARS = str.maketrans("", "", "'\"\\")
 INTERPRETERS = re.compile(r"^(?:python|perl|ruby|node|gawk|mawk|awk|php)(?:\d+(?:\.\d+)*[a-z]*)?$")
 GLOB_CHARS = frozenset(("*", "?", "["))
 REDIRECT_OP = re.compile(r"^(?:&>>?|\d*>>?|\d*<<?|\d*>[&|]?|\d*<&)$")
@@ -231,16 +234,22 @@ def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
     return None, c_seen
 
 
+def _flatten(text: str) -> str:
+    """Normalize dynamic and quoted tokens to unquoted literal forms."""
+    text = BRACED_VARIABLE.sub("", text)
+    text = text.replace("$'", "'")
+    text = NAMED_VARIABLE.sub("", text)
+    return text.translate(STRIP_CHARS)
+
+
 def _dynamic_configure(word: str) -> bool:
     """Identify whether a dynamic shell word targets the configure script."""
     if "$(" in word or "`" in word:
         return bool(CONFIGURE_WORD.search(word))
+    if "/" not in word:
+        return False
     last = word.rsplit("/", 1)[-1]
-    if "}" in last:
-        last = last.rsplit("}", 1)[-1]
-    elif last.startswith("$"):
-        last = DYNAMIC_VARIABLE.sub("", last)
-    return last == "configure"
+    return _flatten(last) == "configure"
 
 
 def _clean_word(word: str) -> str:
@@ -443,9 +452,10 @@ def _inspect_tokens(
 
 def _has_unparsed_configure(source: str) -> bool:
     """Detect direct or globbed configure references in unparsed command text."""
-    if "configure" in source:
+    flattened = _flatten(source)
+    if "configure" in flattened:
         return True
-    for word in source.split()[:MAX_INPUT]:
+    for word in flattened.split()[:MAX_INPUT]:
         base = os.path.basename(word)
         if bool(GLOB_CHARS.intersection(base)) and fnmatch.fnmatchcase("configure", base):
             return True
