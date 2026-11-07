@@ -579,6 +579,34 @@ class RawConfigureGuardTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(self.marker.exists())
 
+    def test_decidable_allowlist_configure_refusal_and_benign_allow(self) -> None:
+        """Refuse undecidable names and directory expansions while allowing safe patterns."""
+        (self.tree / "tools").mkdir(exist_ok=True)
+        refuse_cases = (
+            ("./co`printf n`figure", self.tree),
+            ("./co{n,}figure", self.tree),
+            ("{.,x}/configure", self.tree),
+            ("./co{n..n}figure", self.tree),
+            ("./co[n]figure", self.tree),
+        )
+        self._assert_refused(refuse_cases)
+        allow_cases = (
+            ("ls ./*.c", self.tree),
+            ("cp ./a.txt ./b.txt", self.tree),
+            ("echo {a,b}", self.tree),
+            ("ls libavcodec/{a,b}.c", self.tree),
+            ("./co{n,}figure", self.root),
+            ("$HOME/bin/tool", self.tree),
+            ("tools/$X", self.tree),
+            ("ls $PWD", self.tree),
+        )
+        for client in CLIENTS:
+            for command, cwd in allow_cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
+
     def test_hook_start_failure_exits_two(self) -> None:
         """Fail closed with returncode 2 when python3 is missing or fails on startup."""
         git_bin = shutil.which("git")

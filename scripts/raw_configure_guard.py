@@ -11,7 +11,8 @@ options.
 Known limitation: words assembled from variables (e.g. `p=con; ./${p}figure`)
 are not expanded across assignments; directory existence is read when the hook
 runs; a command that removes or creates the target before its cd runs is judged
-by the state at hook time.
+by the state at hook time. A word whose directory and basename are both
+undecidable (e.g. `$X/$Y`) passes.
 """
 
 from __future__ import annotations
@@ -41,6 +42,9 @@ NAMED_VARIABLE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 STRIP_CHARS = str.maketrans("", "", "'\"\\")
 INTERPRETERS = re.compile(r"^(?:python|perl|ruby|node|gawk|mawk|awk|php)(?:\d+(?:\.\d+)*[a-z]*)?$")
 GLOB_CHARS = frozenset(("*", "?", "["))
+# Literal name characters plus the glob characters fnmatch already decides.
+DECIDABLE_NAME = re.compile(r"[A-Za-z0-9._+,:@%#=*?\[\]!^-]*")
+DECIDABLE_DIR = re.compile(r"~?[A-Za-z0-9._+,:@%#=*?\[\]!^/-]*")
 REDIRECT_OP = re.compile(r"^(?:&>>?|\d*>>?|\d*<<?|\d*>[&|]?|\d*<&)$")
 REDIRECT_FULL = re.compile(r"^(?:&>>?|\d*>>?|\d*<<?|\d*>[&|]?|\d*<&)[^<>&|].*$")
 DIGITS_REDIRECT = re.compile(r"^\d+(?:&>>?|>>?|<<?|>[&|]?|<&)")
@@ -263,10 +267,10 @@ def _clean_word(word: str) -> str:
 
 def _undecidable_in_tree(cleaned: str, cwd: Path | None) -> bool:
     """Identify an undecidable command targeting an FFmpeg tree."""
-    if "/" not in cleaned or "$" not in os.path.basename(cleaned):
+    if "/" not in cleaned or DECIDABLE_NAME.fullmatch(os.path.basename(cleaned)):
         return False
     dirname = os.path.dirname(cleaned) or "."
-    if "$" in dirname or "`" in dirname:
+    if not DECIDABLE_DIR.fullmatch(dirname):
         return False
     if cwd is None:
         return True
@@ -277,17 +281,18 @@ def _undecidable_in_tree(cleaned: str, cwd: Path | None) -> bool:
 def _configure_path(word: str, cwd: Path | None) -> Path | None:
     """Identify a configure word in an FFmpeg tree or unknown directory."""
     cleaned = _clean_word(word)
+    if _undecidable_in_tree(cleaned, cwd):
+        return Path(word)
     if "$" in cleaned or "`" in cleaned:
-        if _dynamic_configure(cleaned) or _undecidable_in_tree(cleaned, cwd):
-            return Path(word)
-        return None
+        return Path(word) if _dynamic_configure(cleaned) else None
     base = os.path.basename(cleaned)
     is_glob = bool(GLOB_CHARS.intersection(base)) and fnmatch.fnmatchcase("configure", base)
     if base != "configure" and not is_glob:
         return None
-    if cwd is None:
+    dirname = os.path.dirname(cleaned) or "."
+    if not DECIDABLE_DIR.fullmatch(dirname) or cwd is None:
         return Path(word)
-    parent = (cwd / os.path.expanduser(os.path.dirname(cleaned) or ".")).resolve()
+    parent = (cwd / os.path.expanduser(dirname)).resolve()
     return (parent / base) if (parent / "libavcodec").is_dir() else None
 
 
