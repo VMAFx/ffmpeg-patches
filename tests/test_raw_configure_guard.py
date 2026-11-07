@@ -108,6 +108,10 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("echo $(./configure)", self.tree),
             ("echo `./configure`", self.tree),
             ("bash -c 'sudo ./configure'", self.tree),
+            ("python3 -c \"import os; os.system('./configure')\"", self.tree),
+            ("perl -e 'system q(./configure)'", self.tree),
+            ('awk "BEGIN{system(\\"./configure\\")}"', self.tree),
+            ("./conf*", self.tree),
         )
         (self.root / "BUILD").mkdir()
         for client in CLIENTS:
@@ -123,6 +127,12 @@ class RawConfigureGuardTest(unittest.TestCase):
         """Keep wrapper use, inspection, other trees, and ordinary builds available."""
         cases = (
             (f"python3 scripts/ffmpeg_configure.py {self.tree} {self.build}", self.root),
+            (
+                'python3 "$REPO/scripts/ffmpeg_configure.py" "$SRC" "$B" -- --enable-shared',
+                self.root,
+            ),
+            ('python3 -c "print(1)"', self.tree),
+            ("perl -e 'print 1'", self.tree),
             ("cat configure", self.tree),
             ("grep -n foo configure", self.tree),
             ("git diff -- configure", self.tree),

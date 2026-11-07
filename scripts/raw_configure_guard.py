@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Refuse raw FFmpeg configure before a shell can write its environment to config.log."""
+"""Refuse raw FFmpeg configure before a shell can write its environment to config.log.
+
+Known limitation: words assembled from variables (e.g. `p=con; ./${p}figure`)
+are not expanded across assignments.
+"""
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -21,6 +26,10 @@ MAX_DEPTH = 4
 SEPARATORS = frozenset((";", "&&", "||", "|", "&", "\n", "(", ")"))
 SHELLS = frozenset(("bash", "sh"))
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.DOTALL)
+CONFIGURE_WORD = re.compile(r"(?<![A-Za-z0-9_])configure(?![A-Za-z0-9_])")
+DYNAMIC_VARIABLE = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*")
+INTERPRETERS = re.compile(r"^(?:python|perl|ruby|node|gawk|mawk|awk|php)(?:\d+(?:\.\d+)*[a-z]*)?$")
+GLOB_CHARS = frozenset(("*", "?", "["))
 READERS = frozenset(
     (
         "cat",
@@ -103,33 +112,69 @@ def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
     return None, False
 
 
+def _dynamic_configure(word: str) -> bool:
+    """Identify whether a dynamic shell word targets the configure script."""
+    if "$(" in word or "`" in word:
+        return bool(CONFIGURE_WORD.search(word))
+    last = word.rsplit("/", 1)[-1]
+    if "}" in last:
+        last = last.rsplit("}", 1)[-1]
+    elif last.startswith("$"):
+        last = DYNAMIC_VARIABLE.sub("", last)
+    return last == "configure"
+
+
 def _configure_path(word: str, cwd: Path | None) -> Path | None:
     """Identify a configure word in an FFmpeg tree or unknown directory."""
     if ASSIGNMENT.fullmatch(word):
         word = word.split("=", 1)[1]
     if "$" in word or "`" in word:
-        return Path(word) if "configure" in word else None
-    if os.path.basename(word) != "configure":
+        return Path(word) if _dynamic_configure(word) else None
+    base = os.path.basename(word)
+    is_glob = bool(GLOB_CHARS.intersection(base)) and fnmatch.fnmatchcase("configure", base)
+    if base != "configure" and not is_glob:
         return None
     if cwd is None:
         return Path(word)
-    path = (cwd / os.path.expanduser(word)).resolve()
-    return path if (path.parent / "libavcodec").is_dir() else None
+    parent = (cwd / os.path.expanduser(os.path.dirname(word) or ".")).resolve()
+    return (parent / base) if (parent / "libavcodec").is_dir() else None
+
+
+def _inspect_interpreter(words: list[str], index: int, cwd: Path | None) -> Path | None:
+    """Refuse interpreter one-liners embedding raw configure invocations."""
+    name = os.path.basename(words[index]) if index < len(words) else ""
+    if not INTERPRETERS.match(name) or (cwd is not None and not (cwd / "libavcodec").is_dir()):
+        return None
+    for word in words[index + 1 : index + 1 + MAX_TOKENS]:
+        if CONFIGURE_WORD.search(word):
+            return Path(word)
+    return None
+
+
+def _find_configure_path(words: list[str], cwd: Path | None) -> Path | None:
+    """Find the first blocked configure reference across command words."""
+    for word in words[: MAX_TOKENS + 1]:
+        blocked = _configure_path(word, cwd)
+        if blocked is not None:
+            return blocked
+    return None
 
 
 def _inspect_simple(words: list[str], cwd: Path | None) -> tuple[Path | None, str | None]:
     """Classify a simple command and return an inline program when present."""
     index = 0
-    for word in words:
+    for word in words[: MAX_TOKENS + 1]:
         if not ASSIGNMENT.fullmatch(word):
             break
         index += 1
+    blocked = _inspect_interpreter(words, index, cwd)
+    if blocked is not None:
+        return blocked, None
     name = os.path.basename(words[index]) if index < len(words) else ""
     if name not in READERS:
-        for word in words:
-            blocked = _configure_path(word, cwd)
-            if blocked is not None:
-                return blocked, None
+        blocked = _find_configure_path(words, cwd)
+        if blocked is not None:
+            return blocked, None
     if name == "eval":
         return None, " ".join(words[index + 1 :])
     if name in SHELLS:
