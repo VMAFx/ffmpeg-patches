@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 120" width="1200" height="120" role="img" aria-label="ffmpeg-patches — shared FFmpeg fix patch series for VMAFx projects">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1020"/>
+      <stop offset="55%" stop-color="#111a35"/>
+      <stop offset="100%" stop-color="#0b1020"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.15"/>
+      <stop offset="50%" stop-color="#3b82f6" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#8b5cf6" stop-opacity="0.15"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="120" rx="12" fill="url(#bg)"/>
+
+  <!-- patch series flowing into master upstream -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M720 78 C 800 48, 860 96, 940 70 S 1080 40, 1160 60"
+          stroke="url(#wave)" stroke-width="14"/>
+    <path d="M720 78 C 800 48, 860 96, 940 70 S 1080 40, 1160 60"
+          stroke="url(#accent)" stroke-width="2.5" opacity="0.95"/>
+    <path d="M720 84 C 800 58, 860 102, 940 78 S 1080 50, 1160 68"
+          stroke="#06b6d4" stroke-width="1.6" stroke-dasharray="7 9" opacity="0.6"/>
+  </g>
+
+  <text x="44" y="74" font-family="ui-sans-serif,Segoe UI,Helvetica,Arial,sans-serif"
+        font-size="52" font-weight="700" fill="#e2e8f0" letter-spacing="-1">ffmpeg-<tspan fill="url(#accent)">patches</tspan></text>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="15" fill="#94a3b8">
+    <text x="500" y="52">Shared fix series · VMAFx &amp; Pelorus</text>
+    <text x="500" y="76">Tracked against master · Sent upstream</text>
+  </g>
+</svg>

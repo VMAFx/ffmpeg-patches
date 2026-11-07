@@ -334,15 +334,26 @@ class ForgeSettingsNegativeTest(ForgeSettingsTestCase):
 
     def test_invalid_bot_reviewer_rejected(self) -> None:
         """Malformed bot reviewer logins are rejected naming the variable."""
-        with self.assertRaises(ValueError) as ctx:
-            forge_settings.validate_bot_reviewer("bad bot!")
-        self.assertIn("FFMPEG_FORGEJO_BOT_REVIEWER", str(ctx.exception))
+        for bad in ("bad bot!", "..", ".x", "x/../y", "-x", ""):
+            with self.subTest(bot=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    forge_settings.validate_bot_reviewer(bad)
+                self.assertIn("FFMPEG_FORGEJO_BOT_REVIEWER", str(ctx.exception))
 
     def test_invalid_login_rejected(self) -> None:
         """Malformed user logins are rejected naming the variable."""
-        with self.assertRaises(ValueError) as ctx:
-            forge_settings.validate_login("bad user!")
-        self.assertIn("FFMPEG_FORGEJO_LOGIN", str(ctx.exception))
+        for bad in ("bad user!", "..", ".x", "x/../y", "-x", ""):
+            with self.subTest(login=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    forge_settings.validate_login(bad)
+                self.assertIn("FFMPEG_FORGEJO_LOGIN", str(ctx.exception))
+
+    def test_valid_login_and_bot_reviewer_accepted(self) -> None:
+        """Valid logins and bot reviewers pass validation unchanged."""
+        for good in ("a", "custom_user", "a.b-c_d", "Forgejo_Fairy"):
+            with self.subTest(login=good):
+                self.assertEqual(forge_settings.validate_login(good), good)
+                self.assertEqual(forge_settings.validate_bot_reviewer(good), good)
 
     def test_user_failure_missing_keyring_token(self) -> None:
         """Missing keyring tokens fail naming FFMPEG_FORGEJO_LOGIN."""
