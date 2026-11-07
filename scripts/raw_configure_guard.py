@@ -38,6 +38,8 @@ CONFIGURE_WORD = re.compile(r"(?<![A-Za-z0-9_])configure(?![A-Za-z0-9_])")
 DYNAMIC_VARIABLE = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*")
 INTERPRETERS = re.compile(r"^(?:python|perl|ruby|node|gawk|mawk|awk|php)(?:\d+(?:\.\d+)*[a-z]*)?$")
 GLOB_CHARS = frozenset(("*", "?", "["))
+REDIRECT_OP = re.compile(r"^(?:&>>?|\d*>>?|\d*<<?|\d*>[&|]?|\d*<&)$")
+REDIRECT_FULL = re.compile(r"^(?:&>>?|\d*>>?|\d*<<?|\d*>[&|]?|\d*<&)[^<>&|].*$")
 READERS = frozenset(
     (
         "cat",
@@ -127,11 +129,54 @@ def _input(client: str, payload: dict[str, Any]) -> tuple[str | None, Path]:
     return command, base
 
 
+def _append_redirect_fd(punc: str, tokens: list[str], raw_tokens: list[str], idx: int) -> int:
+    """Attach a redirection operator and any immediate target descriptor."""
+    if tokens and tokens[-1].isdigit():
+        tokens[-1] += punc
+    else:
+        tokens.append(punc)
+    if idx < len(raw_tokens) and (raw_tokens[idx].isdigit() or raw_tokens[idx] == "-"):
+        tokens[-1] += raw_tokens[idx]
+        return idx + 1
+    return idx
+
+
+def _append_punctuation(token: str, tokens: list[str], raw_tokens: list[str], idx: int) -> int:
+    """Expand one punctuation run and merge shell redirect operators."""
+    pos = 0
+    for _ in range(len(token)):
+        if pos >= len(token):
+            break
+        if token[pos : pos + 3] == "&>>":
+            tokens.append("&>>")
+            pos += 3
+        elif token[pos : pos + 2] in (">&", "<&"):
+            idx = _append_redirect_fd(token[pos : pos + 2], tokens, raw_tokens, idx)
+            pos += 2
+        elif token[pos : pos + 2] == "&>":
+            tokens.append("&>")
+            pos += 2
+        elif token[pos : pos + 2] == ">|":
+            tokens.append(">")
+            tokens.append("|")
+            pos += 2
+        elif token[pos : pos + 2] in ("&&", "||", ">>", "<<"):
+            tokens.append(token[pos : pos + 2])
+            pos += 2
+        elif token[pos : pos + 2] == "|&":
+            tokens.append("|")
+            pos += 2
+        else:
+            tokens.append(token[pos])
+            pos += 1
+    return idx
+
+
 def _tokens(command: str) -> list[str] | None:
     """Split a shell command without executing substitutions or expansions."""
     if len(command.encode("utf-8", "surrogatepass")) > MAX_COMMAND:
         return None
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -140,21 +185,15 @@ def _tokens(command: str) -> list[str] | None:
     except ValueError:
         return None
     tokens: list[str] = []
-    for token in raw_tokens[: MAX_TOKENS + 1]:
-        if token not in ("&&", "||") and all(c in ";&|()\n" for c in token):
-            pos = 0
-            for _ in range(len(token)):
-                if pos >= len(token):
-                    break
-                if token[pos : pos + 2] in ("&&", "||"):
-                    tokens.append(token[pos : pos + 2])
-                    pos += 2
-                elif token[pos : pos + 2] == "|&":
-                    tokens.append("|")
-                    pos += 2
-                else:
-                    tokens.append(token[pos])
-                    pos += 1
+    idx = 0
+    raw_slice = raw_tokens[: MAX_TOKENS + 2]
+    for _ in range(len(raw_slice)):
+        if idx >= len(raw_slice):
+            break
+        token = raw_slice[idx]
+        idx += 1
+        if all(c in ";&|<>()\n" for c in token):
+            idx = _append_punctuation(token, tokens, raw_slice, idx)
             continue
         tokens.append(token)
     return tokens if len(tokens) <= MAX_TOKENS else None
@@ -398,6 +437,27 @@ def _inspect(command: str, cwd: Path) -> Path | None:
     return Path("configure (worklist limit)")
 
 
+def _valid_cd_words(words: list[str]) -> bool:
+    """Verify cd arguments consist of at most one directory plus redirections."""
+    if len(words) < 2:
+        return False
+    if len(words) == 2:
+        return True
+    idx = 2
+    for _ in range(len(words)):
+        if idx >= len(words):
+            return True
+        word = words[idx]
+        if REDIRECT_FULL.match(word):
+            idx += 1
+            continue
+        if REDIRECT_OP.match(word) and idx + 1 < len(words):
+            idx += 2
+            continue
+        return False
+    return True
+
+
 def _step(
     words: list[str], cwd: Path | None, depth: int, pending: list[tuple[str, Path | None, int]]
 ) -> tuple[Path | None, Path | None]:
@@ -408,7 +468,7 @@ def _step(
     if words[0] == "popd":
         return blocked, None
     if words[0] in ("cd", "pushd"):
-        target = "~" if words == ["cd"] else words[1] if len(words) == 2 else ""
+        target = "~" if words == ["cd"] else words[1] if _valid_cd_words(words) else ""
         if not target or target == "-" or "$" in target or "`" in target or cwd is None:
             return blocked, None
         if os.environ.get("CDPATH") and not (
@@ -416,7 +476,7 @@ def _step(
         ):
             return blocked, None
         resolved = Path(os.path.normpath(cwd / os.path.expanduser(target))).resolve()
-        if not resolved.is_dir():
+        if not resolved.is_dir() or not os.access(resolved, os.X_OK):
             return blocked, cwd
         return blocked, resolved
     return blocked, cwd

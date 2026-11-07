@@ -209,6 +209,42 @@ class RawConfigureGuardTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(self.marker.exists())
 
+    def test_refuses_redirect_ampersand_forms(self) -> None:
+        """Refuse configure runs where cd or configure contains redirect ampersands."""
+        cases = (
+            (f"cd {self.tree} 2>&1; ./configure", self.other),
+            (f"cd {self.tree} &>/dev/null; ./configure", self.other),
+            (f"cd {self.tree} >&2; ./configure", self.other),
+            (f"cd {self.tree} &>>log; ./configure", self.other),
+            (f"cd {self.tree} 2>&-; ./configure", self.other),
+            ("./configure 2>&1", self.tree),
+            ("./configure >log 2>&1 &", self.tree),
+        )
+        self._assert_refused(cases)
+
+    def test_refuses_unsearchable_directory_cd(self) -> None:
+        """Refuse raw configure after cd into a directory without search permission."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root ignores directory search permissions")
+        noexec = self.root / "noexec"
+        noexec.mkdir(mode=0o700, exist_ok=True)
+        noexec.chmod(0o600)
+        self.addCleanup(lambda: noexec.chmod(0o700) if noexec.exists() else None)
+        self._assert_refused(((f"cd {noexec}; ./configure", self.tree),))
+
+    def test_allows_redirect_cd_forms(self) -> None:
+        """Allow safe cd into unrelated directory with redirect operators."""
+        cases = (
+            (f"cd {self.other} 2>&1; ./configure", self.tree),
+            (f"cd {self.other} >&2 && ./configure", self.tree),
+        )
+        for client in CLIENTS:
+            for command, cwd in cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
+
     def test_allows_unrelated_commands(self) -> None:
         """Keep wrapper use, inspection, other trees, and ordinary builds available."""
         cases = (
