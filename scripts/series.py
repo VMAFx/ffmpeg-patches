@@ -1268,6 +1268,20 @@ def _extract_function_name(node: Node) -> str | None:
     if fn_decl is None:
         return None
     inner = _unwrap_parentheses(fn_decl.child_by_field_name("declarator"))
+    if inner is not None and inner.type == "pointer_declarator":
+        for _ in range(32):
+            if inner is None:
+                break
+            if inner.type == "pointer_declarator":
+                inner = _unwrap_parentheses(inner.child_by_field_name("declarator"))
+            elif inner.type == "function_declarator":
+                nxt = _unwrap_parentheses(inner.child_by_field_name("declarator"))
+                if nxt is not None and nxt.type == "function_declarator":
+                    inner = nxt
+                    break
+                inner = nxt
+            else:
+                break
     if inner is None or inner.text is None:
         return None
     text = inner.text.decode("utf-8", errors="replace")
