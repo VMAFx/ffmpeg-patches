@@ -202,16 +202,33 @@ def _tokens(command: str) -> list[str] | None:
 
 def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
     """Find a shell script path or its -c program string."""
-    for index in range(1, len(words)):
-        word = words[index]
+    idx = 1
+    c_seen = False
+    for _ in range(min(len(words), MAX_TOKENS + 1)):
+        if idx >= len(words):
+            break
+        word = words[idx]
         if word == "--":
-            return (words[index + 1], False) if index + 1 < len(words) else (None, False)
-        if word.startswith("-") and word != "-":
-            if "c" in word[1:]:
-                return (words[index + 1], True) if index + 1 < len(words) else (None, True)
+            operand = words[idx + 1] if idx + 1 < len(words) else None
+            return operand, c_seen
+        if word == "-":
+            return word, c_seen
+        if word in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            idx += 2
             continue
-        return word, False
-    return None, False
+        if word.startswith("--"):
+            idx += 1
+            continue
+        if word.startswith("+"):
+            idx += 2 if word.endswith(("o", "O")) else 1
+            continue
+        if word.startswith("-"):
+            if "c" in word[1:]:
+                c_seen = True
+            idx += 2 if word.endswith(("o", "O")) else 1
+            continue
+        return word, c_seen
+    return None, c_seen
 
 
 def _dynamic_configure(word: str) -> bool:
@@ -311,6 +328,19 @@ def _is_reader(words: list[str]) -> bool:
     return False
 
 
+def _scan_inline(words: list[str], index: int) -> str | None:
+    """Find an inline shell program or eval arguments across command words."""
+    for pos in range(index, min(len(words), index + MAX_TOKENS)):
+        name = os.path.basename(words[pos])
+        if name == "eval":
+            return " ".join(words[pos + 1 :])
+        if name in SHELLS:
+            target, inline = _shell_argument(words[pos:])
+            if inline:
+                return target
+    return None
+
+
 def _inspect_simple(words: list[str], cwd: Path | None) -> tuple[Path | None, str | None]:
     """Classify a simple command and return an inline program when present."""
     index = 0
@@ -328,14 +358,7 @@ def _inspect_simple(words: list[str], cwd: Path | None) -> tuple[Path | None, st
         blocked = _find_configure_path(words, cwd)
         if blocked is not None:
             return blocked, None
-    name = os.path.basename(words[index]) if index < len(words) else ""
-    if name == "eval":
-        return None, " ".join(words[index + 1 :])
-    if name in SHELLS:
-        target, inline = _shell_argument(words[index:])
-        if inline:
-            return None, target
-    return None, None
+    return None, _scan_inline(words, index)
 
 
 def _inspect_pipeline(
@@ -418,6 +441,17 @@ def _inspect_tokens(
     return None
 
 
+def _has_unparsed_configure(source: str) -> bool:
+    """Detect direct or globbed configure references in unparsed command text."""
+    if "configure" in source:
+        return True
+    for word in source.split()[:MAX_INPUT]:
+        base = os.path.basename(word)
+        if bool(GLOB_CHARS.intersection(base)) and fnmatch.fnmatchcase("configure", base):
+            return True
+    return False
+
+
 def _inspect(command: str, cwd: Path) -> Path | None:
     """Walk bounded shell fragments and inline programs without recursion."""
     pending = [(command, cwd, 0)]
@@ -429,7 +463,7 @@ def _inspect(command: str, cwd: Path) -> Path | None:
             return Path("configure (nesting limit)")
         tokens = _tokens(source)
         if tokens is None:
-            if "configure" in source:
+            if _has_unparsed_configure(source):
                 return Path("configure (parse or size limit)")
             continue
         blocked = _inspect_tokens(tokens, directory, depth, pending)

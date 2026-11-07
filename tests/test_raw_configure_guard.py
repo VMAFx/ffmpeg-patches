@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -21,6 +22,11 @@ CONFIGS = {
     "codex": (ROOT / ".codex/hooks.json", "PreToolUse", "Bash", 15),
     "gemini": (ROOT / ".gemini/settings.json", "BeforeTool", "run_shell_command", 15000),
 }
+SPEC = importlib.util.spec_from_file_location("raw_configure_guard", GUARD)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError(f"Cannot load module from {GUARD}")
+GUARD_MOD = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(GUARD_MOD)
 
 
 class RawConfigureGuardTest(unittest.TestCase):
@@ -303,6 +309,9 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("git status", self.tree),
             (f"(cd {self.other} && ./configure)", self.tree),
             (f"cd {self.other} && ./configure", self.tree),
+            ("env bash -c 'echo hi'", self.root),
+            ("bash -o pipefail -c 'ls'", self.root),
+            ("bash script.sh", self.other),
         )
         for client in CLIENTS:
             for command, cwd in cases:
@@ -376,6 +385,8 @@ class RawConfigureGuardTest(unittest.TestCase):
                     },
                 )
                 self.assertGreaterEqual(len(hooks), 2)
+                if client == "claude":
+                    self.assertEqual(hooks[1].get("onFailure"), "block")
                 self.assertIn("scripts/raw_configure_guard.py", hooks[1]["command"])
                 self.assertIn(f"--client {client}", hooks[1]["command"])
                 for command, expected in (
@@ -411,7 +422,7 @@ class RawConfigureGuardTest(unittest.TestCase):
             text=True,
             timeout=5,
         )
-        for client in ("codex", "gemini"):
+        for client in ("claude", "codex", "gemini"):
             with self.subTest(client=client):
                 path = CONFIGS[client][0]
                 hooks = json.loads(path.read_text(encoding="utf-8"))["hooks"]
@@ -425,7 +436,11 @@ class RawConfigureGuardTest(unittest.TestCase):
                     cwd=missing / "tests",
                     timeout=5,
                     check=False,
-                    env={**os.environ, "GEMINI_PROJECT_DIR": str(missing)},
+                    env={
+                        **os.environ,
+                        "CLAUDE_PROJECT_DIR": str(missing),
+                        "GEMINI_PROJECT_DIR": str(missing),
+                    },
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(str(missing / "scripts/raw_configure_guard.py"), result.stderr)
@@ -445,3 +460,110 @@ class RawConfigureGuardTest(unittest.TestCase):
             [node, "--check", str(path)], capture_output=True, text=True, timeout=5, check=False
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_tokens_helper(self) -> None:
+        """Verify _tokens handles redirection merges, size caps, and syntax errors."""
+        self.assertEqual(GUARD_MOD._tokens("echo 2>&1"), ["echo", "2>&1"])
+        self.assertEqual(GUARD_MOD._tokens("cmd |& next"), ["cmd", "|", "next"])
+        self.assertIsNone(GUARD_MOD._tokens("x" * (GUARD_MOD.MAX_COMMAND + 1)))
+        self.assertIsNone(GUARD_MOD._tokens('echo "unbalanced'))
+
+    def test_shell_argument_helper(self) -> None:
+        """Verify _shell_argument parses bash options and identifies inline commands."""
+        cases = (
+            (["bash", "-o", "pipefail", "-c", "X"], ("X", True)),
+            (["bash", "--norc", "-c", "X"], ("X", True)),
+            (["bash", "-ec", "X"], ("X", True)),
+            (["bash", "-eo", "pipefail", "-c", "X"], ("X", True)),
+            (["bash", "+o", "posix", "-c", "X"], ("X", True)),
+            (["bash", "--", "script"], ("script", False)),
+            (["bash", "script.sh"], ("script.sh", False)),
+            (["bash"], (None, False)),
+        )
+        for words, expected in cases:
+            with self.subTest(words=words):
+                self.assertEqual(GUARD_MOD._shell_argument(words), expected)
+
+    def test_step_helper(self) -> None:
+        """Verify _step tracks directories and detects configure invocations."""
+        pending: list[tuple[str, Path | None, int]] = []
+        blocked, new_cwd = GUARD_MOD._step(["cd", str(self.tree)], self.root, 0, pending)
+        self.assertIsNone(blocked)
+        self.assertEqual(new_cwd, self.tree)
+        blocked, _ = GUARD_MOD._step(["./configure"], new_cwd, 0, pending)
+        self.assertIsNotNone(blocked)
+
+        blocked, other_cwd = GUARD_MOD._step(["cd", str(self.other)], self.root, 0, pending)
+        self.assertIsNone(blocked)
+        self.assertEqual(other_cwd, self.other)
+        blocked, _ = GUARD_MOD._step(["./configure"], other_cwd, 0, pending)
+        self.assertIsNone(blocked)
+
+    def test_refuses_wrapped_shell_and_option_forms(self) -> None:
+        """Refuse shell invocations behind wrappers and with complex options."""
+        cases = (
+            (f"env bash -c 'cd {self.tree} && ./configure'", self.root),
+            (f"timeout 5 sh -c 'cd {self.tree} && ./configure'", self.root),
+            (f"nohup bash -c 'cd {self.tree} && ./configure'", self.root),
+            (f"bash -o pipefail -c 'cd {self.tree} && ./configure'", self.root),
+            (f"bash --norc -c 'cd {self.tree} && ./configure'", self.root),
+            (f"bash -eo pipefail -c 'cd {self.tree} && ./configure'", self.root),
+        )
+        self._assert_refused(cases)
+
+    def test_oversized_glob_refusal_and_benign_allow(self) -> None:
+        """Refuse oversized glob configure invocations while allowing benign commands."""
+        padding = " # " + "x" * 65536
+        oversized_refusal = f"cd {self.tree} && ./c?nfigure{padding}"
+        oversized_allow = f"ls{padding}"
+        self._assert_refused(((oversized_refusal, self.root),))
+        for client in CLIENTS:
+            with self.subTest(client=client):
+                result = self.run_guard(client, self.payload(client, oversized_allow, self.root))
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_hook_start_failure_exits_two(self) -> None:
+        """Fail closed with returncode 2 when python3 is missing or fails on startup."""
+        git_bin = shutil.which("git")
+        bash_bin = shutil.which("bash") or "/bin/bash"
+        self.assertIsNotNone(git_bin)
+        temp_missing = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_missing.cleanup)
+        missing_bin_dir = Path(temp_missing.name)
+        (missing_bin_dir / "git").symlink_to(git_bin)  # type: ignore[arg-type]
+
+        temp_failing = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_failing.cleanup)
+        failing_bin_dir = Path(temp_failing.name)
+        (failing_bin_dir / "git").symlink_to(git_bin)  # type: ignore[arg-type]
+        failing_py = failing_bin_dir / "python3"
+        failing_py.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        failing_py.chmod(0o755)
+
+        for client in ("claude", "codex", "gemini"):
+            path, event, _, _ = CONFIGS[client]
+            hooks = json.loads(path.read_text(encoding="utf-8"))["hooks"][event][0]["hooks"]
+            command = hooks[1]["command"]
+            for label, bin_dir in (
+                ("missing_python", missing_bin_dir),
+                ("failing_python", failing_bin_dir),
+            ):
+                with self.subTest(client=client, setup=label):
+                    env = {
+                        **os.environ,
+                        "PATH": str(bin_dir),
+                        "CLAUDE_PROJECT_DIR": str(ROOT),
+                        "GEMINI_PROJECT_DIR": str(ROOT),
+                    }
+                    result = subprocess.run(  # nosec B603 B607 - repo-owned hook command.
+                        [bash_bin, "-c", command],
+                        input=json.dumps(self.payload(client, "./configure", self.tree)),
+                        text=True,
+                        capture_output=True,
+                        cwd=ROOT / "tests",
+                        timeout=5,
+                        check=False,
+                        env=env,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)

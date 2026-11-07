@@ -11,8 +11,9 @@
           },
           {
             "type": "command",
-            "command": "python3 -I \"$CLAUDE_PROJECT_DIR/scripts/raw_configure_guard.py\" --client claude",
-            "timeout": 15
+            "command": "python3 -I \"$CLAUDE_PROJECT_DIR/scripts/raw_configure_guard.py\" --client claude || exit 2",
+            "timeout": 15,
+            "onFailure": "block"
           }
         ]
       }
