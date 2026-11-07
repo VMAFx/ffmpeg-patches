@@ -452,12 +452,18 @@ print(json.dumps([row for page in sys.stdin if page.strip() for row in json.load
   die "pagination limit reached for $path; listing incomplete"
 }
 
+# own_open_pulls LOGIN: list only the login's open pulls.
+own_open_pulls() {
+  local encoded_me
+  encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1")" || return 1
+  api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&"
+}
+
 # own_open_pr_numbers: list own open pull numbers using the overlap checks poster filter.
 own_open_pr_numbers() {
-  local me encoded_me out
+  local me out
   me="$(login)" || die "cannot read login"
-  encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
-  out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || exit 1
+  out="$(own_open_pulls "$me")" || exit 1
   python3 -c 'import json,sys
 for row in json.load(sys.stdin):
     number = row.get("number")
@@ -569,7 +575,7 @@ for row in json.load(sys.stdin):
 
 # fairy_requests [--skip-unavailable]: audit own open PRs using bounded API lists.
 fairy_requests() {
-  local optional="${1:-}" out me encoded_me rows row number reviews seen rc
+  local optional="${1:-}" out me rows row number reviews seen rc
   local -a candidates results=()
   [ $# -eq 0 ] || { [ $# -eq 1 ] && [ "$optional" = --skip-unavailable ]; } \
     || usage_error "fairy-requests [--skip-unavailable]"
@@ -590,9 +596,8 @@ fairy_requests() {
   fi
   [ "$rc" -eq 0 ] || return "$rc"
   me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
-  encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
   discover_page_size
-  out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || return 1
+  out="$(own_open_pulls "$me")" || return 1
   rows="$(fairy_request_candidates "$me" <<<"$out")" || return 1
   [ -n "$rows" ] || return 0
   mapfile -t candidates <<<"$rows"
@@ -682,7 +687,7 @@ import stat
 import subprocess
 import sys
 
-PATTERN = re.compile(r"\bI(?: will|'ll)\b[^.!?\n]{0,300}?\b(?:with|in|on) (?:the|my) next push\b", re.I)
+PATTERN = re.compile(r"\bI(?: will|'ll)\b[^.!?\n]{0,300}?\b(?:with|in|into|on|for) (?:the|my) next (?:push|revision|version|iteration|round)\b", re.I)
 
 
 def refuse(message: str) -> None:
@@ -706,6 +711,7 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
         body = row.get("body")
         if not isinstance(body, str):
             refuse("malformed own issue comment")
+        body = re.sub(r"(?m)^[^\S\n]*>[^\n]*", "", body)
         match = PATTERN.search(body)
         if match is None:
             continue
@@ -782,8 +788,8 @@ promise_python_main() {
   cat <<'PY'
 def main() -> None:
     """Validate all own promises against literal evidence in the pushed revision."""
-    path, me, swept, number, pulls_json, comments_json = sys.argv[1:]
-    pulls, comments = json.loads(pulls_json), json.loads(comments_json)
+    path, me, swept, number = sys.argv[1:]
+    pulls, comments = json.loads(sys.stdin.readline()), json.loads(sys.stdin.readline())
     pull = next(row for row in pulls if row.get("number") == int(number))
     promises = promise_rows(comments, me)
     if not promises:
@@ -818,12 +824,12 @@ PY
 require_promises() {
   local branch="$1" promises="$2" me="$3" pulls selected comments code
   discover_page_size
-  pulls="$(api_list "/repos/$REPO/pulls?state=open&")" || return 1
+  pulls="$(own_open_pulls "$me")" || return 1
   selected="$(select_promise_pull "$branch" "$me" <<<"$pulls")" || return 79
   [ -n "$selected" ] || return 0
   comments="$(api_list "/repos/$REPO/issues/$selected/comments?")" || return 1
   code="$(promise_python_header; promise_python_comments; promise_python_file; promise_python_git; promise_python_main)"
-  python3 -I -c "$code" "$promises" "$me" "$SWEPT_SHA" "$selected" "$pulls" "$comments"
+  printf '%s\n%s\n' "$pulls" "$comments" | python3 -I -c "$code" "$promises" "$me" "$SWEPT_SHA" "$selected"
 }
 
 # require_swept_fork_head LOGIN BRANCH: bind PR creation to the reviewed commit.

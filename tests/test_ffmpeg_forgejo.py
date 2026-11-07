@@ -218,7 +218,15 @@ class Stub:
         """Return one filtered, server-capped page of open pull requests."""
 
         poster = query.get("poster", [None])[0]
-        rows = [row for row in self.open_pulls if poster is None or row["user"]["login"] == poster]
+        rows = [
+            row
+            for row in self.open_pulls
+            if poster is None
+            or not isinstance(row, dict)
+            or not isinstance(row.get("user"), dict)
+            or "login" not in row["user"]
+            or row["user"].get("login") == poster
+        ]
         page = int(query.get("page", ["1"])[0])
         limit = self.page_limit(query)
         return rows[(page - 1) * limit : page * limit]
@@ -2254,6 +2262,25 @@ class SweepTest(ForgejoTest):
         ]
         return stub
 
+    def large_promise_stub(self) -> Stub:
+        """Build 60 large own pulls and more than 200 KiB of comments."""
+
+        stub = self.promise_stub(body="x" * 4096)
+        stub.open_pulls.extend(
+            {
+                "number": 30000 + n,
+                "user": {"login": "tester"},
+                "head": {"ref": f"other-{n}"},
+                "merge_base": A,
+                "body": "x" * 4096,
+            }
+            for n in range(59)
+        )
+        stub.comments[25619].extend(
+            {"id": 90000 + n, "user": {"login": "tester"}, "body": "z" * 45000} for n in range(5)
+        )
+        return stub
+
     def promise_file(self, content: str = "81815: qualify the close errors\n") -> Path:
         """Write a promise-row fixture in the temporary test directory."""
 
@@ -2305,6 +2332,96 @@ class SweepTest(ForgejoTest):
         result = self.promise_push(self.promise_stub(), self.promise_file())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_accepts_large_listings_with_commit_evidence(self) -> None:
+        """Large pull and comment listings reach Git push with commit evidence."""
+
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "qualify the close errors",
+        )
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
+        stub = self.large_promise_stub()
+        self.assertGreater(len(json.dumps(stub.comments[25619])), 200 * 1024)
+        result = self.promise_push(stub, self.promise_file())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_large_listings_without_commit_evidence(self) -> None:
+        """Large listings still reject an unkept promise with its comment ID."""
+
+        stub = self.large_promise_stub()
+        self.assertGreater(len(json.dumps(stub.comments[25619])), 200 * 1024)
+        result = self.promise_push(stub, self.promise_file())
+        self.assertEqual(result.returncode, 79, result.stderr)
+        self.assertIn("81815", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_push_filters_own_pulls_and_default_reviews_keep_numbers(self) -> None:
+        """Push and default review listing share the filtered open-pull query."""
+
+        stub = self.promise_stub(comment="No promise here.")
+        stub.open_pulls.append(dict(stub.open_pulls[0], number=25620, head={"ref": "other"}))
+        stub.open_pulls.append(dict(stub.open_pulls[0], number=25621, user={"login": "other"}))
+        result = self.promise_push(stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pull_paths = [
+            path for method, path, _ in stub.requests if method == "GET" and "/pulls?" in path
+        ]
+        self.assertTrue(pull_paths)
+        self.assertTrue(
+            all("state=open" in path and "poster=tester" in path for path in pull_paths)
+        )
+        reviews = self.run_command(stub, "fairy-reviews")
+        self.assertEqual(reviews.returncode, 0, reviews.stderr)
+        self.assertEqual(reviews.stdout.splitlines(), ["25619\t0\t-\t-", "25620\t0\t-\t-"])
+
+    def test_push_ignores_quoted_own_promise(self) -> None:
+        """Quoted lines in an own comment do not create an own promise."""
+
+        stub = self.promise_stub(
+            comment="Context:\n  > I will fix it with the next push.\nAcknowledged."
+        )
+        result = self.promise_push(stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_matches_new_promise_wording(self) -> None:
+        """New prepositions and next-revision nouns require promise rows."""
+
+        for sentence in (
+            "I'll fold it into the next push.",
+            "I will fix that in my next revision.",
+            "I will fix it for the next version.",
+            "I will fix it on my next iteration.",
+            "I will fix it with the next round.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assert_promise_refused(self.promise_stub(comment=sentence), None, "81815")
+        result = self.promise_push(self.promise_stub(comment="the next push from the bot"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_push_promise_sentence_bound_is_300_characters(self) -> None:
+        """The matcher accepts 300 intervening characters and rejects 301."""
+
+        prefix = "I will "
+        suffix = " with my next push."
+        self.assert_promise_refused(
+            self.promise_stub(comment=prefix + "x" * 298 + suffix), None, "81815"
+        )
+        result = self.promise_push(self.promise_stub(comment=prefix + "x" * 299 + suffix))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_push_accepts_fragment_only_in_pr_body(self) -> None:
         """The PR body can supply literal promise evidence."""
