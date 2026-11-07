@@ -100,7 +100,7 @@ jobs:
       # the step above; the upload runs either way.
       - name: Upload the findings to code scanning
         if: always() && github.event.pull_request.draft != true && hashFiles('semgrep.sarif') != ''
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
         with:
           sarif_file: semgrep.sarif
           category: semgrep-local
@@ -122,13 +122,13 @@ jobs:
     steps:
       - *stop-on-draft
       - *checkout
-      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
         if: github.event.pull_request.draft != true
         with:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-and-quality
-      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
         if: github.event.pull_request.draft != true
         with:
           category: /language:${{ matrix.language }}
