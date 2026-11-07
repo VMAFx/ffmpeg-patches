@@ -459,5 +459,5 @@ integrity, and the debt ratchet.
 generated agent context against `AGENTS.md`.
 
 **Debt Baseline**: `.standards-baseline.json` anchors the debt ratchet at
-4 recorded infractions; audit forbids growth.
+1 recorded infraction; audit forbids growth.
 <!-- praetor:readme-governance:end -->

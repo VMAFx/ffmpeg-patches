@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import signal
 import subprocess  # nosec B404 - configure is a fixed path, no shell, with timeout.
@@ -16,6 +15,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn
+
+# Ensure repository root is on sys.path for test/tool imports
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.process_group import kill_process_group  # noqa: E402
 
 ALLOWED = (
     "PATH",
@@ -69,8 +75,7 @@ def allowed_environment(environ: Mapping[str, str], keep: Sequence[str]) -> dict
 def _kill_configure(process: subprocess.Popen[bytes]) -> None:
     """Terminate configure and its descendants where process groups are available."""
     if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+        kill_process_group(process)
     else:
         # HISS-21: non-POSIX platforms can terminate only the direct child here.
         process.kill()

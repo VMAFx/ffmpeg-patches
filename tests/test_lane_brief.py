@@ -16,7 +16,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import lane_brief
 
@@ -713,6 +713,47 @@ class LaneBriefTest(unittest.TestCase):
                 self.assertEqual(output, "")
                 self.assertFalse(destination.exists())
                 self.assertIn(reason, error)
+
+    def test_run_runner_pid_guards(self) -> None:
+        """Prove run_runner guards against invalid and current-group PIDs in cleanup."""
+
+        def run_with(pid: int | bool) -> tuple[Mock, Mock]:
+            killpg = Mock()
+            process = SimpleNamespace(
+                pid=pid,
+                kill=Mock(),
+                wait=Mock(return_value=0),
+                poll=Mock(return_value=None),
+                stdout=SimpleNamespace(close=Mock()),
+            )
+            with (
+                patch.object(lane_brief.subprocess, "Popen", return_value=process),
+                patch.object(lane_brief, "read_runner_output", side_effect=RuntimeError("planted")),
+                patch.object(lane_brief.os, "killpg", killpg),
+                self.assertRaisesRegex(RuntimeError, "planted"),
+            ):
+                lane_brief.run_runner(["dummy"])
+            return killpg, process.kill
+
+        for bad_pid in (0, 1, True):
+            with self.subTest(bad_pid=bad_pid):
+                killpg, kill = run_with(bad_pid)
+                killpg.assert_not_called()
+                kill.assert_not_called()
+
+        with self.subTest(bad_pid=os.getpgrp()):
+            killpg, kill = run_with(os.getpgrp())
+            killpg.assert_not_called()
+            kill.assert_called_once_with()
+
+        good_pid = 4242 if os.getpgrp() != 4242 else 4243
+        killpg, kill = run_with(good_pid)
+        killpg.assert_called_once_with(good_pid, signal.SIGKILL)
+        kill.assert_not_called()
+
+        killpg, kill = run_with(2)
+        killpg.assert_called_once_with(2, signal.SIGKILL)
+        kill.assert_not_called()
 
 
 if __name__ == "__main__":
