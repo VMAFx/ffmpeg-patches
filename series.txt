@@ -47,3 +47,5 @@
 0040-avfilter-vf_libvmaf-accept-more-planar-pixel-formats.patch
 0041-avfilter-vf_libvmaf-copy-all-planes-of-CUDA-hardware.patch
 0042-avfilter-vf_libvmaf-pop-the-CUDA-context-when-a-plan.patch
+0043-libavcodec-unified-qpfile-across-libx264-libsvtav1-l.patch
+0044-fftools-decode-on-the-GPU-in-a-loopback-decoder.patch
