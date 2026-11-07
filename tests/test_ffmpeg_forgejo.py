@@ -1158,6 +1158,25 @@ class TestClaimHeadTest(ForgejoTest):
 
         return self.sent_bodies(stub, "PATCH")
 
+    def test_own_duplicate_comment_is_refused(self) -> None:
+        """A whitespace-equivalent own reply exits 78 without a POST."""
+
+        stub = Stub()
+        stub.comments = {
+            1: [
+                {
+                    "user": {"login": "tester"},
+                    "id": 81918,
+                    "html_url": "stub/issues/1#issuecomment-81918",
+                    "body": "  new   body\tline two \n\n",
+                }
+            ]
+        }
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertIn("own comment 81918", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
     def test_stale_evidence_is_refused_before_network(self) -> None:
         """A test on another head cannot authorize either write."""
 
