@@ -3,8 +3,16 @@
 """Stub-only coverage of the own-PR Fairy request check."""
 
 import datetime
+import socket
 
 from tests import test_ffmpeg_forgejo as forgejo
+
+
+def _closed_port() -> int:
+    """Return an unbound local TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def pull(age=20, reviewers=(), login="tester", number=1):
@@ -95,3 +103,48 @@ class FairyRequestCheckTest(forgejo.FairyRequestTestBase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SKIPPED", proc.stderr)
         self.assertEqual(stub.requests, [])
+
+    def test_offline_api_with_login_skips_loudly(self):
+        """A closed API port with preset login skips loudly when requested."""
+        port = _closed_port()
+        stub = forgejo.Stub()
+        proc = self.run_command(
+            stub,
+            "fairy-requests",
+            "--skip-unavailable",
+            env_updates={
+                "FFMPEG_FORGEJO_LOGIN": "tester",
+                "FFMPEG_FORGEJO_API": f"http://127.0.0.1:{port}/api/v1",
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SKIPPED", proc.stderr)
+        self.assertIn("curl rc 7", proc.stderr)
+
+    def test_offline_api_with_login_fails_without_skip(self):
+        """A closed API port with preset login fails without the skip flag."""
+        port = _closed_port()
+        stub = forgejo.Stub()
+        proc = self.run_command(
+            stub,
+            "fairy-requests",
+            env_updates={
+                "FFMPEG_FORGEJO_LOGIN": "tester",
+                "FFMPEG_FORGEJO_API": f"http://127.0.0.1:{port}/api/v1",
+            },
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("SKIPPED", proc.stderr)
+
+    def test_online_api_with_login_runs_full_check(self):
+        """An online API with preset login probes settings and audits pulls."""
+        stub = forgejo.Stub()
+        stub.open_pulls = [pull()]
+        proc = self.run_command(
+            stub,
+            "fairy-requests",
+            "--skip-unavailable",
+            env_updates={"FFMPEG_FORGEJO_LOGIN": "tester"},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(("GET", "/api/v1/settings/api", ""), stub.requests)
