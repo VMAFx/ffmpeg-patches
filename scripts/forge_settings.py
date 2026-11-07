@@ -19,7 +19,7 @@ DEFAULT_REPO = "FFmpeg/FFmpeg"
 DEFAULT_BOT_REVIEWER = "Forgejo_Fairy"
 
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
-LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 
 
 def validate_host(raw: str) -> str:

@@ -3,6 +3,7 @@
 # Unified patches encode empty context lines as one space. Added C lines are
 # checked across the series by test_libvmaf_patches and on fixture application.
 patches/*.patch whitespace=-blank-at-eol
+tests/fixtures/libvmaf_cuda/vf_libvmaf.c text eol=lf
 # BEGIN praetor managed attributes (praetorctl adopt)
 # praetorctl audit hashes these files; keep their checkout bytes the same on every platform.
 .devcontainer/Dockerfile.praetor text eol=lf
