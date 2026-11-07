@@ -11,12 +11,10 @@ Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import io
 import os
 import re
 import selectors
-import signal
 import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
@@ -24,6 +22,11 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.process_group import kill_process_group  # noqa: E402
+
 TEMPLATE = ROOT / "scripts" / "lane_brief_template.md"
 CONFIG = ROOT / ".config" / "lane-brief.yaml"
 NAMES = ("task", "branch", "n", "r", "finding", "fix", "tests", "paths", "modules")
@@ -212,24 +215,7 @@ def run_runner(argv: list[str]) -> tuple[bytes, int]:
         return output, process.returncode
     finally:
         if not completed or process.poll() != 0:
-            # HISS-08: never signal pid 0/1 or our own process group.
-            if (
-                not isinstance(process.pid, int)
-                or isinstance(process.pid, bool)
-                or process.pid <= 1
-                or process.pid == os.getpgrp()
-            ):
-                with contextlib.suppress(ProcessLookupError):
-                    # pid 0/1/bool: Popen.kill() would reach os.kill(0|1); signal nothing.
-                    if (
-                        isinstance(process.pid, int)
-                        and not isinstance(process.pid, bool)
-                        and process.pid > 1
-                    ):
-                        process.kill()
-            else:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
+            kill_process_group(process)
         try:
             process.wait(timeout=5)
         finally:

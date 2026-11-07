@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import signal
 import subprocess  # nosec B404 - configure is a fixed path, no shell, with timeout.
@@ -16,6 +15,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn
+
+# Ensure repository root is on sys.path for test/tool imports
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.process_group import kill_process_group  # noqa: E402
 
 ALLOWED = (
     "PATH",
@@ -69,24 +75,7 @@ def allowed_environment(environ: Mapping[str, str], keep: Sequence[str]) -> dict
 def _kill_configure(process: subprocess.Popen[bytes]) -> None:
     """Terminate configure and its descendants where process groups are available."""
     if os.name == "posix":
-        # HISS-08: never signal pid 0/1 or our own process group.
-        if (
-            not isinstance(process.pid, int)
-            or isinstance(process.pid, bool)
-            or process.pid <= 1
-            or process.pid == os.getpgrp()
-        ):
-            with contextlib.suppress(ProcessLookupError):
-                # pid 0/1/bool: Popen.kill() would reach os.kill(0|1); signal nothing.
-                if (
-                    isinstance(process.pid, int)
-                    and not isinstance(process.pid, bool)
-                    and process.pid > 1
-                ):
-                    process.kill()
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+        kill_process_group(process)
     else:
         # HISS-21: non-POSIX platforms can terminate only the direct child here.
         process.kill()

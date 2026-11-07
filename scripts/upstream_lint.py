@@ -33,10 +33,16 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+
+# Ensure repository root is on sys.path for test/tool imports
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.process_group import kill_process_group  # noqa: E402
 
 PRE_COMMIT = "pre-commit"
 ALLOWED_EXECUTABLES = frozenset({"git", "pre-commit", "bash"})
@@ -146,24 +152,7 @@ def _reap_timeout(
     process: subprocess.Popen[bytes], argv: list[str], partial_output: bytes | None = None
 ) -> RunResult:
     """Kill a timed-out process group and bound the remaining pipe drain."""
-    # HISS-08: never signal pid 0/1 or our own process group.
-    if (
-        not isinstance(process.pid, int)
-        or isinstance(process.pid, bool)
-        or process.pid <= 1
-        or process.pid == os.getpgrp()
-    ):
-        with suppress(ProcessLookupError):
-            # pid 0/1/bool: Popen.kill() would reach os.kill(0|1); signal nothing.
-            if (
-                isinstance(process.pid, int)
-                and not isinstance(process.pid, bool)
-                and process.pid > 1
-            ):
-                process.kill()
-    else:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+    kill_process_group(process)
     try:
         output, _ = process.communicate(timeout=_remaining(REAP_TIMEOUT))
     except subprocess.TimeoutExpired as error:
