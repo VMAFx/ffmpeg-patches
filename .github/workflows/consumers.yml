@@ -3,7 +3,8 @@
 #
 # The consumers apply their own FFmpeg patch stacks on top of this series,
 # each from ffmpeg-patches/series.txt on its default branch unless a dispatch
-# names a Pelorus or vmafx branch. The job's
+# or committed .github/consumer-refs/<consumer> file names a Pelorus or vmafx
+# branch (dispatch input takes precedence). The job's
 # CONSUMERS map is the one place to add a consumer; the owner follows this
 # repository's owner, so forks use their own consumers.
 # This run applies the series on the pinned base, then each
@@ -81,17 +82,22 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-python
         if: github.event.pull_request.draft != true
-      # A dispatch may name the Pelorus or vmafx branch to test a consumer
-      # change against a series branch before either lands. The names only
-      # reach the shell through the environment, and only branch-name
-      # characters pass; everything else stops the run before any clone.
+      # A dispatch or committed .github/consumer-refs/<consumer> file may name
+      # the Pelorus or vmafx branch to test a consumer change against a series
+      # branch before either lands. A non-empty dispatch input takes precedence
+      # over the file; when an input is provided, the file is not read. The
+      # names only reach the shell through the environment or file read, and
+      # only branch-name characters pass; everything else stops the run before
+      # any clone.
       - name: Check the consumer refs
         if: github.event.pull_request.draft != true
         env:
           PELORUS_REF: ${{ inputs.pelorus_ref }}
           VMAFX_REF: ${{ inputs.vmafx_ref }}
         run: |
+          warnings=()
           for input in pelorus_ref vmafx_ref; do
+            consumer=${input%_ref}
             case "$input" in
               pelorus_ref) ref=$PELORUS_REF ;;
               vmafx_ref) ref=$VMAFX_REF ;;
@@ -102,7 +108,30 @@ jobs:
                 echo "::error::$input is not a plain branch name"
                 exit 1
               fi
+            else
+              file=".github/consumer-refs/$consumer"
+              if [ -e "$file" ] || [ -L "$file" ]; then
+                if [ -L "$file" ] || ! [ -f "$file" ]; then
+                  echo "::error::$input file is not a regular file"
+                  exit 1
+                fi
+                ref=$(head -c 256 -- "$file")
+                if ! [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
+                  || ! timeout 10s git check-ref-format --branch "$ref" > /dev/null; then
+                  echo "::error::$input is not a plain branch name"
+                  exit 1
+                fi
+                warnings+=("::warning::${consumer} consumer ref ${ref} comes from .github/consumer-refs/${consumer}; reset it after the consumer lands")
+              fi
             fi
+            case "$input" in
+              pelorus_ref) PELORUS_REF=$ref ;;
+              vmafx_ref) VMAFX_REF=$ref ;;
+            esac
+          done
+          for warning in "${warnings[@]}"; do
+            echo "$warning"
+            echo "$warning" >> "$GITHUB_STEP_SUMMARY"
           done
           echo "PELORUS_REF=$PELORUS_REF" >> "$GITHUB_ENV"
           echo "VMAFX_REF=$VMAFX_REF" >> "$GITHUB_ENV"

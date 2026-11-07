@@ -520,6 +520,119 @@ class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
             {"type": "string", "required": False, "default": ""},
         )
 
+    def test_valid_ref_file_sets_environment_and_warns(self) -> None:
+        """Accept valid branch names from consumer ref files and emit warnings."""
+        branch = "chore/ffmpeg-drop-qpfile-loopback"
+        ref_dir = self.root / ".github" / "consumer-refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        for consumer in ("vmafx", "pelorus"):
+            for newline in ("", "\n"):
+                with self.subTest(consumer=consumer, newline=bool(newline)):
+                    (ref_dir / "vmafx").unlink(missing_ok=True)
+                    (ref_dir / "pelorus").unlink(missing_ok=True)
+                    self.env_file.unlink(missing_ok=True)
+                    self.summary.unlink(missing_ok=True)
+                    (ref_dir / consumer).write_text(f"{branch}{newline}", encoding="utf-8")
+                    done = self.run_step(self.ref_step)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    expected_env = (
+                        f"PELORUS_REF={branch}\nVMAFX_REF=\n"
+                        if consumer == "pelorus"
+                        else f"PELORUS_REF=\nVMAFX_REF={branch}\n"
+                    )
+                    self.assertEqual(self.env_file.read_text(encoding="utf-8"), expected_env)
+                    warning = (
+                        f"::warning::{consumer} consumer ref {branch} comes from "
+                        f".github/consumer-refs/{consumer}; reset it after the consumer lands"
+                    )
+                    self.assertIn(warning, done.stdout)
+                    self.assertIn(warning, self.summary.read_text(encoding="utf-8"))
+
+    def test_invalid_ref_file_rejects_planted_values(self) -> None:
+        """Reject planted invalid ref file values without writing environment."""
+        invalid = (
+            "-x",
+            "a..b",
+            "a b",
+            "a;b",
+            "$(id)",
+            "x.lock",
+            "/x",
+            "x/",
+            "@{u",
+            "a" * 201,
+            "a\nb",
+            " ",
+            "a" * 300,
+        )
+        ref_dir = self.root / ".github" / "consumer-refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        ref_file = ref_dir / "vmafx"
+        for value in invalid:
+            with self.subTest(value=value):
+                self.env_file.unlink(missing_ok=True)
+                ref_file.write_text(value, encoding="utf-8")
+                done = self.run_step(self.ref_step)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::vmafx_ref is not a plain branch name", done.stdout)
+                self.assertEqual(
+                    self.env_file.read_text(encoding="utf-8") if self.env_file.exists() else "",
+                    "",
+                )
+
+    def test_symlink_ref_file_is_rejected(self) -> None:
+        """Reject symlinked consumer ref files before reading branch names."""
+        target = self.root / "target_ref"
+        target.write_text("chore/ffmpeg-drop-qpfile-loopback\n", encoding="utf-8")
+        ref_dir = self.root / ".github" / "consumer-refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        ref_file = ref_dir / "vmafx"
+        ref_file.unlink(missing_ok=True)
+        ref_file.symlink_to(target)
+        self.env_file.unlink(missing_ok=True)
+        done = self.run_step(self.ref_step)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("::error::vmafx_ref file is not a regular file", done.stdout)
+        self.assertEqual(
+            self.env_file.read_text(encoding="utf-8") if self.env_file.exists() else "",
+            "",
+        )
+
+    def test_absent_ref_file_with_empty_input_leaves_refs_empty(self) -> None:
+        """Default to empty consumer refs when no input or ref file is present."""
+        self.env_file.unlink(missing_ok=True)
+        done = self.run_step(self.ref_step, {"PELORUS_REF": "", "VMAFX_REF": ""})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), "PELORUS_REF=\nVMAFX_REF=\n")
+
+    def test_dispatch_input_precedes_ref_file(self) -> None:
+        """Dispatch input takes precedence over a committed consumer ref file."""
+        ref_dir = self.root / ".github" / "consumer-refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        (ref_dir / "vmafx").write_text("ci/y\n", encoding="utf-8")
+        self.env_file.unlink(missing_ok=True)
+        self.summary.unlink(missing_ok=True)
+        done = self.run_step(self.ref_step, {"VMAFX_REF": "ci/x"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            self.env_file.read_text(encoding="utf-8"), "PELORUS_REF=\nVMAFX_REF=ci/x\n"
+        )
+        self.assertNotIn("::warning::", done.stdout)
+        summary_text = self.summary.read_text(encoding="utf-8") if self.summary.exists() else ""
+        self.assertNotIn("::warning::", summary_text)
+
+    def test_valid_input_ignores_invalid_ref_file(self) -> None:
+        """Non-empty dispatch input skips reading an invalid consumer ref file."""
+        ref_dir = self.root / ".github" / "consumer-refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        (ref_dir / "vmafx").write_text("a..b\n", encoding="utf-8")
+        self.env_file.unlink(missing_ok=True)
+        done = self.run_step(self.ref_step, {"VMAFX_REF": "ci/x"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            self.env_file.read_text(encoding="utf-8"), "PELORUS_REF=\nVMAFX_REF=ci/x\n"
+        )
+
 
 class ConsumerMapWorkflowTest(ConsumerWorkflowFixture):
     """Keep consumer configuration centralized and execute the fetch/apply contracts."""
