@@ -130,6 +130,8 @@ Before pushing or opening a pull request, scan the committed fix and callers of 
 ```bash
 # Fetch the upstream base so both master and topic resolve as local refs:
 git -C /path/to/FFmpeg fetch origin master:master
+# A shallow clone needs enough history for the merge base; deepen it if merge-base fails:
+git -C /path/to/FFmpeg fetch --unshallow origin  # or: fetch --deepen=<commits> origin
 # Sweep from the merge base so upstream-only changes are excluded:
 python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return \
   "$(git -C /path/to/FFmpeg merge-base master topic)" topic -o sweep.md
