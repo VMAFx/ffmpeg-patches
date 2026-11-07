@@ -10,7 +10,7 @@ import signal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import subprocess
+    import subprocess  # nosec B404 - type annotation only, no process started here.
 
 
 def kill_process_group(process: subprocess.Popen[bytes]) -> None:
