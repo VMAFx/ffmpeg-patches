@@ -163,6 +163,8 @@ class Stub:
         self.fail_files: set[int] = set()
         self.reviews: dict[int, list[dict]] = {}
         self.fail_reviews: set[int] = set()
+        self.comments: dict[int, list[dict]] = {}
+        self.fail_comments: set[int] = set()
         self.head_reads = 0
         self.reviewer_reads = 0
         self.poll_index = {sha: -1 for sha in polls}
@@ -239,6 +241,13 @@ class Stub:
         page = int(query.get("page", ["1"])[0])
         limit = self.page_limit(query)
         return self.reviews.get(number, [])[(page - 1) * limit : page * limit]
+
+    def comment_page(self, number: int, query: dict[str, list[str]]) -> list[dict]:
+        """Return one server-capped page of issue comments."""
+
+        page = int(query.get("page", ["1"])[0])
+        limit = self.page_limit(query)
+        return self.comments.get(number, [])[(page - 1) * limit : page * limit]
 
     def page_limit(self, query: dict[str, list[str]]) -> int:
         """Cap the requested page size at the configured server maximum."""
@@ -342,6 +351,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         return False
 
+    def _route_comments(self, stub: Stub, parts: list[str], url: urllib.parse.SplitResult) -> bool:
+        """Handle paged issue comment reads."""
+
+        if len(parts) > 3 and parts[-3] == "issues" and parts[-1] == "comments":
+            number = int(parts[-2])
+            if number in stub.fail_comments:
+                self.reply(500, {"message": "comments failed"})
+            else:
+                self.reply(200, stub.comment_page(number, urllib.parse.parse_qs(url.query)))
+            return True
+        return False
+
     def _route_status(self, stub: Stub, parts: list[str], url: urllib.parse.SplitResult) -> bool:
         """Handle commit status requests."""
 
@@ -371,6 +392,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             lambda: self._route_pull(stub, url),
             lambda: self._route_pull_files(stub, parts, url),
             lambda: self._route_reviews(stub, parts, url),
+            lambda: self._route_comments(stub, parts, url),
             lambda: self._route_branch(stub, parts),
             lambda: self._route_status(stub, parts, url),
         )
@@ -2148,7 +2170,9 @@ class SweepTest(ForgejoTest):
         result = self.sweep_command("push", "--sweep", str(self.sweep))
         self.assertIn("report size limit", result.stderr)
 
-    def sweep_command(self, command: str, *options: str) -> subprocess.CompletedProcess[str]:
+    def sweep_command(
+        self, command: str, *options: str, stub: Stub | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """Attempt an outbound operation with API and Git push stubbed."""
 
         real_git = shutil.which("git")
@@ -2165,13 +2189,284 @@ class SweepTest(ForgejoTest):
             encoding="utf-8",
         )
         fake.chmod(0o755)
-        stub = Stub(reviewers=[["alice"]])
+        stub = stub or Stub(reviewers=[["alice"]])
         positional = ["topic"]
         if command == "pr":
             positional += ["title", str(self.tmp / "body.md")]
         result = self.run_command(stub, command, *options, *positional)
         self.sweep_requests = stub.requests
         return result
+
+    def test_push_refuses_unrecorded_own_next_push_promise(self) -> None:
+        """An own next-push promise blocks a push without a promise file."""
+
+        stub = Stub()
+        base = git_output(self.repo, "rev-parse", "master")
+        stub.open_pulls = [
+            {
+                "number": 25619,
+                "user": {"login": "tester"},
+                "head": {"ref": "topic"},
+                "merge_base": base,
+                "body": "Unrelated body.",
+            }
+        ]
+        stub.comments[25619] = [
+            {
+                "id": 81815,
+                "user": {"login": "tester"},
+                "body": "I will qualify the close errors in the commit message with the next push.",
+                "html_url": "https://example.invalid/comments/81815",
+            }
+        ]
+        result = self.sweep_command("push", "--sweep", str(self.sweep), stub=stub)
+        self.assertEqual(result.returncode, 79, result.stderr)
+        self.assertIn("81815", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def promise_stub(
+        self,
+        *,
+        body: str = "Unrelated body.",
+        comment: str = "I will qualify the close errors in the commit message with the next push.",
+        login: str = "tester",
+        max_response_items: int = 50,
+    ) -> Stub:
+        """Build an open pull and a scripted next-push comment."""
+
+        stub = Stub(max_response_items=max_response_items)
+        stub.open_pulls = [
+            {
+                "number": 25619,
+                "user": {"login": "tester"},
+                "head": {"ref": "topic"},
+                "merge_base": git_output(self.repo, "rev-parse", "master"),
+                "body": body,
+            }
+        ]
+        stub.comments[25619] = [
+            {
+                "id": 81815,
+                "user": {"login": login},
+                "body": comment,
+                "html_url": "https://example.invalid/comments/81815",
+            }
+        ]
+        return stub
+
+    def promise_file(self, content: str = "81815: qualify the close errors\n") -> Path:
+        """Write a promise-row fixture in the temporary test directory."""
+
+        path = self.tmp / "promises.txt"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def promise_push(
+        self, stub: Stub, path: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Attempt a stubbed push with an optional promise-row file."""
+
+        options = ["--sweep", str(self.sweep)]
+        if path is not None:
+            options += ["--promises", str(path)]
+        return self.sweep_command("push", *options, stub=stub)
+
+    def assert_promise_refused(self, stub: Stub, path: Path | None, detail: str) -> None:
+        """Assert promise rejection precedes the stubbed Git push."""
+
+        result = self.promise_push(stub, path)
+        self.assertEqual(result.returncode, 79, result.stderr)
+        self.assertIn(detail, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_fragment_absent_from_messages_and_body(self) -> None:
+        """A row without literal evidence in either location blocks the push."""
+
+        self.assert_promise_refused(self.promise_stub(), self.promise_file(), "fragment absent")
+
+    def test_push_accepts_fragment_in_commit_message(self) -> None:
+        """A normalized fragment in one pushed commit message satisfies a promise."""
+
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "qualify  the close\nerrors",
+        )
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
+        result = self.promise_push(self.promise_stub(), self.promise_file())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_accepts_fragment_only_in_pr_body(self) -> None:
+        """The PR body can supply literal promise evidence."""
+
+        result = self.promise_push(
+            self.promise_stub(body="We will qualify the close errors in this patch."),
+            self.promise_file(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_ignores_other_login_promise(self) -> None:
+        """A promise from another login imposes no row requirement."""
+
+        result = self.promise_push(self.promise_stub(login="reviewer"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_ignores_own_non_promise_comment(self) -> None:
+        """An own comment without next-push language permits a push."""
+
+        result = self.promise_push(self.promise_stub(comment="I will push"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_row_for_non_promise_comment(self) -> None:
+        """A row naming an own comment without a promise is refused."""
+
+        stub = self.promise_stub(body="qualify the close errors", comment="I will push")
+        stub.comments[25619].append(
+            {
+                "id": 81816,
+                "user": {"login": "tester"},
+                "body": "I'll qualify it in my next push.",
+                "html_url": "https://example.invalid/comments/81816",
+            }
+        )
+        self.assert_promise_refused(stub, self.promise_file(), "not an own next-push promise")
+
+    def test_push_enforces_promise_on_second_comment_page(self) -> None:
+        """A promise after one full comment page still blocks an unrecorded push."""
+
+        stub = self.promise_stub(max_response_items=1)
+        stub.comments[25619].insert(
+            0,
+            {
+                "id": 81814,
+                "user": {"login": "tester"},
+                "body": "No promise here.",
+            },
+        )
+        self.assert_promise_refused(stub, None, "81815")
+        self.assertTrue(any("page=2" in path for _, path, _ in stub.requests))
+
+    def test_push_fragment_length_boundary_and_contraction(self) -> None:
+        """Seven non-space characters fail; eight satisfy an I'll promise."""
+
+        stub = self.promise_stub(body="abcdefgh", comment="I'll qualify it in my next push.")
+        path = self.promise_file("81815: abcdefg\n")
+        self.assert_promise_refused(stub, path, "malformed row")
+        path.write_text("81815: abcdefgh\n", encoding="utf-8")
+        result = self.promise_push(stub, path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_push_comment_read_failure_stops_push(self) -> None:
+        """A failed comment API read never reaches Git push."""
+
+        stub = self.promise_stub()
+        stub.fail_comments.add(25619)
+        result = self.promise_push(stub)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_push_without_open_pull_proceeds(self) -> None:
+        """A branch without an open pull carries no promise check."""
+
+        result = self.promise_push(Stub())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_malformed_open_pull_rows(self) -> None:
+        """Every malformed pull row fails closed before comment selection."""
+
+        for row in (
+            {"head": {}},
+            {"head": {"ref": ""}, "user": {"login": "tester"}},
+            {"head": {"ref": "other"}, "user": {}},
+            "bad row",
+        ):
+            with self.subTest(row=row):
+                stub = self.promise_stub()
+                stub.open_pulls.insert(0, row)
+                self.assert_promise_refused(stub, None, "malformed")
+
+    def test_push_refuses_fifo_and_oversize_promise_file(self) -> None:
+        """Promise input must be a regular file of at most 64 KiB."""
+
+        stub = self.promise_stub()
+        fifo = self.tmp / "promise.fifo"
+        os.mkfifo(fifo)
+        self.assert_promise_refused(stub, fifo, "not a regular file")
+        path = self.promise_file("#" + "x" * 65536)
+        self.assert_promise_refused(stub, path, "above 64 KiB")
+
+    def test_push_refuses_fragment_split_across_commit_messages(self) -> None:
+        """Adjacent commit messages cannot combine to satisfy one fragment."""
+
+        for message in ("errors now", "qualify close"):
+            git(
+                self.repo,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                message,
+            )
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
+        self.assert_promise_refused(
+            self.promise_stub(),
+            self.promise_file("81815: qualify close errors\n"),
+            "fragment absent",
+        )
+
+    def test_push_refuses_missing_row_and_invalid_file_rows(self) -> None:
+        """Missing, malformed, and unrelated rows all block an own promise."""
+
+        for content, detail in (
+            ("# empty\n", "missing row"),
+            ("not a row\n", "malformed row"),
+            ("81816: unrelated content\n", "not an own next-push promise"),
+        ):
+            with self.subTest(content=content):
+                self.assert_promise_refused(self.promise_stub(), self.promise_file(content), detail)
+
+    def test_push_refuses_invalid_utf8_and_too_many_rows(self) -> None:
+        """Invalid UTF-8 and more than 200 rows fail before the push."""
+
+        path = self.promise_file()
+        path.write_bytes(b"\xff")
+        self.assert_promise_refused(self.promise_stub(), path, str(path))
+        path.write_text("".join(f"{n}: eightchars\n" for n in range(1, 202)), encoding="utf-8")
+        self.assert_promise_refused(self.promise_stub(), path, "above 200 rows")
+
+    def test_push_refuses_nonlocal_merge_base(self) -> None:
+        """A PR merge base absent from local Git cannot satisfy a promise."""
+
+        stub = self.promise_stub(body="qualify the close errors")
+        stub.open_pulls[0]["merge_base"] = B
+        self.assert_promise_refused(stub, self.promise_file(), "not a local commit")
+
+    def test_push_refuses_multiple_own_pulls(self) -> None:
+        """Ambiguous own open pull selection blocks a push."""
+
+        stub = self.promise_stub()
+        stub.open_pulls.append(dict(stub.open_pulls[0], number=25620))
+        self.assert_promise_refused(stub, None, "ambiguous")
 
     def assert_sweep_refused(self, *options: str) -> None:
         """Both operations fail locally with a sweep-specific error."""
