@@ -220,3 +220,18 @@ class FairyRequestCheckTest(forgejo.FairyRequestTestBase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn(f"invalid FFMPEG_FORGEJO_LOGIN: {bad}", proc.stderr)
                 self.assertEqual(stub.requests, [])
+
+    def test_bot_reviewer_traversal_refused_without_api(self):
+        """Path traversal in FFMPEG_FORGEJO_BOT_REVIEWER is refused without API I/O."""
+        stub = forgejo.Stub()
+        proc = self.run_command(
+            stub,
+            "pr",
+            "topic",
+            "title",
+            str(self.tmp / "body.md"),
+            env_updates={"FFMPEG_FORGEJO_BOT_REVIEWER": ".."},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("not a login: ..", proc.stderr)
+        self.assertEqual(stub.requests, [])
