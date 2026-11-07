@@ -94,6 +94,20 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("builtin ./configure", self.tree),
             ("time ./configure", self.tree),
             ("systemd-run --user -p MemoryHigh=8G ./configure", self.tree),
+            ('cd "$X" && ./configure', self.tree),
+            ("cd - && ./configure", self.tree),
+            ("popd; ./configure", self.tree),
+            ("sudo ./configure", self.tree),
+            ("flock /tmp/l ./configure", self.tree),
+            ("xargs ./configure", self.tree),
+            ("echo ./configure | bash", self.tree),
+            ("f=./configure; $f", self.tree),
+            ("source ./configure", self.tree),
+            (". ./configure", self.tree),
+            ("find . -name configure -exec sh {} \\;", self.tree),
+            ("echo $(./configure)", self.tree),
+            ("echo `./configure`", self.tree),
+            ("bash -c 'sudo ./configure'", self.tree),
         )
         (self.root / "BUILD").mkdir()
         for client in CLIENTS:
@@ -114,6 +128,16 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("git diff -- configure", self.tree),
             ("./configure", self.other),
             ("make -j4", self.tree),
+            ("sed -n 1,20p configure", self.tree),
+            ("head -50 configure", self.tree),
+            ("git log -- configure", self.tree),
+            (f"ls {self.tree}/configure", self.root),
+            ("rg -n foo configure", self.tree),
+            ('cd "$X" && make -j4', self.tree),
+            (f"python3 -I scripts/ffmpeg_configure.py {self.tree} {self.build}", self.root),
+            ("sudo ./configure", self.other),
+            ("echo hello", self.tree),
+            (f"bash -c 'cd {self.tree} && make'", self.root),
         )
         for client in CLIENTS:
             for command, cwd in cases:
@@ -191,6 +215,7 @@ class RawConfigureGuardTest(unittest.TestCase):
                 self.assertIn(f"--client {client}", hooks[1]["command"])
                 for command, expected in (
                     ("./configure", 2),
+                    ("sudo ./configure", 2),
                     ("python3 scripts/ffmpeg_configure.py A B", 0),
                 ):
                     result = subprocess.run(
@@ -198,13 +223,47 @@ class RawConfigureGuardTest(unittest.TestCase):
                         input=json.dumps(self.payload(client, command, self.tree)),
                         text=True,
                         capture_output=True,
-                        cwd=ROOT,
+                        cwd=ROOT / "tests",
                         timeout=5,
                         check=False,
-                        env={**os.environ, "CLAUDE_PROJECT_DIR": str(ROOT)},
+                        env={
+                            **os.environ,
+                            "CLAUDE_PROJECT_DIR": str(ROOT),
+                            "GEMINI_PROJECT_DIR": str(ROOT),
+                        },
                     )
                     self.assertEqual(result.returncode, expected, result.stderr)
         self.assertFalse(self.marker.exists())
+
+    def test_missing_hook_script_blocks(self) -> None:
+        """Refuse shell tool calls when a hook resolves to a missing guard script."""
+        missing = self.root / "missing"
+        (missing / "tests").mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "-q", str(missing)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for client in ("codex", "gemini"):
+            with self.subTest(client=client):
+                path = CONFIGS[client][0]
+                hooks = json.loads(path.read_text(encoding="utf-8"))["hooks"]
+                event = CONFIGS[client][1]
+                command = hooks[event][0]["hooks"][1]["command"]
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    input=json.dumps(self.payload(client, "./configure", self.tree)),
+                    text=True,
+                    capture_output=True,
+                    cwd=missing / "tests",
+                    timeout=5,
+                    check=False,
+                    env={**os.environ, "GEMINI_PROJECT_DIR": str(missing)},
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(str(missing / "scripts/raw_configure_guard.py"), result.stderr)
 
     def test_opencode_plugin_wiring(self) -> None:
         """Verify the project plugin refuses blocks and has valid JavaScript syntax."""

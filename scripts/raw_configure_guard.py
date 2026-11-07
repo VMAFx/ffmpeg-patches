@@ -19,12 +19,32 @@ MAX_COMMAND = 65536
 MAX_TOKENS = 4000
 MAX_DEPTH = 4
 SEPARATORS = frozenset((";", "&&", "||", "|", "&", "\n", "(", ")"))
-SHELLS = frozenset(("bash", "sh", "dash", "zsh", "ksh"))
+SHELLS = frozenset(("bash", "sh"))
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.DOTALL)
-SYSTEMD_VALUES = frozenset(
-    ("-p", "--property", "-u", "--unit", "-E", "--setenv", "-M", "--machine", "--slice", "-G")
+READERS = frozenset(
+    (
+        "cat",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "wc",
+        "nl",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "diff",
+        "cmp",
+        "file",
+        "stat",
+        "ls",
+        "sha256sum",
+        "md5sum",
+        "sed",
+        "git",
+    )
 )
-ENV_VALUES = frozenset(("-u", "--unset", "-C", "--chdir", "-S", "--split-string"))
 
 
 def _input(client: str, payload: dict[str, Any]) -> tuple[str | None, Path]:
@@ -69,75 +89,6 @@ def _tokens(command: str) -> list[str] | None:
     return tokens if len(tokens) <= MAX_TOKENS else None
 
 
-def _after_options(words: list[str], start: int, values: frozenset[str]) -> int:
-    """Skip bounded wrapper options and their documented separate values."""
-    index = start
-    for _ in range(len(words)):
-        if index >= len(words):
-            break
-        word = words[index]
-        if word == "--":
-            return index + 1
-        if not word.startswith("-") or word == "-":
-            break
-        index += 2 if word in values else 1
-    return min(index, len(words))
-
-
-def _peel(words: list[str]) -> list[str]:
-    """Remove leading assignments and supported process wrappers."""
-    index = 0
-    for _ in range(len(words)):
-        if index >= len(words):
-            break
-        next_index = _wrapper_end(words, index)
-        if next_index == index:
-            break
-        index = next_index
-    return words[index:]
-
-
-def _wrapper_end(words: list[str], index: int) -> int:
-    """Return the next command index after one supported wrapper."""
-    name = os.path.basename(words[index])
-    end = index
-    if ASSIGNMENT.fullmatch(words[index]):
-        end = index + 1
-    elif name == "env":
-        end = _after_env(words, index + 1)
-    elif name in ("nice", "ionice", "chrt", "time", "timeout", "stdbuf"):
-        values = {
-            "nice": frozenset(("-n",)),
-            "ionice": frozenset(("-c", "-n")),
-            "timeout": frozenset(("-k",)),
-            "stdbuf": frozenset(("-o", "-e", "-i")),
-        }.get(name, frozenset())
-        end = _after_options(words, index + 1, values)
-        end = min(end + int(name in ("timeout", "chrt")), len(words))
-    elif name == "taskset":
-        end = min(index + 2, len(words))
-    elif name in ("nohup", "setsid", "exec", "command", "builtin"):
-        end = index + 1
-    elif name == "systemd-run":
-        end = _after_options(words, index + 1, SYSTEMD_VALUES)
-    elif name == "praetorctl" and words[index + 1 : index + 2] == ["admit"]:
-        try:
-            end = words.index("--", index + 2) + 1
-        except ValueError:
-            end = len(words)
-    return end
-
-
-def _after_env(words: list[str], start: int) -> int:
-    """Skip env options and its leading variable assignments."""
-    end = _after_options(words, start, ENV_VALUES)
-    for _ in range(len(words)):
-        if end >= len(words) or not ASSIGNMENT.fullmatch(words[end]):
-            break
-        end += 1
-    return end
-
-
 def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
     """Find a shell script path or its -c program string."""
     for index in range(1, len(words)):
@@ -152,32 +103,40 @@ def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
     return None, False
 
 
-def _configure_path(word: str, cwd: Path) -> Path | None:
-    """Return the configure file when its source tree has libavcodec."""
+def _configure_path(word: str, cwd: Path | None) -> Path | None:
+    """Identify a configure word in an FFmpeg tree or unknown directory."""
+    if ASSIGNMENT.fullmatch(word):
+        word = word.split("=", 1)[1]
     if "$" in word or "`" in word:
         return Path(word) if "configure" in word else None
     if os.path.basename(word) != "configure":
         return None
+    if cwd is None:
+        return Path(word)
     path = (cwd / os.path.expanduser(word)).resolve()
     return path if (path.parent / "libavcodec").is_dir() else None
 
 
-def _inspect_simple(words: list[str], cwd: Path) -> tuple[Path | None, str | None]:
+def _inspect_simple(words: list[str], cwd: Path | None) -> tuple[Path | None, str | None]:
     """Classify a simple command and return an inline program when present."""
-    words = _peel(words)
-    if not words:
-        return None, None
-    name = os.path.basename(words[0])
+    index = 0
+    for word in words:
+        if not ASSIGNMENT.fullmatch(word):
+            break
+        index += 1
+    name = os.path.basename(words[index]) if index < len(words) else ""
+    if name not in READERS:
+        for word in words:
+            blocked = _configure_path(word, cwd)
+            if blocked is not None:
+                return blocked, None
     if name == "eval":
-        return None, " ".join(words[1:])
+        return None, " ".join(words[index + 1 :])
     if name in SHELLS:
-        target, inline = _shell_argument(words)
-        if target is None:
-            return None, None
+        target, inline = _shell_argument(words[index:])
         if inline:
             return None, target
-        return _configure_path(target, cwd), None
-    return _configure_path(words[0], cwd), None
+    return None, None
 
 
 def _inspect(command: str, cwd: Path) -> Path | None:
@@ -208,14 +167,19 @@ def _inspect(command: str, cwd: Path) -> Path | None:
 
 
 def _step(
-    words: list[str], cwd: Path, depth: int, pending: list[tuple[str, Path, int]]
-) -> tuple[Path | None, Path]:
+    words: list[str], cwd: Path | None, depth: int, pending: list[tuple[str, Path | None, int]]
+) -> tuple[Path | None, Path | None]:
     """Update directory or queue an inline program from one simple command."""
-    if words[0] in ("cd", "pushd") and len(words) > 1:
-        return None, (cwd / os.path.expanduser(words[1])).resolve()
     blocked, inline = _inspect_simple(words, cwd)
     if inline is not None:
         pending.append((inline, cwd, depth + 1))
+    if words[0] == "popd":
+        return blocked, None
+    if words[0] in ("cd", "pushd"):
+        target = "~" if words == ["cd"] else words[1] if len(words) == 2 else ""
+        if not target or target == "-" or "$" in target or "`" in target or cwd is None:
+            return blocked, None
+        return blocked, (cwd / os.path.expanduser(target)).resolve()
     return blocked, cwd
 
 

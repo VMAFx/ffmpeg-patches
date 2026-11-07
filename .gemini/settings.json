@@ -11,7 +11,7 @@
           },
           {
             "type": "command",
-            "command": "python3 -I scripts/raw_configure_guard.py --client gemini",
+            "command": "python3 -I \"$GEMINI_PROJECT_DIR/scripts/raw_configure_guard.py\" --client gemini",
             "timeout": 15000
           }
         ]

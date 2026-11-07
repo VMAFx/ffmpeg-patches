@@ -11,7 +11,7 @@
           },
           {
             "type": "command",
-            "command": "python3 -I scripts/raw_configure_guard.py --client codex",
+            "command": "sh -c 'exec python3 -I \"$(git rev-parse --show-toplevel)/scripts/raw_configure_guard.py\" --client codex'",
             "timeout": 15
           }
         ]
