@@ -12,7 +12,8 @@ Known limitation: words assembled from variables (e.g. `p=con; ./${p}figure`)
 are not expanded across assignments; directory existence is read when the hook
 runs; a command that removes or creates the target before its cd runs is judged
 by the state at hook time. A word whose directory and basename are both
-undecidable (e.g. `$X/$Y`) passes.
+undecidable (e.g. `$X/$Y`) passes. An unparsed command outside a tree that
+names no cd-family word and no tree path passes.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ MAX_TOKENS = 4000
 MAX_DEPTH = 4
 MAX_SUBSHELL_DEPTH = 64
 SEPARATORS = frozenset((";", "&&", "||", "|", "&", "\n", "(", ")"))
+NAVIGATORS = frozenset(("cd", "pushd", "popd", "exec", "eval", "source", "."))
 SHELLS = frozenset(("bash", "sh"))
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.DOTALL)
 CONFIGURE_WORD = re.compile(r"(?<![A-Za-z0-9_])configure(?![A-Za-z0-9_])")
@@ -270,6 +272,8 @@ def _undecidable_in_tree(cleaned: str, cwd: Path | None) -> bool:
     if "/" not in cleaned or DECIDABLE_NAME.fullmatch(os.path.basename(cleaned)):
         return False
     dirname = os.path.dirname(cleaned) or "."
+    if dirname in ("$(pwd)", '"$(pwd)"', "'$(pwd)'"):
+        return cwd is None or (cwd / "libavcodec").is_dir()
     if not DECIDABLE_DIR.fullmatch(dirname):
         return False
     if cwd is None:
@@ -278,22 +282,31 @@ def _undecidable_in_tree(cleaned: str, cwd: Path | None) -> bool:
     return (parent / "libavcodec").is_dir()
 
 
+def _resolve_target_tree(dirname: str, base: str, word: str, cwd: Path | None) -> Path | None:
+    """Check whether a resolved directory and configure basename target an FFmpeg tree."""
+    if dirname in ("$(pwd)", '"$(pwd)"', "'$(pwd)'"):
+        return Path(word) if (cwd is None or (cwd / "libavcodec").is_dir()) else None
+    if not DECIDABLE_DIR.fullmatch(dirname) or cwd is None:
+        return Path(word)
+    parent = (cwd / os.path.expanduser(dirname)).resolve()
+    return (parent / base) if (parent / "libavcodec").is_dir() else None
+
+
 def _configure_path(word: str, cwd: Path | None) -> Path | None:
     """Identify a configure word in an FFmpeg tree or unknown directory."""
     cleaned = _clean_word(word)
     if _undecidable_in_tree(cleaned, cwd):
         return Path(word)
+    dirname = os.path.dirname(cleaned) or "."
     if "$" in cleaned or "`" in cleaned:
-        return Path(word) if _dynamic_configure(cleaned) else None
+        if not _dynamic_configure(cleaned):
+            return None
+        return _resolve_target_tree(dirname, "configure", word, cwd)
     base = os.path.basename(cleaned)
     is_glob = bool(GLOB_CHARS.intersection(base)) and fnmatch.fnmatchcase("configure", base)
     if base != "configure" and not is_glob:
         return None
-    dirname = os.path.dirname(cleaned) or "."
-    if not DECIDABLE_DIR.fullmatch(dirname) or cwd is None:
-        return Path(word)
-    parent = (cwd / os.path.expanduser(dirname)).resolve()
-    return (parent / base) if (parent / "libavcodec").is_dir() else None
+    return _resolve_target_tree(dirname, base, word, cwd)
 
 
 def _inspect_interpreter(words: list[str], index: int, cwd: Path | None) -> Path | None:
@@ -357,17 +370,35 @@ def _is_reader(words: list[str]) -> bool:
     return False
 
 
-def _scan_inline(words: list[str], index: int) -> str | None:
-    """Find an inline shell program or eval arguments across command words."""
+def _inspect_shell_operand(target: str, cwd: Path | None) -> Path | None:
+    """Judge a shell script operand without a slash like a relative script in cwd."""
+    if "/" in target:
+        return None
+    in_tree = cwd is None or (cwd / "libavcodec").is_dir()
+    cleaned = _clean_word(target)
+    if not DECIDABLE_NAME.fullmatch(cleaned):
+        return Path(target) if in_tree else None
+    is_glob = bool(GLOB_CHARS.intersection(cleaned)) and fnmatch.fnmatchcase("configure", cleaned)
+    if (cleaned == "configure" or is_glob or _flatten(cleaned) == "configure") and in_tree:
+        return Path(target)
+    return None
+
+
+def _scan_inline(words: list[str], index: int, cwd: Path | None) -> tuple[Path | None, str | None]:
+    """Find an inline shell program, blocked script operand, or eval arguments."""
     for pos in range(index, min(len(words), index + MAX_TOKENS)):
         name = os.path.basename(words[pos])
         if name == "eval":
-            return " ".join(words[pos + 1 :])
+            return None, " ".join(words[pos + 1 :])
         if name in SHELLS:
             target, inline = _shell_argument(words[pos:])
             if inline:
-                return target
-    return None
+                return None, target
+            if target is not None:
+                blocked = _inspect_shell_operand(target, cwd)
+                if blocked is not None:
+                    return blocked, None
+    return None, None
 
 
 def _inspect_simple(words: list[str], cwd: Path | None) -> tuple[Path | None, str | None]:
@@ -387,7 +418,7 @@ def _inspect_simple(words: list[str], cwd: Path | None) -> tuple[Path | None, st
         blocked = _find_configure_path(words, cwd)
         if blocked is not None:
             return blocked, None
-    return None, _scan_inline(words, index)
+    return _scan_inline(words, index, cwd)
 
 
 def _inspect_pipeline(
@@ -482,6 +513,132 @@ def _has_unparsed_configure(source: str) -> bool:
     return False
 
 
+def _unparsed_reaches_tree(source: str, cwd: Path | None) -> bool:
+    """Determine whether an unparsed shell command could reach an FFmpeg tree."""
+    for raw in source.split()[:MAX_TOKENS]:
+        word = raw.lstrip("({").rstrip(";)")
+        if word in NAVIGATORS:
+            return True
+        if "/" not in word:
+            continue
+        dirname = os.path.dirname(word)
+        if not DECIDABLE_DIR.fullmatch(dirname) or cwd is None:
+            return True
+        try:
+            resolved_dir = Path(os.path.normpath(cwd / os.path.expanduser(dirname)))
+            resolved_word = Path(os.path.normpath(cwd / os.path.expanduser(word)))
+            if (resolved_dir / "libavcodec").is_dir() or (resolved_word / "libavcodec").is_dir():
+                return True
+        except (OSError, ValueError):
+            return True
+    return False
+
+
+def _update_quote(char: str, quote: str | None) -> str | None:
+    """Update current quote state when encountering quote delimiters."""
+    if quote is None and char in ("'", '"'):
+        return char
+    if quote is not None and char == quote:
+        return None
+    return quote
+
+
+def _scan_substitution_body(command: str, start: int) -> tuple[int, int] | None:
+    """Find the closing parenthesis of a command substitution without recursion."""
+    depth = 1
+    idx = start
+    quote: str | None = None
+    cmd_len = len(command)
+    for _ in range(cmd_len):
+        if idx >= cmd_len:
+            break
+        char = command[idx]
+        if char == "\\":
+            idx += 2
+            continue
+        if quote is not None:
+            quote = _update_quote(char, quote)
+            idx += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            idx += 1
+            continue
+        if command[idx : idx + 2] == "$(":
+            depth += 1
+            if depth > MAX_SUBSHELL_DEPTH:
+                return None
+            idx += 2
+            continue
+        if char == ")":
+            depth -= 1
+            if depth == 0:
+                return start, idx
+        idx += 1
+    return None
+
+
+def _scan_substitutions(
+    command: str,
+) -> tuple[str, list[str], list[tuple[str, str]]] | None:
+    """Find command substitutions before shlex parsing without recursion."""
+    if len(command.encode("utf-8", "surrogatepass")) > MAX_COMMAND:
+        return None
+    pieces: list[str] = []
+    inners: list[str] = []
+    replacements: list[tuple[str, str]] = []
+    idx = 0
+    quote: str | None = None
+    cmd_len = len(command)
+    for _ in range(cmd_len):
+        if idx >= cmd_len:
+            break
+        char = command[idx]
+        if char == "\\":
+            pieces.append(command[idx : idx + 2])
+            idx += 2
+            continue
+        if quote != "'" and command[idx : idx + 2] == "$(":
+            bounds = _scan_substitution_body(command, idx + 2)
+            if bounds is None:
+                return None
+            inner_start, inner_end = bounds
+            tag = f"__RCG_SUB_{len(replacements)}__"
+            replacements.append((tag, command[idx : inner_end + 1]))
+            inners.append(command[inner_start:inner_end])
+            pieces.append(tag)
+            idx = inner_end + 1
+            continue
+        quote = _update_quote(char, quote)
+        pieces.append(char)
+        idx += 1
+    return "".join(pieces), inners, replacements
+
+
+def _restore_tokens(tokens: list[str], replacements: list[tuple[str, str]]) -> list[str]:
+    """Restore command substitution placeholders in parsed tokens."""
+    if not replacements:
+        return tokens
+    restored = list(tokens)
+    for tag, full_sub in replacements:
+        restored = [tok.replace(tag, full_sub) for tok in restored]
+    return restored
+
+
+def _parse_source(
+    source: str, directory: Path | None, depth: int, pending: list[tuple[str, Path | None, int]]
+) -> list[str] | None:
+    """Extract substitutions, queue inner commands, and return parsed tokens."""
+    sub_info = _scan_substitutions(source)
+    if sub_info is None:
+        return None
+    rewritten, inners, reps = sub_info
+    for inner in inners:
+        pending.append((inner, directory, depth + 1))
+    tokens = _tokens(rewritten)
+    return _restore_tokens(tokens, reps) if tokens is not None else None
+
+
 def _inspect(command: str, cwd: Path) -> Path | None:
     """Walk bounded shell fragments and inline programs without recursion."""
     pending = [(command, cwd, 0)]
@@ -491,10 +648,12 @@ def _inspect(command: str, cwd: Path) -> Path | None:
         source, directory, depth = pending.pop()
         if depth > MAX_DEPTH:
             return Path("configure (nesting limit)")
-        tokens = _tokens(source)
+        tokens = _parse_source(source, directory, depth, pending)
         if tokens is None:
             if _has_unparsed_configure(source):
                 return Path("configure (parse or size limit)")
+            if _unparsed_reaches_tree(source, directory):
+                return Path("configure (unparsed command can reach an FFmpeg tree)")
             continue
         blocked = _inspect_tokens(tokens, directory, depth, pending)
         if blocked is not None:

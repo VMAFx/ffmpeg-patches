@@ -651,3 +651,60 @@ class RawConfigureGuardTest(unittest.TestCase):
                         env=env,
                     )
                     self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_unparsed_reaches_tree_refusals(self) -> None:
+        """Refuse unparsed configure invocations that can reach an FFmpeg tree."""
+        pad = " # " + "x" * 65536
+        cases = (
+            ("./co{n,}figure" + pad, self.tree),
+            ("./co`printf n`figure" + pad, self.tree),
+            ("./co${x:-n}figure" + pad, self.tree),
+            (f"cd {self.tree} && ./co{{n,}}figure" + pad, self.other),
+            ("cd tree && ./co{n,}figure" + pad, self.root),
+            (f"{self.tree}/co{{n,}}figure" + pad, self.other),
+            (f"bash {self.tree}/co{{n,}}figure" + pad, self.other),
+            ("./co{n,}figure # don't", self.tree),
+            (f"cd {self.tree} && ./co{{n,}}figure # don't", self.other),
+        )
+        self._assert_refused(cases)
+
+    def test_command_substitution_path_refusals(self) -> None:
+        """Refuse command substitutions glued to configure paths targeting a tree."""
+        cases = (
+            ("$(pwd)/configure", self.tree),
+            ("$(git rev-parse --show-toplevel 2>/dev/null || pwd)/configure", self.tree),
+            ('"$(pwd)"/configure', self.tree),
+            ("$(pwd)/co{n,}figure", self.tree),
+        )
+        self._assert_refused(cases)
+
+    def test_shell_script_operand_without_slash_refusals(self) -> None:
+        """Refuse shell script arguments without a slash that target configure."""
+        cases = (
+            ("sh co{n,}figure", self.tree),
+            ("bash co`echo n`figure", self.tree),
+            ("sh co$'n'figure", self.tree),
+        )
+        self._assert_refused(cases)
+
+    def test_unparsed_and_dynamic_path_allows(self) -> None:
+        """Allow unparsed comments and dynamic paths outside an FFmpeg tree."""
+        pad = " # " + "x" * 65536
+        cases = (
+            ("ls" + pad, self.other),
+            ("ls # don't", self.other),
+            ("cat <<'EOF' > /dev/null\nfix(hooks): it's in scripts/x.py\nEOF", self.other),
+            ("cat <<'EOF' > /dev/null\nfix(hooks): it's in scripts/x.py\nEOF" + pad, self.other),
+            ("git commit -F - <<'EOF'\nfix: don't refuse scripts/a.py\nEOF", self.other),
+            ("echo $(pwd)/x", self.tree),
+            ("sh ./tools/x.sh", self.tree),
+            ("cat $(pwd)/README", self.tree),
+            ("$(pwd)/configure", self.other),
+            ("sh co{n,}figure", self.other),
+        )
+        for client in CLIENTS:
+            for command, cwd in cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
