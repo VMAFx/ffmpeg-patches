@@ -55,7 +55,7 @@ class RawConfigureGuardTest(unittest.TestCase):
     def run_guard(self, client: str, payload: object) -> subprocess.CompletedProcess[str]:
         """Run only the guard with JSON on stdin and a short deadline."""
         data = payload if isinstance(payload, str) else json.dumps(payload)
-        return subprocess.run(
+        return subprocess.run(  # nosec B603 - fixed guard argv with explicit interpreter.
             [sys.executable, "-I", str(GUARD), "--client", client],
             input=data,
             text=True,
@@ -228,7 +228,7 @@ class RawConfigureGuardTest(unittest.TestCase):
                     ("sudo ./configure", 2),
                     ("python3 scripts/ffmpeg_configure.py A B", 0),
                 ):
-                    result = subprocess.run(
+                    result = subprocess.run(  # nosec B603 B607 - repo-owned hook command.
                         ["bash", "-c", hooks[1]["command"]],
                         input=json.dumps(self.payload(client, command, self.tree)),
                         text=True,
@@ -249,7 +249,7 @@ class RawConfigureGuardTest(unittest.TestCase):
         """Refuse shell tool calls when a hook resolves to a missing guard script."""
         missing = self.root / "missing"
         (missing / "tests").mkdir(parents=True)
-        subprocess.run(
+        subprocess.run(  # nosec B603 B607 - fixed git init in a temp test tree.
             ["git", "init", "-q", str(missing)],
             check=True,
             capture_output=True,
@@ -262,7 +262,7 @@ class RawConfigureGuardTest(unittest.TestCase):
                 hooks = json.loads(path.read_text(encoding="utf-8"))["hooks"]
                 event = CONFIGS[client][1]
                 command = hooks[event][0]["hooks"][1]["command"]
-                result = subprocess.run(
+                result = subprocess.run(  # nosec B603 B607 - repo-owned hook command.
                     ["bash", "-c", command],
                     input=json.dumps(self.payload(client, "./configure", self.tree)),
                     text=True,
@@ -286,7 +286,7 @@ class RawConfigureGuardTest(unittest.TestCase):
         node = shutil.which("node")
         if node is None:
             self.skipTest("node unavailable; JavaScript syntax check skipped")
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 B607 - tracked plugin file.
             [node, "--check", str(path)], capture_output=True, text=True, timeout=5, check=False
         )
         self.assertEqual(result.returncode, 0, result.stderr)
