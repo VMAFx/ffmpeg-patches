@@ -4,6 +4,7 @@
 
 import datetime
 import socket
+import unittest.mock
 
 from tests import test_ffmpeg_forgejo as forgejo
 
@@ -148,3 +149,74 @@ class FairyRequestCheckTest(forgejo.FairyRequestTestBase):
         )
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn(("GET", "/api/v1/settings/api", ""), stub.requests)
+
+    def test_skip_unavailable_probes_settings_once(self):
+        """Skip-unavailable reuses the settings probe response without duplicate requests."""
+        stub = forgejo.Stub()
+        stub.open_pulls = [pull(reviewers=["Forgejo_Fairy"])]
+        served = 0
+        original = forgejo.Handler._route_settings
+
+        def single_settings(handler, s, url):
+            nonlocal served
+            if url.path == "/api/v1/settings/api":
+                served += 1
+                if served > 1:
+                    handler.reply(500, {"message": "duplicate settings request"})
+                    return True
+            return original(handler, s, url)
+
+        with unittest.mock.patch.object(forgejo.Handler, "_route_settings", single_settings):
+            proc = self.run_command(
+                stub,
+                "fairy-requests",
+                "--skip-unavailable",
+                env_updates={"FFMPEG_FORGEJO_LOGIN": "tester"},
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        settings_reqs = [r for r in stub.requests if r[1] == "/api/v1/settings/api"]
+        self.assertEqual(len(settings_reqs), 1)
+
+    def test_login_validation_positive_and_boundary(self):
+        """Valid and single-character logins are accepted without rejection."""
+        for user in ("custom_user", "a.b-c_d", "a"):
+            with self.subTest(login=user):
+                stub = forgejo.Stub()
+                proc = self.run_command(
+                    stub,
+                    "fairy-requests",
+                    env_updates={"FFMPEG_FORGEJO_LOGIN": user},
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, "")
+
+    def test_login_validation_negative_rejects_and_avoids_api(self):
+        """Malformed and path traversal logins die naming the variable without API I/O."""
+        for bad in ("x/../FFmpeg", "..", "-x", "a b"):
+            with self.subTest(login=bad):
+                stub = forgejo.Stub()
+                proc = self.run_command(
+                    stub,
+                    "fairy-requests",
+                    env_updates={"FFMPEG_FORGEJO_LOGIN": bad},
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(f"invalid FFMPEG_FORGEJO_LOGIN: {bad}", proc.stderr)
+                self.assertEqual(stub.requests, [])
+
+    def test_login_negative_rejects_in_pr_without_api(self):
+        """Malformed logins in PR commands die naming the variable without API I/O."""
+        for bad in ("x/../FFmpeg", "..", "-x", "a b"):
+            with self.subTest(login=bad):
+                stub = forgejo.Stub()
+                proc = self.run_command(
+                    stub,
+                    "pr",
+                    "topic",
+                    "title",
+                    str(self.tmp / "body.md"),
+                    env_updates={"FFMPEG_FORGEJO_LOGIN": bad},
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(f"invalid FFMPEG_FORGEJO_LOGIN: {bad}", proc.stderr)
+                self.assertEqual(stub.requests, [])

@@ -87,9 +87,20 @@ api() (
   fi
 )
 
+# validate_login [LOGIN]: validate and print LOGIN (default: FFMPEG_FORGEJO_LOGIN); die if invalid.
+validate_login() {
+  local val="${1-${FFMPEG_FORGEJO_LOGIN:-}}"
+  if [[ "$val" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
+    printf '%s\n' "$val"
+    return 0
+  fi
+  die "invalid FFMPEG_FORGEJO_LOGIN: $val"
+}
+
+# login: print the authenticated Forgejo username or configured override.
 login() {
-  if [ -n "${FFMPEG_FORGEJO_LOGIN:-}" ]; then
-    printf '%s\n' "$FFMPEG_FORGEJO_LOGIN"
+  if [ "${FFMPEG_FORGEJO_LOGIN+set}" = set ]; then
+    validate_login "$FFMPEG_FORGEJO_LOGIN"
     return
   fi
   local out
@@ -419,16 +430,21 @@ print(*numbers, sep="\n")' <<<"$out" 2>/dev/null)"; then
   rm -f "$candidates"
 }
 
+# parse_page_size: parse max_response_items from /settings/api JSON on stdin.
+parse_page_size() {
+  python3 -c 'import json,sys
+size = json.load(sys.stdin)["max_response_items"]
+if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+    raise SystemExit(1)
+print(min(50, size))' 2>/dev/null
+}
+
 # discover_page_size: cache API settings in the parent shell before listing subshells.
 discover_page_size() {
   [ -z "$page_size" ] || return 0
   local out
   out="$(api GET /settings/api)" || die "cannot read /settings/api"
-  page_size="$(python3 -c 'import json,sys
-size = json.load(sys.stdin)["max_response_items"]
-if isinstance(size, bool) or not isinstance(size, int) or size < 1:
-    raise SystemExit(1)
-print(min(50, size))' <<<"$out" 2>/dev/null)" \
+  page_size="$(parse_page_size <<<"$out")" \
     || die "invalid max_response_items in /settings/api; expected a positive integer"
 }
 
@@ -585,8 +601,8 @@ fairy_requests() {
       return 0
     fi
   fi
-  if [ -n "${FFMPEG_FORGEJO_LOGIN:-}" ]; then
-    me="$FFMPEG_FORGEJO_LOGIN"
+  if [ "${FFMPEG_FORGEJO_LOGIN+set}" = set ]; then
+    me="$(validate_login "$FFMPEG_FORGEJO_LOGIN")" || exit 1
   else
     if out="$(api GET /user)"; then rc=0; else rc=$?; fi
     if [ "$optional" = --skip-unavailable ] && [[ "$rc" =~ ^(6|7|28)$ ]]; then
@@ -604,6 +620,8 @@ fairy_requests() {
       return 0
     fi
     [ "$rc" -eq 0 ] || return "$rc"
+    page_size="$(parse_page_size <<<"$out")" \
+      || die "invalid max_response_items in /settings/api; expected a positive integer"
   fi
   discover_page_size
   out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || return 1
