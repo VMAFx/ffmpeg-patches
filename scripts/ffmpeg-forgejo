@@ -585,13 +585,17 @@ fairy_requests() {
       return 0
     fi
   fi
-  if out="$(api GET /user)"; then rc=0; else rc=$?; fi
-  if [ "$optional" = --skip-unavailable ] && [[ "$rc" =~ ^(6|7|28)$ ]]; then
-    echo "fairy-requests: SKIPPED - API offline (curl rc $rc)." >&2
-    return 0
+  if [ -n "${FFMPEG_FORGEJO_LOGIN:-}" ]; then
+    me="$FFMPEG_FORGEJO_LOGIN"
+  else
+    if out="$(api GET /user)"; then rc=0; else rc=$?; fi
+    if [ "$optional" = --skip-unavailable ] && [[ "$rc" =~ ^(6|7|28)$ ]]; then
+      echo "fairy-requests: SKIPPED - API offline (curl rc $rc)." >&2
+      return 0
+    fi
+    [ "$rc" -eq 0 ] || return "$rc"
+    me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
   fi
-  [ "$rc" -eq 0 ] || return "$rc"
-  me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
   encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
   discover_page_size
   out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || return 1

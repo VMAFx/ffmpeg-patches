@@ -13,8 +13,8 @@
   <!-- 2 CI/build -->
   [![Series](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml)
   [![Consumers](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml)
-  [![FFmpeg Master](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml)
-  [![Upstream Drift](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml)
+  [![FFmpeg Master](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml)
+  [![Upstream Drift](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml)
   [![Release Build](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release-build.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release-build.yml)
   <!-- 3 security/scorecard -->
   [![Scanners](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml)
@@ -128,6 +128,9 @@ daily check fails once that PR merges or closes.
 Before pushing or opening a pull request, scan the committed fix and callers of its targets:
 
 ```bash
+# Fetch the upstream base so both master and topic resolve as local refs:
+git -C /path/to/FFmpeg fetch origin master:master
+# Then run the sweep against the local refs:
 python3 scripts/variant_sweep.py -C /path/to/FFmpeg --class unchecked-return master topic -o sweep.md
 ```
 
