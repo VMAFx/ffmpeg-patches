@@ -115,7 +115,7 @@ jobs:
                   echo "::error::$input file is not a regular file"
                   exit 1
                 fi
-                ref=$(head -c 256 -- "$file")
+                if ! ref=$(timeout 10s head -c 256 -- "$file"); then echo "::error::$input file could not be read"; exit 1; fi
                 from_file=1
               fi
             fi

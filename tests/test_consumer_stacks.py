@@ -603,6 +603,42 @@ class ConsumerRefWorkflowTest(ConsumerWorkflowFixture):
             "",
         )
 
+    def test_unreadable_ref_file_is_rejected(self) -> None:
+        """Reject unreadable consumer ref files and emit error annotation."""
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses mode 000 file permissions")
+        path = self._write_ref_file("vmafx", "chore/ffmpeg-drop-qpfile-loopback\n")
+        self.addCleanup(path.chmod, 0o644)
+        path.chmod(0o000)
+        self.env_file.unlink(missing_ok=True)
+        done = self.run_step(self.ref_step)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("::error::vmafx_ref file could not be read", done.stdout)
+        self.assertEqual(
+            self.env_file.read_text(encoding="utf-8") if self.env_file.exists() else "",
+            "",
+        )
+
+    def test_ref_file_read_timeout_is_rejected(self) -> None:
+        """Reject consumer ref file when reading exceeds the execution timeout."""
+        self._write_ref_file("vmafx", "chore/ffmpeg-drop-qpfile-loopback\n")
+        timeout_dir = self.root / "timeout_bin"
+        timeout_dir.mkdir(parents=True, exist_ok=True)
+        stub = timeout_dir / "timeout"
+        stub.write_text("#!/bin/sh\nexit 124\n", encoding="utf-8")
+        stub.chmod(0o755)
+        self.env_file.unlink(missing_ok=True)
+        done = self.run_step(
+            self.ref_step,
+            {"PATH": f"{timeout_dir}{os.pathsep}{self.environment['PATH']}"},
+        )
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("::error::vmafx_ref file could not be read", done.stdout)
+        self.assertEqual(
+            self.env_file.read_text(encoding="utf-8") if self.env_file.exists() else "",
+            "",
+        )
+
     def test_absent_ref_file_with_empty_input_leaves_refs_empty(self) -> None:
         """Default to empty consumer refs when no input or ref file is present."""
         self.env_file.unlink(missing_ok=True)
