@@ -1251,6 +1251,13 @@ class TestClaimHeadTest(ForgejoTest):
         proc = self.comment_body(stub)
         self.assertEqual(proc.returncode, 76, proc.stderr)
         self.assertIn("does not match live head", proc.stderr)
+        paths = [
+            urllib.parse.urlsplit(path).path for method, path, _ in stub.requests if method == "GET"
+        ]
+        pull_reads = [i for i, p in enumerate(paths) if p.endswith("/pulls/1")]
+        listed = [i for i, p in enumerate(paths) if p.endswith("/issues/1/comments")]
+        self.assertTrue(listed)
+        self.assertGreater(pull_reads[-1], listed[-1])
         self.assertEqual(self.posts(stub), [])
 
     def test_comment_distinct_or_other_author_is_posted(self) -> None:
