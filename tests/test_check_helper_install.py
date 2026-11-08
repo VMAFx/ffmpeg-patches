@@ -37,6 +37,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.bin_dir = Path(self.directory.name) / "bin"
         self.bin_dir.mkdir()
         self.install_path = self.bin_dir / "ffmpeg-forgejo"
+        self.share_dir = Path(self.directory.name) / "share" / "ffmpeg-forgejo"
 
     def git(self, *args: str) -> str:
         """Run bounded Git commands in the temporary fixture repository."""
@@ -66,9 +67,9 @@ class CheckHelperInstallTest(unittest.TestCase):
     def run_check(
         self, *args: str, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        """Run check_helper_install.py with explicit arguments and timeout."""
+        """Run check_helper_install.py on fixture share dir with explicit args and timeout."""
         return subprocess.run(  # nosec B603 - fixed Python executable and test script.
-            [sys.executable, "-B", str(SCRIPT), *args],
+            [sys.executable, "-B", str(SCRIPT), "--share-dir", str(self.share_dir), *args],
             capture_output=True,
             text=True,
             check=False,
@@ -151,6 +152,69 @@ class CheckHelperInstallTest(unittest.TestCase):
         proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertIn("origin/main", proc.stderr)
+
+    def test_stale_shared_copy_is_flagged(self) -> None:
+        """A stale regular file in the share directory exits 1 and reports a stray copy."""
+        self.install_path.symlink_to(self.helper_script)
+        self.share_dir.mkdir(parents=True)
+        stale_file = self.share_dir / "test_pr_flow.sh.stale-x"
+        stale_file.write_text("echo stale\n", encoding="utf-8")
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"stray copy, not a symlink into {self.repo}: {stale_file}", proc.stderr)
+        self.assertIn("helper ok:", proc.stdout)
+
+    def test_backup_beside_helper_is_flagged(self) -> None:
+        """A backup copy beside the helper exits 1 and reports a stray copy."""
+        self.install_path.symlink_to(self.helper_script)
+        backup_file = self.bin_dir / "ffmpeg-forgejo.bak-x"
+        backup_file.write_bytes(self.helper_content)
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"stray copy, not a symlink into {self.repo}: {backup_file}", proc.stderr)
+
+    def test_shared_symlink_into_repo_is_accepted(self) -> None:
+        """A symlink in the share directory pointing into the repo exits 0."""
+        self.install_path.symlink_to(self.helper_script)
+        self.share_dir.mkdir(parents=True)
+        repo_file = self.scripts_dir / "test_pr_flow.sh"
+        repo_file.write_text("echo flow\n", encoding="utf-8")
+        (self.share_dir / "test_pr_flow.sh").symlink_to(repo_file)
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("stray copy", proc.stderr)
+
+    def test_shared_symlink_outside_repo_is_flagged(self) -> None:
+        """A symlink in the share directory pointing outside the repo exits 1."""
+        self.install_path.symlink_to(self.helper_script)
+        outside_file = Path(self.directory.name) / "outside.sh"
+        outside_file.write_text("echo outside\n", encoding="utf-8")
+        self.share_dir.mkdir(parents=True)
+        link_path = self.share_dir / "outside.sh"
+        link_path.symlink_to(outside_file)
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"stray copy, not a symlink into {self.repo}: {link_path}", proc.stderr)
+
+    def test_unrelated_entries_and_empty_share_dir_pass(self) -> None:
+        """Unrelated bin entries and an empty share directory exit 0."""
+        self.install_path.symlink_to(self.helper_script)
+        self.share_dir.mkdir(parents=True)
+        unrelated = self.bin_dir / "other-tool"
+        unrelated.write_text("echo other\n", encoding="utf-8")
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("stray copy", proc.stderr)
+
+    def test_stray_copy_reported_when_helper_absent(self) -> None:
+        """A stray copy in the share directory exits 1 even when the helper is absent."""
+        self.share_dir.mkdir(parents=True)
+        old_file = self.share_dir / "old.sh"
+        old_file.write_text("echo old\n", encoding="utf-8")
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("helper not installed at", proc.stdout)
+        self.assertIn(f"stray copy, not a symlink into {self.repo}: {old_file}", proc.stderr)
 
 
 if __name__ == "__main__":

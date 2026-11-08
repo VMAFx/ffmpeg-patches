@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Check whether the ffmpeg-forgejo helper is a fresh, executable symlink."""
+"""Check that the ffmpeg-forgejo helper is a fresh symlink and no stray copy is installed."""
 
 from __future__ import annotations
 
@@ -93,18 +93,53 @@ def check_install(path: Path, repo: Path) -> int:
     return check_symlink_target(path, repo)
 
 
+def is_repository_link(entry: Path, repo: Path) -> bool:
+    """Report whether entry is a symlink that resolves inside repo."""
+    return entry.is_symlink() and entry.resolve().is_relative_to(repo)
+
+
+def installed_files(install: Path, share_dir: Path) -> list[Path]:
+    """List ffmpeg-forgejo files beside install and every entry of share_dir, install excluded."""
+    siblings = sorted(install.parent.glob("ffmpeg-forgejo*")) if install.parent.is_dir() else []
+    shared = sorted(share_dir.iterdir()) if share_dir.is_dir() else []
+    return [entry for entry in siblings + shared if entry != install]
+
+
+def check_stray_copies(install: Path, share_dir: Path, repo: Path) -> int:
+    """Report every installed ffmpeg-forgejo file that is not a symlink into repo."""
+    try:
+        entries = installed_files(install, share_dir)
+    except OSError as error:
+        print(f"cannot list installed helper files: {error}", file=sys.stderr)
+        return 1
+    strays = [entry for entry in entries if not is_repository_link(entry, repo)]
+    for entry in strays:
+        print(f"stray copy, not a symlink into {repo}: {entry}", file=sys.stderr)
+    return 1 if strays else 0
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the helper installation checker."""
     parser = argparse.ArgumentParser(
-        description="Check whether the ffmpeg-forgejo helper is a fresh, executable symlink."
+        description=(
+            "Check that the ffmpeg-forgejo helper is a fresh symlink and no stray copy is"
+            " installed."
+        )
     )
     repo_default = Path(__file__).resolve().parent.parent
     path_default = Path.home() / ".local" / "bin" / "ffmpeg-forgejo"
+    share_default = Path.home() / ".local" / "share" / "ffmpeg-forgejo"
     parser.add_argument(
         "--path",
         type=Path,
         default=path_default,
         help="Path to the installed helper executable (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--share-dir",
+        type=Path,
+        default=share_default,
+        help="Directory of installed ffmpeg-forgejo support files (default: %(default)s)",
     )
     parser.add_argument(
         "--repo",
@@ -120,7 +155,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     path = args.path.expanduser()
     repo = args.repo.resolve()
-    return check_install(path, repo)
+    install_rc = check_install(path, repo)
+    stray_rc = check_stray_copies(path, args.share_dir.expanduser(), repo)
+    return max(install_rc, stray_rc)
 
 
 if __name__ == "__main__":
