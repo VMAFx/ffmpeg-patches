@@ -154,6 +154,25 @@ NEGATED_STATUS_FIXTURE = (
     "  # if ! f; then rc=$?; fi\n"
     '  echo "if ! f; then rc=$?"\n'
     "  if ! f; then :; fi; if f; then rc=$?; fi\n"
+    "  if ! f 1; then # say why\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f 2; then\n"
+    "    # say why\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f 3;\n"
+    "  then\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f 4; # say why\n"
+    "  then rc=$?; fi\n"
+    "  if ! grep -q '#' f; then\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f 5; then # rc=$? is the negation\n"
+    "    echo none\n"
+    "  fi\n"
     "}\n"
 )
 
@@ -167,6 +186,11 @@ def _negated_status_expected_lines() -> set[int]:
         next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then rc=$?; fi"),
         next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f"),
         next(i for i, line in enumerate(lines, 1) if line.strip() == "elif ! f; then rc=$?; fi"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f 1; then # say why"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f 2; then"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f 3;"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f 4; # say why"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! grep -q '#' f; then"),
     }
 
 

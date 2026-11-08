@@ -200,6 +200,7 @@ rules:
 
   # shellcheck does not flag reading $? inside a negated if (pull request 248 review, 2026-11-08).
   # Anchored at line start (no comments or strings); ";" or a newline before then; elif too.
+  # Whitespace and whole comments may sit before and after then; a comment naming $? is no read.
   - id: negated-if-status-read
     languages: [generic]
     severity: ERROR
@@ -210,5 +211,5 @@ rules:
       include:
         - "*.sh"
         - /scripts/ffmpeg-forgejo
-    pattern-regex: '(?m)^[ \t]*(?:el)?if[ \t]+![ \t][^\n;]*(?:;[ \t]*|\n[ \t]*)then\s+(?:local\s+)?\w+=\$\?'
+    pattern-regex: '(?m)^[ \t]*(?:el)?if[ \t]+![ \t][^\n;]*[;\n](?:\s|#[^\n]*\n)*then(?:\s|#[^\n]*\n)+(?:local\s+)?\w+=\$\?'
 
