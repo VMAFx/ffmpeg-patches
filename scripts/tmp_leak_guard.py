@@ -14,24 +14,29 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
+# Ensure repository root is on sys.path for test/tool imports
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.process_group import kill_process_group  # noqa: E402
+
 MAX_SCANNED_ENTRIES = 1000
 MAX_REPORTED_ENTRIES = 20
 DEFAULT_TIMEOUT = 3600.0
+REAP_TIMEOUT_S = 10
 
 
 def scan_entries(root: Path, limit: int = MAX_SCANNED_ENTRIES) -> list[str]:
     """List up to limit entry names found directly inside root."""
     entries: list[str] = []
-    try:
-        with os.scandir(root) as it:
-            for _ in range(limit):
-                try:
-                    entry = next(it)
-                except StopIteration:
-                    break
-                entries.append(entry.name)
-    except OSError:
-        return []
+    with os.scandir(root) as it:
+        for _ in range(limit):
+            try:
+                entry = next(it)
+            except StopIteration:
+                break
+            entries.append(entry.name)
     entries.sort()
     return entries
 
@@ -64,29 +69,69 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _kill_command(process: subprocess.Popen[bytes]) -> None:
+    """Terminate command and its descendants where process groups are available."""
+    if os.name == "posix":
+        kill_process_group(process)
+    else:
+        # HISS-21: non-POSIX platforms can terminate only the direct child here.
+        process.kill()
+
+
+def _reap_command(cmd: str, process: subprocess.Popen[bytes]) -> None:
+    """Reap terminated command without leaking a second timeout."""
+    try:
+        process.wait(timeout=REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(
+            f"tmp leak guard: {cmd} did not exit within {REAP_TIMEOUT_S} s after termination",
+            file=sys.stderr,
+        )
+
+
+def _wait_command(cmd: str, process: subprocess.Popen[bytes], timeout: float) -> int:
+    """Wait with a deadline and kill and reap the command group on timeout or interruption."""
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_command(process)
+        _reap_command(cmd, process)
+        limit_s = int(timeout) if int(timeout) == timeout else timeout
+        print(f"tmp leak guard: {cmd} exceeded the {limit_s} s deadline", file=sys.stderr)
+        return 124
+    except BaseException:
+        _kill_command(process)
+        _reap_command(cmd, process)
+        raise
+    return process.returncode
+
+
 def run_guard(cmd: str, args: Sequence[str], timeout: float) -> int:
     """Execute command in an isolated temporary directory and report leaked entries."""
     root = Path(tempfile.mkdtemp(prefix="tmp-leak-guard-"))
     cmd_rc = 0
     clean_rc = 0
     entries: list[str] = []
+    scan_error = False
     try:
         env = os.environ.copy()
         env["TMPDIR"] = str(root)
         try:
-            proc = subprocess.run(  # nosec B603 - explicit argv list without shell interpolation.
+            process = subprocess.Popen(  # nosec B603 - explicit argv list without shell interpolation.
                 [cmd, *args],
                 env=env,
-                timeout=timeout,
-                check=False,
+                start_new_session=os.name == "posix",
             )
-            cmd_rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            cmd_rc = 124
         except FileNotFoundError as exc:
             print(f"tmp leak guard: {exc}", file=sys.stderr)
             cmd_rc = 127
-        entries = scan_entries(root)
+        else:
+            cmd_rc = _wait_command(cmd, process, timeout)
+        try:
+            entries = scan_entries(root)
+        except OSError as exc:
+            print(f"tmp leak guard: cannot scan {root}: {exc}", file=sys.stderr)
+            scan_error = True
         if entries:
             print(format_leak_line(cmd, entries), file=sys.stderr)
     finally:
@@ -97,7 +142,7 @@ def run_guard(cmd: str, args: Sequence[str], timeout: float) -> int:
             clean_rc = 1
     if cmd_rc != 0:
         return cmd_rc
-    if entries:
+    if entries or scan_error:
         return 1
     return clean_rc
 

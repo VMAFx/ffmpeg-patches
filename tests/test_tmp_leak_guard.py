@@ -4,11 +4,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import os
 import subprocess  # nosec B404 - test runner subprocess invocation with timeout.
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 GUARD = Path(__file__).resolve().parent.parent / "scripts" / "tmp_leak_guard.py"
@@ -109,3 +114,74 @@ class TmpLeakGuardTest(unittest.TestCase):
         outer = self.outer_dir.resolve()
         self.assertNotEqual(child_tmp, outer)
         self.assertTrue(child_tmp.is_relative_to(outer))
+
+    def test_timeout_kills_descendants(self) -> None:
+        """Descendant processes in the child process group are terminated on timeout."""
+        grand = (
+            "import pathlib, tempfile, time; "
+            "tmp = tempfile.gettempdir(); "
+            "time.sleep(2); "
+            "target = pathlib.Path(tmp) / 'late.txt'; "
+            "target.parent.mkdir(parents=True, exist_ok=True); "
+            "target.write_text('late', encoding='utf-8')"
+        )
+        code = (
+            f"import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {grand!r}], start_new_session=False); "
+            f"time.sleep(30)"
+        )
+        proc = self.run_guard(
+            ["--timeout", "1"],
+            [sys.executable, "-I", "-c", code],
+            timeout=15.0,
+        )
+        self.assertEqual(proc.returncode, 124)
+        time.sleep(4)
+        self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def test_nonexistent_executable_fails_with_rc_127(self) -> None:
+        """A nonexistent command executable triggers exit code 127 and cleans up."""
+        proc = self.run_guard([], ["/nonexistent/tmp-leak-guard-cmd"])
+        self.assertEqual(proc.returncode, 127)
+        self.assertIn("tmp leak guard:", proc.stderr)
+        self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def test_more_than_twenty_leaked_entries_reported(self) -> None:
+        """Leaking more than twenty entries truncates the reported list in stderr."""
+        code = (
+            "import pathlib, tempfile\n"
+            "root = pathlib.Path(tempfile.gettempdir())\n"
+            "for i in range(25):\n"
+            "    (root / f'leak_{i:02d}.txt').write_text('x', encoding='utf-8')\n"
+        )
+        proc = self.run_guard([], [sys.executable, "-I", "-c", code])
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("25 entries", proc.stderr)
+        self.assertIn("(first 20 names)", proc.stderr)
+        self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def test_scan_error_reported_and_root_cleaned(self) -> None:
+        """An unreadable temporary root reports a scan error and removes the root."""
+        spec = importlib.util.spec_from_file_location("tmp_leak_guard", GUARD)
+        self.assertIsNotNone(spec)
+        if spec is None or spec.loader is None:
+            self.fail("failed to load tmp_leak_guard spec")
+        guard_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard_mod)
+
+        prev_tempdir = tempfile.tempdir
+        self.addCleanup(setattr, tempfile, "tempdir", prev_tempdir)
+        tempfile.tempdir = str(self.outer_dir)
+
+        stderr_buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                guard_mod, "scan_entries", side_effect=PermissionError("denied")
+            ),
+            contextlib.redirect_stderr(stderr_buf),
+        ):
+            rc = guard_mod.run_guard(sys.executable, ["-I", "-c", "pass"], 15.0)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("cannot scan", stderr_buf.getvalue())
+        self.assertEqual(list(self.outer_dir.iterdir()), [])

@@ -105,3 +105,42 @@ rules:
     severity: ERROR
     message: tempfile.mktemp returns a name another process can take first; use mkstemp or TemporaryDirectory.
     pattern: tempfile.mktemp(...)
+
+  - id: oserror-swallowed-as-empty
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Propagate or report; never return an empty value from an OSError handler.
+    paths:
+      include:
+        - scripts/
+        - tests/
+    patterns:
+      - pattern-either:
+          - pattern: |
+              try:
+                  ...
+              except $EXC:
+                  return $EMPTY
+          - pattern: |
+              try:
+                  ...
+              except $EXC as $E:
+                  return $EMPTY
+          - pattern: |
+              try:
+                  ...
+              except (..., $EXC, ...):
+                  return $EMPTY
+          - pattern: |
+              try:
+                  ...
+              except (..., $EXC, ...) as $E:
+                  return $EMPTY
+      - metavariable-regex:
+          metavariable: $EXC
+          regex: ^(OSError|FileNotFoundError|PermissionError|IsADirectoryError|NotADirectoryError)$
+      - metavariable-regex:
+          metavariable: $EMPTY
+          regex: ^(\[\]|\{\}|\(\)|set\(\)|""|''|0)$
+
