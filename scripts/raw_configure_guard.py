@@ -76,6 +76,16 @@ GIT_GLOBAL_OPTS_WITH_ARG = frozenset(
         "--super-prefix",
     )
 )
+WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
+    "sudo": frozenset(("-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U")),
+    "timeout": frozenset(("-s", "-k")),
+    "flock": frozenset(("-E", "-w")),
+    "nice": frozenset(("-n",)),
+    "ionice": frozenset(("-c", "-n", "-p")),
+    "taskset": frozenset(("-c",)),
+    "chrt": frozenset(),
+    "stdbuf": frozenset(("-i", "-o", "-e")),
+}
 REDIRECT_TARGET_OPS = frozenset(
     (
         ">",
@@ -691,6 +701,7 @@ def _skip_bracketed_runner(words: list[str], idx: int) -> int:
 def _skip_optioned_wrapper(words: list[str], idx: int) -> int:
     """Advance past a Unix execution wrapper and its option arguments."""
     name = os.path.basename(words[idx])
+    value_options = WRAPPER_VALUE_OPTIONS.get(name, frozenset())
     idx += 1
     words_len = len(words)
     for _ in range(words_len):
@@ -699,23 +710,7 @@ def _skip_optioned_wrapper(words: list[str], idx: int) -> int:
         word = words[idx]
         if word == "--":
             return idx + 1
-        if word in (
-            "-n",
-            "-u",
-            "-g",
-            "-h",
-            "-p",
-            "-C",
-            "-s",
-            "-k",
-            "-I",
-            "-P",
-            "-d",
-            "-E",
-            "-a",
-            "-w",
-            "-c",
-        ):
+        if word in value_options:
             idx += 2 if idx + 1 < words_len else 1
             continue
         if word.startswith(("-", "+")):
@@ -841,14 +836,19 @@ def _inspect_find(words: list[str], idx: int) -> Path | None:
     for i in range(idx + 1, words_len):
         if words[i] in ("-exec", "-execdir", "-ok", "-okdir") and i + 1 < words_len:
             exec_args: list[str] = []
+            terminated = False
             for j in range(i + 1, min(words_len, i + 32)):
                 if words[j] in (";", "\\;", "+"):
+                    terminated = True
                     break
                 exec_args.append(words[j])
+            if not terminated and words_len >= i + 32:
+                return Path("find -exec (argument limit)")
             if has_conf_name and any("{}" in arg for arg in exec_args):
                 return Path("find -exec configure")
-            for arg in exec_args:
-                if _is_configure_word(arg):
+            for k in range(len(exec_args)):
+                arg = exec_args[k]
+                if _is_configure_word(arg) or _has_configure_token(arg, {}):
                     return Path(arg)
     return None
 
@@ -879,19 +879,25 @@ def _inspect_git(words: list[str], idx: int) -> Path | None:
             return Path(words[i + 1])
         if w.startswith("-c") and CONFIGURE_WORD.search(w):
             return Path(w)
-        if w in ("-x", "--exec") and i + 1 < words_len and _is_configure_word(words[i + 1]):
+        if (
+            w in ("-x", "--exec")
+            and i + 1 < words_len
+            and (_is_configure_word(words[i + 1]) or _has_configure_token(words[i + 1], {}))
+        ):
             return Path(words[i + 1])
-        if (w.startswith("--exec=") or w.startswith("--exec-path=")) and _is_configure_word(
-            w.split("=", 1)[1]
+        if (w.startswith("--exec=") or w.startswith("--exec-path=")) and (
+            _is_configure_word(w.split("=", 1)[1]) or _has_configure_token(w.split("=", 1)[1], {})
         ):
             return Path(w)
         if (
             w in ("bisect", "submodule")
-            and i + 2 < words_len
+            and i + 1 < words_len
             and words[i + 1] in ("run", "foreach")
-            and _is_configure_word(words[i + 2])
         ):
-            return Path(words[i + 2])
+            for j in range(i + 2, words_len):
+                sub_w = words[j]
+                if _is_configure_word(sub_w) or _has_configure_token(sub_w, {}):
+                    return Path(sub_w)
     return None
 
 
@@ -916,10 +922,13 @@ def _inspect_xargs(
         ):
             return Path(stdin_prog)
         target, _ = _shell_argument(words[i:])
-        if target is not None and _is_configure_word(target):
+        if target is not None and (
+            _is_configure_word(target) or _has_configure_token(target, assignments)
+        ):
             return Path(target)
-    for arg in words[i + 1 :]:
-        if _is_configure_word(arg):
+    for j in range(i + 1, words_len):
+        arg = words[j]
+        if _is_configure_word(arg) or _has_configure_token(arg, assignments):
             return Path(arg)
     return None
 
@@ -1027,6 +1036,46 @@ def _inspect_known_dispatch(
     return False, None
 
 
+def _skipped_configure(words: list[str], cmd_idx: int, assignments: dict[str, str]) -> Path | None:
+    """Inspect skipped wrapper tokens for embedded configure references."""
+    bound = min(len(words), max(0, cmd_idx))
+    for i in range(bound):
+        word = words[i]
+        if not ASSIGNMENT.fullmatch(word) and _has_configure_token(word, assignments):
+            return Path(word)
+    return None
+
+
+def _inspect_trailing_arguments(
+    words: list[str], start_idx: int, assignments: dict[str, str]
+) -> Path | None:
+    """Check remaining command arguments for configure tokens."""
+    for i in range(start_idx, len(words)):
+        if _has_configure_token(words[i], assignments):
+            return Path(words[i])
+    return None
+
+
+def _classify_target(
+    words: list[str],
+    cmd_idx: int,
+    assignments: dict[str, str],
+    stdin_prog: str | None,
+) -> Path | None:
+    """Classify the unwrapped command target and arguments."""
+    raw_cmd = words[cmd_idx]
+    cmd_word = _substitute_literals(raw_cmd, assignments)
+    if not DECIDABLE_NAME.fullmatch(os.path.basename(cmd_word)) or _is_configure_word(cmd_word):
+        return Path(cmd_word)
+    name = os.path.basename(cmd_word)
+    handled, blocked = _inspect_known_dispatch(name, words, cmd_idx, stdin_prog, assignments)
+    if handled:
+        return blocked
+    if not _is_data_only_command(name):
+        return _inspect_trailing_arguments(words, cmd_idx + 1, assignments)
+    return None
+
+
 def _classify_command(
     words: list[str], assignments: dict[str, str], stdin_prog: str | None = None
 ) -> tuple[Path | None, list[str]]:
@@ -1035,21 +1084,12 @@ def _classify_command(
     if env_blocked is not None:
         return env_blocked, []
     cmd_idx = _unwrap_command(words, 0)
+    skipped = _skipped_configure(words, cmd_idx, assignments)
+    if skipped is not None:
+        return skipped, []
     if cmd_idx >= len(words):
         return None, []
-    raw_cmd = words[cmd_idx]
-    cmd_word = _substitute_literals(raw_cmd, assignments)
-    if not DECIDABLE_NAME.fullmatch(os.path.basename(cmd_word)) or _is_configure_word(cmd_word):
-        return Path(cmd_word), []
-    name = os.path.basename(cmd_word)
-    handled, blocked = _inspect_known_dispatch(name, words, cmd_idx, stdin_prog, assignments)
-    if handled:
-        return blocked, []
-    if not _is_data_only_command(name):
-        for arg in words[cmd_idx + 1 :]:
-            if _has_configure_token(arg, assignments):
-                return Path(arg), []
-    return None, []
+    return _classify_target(words, cmd_idx, assignments, stdin_prog), []
 
 
 def _handle_nested_program(source: str, depth: int, pending: list[tuple[str, int]]) -> Path | None:

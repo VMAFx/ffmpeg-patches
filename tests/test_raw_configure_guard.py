@@ -132,6 +132,33 @@ MUST_ALLOW_R22 = (
     "cp configure /tmp/x/configure.bak",
     "mytool --input data.txt",
 )
+MUST_REFUSE_R24 = (
+    "sudo -n ./configure",
+    "sudo -E ./configure",
+    "sudo -n ./configure foo",
+    "sudo -n bash -c './configure'",
+    "env -S './configure --prefix=/x'",
+    "env --split-string='./configure --prefix=/x'",
+    "find . -maxdepth 0 -exec sh -c './configure --prefix=/x' \\;",
+    "find . -exec echo " + ("a " * 40) + "./configure \\;",
+    "git rebase -x './configure --enable-gpl' HEAD~1",
+    "git rebase --exec='./configure --enable-gpl' HEAD~1",
+    "git -C . rebase -x './configure --prefix=/x' HEAD~1",
+    "xargs sh -c './configure --prefix=/x'",
+    "git bisect run sh ./configure",
+    "git bisect run env ./configure",
+    "git submodule foreach './configure --prefix=/x'",
+)
+MUST_ALLOW_R24 = (
+    "sudo -n ls",
+    "sudo -u root make -j4",
+    "env -S 'ls -la'",
+    "timeout -s KILL 60 make",
+    "stdbuf -oL make",
+    "git rebase -x 'make -j4' HEAD~1",
+    "git bisect run make fate",
+    "python3 scripts/ffmpeg_configure.py /src /build",
+)
 SPEC = importlib.util.spec_from_file_location("raw_configure_guard", GUARD)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Cannot load module from {GUARD}")
@@ -985,6 +1012,24 @@ class RawConfigureGuardTest(unittest.TestCase):
         temp_dir = self.other
         for client in CLIENTS:
             for command in MUST_ALLOW_R22:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, temp_dir))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_must_refuse_r24(self) -> None:
+        """Refuse execution-capable configure invocations from MUST_REFUSE_R24."""
+        for client in CLIENTS:
+            for command in MUST_REFUSE_R24:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, self.other))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("scripts/ffmpeg_configure.py", result.stderr)
+
+    def test_must_allow_r24(self) -> None:
+        """Allow verified benign agent command shapes from MUST_ALLOW_R24."""
+        temp_dir = self.other
+        for client in CLIENTS:
+            for command in MUST_ALLOW_R24:
                 with self.subTest(client=client, command=command):
                     result = self.run_guard(client, self.payload(client, command, temp_dir))
                     self.assertEqual(result.returncode, 0, result.stderr)
