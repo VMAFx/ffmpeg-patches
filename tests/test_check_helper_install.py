@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess  # nosec B404 - fixed Git and Python test commands in temporary directories.
 import sys
 import tempfile
@@ -195,6 +196,69 @@ class CheckHelperInstallTest(unittest.TestCase):
         proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertIn(f"stray copy, not a symlink into {self.repo}: {link_path}", proc.stderr)
+
+    def test_shared_link_to_loop_in_repo_is_flagged(self) -> None:
+        """A share-dir link to a symlink loop inside the repo exits 1 as a stray copy."""
+        self.install_path.symlink_to(self.helper_script)
+        loop_a = self.scripts_dir / "loop-a"
+        loop_b = self.scripts_dir / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        self.share_dir.mkdir(parents=True)
+        link_path = self.share_dir / "loop.sh"
+        link_path.symlink_to(loop_a)
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"stray copy, not a symlink into {self.repo}: {link_path}", proc.stderr)
+
+    def test_shared_dangling_link_into_repo_is_flagged(self) -> None:
+        """A share-dir link to a missing file inside the repo exits 1 as a stray copy."""
+        self.install_path.symlink_to(self.helper_script)
+        self.share_dir.mkdir(parents=True)
+        link_path = self.share_dir / "gone.sh"
+        link_path.symlink_to(self.scripts_dir / "gone.sh")
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"stray copy, not a symlink into {self.repo}: {link_path}", proc.stderr)
+
+    def test_unlistable_share_dir_reports_listing_error(self) -> None:
+        """A share directory that cannot be listed exits 1 with the listing error."""
+        if os.geteuid() == 0:
+            self.skipTest("root lists a mode-0 directory")
+        self.install_path.symlink_to(self.helper_script)
+        self.share_dir.mkdir(parents=True)
+        self.share_dir.chmod(0o000)
+        self.addCleanup(self.share_dir.chmod, 0o755)
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("cannot list installed helper files:", proc.stderr)
+
+    def test_default_share_dir_follows_home(self) -> None:
+        """Without --share-dir the scan reads HOME/.local/share/ffmpeg-forgejo."""
+        home = Path(self.directory.name) / "home"
+        share = home / ".local" / "share" / "ffmpeg-forgejo"
+        share.mkdir(parents=True)
+        old_file = share / "old.sh"
+        old_file.write_text("echo old\n", encoding="utf-8")
+        self.install_path.symlink_to(self.helper_script)
+        proc = subprocess.run(  # nosec B603 - fixed Python executable and test script.
+            [
+                sys.executable,
+                "-B",
+                str(SCRIPT),
+                "--path",
+                str(self.install_path),
+                "--repo",
+                str(self.repo),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env={**isolated_git_environment(), "HOME": str(home)},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"stray copy, not a symlink into {self.repo}: {old_file}", proc.stderr)
 
     def test_unrelated_entries_and_empty_share_dir_pass(self) -> None:
         """Unrelated bin entries and an empty share directory exit 0."""

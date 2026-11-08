@@ -94,8 +94,15 @@ def check_install(path: Path, repo: Path) -> int:
 
 
 def is_repository_link(entry: Path, repo: Path) -> bool:
-    """Report whether entry is a symlink that resolves inside repo."""
-    return entry.is_symlink() and entry.resolve().is_relative_to(repo)
+    """Report whether entry is a symlink whose existing target resolves inside repo;
+    loops and dangling links count as not.
+    """
+    if not entry.is_symlink():
+        return False
+    try:
+        return entry.resolve(strict=True).is_relative_to(repo)
+    except (OSError, RuntimeError):
+        return False
 
 
 def installed_files(install: Path, share_dir: Path) -> list[Path]:
