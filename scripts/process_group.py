@@ -45,7 +45,7 @@ def kill_process_tree(process: subprocess.Popen[bytes]) -> None:
     if os.name == "nt":
         cmd = ["taskkill", "/T", "/F", "/PID", str(process.pid)]
         try:
-            subprocess.run(
+            subprocess.run(  # nosec B603 B607 - fixed taskkill argv with explicit timeout.
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

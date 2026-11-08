@@ -163,7 +163,7 @@ class TmpLeakGuardTest(unittest.TestCase):
             "-c",
             code,
         ]
-        guard_proc = subprocess.Popen(
+        guard_proc = subprocess.Popen(  # nosec B603 - fixed guard argv with explicit timeout.
             guard_cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
