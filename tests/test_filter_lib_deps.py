@@ -7,7 +7,6 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from scripts import filter_lib_deps
 from tests.helpers import capture_main
@@ -337,7 +336,7 @@ class FilterLibDepsTest(unittest.TestCase):
             {"vf_large.c": "x" * 129},
             {"large": ["vf_large.o"]},
         )
-        with mock.patch.object(filter_lib_deps, "MAX_BYTES_PER_FILE", 128):
+        with unittest.mock.patch.object(filter_lib_deps, "MAX_BYTES_PER_FILE", 128):
             self.assertEqual(self.run_check()[0], 2)
 
     def test_registered_filter_without_makefile_uses_definition(self) -> None:

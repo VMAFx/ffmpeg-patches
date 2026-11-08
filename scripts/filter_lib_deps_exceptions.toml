@@ -4,56 +4,56 @@
 [[exceptions]]
 filter = "derain"
 library = "swscale"
-reason = "DNN dependency gap tracked upstream as 25638"
+reason = "DNN dependency gap raised in upstream review of 25638, deferred without a DNN backend build"
 category = "D"
 entered = 2026-11-08
 
 [[exceptions]]
 filter = "dnn_classify"
 library = "swscale"
-reason = "DNN dependency gap tracked upstream as 25638"
+reason = "DNN dependency gap raised in upstream review of 25638, deferred without a DNN backend build"
 category = "D"
 entered = 2026-11-08
 
 [[exceptions]]
 filter = "dnn_detect"
 library = "swscale"
-reason = "DNN dependency gap tracked upstream as 25638"
+reason = "DNN dependency gap raised in upstream review of 25638, deferred without a DNN backend build"
 category = "D"
 entered = 2026-11-08
 
 [[exceptions]]
 filter = "dnn_processing"
 library = "swscale"
-reason = "DNN dependency gap tracked upstream as 25638"
+reason = "DNN dependency gap raised in upstream review of 25638, deferred without a DNN backend build"
 category = "D"
 entered = 2026-11-08
 
 [[exceptions]]
 filter = "derain"
 library = "avformat"
-reason = "DNN dependency gap tracked upstream as 25638"
+reason = "DNN dependency gap raised in upstream review of 25638, deferred without a DNN backend build"
 category = "D"
 entered = 2026-11-08
 
 [[exceptions]]
 filter = "dnn_classify"
 library = "avformat"
-reason = "DNN dependency gap tracked upstream as 25638"
+reason = "DNN dependency gap raised in upstream review of 25638, deferred without a DNN backend build"
 category = "D"
 entered = 2026-11-08
 
 [[exceptions]]
 filter = "dnn_detect"
 library = "avformat"
-reason = "DNN dependency gap tracked upstream as 25638"
+reason = "DNN dependency gap raised in upstream review of 25638, deferred without a DNN backend build"
 category = "D"
 entered = 2026-11-08
 
 [[exceptions]]
 filter = "dnn_processing"
 library = "avformat"
-reason = "DNN dependency gap tracked upstream as 25638"
+reason = "DNN dependency gap raised in upstream review of 25638, deferred without a DNN backend build"
 category = "D"
 entered = 2026-11-08
 
