@@ -708,6 +708,16 @@ def check_entry(entry: dict, findings: Findings) -> None:
         )
 
 
+def _sent_status(data: dict, name: str, findings: Findings) -> str | None:
+    """Return the status if sent upstream, reporting non-string values as findings."""
+    status = data.get("status")
+    if isinstance(status, str):
+        return status if status in FORGE_STATES else None
+    if "status" in data:
+        findings.error(name, "status must be a string")
+    return None
+
+
 def patch_links(root: Path, names: list[str], findings: Findings) -> dict[str, tuple[str, str]]:
     """Map each listed patch that was sent upstream to (status, upstream link)."""
     links: dict[str, tuple[str, str]] = {}
@@ -718,8 +728,8 @@ def patch_links(root: Path, names: list[str], findings: Findings) -> dict[str, t
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             findings.error(str(sidecar), f"invalid metadata: {exc}")
             continue
-        status, link = data.get("status"), str(data.get("upstream", ""))
-        if status in FORGE_STATES and link.startswith("https://"):
+        status, link = _sent_status(data, str(sidecar), findings), str(data.get("upstream", ""))
+        if status and link.startswith("https://"):
             links[name] = (status, link)
     return links
 
@@ -753,7 +763,7 @@ def master_form_parts(root: Path, names: list[str], findings: Findings) -> dict[
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
             continue
         link = str(data.get("upstream", ""))
-        if link.startswith("https://"):
+        if _sent_status(data, name, findings) and link.startswith("https://"):
             groups.setdefault(link, []).append((name, "master_form" in data))
     parts: dict[str, str] = {}
     for url, items in groups.items():

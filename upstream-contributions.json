@@ -468,6 +468,19 @@
       "patch": "0040-avfilter-vf_libvmaf-accept-more-planar-pixel-formats.patch, 0041-avfilter-vf_libvmaf-copy-all-planes-of-CUDA-hardware.patch",
       "project": "vmafx",
       "note": "By luoye-cpu, not from this series (VMAFx/vmafx#3274); the series carries it ahead of review. 25708 stacks on 24973, which the series does not carry; the conflict was context only."
+    },
+    {
+      "number": 25867,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25867",
+      "title": "avfilter/vf_zscale: keep the light levels when linearising",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0014-avfilter-vf_zscale-keep-the-light-levels-when-linear.patch",
+      "project": "vmafx",
+      "note": "Part 2 of the Dolby Vision profile 5 tone mapping without libplacebo (ADR-0002)."
     }
   ]
 }
