@@ -106,9 +106,9 @@ rules:
     message: tempfile.mktemp returns a name another process can take first; use mkstemp or TemporaryDirectory.
     pattern: tempfile.mktemp(...)
 
-  # FileNotFoundError is left out on purpose because absence read as empty is a
-  # deliberate value (example .config/lefthook/scripts/checkpoint.py _open_worktree_text);
-  # a tuple that also names another listed class still matches.
+  # Excluded: .config/lefthook/scripts/checkpoint.py (adopted praetor helper;
+  # a missing OPEN ledger names no worktrees by design; adopted file is not edited here).
+  # Category D, 120 days, expires 2027-03-08.
   - id: oserror-swallowed-as-empty
     languages: [python]
     severity: ERROR
@@ -118,31 +118,82 @@ rules:
       include:
         - scripts/
         - tests/
+      exclude:
+        - .config/lefthook/scripts/checkpoint.py
     patterns:
       - pattern-either:
           - pattern: |
               try:
                   ...
               except $EXC:
+                  ...
                   return $EMPTY
           - pattern: |
               try:
                   ...
               except $EXC as $E:
+                  ...
                   return $EMPTY
           - pattern: |
               try:
                   ...
               except (..., $EXC, ...):
+                  ...
                   return $EMPTY
           - pattern: |
               try:
                   ...
               except (..., $EXC, ...) as $E:
+                  ...
                   return $EMPTY
+      - pattern-not:
+          patterns:
+            - pattern-either:
+                - pattern: |
+                    try:
+                        ...
+                    except $EXC:
+                        ...
+                        $REPORT
+                        ...
+                        return $EMPTY
+                - pattern: |
+                    try:
+                        ...
+                    except $EXC as $E:
+                        ...
+                        $REPORT
+                        ...
+                        return $EMPTY
+                - pattern: |
+                    try:
+                        ...
+                    except (..., $EXC, ...):
+                        ...
+                        $REPORT
+                        ...
+                        return $EMPTY
+                - pattern: |
+                    try:
+                        ...
+                    except (..., $EXC, ...) as $E:
+                        ...
+                        $REPORT
+                        ...
+                        return $EMPTY
+            - metavariable-pattern:
+                metavariable: $REPORT
+                pattern-either:
+                  - pattern: print(..., file=sys.stderr)
+                  - pattern: print(..., file=sys.stderr, ...)
+                  - pattern: sys.stderr.write(...)
+                  - pattern: $LOG.warning(...)
+                  - pattern: $LOG.error(...)
+                  - pattern: $LOG.exception(...)
+                  - pattern: warnings.warn(...)
       - metavariable-regex:
           metavariable: $EXC
-          regex: ^(OSError|PermissionError|IsADirectoryError|NotADirectoryError)$
+          regex: ^(OSError|FileNotFoundError|PermissionError|IsADirectoryError|NotADirectoryError)$
       - metavariable-regex:
           metavariable: $EMPTY
           regex: ^(\[\]|\{\}|\(\)|set\(\)|""|''|0)$

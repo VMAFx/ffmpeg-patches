@@ -18,7 +18,10 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_SOURCE = """# SPDX-License-Identifier: EUPL-1.2
 \"\"\"Fixture functions for semgrep rule testing.\"\"\"
 
+import logging
 import sys
+
+log = logging.getLogger(__name__)
 
 
 def case_flagged_oserror():
@@ -53,20 +56,56 @@ def case_flagged_tuple_fnf_permission():
         return 0
 
 
-def case_not_flagged_fnf():
-    \"\"\"Not flagged: FileNotFoundError returning empty string.\"\"\"
+def case_flagged_fnf():
+    \"\"\"Flagged: FileNotFoundError returning empty string.\"\"\"
     try:
         pass
     except FileNotFoundError:
         return ""
 
 
-def case_not_flagged_fnf_as_exc():
-    \"\"\"Not flagged: FileNotFoundError as exc returning empty list.\"\"\"
+def case_flagged_fnf_as_exc():
+    \"\"\"Flagged: FileNotFoundError as exc returning empty list.\"\"\"
     try:
         pass
     except FileNotFoundError as exc:
         return []
+
+
+def case_flagged_state_then_empty():
+    \"\"\"Flagged: OSError mutating state before returning empty list.\"\"\"
+    try:
+        pass
+    except OSError:
+        state = 1
+        return []
+
+
+def case_not_flagged_print_stderr_then_empty():
+    \"\"\"Not flagged: OSError printed to stderr returning empty list.\"\"\"
+    try:
+        pass
+    except OSError as exc:
+        print(exc, file=sys.stderr)
+        return []
+
+
+def case_not_flagged_stderr_write_then_empty():
+    \"\"\"Not flagged: OSError written to stderr returning empty string.\"\"\"
+    try:
+        pass
+    except OSError as exc:
+        sys.stderr.write(str(exc))
+        return ""
+
+
+def case_not_flagged_logged_then_empty():
+    \"\"\"Not flagged: OSError logged returning empty dict.\"\"\"
+    try:
+        pass
+    except OSError as exc:
+        log.warning("warning: %s", exc)
+        return {}
 
 
 def case_not_flagged_oserror_raise():
@@ -161,7 +200,7 @@ class SemgrepRulesTest(unittest.TestCase):
     """Verify repository semgrep rule behavior against test fixtures."""
 
     def test_oserror_swallowed_as_empty_rule(self) -> None:
-        """Rule oserror-swallowed-as-empty flags swallowed errors but permits FileNotFoundError."""
+        """Rule oserror-swallowed-as-empty flags swallowed errors unless reported."""
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         scratch_path = Path(scratch.name)
@@ -177,5 +216,35 @@ class SemgrepRulesTest(unittest.TestCase):
             "case_flagged_permission_error",
             "case_flagged_tuple_value_os",
             "case_flagged_tuple_fnf_permission",
+            "case_flagged_fnf",
+            "case_flagged_fnf_as_exc",
+            "case_flagged_state_then_empty",
         }
         self.assertEqual(flagged, expected_flagged)
+
+    def test_oserror_rule_skips_excluded_checkpoint(self) -> None:
+        """Rule oserror-swallowed-as-empty skips excluded checkpoint helper."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        scratch_path = Path(scratch.name)
+        target_dir = scratch_path / ".config" / "lefthook" / "scripts"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_file = target_dir / "checkpoint.py"
+        fixture_content = (
+            "# SPDX-"
+            "License-Identifier: EUPL-1.2\n"
+            '"""Checkpoint fixture for exclusion testing."""\n\n'
+            "def case_checkpoint_open():\n"
+            '    """Deliberately swallowed FileNotFoundError returning empty string."""\n'
+            "    try:\n"
+            "        pass\n"
+            "    except FileNotFoundError:\n"
+            '        return ""\n'
+        )
+        checkpoint_file.write_text(fixture_content, encoding="utf-8")
+
+        data = _run_semgrep(checkpoint_file, scratch_path)
+        flagged = _flagged_functions(data.get("results", []), fixture_content)
+        self.assertEqual(flagged, set())
+        scanned = [Path(p).resolve() for p in data.get("paths", {}).get("scanned", [])]
+        self.assertIn(checkpoint_file.resolve(), scanned)

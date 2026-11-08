@@ -120,6 +120,9 @@ def run_guard(cmd: str, args: Sequence[str], timeout: float) -> int:
             process = subprocess.Popen(  # nosec B603 - explicit argv list without shell interpolation.
                 [cmd, *args],
                 env=env,
+                # POSIX limit: a descendant that calls setsid() leaves the process
+                # group, survives kill_process_group, and can still write into the
+                # root; rmtree then fails, the guard reports it and returns 1.
                 start_new_session=os.name == "posix",
             )
         except FileNotFoundError as exc:
