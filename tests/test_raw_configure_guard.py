@@ -13,8 +13,8 @@ import subprocess  # nosec B404 - fixed guard and shell-hook commands, never con
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "scripts" / "raw_configure_guard.py"
@@ -921,12 +921,14 @@ class RawConfigureGuardTest(unittest.TestCase):
         """Fail closed on inspection exceptions and refuse whitespace-only quoted words."""
         stderr_buf = io.StringIO()
         with (
-            mock.patch(
+            unittest.mock.patch(
                 "sys.stdin.buffer.read",
                 return_value=json.dumps(self.payload("claude", "ls", self.other)).encode("utf-8"),
             ),
-            mock.patch.object(GUARD_MOD, "_inspect", side_effect=RuntimeError("simulated error")),
-            mock.patch("sys.stderr", stderr_buf),
+            unittest.mock.patch.object(
+                GUARD_MOD, "_inspect", side_effect=RuntimeError("simulated error")
+            ),
+            unittest.mock.patch("sys.stderr", stderr_buf),
         ):
             rc = GUARD_MOD.main(["--client", "claude"])
             self.assertEqual(rc, 2)
