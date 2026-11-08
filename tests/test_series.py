@@ -1289,6 +1289,18 @@ class MasterFormTest(SeriesTestCase):
         self.assertEqual([s for _, s in results], ["conflict", "applied"])
         self.assert_clean()
 
+    def test_multi_patch_pr_rejects_invalid_metadata_on_earlier_patch(self) -> None:
+        """Verify apply rejects invalid metadata on an earlier patch of a pull request."""
+        self.setup_multi_patch_pr(2)
+        sidecar = (self.fx.root / "patches" / self.fx.names[0]).with_suffix(".toml")
+        with sidecar.open("a", encoding="utf-8") as file:
+            file.write(f'upstream_commit = "{"a" * 40}"\n')
+        with self.assertRaisesRegex(
+            series.SeriesError, "upstream_commit is allowed only with status merged"
+        ):
+            self.apply()
+        self.assert_clean()
+
 
 class MainTest(SeriesTestCase):
     def test_tool_error_exits_two(self) -> None:

@@ -12,7 +12,8 @@
         upstream commits already in the tested master's history and skip
         patches marked release_only. A pull request that carries several
         patches records its master_form on the last of them; the earlier
-        ones report in-master-form and are applied with it.
+        ones report in-master-form and are included only if that form
+        applies.
     series.py export TREE
         Regenerate patches/ and series.txt from the commits on TREE after
         the pinned base commit.
@@ -1041,6 +1042,16 @@ def apply_for_master(tree: Path, patch: Path, url: str) -> str:
     return apply_one(tree, patch)
 
 
+def apply_master_part(patch: Path) -> str:
+    """Validate metadata of an earlier patch covered by a later master form."""
+    meta = note_metadata(patch)
+    findings = Findings()
+    check_master_metadata(meta, patch.name, findings)
+    if findings.errors:
+        raise SeriesError("\n".join(findings.errors))
+    return "in-master-form"
+
+
 def apply_series(
     root: Path, tree: Path, expect_base: bool, keep_going: bool, master_forms: str | None = None
 ) -> Results:
@@ -1060,7 +1071,7 @@ def apply_series(
             continue
         patch = root / "patches" / name
         if name in parts:
-            status = "in-master-form"
+            status = apply_master_part(patch)
         elif master_forms is not None:
             status = apply_for_master(tree, patch, master_forms)
         else:
