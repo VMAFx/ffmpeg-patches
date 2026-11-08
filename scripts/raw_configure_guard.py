@@ -12,8 +12,9 @@ Known limitation: words assembled from variables (e.g. `p=con; ./${p}figure`)
 are not expanded across assignments; directory existence is read when the hook
 runs; a command that removes or creates the target before its cd runs is judged
 by the state at hook time. A word whose directory and basename are both
-undecidable (e.g. `$X/$Y`) passes. An unparsed command outside a tree that
-names no cd-family word and no tree path passes.
+undecidable (e.g. `$X/$Y`) passes. A command the guard cannot tokenize (over
+MAX_COMMAND bytes, over MAX_TOKENS tokens, or a quote shlex cannot close) is
+refused everywhere; write such text to a file.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ MAX_TOKENS = 4000
 MAX_DEPTH = 4
 MAX_SUBSHELL_DEPTH = 64
 SEPARATORS = frozenset((";", "&&", "||", "|", "&", "\n", "(", ")"))
-NAVIGATORS = frozenset(("cd", "pushd", "popd", "exec", "eval", "source", "."))
 SHELLS = frozenset(("bash", "sh"))
+UNPARSED = Path("unparsed command")
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.DOTALL)
 CONFIGURE_WORD = re.compile(r"(?<![A-Za-z0-9_])configure(?![A-Za-z0-9_])")
 DYNAMIC_VARIABLE = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*")
@@ -501,39 +502,6 @@ def _inspect_tokens(
     return None
 
 
-def _has_unparsed_configure(source: str) -> bool:
-    """Detect direct or globbed configure references in unparsed command text."""
-    flattened = _flatten(source)
-    if "configure" in flattened:
-        return True
-    for word in flattened.split()[:MAX_INPUT]:
-        base = os.path.basename(word)
-        if bool(GLOB_CHARS.intersection(base)) and fnmatch.fnmatchcase("configure", base):
-            return True
-    return False
-
-
-def _unparsed_reaches_tree(source: str, cwd: Path | None) -> bool:
-    """Determine whether an unparsed shell command could reach an FFmpeg tree."""
-    for raw in source.split()[:MAX_TOKENS]:
-        word = raw.lstrip("({").rstrip(";)")
-        if word in NAVIGATORS:
-            return True
-        if "/" not in word:
-            continue
-        dirname = os.path.dirname(word)
-        if not DECIDABLE_DIR.fullmatch(dirname) or cwd is None:
-            return True
-        try:
-            resolved_dir = Path(os.path.normpath(cwd / os.path.expanduser(dirname)))
-            resolved_word = Path(os.path.normpath(cwd / os.path.expanduser(word)))
-            if (resolved_dir / "libavcodec").is_dir() or (resolved_word / "libavcodec").is_dir():
-                return True
-        except (OSError, ValueError):
-            return True
-    return False
-
-
 def _update_quote(char: str, quote: str | None) -> str | None:
     """Update current quote state when encountering quote delimiters."""
     if quote is None and char in ("'", '"'):
@@ -650,11 +618,7 @@ def _inspect(command: str, cwd: Path) -> Path | None:
             return Path("configure (nesting limit)")
         tokens = _parse_source(source, directory, depth, pending)
         if tokens is None:
-            if _has_unparsed_configure(source):
-                return Path("configure (parse or size limit)")
-            if _unparsed_reaches_tree(source, directory):
-                return Path("configure (unparsed command can reach an FFmpeg tree)")
-            continue
+            return UNPARSED
         blocked = _inspect_tokens(tokens, directory, depth, pending)
         if blocked is not None:
             return blocked
@@ -740,6 +704,15 @@ def main(argv: list[str] | None = None) -> int:
     blocked = _inspect(command, cwd)
     if blocked is None:
         return 0
+    if blocked is UNPARSED:
+        print(
+            "Raw configure guard refused a command it cannot parse (size limit, "
+            "unbalanced quote, or heredoc or comment text with an apostrophe); "
+            "split the command, or move quoted text into a file (git commit -F FILE, "
+            "gh pr create --body-file FILE)",
+            file=sys.stderr,
+        )
+        return 2
     print(
         f"Raw FFmpeg configure refused: {blocked}; use "
         "python3 scripts/ffmpeg_configure.py <SRC_DIR> <BUILD_DIR>",

@@ -82,6 +82,7 @@ class RawConfigureGuardTest(unittest.TestCase):
         self,
         cases: tuple[tuple[str, Path], ...],
         env: dict[str, str] | None = None,
+        remedy: str = "python3 scripts/ffmpeg_configure.py",
     ) -> None:
         """Verify the guard refuses raw configure invocations across clients."""
         for client in CLIENTS:
@@ -90,7 +91,7 @@ class RawConfigureGuardTest(unittest.TestCase):
                     result = self.run_guard(client, self.payload(client, command, cwd), env=env)
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("configure", result.stderr)
-                    self.assertIn("python3 scripts/ffmpeg_configure.py", result.stderr)
+                    self.assertIn(remedy, result.stderr)
                     self.assertFalse(self.marker.exists())
 
     def test_refuses_wrapper_and_relocation_forms(self) -> None:
@@ -336,9 +337,7 @@ class RawConfigureGuardTest(unittest.TestCase):
                     payload["tool_name"] = "Read"
                 self.assertEqual(self.run_guard(client, payload).returncode, 0)
                 self.assertEqual(
-                    self.run_guard(
-                        client, self.payload(client, "x" * (65536 + 1), self.tree)
-                    ).returncode,
+                    self.run_guard(client, self.payload(client, "x" * 65536, self.tree)).returncode,
                     0,
                 )
                 self.assertEqual(
@@ -348,7 +347,7 @@ class RawConfigureGuardTest(unittest.TestCase):
                     2,
                 )
                 self.assertEqual(
-                    self.run_guard(client, self.payload(client, "x " * 4001, self.tree)).returncode,
+                    self.run_guard(client, self.payload(client, "x " * 4000, self.tree)).returncode,
                     0,
                 )
                 self.assertEqual(
@@ -515,8 +514,8 @@ class RawConfigureGuardTest(unittest.TestCase):
         """Refuse oversized glob configure invocations while allowing benign commands."""
         padding = " # " + "x" * 65536
         oversized_refusal = f"cd {self.tree} && ./c?nfigure{padding}"
-        oversized_allow = f"ls{padding}"
-        self._assert_refused(((oversized_refusal, self.root),))
+        self._assert_refused(((oversized_refusal, self.root),), remedy="--body-file")
+        oversized_allow = "ls"
         for client in CLIENTS:
             with self.subTest(client=client):
                 result = self.run_guard(client, self.payload(client, oversized_allow, self.root))
@@ -532,7 +531,7 @@ class RawConfigureGuardTest(unittest.TestCase):
             (f"cd {self.tree} && ./conf\\igure{padding}", self.root),
             (f"./con''figure{padding}", self.tree),
         )
-        self._assert_refused(cases)
+        self._assert_refused(cases, remedy="--body-file")
 
     def test_midword_expansion_configure_refusal_and_benign_allow(self) -> None:
         """Refuse mid-word configure expansions while allowing benign variants."""
@@ -652,9 +651,10 @@ class RawConfigureGuardTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 2, result.stderr)
 
-    def test_unparsed_reaches_tree_refusals(self) -> None:
-        """Refuse unparsed configure invocations that can reach an FFmpeg tree."""
+    def test_unparsed_command_refusals(self) -> None:
+        """Refuse unparsed configure invocations across shell commands."""
         pad = " # " + "x" * 65536
+        big = ": " + "a" * 70000 + "; "
         cases = (
             ("./co{n,}figure" + pad, self.tree),
             ("./co`printf n`figure" + pad, self.tree),
@@ -665,8 +665,13 @@ class RawConfigureGuardTest(unittest.TestCase):
             (f"bash {self.tree}/co{{n,}}figure" + pad, self.other),
             ("./co{n,}figure # don't", self.tree),
             (f"cd {self.tree} && ./co{{n,}}figure # don't", self.other),
+            (big + "sh co{n,}figure", self.tree),
+            (big + "x=n; sh co${x}figure", self.tree),
+            (big + "sh co`printf n`figure", self.tree),
+            (big + "sh co$(printf n)figure", self.tree),
+            (big + "sh co${x:-n}figure", self.tree),
         )
-        self._assert_refused(cases)
+        self._assert_refused(cases, remedy="--body-file")
 
     def test_command_substitution_path_refusals(self) -> None:
         """Refuse command substitutions glued to configure paths targeting a tree."""
@@ -687,20 +692,39 @@ class RawConfigureGuardTest(unittest.TestCase):
         )
         self._assert_refused(cases)
 
-    def test_unparsed_and_dynamic_path_allows(self) -> None:
-        """Allow unparsed comments and dynamic paths outside an FFmpeg tree."""
+    def test_unparsed_command_refused_everywhere(self) -> None:
+        """Refuse unparsed shell commands across directories and clients."""
         pad = " # " + "x" * 65536
+        big = ": " + "a" * 70000 + "; "
+        heredoc = "cat <<'EOF' > /dev/null\nfix(hooks): it's in scripts/x.py\nEOF"
         cases = (
             ("ls" + pad, self.other),
             ("ls # don't", self.other),
-            ("cat <<'EOF' > /dev/null\nfix(hooks): it's in scripts/x.py\nEOF", self.other),
-            ("cat <<'EOF' > /dev/null\nfix(hooks): it's in scripts/x.py\nEOF" + pad, self.other),
+            (heredoc, self.other),
+            (heredoc + pad, self.other),
             ("git commit -F - <<'EOF'\nfix: don't refuse scripts/a.py\nEOF", self.other),
+            (big + "ls", self.other),
+            ("ls # don't", self.tree),
+            ("echo 'unbalanced", self.other),
+            ("echo 'unbalanced", self.tree),
+            (f"ls{pad}", self.root),
+            ("x" * (65536 + 1), self.tree),
+            ("x " * 4001, self.tree),
+        )
+        self._assert_refused(cases, remedy="--body-file")
+
+    def test_parsed_dynamic_path_allows(self) -> None:
+        """Allow parsed commands with substitutions and dynamic paths outside trees."""
+        cases = (
             ("echo $(pwd)/x", self.tree),
             ("sh ./tools/x.sh", self.tree),
             ("cat $(pwd)/README", self.tree),
             ("$(pwd)/configure", self.other),
             ("sh co{n,}figure", self.other),
+            ("git commit -F - <<'EOF'\nfix: refuse scripts/a.py\nEOF", self.other),
+            ("git commit -F /tmp/msg.txt", self.other),
+            ("gh pr create --body-file /tmp/body.md --title x", self.other),
+            ("ls", self.other),
         )
         for client in CLIENTS:
             for command, cwd in cases:
