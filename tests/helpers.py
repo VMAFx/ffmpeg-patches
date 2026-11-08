@@ -77,6 +77,41 @@ def isolated_git_environment(
     return {name: value for name, value in source.items() if name not in GIT_ENVIRONMENT_NAMES}
 
 
+def repository_git_environment(
+    root: Path, environment: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Preserve a repository-owned alternate index while isolating Git locations."""
+    env = isolated_git_environment(environment)
+    source = os.environ if environment is None else environment
+    index_file = source.get("GIT_INDEX_FILE")
+    if not index_file:
+        return env
+    try:
+        proc = subprocess.run(  # nosec B603 B607 - rev-parse with bounded arguments.
+            ["git", "-C", str(root), "rev-parse", "--absolute-git-dir"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=env,
+        )
+        if proc.returncode != 0:
+            return env
+        git_dir_raw = proc.stdout.strip()
+        if not git_dir_raw:
+            return env
+        git_dir = Path(git_dir_raw).resolve()
+        candidate = Path(index_file)
+        resolved = (
+            (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+        )
+        if resolved.is_relative_to(git_dir) and resolved != git_dir:
+            env["GIT_INDEX_FILE"] = index_file
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return env
+    return env
+
+
 def python_sources(root: Path, *, preserve_config: bool = False) -> list[Path]:
     """Return tracked Python modules and shebang-identified scripts."""
 

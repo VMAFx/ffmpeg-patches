@@ -4,12 +4,10 @@
 
 from __future__ import annotations
 
-import os
 import subprocess  # nosec B404 - fixed Git and Python test commands in temporary directories.
 import sys
 import tempfile
 import unittest
-import unittest.mock
 from pathlib import Path
 
 from tests.helpers import isolated_git_environment
@@ -63,7 +61,9 @@ class CheckHelperInstallTest(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def run_check(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def run_check(
+        self, *args: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """Run check_helper_install.py with explicit arguments and timeout."""
         return subprocess.run(  # nosec B603 - fixed Python executable and test script.
             [sys.executable, "-B", str(SCRIPT), *args],
@@ -71,7 +71,7 @@ class CheckHelperInstallTest(unittest.TestCase):
             text=True,
             check=False,
             timeout=30,
-            env=isolated_git_environment(),
+            env=isolated_git_environment() if env is None else env,
         )
 
     def test_absent_path_reports_skipped(self) -> None:
@@ -123,8 +123,13 @@ class CheckHelperInstallTest(unittest.TestCase):
             "GIT_INDEX_FILE": str(bogus / "index"),
         }
         self.install_path.symlink_to(self.helper_script)
-        with unittest.mock.patch.dict(os.environ, overrides):
-            proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        proc = self.run_check(
+            "--path",
+            str(self.install_path),
+            "--repo",
+            str(self.repo),
+            env={**isolated_git_environment(), **overrides},
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(bogus.exists())
 

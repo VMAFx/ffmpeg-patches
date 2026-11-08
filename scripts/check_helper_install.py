@@ -11,6 +11,13 @@ import subprocess  # nosec B404 - bounded Git subprocess call.
 import sys
 from pathlib import Path
 
+# Ensure repository root is on sys.path for test/tool imports
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.variant_sweep import git_environment  # noqa: E402
+
 
 def read_origin_helper(repo: Path) -> bytes | None:
     """Read scripts/ffmpeg-forgejo at origin/main or report an unreadable error."""
@@ -20,6 +27,7 @@ def read_origin_helper(repo: Path) -> bytes | None:
             cmd,
             capture_output=True,
             check=False,
+            env=git_environment(),
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
