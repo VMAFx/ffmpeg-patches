@@ -106,6 +106,9 @@ rules:
     message: tempfile.mktemp returns a name another process can take first; use mkstemp or TemporaryDirectory.
     pattern: tempfile.mktemp(...)
 
+  # FileNotFoundError is left out on purpose because absence read as empty is a
+  # deliberate value (example .config/lefthook/scripts/checkpoint.py _open_worktree_text);
+  # a tuple that also names another listed class still matches.
   - id: oserror-swallowed-as-empty
     languages: [python]
     severity: ERROR
@@ -139,7 +142,7 @@ rules:
                   return $EMPTY
       - metavariable-regex:
           metavariable: $EXC
-          regex: ^(OSError|FileNotFoundError|PermissionError|IsADirectoryError|NotADirectoryError)$
+          regex: ^(OSError|PermissionError|IsADirectoryError|NotADirectoryError)$
       - metavariable-regex:
           metavariable: $EMPTY
           regex: ^(\[\]|\{\}|\(\)|set\(\)|""|''|0)$

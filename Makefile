@@ -2,10 +2,11 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings build test lint lint-mutable-defaults apply lengths lengths-local upstream-lint dist
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply lengths lengths-local upstream-lint dist
 .PHONY: fairy-requests
 
 DOCSTRING_BASE ?= origin/main
+SEMGREP ?= semgrep
 
 all: build
 
@@ -13,7 +14,7 @@ all: build
 fairy-requests:
 	@bash scripts/ffmpeg-forgejo fairy-requests --skip-unavailable
 
-verify-all: compile-context-verify caveman-sources audit docstrings test lengths-local upstream-lint
+verify-all: compile-context-verify caveman-sources audit docstrings semgrep test lengths-local upstream-lint
 
 compile-context:
 	@$(PRAETORCTL) compile-context
@@ -29,6 +30,16 @@ audit:
 
 docstrings:
 	@sh .config/lefthook/python.sh -B scripts/docstring_diff.py --base "$(DOCSTRING_BASE)"
+
+# Same command as the scanners workflow (.github/workflows/scanners.yml), so a
+# rule finding fails the local gate before CI.
+semgrep:
+	@if ! command -v $(SEMGREP) >/dev/null 2>&1; then \
+		echo "semgrep: not installed; the scanners workflow runs semgrep 1.178.0 (.github/workflows/scanners.yml); install it, for example pipx install semgrep==1.178.0" >&2; \
+		exit 1; \
+	fi
+	@$(SEMGREP) --version
+	@$(SEMGREP) scan --config .semgrep.yml --error --metrics off --disable-version-check
 
 # The repository builds nothing: "build" lints the series and its metadata.
 build:

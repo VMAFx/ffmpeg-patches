@@ -28,6 +28,8 @@ or through `make lint-mutable-defaults`. Its Pylint pin in `requirements-dev.in`
 must match the script's `PYLINT_VERSION`. The script
 uses that exact version on PATH, falling back to `uvx` to fetch the pinned version.
 
+`make semgrep` (part of `make verify-all`) runs the repository rules in `.semgrep.yml` with the scanners workflow's command; semgrep is not in requirements-dev.txt because CI runs it from the pinned container image, so install semgrep 1.178.0 yourself (for example with pipx).
+
 ### Modernized NASA JPL Power-of-10 Rules
 
 1. **Simple Control Flow (HISS-01)**: Recursion is strictly banned; call graph
