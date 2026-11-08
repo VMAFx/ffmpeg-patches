@@ -79,11 +79,15 @@ class Gap:
     linked: bool
 
 
+def _nonblocking_opener(name: str, flags: int) -> int:
+    """Open one path for the builtin open without blocking on FIFOs or devices."""
+    return os.open(name, flags | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+
+
 def _read_regular(path: Path, limit: int, label: str) -> bytes:
     """Read at most limit bytes from one regular file or raise an input error."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
-        with open(os.open(path, flags), "rb") as handle:
+        with open(path, "rb", opener=_nonblocking_opener) as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 raise InputError(f"not a regular file: {path}")
             payload = handle.read(limit + 1)

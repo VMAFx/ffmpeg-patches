@@ -585,6 +585,21 @@ class FilterLibDepsTest(unittest.TestCase):
             filter_lib_deps._read_regular(over_path, 10, "over file")
         self.assertIn("exceeds 10 bytes", str(context.exception))
 
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "needs /proc/self/fd")
+    def test_read_regular_closes_descriptor_when_open_fails(self) -> None:
+        """Closing descriptor is guaranteed when the builtin open raises."""
+        target = self.tree / "four_bytes.bin"
+        target.write_bytes(b"1234")
+        count_before = len(list(Path("/proc/self/fd").iterdir()))
+        with unittest.mock.patch.object(
+            filter_lib_deps, "open", side_effect=OSError("planted"), create=True
+        ):
+            with self.assertRaises(filter_lib_deps.InputError) as context:
+                filter_lib_deps._read_regular(target, 10, "file")
+            self.assertIn("cannot read", str(context.exception))
+        count_after = len(list(Path("/proc/self/fd").iterdir()))
+        self.assertEqual(count_before, count_after)
+
 
 if __name__ == "__main__":
     unittest.main()
