@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "scripts" / "raw_configure_guard.py"
@@ -51,6 +53,45 @@ PROBE_GAP_SHAPES = (
     "enable -n cd; cd /tmp; ./configure",
     "shopt -s expand_aliases\nalias cd=:\ncd /tmp; ./configure",
     "for i in; do cd /tmp; done; ./configure",
+)
+MUST_ALLOW = (
+    (
+        "grep -n 'x' .workingdir/OPEN.md | tail -8 | cut -c1-300; "
+        "grep -rn 'x' docs/ scripts/*.py 2>/dev/null | head -5"
+    ),
+    "W=/w/ffmpeg-patches-raw-configure-guard; cd $W && sed -n 100,200p scripts/ffmpeg_configure.py",
+    "W=/w/ffmpeg-patches-raw-configure-guard; cat $W/.config/lane-brief.yaml",
+    "python3 - <<'EOF'\nimport json\nprint(json.dumps({}))\nEOF",
+    "git merge -S --no-edit origin/main 2>&1 | tail -5; git log -1 --format='%h %G? %s'",
+    "sed -e 's/<[^>]*>//g' /t/rev.md | grep -v '^\\s*$' | head -80",
+    "P=/p/record_answers.py; python3 -B $P --get some-id 2>&1 | cut -c1-1500",
+    "F=/t/dashenc.c; sed -n 336,372p $F; echo ....; sed -n 1985,2045p $F",
+    "grep -n '^- \\[' .workingdir/OPEN.md | grep -v 'DONE' | tail -80",
+    "B=/w/ffmpeg-botfollow; git -C $B for-each-ref --format='%(refname)' | grep -ci embargo",
+    "A=/t/agy-run.sh; sed -n 1,60p $A | grep -n 'usage\\|LANE_' | head -30",
+    "comm -13 <(cut -f1 a.tsv | sort) <(cut -f1 b.tsv | sort)",
+    (
+        "cd /w/ffmpeg-25480-rebase && git add tests/checkasm/vvc_mc.c && "
+        "GIT_EDITOR=true git rebase --continue 2>&1 | tail -3"
+    ),
+    "git -C /w/ffmpeg-patches-raw-configure-guard log --oneline -3 fix/raw-configure-guard",
+    "cat > /t/msg.txt <<'EOF'\nfix(hooks): keep the configure guard whole\nEOF",
+    "ls -la /w/ffmpeg-patches-raw-configure-guard/scripts/ffmpeg_configure.py",
+    "python3 scripts/ffmpeg_configure.py /src /build -- --prefix=/x",
+)
+MUST_REFUSE_R21 = (
+    "C=./configure; $C --prefix=/x",
+    "C=./configure; bash $C",
+    "x=n; sh co${x}figure",
+    "$UNSET_TOOL --prefix=/x",
+    "bash <<'EOF'\n./configure\nEOF",
+    "sh <<< './configure'",
+    "python3 - <<'EOF'\nimport os; os.system(\"./configure\")\nEOF",
+    "sed -n '1e ./configure' f.txt",
+    "find . -name configure -exec {} \\;",
+    "cat <(./configure)",
+    "echo $(./configure)",
+    "ls | xargs ./configure",
 )
 SPEC = importlib.util.spec_from_file_location("raw_configure_guard", GUARD)
 if SPEC is None or SPEC.loader is None:
@@ -222,8 +263,6 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("GIT_PAGER=./configure git log", self.tree),
             ("GIT_EXTERNAL_DIFF=./configure git diff", self.tree),
             ("cat configure | sh", self.tree),
-            ("sed -n 1p configure", self.tree),
-            ("less configure", self.tree),
         )
         self._assert_refused(cases)
 
@@ -747,9 +786,7 @@ class RawConfigureGuardTest(unittest.TestCase):
         cases = (
             ("ls" + pad, self.other),
             ("ls # don't", self.other),
-            (heredoc, self.other),
             (heredoc + pad, self.other),
-            ("git commit -F - <<'EOF'\nfix: don't refuse scripts/a.py\nEOF", self.other),
             (big + "ls", self.other),
             ("ls # don't", self.tree),
             ("echo 'unbalanced", self.other),
@@ -762,11 +799,16 @@ class RawConfigureGuardTest(unittest.TestCase):
 
     def test_parsed_dynamic_path_allows(self) -> None:
         """Allow parsed commands with substitutions and dynamic paths outside trees."""
+        heredoc = "cat <<'EOF' > /dev/null\nfix(hooks): it's in scripts/x.py\nEOF"
         cases = (
             ("echo $(pwd)/x", self.tree),
             ("sh ./tools/x.sh", self.tree),
             ("cat $(pwd)/README", self.tree),
             ("git commit -F - <<'EOF'\nfix: refuse scripts/a.py\nEOF", self.other),
+            ("git commit -F - <<'EOF'\nfix: don't refuse scripts/a.py\nEOF", self.other),
+            (heredoc, self.other),
+            ("sed -n 1p configure", self.tree),
+            ("less configure", self.tree),
             ("git commit -F /tmp/msg.txt", self.other),
             ("gh pr create --body-file /tmp/body.md --title x", self.other),
             ("ls", self.other),
@@ -818,3 +860,73 @@ class RawConfigureGuardTest(unittest.TestCase):
                 result = self.run_guard(client, self.payload(client, long_if, self.root))
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.marker.exists())
+
+    def test_must_allow(self) -> None:
+        """Allow verified benign agent command shapes from MUST_ALLOW."""
+        temp_dir = self.other
+        for client in CLIENTS:
+            for command in MUST_ALLOW:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, temp_dir))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_must_refuse_r21(self) -> None:
+        """Refuse execution-capable configure invocations from MUST_REFUSE_R21."""
+        for client in CLIENTS:
+            for command in MUST_REFUSE_R21:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, self.other))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("scripts/ffmpeg_configure.py", result.stderr)
+
+    def test_exception_and_whitespace_quoted_word(self) -> None:
+        """Fail closed on inspection exceptions and refuse whitespace-only quoted words."""
+        stderr_buf = io.StringIO()
+        with (
+            mock.patch(
+                "sys.stdin.buffer.read",
+                return_value=json.dumps(self.payload("claude", "ls", self.other)).encode("utf-8"),
+            ),
+            mock.patch.object(GUARD_MOD, "_inspect", side_effect=RuntimeError("simulated error")),
+            mock.patch("sys.stderr", stderr_buf),
+        ):
+            rc = GUARD_MOD.main(["--client", "claude"])
+            self.assertEqual(rc, 2)
+            self.assertIn("scripts/ffmpeg_configure.py", stderr_buf.getvalue())
+        for client in CLIENTS:
+            for cmd in ('"  " ./configure', './configure "  "'):
+                with self.subTest(client=client, command=cmd):
+                    result = self.run_guard(client, self.payload(client, cmd, self.other))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("scripts/ffmpeg_configure.py", result.stderr)
+
+    def test_tokenization_helper(self) -> None:
+        """Verify _tokenize_command extracts heredocs, substitutions, and literal assignments."""
+        cmd = "C=./configure; cat <<'EOF' > out.txt\ndata\nEOF\necho $(pwd) <(cat a.txt)"
+        res = GUARD_MOD._tokenize_command(cmd)
+        self.assertIsNotNone(res)
+        pipelines, assignments, stdin_map, inners = res
+        self.assertEqual(assignments.get("C"), "./configure")
+        self.assertEqual(len(stdin_map), 1)
+        self.assertIn("data\n", stdin_map.values())
+        self.assertEqual(len(inners), 2)
+
+    def test_command_classification_helper(self) -> None:
+        """Verify _classify_command identifies inspected positions and distinguishes data."""
+        blocked, _ = GUARD_MOD._classify_command(["./configure"], {})
+        self.assertIsNotNone(blocked)
+        blocked, _ = GUARD_MOD._classify_command(["grep", "-n", "pattern", "configure"], {})
+        self.assertIsNone(blocked)
+        blocked, _ = GUARD_MOD._classify_command(["$UNSET"], {})
+        self.assertIsNotNone(blocked)
+        blocked, _ = GUARD_MOD._classify_command(["$C"], {"C": "./configure"})
+        self.assertIsNotNone(blocked)
+
+    def test_nested_program_helper(self) -> None:
+        """Verify _handle_nested_program queues inner programs and enforces recursion limits."""
+        pending: list[tuple[str, int]] = []
+        err = GUARD_MOD._handle_nested_program("echo 1", 1, pending)
+        self.assertIsNone(err)
+        self.assertEqual(pending, [("echo 1", 1)])
+        err = GUARD_MOD._handle_nested_program("echo 1", GUARD_MOD.MAX_DEPTH + 1, pending)
+        self.assertIsNotNone(err)
