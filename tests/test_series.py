@@ -1214,6 +1214,93 @@ class MasterFormTest(SeriesTestCase):
         )
         self.assert_error(series.check(self.fx.root), "full 40-hex commit")
 
+    def setup_multi_patch_pr(self, *form_on: int) -> str:
+        """Link both fixture patches to pull request 1 and build its forge branch."""
+        run_git(self.forge, "checkout", "-q", "-B", "multi-pr", self.fx.base)
+        commit_edit(self.forge, 4, "int line_5 = 50;", "PR: line five")
+        commit_edit(self.forge, 29, "int line_30 = 300;", "PR: line thirty")
+        head = run_git(self.forge, "rev-parse", "HEAD")
+        for number, name in enumerate(self.fx.names, 1):
+            metadata = METADATA
+            if number in form_on:
+                metadata += f'master_form = {{ base = "{self.fx.base}", head = "{head}" }}\n'
+            (self.fx.root / "patches" / name).with_suffix(".toml").write_text(
+                metadata, encoding="utf-8"
+            )
+        self.fx.write_records([self.fx.record(1, patch=f"{self.fx.names[0]}, {self.fx.names[1]}")])
+        return head
+
+    def test_multi_patch_pr_applies_master_form_on_last_patch(self) -> None:
+        """Verify master form on last patch covers earlier pull request parts."""
+        self.setup_multi_patch_pr(2)
+        results = self.apply(keep_going=True)
+        self.assertEqual([s for _, s in results], ["in-master-form", "master-form"])
+        lines = (self.fx.tree / "lib.c").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[4], "int line_5 = 50;")
+        self.assertEqual(lines[29], "int line_30 = 300;")
+        self.assertEqual(run_git(self.fx.tree, "rev-list", "--count", f"{self.master}..HEAD"), "1")
+        self.assertEqual(series.check(self.fx.root).errors, [])
+        self.assert_clean()
+
+    def test_multi_patch_pr_run_main_prints_in_master_form(self) -> None:
+        """Verify run_main prints in-master-form for earlier pull request parts."""
+        self.setup_multi_patch_pr(2)
+        status, out, err = self.run_main("--master-forms", self.url, "--keep-going")
+        self.assertEqual((status, err), (0, ""))
+        self.assertIn("in-master-form", out)
+        self.assertIn(self.fx.names[0], out)
+        self.assert_clean()
+
+    def test_multi_patch_pr_rejects_master_form_on_earlier_patch(self) -> None:
+        """Verify check and apply reject master form on an earlier patch of a pull request."""
+        self.setup_multi_patch_pr(1)
+        findings = series.check(self.fx.root)
+        self.assertTrue(any("must be on the last patch" in error for error in findings.errors))
+        with self.assertRaises(series.SeriesError):
+            self.apply()
+        self.assert_clean()
+
+    def test_multi_patch_pr_rejects_master_form_on_multiple_patches(self) -> None:
+        """Verify check and apply reject master form on multiple patches of a pull request."""
+        self.setup_multi_patch_pr(1, 2)
+        findings = series.check(self.fx.root)
+        self.assertTrue(
+            any("master_form on more than one patch" in error for error in findings.errors)
+        )
+        with self.assertRaises(series.SeriesError):
+            self.apply()
+        self.assert_clean()
+
+    def test_multi_patch_pr_boundary_without_master_forms_applies_release_form(self) -> None:
+        """Verify apply without master forms uses release form for multi-patch pull requests."""
+        self.setup_multi_patch_pr(2)
+        self.fx.reset()
+        results = series.apply_series(self.fx.root, self.fx.tree, False, False)
+        self.assertEqual([s for _, s in results], ["applied", "applied"])
+        self.assert_clean()
+
+    def test_multi_patch_pr_boundary_no_master_form_preserves_plain_apply(self) -> None:
+        """Verify multi-patch pull request without master form preserves plain apply statuses."""
+        self.setup_multi_patch_pr()
+        findings = series.check(self.fx.root)
+        self.assertFalse(any("master_form" in error for error in findings.errors))
+        results = self.apply(keep_going=True)
+        self.assertNotIn("in-master-form", [s for _, s in results])
+        self.assertEqual([s for _, s in results], ["conflict", "applied"])
+        self.assert_clean()
+
+    def test_multi_patch_pr_rejects_invalid_metadata_on_earlier_patch(self) -> None:
+        """Verify apply rejects invalid metadata on an earlier patch of a pull request."""
+        self.setup_multi_patch_pr(2)
+        sidecar = (self.fx.root / "patches" / self.fx.names[0]).with_suffix(".toml")
+        with sidecar.open("a", encoding="utf-8") as file:
+            file.write(f'upstream_commit = "{"a" * 40}"\n')
+        with self.assertRaisesRegex(
+            series.SeriesError, "upstream_commit is allowed only with status merged"
+        ):
+            self.apply()
+        self.assert_clean()
+
 
 class MainTest(SeriesTestCase):
     def test_tool_error_exits_two(self) -> None:
