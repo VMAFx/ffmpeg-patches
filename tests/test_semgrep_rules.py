@@ -140,10 +140,31 @@ NEGATED_STATUS_FIXTURE = (
     "    local rc=$?\n"
     "  fi\n"
     "  if ! f; then rc=$?; fi\n"
+    "  if ! f\n"
+    "  then\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f; then echo first\n"
+    "  elif ! f; then rc=$?; fi\n"
     "  if f; then rc=0; else rc=$?; fi\n"
     "  f && rc=0 || rc=$?\n"
+    "  # if ! f; then rc=$?; fi\n"
+    '  echo "if ! f; then rc=$?"\n'
+    "  if ! f; then :; fi; if f; then rc=$?; fi\n"
     "}\n"
 )
+
+
+def _negated_status_expected_lines() -> set[int]:
+    """Return expected 1-based line numbers flagged in NEGATED_STATUS_FIXTURE."""
+    lines = NEGATED_STATUS_FIXTURE.splitlines()
+    return {
+        next(i for i, line in enumerate(lines, 1) if 'if ! out="$(f)"; then' in line),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then rc=$?; fi"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "elif ! f; then rc=$?; fi"),
+    }
 
 
 def _find_enclosing_function(
@@ -270,7 +291,7 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertIn(checkpoint_file.resolve(), scanned)
 
     def test_negated_if_status_read_rule(self) -> None:
-        """Rule negated-if-status-read flags status reads inside negated if conditions."""
+        """Rule negated-if-status-read flags negated if/elif status reads, not comments, strings or later statements."""  # noqa: E501
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         scratch_path = Path(scratch.name)
@@ -285,12 +306,7 @@ class SemgrepRulesTest(unittest.TestCase):
             for item in data.get("results", [])
             if item.get("check_id", "").endswith("negated-if-status-read")
         }
-        lines = NEGATED_STATUS_FIXTURE.splitlines()
-        expected_lines = {
-            next(i for i, line in enumerate(lines, 1) if 'if ! out="$(f)"; then' in line),
-            next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then"),
-            next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then rc=$?; fi"),
-        }
+        expected_lines = _negated_status_expected_lines()
         self.assertEqual(flagged_lines, expected_lines)
 
     def test_negated_if_status_read_rule_covers_forgejo_script(self) -> None:
@@ -309,12 +325,7 @@ class SemgrepRulesTest(unittest.TestCase):
             for item in data.get("results", [])
             if item.get("check_id", "").endswith("negated-if-status-read")
         }
-        lines = NEGATED_STATUS_FIXTURE.splitlines()
-        expected_lines = {
-            next(i for i, line in enumerate(lines, 1) if 'if ! out="$(f)"; then' in line),
-            next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then"),
-            next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then rc=$?; fi"),
-        }
+        expected_lines = _negated_status_expected_lines()
         self.assertEqual(flagged_lines, expected_lines)
         scanned = [Path(p).resolve() for p in data.get("paths", {}).get("scanned", [])]
         self.assertIn(fixture_file.resolve(), scanned)

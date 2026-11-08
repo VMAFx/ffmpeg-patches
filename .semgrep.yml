@@ -199,6 +199,7 @@ rules:
           regex: ^(\[\]|\{\}|\(\)|set\(\)|""|''|0)$
 
   # shellcheck does not flag reading $? inside a negated if (pull request 248 review, 2026-11-08).
+  # Anchored at line start (no comments or strings); ";" or a newline before then; elif too.
   - id: negated-if-status-read
     languages: [generic]
     severity: ERROR
@@ -209,5 +210,5 @@ rules:
       include:
         - "*.sh"
         - scripts/ffmpeg-forgejo
-    pattern-regex: 'if\s+!\s[^\n]*;\s*then\s*(?:\n\s*)?(?:local\s+)?\w+=\$\?'
+    pattern-regex: '(?m)^[ \t]*(?:el)?if[ \t]+![ \t][^\n;]*(?:;[ \t]*|\n[ \t]*)then\s+(?:local\s+)?\w+=\$\?'
 
