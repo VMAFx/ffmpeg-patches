@@ -198,3 +198,16 @@ rules:
           metavariable: $EMPTY
           regex: ^(\[\]|\{\}|\(\)|set\(\)|""|''|0)$
 
+  # shellcheck does not flag reading $? inside a negated if (pull request 248 review, 2026-11-08).
+  - id: negated-if-status-read
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      $? inside "if ! cmd; then" is the status of the negation (0), not of cmd;
+      write "if cmd; then rc=0; else rc=$?; fi".
+    paths:
+      include:
+        - "*.sh"
+        - scripts/ffmpeg-forgejo
+    pattern-regex: 'if\s+!\s[^\n]*;\s*then\s*(?:\n\s*)?(?:local\s+)?\w+=\$\?'
+

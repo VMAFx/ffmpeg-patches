@@ -50,10 +50,16 @@ def other_status(state: str, updated_at: str, n: int = 0) -> dict:
     return {"context": f"Test / job {n}", "status": state, "updated_at": updated_at}
 
 
-def open_pull(number: int = 25612, login: str = "tester") -> dict:
+def open_pull(number: int = 25612, login: str = "tester", head_sha: str | None = None) -> dict:
     """Build one open pull request list item."""
 
-    return {"number": number, "state": "open", "user": {"login": login}}
+    sha = head_sha if head_sha is not None else f"{number:040x}"
+    return {
+        "number": number,
+        "state": "open",
+        "user": {"login": login},
+        "head": {"sha": sha},
+    }
 
 
 def fairy_review(
@@ -507,6 +513,25 @@ class ForgejoTest(unittest.TestCase):
         sha = git_output(self.repo, "rev-parse", "topic")
         self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
 
+    def command_environment(
+        self,
+        server: http.server.HTTPServer,
+        path_first: Path | None = None,
+        env_updates: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Build the isolated execution environment for helper runs."""
+
+        env = isolated_git_environment(preserve_config=True)
+        dirs = [str(p) for p in (path_first, self.bin_dir) if p]
+        env.update(
+            PATH=os.pathsep.join(dirs + [env.get("PATH", "")]),
+            FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
+            FFMPEG_FORGEJO_GIT=str(self.upstream),
+            FFMPEG_FORGEJO_POLL="0",
+        )
+        env.update(env_updates or {})
+        return env
+
     def run_command(
         self,
         stub: Stub,
@@ -522,15 +547,7 @@ class ForgejoTest(unittest.TestCase):
             stub.branch_head = git_output(self.repo, "rev-parse", "topic")
         server = serve(stub)
         try:
-            env = isolated_git_environment(preserve_config=True)
-            dirs = [str(p) for p in (path_first, self.bin_dir) if p]
-            env.update(
-                PATH=os.pathsep.join(dirs + [env.get("PATH", "")]),
-                FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
-                FFMPEG_FORGEJO_GIT=str(self.upstream),
-                FFMPEG_FORGEJO_POLL="0",
-            )
-            env.update(env_updates or {})
+            env = self.command_environment(server, path_first=path_first, env_updates=env_updates)
             return subprocess.run(  # nosec B603 - fixed interpreter/helper, allow-list, test literals.
                 ["bash", str(self.helper), *args],
                 env=env,
@@ -2299,6 +2316,20 @@ class OverlapVerbTest(ForgejoTest):
 
         return self.run_command(stub, "overlap", *options, "topic")
 
+    def pr(self, stub: Stub, *options: str) -> subprocess.CompletedProcess[str]:
+        """Attempt to create the shared topic pull request."""
+
+        return self.run_command(
+            stub,
+            "pr",
+            "--sweep",
+            str(self.sweep),
+            *options,
+            "topic",
+            "title",
+            str(self.tmp / "body.md"),
+        )
+
     def test_fate_list_overlap_is_listed(self) -> None:
         """A shared fate makefile is detected as an overlap."""
 
@@ -2354,6 +2385,8 @@ class OverlapVerbTest(ForgejoTest):
         )
         proc = self.overlap(stub)
         self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertIn('#25612 ["libavfilter/vf_find_rect.c"]', proc.stdout)
+        self.assertIn('#25700 ["libavfilter/vf_find_rect.c"]', proc.stdout)
         lines = proc.stdout.splitlines()
         self.assertEqual(lines[-1], "own-open: 25612 25700")
 
@@ -2390,6 +2423,16 @@ class OverlapVerbTest(ForgejoTest):
         lines2 = proc2.stdout.splitlines()
         self.assertEqual(lines2[-1], "own-open: none")
 
+        stub3 = overlap_stub(
+            open_pulls=[open_pull(number=25612), open_pull(number=25700)],
+            pull_files={25612: [OVERLAP_FILE], 25700: [OVERLAP_FILE]},
+        )
+        proc3 = self.overlap(stub3, "--overlap-ok", "25700")
+        self.assertEqual(proc3.returncode, 77, proc3.stderr)
+        lines3 = proc3.stdout.splitlines()
+        self.assertEqual(lines3[-1], "own-open: 25612")
+        self.assertNotIn("25700", proc3.stdout)
+
     def test_unlistable_pulls_fail_closed(self) -> None:
         """Failure to list open pulls exits one without reporting an own-open line."""
 
@@ -2406,6 +2449,189 @@ class OverlapVerbTest(ForgejoTest):
             with self.subTest(bad=bad):
                 proc = self.overlap(stub, "--overlap-ok", bad)
                 self.assertEqual(proc.returncode, 64, proc.stderr)
+
+    def test_zero_open_pulls_report_none(self) -> None:
+        """When there are no own open pulls, report none without file requests."""
+
+        stub = overlap_stub(open_pulls=[])
+        proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[-1], "own-open: none")
+        self.assertFalse(any("/files" in path for _, path, _ in stub.requests))
+
+    def test_stale_fetch_head_does_not_change_the_base(self) -> None:
+        """Diff against the fetched base ignores a pre-existing stale FETCH_HEAD."""
+
+        git_path = git_output(self.repo, "rev-parse", "--git-path", "FETCH_HEAD")
+        fetch_head_path = Path(git_path) if Path(git_path).is_absolute() else self.repo / git_path
+        topic_sha = git_output(self.repo, "rev-parse", "topic")
+        stale_content = f"{topic_sha}\t\tbranch 'topic' of elsewhere\n".encode()
+        fetch_head_path.write_bytes(stale_content)
+
+        stub = overlap_stub(
+            open_pulls=[open_pull(number=25612)],
+            pull_files={25612: [OVERLAP_FILE]},
+        )
+        proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[-1], "own-open: 25612")
+        self.assertEqual(fetch_head_path.read_bytes(), stale_content)
+        refs = git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo")
+        self.assertEqual(refs, "")
+
+    def test_pull_closed_during_listing_is_rechecked(self) -> None:
+        """A pull closed during listing triggers a second round that catches missed pulls."""
+
+        open_pulls = [open_pull(number=n) for n in range(25000, 25051)]
+        stub = overlap_stub(
+            open_pulls=open_pulls,
+            pull_files={25050: [OVERLAP_FILE]},
+        )
+        original_pulls = stub.pulls
+        first_page1 = True
+
+        def side_effect(query: dict[str, list[str]]) -> list[dict]:
+            nonlocal first_page1
+            result = original_pulls(query)
+            if first_page1 and query.get("page", ["1"])[0] == "1":
+                first_page1 = False
+                stub.open_pulls.pop(0)
+            return result
+
+        with unittest.mock.patch.object(stub, "pulls", side_effect=side_effect):
+            proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[-1], "own-open: 25050")
+        page1_requests = [
+            path for _, path, _ in stub.requests if "/pulls?" in path and "page=1" in path
+        ]
+        self.assertGreaterEqual(len(page1_requests), 4)
+
+    def test_listing_that_never_settles_fails_closed(self) -> None:
+        """A pull list whose head SHA changes across every check fails closed after three rounds."""
+
+        stub = overlap_stub(open_pulls=[open_pull(number=25612)])
+        counter = 0
+
+        def side_effect(query: dict[str, list[str]]) -> list[dict]:
+            nonlocal counter
+            page = query.get("page", ["1"])[0]
+            if page != "1":
+                return []
+            counter += 1
+            return [
+                {
+                    "number": 25612,
+                    "state": "open",
+                    "user": {"login": "tester"},
+                    "head": {"sha": f"{counter:040x}"},
+                }
+            ]
+
+        with unittest.mock.patch.object(stub, "pulls", side_effect=side_effect):
+            proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("changed during 3 overlap checks", proc.stderr)
+        self.assertNotIn("own-open:", proc.stdout)
+        page1_requests = [
+            path for _, path, _ in stub.requests if "/pulls?" in path and "page=1" in path
+        ]
+        self.assertEqual(len(page1_requests), 6)
+
+    def test_shared_paths_on_every_file_page_are_listed(self) -> None:
+        """All shared paths across multiple file pages are accumulated and reported."""
+
+        identity = [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+        ]
+        commit = [*identity, "commit", "-qm"]
+        second = self.repo / "libavfilter" / "vf_second.c"
+        second.write_text("second\n", encoding="utf-8")
+        git(self.repo, "add", "libavfilter/vf_second.c")
+        git(self.repo, *commit, "second file")
+
+        files = (
+            [OVERLAP_FILE]
+            + [f"libavfilter/filler_{number}.c" for number in range(49)]
+            + ["libavfilter/vf_second.c"]
+        )
+        stub = overlap_stub(
+            open_pulls=[open_pull(number=25612)],
+            pull_files={25612: files},
+        )
+        proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertIn(
+            '#25612 ["libavfilter/vf_find_rect.c", "libavfilter/vf_second.c"]',
+            proc.stdout,
+        )
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[-1], "own-open: 25612")
+
+    def test_interrupted_overlap_cleans_up(self) -> None:
+        """An interrupted overlap check cleans up its candidate file and private base ref."""
+
+        clean_tmp = self.tmp / "interrupted-tmp"
+        clean_tmp.mkdir()
+        stub = overlap_stub(
+            open_pulls=[open_pull(number=25612)],
+            pull_files={25612: [OVERLAP_FILE]},
+        )
+        original_files = stub.files
+        term_sent = threading.Event()
+        proc: subprocess.Popen[str] | None = None
+
+        def files_side_effect(number: int, query: dict[str, list[str]]) -> list[dict] | None:
+            if not term_sent.is_set() and proc is not None:
+                proc.terminate()
+                term_sent.set()
+            return original_files(number, query)
+
+        server = serve(stub)
+        try:
+            with unittest.mock.patch.object(stub, "files", side_effect=files_side_effect):
+                env = self.command_environment(server, env_updates={"TMPDIR": str(clean_tmp)})
+                proc = subprocess.Popen(  # nosec B603 - fixed helper invocation in test
+                    ["bash", str(self.helper), "overlap", "topic"],
+                    env=env,
+                    cwd=self.repo,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                proc.wait(timeout=10)
+        finally:
+            server.shutdown()
+            server.server_close()
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+        self.assertIsNotNone(proc)
+        self.assertEqual(proc.returncode, 143)
+        self.assertEqual(list(clean_tmp.iterdir()), [])
+        refs = git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo")
+        self.assertEqual(refs, "")
+
+    def test_overlap_errors_name_no_pull_request(self) -> None:
+        """The overlap verb never claims no pull request was opened on probe errors."""
+
+        overlap_proc = self.overlap(overlap_stub(fail_pulls=True))
+        self.assertEqual(overlap_proc.returncode, 1, overlap_proc.stderr)
+        self.assertIn("overlap not proven absent", overlap_proc.stderr)
+        self.assertNotIn("no pull request opened", overlap_proc.stderr)
+
+        pr_proc = self.pr(overlap_stub(fail_pulls=True))
+        self.assertEqual(pr_proc.returncode, 1, pr_proc.stderr)
+        self.assertIn("no pull request opened", pr_proc.stderr)
 
 
 class SweepTest(ForgejoTest):
@@ -3135,7 +3361,7 @@ class PullOverlapMutantTest(unittest.TestCase):
                 ("test_null_first_file_page_fails_closed",),
             ),
             (
-                '"FETCH_HEAD...$branch"',
+                '"$OVERLAP_REF...$branch"',
                 '"$BASE...$branch"',
                 ("test_upstream_base_avoids_stale_local_master",),
             ),
@@ -3155,14 +3381,44 @@ class PullOverlapMutantTest(unittest.TestCase):
         source = HELPER.read_text(encoding="utf-8")
         mutations = (
             (
-                '"FETCH_HEAD...$branch" --',
-                "\"FETCH_HEAD...$branch\" -- 'lib*'",
+                '"$OVERLAP_REF...$branch" --',
+                "\"$OVERLAP_REF...$branch\" -- 'lib*'",
                 ("test_fate_list_overlap_is_listed",),
             ),
             (
-                'overlapping+=("$number"); continue',
-                'overlapping+=("$number"); rm -f "$candidates"; return 77',
+                'overlapping_records+=("$number $shared")',
+                'overlapping_records+=("$number $shared"); overlap_cleanup; return 77',
                 ("test_every_overlapping_pull_is_listed",),
+            ),
+            (
+                '[ "$count" -ne 0 ] || break',
+                ":",
+                ("test_zero_open_pulls_report_none",),
+            ),
+            (
+                '"$OVERLAP_REF...$branch"',
+                '"FETCH_HEAD...$branch"',
+                ("test_stale_fetch_head_does_not_change_the_base",),
+            ),
+            (
+                "--no-write-fetch-head ",
+                "",
+                ("test_stale_fetch_head_does_not_change_the_base",),
+            ),
+            (
+                '[ "$snapshot_a" = "$snapshot_b" ]',
+                "[ 0 -eq 0 ]",
+                ("test_pull_closed_during_listing_is_rechecked",),
+            ),
+            (
+                'shared+=("${page_shared[@]}")',
+                'shared+=("${page_shared[@]}"); break',
+                ("test_shared_paths_on_every_file_page_are_listed",),
+            ),
+            (
+                '[[ " $allowed " == *" $number "* ]] && continue',
+                '[[ -n "$allowed" && "$number" == "${numbers[0]}" ]] && continue',
+                ("test_overlap_ok_skips_exact_pull",),
             ),
         )
         for old, new, cases in mutations:

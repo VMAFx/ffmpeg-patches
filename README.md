@@ -153,7 +153,7 @@ Pass the reviewed report before positional arguments to both commands (run these
 /path/to/ffmpeg-patches/scripts/ffmpeg-forgejo pr --sweep /path/to/sweep.md topic "Fix title" /path/to/body.md
 ```
 
-Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`. `ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>` lists every own open pull sharing a file with the branch diff against the fetched base (exit 77 when any, 0 when none, 1 when not proven).
+Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`. `ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>` lists every own open pull sharing a file with the branch diff against the fetched base (exit 77 when any, 0 when none, 1 when not proven). The base is fetched into a private ref (the caller's FETCH_HEAD is untouched), the own open pulls are listed oldest first and listed again after the file checks (up to 3 rounds; unequal listings exit 1), and every shared path of each pull is printed.
 
 #### Forge settings
 

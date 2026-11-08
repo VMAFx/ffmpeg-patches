@@ -125,6 +125,26 @@ def case_not_flagged_oserror_print_err():
         return 1
 """
 
+NEGATED_STATUS_FIXTURE = (
+    "#!/usr/bin/env bash\n"
+    "# SPDX-"
+    "License-Identifier: EUPL-1.2\n"
+    "set -euo pipefail\n\n"
+    "f() { return 77; }\n\n"
+    "g() {\n"
+    '  if ! out="$(f)"; then\n'
+    "    rc=$?\n"
+    '    echo "$rc"\n'
+    "  fi\n"
+    "  if ! f; then\n"
+    "    local rc=$?\n"
+    "  fi\n"
+    "  if ! f; then rc=$?; fi\n"
+    "  if f; then rc=0; else rc=$?; fi\n"
+    "  f && rc=0 || rc=$?\n"
+    "}\n"
+)
+
 
 def _find_enclosing_function(
     functions: list[ast.FunctionDef],
@@ -248,3 +268,53 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertEqual(flagged, set())
         scanned = [Path(p).resolve() for p in data.get("paths", {}).get("scanned", [])]
         self.assertIn(checkpoint_file.resolve(), scanned)
+
+    def test_negated_if_status_read_rule(self) -> None:
+        """Rule negated-if-status-read flags status reads inside negated if conditions."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        scratch_path = Path(scratch.name)
+        scripts_dir = scratch_path / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        fixture_file = scripts_dir / "fixture.sh"
+        fixture_file.write_text(NEGATED_STATUS_FIXTURE, encoding="utf-8")
+
+        data = _run_semgrep(fixture_file, scratch_path)
+        flagged_lines = {
+            item["start"]["line"]
+            for item in data.get("results", [])
+            if item.get("check_id", "").endswith("negated-if-status-read")
+        }
+        lines = NEGATED_STATUS_FIXTURE.splitlines()
+        expected_lines = {
+            next(i for i, line in enumerate(lines, 1) if 'if ! out="$(f)"; then' in line),
+            next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then"),
+            next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then rc=$?; fi"),
+        }
+        self.assertEqual(flagged_lines, expected_lines)
+
+    def test_negated_if_status_read_rule_covers_forgejo_script(self) -> None:
+        """Rule negated-if-status-read scans ffmpeg-forgejo without extension."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        scratch_path = Path(scratch.name)
+        scripts_dir = scratch_path / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        fixture_file = scripts_dir / "ffmpeg-forgejo"
+        fixture_file.write_text(NEGATED_STATUS_FIXTURE, encoding="utf-8")
+
+        data = _run_semgrep(fixture_file, scratch_path)
+        flagged_lines = {
+            item["start"]["line"]
+            for item in data.get("results", [])
+            if item.get("check_id", "").endswith("negated-if-status-read")
+        }
+        lines = NEGATED_STATUS_FIXTURE.splitlines()
+        expected_lines = {
+            next(i for i, line in enumerate(lines, 1) if 'if ! out="$(f)"; then' in line),
+            next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then"),
+            next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then rc=$?; fi"),
+        }
+        self.assertEqual(flagged_lines, expected_lines)
+        scanned = [Path(p).resolve() for p in data.get("paths", {}).get("scanned", [])]
+        self.assertIn(fixture_file.resolve(), scanned)
