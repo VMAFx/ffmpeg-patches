@@ -19,10 +19,13 @@ from scripts.raw_configure_words import (  # noqa: E402
     DATA_ONLY_COMMANDS,
     DECIDABLE_NAME,
     EXEC_ENV_VARS,
+    EXEC_PROGRAM_OPTIONS,
     GIT_DATA_SUBCOMMANDS,
     GIT_GLOBAL_OPTS_WITH_ARG,
     INLINE_PROGRAM_FLAG,
+    INTERPRETER_VALUE_OPTIONS,
     INTERPRETERS,
+    MAKE_VAR_ASSIGN,
     MAX_TOKENS,
     PREFIX_SIMPLE,
     SED_EXEC_PATTERN,
@@ -32,7 +35,9 @@ from scripts.raw_configure_words import (  # noqa: E402
     _flatten,
     _has_command_position_configure,
     _has_configure_token,
+    _interpreter_family,
     _is_configure_word,
+    _long_option_values,
     _substitute_literals,
 )
 
@@ -218,24 +223,38 @@ def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
     return None, c_seen
 
 
+def _check_interpreter_flag(
+    w: str, next_word: str | None, val_opts: frozenset[str]
+) -> tuple[int, Path | None]:
+    """Check an interpreter flag and optional argument for configure references."""
+    if CONFIGURE_WORD.search(w):
+        return 1, Path(w)
+    if INLINE_PROGRAM_FLAG.fullmatch(w) and next_word is not None:
+        if CONFIGURE_WORD.search(next_word):
+            return 2, Path(next_word)
+        return 2, None
+    if w in val_opts and next_word is not None:
+        if CONFIGURE_WORD.search(next_word):
+            return 2, Path(next_word)
+        return 2, None
+    return 1, None
+
+
 def _inspect_interpreter_flags(words: list[str], idx: int) -> Path | None:
     """Scan leading interpreter option flags for inline configure code."""
+    family = _interpreter_family(os.path.basename(words[idx]))
+    val_opts = INTERPRETER_VALUE_OPTIONS.get(family or "", frozenset())
     words_len = len(words)
     bound = min(words_len, idx + 16)
     i = idx + 1
     for _ in range(bound - idx):
         if i >= bound or not words[i].startswith("-"):
             break
-        w = words[i]
-        if CONFIGURE_WORD.search(w):
-            return Path(w)
-        if INLINE_PROGRAM_FLAG.fullmatch(w) and i + 1 < words_len:
-            code = words[i + 1]
-            if CONFIGURE_WORD.search(code):
-                return Path(code)
-            i += 2
-            continue
-        i += 1
+        next_w = words[i + 1] if i + 1 < words_len else None
+        step, blocked = _check_interpreter_flag(words[i], next_w, val_opts)
+        if blocked is not None:
+            return blocked
+        i += step
     return None
 
 
@@ -274,7 +293,7 @@ def _inspect_find(words: list[str], idx: int) -> Path | None:
                 exec_args.append(words[j])
             if not terminated and words_len >= i + 32:
                 return Path("find -exec (argument limit)")
-            if exec_args and os.path.basename(exec_args[0]) in DATA_ONLY_COMMANDS:
+            if exec_args and _is_inert_command(exec_args, 0, {}):
                 continue
             if has_conf_name and any("{}" in arg for arg in exec_args):
                 return Path("find -exec configure")
@@ -394,15 +413,57 @@ def _inspect_shell_or_eval(
     return None, None
 
 
-def _inspect_prefix_env(words: list[str]) -> Path | None:
+def _assignment_blocked(word: str, assignments: dict[str, str]) -> bool:
+    """Check whether an assignment binds an execution-capable configure override."""
+    if not ASSIGNMENT.fullmatch(word):
+        return False
+    var, val = word.split("=", 1)
+    if var in EXEC_ENV_VARS and (_is_configure_word(val) or bool(CONFIGURE_WORD.search(val))):
+        return True
+    return _has_command_position_configure(val, assignments)
+
+
+def _inspect_prefix_env(words: list[str], assignments: dict[str, str]) -> Path | None:
     """Check prefix environment variable assignments for command execution overrides."""
     for w in words:
         if not ASSIGNMENT.fullmatch(w):
             break
-        var, val = w.split("=", 1)
-        if var in EXEC_ENV_VARS and (_is_configure_word(val) or CONFIGURE_WORD.search(val)):
+        if _assignment_blocked(w, assignments):
             return Path(w)
     return None
+
+
+def _inspect_make_eval(words: list[str], idx: int, assignments: dict[str, str]) -> Path | None:
+    """Check make -E and --eval options for configure invocations."""
+    words_len = len(words)
+    bound = min(words_len, idx + 32)
+    for i in range(idx + 1, bound):
+        w = words[i]
+        if w == "-E" and i + 1 < words_len and _has_configure_token(words[i + 1], assignments):
+            return Path(words[i + 1])
+        if w.startswith("-E") and len(w) > 2 and _has_configure_token(w[2:], assignments):
+            return Path(w[2:])
+    for val in _long_option_values(words, idx + 1, "--eval", 4):
+        if _has_configure_token(val, assignments):
+            return Path(val)
+    return None
+
+
+def _inspect_make(
+    words: list[str], idx: int, stdin_prog: str | None, assignments: dict[str, str]
+) -> Path | None:
+    """Inspect make commands for stdin recipes, variable overrides, and eval flags."""
+    if stdin_prog is not None and (
+        CONFIGURE_WORD.search(stdin_prog) or CONFIGURE_WORD.search(_flatten(stdin_prog))
+    ):
+        return Path(stdin_prog[:50])
+    words_len = len(words)
+    bound = min(words_len, idx + 32)
+    for i in range(idx + 1, bound):
+        m = MAKE_VAR_ASSIGN.match(words[i])
+        if m and _has_configure_token(m.group(1), assignments):
+            return Path(words[i])
+    return _inspect_make_eval(words, idx, assignments)
 
 
 def _inspect_known_dispatch(
@@ -421,6 +482,7 @@ def _inspect_known_dispatch(
         "git": lambda: _inspect_git(words, cmd_idx),
         "xargs": lambda: _inspect_xargs(words, cmd_idx, stdin_prog, assignments),
         "rg": lambda: _inspect_rg(words, cmd_idx),
+        "make": lambda: _inspect_make(words, cmd_idx, stdin_prog, assignments),
     }
     handler = handlers.get(name)
     if handler is not None:
@@ -433,9 +495,45 @@ def _skipped_configure(words: list[str], cmd_idx: int, assignments: dict[str, st
     bound = min(len(words), max(0, cmd_idx))
     for i in range(bound):
         word = words[i]
-        if not ASSIGNMENT.fullmatch(word) and _has_configure_token(word, assignments):
+        if ASSIGNMENT.fullmatch(word):
+            if _assignment_blocked(word, assignments):
+                return Path(word)
+        elif _has_configure_token(word, assignments):
             return Path(word)
     return None
+
+
+def _wrapper_blocked(words: list[str], cmd_idx: int, assignments: dict[str, str]) -> Path | None:
+    """Check prefix environment assignments and skipped wrapper tokens."""
+    env_blocked = _inspect_prefix_env(words, assignments)
+    if env_blocked is not None:
+        return env_blocked
+    return _skipped_configure(words, cmd_idx, assignments)
+
+
+def _exec_option_blocked(
+    name: str, words: list[str], idx: int, assignments: dict[str, str]
+) -> Path | None:
+    """Check whether a data-only tool option passes an execution-capable program."""
+    options = EXEC_PROGRAM_OPTIONS.get(name)
+    if not options:
+        return None
+    for opt in options:
+        min_len = 4 if opt == "--compress-program" else 8
+        for val in _long_option_values(words, idx + 1, opt, min_len):
+            if _is_configure_word(val) or _has_configure_token(val, assignments):
+                return Path(val)
+    return None
+
+
+def _is_inert_command(words: list[str], idx: int, assignments: dict[str, str]) -> bool:
+    """Check whether a command is data-only without execution-capable options."""
+    if idx >= len(words):
+        return False
+    name = os.path.basename(_substitute_literals(words[idx], assignments))
+    return (
+        name in DATA_ONLY_COMMANDS and _exec_option_blocked(name, words, idx, assignments) is None
+    )
 
 
 def _inspect_trailing_arguments(
@@ -472,6 +570,12 @@ def _git_subcommand(words: list[str], start_idx: int) -> str | None:
     return None
 
 
+def _inspect_git_data(words: list[str], start_idx: int) -> bool:
+    """Check whether a git invocation targets an allowed data subcommand."""
+    subcmd = _git_subcommand(words, start_idx)
+    return subcmd is not None and subcmd in GIT_DATA_SUBCOMMANDS
+
+
 def _classify_target(
     words: list[str],
     cmd_idx: int,
@@ -487,12 +591,13 @@ def _classify_target(
     handled, blocked = _inspect_known_dispatch(name, words, cmd_idx, stdin_prog, assignments)
     if handled and blocked is not None:
         return blocked
-    if name in DATA_ONLY_COMMANDS or name in ("find", "sed", "rg", "xargs"):
+    exec_blocked = _exec_option_blocked(name, words, cmd_idx, assignments)
+    if exec_blocked is not None:
+        return exec_blocked
+    if _is_inert_command(words, cmd_idx, assignments) or name in ("find", "sed", "rg", "xargs"):
         return None
-    if name == "git":
-        subcmd = _git_subcommand(words, cmd_idx + 1)
-        if subcmd is not None and subcmd in GIT_DATA_SUBCOMMANDS:
-            return None
+    if name == "git" and _inspect_git_data(words, cmd_idx + 1):
+        return None
     return _inspect_trailing_arguments(words, cmd_idx + 1, assignments)
 
 
@@ -500,13 +605,10 @@ def _classify_command(
     words: list[str], assignments: dict[str, str], stdin_prog: str | None = None
 ) -> tuple[Path | None, list[str]]:
     """Determine whether inspected command positions run configure or require queuing."""
-    env_blocked = _inspect_prefix_env(words)
-    if env_blocked is not None:
-        return env_blocked, []
     cmd_idx = _unwrap_command(words, 0)
-    skipped = _skipped_configure(words, cmd_idx, assignments)
-    if skipped is not None:
-        return skipped, []
+    blocked = _wrapper_blocked(words, cmd_idx, assignments)
+    if blocked is not None:
+        return blocked, []
     if cmd_idx >= len(words):
         return None, []
     return _classify_target(words, cmd_idx, assignments, stdin_prog), []

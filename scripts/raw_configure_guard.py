@@ -27,6 +27,7 @@ from scripts.raw_configure_inspect import (  # noqa: E402
     _inspect_shell_or_eval,
     _shell_argument,
     _unwrap_command,
+    _wrapper_blocked,
 )
 from scripts.raw_configure_lex import (  # noqa: E402
     _restore_tokens,
@@ -257,6 +258,27 @@ def _inspect_shell_stage(
     return _decide_shell_stdin(prev_stage, stdin_prog, assignments, stdin_map, shell_words[0])
 
 
+def _inspect_stage_interpreter(
+    words: list[str],
+    cmd_idx: int,
+    prev_stage: list[str] | None,
+    stdin_prog: str | None,
+    context: tuple[dict[str, str], dict[str, str]],
+) -> tuple[bool, Path | None, str | None]:
+    """Inspect shell, eval, or source stage and return handled status."""
+    assignments, stdin_map = context
+    name = os.path.basename(_substitute_literals(words[cmd_idx], assignments))
+    if name in SHELLS:
+        blocked, to_queue = _inspect_shell_stage(
+            words[cmd_idx:], prev_stage, stdin_prog, assignments, stdin_map
+        )
+        return True, blocked, to_queue
+    if name in ("eval", "source", "."):
+        blocked, to_queue = _inspect_shell_or_eval(words, cmd_idx, stdin_prog, assignments)
+        return True, blocked, to_queue
+    return False, None, None
+
+
 def _inspect_pipeline(
     pipeline: list[list[str]],
     depth: int,
@@ -269,20 +291,15 @@ def _inspect_pipeline(
         words, attached = _strip_redirections(raw_stage)
         stdin_prog = stdin_map.get(attached[0]) if attached else None
         cmd_idx = _unwrap_command(words, 0)
+        wrapper_blocked = _wrapper_blocked(words, cmd_idx, assignments)
+        if wrapper_blocked is not None:
+            return wrapper_blocked
         if cmd_idx < len(words):
-            name = os.path.basename(_substitute_literals(words[cmd_idx], assignments))
-            if name in SHELLS:
-                prev_stage = pipeline[idx - 1] if idx > 0 else None
-                blocked, to_queue = _inspect_shell_stage(
-                    words[cmd_idx:], prev_stage, stdin_prog, assignments, stdin_map
-                )
-                if blocked is not None:
-                    return blocked
-                if to_queue is not None:
-                    pending.append((to_queue, depth + 1))
-                continue
-            if name in ("eval", "source", "."):
-                blocked, to_queue = _inspect_shell_or_eval(words, cmd_idx, stdin_prog, assignments)
+            prev_stage = pipeline[idx - 1] if idx > 0 else None
+            handled, blocked, to_queue = _inspect_stage_interpreter(
+                words, cmd_idx, prev_stage, stdin_prog, (assignments, stdin_map)
+            )
+            if handled:
                 if blocked is not None:
                     return blocked
                 if to_queue is not None:

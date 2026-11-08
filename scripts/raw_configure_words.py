@@ -142,7 +142,15 @@ EXEC_ENV_VARS = frozenset(
         "GIT_EXTERNAL_DIFF",
         "GIT_EDITOR",
         "GIT_SEQUENCE_EDITOR",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "SUDO_ASKPASS",
+        "GIT_PROXY_COMMAND",
         "LESSOPEN",
+        "LESSCLOSE",
+        "MANPAGER",
         "BASH_ENV",
         "PAGER",
         "EDITOR",
@@ -218,8 +226,49 @@ DATA_ONLY_COMMANDS = frozenset(
         "popd",
         "true",
         "false",
-        "make",
     )
+)
+INTERPRETER_FAMILY_RE = re.compile(
+    r"^(python|perl|ruby|node|php|gawk|mawk|awk)(?:\d+(?:\.\d+)*[a-z]*)?$"
+)
+INTERPRETER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
+    "python": frozenset(("-W", "-X", "--check-hash-based-pycs")),
+    "perl": frozenset(("-I", "-M", "-m")),
+    "ruby": frozenset(("-I", "-C", "-r")),
+    "node": frozenset(
+        (
+            "--require",
+            "--import",
+            "--loader",
+            "--experimental-loader",
+            "-C",
+            "--conditions",
+            "--input-type",
+            "--title",
+        )
+    ),
+    "php": frozenset(("-d", "-z", "-t", "-S", "-c")),
+    "awk": frozenset(
+        (
+            "-f",
+            "-v",
+            "-F",
+            "-i",
+            "-l",
+            "--file",
+            "--assign",
+            "--field-separator",
+            "--include",
+            "--load",
+        )
+    ),
+}
+EXEC_PROGRAM_OPTIONS: dict[str, tuple[str, ...]] = {
+    "sort": ("--compress-program",),
+    "install": ("--strip-program",),
+}
+MAKE_VAR_ASSIGN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.-]*(?:::[:=]|::=|:=|\!=|\?=|\+=|=)(.*)", re.DOTALL
 )
 CONFIGURE_TOKEN_DELIMS = re.compile(r"[\s;&|()`<>!{}'\"]+")
 COMMAND_POSITION_TOKEN = re.compile(r"&&|\|\||\$\(|[;&|()`\n{}]|[^\s;&|()`<>{}'\"]+")
@@ -252,6 +301,35 @@ COMMAND_PREFIX_WORDS: frozenset[str] = frozenset(
         ".",
     )
 )
+
+
+def _interpreter_family(name: str) -> str | None:
+    """Normalize interpreter executable name to canonical language family."""
+    m = INTERPRETER_FAMILY_RE.match(name)
+    if m is None:
+        return None
+    family = m.group(1)
+    return "awk" if family in ("gawk", "mawk", "awk") else family
+
+
+def _long_option_values(words: list[str], start: int, option: str, min_len: int) -> list[str]:
+    """Extract values of a long option and its valid prefixes from argument words."""
+    values: list[str] = []
+    words_len = len(words)
+    bound = min(words_len, start + 32)
+    for i in range(start, bound):
+        w = words[i]
+        if w == "--":
+            break
+        if not w.startswith("--"):
+            continue
+        if "=" in w:
+            opt_part, val = w.split("=", 1)
+            if len(opt_part) >= min_len and option.startswith(opt_part):
+                values.append(val)
+        elif len(w) >= min_len and option.startswith(w) and i + 1 < words_len:
+            values.append(words[i + 1])
+    return values
 
 
 def _is_data_only_command(command: str) -> bool:
