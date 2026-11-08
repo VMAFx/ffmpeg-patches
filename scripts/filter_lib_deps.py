@@ -30,6 +30,11 @@ CALL = re.compile(
 )
 ASSIGNMENT = re.compile(r'^([A-Za-z0-9_]+)="([^"\n]*)"$', re.MULTILINE)
 OBJECTS = re.compile(r"^OBJS-\$\(CONFIG_([A-Za-z0-9_]+)\)\s*\+=\s*(.*)$", re.MULTILINE)
+OBJECT_GROUPS = re.compile(
+    r"^([A-Za-z0-9_-]+)-\$\(CONFIG_[A-Za-z0-9_]+\)\s*\+=\s*(.*)$", re.MULTILINE
+)
+OBJECT_GROUP_REFERENCE = re.compile(r"\$\(([A-Za-z0-9_-]+)-yes\)")
+OBJECT_FILE = re.compile(r"[A-Za-z0-9_./-]+\.o\b")
 REGISTERED = re.compile(r"^extern const FFFilter ff_[a-z0-9]+_([a-z0-9_]+);", re.MULTILINE)
 CONDITIONAL = re.compile(r'enabled\s+([a-z0-9_]+)_filter\b.*?\bprepend\s+avfilter_deps\s+"([^"]*)"')
 PREPROCESSOR = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
@@ -158,15 +163,28 @@ def _read_sources(root: Path, budget: ReadBudget) -> dict[str, str]:
     return sources
 
 
+def _conditional_object_groups(text: str) -> dict[str, set[str]]:
+    """Collect literal objects from conditional groups in one Makefile."""
+    groups: dict[str, set[str]] = collections.defaultdict(set)
+    # Nested NAME-yes references are intentionally not expanded.
+    for name, value in OBJECT_GROUPS.findall(text):
+        groups[name].update(OBJECT_FILE.findall(value))
+    return dict(groups)
+
+
 def _read_object_map(root: Path, budget: ReadBudget) -> dict[str, set[str]]:
+    """Map configure symbols to literal and one-level grouped objects."""
     makefiles = sorted((root / "libavfilter").rglob("Makefile"))
     if root / "libavfilter" / "Makefile" not in makefiles:
         raise InputError(f"missing file: {root / 'libavfilter' / 'Makefile'}")
     object_map: dict[str, set[str]] = collections.defaultdict(set)
     for makefile in makefiles:
         text = budget.text(makefile).replace("\\\n", " ")
+        groups = _conditional_object_groups(text)
         for config, value in OBJECTS.findall(text):
-            object_map[config].update(re.findall(r"[A-Za-z0-9_./-]+\.o\b", value))
+            object_map[config].update(OBJECT_FILE.findall(value))
+            for name in OBJECT_GROUP_REFERENCE.findall(value):
+                object_map[config].update(groups.get(name, ()))
     return dict(object_map)
 
 

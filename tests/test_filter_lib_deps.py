@@ -152,6 +152,47 @@ class FilterLibDepsTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("calls=1 gaps=0", out)
 
+    def test_select_expands_conditional_object_group(self) -> None:
+        """A selected subsystem includes objects from a referenced conditional group."""
+        self.write_tree(
+            'detect_filter_select="dnn"\ndnn_deps="avformat"\n',
+            {
+                "vf_detect.c": "int run(void) { return 0; }\n",
+                "dnn/dnn_io_proc.c": "int run(void) { return 0; }\n",
+                "dnn/dnn_backend_x.c": "int run(void) { return avio_open(); }\n",
+            },
+            {"detect": ["vf_detect.o"]},
+        )
+        (self.tree / "libavfilter" / "dnn" / "Makefile").write_text(
+            "OBJS-$(CONFIG_DNN) += dnn/dnn_io_proc.o\n"
+            "OBJS-$(CONFIG_DNN) += $(DNN-OBJS-yes)\n"
+            "DNN-OBJS-$(CONFIG_LIBX) += dnn/dnn_backend_x.o\n",
+            encoding="utf-8",
+        )
+        status, out, _ = self.run_check()
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "| detect | libavfilter/dnn/dnn_backend_x.c:1 (avio_open) | libavformat |",
+            out,
+        )
+
+    def test_missing_conditional_object_group_adds_nothing(self) -> None:
+        """A referenced object group without definitions adds no objects or failures."""
+        self.write_tree(
+            'detect_filter_select="dnn"\n',
+            {
+                "vf_detect.c": "int run(void) { return 0; }\n",
+                "dnn/dnn_backend_x.c": "int run(void) { return avio_open(); }\n",
+            },
+            {"detect": ["vf_detect.o"]},
+        )
+        (self.tree / "libavfilter" / "dnn" / "Makefile").write_text(
+            "OBJS-$(CONFIG_DNN) += $(MISSING-yes)\n", encoding="utf-8"
+        )
+        status, out, _ = self.run_check()
+        self.assertEqual(status, 0)
+        self.assertIn("calls=0 gaps=0", out)
+
     def test_exact_library_guard_excuses_call(self) -> None:
         """An exact CONFIG_SWRESAMPLE branch makes its swr call optional."""
         self.write_tree(
