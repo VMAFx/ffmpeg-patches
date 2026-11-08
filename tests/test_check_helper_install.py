@@ -51,6 +51,8 @@ class CheckHelperInstallTest(unittest.TestCase):
                 "user.email=fixture@invalid",
                 "-c",
                 "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
                 *args,
             ],
             capture_output=True,

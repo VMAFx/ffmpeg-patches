@@ -441,6 +441,8 @@ class NosemgrepBindingTest(unittest.TestCase):
                 "user.email=fixture@invalid",
                 "-c",
                 "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
                 *args,
             ],
             check=True,
