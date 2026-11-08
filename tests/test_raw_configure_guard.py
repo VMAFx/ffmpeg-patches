@@ -211,6 +211,27 @@ MUST_ALLOW_R25 = (
     "sed -n '/configure/p' README.md",
     "rg -n configure scripts",
 )
+MUST_REFUSE_R26 = (
+    "python3 tools/post.py 'DECISION x: cd X && ./configure'",
+    "ssh host 'cd /src && ./configure'",
+    "ssh host './configure --prefix=/x'",
+    "watch ./configure",
+    "ssh host ./configure",
+    "ssh host 'cd /src; bash configure'",
+    "tmux new-session -d 'cd /src && ./configure'",
+    "ssh host 'X=1 ./configure'",
+    "ssh host 'cd /src && configure'",
+    "ssh host 'make; $(./configure)'",
+)
+MUST_ALLOW_R26 = (
+    (
+        "timeout 60 python3 /x/post_line.py --from claude-ffmpeg-patches "
+        "'REPORT x: done | (one configure line) | ok'"
+    ),
+    "gh pr comment 224 --body 'the guard refuses configure runs'",
+    "notify-send 'configure done'",
+    "python3 tools/post.py 'FACT x: run ./configure via scripts/ffmpeg_configure.py'",
+)
 SPEC = importlib.util.spec_from_file_location("raw_configure_guard", GUARD)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Cannot load module from {GUARD}")
@@ -1100,6 +1121,24 @@ class RawConfigureGuardTest(unittest.TestCase):
         temp_dir = self.other
         for client in CLIENTS:
             for command in MUST_ALLOW_R25:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, temp_dir))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_must_refuse_r26(self) -> None:
+        """Refuse execution-capable configure invocations from MUST_REFUSE_R26."""
+        for client in CLIENTS:
+            for command in MUST_REFUSE_R26:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, self.other))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("scripts/ffmpeg_configure.py", result.stderr)
+
+    def test_must_allow_r26(self) -> None:
+        """Allow verified benign agent command shapes from MUST_ALLOW_R26."""
+        temp_dir = self.other
+        for client in CLIENTS:
+            for command in MUST_ALLOW_R26:
                 with self.subTest(client=client, command=command):
                     result = self.run_guard(client, self.payload(client, command, temp_dir))
                     self.assertEqual(result.returncode, 0, result.stderr)

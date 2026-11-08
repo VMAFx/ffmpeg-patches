@@ -232,6 +232,36 @@ DATA_ONLY_COMMANDS = frozenset(
     )
 )
 CONFIGURE_TOKEN_DELIMS = re.compile(r"[\s;&|()`<>!{}'\"]+")
+COMMAND_POSITION_TOKEN = re.compile(r"&&|\|\||\$\(|[;&|()`\n{}]|[^\s;&|()`<>{}'\"]+")
+COMMAND_SEPARATORS: frozenset[str] = frozenset(
+    ("&&", "||", "$(", ";", "&", "|", "(", ")", "`", "\n", "{", "}")
+)
+COMMAND_PREFIX_WORDS: frozenset[str] = frozenset(
+    (
+        "sh",
+        "bash",
+        "dash",
+        "zsh",
+        "ksh",
+        "exec",
+        "env",
+        "command",
+        "nohup",
+        "nice",
+        "sudo",
+        "time",
+        "then",
+        "do",
+        "else",
+        "if",
+        "while",
+        "until",
+        "!",
+        "eval",
+        "source",
+        ".",
+    )
+)
 
 
 def _is_data_only_command(command: str) -> bool:
@@ -251,6 +281,36 @@ def _has_configure_token(word: str, assignments: dict[str, str] | None = None) -
     for tok in _split_configure_tokens(word, assignments):
         if tok.rsplit("/", 1)[-1] == "configure":
             return True
+    return False
+
+
+def _has_command_position_configure(word: str, assignments: dict[str, str]) -> bool:
+    """Check whether a configure command appears in command position within an argument."""
+    if assignments:
+        word = _substitute_literals(word, assignments)
+    toks = COMMAND_POSITION_TOKEN.findall(word)
+    if len(toks) <= 1:
+        return _has_configure_token(word, {})
+    pos = True
+    start = True
+    after_prefix = False
+    for token in toks[:4096]:
+        if token in COMMAND_SEPARATORS:
+            pos = True
+            start = False
+            after_prefix = False
+            continue
+        if not pos:
+            continue
+        if ASSIGNMENT.fullmatch(token):
+            continue
+        base = token.rsplit("/", 1)[-1]
+        if base in COMMAND_PREFIX_WORDS:
+            after_prefix = True
+            continue
+        if base == "configure" and ("/" in token or not start or after_prefix):
+            return True
+        pos = False
     return False
 
 
@@ -1169,7 +1229,7 @@ def _inspect_trailing_arguments(
 ) -> Path | None:
     """Check remaining command arguments for configure tokens."""
     for i in range(start_idx, len(words)):
-        if _has_configure_token(words[i], assignments):
+        if _has_command_position_configure(words[i], assignments):
             return Path(words[i])
     return None
 
