@@ -2,7 +2,7 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply lengths lengths-local upstream-lint dist
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply filter-deps lengths lengths-local upstream-lint dist
 .PHONY: fairy-requests
 
 DOCSTRING_BASE ?= origin/main
@@ -61,6 +61,11 @@ lint-mutable-defaults:
 apply:
 	@test -n "$(FFMPEG_TREE)" || { echo 'set FFMPEG_TREE to an FFmpeg checkout' >&2; exit 1; }
 	@python3 scripts/series.py apply --expect-base "$(FFMPEG_TREE)"
+
+# Detect filters that call a library configure does not declare.
+filter-deps:
+	@test -n "$(FILTER_DEPS_TREE)" || { echo 'usage: make filter-deps FILTER_DEPS_TREE=<FFmpeg tree>' >&2; exit 2; }
+	@python3 scripts/filter_lib_deps.py "$(FILTER_DEPS_TREE)"
 
 # HISS-04 function-length gate on the applied series. It needs the series
 # applied to an FFmpeg checkout (base..HEAD, one commit per patch), so it is

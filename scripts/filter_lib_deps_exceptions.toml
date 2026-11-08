@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+
+[[exceptions]]
+filter = "derain"
+library = "swscale"
+reason = "DNN dependency gap tracked upstream as 25638"
+category = "D"
+entered = 2026-11-08
+
+[[exceptions]]
+filter = "dnn_classify"
+library = "swscale"
+reason = "DNN dependency gap tracked upstream as 25638"
+category = "D"
+entered = 2026-11-08
+
+[[exceptions]]
+filter = "dnn_detect"
+library = "swscale"
+reason = "DNN dependency gap tracked upstream as 25638"
+category = "D"
+entered = 2026-11-08
+
+[[exceptions]]
+filter = "dnn_processing"
+library = "swscale"
+reason = "DNN dependency gap tracked upstream as 25638"
+category = "D"
+entered = 2026-11-08
+
+[[exceptions]]
+filter = "qrencode"
+library = "swscale"
+reason = "qrencode_filter_deps is missing the swscale configure edge"
+category = "C"
+entered = 2026-11-08
+
+[[exceptions]]
+filter = "qrencodesrc"
+library = "swscale"
+reason = "qrencodesrc_filter_deps is missing the swscale configure edge"
+category = "C"
+entered = 2026-11-08
