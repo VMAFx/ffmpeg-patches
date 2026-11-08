@@ -34,8 +34,9 @@ docstrings:
 build:
 	@python3 scripts/series.py check
 
+# The temporary leak guard fails a run that leaves files in its temporary directory.
 test: build lint
-	@python3 -m unittest discover -s tests
+	@python3 scripts/tmp_leak_guard.py -- python3 -m unittest discover -s tests
 
 lint: lint-mutable-defaults
 	@ruff check scripts tests

@@ -432,7 +432,9 @@ class ForgejoTest(unittest.TestCase):
     def setUp(self) -> None:
         """Create an isolated helper environment with a fake keyring command."""
 
-        self.tmp = Path(tempfile.mkdtemp())
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.tmp = Path(scratch.name)
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
         tool = bin_dir / "secret-tool"
@@ -519,6 +521,23 @@ class RunCommandTest(ForgejoTest):
         with self.assertRaises(ValueError):
             self.run_command(stub, "unknown")
         self.assertEqual(stub.requests, [])
+
+
+class FixtureCleanupTest(unittest.TestCase):
+    """Verify that Forgejo test fixtures clean up their temporary directories."""
+
+    def test_fixture_root_removed_after_cleanup(self) -> None:
+        """The temporary fixture root created in setUp is removed by cleanups."""
+        case = RunCommandTest("test_unknown_subcommand_is_rejected_before_any_request")
+        case.setUp()
+        root = case.tmp
+        self.assertTrue(root.is_dir())
+        try:
+            case.doCleanups()
+            self.assertFalse(root.exists())
+        finally:
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)
 
 
 class FairyReviewsTest(ForgejoTest):
