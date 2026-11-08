@@ -16,6 +16,8 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+from scripts import raw_configure_inspect, raw_configure_words
+
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "scripts" / "raw_configure_guard.py"
 CLIENTS = ("claude", "codex", "gemini", "opencode")
@@ -661,7 +663,7 @@ class RawConfigureGuardTest(unittest.TestCase):
         """Verify _tokens handles redirection merges, size caps, and syntax errors."""
         self.assertEqual(GUARD_MOD._tokens("echo 2>&1"), ["echo", "2>&1"])
         self.assertEqual(GUARD_MOD._tokens("cmd |& next"), ["cmd", "|", "next"])
-        self.assertIsNone(GUARD_MOD._tokens("x" * (GUARD_MOD.MAX_COMMAND + 1)))
+        self.assertIsNone(GUARD_MOD._tokens("x" * (raw_configure_words.MAX_COMMAND + 1)))
         self.assertIsNone(GUARD_MOD._tokens('echo "unbalanced'))
 
     def test_shell_argument_helper(self) -> None:
@@ -714,7 +716,7 @@ class RawConfigureGuardTest(unittest.TestCase):
         )
         for words, expected in cases:
             with self.subTest(words=words):
-                self.assertEqual(GUARD_MOD._command_start(words), expected)
+                self.assertEqual(raw_configure_inspect._command_start(words), expected)
 
     def test_is_configure_word_helper(self) -> None:
         """Verify _is_configure_word distinguishes configure and benign names."""
@@ -1179,32 +1181,32 @@ class RawConfigureGuardTest(unittest.TestCase):
 
     def test_configure_token_split_helper(self) -> None:
         """Verify _split_configure_tokens and _has_configure_token identify configure tokens."""
-        tokens = GUARD_MOD._split_configure_tokens("cd src && ./configure")
+        tokens = raw_configure_words._split_configure_tokens("cd src && ./configure")
         self.assertEqual(tokens, ["cd", "src", "./configure"])
-        tokens = GUARD_MOD._split_configure_tokens("-c '!./configure'")
+        tokens = raw_configure_words._split_configure_tokens("-c '!./configure'")
         self.assertEqual(tokens, ["-c", "./configure"])
-        self.assertTrue(GUARD_MOD._has_configure_token("./configure"))
-        self.assertTrue(GUARD_MOD._has_configure_token("!./configure"))
-        self.assertTrue(GUARD_MOD._has_configure_token("--to-command=./configure"))
-        self.assertTrue(GUARD_MOD._has_configure_token("$C", {"C": "./configure"}))
-        self.assertFalse(GUARD_MOD._has_configure_token("configure.orig"))
-        self.assertFalse(GUARD_MOD._has_configure_token("configure.bak"))
-        self.assertFalse(GUARD_MOD._has_configure_token("data.txt"))
-        self.assertFalse(GUARD_MOD._has_configure_token("--input"))
+        self.assertTrue(raw_configure_words._has_configure_token("./configure"))
+        self.assertTrue(raw_configure_words._has_configure_token("!./configure"))
+        self.assertTrue(raw_configure_words._has_configure_token("--to-command=./configure"))
+        self.assertTrue(raw_configure_words._has_configure_token("$C", {"C": "./configure"}))
+        self.assertFalse(raw_configure_words._has_configure_token("configure.orig"))
+        self.assertFalse(raw_configure_words._has_configure_token("configure.bak"))
+        self.assertFalse(raw_configure_words._has_configure_token("data.txt"))
+        self.assertFalse(raw_configure_words._has_configure_token("--input"))
 
     def test_data_only_commands_membership_helper(self) -> None:
         """Verify _is_data_only_command resolves command membership by basename."""
-        self.assertTrue(GUARD_MOD._is_data_only_command("/usr/bin/cat"))
-        self.assertTrue(GUARD_MOD._is_data_only_command("cat"))
-        self.assertTrue(GUARD_MOD._is_data_only_command("/bin/grep"))
-        self.assertTrue(GUARD_MOD._is_data_only_command("grep"))
-        self.assertTrue(GUARD_MOD._is_data_only_command("make"))
-        self.assertTrue(GUARD_MOD._is_data_only_command("test"))
-        self.assertTrue(GUARD_MOD._is_data_only_command("["))
-        self.assertTrue(GUARD_MOD._is_data_only_command("/usr/bin/diff"))
-        self.assertFalse(GUARD_MOD._is_data_only_command("watch"))
-        self.assertFalse(GUARD_MOD._is_data_only_command("/usr/bin/watch"))
-        self.assertFalse(GUARD_MOD._is_data_only_command("vim"))
-        self.assertFalse(GUARD_MOD._is_data_only_command("less"))
-        self.assertFalse(GUARD_MOD._is_data_only_command("/usr/bin/tar"))
-        self.assertFalse(GUARD_MOD._is_data_only_command("ssh"))
+        self.assertTrue(raw_configure_words._is_data_only_command("/usr/bin/cat"))
+        self.assertTrue(raw_configure_words._is_data_only_command("cat"))
+        self.assertTrue(raw_configure_words._is_data_only_command("/bin/grep"))
+        self.assertTrue(raw_configure_words._is_data_only_command("grep"))
+        self.assertTrue(raw_configure_words._is_data_only_command("make"))
+        self.assertTrue(raw_configure_words._is_data_only_command("test"))
+        self.assertTrue(raw_configure_words._is_data_only_command("["))
+        self.assertTrue(raw_configure_words._is_data_only_command("/usr/bin/diff"))
+        self.assertFalse(raw_configure_words._is_data_only_command("watch"))
+        self.assertFalse(raw_configure_words._is_data_only_command("/usr/bin/watch"))
+        self.assertFalse(raw_configure_words._is_data_only_command("vim"))
+        self.assertFalse(raw_configure_words._is_data_only_command("less"))
+        self.assertFalse(raw_configure_words._is_data_only_command("/usr/bin/tar"))
+        self.assertFalse(raw_configure_words._is_data_only_command("ssh"))
