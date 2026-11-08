@@ -329,7 +329,7 @@ standards (HISS-21, NASA JPL Power of 10), and local verification instructions.
 
 ## Support ffmpeg-patches
 
-**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [36 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 10 merged, 23 open.
+**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [36 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 11 merged, 22 open.
 
 **What support funds.**
 - Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
@@ -407,11 +407,11 @@ without a series patch is a change the series does not carry.
 | [25483](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25483) | `master` | merged 2026-11-02 (`f675c507e20a`), in no release yet | avcodec/adpcm: fix GCC 14 and 16 unused warnings in single-decoder builds | none |
 | [25533](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25533) | `master` | open | checkasm/snowdsp: Include intmath before public headers | 0036 |
 | [25534](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25534) | `master` | open | avcodec/aom_film_grain: Assume the predicted luma point bound | 0037 |
-| [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | open | avcodec/vvc/intra_template: bound reference corner extension | 0038 |
+| [25535](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25535) | `master` | merged 2026-11-07 (`0706d0ab1fad`), in no release yet | avcodec/vvc/intra_template: bound reference corner extension | 0038 |
 | [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
 | [25708](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708) | `master` | open | avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes | 0040, 0041 |
 
-State read from the FFmpeg forge on 2026-11-04.
+State read from the FFmpeg forge on 2026-11-08.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned
