@@ -17,7 +17,8 @@
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
 #                          (exit 77); --overlap-ok permits exactly that PR;
 #                          exits 3 when Fairy is missing or no human reviewer is requested
-#                          pr/push require a sweep for the local head; every row must be fold or follow-up: <reproducer path>
+#                          pr/push require a sweep for the local head; every row must be fold, follow-up: <reproducer path> or no-variant: <reason>
+#                          pr/push run only as scripts/ffmpeg-forgejo of a Git checkout, directly or through a symlink (exit 74 otherwise)
 #   ffmpeg-forgejo issue   <title> <body-file>
 #   ffmpeg-forgejo comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head;
@@ -708,8 +709,22 @@ fairy_requests() {
   return 1
 }
 
+# require_repository_helper: refuse push and pr unless this file resolves to scripts/ffmpeg-forgejo of a Git checkout.
+require_repository_helper() {
+  local self top
+  self="$(python3 -I -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${BASH_SOURCE[0]}")" \
+    || die "sweep: cannot resolve helper path: ${BASH_SOURCE[0]}"
+  top="${self%/scripts/ffmpeg-forgejo}"
+  if [ "$top" != "$self" ] && [ -e "$top/.git" ]; then
+    return 0
+  fi
+  printf 'ffmpeg-forgejo: sweep: helper is not the repository script: %s\n' "$self" >&2
+  exit 74
+}
+
 # require_sweep FILE BRANCH: validate reviewed dispositions against the local commit.
 require_sweep() {
+  require_repository_helper
   local report="$1" branch="$2" sha
   [ -n "$report" ] || die "--sweep <file> required"
   [ -f "$report" ] || die "no sweep file $report"

@@ -143,6 +143,7 @@ Replace every `TODO` disposition with one of:
 
 - `fold`: same bug class and same file as the fix; fold the correction into this pull request.
 - `follow-up: <reproducer path>`: otherwise, record the ancestor reproducer path in the evidence and track the correction separately.
+- `no-variant: <reason>`: the row is not a variant of the fixed bug, for example an error check that predates the series and already handles the error; state the reason and keep the analysis in the evidence.
 
 Keep the PR body unchanged unless a variant is folded into the fix. After folding, regenerate the report for the new head and review its rows again. A report with no findings ends with `no hits`.
 
@@ -154,6 +155,8 @@ Pass the reviewed report before positional arguments to both commands (run these
 ```
 
 Both commands refuse a missing report, a head that differs from the local branch, or an unresolved or unknown disposition before contacting the forge or pushing. `--sweep` may be interleaved with `--lease` on `push` or `--overlap-ok` on `pr`.
+
+Both commands also exit 74 when the helper is not `scripts/ffmpeg-forgejo` of a Git checkout, run directly or through a symlink, so an installed copy that predates a newer check cannot push or open a pull request. Install the helper as a symlink to the repository script; `make doctor` checks the installation.
 
 #### Forge settings
 
