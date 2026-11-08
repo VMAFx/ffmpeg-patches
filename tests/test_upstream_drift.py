@@ -518,6 +518,149 @@ class FixTest(unittest.TestCase):
         self.data["contributions"][0]["patch"] = self.name
         self.write_data()
 
+    def submitted_sidecar(self, extra: str = "") -> None:
+        """Configure a submitted patch linked to contribution record 1."""
+        self.sidecar.write_text(
+            f'status = "submitted"\nupstream = "{FORGE}1"\nconsumers = ["a"]\n' + extra,
+            encoding="utf-8",
+        )
+        self.data["contributions"][0]["patch"] = self.name
+        self.write_data()
+
+    def test_fix_moves_submitted_sidecar_to_merged(self) -> None:
+        """Move a submitted linked sidecar to merged with its forge merge commit."""
+        self.submitted_sidecar()
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, err), (0, ""))
+        content = self.sidecar.read_text(encoding="utf-8")
+        expected = (
+            'status = "merged"\n'
+            f'upstream = "{FORGE}1"\n'
+            f'upstream_commit = "{COMMIT}"\n'
+            'consumers = ["a"]\n'
+        )
+        self.assertEqual(content, expected)
+        actual = json.loads(self.data_path.read_bytes())["contributions"][0]
+        self.assertEqual(actual["state"], "merged")
+        self.assertEqual(actual["merged_commit"], COMMIT)
+        self.assertEqual(upstream_drift.series.check(self.root).errors, [])
+        self.assertIn("fixed: " + self.name + ": status is 'merged'", out)
+        sidecar_fixed = [
+            line
+            for line in out.splitlines()
+            if line.startswith("fixed: ") and self.sidecar.name in line
+        ]
+        self.assertEqual(len(sidecar_fixed), 1)
+
+    def test_fix_moves_submitted_sidecar_to_rejected(self) -> None:
+        """Move a submitted linked sidecar to rejected when the pull request closes."""
+        self.submitted_sidecar()
+        status, out, err = self.fix(pull(1, state="closed"))
+        self.assertEqual((status, err), (0, ""))
+        content = self.sidecar.read_text(encoding="utf-8")
+        expected = f'status = "rejected"\nupstream = "{FORGE}1"\nconsumers = ["a"]\n'
+        self.assertEqual(content, expected)
+        self.assertNotIn("upstream_commit", content)
+        self.assertEqual(upstream_drift.series.check(self.root).errors, [])
+        self.assertIn("fixed: " + self.name + ": status is 'rejected'", out)
+
+    def test_fix_merged_drops_master_form_and_adds_upstream_commit(self) -> None:
+        """Remove inline master_form and add upstream_commit when a patch merges."""
+        self.master_form()
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, err), (0, ""))
+        content = self.sidecar.read_text(encoding="utf-8")
+        self.assertNotIn("master_form", content)
+        self.assertIn(f'upstream_commit = "{COMMIT}"', content)
+        self.assertIn('status = "merged"', content)
+        self.assertEqual(upstream_drift.series.check(self.root).errors, [])
+
+    def test_fix_invalid_merge_commit_sha_refuses_all_writes(self) -> None:
+        """Reject a non-40-hex merge commit without writing any fixture files."""
+        self.submitted_sidecar()
+        before = self.snapshot()
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha="abc")
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("merged_commit must be a 40-hex commit", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_malformed_sidecar_or_release_only_refuses_writes(self) -> None:
+        """Reject multiple status lines or merged release-only sidecars without changes."""
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
+        self.submitted_sidecar(extra='release_only = "cannot merge to master"\n')
+        before = self.snapshot()
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("release_only excludes upstream_commit", err)
+        self.assertEqual(self.snapshot(), before)
+
+        self.submitted_sidecar()
+        self.sidecar.write_text(
+            self.sidecar.read_text(encoding="utf-8") + 'status = "submitted"\n',
+            encoding="utf-8",
+        )
+        before = self.snapshot()
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, out), (2, ""))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_record_linked_to_two_patches_moves_both_sidecars(self) -> None:
+        """Move all linked sidecars when a record links multiple patch files."""
+        second_name = "0002-lib-change-two.patch"
+        second_sidecar = (self.root / "patches" / second_name).with_suffix(".toml")
+        for path in (self.sidecar, second_sidecar):
+            path.write_text(
+                f'status = "submitted"\nupstream = "{FORGE}1"\nconsumers = ["a"]\n',
+                encoding="utf-8",
+            )
+        self.data["contributions"][0]["patch"] = f"{self.name}, {second_name}"
+        self.write_data()
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, err), (0, ""))
+        for path in (self.sidecar, second_sidecar):
+            content = path.read_text(encoding="utf-8")
+            self.assertIn('status = "merged"', content)
+            self.assertIn(f'upstream_commit = "{COMMIT}"', content)
+        self.assertEqual(upstream_drift.series.check(self.root).errors, [])
+        sidecar_fixed = [
+            line
+            for line in out.splitlines()
+            if line.startswith("fixed: ") and "status is 'merged'" in line
+        ]
+        self.assertEqual(len(sidecar_fixed), 2)
+
+    def test_fix_sidecar_status_already_agrees_leaves_bytes_unchanged(self) -> None:
+        """Leave sidecar bytes unchanged when its status already agrees with the forge."""
+        self.submitted_sidecar()
+        before = self.snapshot()
+        status, out, err = self.fix(pull(1))
+        self.assertEqual((status, err), (0, ""))
+        self.assertNotIn("fixed:", out)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fix_reopened_pull_request_moves_sidecar_to_submitted(self) -> None:
+        """Move a rejected sidecar to submitted when a closed pull request reopens."""
+        self.sidecar.write_text(
+            f'status = "rejected"\nupstream = "{FORGE}1"\nconsumers = ["a"]\n',
+            encoding="utf-8",
+        )
+        self.data["contributions"][0].update(state="closed", patch=self.name)
+        self.write_data()
+        status, out, err = self.fix(pull(1, state="open"))
+        self.assertEqual((status, err), (0, ""))
+        content = self.sidecar.read_text(encoding="utf-8")
+        self.assertIn('status = "submitted"', content)
+        self.assertNotIn("upstream_commit", content)
+        self.assertEqual(upstream_drift.series.check(self.root).errors, [])
+        self.assertEqual(
+            json.loads(self.data_path.read_bytes())["contributions"][0]["state"], "open"
+        )
+        self.assertIn("fixed: " + self.name + ": status is 'submitted'", out)
+
     def test_fix_merge_fields_and_regenerate_readme(self) -> None:
         """Repair merge fields and regenerate the README while preserving surrounding text."""
         before = self.readme.read_text(encoding="utf-8")

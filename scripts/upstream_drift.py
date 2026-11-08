@@ -13,6 +13,9 @@
         Report covered_by pull requests that have merged or closed.
         With --fix, update drifted contribution fields and inline master_form
         commits, date the changes in UTC and regenerate the README table.
+        --fix also moves the status of each linked patch sidecar to the
+        repaired state (submitted, merged with upstream_commit, rejected)
+        and drops a master_form that the new status no longer allows.
         Print each repaired field with `fixed:`. Covering pull requests still
         require a human to drop the patch and remain drift findings.
 
@@ -26,6 +29,7 @@ import argparse
 import json
 import re
 import sys
+import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -43,6 +47,7 @@ Fetch = Callable[[str], dict]
 MAX_SERIES_ENTRIES = 4096
 MAX_SIDECAR_LINES = 4096
 MAX_REPAIR_PATHS = MAX_SERIES_ENTRIES + 2
+STATE_TO_STATUS = {v: k for k, v in series.FORGE_STATES.items()}
 
 
 class DriftError(Exception):
@@ -206,6 +211,115 @@ def master_form_fix(path: Path, form: dict, pull: dict, original: bytes | None =
     return "".join(lines).encode("utf-8")
 
 
+def sidecar_key(name: str) -> re.Pattern[str]:
+    """Compile a regex matching a TOML key assignment for name."""
+    escaped = re.escape(name)
+    return re.compile(rf'^\s*(?:{escaped}|"{escaped}"|\'{escaped}\')\s*=')
+
+
+def sidecar_table(name: str) -> re.Pattern[str]:
+    """Compile a regex matching a TOML table header for name."""
+    escaped = re.escape(name)
+    return re.compile(rf'^\s*\[\s*(?:{escaped}|"{escaped}"|\'{escaped}\')\s*\]')
+
+
+def single_line(path: Path, lines: list[str], name: str, what: str) -> int | None:
+    """Return index of the single key line for name, or None."""
+    if any(sidecar_table(name).match(line) for line in lines):
+        if name == "master_form":
+            raise DriftError(f"{path}: expected single inline master_form line")
+        raise DriftError(f"{path}: expected {what} line, found table")
+    matches = [i for i, line in enumerate(lines) if sidecar_key(name).match(line)]
+    if len(matches) > 1:
+        raise DriftError(f"{path}: expected at most one {what} line")
+    return matches[0] if matches else None
+
+
+def string_value_set(path: Path, lines: list[str], index: int, name: str, value: str) -> None:
+    """Replace the quoted string value of a key line at index."""
+    pattern = rf'{sidecar_key(name).pattern}\s*(["\'])(.*?)\1(\s*(?:#.*)?)$'
+    line = lines[index]
+    match = re.match(pattern, line)
+    if not match:
+        if name == "status":
+            raise DriftError(f'{path}: expected status = "<old>" line')
+        raise DriftError(f"{path}: cannot replace {name} value")
+    if name == "status" and match.group(2) not in series.STATUSES:
+        raise DriftError(f"{path}: unknown status {match.group(2)!r}")
+    start, end = match.start(2), match.end(2)
+    lines[index] = line[:start] + value + line[end:]
+
+
+def status_line_fix(path: Path, lines: list[str], new_status: str) -> None:
+    """Replace the sidecar status value and reject merged release-only sidecars."""
+    if any(sidecar_key("release_only").match(line) for line in lines) and new_status == "merged":
+        raise DriftError(f"{path}: release_only excludes upstream_commit; requires human decision")
+    status_matches = [i for i, line in enumerate(lines) if sidecar_key("status").match(line)]
+    if len(status_matches) != 1:
+        raise DriftError(f"{path}: expected exactly one status line")
+    string_value_set(path, lines, status_matches[0], "status", new_status)
+
+
+def master_form_drop(path: Path, lines: list[str]) -> None:
+    """Delete the single inline master_form line from a sidecar."""
+    index = single_line(path, lines, "master_form", "master_form")
+    if index is None:
+        return
+    pattern = rf"{sidecar_key('master_form').pattern}\s*\{{.*\}}\s*(?:#.*)?$"
+    if not re.match(pattern, lines[index]):
+        raise DriftError(f"{path}: expected single inline master_form line")
+    del lines[index]
+
+
+def merged_commit(path: Path, entry: dict) -> str:
+    """Return verified 40-hex merged_commit string from entry or raise DriftError."""
+    commit = entry.get("merged_commit", "")
+    if not isinstance(commit, str) or not series.COMMIT.fullmatch(commit):
+        raise DriftError(f"{path}: merged_commit must be a 40-hex commit")
+    return commit
+
+
+def commit_insert_index(path: Path, lines: list[str]) -> int:
+    """Return index of the line after which upstream_commit should be inserted."""
+    idx = single_line(path, lines, "upstream", "upstream")
+    if idx is not None:
+        return idx
+    status_matches = [i for i, line in enumerate(lines) if sidecar_key("status").match(line)]
+    return status_matches[0]
+
+
+def upstream_commit_fix(path: Path, lines: list[str], new_status: str, entry: dict) -> None:
+    """Set or remove the sidecar upstream_commit line to match the new status."""
+    index = single_line(path, lines, "upstream_commit", "upstream_commit")
+    if new_status != "merged":
+        if index is not None:
+            del lines[index]
+        return
+    commit = merged_commit(path, entry)
+    if index is not None:
+        string_value_set(path, lines, index, "upstream_commit", commit)
+        return
+    target = commit_insert_index(path, lines)
+    newline = "\r\n" if lines[target].endswith("\r\n") else "\n"
+    lines.insert(target + 1, f'upstream_commit = "{commit}"{newline}')
+
+
+def status_fix(path: Path, entry: dict, original: bytes | None = None) -> bytes:
+    """Update sidecar status, upstream_commit and master_form to match the forge state."""
+    state = entry.get("state")
+    new_status = STATE_TO_STATUS.get(state)
+    if new_status is None:
+        raise DriftError(f"{path}: unknown forge state {state!r}")
+    lines = bounded_lines(
+        path, path.read_bytes() if original is None else original, MAX_SIDECAR_LINES
+    )
+    status_line_fix(path, lines, new_status)
+    if new_status != "submitted":
+        master_form_drop(path, lines)
+    upstream_commit_fix(path, lines, new_status, entry)
+    return "".join(lines).encode("utf-8")
+
+
 def covered_by_drift(name: str, url: str, pull: dict) -> list[str]:
     """A covering pull request must stay open until the patch can be dropped."""
     actual = forge_record(pull)
@@ -327,6 +441,34 @@ def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date
     repairs.lines.extend(stale)
 
 
+def sidecar_status_repair(root: Path, entry: dict, name: str, repairs: Repairs) -> None:
+    """Repair the status and fields of one patch sidecar if drifted."""
+    path = (root / "patches" / name).with_suffix(".toml")
+    if path not in repairs.originals:
+        raise DriftError(f"{path}: missing original snapshot")
+    content = repairs.files.get(path, repairs.originals[path])
+    try:
+        meta = tomllib.loads(content.decode("utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise DriftError(f"{path}: {exc}") from exc
+    old = meta.get("status")
+    if old not in series.FORGE_STATES or series.FORGE_STATES[old] == entry["state"]:
+        return
+    new = STATE_TO_STATUS[entry["state"]]
+    repairs.files[path] = status_fix(path, entry, content)
+    repairs.lines.append(
+        f"{name}: status is {new!r} for the forge state {entry['state']!r}, "
+        f"{old!r} in patches/{path.name}"
+    )
+
+
+def sidecar_status_drift(root: Path, entries: list[dict], repairs: Repairs) -> None:
+    """Scan and repair status drift across all sidecars linked to entries."""
+    for entry in entries:
+        for name in series.contribution_patches(entry):
+            sidecar_status_repair(root, entry, name, repairs)
+
+
 def fix_drift(root: Path, fetch: Fetch, today: date | None) -> tuple[list[str], list[str]]:
     """Repair supported drift; return unfixed and fixed field diagnostics."""
     repairs = Repairs()
@@ -336,6 +478,7 @@ def fix_drift(root: Path, fetch: Fetch, today: date | None) -> tuple[list[str], 
         entries = recorded_entries(root, repairs)
         repairs.lines.extend(drift(entries, fetch, fix=True))
         lines = patch_drift(root, fetch, repairs)
+        sidecar_status_drift(root, entries, repairs)
         write_repairs(root, entries, repairs, today)
     except (OSError, UnicodeError) as exc:
         raise DriftError(str(exc)) from exc

@@ -427,6 +427,9 @@ The pre-commit hook also regenerates and stages `README.md` whenever
 Run `python3 scripts/upstream_drift.py` to compare recorded fields and
 `master_form` commits with the FFmpeg forge. Add `--fix` to update changed
 fields, set the checked date to today in UTC and regenerate the table.
+`--fix` also moves the status of each linked patch sidecar to the repaired
+state (submitted, merged with `upstream_commit`, rejected) and drops a
+`master_form` that the new status no longer allows.
 Unchanged files keep their bytes and checked date. The README table is checked
 even when the forge records match; `--fix` repairs a stale table without changing
 the checked date. Concurrent edits detected before writing abort the repair
