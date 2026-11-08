@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Check whether the ffmpeg-forgejo helper is installed as a fresh symlink."""
+"""Check whether the ffmpeg-forgejo helper is a fresh, executable symlink."""
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess  # nosec B404 - bounded Git subprocess call.
 import sys
 from pathlib import Path
@@ -59,6 +60,9 @@ def check_symlink_target(path: Path, repo: Path) -> int:
     if target_bytes != origin_bytes:
         print(f"stale: {target} differs from origin/main", file=sys.stderr)
         return 1
+    if not os.access(target, os.X_OK):
+        print(f"not executable: {target}; run: chmod +x {target}", file=sys.stderr)
+        return 1
 
     print(f"helper ok: {path} -> {target}")
     return 0
@@ -84,7 +88,7 @@ def check_install(path: Path, repo: Path) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the helper installation checker."""
     parser = argparse.ArgumentParser(
-        description="Check whether the ffmpeg-forgejo helper is installed as a fresh symlink."
+        description="Check whether the ffmpeg-forgejo helper is a fresh, executable symlink."
     )
     repo_default = Path(__file__).resolve().parent.parent
     path_default = Path.home() / ".local" / "bin" / "ffmpeg-forgejo"

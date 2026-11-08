@@ -14,6 +14,8 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.helpers import isolated_git_environment
+
 try:
     import yaml
 except ImportError:
@@ -56,6 +58,7 @@ def tracked_texts(root: Path) -> list[tuple[str, str]]:
         capture_output=True,
         check=True,
         timeout=30,
+        env=isolated_git_environment(),
     )
     sources = []
     for name in tracked.stdout.split(b"\0"):

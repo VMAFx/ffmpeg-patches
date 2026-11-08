@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.helpers import isolated_git_environment
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "docstring_diff.py"
 
 
@@ -46,6 +48,7 @@ class DocstringDiffTest(unittest.TestCase):
             text=True,
             check=True,
             timeout=30,
+            env=isolated_git_environment(),
         )
         return result.stdout.strip()
 

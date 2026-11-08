@@ -4,11 +4,15 @@
 
 from __future__ import annotations
 
+import os
 import subprocess  # nosec B404 - fixed Git and Python test commands in temporary directories.
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
+
+from tests.helpers import isolated_git_environment
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "check_helper_install.py"
 
@@ -55,6 +59,7 @@ class CheckHelperInstallTest(unittest.TestCase):
             text=True,
             check=True,
             timeout=30,
+            env=isolated_git_environment(),
         )
         return result.stdout.strip()
 
@@ -66,6 +71,7 @@ class CheckHelperInstallTest(unittest.TestCase):
             text=True,
             check=False,
             timeout=30,
+            env=isolated_git_environment(),
         )
 
     def test_absent_path_reports_skipped(self) -> None:
@@ -100,6 +106,27 @@ class CheckHelperInstallTest(unittest.TestCase):
         proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"helper ok: {self.install_path} -> {self.helper_script}", proc.stdout)
+
+    def test_matching_non_executable_symlink_reports_not_executable(self) -> None:
+        """A matching target without execute permission exits 1 and names the fix."""
+        self.helper_script.chmod(0o644)
+        self.install_path.symlink_to(self.helper_script)
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"not executable: {self.helper_script}; run: chmod +x", proc.stderr)
+
+    def test_git_repository_environment_does_not_redirect_fixture(self) -> None:
+        """Inherited Git repository paths do not redirect the fixture check."""
+        bogus = Path(self.directory.name) / "bogus"
+        overrides = {
+            "GIT_DIR": str(bogus / "git"),
+            "GIT_INDEX_FILE": str(bogus / "index"),
+        }
+        self.install_path.symlink_to(self.helper_script)
+        with unittest.mock.patch.dict(os.environ, overrides):
+            proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(bogus.exists())
 
     def test_stale_symlink_reports_differs_from_origin_main(self) -> None:
         """A symlink pointing to differing bytes exits 1 and reports stale."""
