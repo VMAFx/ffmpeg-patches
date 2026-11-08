@@ -1,6 +1,6 @@
 status = "submitted"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25867"
-master_form = { base = "681025faf1add6567b1f97d2f1037d0e764afd0f", head = "37c58c793d348ef0f56b5487f1fd5d93ec7910de" }
+master_form = { base = "681025faf1add6567b1f97d2f1037d0e764afd0f", head = "4614c2017ca8ae3c3e79effea063778da2e3f71f" }
 consumers = ["vmafx", "pelorus"]
 origin = "part 2 of the Dolby Vision profile 5 tone-mapping series without libplacebo (ADR-0002): light levels survive zscale=t=linear"
 notes = """
