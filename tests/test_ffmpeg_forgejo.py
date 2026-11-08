@@ -2541,6 +2541,80 @@ class OverlapVerbTest(ForgejoTest):
         ]
         self.assertEqual(len(page1_requests), 6)
 
+    def test_merge_base_that_never_settles_fails_closed(self) -> None:
+        """A pull list whose merge base changes across every check fails closed
+        after three rounds.
+        """
+
+        stub = overlap_stub(open_pulls=[open_pull(number=25612)])
+        counter = 0
+
+        def side_effect(query: dict[str, list[str]]) -> list[dict]:
+            """Return the pull with a new merge base on every read."""
+            nonlocal counter
+            page = query.get("page", ["1"])[0]
+            if page != "1":
+                return []
+            counter += 1
+            return [
+                {
+                    "number": 25612,
+                    "state": "open",
+                    "user": {"login": "tester"},
+                    "head": {"sha": f"{25612:040x}"},
+                    "base": {"ref": "master"},
+                    "merge_base": f"{counter:040x}",
+                }
+            ]
+
+        with unittest.mock.patch.object(stub, "pulls", side_effect=side_effect):
+            proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("changed during 3 overlap checks", proc.stderr)
+        self.assertNotIn("own-open:", proc.stdout)
+        page1_requests = [
+            path for _, path, _ in stub.requests if "/pulls?" in path and "page=1" in path
+        ]
+        self.assertEqual(len(page1_requests), 6)
+
+    def test_retargeted_base_is_rechecked(self) -> None:
+        """A pull retargeted between the two reads of a round is read again before
+        the result is accepted.
+        """
+
+        stub = overlap_stub(
+            open_pulls=[open_pull(number=25612)],
+            pull_files={25612: ["libavfilter/vf_other.c"]},
+        )
+        counter = 0
+
+        def side_effect(query: dict[str, list[str]]) -> list[dict]:
+            """Return the pull with a release base on the first read and master after."""
+            nonlocal counter
+            page = query.get("page", ["1"])[0]
+            if page != "1":
+                return []
+            counter += 1
+            return [
+                {
+                    "number": 25612,
+                    "state": "open",
+                    "user": {"login": "tester"},
+                    "head": {"sha": f"{25612:040x}"},
+                    "base": {"ref": "release/8.0" if counter == 1 else "master"},
+                    "merge_base": f"{1:040x}",
+                }
+            ]
+
+        with unittest.mock.patch.object(stub, "pulls", side_effect=side_effect):
+            proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines()[-1], "own-open: none")
+        page1_requests = [
+            path for _, path, _ in stub.requests if "/pulls?" in path and "page=1" in path
+        ]
+        self.assertEqual(len(page1_requests), 4)
+
     def test_shared_paths_on_every_file_page_are_listed(self) -> None:
         """All shared paths across multiple file pages are accumulated and reported."""
 

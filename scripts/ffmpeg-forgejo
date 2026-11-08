@@ -414,7 +414,7 @@ for name in sorted(candidates.intersection(names)):
   return 77
 }
 
-# parse_open_pulls JSON: parse pull numbers and head SHAs from open pull list JSON; error on stderr.
+# parse_open_pulls JSON: parse number, head SHA, base ref and merge base of each open pull; "-" marks a field the forge omits; error on stderr.
 parse_open_pulls() {
   local out="$1"
   if ! python3 -c 'import json, sys
@@ -430,7 +430,12 @@ for row in rows:
     sha = head.get("sha") if isinstance(head, dict) else None
     if not isinstance(sha, str) or not sha:
         raise SystemExit(1)
-    items.append(f"{number} {sha}")
+    base = row.get("base")
+    ref = base.get("ref") if isinstance(base, dict) else None
+    ref = ref if isinstance(ref, str) and ref and not any(c.isspace() for c in ref) else "-"
+    merge_base = row.get("merge_base")
+    merge_base = merge_base if isinstance(merge_base, str) and merge_base.isalnum() else "-"
+    items.append(f"{number} {sha} {ref} {merge_base}")
 print(len(items))
 for item in items:
     print(item)' <<<"$out" 2>/dev/null; then
@@ -439,7 +444,7 @@ for item in items:
   fi
 }
 
-# list_open_pulls LOGIN: list open pulls oldest first as NUMBER HEAD-SHA lines.
+# list_open_pulls LOGIN: list open pulls oldest first as NUMBER HEAD-SHA BASE-REF MERGE-BASE lines; base.sha is left out because it moves with every base commit.
 list_open_pulls() {
   local me="$1" pull_page out parsed count encoded_me
   encoded_me="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
