@@ -1192,7 +1192,16 @@ class TestClaimHeadTest(ForgejoTest):
         """A configured login override cannot hide a duplicate by the token owner."""
 
         stub = Stub(login="tester")
-        stub.comments = {1: [{"user": {"login": "tester"}, "id": 81918, "body": BODY}]}
+        stub.comments = {
+            1: [
+                {
+                    "user": {"login": "tester"},
+                    "id": 81918,
+                    "html_url": "stub/issues/1#issuecomment-81918",
+                    "body": BODY,
+                }
+            ]
+        }
         proc = self.comment(stub, "--no-test-claims", env_updates={"FFMPEG_FORGEJO_LOGIN": "other"})
         self.assertEqual(proc.returncode, 78, proc.stderr)
         self.assertEqual(self.posts(stub), [])
@@ -1206,7 +1215,14 @@ class TestClaimHeadTest(ForgejoTest):
                 {"user": {"login": "other"}, "id": 10000 + n, "body": "different"}
                 for n in range(1049)
             ]
-            + [{"user": {"login": "tester"}, "id": 11049, "body": BODY}],
+            + [
+                {
+                    "user": {"login": "tester"},
+                    "id": 11049,
+                    "html_url": "stub/issues/1#issuecomment-11049",
+                    "body": BODY,
+                }
+            ],
         }
         proc = self.comment(stub, "--no-test-claims")
         self.assertEqual(proc.returncode, 78, proc.stderr)
@@ -1233,7 +1249,8 @@ class TestClaimHeadTest(ForgejoTest):
 
         stub = Stub([A, B])
         proc = self.comment_body(stub)
-        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("does not match live head", proc.stderr)
         self.assertEqual(self.posts(stub), [])
 
     def test_comment_distinct_or_other_author_is_posted(self) -> None:
