@@ -9,8 +9,10 @@
 #   ffmpeg-forgejo whoami
 #   ffmpeg-forgejo search  <text>                    open issues and PRs matching text
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
-#   ffmpeg-forgejo push    --sweep <file> [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
+#   ffmpeg-forgejo push    --sweep <file> [--promises <file>] [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
+#                          --promises maps own next-push comment IDs to literal fragments, compared after collapsing whitespace runs to one space, in commit messages or PR body;
+#                          missing or unfulfilled promises exit 79 before Git push
 #   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
 #                          (exit 77); --overlap-ok permits exactly that PR;
@@ -475,12 +477,18 @@ print(json.dumps([row for page in sys.stdin if page.strip() for row in json.load
   die "pagination limit reached for $path; listing incomplete"
 }
 
+# own_open_pulls LOGIN: list only the login's open pulls.
+own_open_pulls() {
+  local encoded_me
+  encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1")" || return 1
+  api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&"
+}
+
 # own_open_pr_numbers: list own open pull numbers using the overlap checks poster filter.
 own_open_pr_numbers() {
-  local me encoded_me out
+  local me out
   me="$(login)" || die "cannot read login"
-  encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
-  out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || exit 1
+  out="$(own_open_pulls "$me")" || exit 1
   python3 -c 'import json,sys
 for row in json.load(sys.stdin):
     number = row.get("number")
@@ -592,7 +600,7 @@ for row in json.load(sys.stdin):
 
 # fairy_requests [--skip-unavailable]: audit own open PRs using bounded API lists.
 fairy_requests() {
-  local optional="${1:-}" out me encoded_me rows row number reviews seen rc
+  local optional="${1:-}" out me rows row number reviews seen rc
   local -a candidates results=()
   [ $# -eq 0 ] || { [ $# -eq 1 ] && [ "$optional" = --skip-unavailable ]; } \
     || usage_error "fairy-requests [--skip-unavailable]"
@@ -617,7 +625,6 @@ fairy_requests() {
     [ "$rc" -eq 0 ] || return "$rc"
     me="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" || return 1
   fi
-  encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
   if [ "$optional" = --skip-unavailable ] && [ -z "$page_size" ]; then
     if out="$(api GET /settings/api)"; then rc=0; else rc=$?; fi
     if [[ "$rc" =~ ^(6|7|28)$ ]]; then
@@ -629,7 +636,7 @@ fairy_requests() {
       || die "invalid max_response_items in /settings/api; expected a positive integer"
   fi
   discover_page_size
-  out="$(api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&")" || return 1
+  out="$(own_open_pulls "$me")" || return 1
   rows="$(fairy_request_candidates "$me" <<<"$out")" || return 1
   [ -n "$rows" ] || return 0
   mapfile -t candidates <<<"$rows"
@@ -649,7 +656,7 @@ require_sweep() {
   local report="$1" branch="$2" sha
   [ -n "$report" ] || die "--sweep <file> required"
   [ -f "$report" ] || die "no sweep file $report"
-  sha="$(git rev-parse --verify --end-of-options "$branch^{commit}")" || die "sweep: no local branch $branch"
+  sha="$(timeout 120 git rev-parse --verify --end-of-options "$branch^{commit}")" || die "sweep: no local branch $branch"
   python3 -I - "$report" "$sha" "${BASH_SOURCE[0]}" <<'PY' || die "sweep rejected: $report"
 import importlib.util
 import pathlib
@@ -672,6 +679,196 @@ except (AttributeError, ImportError, OSError, UnicodeError, RuntimeError) as err
 sys.exit(0 if valid else 1)
 PY
   SWEPT_SHA="$sha"
+}
+
+# select_promise_pull BRANCH LOGIN: reject malformed rows before selecting an own PR.
+select_promise_pull() {
+  python3 -I -c '
+import json
+import sys
+
+def refuse() -> None:
+    """Refuse an invalid open-pull listing."""
+    print("ffmpeg-forgejo: promise: malformed or ambiguous open pull", file=sys.stderr)
+    raise SystemExit(79)
+
+rows = json.load(sys.stdin)
+if not isinstance(rows, list):
+    refuse()
+matches = []
+for row in rows:
+    if not isinstance(row, dict):
+        refuse()
+    head, user = row.get("head"), row.get("user")
+    if not isinstance(head, dict) or not isinstance(user, dict):
+        refuse()
+    ref, login = head.get("ref"), user.get("login")
+    if not isinstance(ref, str) or not ref or not isinstance(login, str):
+        refuse()
+    if ref == sys.argv[1] and login == sys.argv[2]:
+        number = row.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            refuse()
+        matches.append(number)
+if len(matches) > 1:
+    refuse()
+if matches:
+    print(matches[0])' "$1" "$2"
+}
+
+# promise_python_header: emit imports, matcher, and refusal routine.
+promise_python_header() {
+  cat <<'PY'
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+
+PATTERN = re.compile(r"\bI(?: will|['\u2019]ll)\b[^.!?\n]{0,300}?\b(?:with|in|into|on|for) (?:the|my) next (?:push|revision|version|iteration|round)\b", re.I)
+
+
+def refuse(message: str) -> None:
+    """Exit with the documented promise rejection status."""
+    print(f"ffmpeg-forgejo: promise: {message}", file=sys.stderr)
+    raise SystemExit(79)
+PY
+}
+
+# promise_python_comments: emit bounded own-comment extraction.
+promise_python_comments() {
+  cat <<'PY'
+def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
+    """Find the first next-push promise sentence in each own comment."""
+    if len(comments) > 1000:
+        refuse("too many issue comments")
+    found = {}
+    for row in comments:
+        if not isinstance(row, dict) or not isinstance(row.get("user"), dict):
+            refuse("malformed issue comment")
+        if row["user"].get("login") != me:
+            continue
+        body = row.get("body")
+        if not isinstance(body, str):
+            refuse("malformed own issue comment")
+        body = re.sub(r"(?m)^[^\S\n]*>[^\n]*", "", body)
+        match = PATTERN.search(body)
+        if match is None:
+            continue
+        start = max(body.rfind(mark, 0, match.start()) for mark in ".!?\n") + 1
+        ends = [body.find(mark, match.end()) for mark in ".!?\n"]
+        end = min((pos for pos in ends if pos >= 0), default=len(body))
+        sentence = body[start : end + (end < len(body))].strip()
+        ident, url = row.get("id"), row.get("html_url")
+        if isinstance(ident, bool) or not isinstance(ident, int) or ident < 1 or not isinstance(url, str):
+            refuse("malformed own promise comment")
+        found[ident] = (url, sentence)
+    return found
+PY
+}
+
+# promise_python_file: emit bounded regular-file parser.
+promise_python_file() {
+  cat <<'PY'
+def read_rows(path: str) -> dict[int, str]:
+    """Read bounded UTF-8 comment ID and whitespace-normalized fragment rows."""
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            refuse(f"{path}: not a regular file")
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                refuse(f"{path}: not a regular file")
+            data = source.read(65537)
+        if len(data) > 65536:
+            refuse(f"{path}: above 64 KiB")
+        lines = data.decode("utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        refuse(f"{path}: {error}")
+    rows = {}
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"([1-9][0-9]*):\s*(.*?)\s*", line)
+        if match is None or len(re.sub(r"\s", "", match[2])) < 8:
+            refuse(f"{path}: malformed row {line!r}")
+        ident = int(match[1])
+        if ident in rows:
+            refuse(f"{path}: duplicate comment id {ident}")
+        rows[ident] = " ".join(match[2].split())
+        if len(rows) > 200:
+            refuse(f"{path}: above 200 rows")
+    return rows
+PY
+}
+
+# promise_python_git: emit commit-message reader with record boundaries.
+promise_python_git() {
+  cat <<'PY'
+def messages(base: str, swept: str) -> list[str]:
+    """Read separate whitespace-normalized commit messages after checking the local merge base."""
+    if not isinstance(base, str) or re.fullmatch(r"[0-9a-fA-F]{40,64}", base) is None:
+        refuse("PR merge_base is not a local commit")
+    try:
+        subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], check=True, timeout=120)
+        result = subprocess.run(
+            ["git", "log", "-z", "--format=%B", f"{base}..{swept}"],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, UnicodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        refuse("PR merge_base is not a local commit or commit messages are unreadable")
+    return [" ".join(message.split()) for message in result.stdout.split("\0")]
+PY
+}
+
+# promise_python_main: emit validation and entry point.
+promise_python_main() {
+  cat <<'PY'
+def main() -> None:
+    """Validate all own promises against whitespace-normalized evidence in the pushed revision."""
+    path, me, swept, number = sys.argv[1:]
+    pulls, comments = json.loads(sys.stdin.readline()), json.loads(sys.stdin.readline())
+    pull = next(row for row in pulls if row.get("number") == int(number))
+    promises = promise_rows(comments, me)
+    if not promises:
+        return
+    if not path:
+        ident, (url, sentence) = next(iter(promises.items()))
+        refuse(f"comment {ident} {url}: {sentence}; --promises <file> required")
+    rows = read_rows(path)
+    for ident in rows:
+        if ident not in promises:
+            refuse(f"comment {ident}: row is not an own next-push promise")
+    body = pull.get("body")
+    if not isinstance(body, str):
+        refuse("PR body unreadable")
+    commits = messages(pull.get("merge_base"), swept)
+    body = " ".join(body.split())
+    for ident, (url, sentence) in promises.items():
+        if ident not in rows:
+            refuse(f"comment {ident} {url}: {sentence}; missing row")
+        if rows[ident] not in body and not any(rows[ident] in commit for commit in commits):
+            refuse(f"comment {ident} {url}: {sentence}; fragment absent")
+
+
+try:
+    main()
+except (KeyError, TypeError, ValueError, StopIteration, json.JSONDecodeError) as error:
+    refuse(f"malformed PR or comments: {error}")
+PY
+}
+
+# require_promises BRANCH FILE LOGIN: verify own next-push promises before Git push.
+require_promises() {
+  local branch="$1" promises="$2" me="$3" pulls selected comments code
+  discover_page_size
+  pulls="$(own_open_pulls "$me")" || return 1
+  selected="$(select_promise_pull "$branch" "$me" <<<"$pulls")" || return 79
+  [ -n "$selected" ] || return 0
+  comments="$(api_list "/repos/$REPO/issues/$selected/comments?")" || return 1
+  code="$(promise_python_header; promise_python_comments; promise_python_file; promise_python_git; promise_python_main)"
+  printf '%s\n%s\n' "$pulls" "$comments" | python3 -I -c "$code" "$promises" "$me" "$SWEPT_SHA" "$selected"
 }
 
 # require_swept_fork_head LOGIN BRANCH: bind PR creation to the reviewed commit.
@@ -742,14 +939,17 @@ for i in json.load(sys.stdin):
     fi
     ;;
   push)
-    usage='push --sweep <file> [--lease <expected-remote-sha>] <local-branch> [<remote-branch>]'
-    lease=""; sweep=""
+    usage='push --sweep <file> [--promises <file>] [--lease <expected-remote-sha>] <local-branch> [<remote-branch>]'
+    lease=""; sweep=""; promises=""
     push_argc=$#
     for ((push_i = 0; push_i < push_argc; push_i++)); do
       case "${1:-}" in
         --sweep)
           [ $# -ge 2 ] && [ -z "$sweep" ] || die "usage: $usage"
           sweep="$2"; shift 2 ;;
+        --promises)
+          [ $# -ge 2 ] && [ -z "$promises" ] || die "usage: $usage"
+          promises="$2"; shift 2 ;;
         --lease)
           [ $# -ge 2 ] && [ -z "$lease" ] || die "usage: $usage"
           [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die "--lease takes the full 40-hex sha the remote branch has now: $2"
@@ -762,9 +962,10 @@ for i in json.load(sys.stdin):
     require_sweep "$sweep" "$1"
     me="$(login)"
     rb="${2:-$1}"
+    require_promises "$rb" "$promises" "$me"
     # The credential helper reads the keyring at push time; nothing lands in argv or config.
     # --lease rewrites the remote branch only while it still points at the expected sha.
-    git -c credential.helper= \
+    timeout 120 git -c credential.helper= \
         -c "credential.$HOST.helper=!f() { echo username=$me; printf 'password='; secret-tool lookup service $KEYRING_SERVICE; echo; }; f" \
         push ${lease:+"--force-with-lease=refs/heads/$rb:$lease"} "$HOST/$me/${REPO#*/}.git" "$SWEPT_SHA:refs/heads/$rb"
     ;;
