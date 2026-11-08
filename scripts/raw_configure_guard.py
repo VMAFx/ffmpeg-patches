@@ -110,6 +110,98 @@ EXEC_ENV_VARS = frozenset(
         "ENV",
     )
 )
+DATA_ONLY_COMMANDS = frozenset(
+    (
+        "cat",
+        "tac",
+        "head",
+        "tail",
+        "grep",
+        "egrep",
+        "fgrep",
+        "zgrep",
+        "wc",
+        "ls",
+        "stat",
+        "file",
+        "diff",
+        "cmp",
+        "comm",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "paste",
+        "join",
+        "column",
+        "nl",
+        "fold",
+        "fmt",
+        "od",
+        "xxd",
+        "hexdump",
+        "strings",
+        "md5sum",
+        "sha1sum",
+        "sha256sum",
+        "sha512sum",
+        "b2sum",
+        "cksum",
+        "touch",
+        "mkdir",
+        "rmdir",
+        "cp",
+        "mv",
+        "rm",
+        "ln",
+        "install",
+        "chmod",
+        "chown",
+        "readlink",
+        "realpath",
+        "basename",
+        "dirname",
+        "test",
+        "[",
+        "echo",
+        "printf",
+        "tee",
+        "du",
+        "df",
+        "jq",
+        "yq",
+        "shellcheck",
+        "shfmt",
+        "patch",
+        "cd",
+        "pushd",
+        "popd",
+        "true",
+        "false",
+        "make",
+    )
+)
+CONFIGURE_TOKEN_DELIMS = re.compile(r"[\s;&|()`<>!{}'\"]+")
+
+
+def _is_data_only_command(command: str) -> bool:
+    """Check whether a command basename is in the data-only allow list."""
+    return os.path.basename(command) in DATA_ONLY_COMMANDS
+
+
+def _split_configure_tokens(word: str, assignments: dict[str, str] | None = None) -> list[str]:
+    """Split a command argument on shell delimiters into constituent tokens."""
+    if assignments:
+        word = _substitute_literals(word, assignments)
+    return [tok for tok in CONFIGURE_TOKEN_DELIMS.split(word) if tok]
+
+
+def _has_configure_token(word: str, assignments: dict[str, str] | None = None) -> bool:
+    """Check whether any constituent token equals configure in its last path component."""
+    for tok in _split_configure_tokens(word, assignments):
+        if tok.rsplit("/", 1)[-1] == "configure":
+            return True
+    return False
 
 
 def _input(client: str, payload: dict[str, Any]) -> str | None:
@@ -639,6 +731,17 @@ def _skip_optioned_wrapper(words: list[str], idx: int) -> int:
     return idx
 
 
+def _skip_applet_wrapper(words: list[str], idx: int) -> int:
+    """Advance past busybox or toybox wrapper and leading options to the applet."""
+    idx += 1
+    words_len = len(words)
+    for _ in range(words_len):
+        if idx >= words_len or not words[idx].startswith("-"):
+            break
+        idx += 1
+    return idx
+
+
 def _skip_complex_wrapper(words: list[str], idx: int) -> int:
     """Advance past complex command wrappers with arguments."""
     if idx >= len(words):
@@ -648,6 +751,8 @@ def _skip_complex_wrapper(words: list[str], idx: int) -> int:
         return _skip_env(words, idx)
     if name in ("systemd-run", "praetorctl"):
         return _skip_bracketed_runner(words, idx)
+    if name in ("busybox", "toybox"):
+        return _skip_applet_wrapper(words, idx)
     if name in ("nice", "timeout", "sudo", "stdbuf", "flock", "chrt", "ionice", "taskset"):
         return _skip_optioned_wrapper(words, idx)
     return idx
@@ -819,22 +924,14 @@ def _inspect_xargs(
     return None
 
 
-def _inspect_pager_and_rg(words: list[str], idx: int) -> Path | None:
-    """Inspect rg and pager commands for command-execution options."""
-    name = os.path.basename(words[idx])
+def _inspect_rg(words: list[str], idx: int) -> Path | None:
+    """Inspect rg command options for preprocessor configure execution."""
     words_len = len(words)
-    if name == "rg":
-        for i in range(idx + 1, words_len):
-            if words[i] == "--pre" and i + 1 < words_len and _is_configure_word(words[i + 1]):
-                return Path(words[i + 1])
-            if words[i].startswith("--pre=") and _is_configure_word(words[i].split("=", 1)[1]):
-                return Path(words[i])
-    elif name in ("less", "more"):
-        for i in range(idx + 1, words_len):
-            if words[i].startswith("+!") and CONFIGURE_WORD.search(words[i]):
-                return Path(words[i])
-            if words[i].startswith("+'!") and CONFIGURE_WORD.search(words[i]):
-                return Path(words[i])
+    for i in range(idx + 1, words_len):
+        if words[i] == "--pre" and i + 1 < words_len and _is_configure_word(words[i + 1]):
+            return Path(words[i + 1])
+        if words[i].startswith("--pre=") and _is_configure_word(words[i].split("=", 1)[1]):
+            return Path(words[i])
     return None
 
 
@@ -853,16 +950,6 @@ def _inspect_shell_or_eval(
                 return Path(target), None
     elif name == "eval":
         return None, " ".join(words[idx + 1 :])
-    elif name in SHELLS:
-        target, inline = _shell_argument(words[idx:])
-        if inline and target is not None:
-            return None, target
-        if stdin_prog is not None:
-            return None, stdin_prog
-        if target is not None:
-            target = _substitute_literals(target, assignments)
-            if _is_configure_word(target) or not DECIDABLE_NAME.fullmatch(os.path.basename(target)):
-                return Path(target), None
     return None, None
 
 
@@ -917,6 +1004,29 @@ def _inspect_prefix_env(words: list[str]) -> Path | None:
     return None
 
 
+def _inspect_known_dispatch(
+    name: str,
+    words: list[str],
+    cmd_idx: int,
+    stdin_prog: str | None,
+    assignments: dict[str, str],
+) -> tuple[bool, Path | None]:
+    """Inspect dedicated dispatcher targets for interpreters, find, sed, git, xargs, and rg."""
+    if INTERPRETERS.match(name):
+        return True, _inspect_interpreter(words, cmd_idx, stdin_prog)
+    handlers = {
+        "find": lambda: _inspect_find(words, cmd_idx),
+        "sed": lambda: _inspect_sed(words, cmd_idx),
+        "git": lambda: _inspect_git(words, cmd_idx),
+        "xargs": lambda: _inspect_xargs(words, cmd_idx, stdin_prog, assignments),
+        "rg": lambda: _inspect_rg(words, cmd_idx),
+    }
+    handler = handlers.get(name)
+    if handler is not None:
+        return True, handler()
+    return False, None
+
+
 def _classify_command(
     words: list[str], assignments: dict[str, str], stdin_prog: str | None = None
 ) -> tuple[Path | None, list[str]]:
@@ -932,20 +1042,14 @@ def _classify_command(
     if not DECIDABLE_NAME.fullmatch(os.path.basename(cmd_word)) or _is_configure_word(cmd_word):
         return Path(cmd_word), []
     name = os.path.basename(cmd_word)
-    blocked: Path | None = None
-    if INTERPRETERS.match(name):
-        blocked = _inspect_interpreter(words, cmd_idx, stdin_prog)
-    elif name == "find":
-        blocked = _inspect_find(words, cmd_idx)
-    elif name == "sed":
-        blocked = _inspect_sed(words, cmd_idx)
-    elif name == "git":
-        blocked = _inspect_git(words, cmd_idx)
-    elif name == "xargs":
-        blocked = _inspect_xargs(words, cmd_idx, stdin_prog, assignments)
-    else:
-        blocked = _inspect_pager_and_rg(words, cmd_idx)
-    return blocked, []
+    handled, blocked = _inspect_known_dispatch(name, words, cmd_idx, stdin_prog, assignments)
+    if handled:
+        return blocked, []
+    if not _is_data_only_command(name):
+        for arg in words[cmd_idx + 1 :]:
+            if _has_configure_token(arg, assignments):
+                return Path(arg), []
+    return None, []
 
 
 def _handle_nested_program(source: str, depth: int, pending: list[tuple[str, int]]) -> Path | None:
@@ -956,17 +1060,119 @@ def _handle_nested_program(source: str, depth: int, pending: list[tuple[str, int
     return None
 
 
-def _check_pipe_shell(prev_stage: list[str]) -> Path | None:
-    """Refuse pipeline feeding configure text from a reader into a shell."""
-    prev_words, _ = _strip_redirections(prev_stage)
-    cmd_idx = _unwrap_command(prev_words, 0)
-    if cmd_idx < len(prev_words):
-        name = os.path.basename(prev_words[cmd_idx])
-        if name in ("cat", "echo", "printf"):
-            for w in prev_words[cmd_idx + 1 :]:
-                if _is_configure_word(w):
-                    return Path(w)
-    return None
+def _translate_printf(fmt: str, extra_args: list[str]) -> str | None:
+    """Translate printf format with safe backslash escapes or fail closed."""
+    if "%" in fmt:
+        return None
+    out: list[str] = []
+    i = 0
+    fmt_len = len(fmt)
+    for _ in range(fmt_len):
+        if i >= fmt_len:
+            break
+        ch = fmt[i]
+        if ch == "\\":
+            if i + 1 >= fmt_len:
+                return None
+            nxt = fmt[i + 1]
+            if nxt == "n":
+                out.append("\n")
+            elif nxt == "t":
+                out.append("\t")
+            elif nxt == "\\":
+                out.append("\\")
+            else:
+                return None
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    translated = "".join(out)
+    return "\n".join([translated, *extra_args]) if extra_args else translated
+
+
+def _has_unresolved_var_or_sub(arg: str) -> bool:
+    """Check if an argument contains unresolved variables or command substitutions."""
+    return bool(re.search(r"\$[A-Za-z_{]", arg) or "`" in arg or "__RCG_SUB_" in arg)
+
+
+def _inspect_echo_printf(
+    prev_name: str,
+    prev_words: list[str],
+    prev_idx: int,
+    assignments: dict[str, str],
+) -> tuple[bool, str | None]:
+    """Inspect echo or printf producer stage and build nested program text if valid."""
+    raw_args = prev_words[prev_idx + 1 :]
+    sub_args = [_substitute_literals(a, assignments) for a in raw_args]
+    if any(_has_unresolved_var_or_sub(a) for a in sub_args):
+        return False, None
+    if prev_name == "echo":
+        return True, " ".join(sub_args)
+    if not sub_args:
+        return False, None
+    translated = _translate_printf(sub_args[0], sub_args[1:])
+    return (True, translated) if translated is not None else (False, None)
+
+
+def _inspect_cat_stdin(
+    prev_words: list[str],
+    prev_idx: int,
+    prev_attached: list[str],
+    stdin_map: dict[str, str],
+) -> tuple[bool, str | None]:
+    """Inspect cat producer stage and extract body if reading from heredoc stdin."""
+    cat_args = prev_words[prev_idx + 1 :]
+    if any(not a.startswith("-") or a == "--" for a in cat_args):
+        return False, None
+    if prev_attached and prev_attached[0] in stdin_map:
+        return True, stdin_map.get(prev_attached[0])
+    return False, None
+
+
+def _decide_shell_stdin(
+    prev_stage: list[str] | None,
+    stdin_prog: str | None,
+    assignments: dict[str, str],
+    stdin_map: dict[str, str],
+    shell_word: str = "shell stdin",
+) -> tuple[Path | None, str | None]:
+    """Determine the stdin program source for a shell without script or inline option."""
+    if stdin_prog is not None:
+        return None, stdin_prog
+    if prev_stage is None:
+        return Path(shell_word), None
+    prev_words, prev_attached = _strip_redirections(prev_stage)
+    prev_idx = _unwrap_command(prev_words, 0)
+    if prev_idx >= len(prev_words):
+        return Path(shell_word), None
+    prev_name = os.path.basename(_substitute_literals(prev_words[prev_idx], assignments))
+    if prev_name in ("echo", "printf"):
+        ok, text = _inspect_echo_printf(prev_name, prev_words, prev_idx, assignments)
+        return (None, text) if (ok and text is not None) else (Path(shell_word), None)
+    if prev_name == "cat":
+        ok, body = _inspect_cat_stdin(prev_words, prev_idx, prev_attached, stdin_map)
+        return (None, body) if (ok and body is not None) else (Path(shell_word), None)
+    return Path(shell_word), None
+
+
+def _inspect_shell_stage(
+    shell_words: list[str],
+    prev_stage: list[str] | None,
+    stdin_prog: str | None,
+    assignments: dict[str, str],
+    stdin_map: dict[str, str],
+) -> tuple[Path | None, str | None]:
+    """Inspect a shell stage for inline script, file operand, or stdin feeding."""
+    target, inline = _shell_argument(shell_words)
+    if inline and target is not None:
+        return None, target
+    if not inline and target is not None and target != "-":
+        target = _substitute_literals(target, assignments)
+        if _is_configure_word(target) or not DECIDABLE_NAME.fullmatch(os.path.basename(target)):
+            return Path(target), None
+        return None, None
+    return _decide_shell_stdin(prev_stage, stdin_prog, assignments, stdin_map, shell_words[0])
 
 
 def _inspect_pipeline(
@@ -981,13 +1187,19 @@ def _inspect_pipeline(
         words, attached = _strip_redirections(raw_stage)
         stdin_prog = stdin_map.get(attached[0]) if attached else None
         cmd_idx = _unwrap_command(words, 0)
-        if idx > 0 and cmd_idx < len(words) and os.path.basename(words[cmd_idx]) in SHELLS:
-            pipe_blocked = _check_pipe_shell(pipeline[idx - 1])
-            if pipe_blocked is not None:
-                return pipe_blocked
         if cmd_idx < len(words):
             name = os.path.basename(_substitute_literals(words[cmd_idx], assignments))
-            if name in SHELLS or name in ("eval", "source", "."):
+            if name in SHELLS:
+                prev_stage = pipeline[idx - 1] if idx > 0 else None
+                blocked, to_queue = _inspect_shell_stage(
+                    words[cmd_idx:], prev_stage, stdin_prog, assignments, stdin_map
+                )
+                if blocked is not None:
+                    return blocked
+                if to_queue is not None:
+                    pending.append((to_queue, depth + 1))
+                continue
+            if name in ("eval", "source", "."):
                 blocked, to_queue = _inspect_shell_or_eval(words, cmd_idx, stdin_prog, assignments)
                 if blocked is not None:
                     return blocked
