@@ -858,6 +858,27 @@ class LaneBriefTest(unittest.TestCase):
         kill.assert_not_called()
 
 
+def _write_import_chain(tests_dir: Path) -> list[str]:
+    """Write import-chain fixture test files and return their sorted dotted module names."""
+    target = "secret" + "-tool"
+    (tests_dir / "test_planted.py").write_text(f"dummy = '{target}'\n", encoding="utf-8")
+    (tests_dir / "test_alias.py").write_text(
+        "from tests import test_planted as p\n", encoding="utf-8"
+    )
+    (tests_dir / "test_dotted.py").write_text("import tests.test_planted\n", encoding="utf-8")
+    (tests_dir / "test_from.py").write_text(
+        "from tests.test_planted import Base\n", encoding="utf-8"
+    )
+    (tests_dir / "test_chain.py").write_text("from tests import test_alias\n", encoding="utf-8")
+    return [
+        "tests.test_alias",
+        "tests.test_chain",
+        "tests.test_dotted",
+        "tests.test_from",
+        "tests.test_planted",
+    ]
+
+
 class CredentialStubGapsTest(unittest.TestCase):
     """Exercise gap detection for declared credential stub tests."""
 
@@ -903,59 +924,19 @@ class CredentialStubGapsTest(unittest.TestCase):
 
     def test_credential_stub_gaps_import_reach_chain(self) -> None:
         """Report all test modules reaching the secret tool via aliases and chained imports."""
-        target = "secret" + "-tool"
         with tempfile.TemporaryDirectory() as tmp_dir:
             tests_dir = Path(tmp_dir)
-            (tests_dir / "test_planted.py").write_text(f"dummy = '{target}'\n", encoding="utf-8")
-            (tests_dir / "test_alias.py").write_text(
-                "from tests import test_planted as p\n", encoding="utf-8"
-            )
-            (tests_dir / "test_dotted.py").write_text(
-                "import tests.test_planted\n", encoding="utf-8"
-            )
-            (tests_dir / "test_from.py").write_text(
-                "from tests.test_planted import Base\n", encoding="utf-8"
-            )
-            (tests_dir / "test_chain.py").write_text(
-                "from tests import test_alias\n", encoding="utf-8"
-            )
-            expected = [
-                "tests.test_alias",
-                "tests.test_chain",
-                "tests.test_dotted",
-                "tests.test_from",
-                "tests.test_planted",
-            ]
+            expected = _write_import_chain(tests_dir)
             self.assertEqual(credential_stub_gaps(tests_dir, []), (expected, []))
 
     def test_credential_stub_gaps_clean_and_declared_boundary(self) -> None:
         """Exclude clean tests and return empty gaps when all reaching tests are declared."""
-        target = "secret" + "-tool"
         with tempfile.TemporaryDirectory() as tmp_dir:
             tests_dir = Path(tmp_dir)
-            (tests_dir / "test_planted.py").write_text(f"dummy = '{target}'\n", encoding="utf-8")
-            (tests_dir / "test_alias.py").write_text(
-                "from tests import test_planted as p\n", encoding="utf-8"
-            )
-            (tests_dir / "test_dotted.py").write_text(
-                "import tests.test_planted\n", encoding="utf-8"
-            )
-            (tests_dir / "test_from.py").write_text(
-                "from tests.test_planted import Base\n", encoding="utf-8"
-            )
-            (tests_dir / "test_chain.py").write_text(
-                "from tests import test_alias\n", encoding="utf-8"
-            )
+            declared = _write_import_chain(tests_dir)
             (tests_dir / "test_clean.py").write_text(
                 "import unittest\nfrom tests import helpers\n", encoding="utf-8"
             )
-            declared = [
-                "tests.test_alias",
-                "tests.test_chain",
-                "tests.test_dotted",
-                "tests.test_from",
-                "tests.test_planted",
-            ]
             self.assertEqual(credential_stub_gaps(tests_dir, declared), ([], []))
 
     def test_credential_stub_gaps_syntax_error_fail_closed(self) -> None:
@@ -967,6 +948,25 @@ class CredentialStubGapsTest(unittest.TestCase):
                 credential_stub_gaps(tests_dir, []),
                 (["tests.test_broken"], []),
             )
+
+    def test_credential_stub_gaps_unreadable_fail_closed(self) -> None:
+        """Report unreadable test files as reaching the stub to fail closed."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tests_dir = Path(tmp_dir)
+            (tests_dir / "test_locked.py").write_text("x = 1\n", encoding="utf-8")
+            real_open = Path.open
+
+            def fake_open(path_obj: Path, *args: object, **kwargs: object) -> object:
+                """Raise PermissionError for test_locked.py or delegate to real open."""
+                if path_obj.name == "test_locked.py":
+                    raise PermissionError("Access denied")
+                return real_open(path_obj, *args, **kwargs)
+
+            with patch("pathlib.Path.open", side_effect=fake_open, autospec=True):
+                self.assertEqual(
+                    credential_stub_gaps(tests_dir, []),
+                    (["tests.test_locked"], []),
+                )
 
 
 if __name__ == "__main__":
