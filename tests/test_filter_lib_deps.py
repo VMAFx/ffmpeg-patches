@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import unittest.mock
@@ -355,6 +356,234 @@ class FilterLibDepsTest(unittest.TestCase):
         status, out, _ = self.run_check()
         self.assertEqual(status, 1)
         self.assertIn("| fallback | libavfilter/vf_fallback.c:2 (avio_open) |", out)
+
+    def test_unmatched_endif_is_input_error(self) -> None:
+        """An unmatched #endif directive is rejected as an input error."""
+        self.write_tree(
+            "",
+            {"vf_bad.c": "#endif\n"},
+            {"bad": ["vf_bad.o"]},
+        )
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("unmatched #endif", err)
+
+    def test_unmatched_else_is_input_error(self) -> None:
+        """An unmatched #else directive is rejected as an input error."""
+        self.write_tree(
+            "",
+            {"vf_bad.c": "#else\n#endif\n"},
+            {"bad": ["vf_bad.o"]},
+        )
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("unmatched #else", err)
+
+    def test_unterminated_if_is_input_error(self) -> None:
+        """An unterminated #if branch is rejected as an input error."""
+        self.write_tree(
+            "",
+            {"vf_bad.c": "#if CONFIG_AVFORMAT\nint x;\n"},
+            {"bad": ["vf_bad.o"]},
+        )
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("unterminated preprocessor branch", err)
+
+    def test_source_count_over_bound_is_input_error(self) -> None:
+        """Source file counts exceeding MAX_SOURCE_FILES raise an input error."""
+        self.write_tree(
+            "",
+            {"vf_a.c": "int a;\n", "vf_b.c": "int b;\n"},
+            {"a": ["vf_a.o"], "b": ["vf_b.o"]},
+        )
+        with unittest.mock.patch.object(filter_lib_deps, "MAX_SOURCE_FILES", 1):
+            status, _, err = self.run_check()
+            self.assertEqual(status, 2)
+            self.assertIn("source count exceeds 1", err)
+
+    def test_total_bytes_over_bound_is_input_error(self) -> None:
+        """Total bytes exceeding MAX_TOTAL_BYTES raise an input error."""
+        self.write_tree(
+            "",
+            {"vf_a.c": "x" * 40, "vf_b.c": "y" * 40},
+            {"a": ["vf_a.o"], "b": ["vf_b.o"]},
+        )
+        with unittest.mock.patch.object(filter_lib_deps, "MAX_TOTAL_BYTES", 64):
+            status, _, err = self.run_check()
+            self.assertEqual(status, 2)
+            self.assertIn("total bytes", err)
+
+    def test_missing_filter_makefile_is_input_error(self) -> None:
+        """A missing libavfilter/Makefile is rejected as an input error."""
+        self.write_tree(
+            "",
+            {"vf_clean.c": "int run(void) { return 0; }\n"},
+            {"clean": ["vf_clean.o"]},
+        )
+        (self.tree / "libavfilter" / "Makefile").unlink()
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("missing file", err)
+
+    def test_missing_filter_registry_is_input_error(self) -> None:
+        """A missing libavfilter/allfilters.c is rejected as an input error."""
+        self.write_tree(
+            "",
+            {"vf_clean.c": "int run(void) { return 0; }\n"},
+            {"clean": ["vf_clean.o"]},
+        )
+        (self.tree / "libavfilter" / "allfilters.c").unlink()
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("cannot read", err)
+
+    def test_object_without_source_adds_no_calls(self) -> None:
+        """An object with no source file contributes zero calls or gaps."""
+        self.write_tree(
+            "",
+            {},
+            {"ghost": ["vf_ghost.o"]},
+        )
+        status, out, _ = self.run_check()
+        self.assertEqual(status, 0)
+        self.assertIn("filters=1 calls=0 gaps=0", out)
+
+    def test_exception_expiring_today_is_live(self) -> None:
+        """An exception expiring today is accepted while tomorrow it fails."""
+        self.write_tree(
+            "",
+            {"vf_detect.c": "int run(void) { return sws_scale(); }\n"},
+            {"detect": ["vf_detect.o"]},
+        )
+        self.exceptions.write_text(
+            "[[exceptions]]\n"
+            'filter = "detect"\n'
+            'library = "swscale"\n'
+            'reason = "upstream tracker 25638"\n'
+            'category = "D"\n'
+            "entered = 2026-11-08\n",
+            encoding="utf-8",
+        )
+        status, out, _ = self.run_check("--today", "2027-03-08")
+        self.assertEqual(status, 0)
+        self.assertIn("excepted (D, expires 2027-03-08)", out)
+        status, _, err = self.run_check("--today", "2027-03-09")
+        self.assertEqual(status, 1)
+        self.assertIn("expired exception: detect libswscale", err)
+
+    def test_datetime_entered_is_input_error(self) -> None:
+        """A datetime entered field is rejected as an invalid date format."""
+        self.write_tree(
+            "",
+            {"vf_clean.c": "int run(void) { return 0; }\n"},
+            {"clean": ["vf_clean.o"]},
+        )
+        self.exceptions.write_text(
+            "[[exceptions]]\n"
+            'filter = "clean"\n'
+            'library = "avformat"\n'
+            'reason = "temporary configure edge"\n'
+            'category = "C"\n'
+            "entered = 2026-11-08T00:00:00\n",
+            encoding="utf-8",
+        )
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("unquoted YYYY-MM-DD date", err)
+
+    def test_huge_interval_is_input_error(self) -> None:
+        """An excessively large interval_days value raises an input error."""
+        self.write_tree(
+            "",
+            {"vf_clean.c": "int run(void) { return 0; }\n"},
+            {"clean": ["vf_clean.o"]},
+        )
+        self.exceptions.write_text(
+            "[[exceptions]]\n"
+            'filter = "clean"\n'
+            'library = "avformat"\n'
+            'reason = "temporary configure edge"\n'
+            'category = "A"\n'
+            "entered = 2026-11-08\n"
+            "interval_days = 1000000000\n",
+            encoding="utf-8",
+        )
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("expiry out of range", err)
+
+    def test_entered_near_date_max_is_input_error(self) -> None:
+        """An entered date whose expiry exceeds date.max raises an input error."""
+        self.write_tree(
+            "",
+            {"vf_clean.c": "int run(void) { return 0; }\n"},
+            {"clean": ["vf_clean.o"]},
+        )
+        self.exceptions.write_text(
+            "[[exceptions]]\n"
+            'filter = "clean"\n'
+            'library = "avformat"\n'
+            'reason = "temporary configure edge"\n'
+            'category = "D"\n'
+            "entered = 9999-12-31\n",
+            encoding="utf-8",
+        )
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("expiry out of range", err)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_fifo_source_is_input_error(self) -> None:
+        """A FIFO source file is rejected as not a regular file."""
+        self.write_tree(
+            "",
+            {},
+            {"pipe": ["vf_pipe.o"]},
+        )
+        os.mkfifo(self.tree / "libavfilter" / "vf_pipe.c")
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("not a regular file", err)
+
+    @unittest.skipUnless(Path("/dev/zero").exists(), "needs /dev/zero")
+    def test_device_symlink_source_is_input_error(self) -> None:
+        """A character device symlink is rejected as not a regular file."""
+        self.write_tree(
+            "",
+            {},
+            {"zero": ["vf_zero.o"]},
+        )
+        (self.tree / "libavfilter" / "vf_zero.c").symlink_to("/dev/zero")
+        status, _, err = self.run_check()
+        self.assertEqual(status, 2)
+        self.assertIn("not a regular file", err)
+
+    def test_exceptions_file_over_byte_bound_is_input_error(self) -> None:
+        """An exceptions file exceeding MAX_BYTES_PER_FILE raises an input error."""
+        self.write_tree(
+            "",
+            {"vf_clean.c": "int run(void) { return 0; }\n"},
+            {"clean": ["vf_clean.o"]},
+        )
+        self.exceptions.write_text("#" * 129, encoding="utf-8")
+        with unittest.mock.patch.object(filter_lib_deps, "MAX_BYTES_PER_FILE", 128):
+            status, _, err = self.run_check()
+            self.assertEqual(status, 2)
+            self.assertIn("exceptions file exceeds 128 bytes", err)
+
+    def test_read_regular_bounds_exact_limit(self) -> None:
+        """Direct reads return exact-limit bytes and raise when exceeding limit."""
+        exact_path = self.tree / "exact.bin"
+        exact_path.write_bytes(b"0123456789")
+        result = filter_lib_deps._read_regular(exact_path, 10, "exact file")
+        self.assertEqual(result, b"0123456789")
+
+        over_path = self.tree / "over.bin"
+        over_path.write_bytes(b"0123456789x")
+        with self.assertRaises(filter_lib_deps.InputError) as context:
+            filter_lib_deps._read_regular(over_path, 10, "over file")
+        self.assertIn("exceeds 10 bytes", str(context.exception))
 
 
 if __name__ == "__main__":

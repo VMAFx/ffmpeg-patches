@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import os
 import re
+import stat
 import sys
 import tomllib
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 MAX_SOURCE_FILES = 4096
@@ -77,6 +79,21 @@ class Gap:
     linked: bool
 
 
+def _read_regular(path: Path, limit: int, label: str) -> bytes:
+    """Read at most limit bytes from one regular file or raise an input error."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        with open(os.open(path, flags), "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise InputError(f"not a regular file: {path}")
+            payload = handle.read(limit + 1)
+    except OSError as error:
+        raise InputError(f"cannot read {path}: {error}") from error
+    if len(payload) > limit:
+        raise InputError(f"{label} exceeds {limit} bytes: {path}")
+    return payload
+
+
 @dataclass
 class ReadBudget:
     """Track bounded bytes read from one input tree."""
@@ -85,12 +102,7 @@ class ReadBudget:
 
     def text(self, path: Path) -> str:
         """Read one bounded UTF-8 file or raise an input error."""
-        try:
-            payload = path.read_bytes()
-        except OSError as error:
-            raise InputError(f"cannot read {path}: {error}") from error
-        if len(payload) > MAX_BYTES_PER_FILE:
-            raise InputError(f"file exceeds {MAX_BYTES_PER_FILE} bytes: {path}")
+        payload = _read_regular(path, MAX_BYTES_PER_FILE, "file")
         self.total += len(payload)
         if self.total > MAX_TOTAL_BYTES:
             raise InputError(f"input exceeds {MAX_TOTAL_BYTES} total bytes")
@@ -310,7 +322,7 @@ def _find_gaps(
 
 
 def _exception_date(value: object, field: str) -> date:
-    if not isinstance(value, date):
+    if isinstance(value, datetime) or not isinstance(value, date):
         raise InputError(f"exception {field} must be an unquoted YYYY-MM-DD date")
     return value
 
@@ -334,15 +346,18 @@ def _exception_entry(raw: object, position: int) -> ExceptionEntry:
     category = strings["category"]
     if category not in {"A", "B", "C", "D"}:
         raise InputError(f"exception {position} bad category: {category}")
-    interval = _exception_interval(raw, position, category)
     entered = _exception_date(raw["entered"], "entered")
+    try:
+        expires = entered + _exception_interval(raw, position, category)
+    except OverflowError as error:
+        raise InputError(f"exception {position} expiry out of range") from error
     return ExceptionEntry(
         strings["filter"],
         strings["library"],
         strings["reason"],
         category,
         entered,
-        entered + interval,
+        expires,
     )
 
 
@@ -359,9 +374,7 @@ def _exception_interval(raw: dict[str, object], position: int, category: str) ->
 
 def _read_exceptions(path: Path) -> list[ExceptionEntry]:
     try:
-        payload = path.read_bytes()
-        if len(payload) > MAX_BYTES_PER_FILE:
-            raise InputError(f"exceptions file exceeds {MAX_BYTES_PER_FILE} bytes: {path}")
+        payload = _read_regular(path, MAX_BYTES_PER_FILE, "exceptions file")
         parsed = tomllib.loads(payload.decode("utf-8")) if payload else {}
     except InputError:
         raise
