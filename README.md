@@ -217,7 +217,9 @@ The checks cover:
 A nightly run applies the series onto FFmpeg master with
 `series.py apply TREE --master-forms https://code.ffmpeg.org/FFmpeg/FFmpeg.git`.
 It fetches each recorded `master_form` and applies that PR diff instead of
-the pinned-release patch. A recorded `upstream_commit` that is an ancestor
+the pinned-release patch. A pull request that carries several patches records
+its master_form on the last of them; the earlier ones report in-master-form
+and are applied with it. A recorded `upstream_commit` that is an ancestor
 of the tested master reports the patch as upstream without applying it;
 a missing commit fails the run because its history cannot be checked.
 A `release_only` patch is reported as `release-only` and not applied.
