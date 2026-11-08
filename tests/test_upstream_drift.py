@@ -577,6 +577,62 @@ class FixTest(unittest.TestCase):
         self.assertIn('status = "merged"', content)
         self.assertEqual(upstream_drift.series.check(self.root).errors, [])
 
+    def test_fix_merged_inserts_upstream_commit_after_unterminated_last_line(self) -> None:
+        """Insert upstream_commit after an unterminated upstream line at end of file."""
+        self.sidecar.write_text(
+            'status = "submitted"\nconsumers = ["a"]\n' + f'upstream = "{FORGE}1"',
+            encoding="utf-8",
+        )
+        self.data["contributions"][0]["patch"] = self.name
+        self.write_data()
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, err), (0, ""))
+        content = self.sidecar.read_text(encoding="utf-8")
+        expected = (
+            'status = "merged"\nconsumers = ["a"]\n'
+            + f'upstream = "{FORGE}1"\nupstream_commit = "{COMMIT}"\n'
+        )
+        self.assertEqual(content, expected)
+        self.assertEqual(upstream_drift.series.check(self.root).errors, [])
+
+    def test_fix_merged_crlf_unterminated_last_line_keeps_crlf(self) -> None:
+        """Preserve CRLF line endings when inserting after an unterminated line."""
+        raw = (
+            ('status = "submitted"\nconsumers = ["a"]\n' + f'upstream = "{FORGE}1"')
+            .replace("\n", "\r\n")
+            .encode("utf-8")
+        )
+        self.sidecar.write_bytes(raw)
+        self.data["contributions"][0]["patch"] = self.name
+        self.write_data()
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, err), (0, ""))
+        expected = (
+            (
+                'status = "merged"\nconsumers = ["a"]\n'
+                + f'upstream = "{FORGE}1"\nupstream_commit = "{COMMIT}"\n'
+            )
+            .replace("\n", "\r\n")
+            .encode("utf-8")
+        )
+        self.assertEqual(self.sidecar.read_bytes(), expected)
+
+    def test_fix_merged_upstream_table_refuses_all_writes(self) -> None:
+        """Refuse writes when upstream is configured as a TOML table."""
+        self.submitted_sidecar()
+        self.sidecar.write_text(
+            'status = "submitted"\nconsumers = ["a"]\n[upstream]\n' + f'url = "{FORGE}1"\n',
+            encoding="utf-8",
+        )
+        before = self.snapshot()
+        merged = pull(1, merged=True, state="closed", merged_at=MERGED_AT, merge_commit_sha=COMMIT)
+        status, out, err = self.fix(merged)
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("does not link", err)
+        self.assertEqual(self.snapshot(), before)
+
     def test_fix_invalid_merge_commit_sha_refuses_all_writes(self) -> None:
         """Reject a non-40-hex merge commit without writing any fixture files."""
         self.submitted_sidecar()

@@ -300,7 +300,9 @@ def upstream_commit_fix(path: Path, lines: list[str], new_status: str, entry: di
         string_value_set(path, lines, index, "upstream_commit", commit)
         return
     target = commit_insert_index(path, lines)
-    newline = "\r\n" if lines[target].endswith("\r\n") else "\n"
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    if not lines[target].endswith("\n"):
+        lines[target] += newline
     lines.insert(target + 1, f'upstream_commit = "{commit}"{newline}')
 
 
@@ -441,6 +443,18 @@ def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date
     repairs.lines.extend(stale)
 
 
+def repaired_sidecar_check(path: Path, content: bytes, entry: dict) -> None:
+    """Verify that a repaired sidecar parses as TOML and matches the forge state."""
+    try:
+        meta = tomllib.loads(content.decode("utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise DriftError(f"{path}: repaired sidecar is not valid TOML: {exc}") from exc
+    if meta.get("status") != STATE_TO_STATUS[entry["state"]]:
+        raise DriftError(
+            f"{path}: repaired sidecar status disagrees with forge state {entry['state']!r}"
+        )
+
+
 def sidecar_status_repair(root: Path, entry: dict, name: str, repairs: Repairs) -> None:
     """Repair the status and fields of one patch sidecar if drifted."""
     path = (root / "patches" / name).with_suffix(".toml")
@@ -455,7 +469,9 @@ def sidecar_status_repair(root: Path, entry: dict, name: str, repairs: Repairs) 
     if old not in series.FORGE_STATES or series.FORGE_STATES[old] == entry["state"]:
         return
     new = STATE_TO_STATUS[entry["state"]]
-    repairs.files[path] = status_fix(path, entry, content)
+    repaired = status_fix(path, entry, content)
+    repaired_sidecar_check(path, repaired, entry)
+    repairs.files[path] = repaired
     repairs.lines.append(
         f"{name}: status is {new!r} for the forge state {entry['state']!r}, "
         f"{old!r} in patches/{path.name}"
