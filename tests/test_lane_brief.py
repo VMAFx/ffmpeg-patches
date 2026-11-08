@@ -18,6 +18,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import yaml
+
 from scripts import lane_brief
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +60,36 @@ def process_alive(pid: int) -> bool:
     except FileNotFoundError:
         return True
     return state not in {"Z", "X"}
+
+
+def credential_stub_gaps(tests_dir: Path, declared: list[str]) -> tuple[list[str], list[str]]:
+    """Return undeclared tests referencing the secret tool and stale declared entries."""
+    target = "secret" + "-tool"
+    max_files = 500
+    max_bytes = 1024 * 1024
+    candidate_files = sorted(tests_dir.glob("test_*.py"))[:max_files]
+    undeclared: list[str] = []
+    for test_file in candidate_files:
+        if not test_file.is_file():
+            continue
+        try:
+            with test_file.open("rb") as handle:
+                raw = handle.read(max_bytes)
+            text = raw.decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        if target in text:
+            dotted = f"tests.{test_file.stem}"
+            if dotted not in declared and f"tests/{test_file.name}" not in declared:
+                undeclared.append(dotted)
+
+    stale: list[str] = []
+    for entry in declared[:max_files]:
+        stem = entry.removesuffix(".py").rpartition("/")[2].rpartition(".")[2]
+        if not (tests_dir / f"{stem}.py").is_file():
+            stale.append(entry)
+
+    return sorted(undeclared), sorted(stale)
 
 
 class LaneBriefTest(unittest.TestCase):
@@ -754,6 +786,50 @@ class LaneBriefTest(unittest.TestCase):
         killpg, kill = run_with(2)
         killpg.assert_called_once_with(2, signal.SIGKILL)
         kill.assert_not_called()
+
+
+class CredentialStubGapsTest(unittest.TestCase):
+    """Exercise gap detection for declared credential stub tests."""
+
+    def test_repository_credential_stub_tests(self) -> None:
+        """Verify repository credential_stub_tests has no undeclared or stale entries."""
+        with CONFIG.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        self.assertIsInstance(data, dict)
+        self.assertIn("credential_stub_tests", data)
+        stub_tests = data["credential_stub_tests"]
+        self.assertIsInstance(stub_tests, list)
+        self.assertEqual(credential_stub_gaps(ROOT / "tests", stub_tests), ([], []))
+
+    def test_credential_stub_gaps_planted_secret_tool(self) -> None:
+        """Report undeclared test files referencing the target stub tool."""
+        target = "secret" + "-tool"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tests_dir = Path(tmp_dir)
+            (tests_dir / "test_planted.py").write_text(f"dummy = '{target}'\n", encoding="utf-8")
+            self.assertEqual(
+                credential_stub_gaps(tests_dir, []),
+                (["tests.test_planted"], []),
+            )
+
+    def test_credential_stub_gaps_stale_declaration(self) -> None:
+        """Report declared entries that do not exist as test files."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tests_dir = Path(tmp_dir)
+            self.assertEqual(
+                credential_stub_gaps(tests_dir, ["tests.test_gone"]),
+                ([], ["tests.test_gone"]),
+            )
+
+    def test_credential_stub_gaps_boundary_cases(self) -> None:
+        """Ignore non-matching variants and non-test helper files."""
+        target = "secret" + "-tool"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tests_dir = Path(tmp_dir)
+            (tests_dir / "test_underscore.py").write_text("val = 'secret_tool'\n", encoding="utf-8")
+            (tests_dir / "test_space.py").write_text('val = "secret tool"\n', encoding="utf-8")
+            (tests_dir / "helper.py").write_text(f"val = '{target}'\n", encoding="utf-8")
+            self.assertEqual(credential_stub_gaps(tests_dir, []), ([], []))
 
 
 if __name__ == "__main__":
