@@ -209,6 +209,6 @@ rules:
     paths:
       include:
         - "*.sh"
-        - scripts/ffmpeg-forgejo
+        - /scripts/ffmpeg-forgejo
     pattern-regex: '(?m)^[ \t]*(?:el)?if[ \t]+![ \t][^\n;]*(?:;[ \t]*|\n[ \t]*)then\s+(?:local\s+)?\w+=\$\?'
 

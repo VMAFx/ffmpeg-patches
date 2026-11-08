@@ -35,15 +35,15 @@ audit:
 docstrings:
 	@sh .config/lefthook/python.sh -B scripts/docstring_diff.py --base "$(DOCSTRING_BASE)"
 
-# Same command as the scanners workflow (.github/workflows/scanners.yml), so a
-# rule finding fails the local gate before CI.
+# Same script as the scanners workflow (.github/workflows/scanners.yml), so a
+# rule finding or a rule configuration warning fails the local gate before CI.
 semgrep:
 	@if ! command -v $(SEMGREP) >/dev/null 2>&1; then \
 		echo "semgrep: not installed; the scanners workflow runs semgrep 1.178.0 (.github/workflows/scanners.yml); install it, for example pipx install --python python3.14 semgrep==1.178.0" >&2; \
 		exit 1; \
 	fi
 	@$(SEMGREP) --version
-	@$(SEMGREP) scan --config .semgrep.yml --error --metrics off --disable-version-check
+	@SEMGREP=$(SEMGREP) sh scripts/semgrep_scan.sh
 
 # The repository builds nothing: "build" lints the series and its metadata.
 build:

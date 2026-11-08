@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - subprocess run for semgrep CLI tool.
 import tempfile
@@ -14,6 +15,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# Semgrep prints a rule configuration warning on stderr and still exits 0.
+RULE_WARNING_RE = re.compile(r"^Rule \S+ contains .*$", re.MULTILINE)
 
 FIXTURE_SOURCE = """# SPDX-License-Identifier: EUPL-1.2
 \"\"\"Fixture functions for semgrep rule testing.\"\"\"
@@ -182,7 +185,7 @@ def _find_enclosing_function(
 
 
 def _run_semgrep(fixture: Path, scratch: Path) -> dict:
-    """Run semgrep scan on a fixture inside scratch with isolated TMPDIR."""
+    """Run semgrep scan on a fixture inside scratch with isolated TMPDIR; fail on a rule warning."""
     semgrep_bin = shutil.which("semgrep")
     if semgrep_bin is None:
         raise RuntimeError("semgrep executable not found on PATH")
@@ -210,6 +213,9 @@ def _run_semgrep(fixture: Path, scratch: Path) -> dict:
     )
     if proc.returncode not in (0, 1):
         raise RuntimeError(f"semgrep exited with code {proc.returncode}: {proc.stderr}")
+    rule_warnings = RULE_WARNING_RE.findall(proc.stderr)
+    if rule_warnings:
+        raise RuntimeError(f"semgrep rule warnings for .semgrep.yml: {rule_warnings}")
     data: dict = json.loads(proc.stdout)
     if data.get("errors"):
         raise RuntimeError(f"semgrep reported execution errors: {data['errors']}")
