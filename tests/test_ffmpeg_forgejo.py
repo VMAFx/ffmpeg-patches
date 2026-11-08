@@ -29,7 +29,9 @@ STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
 NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
-HELPER_SUBCOMMANDS = frozenset({"comment", "edit-body", "issue", "pr", "push", "fairy-reviews"})
+HELPER_SUBCOMMANDS = frozenset(
+    {"comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap"}
+)
 
 
 def label(status: str, n: int = 0) -> dict:
@@ -2289,6 +2291,124 @@ class PullRequestOverlapTest(ForgejoTest):
         self.assertEqual(self.pull_posts(stub), [])
 
 
+class OverlapVerbTest(ForgejoTest):
+    """Verify that the overlap verb reports own open pull requests."""
+
+    def overlap(self, stub: Stub, *options: str) -> subprocess.CompletedProcess[str]:
+        """Run the overlap verb against the topic branch."""
+
+        return self.run_command(stub, "overlap", *options, "topic")
+
+    def test_fate_list_overlap_is_listed(self) -> None:
+        """A shared fate makefile is detected as an overlap."""
+
+        git(self.repo, "checkout", "-q", "master")
+        mak = self.repo / "tests" / "fate" / "filter-video.mak"
+        mak.parent.mkdir(parents=True, exist_ok=True)
+        mak.write_text("fate base\n", encoding="utf-8")
+        git(self.repo, "add", "tests/fate/filter-video.mak")
+        commit = [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+        ]
+        git(self.repo, *commit, "fate base")
+        git(self.repo, "push", "-q", str(self.upstream), "master")
+        git(self.repo, "checkout", "-q", "topic")
+        git(self.repo, "rebase", "-q", "master")
+        mak.write_text("fate topic\n", encoding="utf-8")
+        git(self.repo, "add", "tests/fate/filter-video.mak")
+        git(self.repo, *commit, "fate topic")
+
+        stub = overlap_stub(
+            open_pulls=[
+                open_pull(number=25612),
+                open_pull(number=25613),
+            ],
+            pull_files={
+                25612: ["tests/fate/filter-video.mak"],
+                25613: ["libavfilter/vf_other.c"],
+            },
+        )
+        proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertIn('#25612 ["tests/fate/filter-video.mak"]', proc.stdout)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[-1], "own-open: 25612")
+        self.assertNotIn("25613", proc.stdout)
+        self.assertEqual(
+            [method for method, _, _ in stub.requests if method in {"POST", "PATCH", "PUT"}],
+            [],
+        )
+
+    def test_every_overlapping_pull_is_listed(self) -> None:
+        """Every overlapping own open pull is reported in ascending order."""
+
+        stub = overlap_stub(
+            open_pulls=[open_pull(number=25700), open_pull(number=25612)],
+            pull_files={25612: [OVERLAP_FILE], 25700: [OVERLAP_FILE]},
+        )
+        proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[-1], "own-open: 25612 25700")
+
+    def test_no_overlap_reports_none(self) -> None:
+        """A pull touching unrelated files reports no overlap and exits zero."""
+
+        stub = overlap_stub(
+            open_pulls=[open_pull(number=25612)],
+            pull_files={25612: ["libavfilter/vf_other.c"]},
+        )
+        proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[-1], "own-open: none")
+
+    def test_overlap_ok_skips_exact_pull(self) -> None:
+        """Passing --overlap-ok exempts specific pulls from overlap checks."""
+
+        stub1 = overlap_stub(
+            open_pulls=[open_pull(number=25612), open_pull(number=25700)],
+            pull_files={25612: [OVERLAP_FILE], 25700: [OVERLAP_FILE]},
+        )
+        proc1 = self.overlap(stub1, "--overlap-ok", "25612")
+        self.assertEqual(proc1.returncode, 77, proc1.stderr)
+        lines1 = proc1.stdout.splitlines()
+        self.assertEqual(lines1[-1], "own-open: 25700")
+
+        stub2 = overlap_stub(
+            open_pulls=[open_pull(number=25612), open_pull(number=25700)],
+            pull_files={25612: [OVERLAP_FILE], 25700: [OVERLAP_FILE]},
+        )
+        proc2 = self.overlap(stub2, "--overlap-ok", "25612", "--overlap-ok", "25700")
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        lines2 = proc2.stdout.splitlines()
+        self.assertEqual(lines2[-1], "own-open: none")
+
+    def test_unlistable_pulls_fail_closed(self) -> None:
+        """Failure to list open pulls exits one without reporting an own-open line."""
+
+        stub = overlap_stub(fail_pulls=True)
+        proc = self.overlap(stub)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("own-open:", proc.stdout)
+
+    def test_bad_overlap_ok_is_usage_error(self) -> None:
+        """Non-positive or non-numeric --overlap-ok values exit 64."""
+
+        stub = overlap_stub()
+        for bad in ("0", "x"):
+            with self.subTest(bad=bad):
+                proc = self.overlap(stub, "--overlap-ok", bad)
+                self.assertEqual(proc.returncode, 64, proc.stderr)
+
+
 class SweepTest(ForgejoTest):
     """Require a reviewed sweep before either outbound operation."""
 
@@ -3024,6 +3144,31 @@ class PullOverlapMutantTest(unittest.TestCase):
         for old, new, cases in mutations:
             self.assertEqual(source.count(old), 1, "mutation site missing")
             with mutant_case(source, old, new, PullRequestOverlapTest, "MutatedOverlap") as case:
+                for name in cases:
+                    with self.subTest(test=name):
+                        result = unittest.TestResult()
+                        case(name).run(result)
+                        self.assertTrue(result.failures or result.errors, f"{name} survived")
+
+    def test_overlap_verb_mutants_are_caught(self) -> None:
+        """Each planted overlap verb defect fails its targeted test case."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        mutations = (
+            (
+                '"FETCH_HEAD...$branch" --',
+                "\"FETCH_HEAD...$branch\" -- 'lib*'",
+                ("test_fate_list_overlap_is_listed",),
+            ),
+            (
+                'overlapping+=("$number"); continue',
+                'overlapping+=("$number"); return 77',
+                ("test_every_overlapping_pull_is_listed",),
+            ),
+        )
+        for old, new, cases in mutations:
+            self.assertEqual(source.count(old), 1, "mutation site missing")
+            with mutant_case(source, old, new, OverlapVerbTest, "MutatedOverlapVerb") as case:
                 for name in cases:
                     with self.subTest(test=name):
                         result = unittest.TestResult()
