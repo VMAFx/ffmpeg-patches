@@ -1177,6 +1177,99 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertIn("own comment 81918", proc.stderr)
         self.assertEqual(self.posts(stub), [])
 
+    def test_comment_distinct_or_other_author_is_posted(self) -> None:
+        """Distinct bodies, other authors, and thread boundaries authorize a comment POST."""
+
+        cases = (
+            (
+                "distinct_body",
+                [
+                    {
+                        "user": {"login": "tester"},
+                        "id": 100,
+                        "html_url": "stub/issues/1#issuecomment-100",
+                        "body": "completely different text",
+                    }
+                ],
+            ),
+            (
+                "other_login",
+                [
+                    {
+                        "user": {"login": "someone_else"},
+                        "id": 101,
+                        "html_url": "stub/issues/1#issuecomment-101",
+                        "body": BODY,
+                    }
+                ],
+            ),
+            (
+                "one_char_difference",
+                [
+                    {
+                        "user": {"login": "tester"},
+                        "id": 102,
+                        "html_url": "stub/issues/1#issuecomment-102",
+                        "body": BODY.strip() + "!",
+                    }
+                ],
+            ),
+            (
+                "empty_thread",
+                [],
+            ),
+        )
+        for case_name, comments in cases:
+            with self.subTest(case=case_name):
+                stub = Stub()
+                stub.comments = {1: comments}
+                proc = self.comment(stub, "--no-test-claims")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(self.posts(stub), [BODY])
+
+    def test_own_duplicate_comment_on_page_two_is_refused(self) -> None:
+        """An own duplicate comment spanning onto page two exits 78 without a POST."""
+
+        stub = Stub(max_response_items=1)
+        stub.comments = {
+            1: [
+                {
+                    "user": {"login": "tester"},
+                    "id": 81910,
+                    "html_url": "stub/issues/1#issuecomment-81910",
+                    "body": "first comment",
+                },
+                {
+                    "user": {"login": "tester"},
+                    "id": 81918,
+                    "html_url": "stub/issues/1#issuecomment-81918",
+                    "body": "  new   body\tline two \n\n",
+                },
+            ]
+        }
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertIn("own comment 81918", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_list_failure_exits_nonzero_without_post(self) -> None:
+        """A failure reading existing comments fails closed before posting."""
+
+        stub = Stub()
+        stub.fail_comments.add(1)
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_non_utf8_body_file_exits_nonzero_without_post(self) -> None:
+        """A body file containing invalid UTF-8 fails closed without posting."""
+
+        stub = Stub()
+        (self.tmp / "body.md").write_bytes(b"\xff\xfe\x00\x00invalid")
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.posts(stub), [])
+
     def test_stale_evidence_is_refused_before_network(self) -> None:
         """A test on another head cannot authorize either write."""
 
