@@ -2,13 +2,17 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply filter-deps lengths lengths-local upstream-lint dist
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply filter-deps lengths lengths-local upstream-lint dist doctor
 .PHONY: fairy-requests
 
 DOCSTRING_BASE ?= origin/main
 SEMGREP ?= semgrep
 
 all: build
+
+# Optional check of the installed helper executable.
+doctor:
+	@python3 -B scripts/check_helper_install.py
 
 # Optional live check; keep network access outside verify-all.
 fairy-requests:

@@ -215,6 +215,8 @@ class FixtureTest(unittest.TestCase):
                 "user.email=fixture@invalid",
                 "-c",
                 "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
                 *args,
             ],
             cwd=self.root,

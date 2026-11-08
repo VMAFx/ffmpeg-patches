@@ -5,14 +5,18 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 import subprocess  # nosec B404 - fixed local Git listing, no shell, explicit timeout.
+import tempfile
 import tokenize
 import unittest
 from bisect import bisect_right
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
+
+from tests.helpers import isolated_git_environment, repository_git_environment
 
 try:
     import yaml
@@ -56,6 +60,7 @@ def tracked_texts(root: Path) -> list[tuple[str, str]]:
         capture_output=True,
         check=True,
         timeout=30,
+        env=repository_git_environment(root),
     )
     sources = []
     for name in tracked.stdout.split(b"\0"):
@@ -419,6 +424,65 @@ class NosemgrepBindingTest(unittest.TestCase):
             )
         ]
         self.assertEqual(offenders, [], "invalid Semgrep suppression:\n" + "\n".join(offenders))
+
+    def _git(self, repo: Path, *args: str, extra_env: dict[str, str] | None = None) -> None:
+        """Run bounded Git commands in a test repository with fixture settings."""
+        env = isolated_git_environment()
+        if extra_env:
+            env.update(extra_env)
+        subprocess.run(  # nosec B603 B607 - fixed test Git command with fixture config.
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                *args,
+            ],
+            check=True,
+            timeout=30,
+            env=env,
+        )
+
+    def test_tracked_texts_reads_repository_alternate_index(self) -> None:
+        """Tracked text queries read files added to a repository-owned alternate index."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            self._git(repo, "init", "-q")
+            (repo / "a.txt").write_text("a\n", encoding="utf-8")
+            self._git(repo, "add", "a.txt")
+            self._git(repo, "commit", "-qm", "initial")
+            alt_index = repo / ".git" / "alt-index"
+            (repo / "b.txt").write_text("b\n", encoding="utf-8")
+            self._git(repo, "add", "a.txt", "b.txt", extra_env={"GIT_INDEX_FILE": str(alt_index)})
+            with patch.dict(os.environ, {"GIT_INDEX_FILE": str(alt_index)}):
+                names = [name for name, _ in tracked_texts(repo)]
+            self.assertIn("b.txt", names)
+
+    def test_tracked_texts_ignores_foreign_index(self) -> None:
+        """Tracked text queries ignore alternate index files located outside the repository."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            self._git(repo, "init", "-q")
+            (repo / "a.txt").write_text("a\n", encoding="utf-8")
+            self._git(repo, "add", "a.txt")
+            self._git(repo, "commit", "-qm", "initial")
+            foreign_index = Path(td) / "foreign-index"
+            (repo / "b.txt").write_text("b\n", encoding="utf-8")
+            self._git(
+                repo, "add", "a.txt", "b.txt", extra_env={"GIT_INDEX_FILE": str(foreign_index)}
+            )
+            with patch.dict(os.environ, {"GIT_INDEX_FILE": str(foreign_index)}):
+                names = [name for name, _ in tracked_texts(repo)]
+            self.assertNotIn("b.txt", names)
 
 
 if __name__ == "__main__":

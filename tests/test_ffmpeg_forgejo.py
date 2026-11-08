@@ -137,6 +137,7 @@ class Stub:
     polls: sha -> list of status lists, one per poll (page 1 starts a poll; the last repeats).
     fail_status: answer the status endpoint with HTTP 500.
     pull_status: answer GET /pulls/1 with this HTTP status instead of a pull.
+    paginate_large_comments: paginate comment rows normally even when there are more than 1000.
     """
 
     def __init__(
@@ -165,6 +166,7 @@ class Stub:
         self.fail_reviews: set[int] = set()
         self.comments: dict[int, list[dict]] = {}
         self.fail_comments: set[int] = set()
+        self.paginate_large_comments = bool(kwargs.get("paginate_large_comments", False))
         self.head_reads = 0
         self.reviewer_reads = 0
         self.poll_index = {sha: -1 for sha in polls}
@@ -256,7 +258,7 @@ class Stub:
         page = int(query.get("page", ["1"])[0])
         limit = self.page_limit(query)
         rows = self.comments.get(number, [])
-        if len(rows) > 1000:
+        if len(rows) > 1000 and not self.paginate_large_comments:
             return rows if page == 1 else []
         return rows[(page - 1) * limit : page * limit]
 
@@ -1116,10 +1118,19 @@ class TestClaimHeadTest(ForgejoTest):
         )
         return str(path)
 
-    def comment(self, stub: Stub, *args: str) -> subprocess.CompletedProcess[str]:
+    def comment(
+        self, stub: Stub, *args: str, env_updates: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """Run a comment command with the shared issue and body arguments."""
 
-        return self.run_command(stub, "comment", *args, "1", str(self.tmp / "body.md"))
+        return self.run_command(
+            stub,
+            "comment",
+            *args,
+            "1",
+            str(self.tmp / "body.md"),
+            env_updates=env_updates,
+        )
 
     def comment_body(
         self,
@@ -1157,6 +1168,183 @@ class TestClaimHeadTest(ForgejoTest):
         """Return bodies sent by pull-body PATCH requests."""
 
         return self.sent_bodies(stub, "PATCH")
+
+    def test_own_duplicate_comment_is_refused(self) -> None:
+        """A whitespace-equivalent own reply exits 78 without a POST."""
+
+        stub = Stub()
+        stub.comments = {
+            1: [
+                {
+                    "user": {"login": "tester"},
+                    "id": 81918,
+                    "html_url": "stub/issues/1#issuecomment-81918",
+                    "body": "  new   body\tline two \n\n",
+                }
+            ]
+        }
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertIn("own comment 81918", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_duplicate_uses_authenticated_token_login(self) -> None:
+        """A configured login override cannot hide a duplicate by the token owner."""
+
+        stub = Stub(login="tester")
+        stub.comments = {
+            1: [
+                {
+                    "user": {"login": "tester"},
+                    "id": 81918,
+                    "html_url": "stub/issues/1#issuecomment-81918",
+                    "body": BODY,
+                }
+            ]
+        }
+        proc = self.comment(stub, "--no-test-claims", env_updates={"FFMPEG_FORGEJO_LOGIN": "other"})
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_duplicate_on_page_twenty_one_is_refused(self) -> None:
+        """Comment duplicate detection continues through twenty-one full pages."""
+
+        stub = Stub(paginate_large_comments=True)
+        stub.comments = {
+            1: [
+                {"user": {"login": "other"}, "id": 10000 + n, "body": "different"}
+                for n in range(1049)
+            ]
+            + [
+                {
+                    "user": {"login": "tester"},
+                    "id": 11049,
+                    "html_url": "stub/issues/1#issuecomment-11049",
+                    "body": BODY,
+                }
+            ],
+        }
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertIn("own comment 11049", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_listing_hits_two_hundred_page_bound(self) -> None:
+        """A comment listing at the explicit bound fails closed without posting."""
+
+        stub = Stub(paginate_large_comments=True)
+        stub.comments = {
+            1: [
+                {"user": {"login": "other"}, "id": 10000 + n, "body": "different"}
+                for n in range(10000)
+            ]
+        }
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("pagination limit reached", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_tested_head_is_rechecked_after_comment_listing(self) -> None:
+        """A PR head changing during comment listing prevents the comment POST."""
+
+        stub = Stub([A, B])
+        proc = self.comment_body(stub)
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("does not match live head", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_distinct_or_other_author_is_posted(self) -> None:
+        """Distinct bodies, other authors, and thread boundaries authorize a comment POST."""
+
+        cases = (
+            (
+                "distinct_body",
+                [
+                    {
+                        "user": {"login": "tester"},
+                        "id": 100,
+                        "html_url": "stub/issues/1#issuecomment-100",
+                        "body": "completely different text",
+                    }
+                ],
+            ),
+            (
+                "other_login",
+                [
+                    {
+                        "user": {"login": "someone_else"},
+                        "id": 101,
+                        "html_url": "stub/issues/1#issuecomment-101",
+                        "body": BODY,
+                    }
+                ],
+            ),
+            (
+                "one_char_difference",
+                [
+                    {
+                        "user": {"login": "tester"},
+                        "id": 102,
+                        "html_url": "stub/issues/1#issuecomment-102",
+                        "body": BODY.strip() + "!",
+                    }
+                ],
+            ),
+            (
+                "empty_thread",
+                [],
+            ),
+        )
+        for case_name, comments in cases:
+            with self.subTest(case=case_name):
+                stub = Stub()
+                stub.comments = {1: comments}
+                proc = self.comment(stub, "--no-test-claims")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(self.posts(stub), [BODY])
+
+    def test_own_duplicate_comment_on_page_two_is_refused(self) -> None:
+        """An own duplicate comment spanning onto page two exits 78 without a POST."""
+
+        stub = Stub(max_response_items=1)
+        stub.comments = {
+            1: [
+                {
+                    "user": {"login": "tester"},
+                    "id": 81910,
+                    "html_url": "stub/issues/1#issuecomment-81910",
+                    "body": "first comment",
+                },
+                {
+                    "user": {"login": "tester"},
+                    "id": 81918,
+                    "html_url": "stub/issues/1#issuecomment-81918",
+                    "body": "  new   body\tline two \n\n",
+                },
+            ]
+        }
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertIn("own comment 81918", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_list_failure_exits_nonzero_without_post(self) -> None:
+        """A failure reading existing comments fails closed before posting."""
+
+        stub = Stub()
+        stub.fail_comments.add(1)
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_non_utf8_body_file_exits_nonzero_without_post(self) -> None:
+        """A body file containing invalid UTF-8 fails closed without posting."""
+
+        stub = Stub()
+        (self.tmp / "body.md").write_bytes(b"\xff\xfe\x00\x00invalid")
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(self.posts(stub), [])
 
     def test_stale_evidence_is_refused_before_network(self) -> None:
         """A test on another head cannot authorize either write."""

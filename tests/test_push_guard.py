@@ -290,6 +290,8 @@ def isolated_git_environment() -> dict[str, str]:
 
 class GitEnvironmentNamesTest(unittest.TestCase):
     def test_shared_list_covers_every_repository_variable_git_names(self) -> None:
+        """Require the shared Git environment list to cover Git's local variables."""
+
         local = subprocess.run(  # nosec B603 B607 - fixed argv, no shell.
             ["git", "rev-parse", "--local-env-vars"],
             check=True,
@@ -297,6 +299,7 @@ class GitEnvironmentNamesTest(unittest.TestCase):
             text=True,
             stdin=subprocess.DEVNULL,
             timeout=push_guard.CONFIG_DEADLINE,
+            env=isolated_git_environment(),
         ).stdout.split()
         self.assertTrue(local)
         self.assertEqual(set(local) - GIT_ENVIRONMENT_NAMES, set())
@@ -501,6 +504,8 @@ class FixtureGitTest(unittest.TestCase):
                 run.assert_not_called()
 
     def test_legacy_config_and_other_commands_are_forwarded(self) -> None:
+        """Forward portable fixture Git commands with the isolated environment."""
+
         for args in (
             (),
             ("config",),
@@ -519,6 +524,7 @@ class FixtureGitTest(unittest.TestCase):
                     text=True,
                     stdin=subprocess.DEVNULL,
                     timeout=push_guard.CONFIG_DEADLINE,
+                    env=isolated_git_environment(),
                 )
 
 
@@ -535,6 +541,7 @@ def fixture_git(directory: str, *args: str) -> str:
         text=True,
         stdin=subprocess.DEVNULL,
         timeout=push_guard.CONFIG_DEADLINE,
+        env=isolated_git_environment(),
     ).stdout
 
 

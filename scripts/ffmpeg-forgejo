@@ -20,7 +20,8 @@
 #                          pr/push require a sweep for the local head; every row must be fold or follow-up: <reproducer path>
 #   ffmpeg-forgejo issue   <title> <body-file>
 #   ffmpeg-forgejo comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
-#                          comment on an issue or PR; test claims must match the live PR head
+#                          comment on an issue or PR; test claims must match the live PR head;
+#                          exits 78 when the body equals an own existing comment after whitespace normalization
 #   ffmpeg-forgejo edit-body [--wait] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          replace a PR body; test claims must match the live PR head; refuses (exit 75) while the
 #                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
@@ -113,6 +114,18 @@ login() {
   local out
   out="$(api GET /user)" || exit 1
   python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out"
+}
+
+# token_login: print the username authenticated by the API token, ignoring configured overrides.
+token_login() {
+  local out token_user validated
+  out="$(api GET /user)" || die "cannot read token login"
+  token_user="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])' <<<"$out")" \
+    || die "cannot read token login"
+  if ! validated="$(validate_login "$token_user" 2>/dev/null)"; then
+    die "cannot read token login"
+  fi
+  printf '%s\n' "$validated"
 }
 
 json_body() { # json_body KEY=VALUE... ; values starting with @ are read from that file
@@ -455,11 +468,12 @@ discover_page_size() {
     || die "invalid max_response_items in /settings/api; expected a positive integer"
 }
 
-# api_list PATH: collect a JSON list from at most 20 pages; PATH ends in ? or &.
+# api_list PATH [MAX_PAGES]: collect a JSON list from positive MAX_PAGES (default 20) pages; PATH ends in ? or &.
 api_list() {
-  local path="$1" list_page out parsed count pages=""
+  local path="$1" max_pages="${2:-20}" list_page out parsed count pages=""
+  [[ "$max_pages" =~ ^[1-9][0-9]*$ ]] || die "api_list: max pages must be a positive integer: $max_pages"
   [ -n "$page_size" ] || die "api_list: page size not discovered"
-  for ((list_page = 1; list_page <= 20; list_page++)); do
+  for ((list_page = 1; list_page <= max_pages; list_page++)); do
     out="$(api GET "${path}page=$list_page&limit=$page_size")" || die "cannot read $path"
     parsed="$(python3 -c 'import json,sys
 rows = json.load(sys.stdin)
@@ -474,7 +488,7 @@ print(json.dumps([row for page in sys.stdin if page.strip() for row in json.load
       return
     fi
   done
-  die "pagination limit reached for $path; listing incomplete"
+  die "pagination limit reached for $path after $max_pages pages; listing incomplete"
 }
 
 # own_open_pulls LOGIN: list only the login's open pulls.
@@ -482,6 +496,49 @@ own_open_pulls() {
   local encoded_me
   encoded_me="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1")" || return 1
   api_list "/repos/$REPO/pulls?state=open&poster=$encoded_me&"
+}
+
+# check_comment_duplicate NUMBER BODY-FILE LOGIN: reject an own matching comment from JSON stdin.
+check_comment_duplicate() {
+  python3 -I -c '
+import json
+import sys
+from pathlib import Path
+
+
+def normalize(body: str) -> str:
+    """Collapse Unicode whitespace without changing case."""
+    return " ".join(body.split())
+
+
+number, path, me = sys.argv[1:]
+try:
+    body = normalize(Path(path).read_text(encoding="utf-8"))
+    comments = json.load(sys.stdin)
+    if not isinstance(comments, list):
+        raise ValueError("comment listing is not a list")
+    for comment in comments:
+        if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+            raise ValueError("invalid comment row")
+        user = comment.get("user")
+        if user is not None and (
+            not isinstance(user, dict) or not isinstance(user.get("login"), str)
+        ):
+            raise ValueError("invalid comment author")
+        if user is None or user["login"] != me or normalize(comment["body"]) != body:
+            continue
+        comment_id, url = comment.get("id"), comment.get("html_url")
+        if isinstance(comment_id, bool) or not isinstance(comment_id, int) or not isinstance(url, str):
+            raise ValueError("invalid matching comment identity")
+        print(
+            f"ffmpeg-forgejo: body equals own comment {comment_id} ({url}) on #{number}; not posted",
+            file=sys.stderr,
+        )
+        raise SystemExit(78)
+except (OSError, UnicodeError, ValueError) as error:
+    print(f"ffmpeg-forgejo: cannot check existing comments on #{number}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+' "$1" "$2" "$3"
 }
 
 # own_open_pr_numbers: list own open pull numbers using the overlap checks poster filter.
@@ -1031,6 +1088,11 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: $1"
     [ -f "$2" ] || die "no body file $2"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
+    me="$(token_login)" || die "cannot read token login"
+    discover_page_size
+    out="$(api_list "/repos/$REPO/issues/$1/comments?" 200)" || exit 1
+    check_comment_duplicate "$1" "$2" "$me" <<<"$out"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     body="$(mktemp)"
     json_body "body=@$2" >"$body"

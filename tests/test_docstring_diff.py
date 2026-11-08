@@ -4,11 +4,15 @@
 
 from __future__ import annotations
 
+import os
 import subprocess  # nosec B404 - fixed Git and Python commands in disposable fixtures.
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
+
+from tests.helpers import isolated_git_environment
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "docstring_diff.py"
 
@@ -40,12 +44,15 @@ class DocstringDiffTest(unittest.TestCase):
                 "user.email=fixture@invalid",
                 "-c",
                 "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
                 *args,
             ],
             capture_output=True,
             text=True,
             check=True,
             timeout=30,
+            env=isolated_git_environment(),
         )
         return result.stdout.strip()
 
@@ -209,6 +216,22 @@ class DocstringDiffTest(unittest.TestCase):
         result = self.run_check("--cached")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("renamed.py:1: old has no docstring", result.stderr)
+
+    def test_fixture_commit_ignores_global_hooks(self) -> None:
+        """Global core.hooksPath configuration does not run hooks during fixture commits."""
+        global_config = Path(self.directory.name) / "global_gitconfig"
+        hooks_dir = Path(self.directory.name) / "hooks"
+        hooks_dir.mkdir()
+        pre_commit = hooks_dir / "pre-commit"
+        pre_commit.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        pre_commit.chmod(0o755)
+        global_config.write_text(f"[core]\n\thooksPath = {hooks_dir}\n", encoding="utf-8")
+
+        new_file = self.root / "new.py"
+        new_file.write_text("x = 1\n", encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)}):
+            self.git("add", "new.py")
+            self.git("commit", "-qm", "planted")
 
 
 if __name__ == "__main__":

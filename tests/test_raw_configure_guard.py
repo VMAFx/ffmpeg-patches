@@ -11,6 +11,7 @@ import subprocess  # nosec B404 - fixed guard and shell-hook commands, never con
 import tempfile
 from pathlib import Path
 
+from tests.helpers import isolated_git_environment
 from tests.raw_configure_support import CLIENTS, CONFIGS, ROOT, RawConfigureGuardBase
 
 
@@ -185,6 +186,7 @@ class RawConfigureGuardTest(RawConfigureGuardBase):
             capture_output=True,
             text=True,
             timeout=5,
+            env=isolated_git_environment(),
         )
         for client in ("claude", "codex", "gemini"):
             with self.subTest(client=client):
