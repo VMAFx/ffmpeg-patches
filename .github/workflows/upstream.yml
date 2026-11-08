@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: EUPL-1.2
 #
 # Daily comparison with the FFmpeg forge, read without a token. Repair
-# contribution fields and inline master_form commits, then regenerate the
-# README table. Publish any changes as upstream-drift.patch and show the
-# diff in the job summary before failing the run for human review.
+# contribution fields, patch sidecar status and inline master_form commits,
+# then regenerate the README table. Publish any changes as
+# upstream-drift.patch and show the diff in the job summary before
+# failing the run for human review.
 # Unfixed covered_by drift or a tool error also fails, even without a diff.
 # No pull request is created; repository permissions remain read-only.
 name: upstream drift
