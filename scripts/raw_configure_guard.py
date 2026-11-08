@@ -444,28 +444,28 @@ def _inspect_pipeline(
     return None, directory
 
 
-def _subshell_step(token: str, directory: Path | None, subshells: list[Path | None]) -> Path | None:
-    """Update subshell stack and effective directory on grouping tokens."""
-    if token == "(":
+def _subshell_step(word: str, directory: Path | None, subshells: list[Path | None]) -> Path | None:
+    """Update subshell stack and effective directory on grouping words."""
+    if word == "(":
         if len(subshells) < MAX_SUBSHELL_DEPTH:
             subshells.append(directory)
             return directory
         subshells.append(None)
         return None
-    if token == ")":
+    if word == ")":
         return subshells.pop() if subshells else None
     return directory
 
 
 def _separator_step(
-    token: str, directory: Path | None, list_start: Path | None, subshells: list[Path | None]
+    word: str, directory: Path | None, list_start: Path | None, subshells: list[Path | None]
 ) -> tuple[Path | None, Path | None]:
-    """Update effective directory and list start on shell separator tokens."""
-    if token == "&":
+    """Update effective directory and list start on shell separator words."""
+    if word == "&":
         directory = list_start
-    elif token in ("(", ")"):
-        directory = _subshell_step(token, directory, subshells)
-    if token in (";", "\n", "&", "(", ")"):
+    elif word in ("(", ")"):
+        directory = _subshell_step(word, directory, subshells)
+    if word in (";", "\n", "&", "(", ")"):
         list_start = directory
     return directory, list_start
 
@@ -481,13 +481,13 @@ def _inspect_tokens(
     simple: list[str] = []
     subshells: list[Path | None] = []
     list_start = directory
-    for token in [*tokens, ";"]:
-        if token == "|":
+    for word in [*tokens, ";"]:
+        if word == "|":
             if simple:
                 pipeline.append(simple)
                 simple = []
             continue
-        if token in SEPARATORS:
+        if word in SEPARATORS:
             if simple:
                 pipeline.append(simple)
                 simple = []
@@ -496,9 +496,9 @@ def _inspect_tokens(
                 if blocked is not None:
                     return blocked
                 pipeline = []
-            directory, list_start = _separator_step(token, directory, list_start, subshells)
+            directory, list_start = _separator_step(word, directory, list_start, subshells)
             continue
-        simple.append(token)
+        simple.append(word)
     return None
 
 

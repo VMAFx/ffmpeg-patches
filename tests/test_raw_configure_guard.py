@@ -64,9 +64,7 @@ class RawConfigureGuardTest(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         """Run only the guard with JSON on stdin and a short deadline."""
         data = payload if isinstance(payload, str) else json.dumps(payload)
-        base_env = os.environ.copy()
-        base_env.pop("CDPATH", None)
-        run_env = base_env if env is None else env
+        run_env = {"PATH": os.defpath, "LC_ALL": "C.UTF-8"} if env is None else env
         return subprocess.run(  # nosec B603 - fixed guard argv with explicit interpreter.
             [sys.executable, "-I", str(GUARD), "--client", client],
             input=data,
