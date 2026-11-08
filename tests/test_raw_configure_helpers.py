@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from scripts import raw_configure_inspect, raw_configure_words
+from scripts import raw_configure_inspect, raw_configure_unwrap, raw_configure_words
 from tests.raw_configure_support import GUARD_MOD, RawConfigureGuardBase
 
 
@@ -68,7 +68,7 @@ class RawConfigureHelperTest(RawConfigureGuardBase):
         )
         for words, expected in cases:
             with self.subTest(words=words):
-                self.assertEqual(raw_configure_inspect._command_start(words), expected)
+                self.assertEqual(raw_configure_unwrap._command_start(words), expected)
 
     def test_is_configure_word_helper(self) -> None:
         """Verify _is_configure_word distinguishes configure and benign names."""

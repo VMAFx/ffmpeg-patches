@@ -26,7 +26,6 @@ from scripts.raw_configure_inspect import (  # noqa: E402
     _classify_command,
     _inspect_shell_or_eval,
     _shell_argument,
-    _unwrap_command,
     _wrapper_blocked,
 )
 from scripts.raw_configure_lex import (  # noqa: E402
@@ -36,6 +35,9 @@ from scripts.raw_configure_lex import (  # noqa: E402
     _scan_substitutions,
     _strip_redirections,
     _tokens,
+)
+from scripts.raw_configure_unwrap import (  # noqa: E402
+    _unwrap_command,
 )
 from scripts.raw_configure_words import (  # noqa: E402
     DECIDABLE_NAME,
