@@ -3162,7 +3162,7 @@ class PullOverlapMutantTest(unittest.TestCase):
             ),
             (
                 'overlapping+=("$number"); continue',
-                'overlapping+=("$number"); return 77',
+                'overlapping+=("$number"); rm -f "$candidates"; return 77',
                 ("test_every_overlapping_pull_is_listed",),
             ),
         )
