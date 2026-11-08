@@ -291,7 +291,7 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertIn(checkpoint_file.resolve(), scanned)
 
     def test_negated_if_status_read_rule(self) -> None:
-        """Rule negated-if-status-read flags negated if/elif status reads, not comments, strings or later statements."""  # noqa: E501
+        """Rule flags negated if/elif status reads, not comments, strings or later statements."""
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         scratch_path = Path(scratch.name)
