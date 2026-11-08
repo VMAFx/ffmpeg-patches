@@ -119,7 +119,7 @@ rules:
         - scripts/
         - tests/
       exclude:
-        - .config/lefthook/scripts/checkpoint.py
+        - /.config/lefthook/scripts/checkpoint.py
     patterns:
       - pattern-either:
           - pattern: |
