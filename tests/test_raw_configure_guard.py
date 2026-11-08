@@ -481,6 +481,42 @@ class RawConfigureGuardTest(unittest.TestCase):
             with self.subTest(words=words):
                 self.assertEqual(GUARD_MOD._shell_argument(words), expected)
 
+    def test_command_start_helper(self) -> None:
+        """Verify _command_start skips prefix reserved words, timers, and assignments."""
+        cases = (
+            (["cd", "x"], 0),
+            (["if", "cd", "x"], 1),
+            (["time", "-p", "cd", "x"], 2),
+            (["time", "cd", "x"], 1),
+            (["builtin", "command", "while", "do", "cd", "x"], 4),
+            (["X=1", "Y=2", "cd", "x"], 2),
+            (
+                [
+                    "if",
+                    "then",
+                    "elif",
+                    "else",
+                    "do",
+                    "while",
+                    "until",
+                    "!",
+                    "{",
+                    "}",
+                    "command",
+                    "builtin",
+                ],
+                12,
+            ),
+            ([], 0),
+            (["unknown", "cd", "x"], 0),
+            (["-p", "cd", "x"], 0),
+            (["time", "-p"], 2),
+            (["time"], 1),
+        )
+        for words, expected in cases:
+            with self.subTest(words=words):
+                self.assertEqual(GUARD_MOD._command_start(words), expected)
+
     def test_step_helper(self) -> None:
         """Verify _step tracks directories and detects configure invocations."""
         pending: list[tuple[str, Path | None, int]] = []
@@ -495,6 +531,15 @@ class RawConfigureGuardTest(unittest.TestCase):
         self.assertEqual(other_cwd, self.other)
         blocked, _ = GUARD_MOD._step(["./configure"], other_cwd, 0, pending)
         self.assertIsNone(blocked)
+
+        blocked, eval_cwd = GUARD_MOD._step(["eval", "cd", str(self.tree)], self.root, 0, pending)
+        self.assertIsNone(blocked)
+        self.assertIsNone(eval_cwd)
+        blocked, time_cwd = GUARD_MOD._step(
+            ["time", "-p", "cd", str(self.tree)], self.root, 0, pending
+        )
+        self.assertIsNone(blocked)
+        self.assertEqual(time_cwd, self.tree)
 
     def test_refuses_wrapped_shell_and_option_forms(self) -> None:
         """Refuse shell invocations behind wrappers and with complex options."""
@@ -730,3 +775,44 @@ class RawConfigureGuardTest(unittest.TestCase):
                     result = self.run_guard(client, self.payload(client, command, cwd))
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(self.marker.exists())
+
+    def test_eval_and_prefix_command_refusals(self) -> None:
+        """Refuse configure execution reached through eval or prefix-wrapped directory changes."""
+        cases = (
+            (f"eval 'cd {self.tree}' && ./configure", self.root),
+            (f"eval cd {self.tree}; ./configure", self.root),
+            (f'eval "cd {self.tree}"; sh configure', self.root),
+            (f"if cd {self.tree}; then ./configure; fi", self.root),
+            (f"{{ cd {self.tree}; ./configure; }}", self.root),
+            (f"while cd {self.tree}; do ./configure; break; done", self.root),
+            (f"! cd {self.tree} || ./configure", self.root),
+            (f"time cd {self.tree}; ./configure", self.root),
+            (f"time -p cd {self.tree}; ./configure", self.root),
+            (f"command cd {self.tree}; ./configure", self.root),
+            (f"builtin cd {self.tree}; ./configure", self.root),
+            (f"X=1 cd {self.tree}; ./configure", self.root),
+        )
+        self._assert_refused(cases)
+
+    def test_eval_and_prefix_command_controls_and_boundaries(self) -> None:
+        """Allow benign eval and prefix commands and enforce boundary limits."""
+        allow_cases = (
+            (f"if cd {self.tree}; then ls; fi", self.root),
+            ("eval 'echo hi'; ls", self.root),
+            ("command -v ls", self.root),
+            ("time ls", self.root),
+            ("ls", self.tree),
+            ("{ ls; }", self.tree),
+            ("if then elif else do while until ! { time command builtin", self.root),
+        )
+        for client in CLIENTS:
+            for command, cwd in allow_cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
+            long_if = "if " * 4000 + f"cd {self.tree}; ./configure"
+            with self.subTest(client=client, boundary="long_if"):
+                result = self.run_guard(client, self.payload(client, long_if, self.root))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.marker.exists())

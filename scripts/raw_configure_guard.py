@@ -39,6 +39,22 @@ SHELLS = frozenset(("bash", "sh"))
 UNPARSED = Path("unparsed command")
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.DOTALL)
 CONFIGURE_WORD = re.compile(r"(?<![A-Za-z0-9_])configure(?![A-Za-z0-9_])")
+PREFIX_WORDS = frozenset(
+    (
+        "if",
+        "then",
+        "elif",
+        "else",
+        "do",
+        "while",
+        "until",
+        "!",
+        "{",
+        "}",
+        "command",
+        "builtin",
+    )
+)
 DYNAMIC_VARIABLE = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*")
 BRACED_VARIABLE = re.compile(r"\$\{[^{}]*\}")
 NAMED_VARIABLE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
@@ -646,6 +662,26 @@ def _valid_cd_words(words: list[str]) -> bool:
     return True
 
 
+def _command_start(words: list[str]) -> int:
+    """Find the index of the first command word after shell prefix tokens."""
+    idx = 0
+    words_len = len(words)
+    for _ in range(words_len):
+        if idx >= words_len:
+            break
+        word = words[idx]
+        if word in PREFIX_WORDS or ASSIGNMENT.fullmatch(word):
+            idx += 1
+            continue
+        if word == "time":
+            idx += 1
+            if idx < words_len and words[idx] == "-p":
+                idx += 1
+            continue
+        break
+    return idx
+
+
 def _step(
     words: list[str], cwd: Path | None, depth: int, pending: list[tuple[str, Path | None, int]]
 ) -> tuple[Path | None, Path | None]:
@@ -653,29 +689,35 @@ def _step(
     blocked, inline = _inspect_simple(words, cwd)
     if inline is not None:
         pending.append((inline, cwd, depth + 1))
-    if words[0] == "popd":
-        return blocked, None
-    if words[0] in ("cd", "pushd"):
-        target = "~" if words == ["cd"] else words[1] if _valid_cd_words(words) else ""
-        if (
-            not target
-            or target == "-"
-            or "$" in target
-            or "`" in target
-            or cwd is None
-            or REDIRECT_FULL.match(target)
-            or REDIRECT_OP.match(target)
-            or DIGITS_REDIRECT.match(target)
-        ):
+    start = _command_start(words)
+    remaining = words[start:]
+    if remaining:
+        command = os.path.basename(remaining[0])
+        if command in ("eval", "popd"):
             return blocked, None
-        if os.environ.get("CDPATH") and not (
-            target.startswith(("/", "./", "../", "~")) or target in (".", "..")
-        ):
-            return blocked, None
-        resolved = Path(os.path.normpath(cwd / os.path.expanduser(target))).resolve()
-        if not resolved.is_dir() or not os.access(resolved, os.X_OK):
-            return blocked, cwd
-        return blocked, resolved
+        if command in ("cd", "pushd"):
+            target = (
+                "~" if remaining == ["cd"] else remaining[1] if _valid_cd_words(remaining) else ""
+            )
+            if (
+                not target
+                or target == "-"
+                or "$" in target
+                or "`" in target
+                or cwd is None
+                or REDIRECT_FULL.match(target)
+                or REDIRECT_OP.match(target)
+                or DIGITS_REDIRECT.match(target)
+            ):
+                return blocked, None
+            if os.environ.get("CDPATH") and not (
+                target.startswith(("/", "./", "../", "~")) or target in (".", "..")
+            ):
+                return blocked, None
+            resolved = Path(os.path.normpath(cwd / os.path.expanduser(target))).resolve()
+            if not resolved.is_dir() or not os.access(resolved, os.X_OK):
+                return blocked, cwd
+            return blocked, resolved
     return blocked, cwd
 
 
