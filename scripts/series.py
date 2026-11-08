@@ -753,7 +753,7 @@ def master_form_parts(root: Path, names: list[str], findings: Findings) -> dict[
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
             continue
         link = str(data.get("upstream", ""))
-        if link.startswith("https://"):
+        if data.get("status") in FORGE_STATES and link.startswith("https://"):
             groups.setdefault(link, []).append((name, "master_form" in data))
     parts: dict[str, str] = {}
     for url, items in groups.items():

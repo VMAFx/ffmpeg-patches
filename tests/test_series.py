@@ -1301,6 +1301,20 @@ class MasterFormTest(SeriesTestCase):
             self.apply()
         self.assert_clean()
 
+    def test_multi_patch_pr_unsubmitted_earlier_patch_is_not_a_part(self) -> None:
+        """Verify unsubmitted earlier patch sharing a pull request link is not a part."""
+        self.setup_multi_patch_pr(2)
+        sidecar = (self.fx.root / "patches" / self.fx.names[0]).with_suffix(".toml")
+        sidecar.write_text(
+            sidecar.read_text(encoding="utf-8").replace(
+                'status = "submitted"', 'status = "unsubmitted"'
+            ),
+            encoding="utf-8",
+        )
+        findings = series.Findings()
+        self.assertEqual(series.master_form_parts(self.fx.root, self.fx.names, findings), {})
+        self.assertEqual(findings.errors, [])
+
 
 class MainTest(SeriesTestCase):
     def test_tool_error_exits_two(self) -> None:
