@@ -545,6 +545,53 @@ class LefthookPushGuardTest(unittest.TestCase):
         self.assertEqual(len(result.failures), 1)
         self.assertFalse(result.errors)
 
+    def test_series_build_enables_qpfile_encoder_dependencies(self) -> None:
+        """The Linux series build installs, probes and enables the encoders 0043 changes."""
+        action = yaml.safe_load(
+            (ROOT / ".github/actions/prepare-series/action.yml").read_text(encoding="utf-8")
+        )
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
+        )
+        action_run = next(
+            step["run"]
+            for step in action["runs"]["steps"]
+            if step.get("name") == "Install the FFmpeg build toolchain"
+        )
+        configure_run = next(
+            step["run"]
+            for step in workflow["jobs"]["apply-build"]["steps"]
+            if step.get("name") == "Configure FFmpeg"
+        )
+        pkg_config = next(
+            line for line in action_run.splitlines() if line.startswith("pkg-config --modversion ")
+        ).split()
+        for package, module, flag in (
+            ("libx264-dev", "x264", "--enable-libx264"),
+            ("libsvtav1enc-dev", "SvtAv1Enc", "--enable-libsvtav1"),
+            ("libaom-dev", "aom", "--enable-libaom"),
+        ):
+            with self.subTest(package=package):
+                self.assertIn(package, action_run)
+                self.assertIn(module, pkg_config)
+                self.assertIn(flag, configure_run)
+
+    def test_planted_qpfile_encoder_dependency_omissions_are_refused(self) -> None:
+        """Dropping one encoder package, probe module or configure flag fails the check."""
+        action = (ROOT / ".github/actions/prepare-series/action.yml").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
+        for missing in ("libx264-dev", " x264 ", "--enable-libx264"):
+            with self.subTest(missing=missing):
+                files = {
+                    ".github/actions/prepare-series/action.yml": action.replace(missing, ""),
+                    ".github/workflows/series.yml": workflow.replace(missing, ""),
+                }
+                result = run_with_fixture(
+                    "test_series_build_enables_qpfile_encoder_dependencies", files
+                )
+                self.assertTrue(result.failures)
+                self.assertFalse(result.errors)
+
     def test_hook_jobs_never_interpolate_git_arguments(self) -> None:
         """No lefthook run/args field contains a {N} positional git-argument placeholder."""
 

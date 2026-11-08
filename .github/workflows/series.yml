@@ -172,8 +172,11 @@ jobs:
           # the C++ runtime used by libsvm; --extra-libs supplies that runtime.
           # CONFIG_LIBVMAF_CUDA_FILTER stays off on hosted runners without nvcc;
           # the CUDA block in vf_libvmaf.c needs a separate CUDA-enabled build.
+          # --enable-libx264, --enable-libsvtav1 and --enable-libaom build the encoder
+          # wrappers and qpfile_parser.c that 0043 changes.
           ../ffmpeg/configure --fatal-warnings --disable-doc --enable-gpl --enable-vulkan \
             --enable-nvenc --enable-vaapi --enable-libdrm --enable-libvpl --enable-libzimg \
+            --enable-libx264 --enable-libsvtav1 --enable-libaom \
             --enable-opencl --enable-libvmaf --extra-libs=-lstdc++ \
             || { tail -40 ffbuild/config.log; exit 1; }
       - name: Lint the C sources of this repository with clang-tidy and cppcheck

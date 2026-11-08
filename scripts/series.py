@@ -61,6 +61,7 @@ import subprocess  # nosec B404 - fixed git argv, no shell, explicit timeouts.
 import sys
 import tempfile
 import tomllib
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -268,6 +269,103 @@ def check_patch_form(path: Path, findings: Findings) -> None:
         findings.error(name, "no diff --git section")
 
 
+def _skip_literal(line: str, index: int, quote: str) -> int:
+    """Return the index after a quoted C literal, honoring backslash escapes."""
+    index += 1
+    while index < len(line):
+        if line[index] == "\\":
+            index += 2
+        elif line[index] == quote:
+            return index + 1
+        else:
+            index += 1
+    return index
+
+
+def _code_line(line: str, in_block_comment: bool) -> tuple[str, bool]:
+    """Strip comments and C literals from one line and return block state."""
+    code: list[str] = []
+    index = 0
+    while index < len(line):
+        char = line[index]
+        next_char = line[index + 1] if index + 1 < len(line) else ""
+        if in_block_comment:
+            if char == "*" and next_char == "/":
+                in_block_comment = False
+                index += 2
+            else:
+                index += 1
+        elif char == "/" and next_char == "*":
+            in_block_comment = True
+            index += 2
+        elif char == "/" and next_char == "/":
+            break
+        elif char in "\"'":
+            index = _skip_literal(line, index, char)
+        else:
+            code.append(char)
+            index += 1
+    return "".join(code), in_block_comment
+
+
+def _spliced_diff_lines(text: str) -> Iterator[tuple[str, str, str | None]]:
+    """Join new-file continuations, retaining the first and first added lines."""
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        first_line = line = lines[index]
+        added_line = first_line if first_line.startswith("+") else None
+        index += 1
+        while line.startswith((" ", "+")) and line.endswith("\\") and index < len(lines):
+            if lines[index].startswith(("-", "\\ No newline at end of file")):
+                index += 1
+                continue
+            if not lines[index].startswith((" ", "+")):
+                break
+            if added_line is None and lines[index].startswith("+"):
+                added_line = lines[index]
+            line = line[:-1] + lines[index][1:]
+            index += 1
+        yield first_line, line, added_line
+
+
+def check_added_posix_types(path: Path, findings: Findings) -> None:
+    """Reject added `ssize_t` in C sources because MSVC lacks the POSIX type."""
+    file_name: str | None = None
+    in_hunk = False
+    in_block_comment = False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for diff_line, spliced_line, added_line in _spliced_diff_lines(text):
+        if diff_line.startswith("diff --git "):
+            file_name = None
+            in_hunk = False
+            in_block_comment = False
+            continue
+        if diff_line.startswith("+++ "):
+            file_name = patch_path(diff_line)
+            in_hunk = False
+            in_block_comment = False
+            continue
+        if diff_line.startswith("@@"):
+            in_hunk = True
+            in_block_comment = False
+            continue
+        if not in_hunk or not file_name or not file_name.endswith((".c", ".h")):
+            continue
+        if diff_line.startswith(("-", "\\ No newline")):
+            continue
+        if not diff_line.startswith((" ", "+")):
+            continue
+        code, in_block_comment = _code_line(spliced_line[1:], in_block_comment)
+        if added_line is not None and re.search(r"\bssize_t\b", code):
+            line = added_line[1:].rstrip()
+            findings.error(
+                path.name,
+                f"{file_name}: added line {line!r}: POSIX type; MSVC lacks it, "
+                "use ptrdiff_t or size_t",
+            )
+
+
 def check_exception_dates(entry: dict, name: str, findings: Findings, today: date) -> None:
     cat = entry.get("category")
     ent_raw = entry.get("entered")
@@ -460,6 +558,7 @@ def check_tree(root: Path, names: list[str], findings: Findings, today: date | N
             findings.error(name, "listed in series.txt but missing from patches/")
             continue
         check_patch_form(path, findings)
+        check_added_posix_types(path, findings)
         sidecar = path.with_suffix(".toml")
         if sidecar.is_file():
             check_metadata(sidecar, findings, today=today)
