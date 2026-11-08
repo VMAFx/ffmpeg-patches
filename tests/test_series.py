@@ -508,6 +508,196 @@ class CheckTest(SeriesTestCase):
         self.fx.write_records([self.fx.record(2)])
         self.assertEqual(series.check(self.fx.root).errors, [])
 
+    def test_added_ssize_t_fails(self) -> None:
+        """An added ssize_t line in a C file is refused."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", "+ssize_t line_5 = 50;"),
+            encoding="utf-8",
+        )
+        self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
+        self.assert_error(series.check(self.fx.root), "ssize_t line_5 = 50;")
+
+    def test_added_spliced_ssize_t_fails(self) -> None:
+        """A spliced ssize_t is refused once, citing its first physical line."""
+        path = self.fx.patch(1)
+        first_line = "ssize_\\"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", f"+{first_line}\n+t n;"),
+            encoding="utf-8",
+        )
+        findings = series.check(self.fx.root)
+        self.assertEqual(len(findings.errors), 1)
+        self.assert_error(findings, f"lib.c: added line {first_line!r}: POSIX type; MSVC lacks it")
+
+    def test_added_spliced_ssize_t_across_removed_line_fails(self) -> None:
+        """Removed lines do not interrupt a new-file ssize_t continuation."""
+        path = self.fx.patch(1)
+        first_line = "ssize_\\"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "+int line_5 = 50;", f"+{first_line}\n-int old;\n+t n;"
+            ),
+            encoding="utf-8",
+        )
+        findings = series.check(self.fx.root)
+        self.assertEqual(len(findings.errors), 1)
+        self.assert_error(findings, f"lib.c: added line {first_line!r}: POSIX type; MSVC lacks it")
+
+    def test_added_spliced_ssize_t_from_context_fails(self) -> None:
+        """An added continuation is refused and cited after a context prefix."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", " ssize_\\\n+t n;"),
+            encoding="utf-8",
+        )
+        findings = series.check(self.fx.root)
+        self.assertEqual(len(findings.errors), 1)
+        self.assert_error(findings, "lib.c: added line 't n;': POSIX type; MSVC lacks it")
+
+    def test_context_spliced_ssize_t_passes(self) -> None:
+        """A continuation containing only context lines stays pre-existing."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", " ssize_\\\n t n;"),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_spliced_non_ssize_t_across_removed_line_passes(self) -> None:
+        """Skipping removed lines still requires the exact ssize_t token."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "+int line_5 = 50;", "+ssize_\\\n-int old;\n+x n;"
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_spliced_non_ssize_t_passes(self) -> None:
+        """Splicing a different identifier does not create an ssize_t finding."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", "+ssize_\\\n+total n;"),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_in_block_comment_passes(self) -> None:
+        """An added ssize_t in a block comment is ignored."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "+int line_5 = 50;", "+/* ssize_t is unavailable */"
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_in_line_comment_passes(self) -> None:
+        """An added ssize_t in a line comment is ignored."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", "+// ssize_t"),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_in_string_literal_passes(self) -> None:
+        """An added ssize_t in a string literal is ignored."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "+int line_5 = 50;", '+const char *s = "ssize_t";'
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_in_multiline_block_comment_passes(self) -> None:
+        """An added ssize_t on the second line of a block comment is ignored."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "+int line_5 = 50;", "+/* comment starts\n+ * ssize_t is unavailable */"
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_added_ssize_t_in_context_block_comment_passes(self) -> None:
+        """An added ssize_t between context comment lines is ignored."""
+        path = self.fx.patch(1)
+        text = path.read_text(encoding="utf-8")
+        text = text.replace(" int line_4 = 4;", " /* note")
+        text = text.replace("+int line_5 = 50;", "+ * ssize_t is unavailable")
+        text = text.replace(" int line_6 = 6;", " */")
+        path.write_text(text, encoding="utf-8")
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_removed_comment_does_not_hide_added_ssize_t(self) -> None:
+        """A removed comment opener does not affect added-line state."""
+        path = self.fx.patch(1)
+        text = path.read_text(encoding="utf-8").replace("-int line_5 = 5;", "-/* x")
+        text = text.replace("+int line_5 = 50;", "+ssize_t n;")
+        path.write_text(text, encoding="utf-8")
+        self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
+
+    def test_context_closed_comment_does_not_hide_added_ssize_t(self) -> None:
+        """An added ssize_t after a context comment is refused."""
+        path = self.fx.patch(1)
+        text = path.read_text(encoding="utf-8").replace(" int line_4 = 4;", " /* note */")
+        text = text.replace("+int line_5 = 50;", "+ssize_t n;")
+        path.write_text(text, encoding="utf-8")
+        self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
+
+    def test_block_comment_state_does_not_cross_hunks(self) -> None:
+        """An open comment in one hunk does not hide additions in the next."""
+        path = self.fx.patch(1)
+        text = path.read_text(encoding="utf-8").replace(" int line_4 = 4;", " /* note")
+        text += "@@ -20,1 +20,2 @@\n int line_20 = 20;\n+ssize_t n;\n"
+        path.write_text(text, encoding="utf-8")
+        self.assert_error(series.check(self.fx.root), "POSIX type; MSVC lacks it")
+
+    def test_added_ssize_t_with_trailing_comment_fails(self) -> None:
+        """An added ssize_t before a trailing comment is refused."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", "+ssize_t n; /* note */"),
+            encoding="utf-8",
+        )
+        self.assert_error(series.check(self.fx.root), "ssize_t n; /* note */")
+
+    def test_added_ssize_t_after_closed_comment_fails(self) -> None:
+        """An added ssize_t after a closed comment is refused."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("+int line_5 = 50;", "+/* x */ ssize_t n;"),
+            encoding="utf-8",
+        )
+        self.assert_error(series.check(self.fx.root), "/* x */ ssize_t n;")
+
+    def test_added_ptrdiff_t_passes(self) -> None:
+        """An added ptrdiff_t line passes."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "+int line_5 = 50;", "+ptrdiff_t line_5 = 50;"
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
+    def test_context_ssize_t_passes(self) -> None:
+        """ssize_t in a context line is not the patch's addition, so it passes."""
+        path = self.fx.patch(1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(" int line_4 = 4;", " ssize_t line_4 = 4;"),
+            encoding="utf-8",
+        )
+        self.assertEqual(series.check(self.fx.root).errors, [])
+
 
 class UpstreamCreditTest(SeriesTestCase):
     # Split so REUSE does not read the fixture text as a notice on this file.

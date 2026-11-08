@@ -1,0 +1,24 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx"]
+origin = "the VMAFx fork, so an encoder's loopback decode output stays on the GPU instead of round-tripping through system memory"
+notes = """
+Lets -hwaccel, -hwaccel_device and -hwaccel_output_format precede -dec and set \
+up the loopback decoder's hardware decoding the way they already do for an input \
+stream (fftools/ffmpeg_dec_hwaccel.c). Without them an encoder's loopback output \
+always returned through system memory, so a pipeline that encodes and scores on \
+the GPU round-tripped every frame over the bus.
+
+Generic: carries no VMAFx identifiers and no downstream references; public cuda \
+and NVDEC names are upstream FFmpeg hwaccel vocabulary. Not sent upstream yet; \
+refreshed against the pinned base with every FFmpeg release."""
+
+[[exceptions]]
+rule = "HISS-04"
+path = "fftools/ffmpeg_dec.c"
+function = "dec_create"
+lines = 77
+category = "D"
+entered = "2026-10-31"
+expires = "2027-02-28"
+reason = "upstream function, 73 lines at the pinned base; the patch adds the loopback decoder hwaccel setup inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"

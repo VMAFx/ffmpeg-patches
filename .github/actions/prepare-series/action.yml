@@ -33,10 +33,11 @@ runs:
         sudo apt-get install -y --no-install-recommends \
           build-essential nasm pkg-config meson ninja-build xxd \
           libvulkan-dev spirv-headers libffmpeg-nvenc-dev \
-          libva-dev libdrm-dev libvpl-dev libzimg-dev ocl-icd-opencl-dev glslc clang-tidy cppcheck
+          libva-dev libdrm-dev libvpl-dev libzimg-dev ocl-icd-opencl-dev \
+          libx264-dev libsvtav1enc-dev libaom-dev glslc clang-tidy cppcheck
         gcc --version | head -1
         glslc --version | head -1
-        pkg-config --modversion vulkan ffnvcodec libva libdrm vpl zimg OpenCL
+        pkg-config --modversion vulkan ffnvcodec libva libdrm vpl zimg OpenCL x264 SvtAv1Enc aom
     - name: Build the pinned libvmaf release
       # Ubuntu has no libvmaf package. Upstream's Meson build needs C/C++,
       # NASM and xxd for the built-in models; docs, tools and tests stay off.
