@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Run FFmpeg configure with a filtered environment; its set dump enters config.log."""
+"""Run any configure script (FFmpeg, GCC and other autoconf trees).
+
+Configure runs in BUILD_DIR with a filtered environment so config.log holds no secrets.
+"""
 
 from __future__ import annotations
 
