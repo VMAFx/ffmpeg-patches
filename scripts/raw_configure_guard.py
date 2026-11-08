@@ -54,6 +54,7 @@ BRACED_VARIABLE = re.compile(r"\$\{[^{}]*\}")
 NAMED_VARIABLE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 STRIP_CHARS = str.maketrans("", "", "'\"\\")
 INTERPRETERS = re.compile(r"^(?:python|perl|ruby|node|gawk|mawk|awk|php)(?:\d+(?:\.\d+)*[a-z]*)?$")
+INLINE_PROGRAM_FLAG = re.compile(r"-[A-Za-z]*[cepErR]|--(?:eval|print)")
 GLOB_CHARS = frozenset(("*", "?", "["))
 DECIDABLE_NAME = re.compile(r"[A-Za-z0-9._+,:@%#=*?\[\]!^-]*")
 GIT_DISALLOWED_OPTIONS = frozenset(
@@ -74,6 +75,45 @@ GIT_GLOBAL_OPTS_WITH_ARG = frozenset(
         "--work-tree",
         "--namespace",
         "--super-prefix",
+    )
+)
+GIT_DATA_SUBCOMMANDS: frozenset[str] = frozenset(
+    (
+        "add",
+        "am",
+        "apply",
+        "blame",
+        "branch",
+        "cat-file",
+        "checkout",
+        "cherry-pick",
+        "commit",
+        "describe",
+        "diff",
+        "for-each-ref",
+        "format-patch",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-tree",
+        "merge",
+        "merge-base",
+        "mv",
+        "range-diff",
+        "rebase",
+        "reflog",
+        "restore",
+        "rev-list",
+        "rev-parse",
+        "revert",
+        "rm",
+        "shortlog",
+        "show",
+        "stash",
+        "status",
+        "switch",
+        "tag",
+        "worktree",
     )
 )
 WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
@@ -317,8 +357,10 @@ def _find_configure_word(words: list[str]) -> Path | None:
     return None
 
 
-def _update_quote(char: str, quote: str | None) -> str | None:
+def _update_quote(char: str, quote: str | None, allow_quotes: bool = True) -> str | None:
     """Update current quote state when encountering quote delimiters."""
+    if not allow_quotes:
+        return None
     if quote is None and char in ("'", '"'):
         return char
     if quote is not None and char == quote:
@@ -377,6 +419,8 @@ def _record_sub(full_sub: str, inner: str, reps: list[tuple[str, str]], inners: 
 
 def _scan_substitutions(
     command: str,
+    *,
+    literal_quotes: bool = False,
 ) -> tuple[str, list[str], list[tuple[str, str]]] | None:
     """Find command and process substitutions before shlex parsing without recursion."""
     if len(command.encode("utf-8", "surrogatepass")) > MAX_COMMAND:
@@ -416,7 +460,7 @@ def _scan_substitutions(
                 pieces.append(tag)
                 idx = end_idx + 1
                 continue
-        quote = _update_quote(char, quote)
+        quote = _update_quote(char, quote, not literal_quotes)
         pieces.append(char)
         idx += 1
     return "".join(pieces), inners, replacements
@@ -432,25 +476,47 @@ def _restore_tokens(tokens: list[str], replacements: list[tuple[str, str]]) -> l
     return restored
 
 
-def _read_delim(line: str, pos: int, line_len: int) -> tuple[str, int]:
+def _read_delim(line: str, pos: int, line_len: int) -> tuple[str, int, str | None]:
     """Read a heredoc delimiter token starting at the given position."""
     if pos < line_len and line[pos] in ("'", '"'):
         q_char = line[pos]
         pos += 1
         start_q = pos
-        while pos < line_len and line[pos] != q_char:
+        for _ in range(line_len - pos + 1):
+            if pos >= line_len or line[pos] == q_char:
+                break
             pos += 1
         delim = line[start_q:pos]
-        return delim, (pos + 1 if pos < line_len else pos)
+        return delim, (pos + 1 if pos < line_len else pos), q_char
+    quoted: str | None = None
     if pos < line_len and line[pos] == "\\":
+        quoted = "\\"
         pos += 1
     start_d = pos
-    while pos < line_len and line[pos] not in " \t;&|<>()\n\r":
+    for _ in range(line_len - pos + 1):
+        if pos >= line_len or line[pos] in " \t;&|<>()\n\r":
+            break
+        if line[pos] in ("\\", "'", '"'):
+            quoted = "\\"
         pos += 1
-    return line[start_d:pos], pos
+    return line[start_d:pos], pos, quoted
 
 
-def _scan_heredoc_line(line: str, line_len: int) -> tuple[int, int, str, bool] | None:
+def _parse_heredoc_at(line: str, pos: int, line_len: int) -> tuple[int, str, bool, bool] | None:
+    """Parse heredoc marker details starting after << operator."""
+    tab_strip = pos < line_len and line[pos] == "-"
+    pos += 1 if tab_strip else 0
+    for _ in range(line_len - pos):
+        if line[pos] not in " \t":
+            break
+        pos += 1
+    delim, pos, q_delim = _read_delim(line, pos, line_len)
+    if delim:
+        return pos, delim, tab_strip, q_delim is not None
+    return None
+
+
+def _scan_heredoc_line(line: str, line_len: int) -> tuple[int, int, str, bool, bool] | None:
     """Find one heredoc marker and delimiter on a line outside quotes."""
     quote = None
     pos = 0
@@ -466,27 +532,24 @@ def _scan_heredoc_line(line: str, line_len: int) -> tuple[int, int, str, bool] |
                 continue
             elif line[pos : pos + 2] == "<<":
                 start_hd = pos
-                pos += 2
-                tab_strip = pos < line_len and line[pos] == "-"
-                pos += 1 if tab_strip else 0
-                while pos < line_len and line[pos] in " \t":
-                    pos += 1
-                delim, pos = _read_delim(line, pos, line_len)
-                if delim:
-                    return start_hd, pos, delim, tab_strip
+                parsed = _parse_heredoc_at(line, pos + 2, line_len)
+                if parsed is not None:
+                    end_pos, delim, tab_strip, is_quoted = parsed
+                    return start_hd, end_pos, delim, tab_strip, is_quoted
         elif ch == quote:
             quote = None
         pos += 1
     return None
 
 
-def _scan_heredocs(command: str) -> tuple[str, dict[str, str]] | None:
+def _scan_heredocs(command: str) -> tuple[str, dict[str, str], set[str]] | None:
     """Extract heredocs outside quotes and replace declarations with placeholders."""
     if len(command) > MAX_COMMAND:
         return None
     lines = command.splitlines(keepends=True)
     out_lines: list[str] = []
     heredocs: dict[str, str] = {}
+    expanding_tags: set[str] = set()
     idx = 0
     num_lines = len(lines)
     for _ in range(num_lines):
@@ -498,8 +561,10 @@ def _scan_heredocs(command: str) -> tuple[str, dict[str, str]] | None:
         if found_hd is None:
             out_lines.append(line)
             continue
-        start_hd, end_hd, delim, tab_strip = found_hd
+        start_hd, end_hd, delim, tab_strip, is_quoted = found_hd
         tag = f"__RCG_HD_{len(heredocs)}__"
+        if not is_quoted:
+            expanding_tags.add(tag)
         out_lines.append(line[:start_hd] + tag + line[end_hd:])
         body: list[str] = []
         closed = False
@@ -516,12 +581,13 @@ def _scan_heredocs(command: str) -> tuple[str, dict[str, str]] | None:
         if not closed:
             return None
         heredocs[tag] = "".join(body)
-    return "".join(out_lines), heredocs
+    return "".join(out_lines), heredocs, expanding_tags
 
 
-def _scan_herestrings(command: str) -> tuple[str, dict[str, str]]:
+def _scan_herestrings(command: str) -> tuple[str, dict[str, str], list[str]]:
     """Extract here-strings outside quotes and replace with placeholders."""
     herestrings: dict[str, str] = {}
+    hs_to_scan: list[str] = []
     quote = None
     pos = 0
     cmd_len = len(command)
@@ -535,18 +601,22 @@ def _scan_herestrings(command: str) -> tuple[str, dict[str, str]]:
                 quote = ch
             elif command[pos : pos + 3] == "<<<":
                 pos += 3
-                while pos < cmd_len and command[pos] in " \t":
+                for _ in range(cmd_len - pos):
+                    if command[pos] not in " \t":
+                        break
                     pos += 1
-                val, pos = _read_delim(command, pos, cmd_len)
+                val, pos, q_delim = _read_delim(command, pos, cmd_len)
                 tag = f"__RCG_HS_{len(herestrings)}__"
                 herestrings[tag] = val
+                if q_delim != "'":
+                    hs_to_scan.append(val)
                 pieces.append(tag)
                 continue
         elif ch == quote:
             quote = None
         pieces.append(ch)
         pos += 1
-    return "".join(pieces), herestrings
+    return "".join(pieces), herestrings, hs_to_scan
 
 
 def _tokens(command: str) -> list[str] | None:
@@ -807,13 +877,32 @@ def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
     return None, c_seen
 
 
-def _inspect_interpreter(words: list[str], idx: int, stdin_prog: str | None) -> Path | None:
-    """Check interpreter -c/-e inline scripts and stdin programs for configure words."""
+def _inspect_interpreter_flags(words: list[str], idx: int) -> Path | None:
+    """Scan leading interpreter option flags for inline configure code."""
     words_len = len(words)
-    for i in range(idx + 1, min(words_len, idx + 8)):
-        if words[i] in ("-c", "-e") and i + 1 < words_len:
+    bound = min(words_len, idx + 16)
+    i = idx + 1
+    for _ in range(bound - idx):
+        if i >= bound or not words[i].startswith("-"):
+            break
+        w = words[i]
+        if CONFIGURE_WORD.search(w):
+            return Path(w)
+        if INLINE_PROGRAM_FLAG.fullmatch(w) and i + 1 < words_len:
             code = words[i + 1]
-            return Path(code) if CONFIGURE_WORD.search(code) else None
+            if CONFIGURE_WORD.search(code):
+                return Path(code)
+            i += 2
+            continue
+        i += 1
+    return None
+
+
+def _inspect_interpreter(words: list[str], idx: int, stdin_prog: str | None) -> Path | None:
+    """Check interpreter inline scripts and stdin programs for configure words."""
+    blocked = _inspect_interpreter_flags(words, idx)
+    if blocked is not None:
+        return blocked
     if stdin_prog is not None and (
         CONFIGURE_WORD.search(stdin_prog) or CONFIGURE_WORD.search(_flatten(stdin_prog))
     ):
@@ -844,6 +933,8 @@ def _inspect_find(words: list[str], idx: int) -> Path | None:
                 exec_args.append(words[j])
             if not terminated and words_len >= i + 32:
                 return Path("find -exec (argument limit)")
+            if exec_args and os.path.basename(exec_args[0]) in DATA_ONLY_COMMANDS:
+                continue
             if has_conf_name and any("{}" in arg for arg in exec_args):
                 return Path("find -exec configure")
             for k in range(len(exec_args)):
@@ -962,25 +1053,26 @@ def _inspect_shell_or_eval(
     return None, None
 
 
-def _tokenize_command(
-    command: str,
-) -> tuple[list[list[list[str]]], dict[str, str], dict[str, str], list[str]] | None:
-    """Extract heredocs, substitutions, literal assignments, and pipeline tokens."""
-    hd_info = _scan_heredocs(command)
-    if hd_info is None:
-        return None
-    rewritten_hd, heredocs = hd_info
-    rewritten_hs, herestrings = _scan_herestrings(rewritten_hd)
-    stdin_map = {**heredocs, **herestrings}
-    sub_info = _scan_substitutions(rewritten_hs)
-    if sub_info is None:
-        return None
-    rewritten_sub, inners, reps = sub_info
-    raw_tokens = _tokens(rewritten_sub)
-    if raw_tokens is None:
-        return None
-    tokens = _restore_tokens(raw_tokens, reps)
-    assignments = _find_literal_assignments(tokens)
+def _collect_extra_inners(
+    heredocs: dict[str, str], expanding_tags: set[str], hs_to_scan: list[str]
+) -> list[str] | None:
+    """Collect command substitutions from unquoted heredocs and here-strings."""
+    inners: list[str] = []
+    for tag in expanding_tags:
+        body_sub = _scan_substitutions(heredocs[tag], literal_quotes=True)
+        if body_sub is None:
+            return None
+        inners.extend(body_sub[1])
+    for hs_val in hs_to_scan:
+        hs_sub = _scan_substitutions(hs_val, literal_quotes=True)
+        if hs_sub is None:
+            return None
+        inners.extend(hs_sub[1])
+    return inners
+
+
+def _split_pipelines(tokens: list[str]) -> list[list[list[str]]]:
+    """Group tokens separated by control operators into pipelines."""
     pipelines: list[list[list[str]]] = []
     curr_pipeline: list[list[str]] = []
     curr_stage: list[str] = []
@@ -999,7 +1091,33 @@ def _tokenize_command(
                 curr_pipeline = []
             continue
         curr_stage.append(tok)
-    return pipelines, assignments, stdin_map, inners
+    return pipelines
+
+
+def _tokenize_command(
+    command: str,
+) -> tuple[list[list[list[str]]], dict[str, str], dict[str, str], list[str]] | None:
+    """Extract heredocs, substitutions, literal assignments, and pipeline tokens."""
+    hd_info = _scan_heredocs(command)
+    if hd_info is None:
+        return None
+    rewritten_hd, heredocs, expanding_tags = hd_info
+    rewritten_hs, herestrings, hs_to_scan = _scan_herestrings(rewritten_hd)
+    stdin_map = {**heredocs, **herestrings}
+    sub_info = _scan_substitutions(rewritten_hs)
+    if sub_info is None:
+        return None
+    rewritten_sub, inners, reps = sub_info
+    extra_inners = _collect_extra_inners(heredocs, expanding_tags, hs_to_scan)
+    if extra_inners is None:
+        return None
+    inners.extend(extra_inners)
+    raw_tokens = _tokens(rewritten_sub)
+    if raw_tokens is None:
+        return None
+    tokens = _restore_tokens(raw_tokens, reps)
+    assignments = _find_literal_assignments(tokens)
+    return _split_pipelines(tokens), assignments, stdin_map, inners
 
 
 def _inspect_prefix_env(words: list[str]) -> Path | None:
@@ -1056,6 +1174,30 @@ def _inspect_trailing_arguments(
     return None
 
 
+def _git_subcommand(words: list[str], start_idx: int) -> str | None:
+    """Find the first git subcommand token past global options."""
+    idx = start_idx
+    words_len = len(words)
+    bound = min(words_len, start_idx + 32)
+    for _ in range(bound - start_idx):
+        if idx >= bound:
+            break
+        w = words[idx]
+        if w == "--":
+            idx += 1
+            if idx < words_len and not words[idx].startswith("-"):
+                return words[idx]
+            return None
+        if w == "-c" or w in GIT_GLOBAL_OPTS_WITH_ARG:
+            idx += 2
+            continue
+        if w.startswith("-"):
+            idx += 1
+            continue
+        return w
+    return None
+
+
 def _classify_target(
     words: list[str],
     cmd_idx: int,
@@ -1069,11 +1211,15 @@ def _classify_target(
         return Path(cmd_word)
     name = os.path.basename(cmd_word)
     handled, blocked = _inspect_known_dispatch(name, words, cmd_idx, stdin_prog, assignments)
-    if handled:
+    if handled and blocked is not None:
         return blocked
-    if not _is_data_only_command(name):
-        return _inspect_trailing_arguments(words, cmd_idx + 1, assignments)
-    return None
+    if name in DATA_ONLY_COMMANDS or name in ("find", "sed", "rg", "xargs"):
+        return None
+    if name == "git":
+        subcmd = _git_subcommand(words, cmd_idx + 1)
+        if subcmd is not None and subcmd in GIT_DATA_SUBCOMMANDS:
+            return None
+    return _inspect_trailing_arguments(words, cmd_idx + 1, assignments)
 
 
 def _classify_command(

@@ -159,6 +159,58 @@ MUST_ALLOW_R24 = (
     "git bisect run make fate",
     "python3 scripts/ffmpeg_configure.py /src /build",
 )
+MUST_REFUSE_R25 = (
+    "cat <<EOF\n$(./configure)\nEOF",
+    "git commit -F - <<EOF\nmsg `./configure`\nEOF",
+    'cat <<< "$(./configure)"',
+    "cat <<< `./configure`",
+    "cat <<END\n${HOME} $(cd /src && ./configure --prefix=/x)\nEND",
+    "perl -le 'system q(./configure)'",
+    "perl -E 'system q(./configure)'",
+    "perl -pe 'system q(./configure)' /dev/null",
+    "perl -ne 'system q(./configure)' /dev/null",
+    "python3 -Bc \"import os; os.system('./configure')\"",
+    "node -p \"require('child_process').execSync('./configure')\"",
+    "node --eval \"require('child_process').execSync('./configure')\"",
+    "php -r 'system(\"./configure\");'",
+    "git filter-branch --tree-filter ./configure HEAD",
+    "git ls-remote --upload-pack=./configure .",
+    "git difftool --extcmd=./configure",
+    "git config alias.x '!./configure'",
+    "git fetch --upload-pack=./configure origin",
+    "git push --receive-pack=./configure origin",
+    "git send-email --smtp-server=./configure x.patch",
+    "perl ./configure",
+    "git -C . filter-branch --tree-filter './configure --prefix=/x' HEAD",
+    "cat <<-EOF\n\t$(./configure)\n\tEOF",
+)
+MUST_ALLOW_R25 = (
+    "cat <<'EOF'\nuse ` for code\nEOF",
+    "cat <<'EOF'\n$(./configure) is documented\nEOF",
+    'cat <<"EOF"\n`./configure` text\nEOF',
+    "cat <<\\EOF\n$(./configure)\nEOF",
+    "cat <<< '$(./configure)'",
+    "cat <<EOF\nhello $HOME it's fine\nEOF",
+    "git log --grep=configure --oneline",
+    "git diff -- scripts/ffmpeg_configure.py",
+    "git show HEAD:configure",
+    "git status --short",
+    "git add scripts/raw_configure_guard.py",
+    "git commit -m 'fix configure guard'",
+    "git commit -F - <<'EOF'\nfix(hooks): refuse ./configure\nEOF",
+    "git grep -n configure",
+    "git -C /tmp log -- configure",
+    "git rebase -x 'make -j4' HEAD~1",
+    "git bisect run make fate",
+    "git push origin fix/raw-configure-guard",
+    "perl -ne 'print if /TODO/' README.md",
+    "node -p 1+1",
+    "python3 scripts/ffmpeg_configure.py /src /build",
+    "find . -name '*.c' -exec grep -n configure {} \\;",
+    "find . -name configure -print",
+    "sed -n '/configure/p' README.md",
+    "rg -n configure scripts",
+)
 SPEC = importlib.util.spec_from_file_location("raw_configure_guard", GUARD)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Cannot load module from {GUARD}")
@@ -1030,6 +1082,24 @@ class RawConfigureGuardTest(unittest.TestCase):
         temp_dir = self.other
         for client in CLIENTS:
             for command in MUST_ALLOW_R24:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, temp_dir))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_must_refuse_r25(self) -> None:
+        """Refuse execution-capable configure invocations from MUST_REFUSE_R25."""
+        for client in CLIENTS:
+            for command in MUST_REFUSE_R25:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, self.other))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("scripts/ffmpeg_configure.py", result.stderr)
+
+    def test_must_allow_r25(self) -> None:
+        """Allow verified benign agent command shapes from MUST_ALLOW_R25."""
+        temp_dir = self.other
+        for client in CLIENTS:
+            for command in MUST_ALLOW_R25:
                 with self.subTest(client=client, command=command):
                     result = self.run_guard(client, self.payload(client, command, temp_dir))
                     self.assertEqual(result.returncode, 0, result.stderr)
