@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.process_group import kill_process_group  # noqa: E402
+from scripts.process_group import kill_process_tree  # noqa: E402
 
 MAX_SCANNED_ENTRIES = 1000
 MAX_REPORTED_ENTRIES = 20
@@ -70,12 +70,8 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def _kill_command(process: subprocess.Popen[bytes]) -> None:
-    """Terminate command and its descendants where process groups are available."""
-    if os.name == "posix":
-        kill_process_group(process)
-    else:
-        # HISS-21: non-POSIX platforms can terminate only the direct child here.
-        process.kill()
+    """Terminate command and its descendants across supported platforms."""
+    kill_process_tree(process)
 
 
 def _reap_command(cmd: str, process: subprocess.Popen[bytes]) -> None:

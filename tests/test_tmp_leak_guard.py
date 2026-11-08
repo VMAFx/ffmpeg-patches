@@ -8,10 +8,11 @@ import contextlib
 import importlib.util
 import io
 import os
+import socket
 import subprocess  # nosec B404 - test runner subprocess invocation with timeout.
 import sys
 import tempfile
-import time
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -115,28 +116,83 @@ class TmpLeakGuardTest(unittest.TestCase):
         self.assertNotEqual(child_tmp, outer)
         self.assertTrue(child_tmp.is_relative_to(outer))
 
-    def test_timeout_kills_descendants(self) -> None:
-        """Descendant processes in the child process group are terminated on timeout."""
+    def _ready_listener(self) -> tuple[socket.socket, int]:
+        """Bind a listening localhost TCP socket with timeout and cleanup."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10.0)
+        self.addCleanup(listener.close)
+        return listener, int(listener.getsockname()[1])
+
+    @staticmethod
+    def _descendant_code(port: int, stderr_path: Path) -> str:
+        """Return child process code that spawns a grandchild and sleeps."""
         grand = (
-            "import pathlib, tempfile, time; "
-            "tmp = tempfile.gettempdir(); "
-            "time.sleep(2); "
-            "target = pathlib.Path(tmp) / 'late.txt'; "
-            "target.parent.mkdir(parents=True, exist_ok=True); "
-            "target.write_text('late', encoding='utf-8')"
+            "import pathlib, socket, tempfile\n"
+            f"s = socket.create_connection(('127.0.0.1', {port}), timeout=10.0)\n"
+            "s.sendall(b'ready\\n')\n"
+            "s.settimeout(30.0)\n"
+            "for _ in range(100):\n"
+            "    if not s.recv(1024):\n"
+            "        break\n"
+            "target = pathlib.Path(tempfile.gettempdir()) / 'late.txt'\n"
+            "target.write_text('late', encoding='utf-8')\n"
         )
-        code = (
-            f"import subprocess, sys, time; "
-            f"subprocess.Popen([sys.executable, '-c', {grand!r}], start_new_session=False); "
-            f"time.sleep(30)"
+        return (
+            "import subprocess, sys, time\n"
+            f"err = open({str(stderr_path)!r}, 'w', encoding='utf-8')\n"
+            f"subprocess.Popen([sys.executable, '-c', {grand!r}], "
+            "stderr=err, start_new_session=False)\n"
+            "time.sleep(30)\n"
         )
-        proc = self.run_guard(
-            ["--timeout", "1"],
-            [sys.executable, "-I", "-c", code],
-            timeout=15.0,
+
+    def _start_guard(self, code: str) -> subprocess.Popen[bytes]:
+        """Start the leak guard subprocess redirecting TMPDIR to the outer directory."""
+        env = {**os.environ, "TMPDIR": str(self.outer_dir)}
+        guard_cmd = [
+            sys.executable,
+            "-I",
+            str(GUARD),
+            "--timeout",
+            "1",
+            "--",
+            sys.executable,
+            "-I",
+            "-c",
+            code,
+        ]
+        guard_proc = subprocess.Popen(
+            guard_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
         )
-        self.assertEqual(proc.returncode, 124)
-        time.sleep(4)
+        self.addCleanup(guard_proc.kill)
+        return guard_proc
+
+    def test_timeout_kills_descendants(self) -> None:
+        """Descendant processes in the child process tree are terminated on timeout."""
+        listener, port = self._ready_listener()
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        grandchild_stderr = Path(scratch.name) / "grandchild_stderr.log"
+
+        code = self._descendant_code(port, grandchild_stderr)
+        guard_proc = self._start_guard(code)
+
+        conn, _ = listener.accept()
+        self.addCleanup(conn.close)
+        conn.settimeout(10.0)
+        self.assertEqual(conn.recv(1024), b"ready\n")
+
+        self.assertEqual(guard_proc.wait(timeout=15.0), 124)
+
+        conn.settimeout(5.0)
+        self.assertEqual(conn.recv(1024), b"")
+        err_text = grandchild_stderr.read_text(encoding="utf-8", errors="replace")
+        self.assertNotIn("Traceback", err_text)
         self.assertEqual(list(self.outer_dir.iterdir()), [])
 
     def test_nonexistent_executable_fails_with_rc_127(self) -> None:
@@ -185,3 +241,18 @@ class TmpLeakGuardTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("cannot scan", stderr_buf.getvalue())
         self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def test_kill_command_uses_process_tree(self) -> None:
+        """The command termination helper delegates to kill_process_tree."""
+        spec = importlib.util.spec_from_file_location("tmp_leak_guard", GUARD)
+        self.assertIsNotNone(spec)
+        if spec is None or spec.loader is None:
+            self.fail("failed to load tmp_leak_guard spec")
+        guard_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard_mod)
+
+        fake_process = types.SimpleNamespace(pid=4242, kill=unittest.mock.Mock())
+        with unittest.mock.patch.object(guard_mod, "kill_process_tree") as mock_kill:
+            guard_mod._kill_command(fake_process)
+            mock_kill.assert_called_once_with(fake_process)
+            fake_process.kill.assert_not_called()

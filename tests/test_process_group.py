@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import signal
 import subprocess  # nosec B404 - test subprocesses run fixed commands with deadlines.
@@ -13,7 +15,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from scripts.process_group import kill_process_group
+from scripts.process_group import (
+    TASKKILL_TIMEOUT_S,
+    kill_process_group,
+    kill_process_tree,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -64,6 +70,83 @@ class ProcessGroupTest(unittest.TestCase):
             kill_process_group(fake_own)
         mock_killpg.assert_not_called()
         fake_own.kill.assert_called_once_with()
+
+
+class ProcessTreeTest(unittest.TestCase):
+    """Direct verification of platform-specific process-tree termination."""
+
+    def test_kill_process_tree_windows_taskkill_argv(self) -> None:
+        """Windows invokes taskkill with correct arguments and timeout before process kill."""
+        fake_process = SimpleNamespace(pid=4242, kill=Mock())
+        with (
+            patch.object(os, "name", "nt"),
+            patch("subprocess.run") as mock_run,
+        ):
+            kill_process_tree(fake_process)  # type: ignore[arg-type]
+        mock_run.assert_called_once_with(
+            ["taskkill", "/T", "/F", "/PID", "4242"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=TASKKILL_TIMEOUT_S,
+        )
+        fake_process.kill.assert_called_once_with()
+
+    def test_kill_process_tree_windows_fallback_filenotfound(self) -> None:
+        """Missing taskkill falls back to process.kill and emits one stderr warning line."""
+        fake_process = SimpleNamespace(pid=4242, kill=Mock())
+        stderr_buf = io.StringIO()
+        with (
+            patch.object(os, "name", "nt"),
+            patch("subprocess.run", side_effect=FileNotFoundError("taskkill missing")),
+            contextlib.redirect_stderr(stderr_buf),
+        ):
+            kill_process_tree(fake_process)  # type: ignore[arg-type]
+        fake_process.kill.assert_called_once_with()
+        err_output = stderr_buf.getvalue()
+        self.assertIn("falling back to process.kill()", err_output)
+        self.assertEqual(len(err_output.splitlines()), 1)
+
+    def test_kill_process_tree_windows_fallback_timeout(self) -> None:
+        """Taskkill timeout falls back to process.kill and emits one stderr warning line."""
+        fake_process = SimpleNamespace(pid=4242, kill=Mock())
+        stderr_buf = io.StringIO()
+        with (
+            patch.object(os, "name", "nt"),
+            patch(
+                "subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd=["taskkill"], timeout=TASKKILL_TIMEOUT_S),
+            ),
+            contextlib.redirect_stderr(stderr_buf),
+        ):
+            kill_process_tree(fake_process)  # type: ignore[arg-type]
+        fake_process.kill.assert_called_once_with()
+        err_output = stderr_buf.getvalue()
+        self.assertIn("falling back to process.kill()", err_output)
+        self.assertEqual(len(err_output.splitlines()), 1)
+
+    def test_kill_process_tree_windows_pid_matrix_guards(self) -> None:
+        """Invalid PIDs, bools, and root IDs skip taskkill and process kill on Windows."""
+        for bad_pid in (0, 1, True, False, "invalid", None, 3.14):
+            with self.subTest(bad_pid=bad_pid):
+                fake_process = SimpleNamespace(pid=bad_pid, kill=Mock())
+                with (
+                    patch.object(os, "name", "nt"),
+                    patch("subprocess.run") as mock_run,
+                ):
+                    kill_process_tree(fake_process)  # type: ignore[arg-type]
+                mock_run.assert_not_called()
+                fake_process.kill.assert_not_called()
+
+    def test_kill_process_tree_posix_delegates_to_kill_process_group(self) -> None:
+        """POSIX platforms delegate process tree termination to kill_process_group."""
+        fake_process = SimpleNamespace(pid=4242, kill=Mock())
+        with (
+            patch.object(os, "name", "posix"),
+            patch("scripts.process_group.kill_process_group") as mock_killpg,
+        ):
+            kill_process_tree(fake_process)  # type: ignore[arg-type]
+        mock_killpg.assert_called_once_with(fake_process)
 
 
 class IsolatedScriptExecutionTest(unittest.TestCase):

@@ -35,7 +35,7 @@ docstrings:
 # rule finding fails the local gate before CI.
 semgrep:
 	@if ! command -v $(SEMGREP) >/dev/null 2>&1; then \
-		echo "semgrep: not installed; the scanners workflow runs semgrep 1.178.0 (.github/workflows/scanners.yml); install it, for example pipx install semgrep==1.178.0" >&2; \
+		echo "semgrep: not installed; the scanners workflow runs semgrep 1.178.0 (.github/workflows/scanners.yml); install it, for example pipx install --python python3.14 semgrep==1.178.0" >&2; \
 		exit 1; \
 	fi
 	@$(SEMGREP) --version
