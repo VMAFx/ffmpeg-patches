@@ -1301,6 +1301,73 @@ class MasterFormTest(SeriesTestCase):
             self.apply()
         self.assert_clean()
 
+    def test_multi_patch_pr_unsubmitted_earlier_patch_is_not_a_part(self) -> None:
+        """Verify unsubmitted earlier patch sharing a pull request link is not a part."""
+        self.setup_multi_patch_pr(2)
+        sidecar = (self.fx.root / "patches" / self.fx.names[0]).with_suffix(".toml")
+        sidecar.write_text(
+            sidecar.read_text(encoding="utf-8").replace(
+                'status = "submitted"', 'status = "unsubmitted"'
+            ),
+            encoding="utf-8",
+        )
+        findings = series.Findings()
+        self.assertEqual(series.master_form_parts(self.fx.root, self.fx.names, findings), {})
+        self.assertEqual(findings.errors, [])
+
+    def test_multi_patch_pr_non_string_status_is_a_finding(self) -> None:
+        """Verify non-string status is recorded as an error finding."""
+        self.setup_multi_patch_pr(2)
+        sidecar = (self.fx.root / "patches" / self.fx.names[0]).with_suffix(".toml")
+        sidecar.write_text(
+            sidecar.read_text(encoding="utf-8").replace(
+                'status = "submitted"', 'status = ["submitted"]'
+            ),
+            encoding="utf-8",
+        )
+        findings = series.Findings()
+        self.assertEqual(series.master_form_parts(self.fx.root, self.fx.names, findings), {})
+        self.assertEqual(len(findings.errors), 1)
+        self.assertIn(self.fx.names[0], findings.errors[0])
+        self.assertIn("status must be a string", findings.errors[0])
+        self.assertNotIn(
+            self.fx.names[0],
+            series.patch_links(self.fx.root, self.fx.names, series.Findings()),
+        )
+
+    def test_multi_patch_pr_merged_or_rejected_earlier_patch_is_a_part(self) -> None:
+        """Verify earlier patches marked merged or rejected join master form parts."""
+        for status in ("merged", "rejected"):
+            with self.subTest(status=status):
+                self.setup_multi_patch_pr(2)
+                sidecar = (self.fx.root / "patches" / self.fx.names[0]).with_suffix(".toml")
+                sidecar.write_text(
+                    sidecar.read_text(encoding="utf-8").replace(
+                        'status = "submitted"', f'status = "{status}"'
+                    ),
+                    encoding="utf-8",
+                )
+                findings = series.Findings()
+                self.assertEqual(
+                    series.master_form_parts(self.fx.root, self.fx.names, findings),
+                    {self.fx.names[0]: self.fx.names[1]},
+                )
+                self.assertEqual(findings.errors, [])
+
+    def test_multi_patch_pr_non_https_link_is_not_a_part(self) -> None:
+        """Verify earlier patch with non-https upstream link is excluded from parts."""
+        self.setup_multi_patch_pr(2)
+        sidecar = (self.fx.root / "patches" / self.fx.names[0]).with_suffix(".toml")
+        sidecar.write_text(
+            sidecar.read_text(encoding="utf-8").replace(
+                'upstream = "https://', 'upstream = "http://'
+            ),
+            encoding="utf-8",
+        )
+        findings = series.Findings()
+        self.assertEqual(series.master_form_parts(self.fx.root, self.fx.names, findings), {})
+        self.assertEqual(findings.errors, [])
+
 
 class MainTest(SeriesTestCase):
     def test_tool_error_exits_two(self) -> None:
