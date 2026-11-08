@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from scripts import filter_lib_deps
