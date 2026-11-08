@@ -255,7 +255,10 @@ class Stub:
 
         page = int(query.get("page", ["1"])[0])
         limit = self.page_limit(query)
-        return self.comments.get(number, [])[(page - 1) * limit : page * limit]
+        rows = self.comments.get(number, [])
+        if len(rows) > 1000:
+            return rows if page == 1 else []
+        return rows[(page - 1) * limit : page * limit]
 
     def page_limit(self, query: dict[str, list[str]]) -> int:
         """Cap the requested page size at the configured server maximum."""
@@ -2401,6 +2404,7 @@ class SweepTest(ForgejoTest):
         """New prepositions and next-revision nouns require promise rows."""
 
         for sentence in (
+            "I\u2019ll fold it into the next push.",
             "I'll fold it into the next push.",
             "I will fix that in my next revision.",
             "I will fix it for the next version.",
@@ -2475,6 +2479,36 @@ class SweepTest(ForgejoTest):
         )
         self.assert_promise_refused(stub, None, "81815")
         self.assertTrue(any("page=2" in path for _, path, _ in stub.requests))
+
+    def test_push_refuses_more_than_1000_comments(self) -> None:
+        """More than 1000 issue comments refuse the push before inspecting promises."""
+
+        stub = self.promise_stub(comment="No promise here.")
+        stub.comments[25619] = [
+            {
+                "id": 10000 + n,
+                "user": {"login": "tester"},
+                "body": "No promise here.",
+            }
+            for n in range(1000)
+        ]
+        stub.comments[25619].append(
+            {
+                "id": 11001,
+                "user": {"login": "tester"},
+                "body": "I will qualify the close errors in the commit message with the next push.",
+                "html_url": "https://example.invalid/comments/11001",
+            }
+        )
+        self.assert_promise_refused(stub, None, "too many issue comments")
+
+    def test_push_fragment_match_collapses_whitespace_in_pr_body(self) -> None:
+        """Collapsing whitespace runs in the PR body satisfies a promise fragment."""
+
+        stub = self.promise_stub(body="qualify\r\n  the close\terrors")
+        result = self.promise_push(stub, self.promise_file())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
 
     def test_push_fragment_length_boundary_and_contraction(self) -> None:
         """Seven non-space characters fail; eight satisfy an I'll promise."""

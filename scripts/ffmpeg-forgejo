@@ -11,7 +11,7 @@
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
 #   ffmpeg-forgejo push    --sweep <file> [--promises <file>] [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#                          --promises maps own next-push comment IDs to literal fragments in commit messages or PR body;
+#                          --promises maps own next-push comment IDs to literal fragments, compared after collapsing whitespace runs to one space, in commit messages or PR body;
 #                          missing or unfulfilled promises exit 79 before Git push
 #   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
@@ -726,7 +726,7 @@ import stat
 import subprocess
 import sys
 
-PATTERN = re.compile(r"\bI(?: will|'ll)\b[^.!?\n]{0,300}?\b(?:with|in|into|on|for) (?:the|my) next (?:push|revision|version|iteration|round)\b", re.I)
+PATTERN = re.compile(r"\bI(?: will|['\u2019]ll)\b[^.!?\n]{0,300}?\b(?:with|in|into|on|for) (?:the|my) next (?:push|revision|version|iteration|round)\b", re.I)
 
 
 def refuse(message: str) -> None:
@@ -741,8 +741,10 @@ promise_python_comments() {
   cat <<'PY'
 def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
     """Find the first next-push promise sentence in each own comment."""
+    if len(comments) > 1000:
+        refuse("too many issue comments")
     found = {}
-    for row in comments[:1000]:
+    for row in comments:
         if not isinstance(row, dict) or not isinstance(row.get("user"), dict):
             refuse("malformed issue comment")
         if row["user"].get("login") != me:
@@ -762,8 +764,6 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
         if isinstance(ident, bool) or not isinstance(ident, int) or ident < 1 or not isinstance(url, str):
             refuse("malformed own promise comment")
         found[ident] = (url, sentence)
-    if len(comments) > 1000:
-        refuse("too many issue comments")
     return found
 PY
 }
@@ -772,7 +772,7 @@ PY
 promise_python_file() {
   cat <<'PY'
 def read_rows(path: str) -> dict[int, str]:
-    """Read bounded UTF-8 comment ID and literal fragment rows."""
+    """Read bounded UTF-8 comment ID and whitespace-normalized fragment rows."""
     try:
         if not stat.S_ISREG(os.stat(path).st_mode):
             refuse(f"{path}: not a regular file")
@@ -807,7 +807,7 @@ PY
 promise_python_git() {
   cat <<'PY'
 def messages(base: str, swept: str) -> list[str]:
-    """Read separate commit messages after checking the local merge base."""
+    """Read separate whitespace-normalized commit messages after checking the local merge base."""
     if not isinstance(base, str) or re.fullmatch(r"[0-9a-fA-F]{40,64}", base) is None:
         refuse("PR merge_base is not a local commit")
     try:
@@ -826,7 +826,7 @@ PY
 promise_python_main() {
   cat <<'PY'
 def main() -> None:
-    """Validate all own promises against literal evidence in the pushed revision."""
+    """Validate all own promises against whitespace-normalized evidence in the pushed revision."""
     path, me, swept, number = sys.argv[1:]
     pulls, comments = json.loads(sys.stdin.readline()), json.loads(sys.stdin.readline())
     pull = next(row for row in pulls if row.get("number") == int(number))
