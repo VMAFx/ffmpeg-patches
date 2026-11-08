@@ -10,7 +10,10 @@
         checkout TREE and print one status per patch. With --master-forms,
         fetch recorded upstream PR forms from URL, recognise recorded
         upstream commits already in the tested master's history and skip
-        patches marked release_only.
+        patches marked release_only. A pull request that carries several
+        patches records its master_form on the last of them; the earlier
+        ones report in-master-form and are included only if that form
+        applies.
     series.py export TREE
         Regenerate patches/ and series.txt from the commits on TREE after
         the pinned base commit.
@@ -721,6 +724,44 @@ def patch_links(root: Path, names: list[str], findings: Findings) -> dict[str, t
     return links
 
 
+def _check_group_master_form(
+    url: str, items: list[tuple[str, bool]], findings: Findings, parts: dict[str, str]
+) -> None:
+    """Validate one multi-patch pull request group and record earlier parts."""
+    with_form = [name for name, has_form in items if has_form]
+    if not with_form:
+        return
+    if len(with_form) > 1:
+        findings.error(url, f"master_form on more than one patch: {', '.join(with_form)}")
+    elif with_form[0] != items[-1][0]:
+        findings.error(
+            with_form[0], f"master_form must be on the last patch of {url}, {items[-1][0]}"
+        )
+    else:
+        for name, _ in items[:-1]:
+            parts[name] = with_form[0]
+
+
+def master_form_parts(root: Path, names: list[str], findings: Findings) -> dict[str, str]:
+    """Map earlier patches of a pull request to the patch carrying its master form."""
+    patches = root / "patches"
+    groups: dict[str, list[tuple[str, bool]]] = {}
+    for name in names:
+        sidecar = (patches / name).with_suffix(".toml")
+        try:
+            data = tomllib.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            continue
+        link = str(data.get("upstream", ""))
+        if link.startswith("https://"):
+            groups.setdefault(link, []).append((name, "master_form" in data))
+    parts: dict[str, str] = {}
+    for url, items in groups.items():
+        if len(items) >= 2:
+            _check_group_master_form(url, items, findings, parts)
+    return parts
+
+
 def contribution_patches(entry: dict) -> list[str]:
     """Patch names separated by comma and space; an empty string names none."""
     return entry["patch"].split(", ") if entry["patch"] else []
@@ -840,6 +881,7 @@ def contributions(root: Path, write: bool) -> int:
 
 
 def check(root: Path, today: date | None = None) -> Findings:
+    """Lint base.env, series.txt, patches/*.patch and their metadata."""
     findings = Findings()
     read_base(root, findings)
     names = read_series(root, findings)
@@ -848,6 +890,7 @@ def check(root: Path, today: date | None = None) -> Findings:
     check_tree(root, names, findings, today=today)
     check_upstream_credits(root, names, findings)
     check_contributions(root, names, findings)
+    master_form_parts(root, names, findings)
     return findings
 
 
@@ -999,12 +1042,24 @@ def apply_for_master(tree: Path, patch: Path, url: str) -> str:
     return apply_one(tree, patch)
 
 
+def apply_master_part(patch: Path) -> str:
+    """Validate metadata of an earlier patch covered by a later master form."""
+    meta = note_metadata(patch)
+    findings = Findings()
+    check_master_metadata(meta, patch.name, findings)
+    if findings.errors:
+        raise SeriesError("\n".join(findings.errors))
+    return "in-master-form"
+
+
 def apply_series(
     root: Path, tree: Path, expect_base: bool, keep_going: bool, master_forms: str | None = None
 ) -> Results:
+    """Apply the patch series onto TREE, optionally using master forms."""
     findings = Findings()
     base = read_base(root, findings)
     names = read_series(root, findings)
+    parts = master_form_parts(root, names, findings) if master_forms is not None else {}
     if findings.errors:
         raise SeriesError("\n".join(findings.errors))
     require_clean(tree, base, expect_base)
@@ -1015,11 +1070,12 @@ def apply_series(
             results.append((name, "not-tried"))
             continue
         patch = root / "patches" / name
-        status = (
-            apply_for_master(tree, patch, master_forms)
-            if master_forms is not None
-            else apply_one(tree, patch)
-        )
+        if name in parts:
+            status = apply_master_part(patch)
+        elif master_forms is not None:
+            status = apply_for_master(tree, patch, master_forms)
+        else:
+            status = apply_one(tree, patch)
         results.append((name, status))
         stopped = status == "conflict" and not keep_going
     return results
