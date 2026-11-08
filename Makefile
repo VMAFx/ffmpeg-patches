@@ -50,8 +50,9 @@ build:
 	@python3 scripts/series.py check
 
 # The temporary leak guard fails a run that leaves files in its temporary directory.
+# Unit tests ignore the host git configuration, as on CI, so a test that needs a git identity fails locally too.
 test: build lint
-	@python3 scripts/tmp_leak_guard.py -- python3 -m unittest discover -s tests
+	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 python3 scripts/tmp_leak_guard.py -- python3 -m unittest discover -s tests
 
 lint: lint-mutable-defaults
 	@ruff check scripts tests

@@ -2307,20 +2307,19 @@ class OverlapVerbTest(ForgejoTest):
         mak.parent.mkdir(parents=True, exist_ok=True)
         mak.write_text("fate base\n", encoding="utf-8")
         git(self.repo, "add", "tests/fate/filter-video.mak")
-        commit = [
+        identity = [
             "-c",
             "user.name=Test",
             "-c",
             "user.email=test@example.invalid",
             "-c",
             "commit.gpgSign=false",
-            "commit",
-            "-qm",
         ]
+        commit = [*identity, "commit", "-qm"]
         git(self.repo, *commit, "fate base")
         git(self.repo, "push", "-q", str(self.upstream), "master")
         git(self.repo, "checkout", "-q", "topic")
-        git(self.repo, "rebase", "-q", "master")
+        git(self.repo, *identity, "rebase", "-q", "master")
         mak.write_text("fate topic\n", encoding="utf-8")
         git(self.repo, "add", "tests/fate/filter-video.mak")
         git(self.repo, *commit, "fate topic")
