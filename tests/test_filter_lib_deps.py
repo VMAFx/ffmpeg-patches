@@ -587,16 +587,23 @@ class FilterLibDepsTest(unittest.TestCase):
 
     @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "needs /proc/self/fd")
     def test_read_regular_closes_descriptor_when_open_fails(self) -> None:
-        """Closing descriptor is guaranteed when the builtin open raises."""
-        target = self.tree / "four_bytes.bin"
-        target.write_bytes(b"1234")
+        """The descriptor is closed when open fails after acquiring it."""
+        target = self.tree
+        opened: list[int] = []
+        real_os_open = os.open
+
+        def track_open(path, flags, *args):
+            """Call real os.open and record the acquired descriptor."""
+            descriptor = real_os_open(path, flags, *args)
+            opened.append(descriptor)
+            return descriptor
+
         count_before = len(list(Path("/proc/self/fd").iterdir()))
-        with unittest.mock.patch.object(
-            filter_lib_deps, "open", side_effect=OSError("planted"), create=True
-        ):
+        with unittest.mock.patch.object(filter_lib_deps.os, "open", side_effect=track_open):
             with self.assertRaises(filter_lib_deps.InputError) as context:
                 filter_lib_deps._read_regular(target, 10, "file")
             self.assertIn("cannot read", str(context.exception))
+        self.assertEqual(len(opened), 1)
         count_after = len(list(Path("/proc/self/fd").iterdir()))
         self.assertEqual(count_before, count_after)
 
