@@ -22,6 +22,36 @@ CONFIGS = {
     "codex": (ROOT / ".codex/hooks.json", "PreToolUse", "Bash", 15),
     "gemini": (ROOT / ".gemini/settings.json", "BeforeTool", "run_shell_command", 15000),
 }
+PROBE_GAP_SHAPES = (
+    "command -p cd $R/tree; ./configure",
+    "command -- cd $R/tree; ./configure",
+    "builtin -- cd $R/tree; ./configure",
+    "function f { cd $R/tree; }; f; ./configure",
+    "time -p -- cd $R/tree; ./configure",
+    "CDPATH=$R cd tree; ./configure",
+    "shopt -s expand_aliases; alias c=cd\nc $R/tree; ./configure",
+    "export CDPATH=$R; cd tree; ./configure",
+    "CDPATH=$R; cd tree; ./configure",
+    "pushd $R/tree; pushd /tmp; pushd +1; ./configure",
+    "source $R/s.sh; ./configure",
+    ". $R/s.sh; ./configure",
+    "command -p . $R/s.sh; ./configure",
+    "BASH_ENV=$R/s.sh bash -c ./configure",
+    "env -C $R/tree ./configure",
+    "env --chdir=$R/tree ./configure",
+    "cd $R/tree; ~+/configure",
+    "false && cd /tmp; ./configure",
+    "if false; then cd /tmp; fi; ./configure",
+    "true || cd /tmp; ./configure",
+    "while false; do cd /tmp; done; ./configure",
+    "pushd /tmp; pushd +1; ./configure",
+    "[ -d /nope ] && cd /tmp; ./configure",
+    "f() { cd /tmp; }; ./configure",
+    "cd() { :; }; cd /tmp; ./configure",
+    "enable -n cd; cd /tmp; ./configure",
+    "shopt -s expand_aliases\nalias cd=:\ncd /tmp; ./configure",
+    "for i in; do cd /tmp; done; ./configure",
+)
 SPEC = importlib.util.spec_from_file_location("raw_configure_guard", GUARD)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Cannot load module from {GUARD}")
@@ -90,6 +120,41 @@ class RawConfigureGuardTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("configure", result.stderr)
                     self.assertIn(remedy, result.stderr)
+                    self.assertFalse(self.marker.exists())
+
+    def test_refuses_all_probe_gap_shapes(self) -> None:
+        """Refuse all 28 probe gap shapes from non-tree directories."""
+        (self.root / "s.sh").write_text(f"cd {self.tree}\n", encoding="utf-8")
+        cases = tuple((cmd.replace("$R", str(self.root)), self.other) for cmd in PROBE_GAP_SHAPES)
+        self._assert_refused(cases)
+
+    def test_refuses_configure_in_non_tree_directory(self) -> None:
+        """Refuse direct configure invocations in directories without libavcodec."""
+        cases = (
+            ("./configure --prefix=/x", self.other),
+            ("sh configure", self.other),
+        )
+        self._assert_refused(cases)
+
+    def test_allows_documented_ffmpeg_configure_pass(self) -> None:
+        """Allow scripts/ffmpeg_configure.py from both tree and non-tree directories."""
+        cases = (
+            (
+                f"python3 scripts/ffmpeg_configure.py {self.tree} {self.build} -- --prefix=/x",
+                self.tree,
+            ),
+            (
+                f"python3 scripts/ffmpeg_configure.py {self.tree} {self.build} -- --prefix=/x",
+                self.other,
+            ),
+            (f"python3 {ROOT}/scripts/ffmpeg_configure.py --keep CPPFLAGS a b -- x", self.tree),
+            (f"python3 {ROOT}/scripts/ffmpeg_configure.py --keep CPPFLAGS a b -- x", self.other),
+        )
+        for client in CLIENTS:
+            for command, cwd in cases:
+                with self.subTest(client=client, command=command, cwd=cwd):
+                    result = self.run_guard(client, self.payload(client, command, cwd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(self.marker.exists())
 
     def test_refuses_wrapper_and_relocation_forms(self) -> None:
@@ -195,25 +260,6 @@ class RawConfigureGuardTest(unittest.TestCase):
         cdpath_cases = (("cd tree; ./configure", self.other),)
         self._assert_refused(cdpath_cases, env={**os.environ, "CDPATH": str(self.root)})
 
-    def test_allows_background_symlink_and_cdpath_forms(self) -> None:
-        """Allow background lists, symlink destinations, and CDPATH ignores."""
-        symlink = self.tree / "l"
-        if not symlink.exists():
-            symlink.symlink_to(self.other)
-        cases = (
-            (f"cd {self.other}; ./configure", self.tree, None),
-            (f"(cd {self.other} && ./configure)", self.tree, None),
-            (f"cd {self.other} && ./configure &", self.tree, None),
-            ("cd l; ./configure", self.tree, None),
-            (f"cd {self.other}; ./configure", self.tree, {**os.environ, "CDPATH": str(self.root)}),
-        )
-        for client in CLIENTS:
-            for command, cwd, env in cases:
-                with self.subTest(client=client, command=command):
-                    result = self.run_guard(client, self.payload(client, command, cwd), env=env)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertFalse(self.marker.exists())
-
     def test_refuses_redirect_ampersand_forms(self) -> None:
         """Refuse configure runs where cd or configure contains redirect ampersands."""
         cases = (
@@ -237,19 +283,6 @@ class RawConfigureGuardTest(unittest.TestCase):
         self.addCleanup(lambda: noexec.chmod(0o700) if noexec.exists() else None)
         self._assert_refused(((f"cd {noexec}; ./configure", self.tree),))
 
-    def test_allows_redirect_cd_forms(self) -> None:
-        """Allow safe cd into unrelated directory with redirect operators."""
-        cases = (
-            (f"cd {self.other} 2>&1; ./configure", self.tree),
-            (f"cd {self.other} >&2 && ./configure", self.tree),
-        )
-        for client in CLIENTS:
-            for command, cwd in cases:
-                with self.subTest(client=client, command=command):
-                    result = self.run_guard(client, self.payload(client, command, cwd))
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertFalse(self.marker.exists())
-
     def test_refuses_digit_directory_redirect_ambiguities(self) -> None:
         """Refuse digit directory cd redirect ambiguities while keeping valid targets allowed."""
         digit_tree = self.root / "2"
@@ -266,16 +299,6 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("pushd 2 >&1; ./configure", self.root),
         )
         self._assert_refused(refuse_cases)
-        allow_cases = (
-            (f"cd {self.other} >&2 && ./configure", self.tree),
-            (f"cd {self.other} 2>&1; ./configure", self.tree),
-        )
-        for client in CLIENTS:
-            for command, cwd in allow_cases:
-                with self.subTest(client=client, command=command):
-                    result = self.run_guard(client, self.payload(client, command, cwd))
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertFalse(self.marker.exists())
 
     def test_allows_unrelated_commands(self) -> None:
         """Keep wrapper use, inspection, other trees, and ordinary builds available."""
@@ -290,15 +313,15 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("cat configure", self.tree),
             ("grep -n foo configure", self.tree),
             ("git diff -- configure", self.tree),
-            ("./configure", self.other),
             ("make -j4", self.tree),
             ("head -50 configure", self.tree),
             ("git log -- configure", self.tree),
             (f"ls {self.tree}/configure", self.root),
             ('cd "$X" && make -j4', self.tree),
             (f"python3 -I scripts/ffmpeg_configure.py {self.tree} {self.build}", self.root),
-            ("sudo ./configure", self.other),
             ("echo hello", self.tree),
+            ("echo configure", self.tree),
+            ("echo configure", self.other),
             (f"bash -c 'cd {self.tree} && make'", self.root),
             ("git diff configure", self.tree),
             ("git add configure", self.tree),
@@ -306,8 +329,6 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("tail -f config.log", self.tree),
             ("grep -n foo configure | head -5", self.tree),
             ("git status", self.tree),
-            (f"(cd {self.other} && ./configure)", self.tree),
-            (f"cd {self.other} && ./configure", self.tree),
             ("env bash -c 'echo hi'", self.root),
             ("bash -o pipefail -c 'ls'", self.root),
             ("bash script.sh", self.other),
@@ -517,29 +538,19 @@ class RawConfigureGuardTest(unittest.TestCase):
             with self.subTest(words=words):
                 self.assertEqual(GUARD_MOD._command_start(words), expected)
 
-    def test_step_helper(self) -> None:
-        """Verify _step tracks directories and detects configure invocations."""
-        pending: list[tuple[str, Path | None, int]] = []
-        blocked, new_cwd = GUARD_MOD._step(["cd", str(self.tree)], self.root, 0, pending)
-        self.assertIsNone(blocked)
-        self.assertEqual(new_cwd, self.tree)
-        blocked, _ = GUARD_MOD._step(["./configure"], new_cwd, 0, pending)
-        self.assertIsNotNone(blocked)
-
-        blocked, other_cwd = GUARD_MOD._step(["cd", str(self.other)], self.root, 0, pending)
-        self.assertIsNone(blocked)
-        self.assertEqual(other_cwd, self.other)
-        blocked, _ = GUARD_MOD._step(["./configure"], other_cwd, 0, pending)
-        self.assertIsNone(blocked)
-
-        blocked, eval_cwd = GUARD_MOD._step(["eval", "cd", str(self.tree)], self.root, 0, pending)
-        self.assertIsNone(blocked)
-        self.assertIsNone(eval_cwd)
-        blocked, time_cwd = GUARD_MOD._step(
-            ["time", "-p", "cd", str(self.tree)], self.root, 0, pending
-        )
-        self.assertIsNone(blocked)
-        self.assertEqual(time_cwd, self.tree)
+    def test_is_configure_word_helper(self) -> None:
+        """Verify _is_configure_word distinguishes configure and benign names."""
+        self.assertTrue(GUARD_MOD._is_configure_word("./configure"))
+        self.assertTrue(GUARD_MOD._is_configure_word("configure"))
+        self.assertTrue(GUARD_MOD._is_configure_word("~+/configure"))
+        self.assertTrue(GUARD_MOD._is_configure_word("$PWD/configure"))
+        self.assertTrue(GUARD_MOD._is_configure_word("./conf*"))
+        self.assertTrue(GUARD_MOD._is_configure_word("./co{n,}figure"))
+        self.assertTrue(GUARD_MOD._is_configure_word("$f"))
+        self.assertFalse(GUARD_MOD._is_configure_word("make"))
+        self.assertFalse(GUARD_MOD._is_configure_word("ls"))
+        self.assertFalse(GUARD_MOD._is_configure_word("$HOME/bin/tool"))
+        self.assertFalse(GUARD_MOD._is_configure_word("scripts/ffmpeg_configure.py"))
 
     def test_refuses_wrapped_shell_and_option_forms(self) -> None:
         """Refuse shell invocations behind wrappers and with complex options."""
@@ -585,10 +596,7 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("./conf$eigure", self.tree),
         )
         self._assert_refused(refuse_cases)
-        allow_cases = (
-            ("./conf$eigure", self.root),
-            ("echo conf${e}igure", self.tree),
-        )
+        allow_cases = (("echo conf${e}igure", self.tree),)
         for client in CLIENTS:
             for command, cwd in allow_cases:
                 with self.subTest(client=client, command=command):
@@ -607,11 +615,9 @@ class RawConfigureGuardTest(unittest.TestCase):
         )
         self._assert_refused(refuse_cases)
         allow_cases = (
-            ("./conf$eigure", self.root),
             ("echo co$'n'figure", self.tree),
             ("echo $PATH", self.tree),
             ("$HOME/bin/tool", self.tree),
-            ("tools/$X", self.tree),
             ("ls $PWD", self.tree),
         )
         for client in CLIENTS:
@@ -637,9 +643,7 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("cp ./a.txt ./b.txt", self.tree),
             ("echo {a,b}", self.tree),
             ("ls libavcodec/{a,b}.c", self.tree),
-            ("./co{n,}figure", self.root),
             ("$HOME/bin/tool", self.tree),
-            ("tools/$X", self.tree),
             ("ls $PWD", self.tree),
         )
         for client in CLIENTS:
@@ -762,8 +766,6 @@ class RawConfigureGuardTest(unittest.TestCase):
             ("echo $(pwd)/x", self.tree),
             ("sh ./tools/x.sh", self.tree),
             ("cat $(pwd)/README", self.tree),
-            ("$(pwd)/configure", self.other),
-            ("sh co{n,}figure", self.other),
             ("git commit -F - <<'EOF'\nfix: refuse scripts/a.py\nEOF", self.other),
             ("git commit -F /tmp/msg.txt", self.other),
             ("gh pr create --body-file /tmp/body.md --title x", self.other),
