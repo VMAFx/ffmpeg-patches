@@ -18,3 +18,4 @@ required:
 # the host runs them.
 credential_stub_tests:
   - "tests.test_ffmpeg_forgejo"
+  - "tests.test_fairy_request_check"

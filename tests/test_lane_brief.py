@@ -62,14 +62,51 @@ def process_alive(pid: int) -> bool:
     return state not in {"Z", "X"}
 
 
-def credential_stub_gaps(tests_dir: Path, declared: list[str]) -> tuple[list[str], list[str]]:
-    """Return undeclared tests referencing the secret tool and stale declared entries."""
+def _stems_from_import(node: ast.Import) -> set[str]:
+    """Collect test module stems from an ast.Import node."""
+    stems: set[str] = set()
+    for alias in node.names[:100]:
+        parts = alias.name.split(".")
+        if len(parts) >= 2 and parts[0] == "tests":
+            stems.add(parts[1])
+    return stems
+
+
+def _stems_from_import_from(node: ast.ImportFrom) -> set[str]:
+    """Collect test module stems from an ast.ImportFrom node."""
+    stems: set[str] = set()
+    if node.module == "tests":
+        for alias in node.names[:100]:
+            stems.add(alias.name)
+        return stems
+    if node.module and node.module.startswith("tests."):
+        parts = node.module.split(".")
+        if len(parts) >= 2 and parts[0] == "tests":
+            stems.add(parts[1])
+    return stems
+
+
+def _extract_imported_stems(tree: ast.AST) -> set[str]:
+    """Extract test module stems imported by recognized forms in an AST."""
+    stems: set[str] = set()
+    for idx, node in enumerate(ast.walk(tree)):
+        if idx >= 50000:
+            break
+        if isinstance(node, ast.Import):
+            stems.update(_stems_from_import(node))
+        elif isinstance(node, ast.ImportFrom):
+            stems.update(_stems_from_import_from(node))
+    return stems
+
+
+def _resolve_reach_set(candidate_files: list[Path]) -> set[str]:
+    """Compute the set of test stems that reach the stub helper directly or via imports."""
     target = "secret" + "-tool"
-    max_files = 500
     max_bytes = 1024 * 1024
-    candidate_files = sorted(tests_dir.glob("test_*.py"))[:max_files]
-    undeclared: list[str] = []
-    for test_file in candidate_files:
+    reaching: set[str] = set()
+    imports_map: dict[str, set[str]] = {}
+
+    for test_file in candidate_files[:500]:
         if not test_file.is_file():
             continue
         try:
@@ -77,8 +114,41 @@ def credential_stub_gaps(tests_dir: Path, declared: list[str]) -> tuple[list[str
                 raw = handle.read(max_bytes)
             text = raw.decode("utf-8", errors="replace")
         except OSError:
+            reaching.add(test_file.stem)
             continue
+
         if target in text:
+            reaching.add(test_file.stem)
+
+        try:
+            tree = ast.parse(text, filename=test_file.name)
+        except Exception:
+            reaching.add(test_file.stem)
+            continue
+
+        imports_map[test_file.stem] = _extract_imported_stems(tree)
+
+    max_passes = len(candidate_files) + 1
+    for _ in range(max_passes):
+        added = False
+        for stem, imported_stems in list(imports_map.items())[: len(candidate_files)]:
+            if stem not in reaching and not imported_stems.isdisjoint(reaching):
+                reaching.add(stem)
+                added = True
+        if not added:
+            break
+
+    return reaching
+
+
+def credential_stub_gaps(tests_dir: Path, declared: list[str]) -> tuple[list[str], list[str]]:
+    """Return undeclared tests reaching the secret tool and stale declared entries."""
+    max_files = 500
+    candidate_files = sorted(tests_dir.glob("test_*.py"))[:max_files]
+    reaching = _resolve_reach_set(candidate_files)
+    undeclared: list[str] = []
+    for test_file in candidate_files[:max_files]:
+        if test_file.stem in reaching:
             dotted = f"tests.{test_file.stem}"
             if dotted not in declared and f"tests/{test_file.name}" not in declared:
                 undeclared.append(dotted)
@@ -830,6 +900,73 @@ class CredentialStubGapsTest(unittest.TestCase):
             (tests_dir / "test_space.py").write_text('val = "secret tool"\n', encoding="utf-8")
             (tests_dir / "helper.py").write_text(f"val = '{target}'\n", encoding="utf-8")
             self.assertEqual(credential_stub_gaps(tests_dir, []), ([], []))
+
+    def test_credential_stub_gaps_import_reach_chain(self) -> None:
+        """Report all test modules reaching the secret tool via aliases and chained imports."""
+        target = "secret" + "-tool"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tests_dir = Path(tmp_dir)
+            (tests_dir / "test_planted.py").write_text(f"dummy = '{target}'\n", encoding="utf-8")
+            (tests_dir / "test_alias.py").write_text(
+                "from tests import test_planted as p\n", encoding="utf-8"
+            )
+            (tests_dir / "test_dotted.py").write_text(
+                "import tests.test_planted\n", encoding="utf-8"
+            )
+            (tests_dir / "test_from.py").write_text(
+                "from tests.test_planted import Base\n", encoding="utf-8"
+            )
+            (tests_dir / "test_chain.py").write_text(
+                "from tests import test_alias\n", encoding="utf-8"
+            )
+            expected = [
+                "tests.test_alias",
+                "tests.test_chain",
+                "tests.test_dotted",
+                "tests.test_from",
+                "tests.test_planted",
+            ]
+            self.assertEqual(credential_stub_gaps(tests_dir, []), (expected, []))
+
+    def test_credential_stub_gaps_clean_and_declared_boundary(self) -> None:
+        """Exclude clean tests and return empty gaps when all reaching tests are declared."""
+        target = "secret" + "-tool"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tests_dir = Path(tmp_dir)
+            (tests_dir / "test_planted.py").write_text(f"dummy = '{target}'\n", encoding="utf-8")
+            (tests_dir / "test_alias.py").write_text(
+                "from tests import test_planted as p\n", encoding="utf-8"
+            )
+            (tests_dir / "test_dotted.py").write_text(
+                "import tests.test_planted\n", encoding="utf-8"
+            )
+            (tests_dir / "test_from.py").write_text(
+                "from tests.test_planted import Base\n", encoding="utf-8"
+            )
+            (tests_dir / "test_chain.py").write_text(
+                "from tests import test_alias\n", encoding="utf-8"
+            )
+            (tests_dir / "test_clean.py").write_text(
+                "import unittest\nfrom tests import helpers\n", encoding="utf-8"
+            )
+            declared = [
+                "tests.test_alias",
+                "tests.test_chain",
+                "tests.test_dotted",
+                "tests.test_from",
+                "tests.test_planted",
+            ]
+            self.assertEqual(credential_stub_gaps(tests_dir, declared), ([], []))
+
+    def test_credential_stub_gaps_syntax_error_fail_closed(self) -> None:
+        """Report invalid Python files as reaching the stub to fail closed."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tests_dir = Path(tmp_dir)
+            (tests_dir / "test_broken.py").write_text("def (:\n", encoding="utf-8")
+            self.assertEqual(
+                credential_stub_gaps(tests_dir, []),
+                (["tests.test_broken"], []),
+            )
 
 
 if __name__ == "__main__":
