@@ -481,6 +481,19 @@
       "patch": "0014-avfilter-vf_zscale-keep-the-light-levels-when-linear.patch",
       "project": "vmafx",
       "note": "Part 2 of the Dolby Vision profile 5 tone mapping without libplacebo (ADR-0002)."
+    },
+    {
+      "number": 25875,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875",
+      "title": "avcodec: add a qpfile option to libaom-av1, libsvtav1 and libx264",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0043-libavcodec-unified-qpfile-across-libx264-libsvtav1-l.patch",
+      "project": "vmafx",
+      "note": "One per-frame QP-offset file shared by the libx264, libsvtav1 and libaom-av1 encoders, for the VMAFx vmaf-tune workflow."
     }
   ]
 }
