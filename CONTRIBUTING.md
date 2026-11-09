@@ -21,14 +21,14 @@ python3 -m venv .venv
 python3 -m pip install --require-hashes -r requirements-dev.txt
 ```
 
-`make verify-all` and the hooks start Python through `.config/lefthook/python.sh`, which prefers this checkout's untracked `.venv/bin/python3`; `make dev-deps` (first verify-all step) checks every `requirements-dev.in` pin and the tree-sitter C parser before the unit suite and names the install when one is missing.
+`make verify-all` and the hooks start Python through `.config/lefthook/python.sh`, which prefers this checkout's untracked `.venv/bin/python3` at the Git top level; `make dev-deps` (first verify-all step) checks every `requirements-dev.in` pin and the tree-sitter C parser before the unit suite and names the install when one is missing.
 
 Pins live in `requirements-dev.in`; after editing it, recompile from the repository root with `uv pip compile --universal --generate-hashes --python-version=3.12 requirements-dev.in --output-file=requirements-dev.txt`.
 
 Run the mutable-default check directly with `python3 scripts/lint_mutable_defaults.py`
 or through `make lint-mutable-defaults`. Its Pylint pin in `requirements-dev.in`
 must match the script's `PYLINT_VERSION`. The script
-uses that exact version on PATH, falling back to `uvx` to fetch the pinned version.
+uses that exact version from the active interpreter (`-m pylint`), then on PATH, and falls back to `uvx` to fetch the pinned version.
 
 `make semgrep` (part of `make verify-all`) runs the repository rules in `.semgrep.yml` through `scripts/semgrep_scan.sh`, the script the scanners workflow runs, which also fails on a rule configuration warning that semgrep prints with exit code 0; semgrep is not in requirements-dev.txt because CI runs it from the pinned container image, so install semgrep 1.178.0 yourself (for example with `pipx install --python python3.14 semgrep==1.178.0`, because 1.178.0 ships wheels up to Python 3.14; on 3.15 pipx builds the sdist, which lacks semgrep-core).
 

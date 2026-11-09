@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import importlib.metadata
-import os
 import re
+import shutil
 import subprocess  # nosec B404 - fixed sh, git and interpreter argv in temporary test trees.
 import sys
 import tempfile
@@ -24,30 +24,43 @@ _DOUBLE_QUOTE_RE = re.compile(r'"[^"]*"')
 _INTERPRETER_RE = re.compile(r"(?<![\w.-])(?:python[0-9.]*|py)(?![\w.-])")
 
 
-def make_fake_venv(target_dir: Path) -> Path:
-    """Create an executable fake python3 interpreter in target_dir/.venv/bin/."""
-    venv_bin = target_dir / ".venv" / "bin"
-    venv_bin.mkdir(parents=True, exist_ok=True)
-    venv_py = venv_bin / "python3"
+def make_fake_interpreter(directory: Path, name: str, version: str) -> Path:
+    """Create an executable fake Python interpreter script in directory/name."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
     script = (
         "#!/bin/sh\n"
         'for arg in "$@"; do\n'
         '  case "$arg" in\n'
-        '    *version_info*) echo "3.99"; exit 0 ;;\n'
+        f'    *version_info*) echo "{version}"; exit 0 ;;\n'
         "  esac\n"
         "done\n"
         'echo "venv-selected"\n'
     )
-    venv_py.write_text(script, encoding="utf-8")
-    venv_py.chmod(0o755)
-    return venv_py
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
 
-def run_python_sh(cwd: Path, ceiling: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def make_fake_venv(target_dir: Path, *, version: str = "3.99") -> Path:
+    """Create an executable fake python3 interpreter in target_dir/.venv/bin/."""
+    return make_fake_interpreter(target_dir / ".venv" / "bin", "python3", version)
+
+
+def run_python_sh(
+    cwd: Path, ceiling: Path, *args: str, path: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """Execute python.sh in a subprocess under a Git ceiling directory."""
-    env = dict(os.environ)
+    if path is not None:
+        sh_bin = shutil.which("sh")
+        assert sh_bin is not None  # noqa: S101
+        cmd = [sh_bin, str(ROOT / ".config/lefthook/python.sh"), *args]
+    else:
+        cmd = ["sh", str(ROOT / ".config/lefthook/python.sh"), *args]
+    env = isolated_git_environment()
     env["GIT_CEILING_DIRECTORIES"] = str(ceiling)
-    cmd = ["sh", str(ROOT / ".config/lefthook/python.sh"), *args]
+    if path is not None:
+        env["PATH"] = path
     return subprocess.run(  # nosec B603 - fixed sh argv runs the tracked python.sh.
         cmd,
         cwd=cwd,
@@ -153,6 +166,61 @@ class TestPythonShSelection(unittest.TestCase):
             proc = run_python_sh(tmp_path, tmp_path.parent, "-c", "print('path-python')")
             self.assertEqual(proc.returncode, 0)
             self.assertEqual(proc.stdout.strip(), "path-python")
+
+    def test_subdirectory_selects_root_venv(self) -> None:
+        """Select root .venv when invoked from a repository subdirectory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            make_fake_venv(tmp_path)
+            proc_init = run_git(tmp_path, "init", "-q")
+            self.assertEqual(proc_init.returncode, 0, proc_init.stderr)
+            deeper = tmp_path / "sub" / "deeper"
+            deeper.mkdir(parents=True)
+            proc = run_python_sh(deeper, tmp_path.parent, "-c", "print('path-python')")
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "venv-selected")
+
+    def test_failing_probe_venv_refused(self) -> None:
+        """Refuse .venv interpreters failing the version floor probe and fall back to PATH."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            proc_init = run_git(tmp_path, "init", "-q")
+            self.assertEqual(proc_init.returncode, 0, proc_init.stderr)
+            for version in ("2.7", "3.9", "3.x", ""):
+                with self.subTest(version=version):
+                    make_fake_venv(tmp_path, version=version)
+                    proc = run_python_sh(tmp_path, tmp_path.parent, "-c", "print('path-python')")
+                    self.assertEqual(proc.returncode, 0)
+                    self.assertEqual(proc.stdout.strip(), "path-python")
+
+    def test_floor_version_venv_selected(self) -> None:
+        """Select .venv interpreter meeting the version floor exactly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            make_fake_venv(tmp_path, version="3.10")
+            proc_init = run_git(tmp_path, "init", "-q")
+            self.assertEqual(proc_init.returncode, 0, proc_init.stderr)
+            proc = run_python_sh(tmp_path, tmp_path.parent, "-c", "print('path-python')")
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "venv-selected")
+
+    def test_no_valid_candidate_exits_127(self) -> None:
+        """Exit 127 and report missing dependency when no candidate satisfies the floor."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir = tmp_path / "bin"
+            for name in ("python3", "python", "py"):
+                make_fake_interpreter(bin_dir, name, "2.7")
+            proc = run_python_sh(
+                tmp_path,
+                tmp_path.parent,
+                "-c",
+                "print('path-python')",
+                path=str(bin_dir),
+            )
+            self.assertEqual(proc.returncode, 127)
+            self.assertIn("missing dependency", proc.stderr)
+            self.assertIn("Tried: python3, python, py -3", proc.stderr)
 
 
 class TestMakefilePythonGuard(unittest.TestCase):
