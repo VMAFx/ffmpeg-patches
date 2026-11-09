@@ -285,6 +285,20 @@ rules:
                     - metavariable-regex:
                         metavariable: $READ
                         regex: ^(read|readline|readlines)$
+              - pattern-not:
+                  pattern-either:
+                    - pattern: |
+                        $P = subprocess.Popen(...)
+                        ...
+                        $P.communicate(...)
+                        ...
+                        $P.wait(...)
+                    - pattern: |
+                        with subprocess.Popen(...) as $P:
+                            ...
+                            $P.communicate(...)
+                            ...
+                            $P.wait(...)
           - patterns:
               - pattern-either:
                   - pattern: |
@@ -361,6 +375,20 @@ rules:
                     - metavariable-regex:
                         metavariable: $READ
                         regex: ^(read|readline|readlines)$
+              - pattern-not:
+                  pattern-either:
+                    - pattern: |
+                        $P = subprocess.Popen(...)
+                        ...
+                        $P.communicate(...)
+                        ...
+                        $P.wait(...)
+                    - pattern: |
+                        with subprocess.Popen(...) as $P:
+                            ...
+                            $P.communicate(...)
+                            ...
+                            $P.wait(...)
 
   - id: subtest-cleanup-outside-finally
     languages: [python]

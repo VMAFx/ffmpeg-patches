@@ -241,6 +241,21 @@ def case_flagged_with_both_pipes_stderr_read():
         proc.wait(timeout=10)
 
 
+def case_flagged_other_proc_communicate():
+    \"\"\"Flagged: another process communicates, the piped one is only waited.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    other = subprocess.Popen(["ls"])
+    other.communicate(timeout=10)
+    proc.wait(timeout=10)
+
+
+def case_flagged_communicate_after_wait():
+    \"\"\"Flagged: wait() runs before communicate() drains the pipe.\"\"\"
+    proc = subprocess.Popen(["ls"], stderr=subprocess.PIPE)
+    proc.wait(timeout=10)
+    proc.communicate(timeout=10)
+
+
 def case_ok_pipe_read_by_helper():
     \"\"\"OK: pipe read by helper before wait in finally.\"\"\"
     proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
@@ -314,6 +329,27 @@ def case_ok_both_pipes_both_iterated():
     for line in proc.stderr:
         pass
     proc.wait(timeout=10)
+
+
+def case_ok_both_pipes_communicate_then_wait():
+    \"\"\"OK: communicate() drains both pipes before wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate(timeout=10)
+    proc.wait(timeout=10)
+
+
+def case_ok_stderr_communicate_then_wait():
+    \"\"\"OK: communicate() drains stderr before wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stderr=subprocess.PIPE)
+    proc.communicate(timeout=10)
+    proc.wait(timeout=10)
+
+
+def case_ok_with_communicate_then_wait():
+    \"\"\"OK: communicate() inside the with block before wait().\"\"\"
+    with Popen(["ls"], stdout=PIPE) as proc:
+        proc.communicate(timeout=10)
+        proc.wait(timeout=10)
 """
 
 SUBTEST_CLEANUP_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
