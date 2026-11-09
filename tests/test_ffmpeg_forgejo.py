@@ -50,15 +50,24 @@ def other_status(state: str, updated_at: str, n: int = 0) -> dict:
     return {"context": f"Test / job {n}", "status": state, "updated_at": updated_at}
 
 
-def open_pull(number: int = 25612, login: str = "tester", head_sha: str | None = None) -> dict:
-    """Build one open pull request list item."""
+def open_pull(
+    number: int = 25612,
+    login: str = "tester",
+    head_sha: str | None = None,
+    head_ref: str | None = None,
+) -> dict:
+    """Build one open pull request list item with an optional head ref and label."""
 
     sha = head_sha if head_sha is not None else f"{number:040x}"
+    head = {"sha": sha}
+    if head_ref is not None:
+        head["ref"] = head_ref
+        head["label"] = f"{login}:{head_ref}"
     return {
         "number": number,
         "state": "open",
         "user": {"login": login},
-        "head": {"sha": sha},
+        "head": head,
     }
 
 
@@ -2121,6 +2130,21 @@ class PullRequestOverlapTest(ForgejoTest):
         """An own open pull touching the candidate file exits 77 without a POST."""
 
         stub = overlap_stub(open_pulls=[open_pull()], pull_files={25612: [OVERLAP_FILE]})
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertIn("#25612", proc.stderr)
+        self.assertIn(OVERLAP_FILE, proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
+    def test_own_open_pull_from_the_same_branch_is_refused(self) -> None:
+        """An own open pull from the branch being opened (a lost create response)
+        exits 77 without a POST.
+        """
+
+        stub = overlap_stub(
+            open_pulls=[open_pull(head_ref="topic")],
+            pull_files={25612: [OVERLAP_FILE]},
+        )
         proc = self.pr(stub)
         self.assertEqual(proc.returncode, 77, proc.stderr)
         self.assertIn("#25612", proc.stderr)
