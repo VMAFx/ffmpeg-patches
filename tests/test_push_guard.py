@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import os
@@ -37,12 +38,14 @@ REVIEWED = "2026-11-09T05:50:50Z"
 ANSWERED = "2026-11-09T05:59:50Z"
 
 
-def pull_request(state: str = "closed", merged: bool = True, base: str = REPOSITORY) -> str:
+def pull_request(
+    state: str = "closed", merged: bool = True, base: str = REPOSITORY, number: int = 42
+) -> str:
     """Return a one-item pull request list as the pulls endpoint serves it."""
     return json.dumps(
         [
             {
-                "number": 42,
+                "number": number,
                 "state": state,
                 "head": {"sha": HEAD},
                 "base": {"repo": {"full_name": base}},
@@ -52,7 +55,12 @@ def pull_request(state: str = "closed", merged: bool = True, base: str = REPOSIT
     )
 
 
-def no_activity(repository: str, number: int) -> tuple[list, list]:
+def pull_request_list(*lists: str) -> str:
+    """Join one-item pull request lists into one list, newest first."""
+    return json.dumps([json.loads(raw)[0] for raw in lists])
+
+
+def no_activity(repository: str, number: int, budget: float) -> tuple[list, list]:
     """Serve a pull request with no reviews and no comments."""
     return [], []
 
@@ -68,6 +76,17 @@ def review(
     entry = {"id": 7, "user": user, "body": body, "state": "APPROVED", "submitted_at": submitted}
     entry.update(fields)
     return entry
+
+
+class FloorDatetime(datetime.datetime):
+    """A datetime whose fromisoformat rejects a Z suffix, as Python 3.10 does."""
+
+    @classmethod
+    def fromisoformat(cls, date_string: str) -> datetime.datetime:
+        """Parse like Python 3.10, which has no Z suffix support."""
+        if date_string.endswith("Z"):
+            raise ValueError(f"Invalid isoformat string: {date_string!r}")
+        return datetime.datetime.fromisoformat(date_string)
 
 
 def comment(login: str = HUMAN, created: object = ANSWERED) -> dict:
@@ -695,6 +714,7 @@ class PushGuardTest(unittest.TestCase):
                 self.assertIn("; refusing (fail closed)", err)
 
     def test_bad_json_and_invalid_pr_data_fail_closed(self) -> None:
+        """Bad JSON and invalid pull request fields refuse the push instead of passing."""
         malformed = ["bad JSON", "null", "{}", "[null]", '[{"state": "closed"}]']
         for number in (True, False):
             payload = json.loads(pull_request())
@@ -703,7 +723,7 @@ class PushGuardTest(unittest.TestCase):
         for raw in malformed:
             with self.subTest(raw=raw):
                 with self.assertRaises(ValueError):
-                    push_guard.newest_pull_request(raw)
+                    push_guard.pull_requests(raw)
                 status, _, err = guard(unittest.mock.Mock(return_value=raw), update())
                 self.assertEqual(status, 2)
                 self.assertIn(f"cannot read pull requests for {BRANCH}:", err)
@@ -746,7 +766,7 @@ class BotReviewBodyTest(unittest.TestCase):
         self.assertEqual(status, 1)
         for detail in (BRANCH, "#42", REPOSITORY, "unanswered bot review bodies (7)"):
             self.assertIn(detail, err)
-        activity.assert_called_once_with(REPOSITORY, 42)
+        activity.assert_called_once_with(REPOSITORY, 42, push_guard.READ_DEADLINE)
 
     def test_later_human_comment_or_review_answers_the_body(self) -> None:
         """A human issue comment or review after the bot review lets the push through."""
@@ -794,6 +814,27 @@ class BotReviewBodyTest(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(self.open_guard([review(body=body), pending], [])[:2], (0, ""))
 
+    def test_pending_reviews_neither_answer_nor_need_an_answer(self) -> None:
+        """A pending human draft is no answer; a pending bot draft has no published body."""
+        for submitted in (None, ANSWERED):
+            draft = review(HUMAN, body="draft", submitted=submitted, id=13, state="PENDING")
+            with self.subTest(submitted=submitted):
+                status, err, _ = self.open_guard([review(), draft], [])
+                self.assertEqual(status, 1)
+                self.assertIn("unanswered bot review bodies (7)", err)
+        bot_draft = review(submitted=None, id=14, state="PENDING")
+        self.assertEqual(self.open_guard([bot_draft], [])[:2], (0, ""))
+
+    def test_utc_suffix_matches_the_offset_form(self) -> None:
+        """A Z suffix parses as UTC, so the Python 3.10 hook floor reads GitHub timestamps."""
+        with unittest.mock.patch("scripts.push_guard.datetime", FloorDatetime):
+            stamps = [
+                push_guard._entry_time({"at": value}, "at")
+                for value in ("2026-11-09T05:50:50Z", "2026-11-09T05:50:50+00:00")
+            ]
+        self.assertEqual(stamps[0], stamps[1])
+        self.assertEqual(stamps[0].utcoffset(), datetime.timedelta(0))
+
     def test_closed_or_absent_pull_requests_read_no_reviews(self) -> None:
         """Only an open pull request reads its review activity."""
         activity = unittest.mock.Mock(side_effect=AssertionError("unexpected review read"))
@@ -810,7 +851,34 @@ class BotReviewBodyTest(unittest.TestCase):
         status, _, err = guard(reader, update(HEAD), activity=activity)
         self.assertEqual(status, 1)
         self.assertIn("in FFmpeg/FFmpeg", err)
-        activity.assert_called_once_with("FFmpeg/FFmpeg", 42)
+        activity.assert_called_once_with("FFmpeg/FFmpeg", 42, push_guard.READ_DEADLINE)
+
+    def test_every_open_pull_request_of_the_head_is_checked(self) -> None:
+        """An older open pull request's unanswered body refuses even when a newer PR passes."""
+        older = pull_request("open", False, number=41)
+
+        def activity(repository: str, number: int, budget: float) -> tuple[list, list]:
+            return ([review()] if number == 41 else []), []
+
+        for newest in (pull_request("open", False, number=43), pull_request(number=43)):
+            with self.subTest(newest=newest):
+                reader = unittest.mock.Mock(return_value=pull_request_list(newest, older))
+                reads = unittest.mock.Mock(side_effect=activity)
+                status, _, err = guard(reader, update(OTHER), activity=reads)
+                self.assertEqual(status, 1)
+                self.assertIn("PR #41", err)
+                self.assertEqual(reads.call_args_list[-1].args[:2], (REPOSITORY, 41))
+
+    def test_full_page_of_pull_requests_fails_closed(self) -> None:
+        """A head with a full page of pull requests may hide an open one, so it refuses."""
+        entry = json.loads(pull_request())[0]
+        for count, expected in ((push_guard.MAX_HEAD_PULLS - 1, 0), (push_guard.MAX_HEAD_PULLS, 2)):
+            with self.subTest(count=count):
+                reader = unittest.mock.Mock(return_value=json.dumps([entry] * count))
+                status, _, err = guard(reader, update(OTHER))
+                self.assertEqual(status, expected)
+                if expected:
+                    self.assertIn("a full page of 100 pull requests", err)
 
     def test_open_pull_request_without_base_repository_fails_closed(self) -> None:
         """An open pull request must name a valid base repository."""
@@ -819,7 +887,7 @@ class BotReviewBodyTest(unittest.TestCase):
             payload[0]["base"] = base
             with self.subTest(base=base):
                 with self.assertRaises(ValueError):
-                    push_guard.newest_pull_request(json.dumps(payload))
+                    push_guard.pull_requests(json.dumps(payload))
                 reader = unittest.mock.Mock(return_value=json.dumps(payload))
                 status, _, err = guard(reader, update())
                 self.assertEqual(status, 2)
@@ -841,12 +909,28 @@ class BotReviewBodyTest(unittest.TestCase):
                 self.assertIn("refusing (fail closed)", err)
 
     def test_malformed_activity_fails_closed(self) -> None:
-        """Malformed authors, timestamps, bodies and ids refuse instead of passing."""
+        """Malformed entries, authors, states, timestamps, bodies and ids refuse, never pass."""
         no_login = review()
         no_login["user"] = {"login": ""}
+        authors = []
+        for user in (
+            {"login": HUMAN},
+            {"login": HUMAN, "type": "Organization"},
+            {"login": HUMAN, "type": []},
+            "x",
+        ):
+            later = review(HUMAN, submitted=ANSWERED, id=8)
+            later["user"] = user
+            authors.append(([review(), later], []))
         cases = [
             ([None], []),
+            (["x"], []),
+            ([5], []),
+            ([], [None]),
+            ([], [[]]),
             ([no_login], []),
+            *authors,
+            *(([review(state=state)], []) for state in (None, "approved", "UNKNOWN", [])),
             ([review(submitted="yesterday")], []),
             ([review(submitted="2026-11-09T05:50:50")], []),
             ([review(submitted=None)], []),
@@ -874,6 +958,18 @@ class BotReviewBodyTest(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertIn("check deadline of 120 s passed", err)
         activity.assert_not_called()
+
+    def test_review_read_budget_ends_at_the_check_deadline(self) -> None:
+        """A review read near the check deadline gets only the seconds left before it."""
+        for elapsed, budget in ((0, push_guard.READ_DEADLINE), (100, 20), (120, 0)):
+            with self.subTest(elapsed=elapsed):
+                reader = unittest.mock.Mock(return_value=pull_request("open", False))
+                activity = unittest.mock.Mock(return_value=([], []))
+                clock = unittest.mock.Mock(side_effect=[0, 0, elapsed])
+                with unittest.mock.patch("sys.stdin", io.StringIO(update())):
+                    status = push_guard.check_updates([REPOSITORY], reader, clock, activity)
+                self.assertEqual(status, 0)
+                activity.assert_called_once_with(REPOSITORY, 42, budget)
 
 
 def gh_pages(*sizes: int) -> list[subprocess.CompletedProcess]:
@@ -950,11 +1046,30 @@ class ReviewActivityReaderTest(unittest.TestCase):
             unittest.mock.patch(
                 "scripts.push_guard.subprocess.run", side_effect=gh_pages(100)
             ) as run,
-            self.assertRaises(subprocess.TimeoutExpired),
+            self.assertRaises(TimeoutError),
         ):
             push_guard.read_review_activity(REPOSITORY, 42)
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.kwargs["timeout"], 20)
+
+    def test_read_budget_caps_the_read_deadline(self) -> None:
+        """A budget below the read deadline bounds every call; a spent budget makes none."""
+        with (
+            unittest.mock.patch("scripts.push_guard.time.monotonic", side_effect=[0.0, 0.0, 1.0]),
+            unittest.mock.patch(
+                "scripts.push_guard.subprocess.run", side_effect=gh_pages(0, 0)
+            ) as run,
+        ):
+            push_guard.read_review_activity(REPOSITORY, 42, 5.0)
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [5.0, 4.0])
+        with (
+            unittest.mock.patch("scripts.push_guard.time.monotonic", side_effect=[0.0, 0.0]),
+            unittest.mock.patch("scripts.push_guard.subprocess.run") as run,
+            self.assertRaises(TimeoutError),
+        ):
+            # Exactly zero seconds left is spent, not a zero-second call.
+            push_guard.read_review_activity(REPOSITORY, 42, 0)
+        run.assert_not_called()
 
 
 class StdinTest(unittest.TestCase):
@@ -1162,7 +1277,7 @@ class APIReaderTest(unittest.TestCase):
                         "gh",
                         "api",
                         f"repos/{REPOSITORY}/pulls?head=VMAFx:{BRANCH}"
-                        "&state=all&sort=created&direction=desc&per_page=1",
+                        "&state=all&sort=created&direction=desc&per_page=100",
                         "--hostname",
                         "github.com",
                     ],
@@ -1203,7 +1318,7 @@ class APIReaderTest(unittest.TestCase):
         self.assertEqual(
             endpoint,
             f"repos/upstream/repo/pulls?head=forkowner:{BRANCH}"
-            "&state=all&sort=created&direction=desc&per_page=1",
+            "&state=all&sort=created&direction=desc&per_page=100",
         )
 
     def test_fork_with_empty_parent_list(self) -> None:
@@ -1223,7 +1338,7 @@ class APIReaderTest(unittest.TestCase):
         self.assertEqual(
             endpoint,
             f"repos/forkowner/repo/pulls?head=forkowner:{BRANCH}"
-            "&state=all&sort=created&direction=desc&per_page=1",
+            "&state=all&sort=created&direction=desc&per_page=100",
         )
 
     def test_fork_without_valid_parent_fails_closed(self) -> None:
@@ -1297,7 +1412,7 @@ class APIReaderTest(unittest.TestCase):
             self.assertEqual(push_guard.read_pull_requests("forkowner/repo", BRANCH), pr_payload)
 
     def test_read_deadline_exhausted_before_subsequent_call_fails_closed(self) -> None:
-        """Exhausted read deadline before next query raises TimeoutExpired and fails closed."""
+        """Exhausted read deadline before next query raises TimeoutError and fails closed."""
         deadline = getattr(push_guard, "READ_DEADLINE", 30.0)
         meta = subprocess.CompletedProcess([], 0, stdout='{"fork": false}', stderr="")
         pulls = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
@@ -1306,7 +1421,7 @@ class APIReaderTest(unittest.TestCase):
                 "time.monotonic", side_effect=[0.0, deadline + 1.0, deadline + 1.0]
             ),
             unittest.mock.patch("scripts.push_guard.subprocess.run", side_effect=[meta, pulls]),
-            self.assertRaises(subprocess.TimeoutExpired),
+            self.assertRaises(TimeoutError),
         ):
             push_guard.read_pull_requests(REPOSITORY, BRANCH)
 
@@ -1334,7 +1449,7 @@ class APIReaderTest(unittest.TestCase):
                 "scripts.push_guard.subprocess.run",
                 side_effect=[meta_fork, parent_empty, fork_pulls],
             ),
-            self.assertRaises(subprocess.TimeoutExpired),
+            self.assertRaises(TimeoutError),
         ):
             push_guard.read_pull_requests("forkowner/repo", BRANCH)
 

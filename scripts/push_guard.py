@@ -3,16 +3,18 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Refuse pushes that revive a closed pull request or skip a bot review body.
 
-At most 256 pull request lookups may start within a 120-second check deadline.
-Remote configuration queries share a 30-second deadline.
+At most 256 pull request lookups may start within a 120-second check deadline,
+and review reads end by that deadline. Remote configuration queries share a
+30-second deadline.
 
     push_guard.py REMOTE_NAME REMOTE_URL
         Read Git pre-push ref updates from stdin. For each branch update,
-        query its newest GitHub pull request through gh. Non-GitHub remotes,
-        tags and branch deletions pass without querying GitHub. For an open
-        pull request, read its reviews and issue comments in the pull
-        request's base repository (at most 10 pages of 100 each) and refuse
-        while a bot review with a body has no later human review or comment.
+        query its GitHub pull requests through gh, newest first (fewer than
+        100). Non-GitHub remotes, tags and branch deletions pass without
+        querying GitHub. For each open pull request, read its reviews and
+        issue comments in the pull request's base repository (at most 10
+        pages of 100 each) and refuse while a bot review with a body has no
+        later human review or comment.
 
     push_guard.py --from-config
         Check each update against every GitHub repository in configured remote
@@ -21,8 +23,9 @@ Remote configuration queries share a 30-second deadline.
         (fail closed); rename the branch to proceed.
         Known gap: a push to a bare URL absent from all configured remotes
         is not seen in this mode.
-        The guard reads PR state once before Git updates the ref, so it narrows
-        but cannot close a race with a merge that happens during the push.
+        The guard reads PR state and reviews once before Git updates the ref,
+        so it narrows but cannot close a race with a merge or a bot review
+        that lands during the push.
 
 Exit status: 0 when allowed, 1 for a closed pull request's absent or unchanged
 head branch or an open pull request with an unanswered bot review body, 2 when
@@ -57,6 +60,10 @@ STDIN_DEADLINE = 10
 READ_DEADLINE = 30.0
 MAX_ACTIVITY_PAGES = 10
 ACTIVITY_PAGE_SIZE = 100
+MAX_HEAD_PULLS = 100
+# Tuples, not sets: an unhashable value from the API must fail the check, not raise TypeError.
+SUBMITTED_REVIEW_STATES = ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED")
+ACCOUNT_TYPES = ("User", "Bot")
 # Budget 4096 UTF-8 bytes per update across the complete input.
 MAX_STDIN_BYTES = MAX_UPDATES * 4096
 SCP_REMOTE = re.compile(r"(?:[^/@:\s]+@)?([A-Za-z0-9_.-]+):(.+)")
@@ -66,7 +73,7 @@ GH_HOSTNAME = "github.com"
 REMOTE_SCHEMES = {"https", "http", "ssh", "git", "git+ssh", "ssh+git"}
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 APIReader = Callable[[str, str], str]
-ActivityReader = Callable[[str, int], tuple[list, list]]
+ActivityReader = Callable[[str, int, float], tuple[list, list]]
 ConfigReader = Callable[[], dict[str, list[str]]]
 
 
@@ -219,11 +226,19 @@ def _gh_api(endpoint: str, timeout: float = 20.0) -> str:
     return result.stdout
 
 
+def _call_timeout(deadline: float, target: str) -> float:
+    """Return a per-call timeout of at most 20 s, raising once the read deadline has passed."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"read deadline passed before {target}")
+    return min(remaining, 20)
+
+
 def _pulls_query(repository: str, owner: str, branch: str, timeout: float = 20.0) -> str:
-    """Query the newest pull request for a repository and head."""
+    """Query a repository's pull requests for one head, newest first."""
     endpoint = (
         f"repos/{repository}/pulls?head={owner}:{quote(branch, safe='/')}"
-        "&state=all&sort=created&direction=desc&per_page=1"
+        f"&state=all&sort=created&direction=desc&per_page={MAX_HEAD_PULLS}"
     )
     return _gh_api(endpoint, timeout=timeout)
 
@@ -240,29 +255,21 @@ def _fork_parent(repository: str, payload: dict) -> str:
 
 
 def read_pull_requests(repository: str, branch: str) -> str:
-    """Read the newest PR for this head, checking fork parent repositories first."""
+    """Read the PRs for this head, newest first, checking fork parent repositories first."""
     deadline = time.monotonic() + READ_DEADLINE
-
-    def call_timeout(target: str) -> float:
-        """Return the per-call timeout bounded by remaining deadline budget."""
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(target, READ_DEADLINE)
-        return min(remaining, 20)
-
     owner = repository.split("/", 1)[0]
     meta_endpoint = f"repos/{repository}"
-    meta_raw = _gh_api(meta_endpoint, timeout=call_timeout(meta_endpoint))
+    meta_raw = _gh_api(meta_endpoint, timeout=_call_timeout(deadline, meta_endpoint))
     meta = json.loads(meta_raw)
     if not isinstance(meta, dict) or not isinstance(meta.get("fork"), bool):
         raise ValueError(f"repository {repository} has no valid fork field")
     if not meta["fork"]:
         return _pulls_query(
-            repository, owner, branch, timeout=call_timeout(f"repos/{repository}/pulls")
+            repository, owner, branch, timeout=_call_timeout(deadline, f"repos/{repository}/pulls")
         )
     parent = _fork_parent(repository, meta)
     parent_stdout = _pulls_query(
-        parent, owner, branch, timeout=call_timeout(f"repos/{parent}/pulls")
+        parent, owner, branch, timeout=_call_timeout(deadline, f"repos/{parent}/pulls")
     )
     parent_list = json.loads(parent_stdout)
     if not isinstance(parent_list, list):
@@ -270,22 +277,24 @@ def read_pull_requests(repository: str, branch: str) -> str:
     if parent_list:
         return parent_stdout
     return _pulls_query(
-        repository, owner, branch, timeout=call_timeout(f"repos/{repository}/pulls")
+        repository, owner, branch, timeout=_call_timeout(deadline, f"repos/{repository}/pulls")
     )
 
 
-def newest_pull_request(raw: str) -> PullRequest | None:
-    """Validate the API response so malformed data cannot silently allow a push."""
+def pull_requests(raw: str) -> list[PullRequest]:
+    """Validate every PR in the response so malformed data cannot silently allow a push."""
     payload = json.loads(raw)
     if not isinstance(payload, list):
         raise ValueError("expected a pull request list")
-    if not payload:
-        return None
-    pr = payload[0]
-    if not isinstance(pr, dict):
-        raise ValueError("expected a pull request object")
-    fields = _pull_request_fields(pr)
-    return PullRequest(*fields, _base_repository(pr, fields[1]))
+    if len(payload) >= MAX_HEAD_PULLS:
+        raise ValueError(f"a full page of {MAX_HEAD_PULLS} pull requests for one head")
+    prs: list[PullRequest] = []
+    for pr in payload:
+        if not isinstance(pr, dict):
+            raise ValueError("expected a pull request object")
+        fields = _pull_request_fields(pr)
+        prs.append(PullRequest(*fields, _base_repository(pr, fields[1])))
+    return prs
 
 
 def _pull_request_fields(pr: dict) -> tuple[int, str, str, bool]:
@@ -322,11 +331,8 @@ def _read_pages(endpoint: str, deadline: float) -> list:
     """Read a list endpoint page by page, failing closed past the page bound or deadline."""
     entries: list = []
     for page in range(1, MAX_ACTIVITY_PAGES + 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(endpoint, READ_DEADLINE)
         query = f"{endpoint}?per_page={ACTIVITY_PAGE_SIZE}&page={page}"
-        batch = json.loads(_gh_api(query, timeout=min(remaining, 20)))
+        batch = json.loads(_gh_api(query, timeout=_call_timeout(deadline, query)))
         if not isinstance(batch, list):
             raise ValueError(f"expected a list from {endpoint}")
         entries.extend(batch)
@@ -335,9 +341,11 @@ def _read_pages(endpoint: str, deadline: float) -> list:
     raise ValueError(f"more than {MAX_ACTIVITY_PAGES} pages from {endpoint}")
 
 
-def read_review_activity(repository: str, number: int) -> tuple[list, list]:
-    """Read a pull request's reviews and issue comments within one read deadline."""
-    deadline = time.monotonic() + READ_DEADLINE
+def read_review_activity(
+    repository: str, number: int, budget: float = READ_DEADLINE
+) -> tuple[list, list]:
+    """Read a pull request's reviews and issue comments within one read budget in seconds."""
+    deadline = time.monotonic() + min(READ_DEADLINE, budget)
     reviews = _read_pages(f"repos/{repository}/pulls/{number}/reviews", deadline)
     comments = _read_pages(f"repos/{repository}/issues/{number}/comments", deadline)
     return reviews, comments
@@ -346,15 +354,18 @@ def read_review_activity(repository: str, number: int) -> tuple[list, list]:
 def _author_is_bot(entry: object) -> bool:
     """Whether a review or comment author is a bot account, rejecting malformed authors."""
     user = entry.get("user") if isinstance(entry, dict) else None
-    login = user.get("login") if isinstance(user, dict) else None
-    if not isinstance(login, str) or not login:
+    login, kind = (user.get("login"), user.get("type")) if isinstance(user, dict) else (None, None)
+    if not isinstance(login, str) or not login or kind not in ACCOUNT_TYPES:
         raise ValueError("invalid review or comment author")
-    return login.endswith("[bot]") or user.get("type") == "Bot"
+    return login.endswith("[bot]") or kind == "Bot"
 
 
 def _entry_time(entry: dict, field: str) -> datetime:
     """Parse a timezone-aware review or comment timestamp."""
     value = entry.get(field)
+    if isinstance(value, str) and value.endswith("Z"):
+        # Python 3.10, the hook interpreter floor, rejects a Z suffix in fromisoformat.
+        value = value[:-1] + "+00:00"
     stamp = datetime.fromisoformat(value) if isinstance(value, str) else None
     if stamp is None or stamp.tzinfo is None:
         raise ValueError(f"invalid {field} timestamp")
@@ -371,14 +382,26 @@ def _bot_review_id(review: dict) -> int | None:
     return review_id if body and body.strip() else None
 
 
+def _review_submitted(review: dict) -> bool:
+    """Whether a review was submitted; a pending draft was not, and other states are rejected."""
+    state = review.get("state")
+    if state == "PENDING":
+        return False
+    if state not in SUBMITTED_REVIEW_STATES:
+        raise ValueError("invalid review state")
+    return True
+
+
 def unanswered_bot_reviews(reviews: list, comments: list) -> list[int]:
     """Return ids of bot review bodies that no later human review or issue comment follows."""
     answers = [_entry_time(c, "created_at") for c in comments if not _author_is_bot(c)]
     bodies: list[tuple[int, datetime]] = []
     for review in reviews:
-        if not _author_is_bot(review):
-            if review.get("state") != "PENDING":
-                answers.append(_entry_time(review, "submitted_at"))
+        bot = _author_is_bot(review)
+        if not _review_submitted(review):
+            continue
+        if not bot:
+            answers.append(_entry_time(review, "submitted_at"))
             continue
         review_id = _bot_review_id(review)
         if review_id is not None:
@@ -390,7 +413,7 @@ def unanswered_bot_reviews(reviews: list, comments: list) -> list[int]:
 def check_reviews(branch: str, pr: PullRequest, activity: ActivityReader) -> int:
     """Refuse while a bot review body on the open pull request has no human answer."""
     try:
-        unanswered = unanswered_bot_reviews(*activity(pr.repository, pr.number))
+        unanswered = unanswered_bot_reviews(*activity(pr.repository, pr.number, READ_DEADLINE))
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         print(
             f"push_guard: cannot read reviews of PR #{pr.number} for {branch}: {exc}; "
@@ -409,6 +432,18 @@ def check_reviews(branch: str, pr: PullRequest, activity: ActivityReader) -> int
     return 0
 
 
+def _closed_pull_request(branch: str, remote_sha: str, newest: PullRequest) -> bool:
+    """Report and refuse a push that would revive the branch of the newest, closed pull request."""
+    if newest.state != "closed" or (set(remote_sha) != {"0"} and remote_sha != newest.head_sha):
+        return False
+    disposition = "merged" if newest.merged else "closed-unmerged"
+    print(
+        f"push_guard: refusing branch {branch}: PR #{newest.number} is closed ({disposition})",
+        file=sys.stderr,
+    )
+    return True
+
+
 def check_branch(
     repository: str,
     branch: str,
@@ -416,28 +451,21 @@ def check_branch(
     reader: APIReader,
     activity: ActivityReader = read_review_activity,
 ) -> int:
-    """Check one pushed branch against its newest pull request."""
+    """Check one pushed branch against its newest pull request and every open one."""
     try:
-        pr = newest_pull_request(reader(repository, branch))
+        prs = pull_requests(reader(repository, branch))
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         print(
             f"push_guard: cannot read pull requests for {branch}: {exc}; refusing (fail closed)",
             file=sys.stderr,
         )
         return 2
-    if (
-        pr is not None
-        and pr.state == "closed"
-        and (set(remote_sha) == {"0"} or remote_sha == pr.head_sha)
-    ):
-        disposition = "merged" if pr.merged else "closed-unmerged"
-        print(
-            f"push_guard: refusing branch {branch}: PR #{pr.number} is {pr.state} ({disposition})",
-            file=sys.stderr,
-        )
+    if prs and _closed_pull_request(branch, remote_sha, prs[0]):
         return 1
-    if pr is not None and pr.state == "open":
-        return check_reviews(branch, pr, activity)
+    for pr in prs:
+        status = check_reviews(branch, pr, activity) if pr.state == "open" else 0
+        if status:
+            return status
     return 0
 
 
@@ -518,21 +546,22 @@ def bounded_api_reader(reader: APIReader, clock: Callable[[], float], start: flo
     return bounded_reader
 
 
-def _check_deadline(clock: Callable[[], float], start: float) -> None:
-    """Raise once the shared check deadline has passed."""
-    if clock() - start > CHECK_DEADLINE:
+def _check_deadline(clock: Callable[[], float], start: float) -> float:
+    """Raise once the shared check deadline has passed; return the seconds left."""
+    left = CHECK_DEADLINE - (clock() - start)
+    if left < 0:
         raise ValueError(f"check deadline of {CHECK_DEADLINE} s passed")
+    return left
 
 
 def bounded_activity_reader(
     reader: ActivityReader, clock: Callable[[], float], start: float
 ) -> ActivityReader:
-    """Start no review read after the shared check deadline."""
+    """Start no review read after the shared check deadline, and end each read by it."""
 
-    def bounded_reader(repository: str, number: int) -> tuple[list, list]:
-        """Check the deadline, then read the pull request's review activity."""
-        _check_deadline(clock, start)
-        return reader(repository, number)
+    def bounded_reader(repository: str, number: int, budget: float) -> tuple[list, list]:
+        """Read the pull request's review activity within the time left before the deadline."""
+        return reader(repository, number, min(budget, _check_deadline(clock, start)))
 
     return bounded_reader
 
