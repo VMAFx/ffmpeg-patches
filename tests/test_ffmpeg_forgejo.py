@@ -2691,6 +2691,7 @@ class OverlapVerbTest(ForgejoTest):
         original_files = stub.files
         term_sent = threading.Event()
         proc: subprocess.Popen[str] | None = None
+        stderr = ""
 
         def files_side_effect(number: int, query: dict[str, list[str]]) -> list[dict] | None:
             if not term_sent.is_set() and proc is not None:
@@ -2710,16 +2711,16 @@ class OverlapVerbTest(ForgejoTest):
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                proc.wait(timeout=10)
+                _, stderr = proc.communicate(timeout=10)
         finally:
             server.shutdown()
             server.server_close()
             if proc is not None and proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=5)
+                proc.communicate(timeout=5)
 
         self.assertIsNotNone(proc)
-        self.assertEqual(proc.returncode, 143)
+        self.assertEqual(proc.returncode, 143, stderr)
         self.assertEqual(list(clean_tmp.iterdir()), [])
         refs = git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo")
         self.assertEqual(refs, "")
