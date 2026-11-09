@@ -206,126 +206,161 @@ rules:
       include:
         - scripts/
         - tests/
-    patterns:
-      - pattern-either:
-          - pattern: |
-              $P = subprocess.Popen(..., stdout=subprocess.PIPE, ...)
-              ...
-              $P.wait(...)
-          - pattern: |
-              $P = subprocess.Popen(..., stderr=subprocess.PIPE, ...)
-              ...
-              $P.wait(...)
-          - pattern: |
-              with subprocess.Popen(..., stdout=subprocess.PIPE, ...) as $P:
-                  ...
-                  $P.wait(...)
-          - pattern: |
-              with subprocess.Popen(..., stderr=subprocess.PIPE, ...) as $P:
-                  ...
-                  $P.wait(...)
-      - pattern-not:
-          pattern-either:
-            - pattern: |
-                $P = subprocess.Popen(...)
-                ...
-                for $L in $P.stdout:
-                    ...
-                ...
-                $P.wait(...)
-            - pattern: |
-                $P = subprocess.Popen(...)
-                ...
-                for $L in $P.stderr:
-                    ...
-                ...
-                $P.wait(...)
-            - pattern: |
-                with subprocess.Popen(...) as $P:
-                    ...
-                    for $L in $P.stdout:
+    # One branch per piped stream: with stdout and stderr both on PIPE, each one must be read
+    # or drained before wait(), since a stream nobody reads can fill its buffer and block.
+    pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern: |
+                      $P = subprocess.Popen(..., stdout=subprocess.PIPE, ...)
+                      ...
+                      ...
+                      $P.wait(...)
+                  - pattern: |
+                      with subprocess.Popen(..., stdout=subprocess.PIPE, ...) as $P:
+                          ...
+                          ...
+                          $P.wait(...)
+              - pattern-not:
+                  pattern-either:
+                    - pattern: |
+                        $P = subprocess.Popen(...)
                         ...
-                    ...
-                    $P.wait(...)
-            - pattern: |
-                with subprocess.Popen(...) as $P:
-                    ...
-                    for $L in $P.stderr:
-                        ...
-                    ...
-                    $P.wait(...)
-      - pattern-not:
-          patterns:
-            - pattern-either:
-                - pattern: |
-                    $P = subprocess.Popen(...)
-                    ...
-                    $F(..., $P, ...)
-                    ...
-                    $P.wait(...)
-                - pattern: |
-                    with subprocess.Popen(...) as $P:
-                        ...
-                        $F(..., $P, ...)
+                        for $L in $P.stdout:
+                            ...
                         ...
                         $P.wait(...)
-                - pattern: |
-                    $P = subprocess.Popen(...)
-                    ...
-                    $F(..., $P.stdout, ...)
-                    ...
-                    $P.wait(...)
-                - pattern: |
-                    $P = subprocess.Popen(...)
-                    ...
-                    $F(..., $P.stderr, ...)
-                    ...
-                    $P.wait(...)
-                - pattern: |
-                    with subprocess.Popen(...) as $P:
+                    - pattern: |
+                        with subprocess.Popen(...) as $P:
+                            ...
+                            for $L in $P.stdout:
+                                ...
+                            ...
+                            $P.wait(...)
+              - pattern-not:
+                  patterns:
+                    - pattern-either:
+                        - pattern: |
+                            $P = subprocess.Popen(...)
+                            ...
+                            $F(..., $P, ...)
+                            ...
+                            $P.wait(...)
+                        - pattern: |
+                            with subprocess.Popen(...) as $P:
+                                ...
+                                $F(..., $P, ...)
+                                ...
+                                $P.wait(...)
+                        - pattern: |
+                            $P = subprocess.Popen(...)
+                            ...
+                            $F(..., $P.stdout, ...)
+                            ...
+                            $P.wait(...)
+                        - pattern: |
+                            with subprocess.Popen(...) as $P:
+                                ...
+                                $F(..., $P.stdout, ...)
+                                ...
+                                $P.wait(...)
+                    - metavariable-regex:
+                        metavariable: $F
+                        regex: ^_?(read|drain)_\w+$
+              - pattern-not:
+                  patterns:
+                    - pattern-either:
+                        - pattern: |
+                            $P = subprocess.Popen(...)
+                            ...
+                            $P.stdout.$READ(...)
+                            ...
+                            $P.wait(...)
+                        - pattern: |
+                            with subprocess.Popen(...) as $P:
+                                ...
+                                $P.stdout.$READ(...)
+                                ...
+                                $P.wait(...)
+                    - metavariable-regex:
+                        metavariable: $READ
+                        regex: ^(read|readline|readlines)$
+          - patterns:
+              - pattern-either:
+                  - pattern: |
+                      $P = subprocess.Popen(..., stderr=subprocess.PIPE, ...)
+                      ...
+                      ...
+                      $P.wait(...)
+                  - pattern: |
+                      with subprocess.Popen(..., stderr=subprocess.PIPE, ...) as $P:
+                          ...
+                          ...
+                          $P.wait(...)
+              - pattern-not:
+                  pattern-either:
+                    - pattern: |
+                        $P = subprocess.Popen(...)
                         ...
-                        $F(..., $P.stdout, ...)
+                        for $L in $P.stderr:
+                            ...
                         ...
                         $P.wait(...)
-                - pattern: |
-                    with subprocess.Popen(...) as $P:
-                        ...
-                        $F(..., $P.stderr, ...)
-                        ...
-                        $P.wait(...)
-            - metavariable-regex:
-                metavariable: $F
-                regex: ^_?(read|drain)_\w+$
-      - pattern-not:
-          patterns:
-            - pattern-either:
-                - pattern: |
-                    $P = subprocess.Popen(...)
-                    ...
-                    $P.stdout.$READ(...)
-                    ...
-                    $P.wait(...)
-                - pattern: |
-                    $P = subprocess.Popen(...)
-                    ...
-                    $P.stderr.$READ(...)
-                    ...
-                    $P.wait(...)
-                - pattern: |
-                    with subprocess.Popen(...) as $P:
-                        ...
-                        $P.stdout.$READ(...)
-                        ...
-                        $P.wait(...)
-                - pattern: |
-                    with subprocess.Popen(...) as $P:
-                        ...
-                        $P.stderr.$READ(...)
-                        ...
-                        $P.wait(...)
-            - metavariable-regex:
-                metavariable: $READ
-                regex: ^(read|readline|readlines)$
+                    - pattern: |
+                        with subprocess.Popen(...) as $P:
+                            ...
+                            for $L in $P.stderr:
+                                ...
+                            ...
+                            $P.wait(...)
+              - pattern-not:
+                  patterns:
+                    - pattern-either:
+                        - pattern: |
+                            $P = subprocess.Popen(...)
+                            ...
+                            $F(..., $P, ...)
+                            ...
+                            $P.wait(...)
+                        - pattern: |
+                            with subprocess.Popen(...) as $P:
+                                ...
+                                $F(..., $P, ...)
+                                ...
+                                $P.wait(...)
+                        - pattern: |
+                            $P = subprocess.Popen(...)
+                            ...
+                            $F(..., $P.stderr, ...)
+                            ...
+                            $P.wait(...)
+                        - pattern: |
+                            with subprocess.Popen(...) as $P:
+                                ...
+                                $F(..., $P.stderr, ...)
+                                ...
+                                $P.wait(...)
+                    - metavariable-regex:
+                        metavariable: $F
+                        regex: ^_?(read|drain)_\w+$
+              - pattern-not:
+                  patterns:
+                    - pattern-either:
+                        - pattern: |
+                            $P = subprocess.Popen(...)
+                            ...
+                            $P.stderr.$READ(...)
+                            ...
+                            $P.wait(...)
+                        - pattern: |
+                            with subprocess.Popen(...) as $P:
+                                ...
+                                $P.stderr.$READ(...)
+                                ...
+                                $P.wait(...)
+                    - metavariable-regex:
+                        metavariable: $READ
+                        regex: ^(read|readline|readlines)$
 
   - id: subtest-cleanup-outside-finally
     languages: [python]

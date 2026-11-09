@@ -212,6 +212,35 @@ def case_flagged_unrelated_helper_on_pipe():
     proc.wait(timeout=10)
 
 
+def case_flagged_both_pipes_stdout_read():
+    \"\"\"Flagged: both pipes, only stdout read before wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc.stdout.read()
+    proc.wait(timeout=10)
+
+
+def case_flagged_both_pipes_stderr_iterated():
+    \"\"\"Flagged: both pipes, only stderr iterated before wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for line in proc.stderr:
+        pass
+    proc.wait(timeout=10)
+
+
+def case_flagged_both_pipes_helper_on_stdout():
+    \"\"\"Flagged: both pipes, a read helper drains only stdout.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    read_helper_output(proc.stdout, 10.0)
+    proc.wait(timeout=10)
+
+
+def case_flagged_with_both_pipes_stderr_read():
+    \"\"\"Flagged: with block, both pipes, only stderr read.\"\"\"
+    with Popen(["ls"], stdout=PIPE, stderr=PIPE) as proc:
+        proc.stderr.read()
+        proc.wait(timeout=10)
+
+
 def case_ok_pipe_read_by_helper():
     \"\"\"OK: pipe read by helper before wait in finally.\"\"\"
     proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
@@ -259,6 +288,31 @@ def case_ok_devnull_wait():
 def case_ok_no_pipe_wait():
     \"\"\"OK: no pipe keyword then wait().\"\"\"
     proc = subprocess.Popen(["ls"])
+    proc.wait(timeout=10)
+
+
+def case_ok_both_pipes_both_read():
+    \"\"\"OK: both pipes read before wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc.stdout.read()
+    proc.stderr.read()
+    proc.wait(timeout=10)
+
+
+def case_ok_both_pipes_helper_on_process():
+    \"\"\"OK: both pipes, a read helper takes the process.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    read_helper_output(proc, 10.0)
+    proc.wait(timeout=10)
+
+
+def case_ok_both_pipes_both_iterated():
+    \"\"\"OK: both pipes iterated before wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for line in proc.stdout:
+        pass
+    for line in proc.stderr:
+        pass
     proc.wait(timeout=10)
 """
 
