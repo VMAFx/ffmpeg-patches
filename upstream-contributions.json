@@ -507,6 +507,19 @@
       "patch": "0023-avfilter-vf_hqdn3d_vulkan-add-a-Vulkan-hqdn3d-filter.patch",
       "project": "vmafx, pelorus",
       "note": "Part 1 of hqdn3d on the GPU, bit-exact to the CPU filter except in p012, where it writes 4095 for the 65535 that hqdn3d can write into a 12 bit plane (ADR-0004)."
+    },
+    {
+      "number": 25885,
+      "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25885",
+      "title": "avfilter/vf_tonemap: add the bt2408_hable tone map",
+      "base": "master",
+      "state": "open",
+      "merged_at": "",
+      "merged_commit": "",
+      "in_release": "",
+      "patch": "0012-avfilter-bt2408_hable-add-a-Hable-tone-map-on-IPT-in.patch, 0013-avfilter-vf_tonemap-add-the-bt2408_hable-tone-map.patch",
+      "project": "vmafx, pelorus",
+      "note": "Part 2 of the Dolby Vision profile 5 tone mapping without libplacebo: the libplacebo Hable tone map on IPT intensity as a tonemap value on the CPU (ADR-0002)."
     }
   ]
 }
