@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Offline pre-push checks, including closed PRs and unavailable API responses."""
+"""Offline pre-push checks: closed PRs, unanswered bot reviews, unavailable API responses."""
 
 from __future__ import annotations
 
@@ -31,34 +31,76 @@ OTHER = "c" * 40
 REWRITE_RULES = ("insteadOf", "pushInsteadOf")
 
 
-def pull_request(state: str = "closed", merged: bool = True) -> str:
+BOT = "sourcery-ai[bot]"
+HUMAN = "lusoris"
+REVIEWED = "2026-11-09T05:50:50Z"
+ANSWERED = "2026-11-09T05:59:50Z"
+
+
+def pull_request(state: str = "closed", merged: bool = True, base: str = REPOSITORY) -> str:
+    """Return a one-item pull request list as the pulls endpoint serves it."""
     return json.dumps(
         [
             {
                 "number": 42,
                 "state": state,
                 "head": {"sha": HEAD},
+                "base": {"repo": {"full_name": base}},
                 "merged_at": "2026-11-01T12:00:00Z" if merged else None,
             }
         ]
     )
 
 
+def no_activity(repository: str, number: int) -> tuple[list, list]:
+    """Serve a pull request with no reviews and no comments."""
+    return [], []
+
+
+def review(
+    login: str = BOT,
+    body: object = "### Sourcery assessment\n\n**Approved.**",
+    submitted: object = REVIEWED,
+    **fields: object,
+) -> dict:
+    """Return one review as the reviews endpoint serves it."""
+    user = {"login": login, "type": "Bot" if login.endswith("[bot]") else "User"}
+    entry = {"id": 7, "user": user, "body": body, "state": "APPROVED", "submitted_at": submitted}
+    entry.update(fields)
+    return entry
+
+
+def comment(login: str = HUMAN, created: object = ANSWERED) -> dict:
+    """Return one issue comment as the comments endpoint serves it."""
+    user = {"login": login, "type": "Bot" if login.endswith("[bot]") else "User"}
+    return {"id": 9, "user": user, "body": "Answered.", "created_at": created}
+
+
 def update(remote_sha: str = ZERO, local_sha: str = LOCAL, ref: str = BRANCH) -> str:
     return f"refs/heads/local {local_sha} refs/heads/{ref} {remote_sha}\n"
 
 
-def guard(reader: push_guard.APIReader, lines: str, remote: str = REMOTE) -> tuple[int, str, str]:
+def guard(
+    reader: push_guard.APIReader,
+    lines: str,
+    remote: str = REMOTE,
+    activity: push_guard.ActivityReader = no_activity,
+) -> tuple[int, str, str]:
+    """Run the guard for one remote URL with mocked API readers."""
     with unittest.mock.patch("sys.stdin", io.StringIO(lines)):
-        return capture_main(lambda argv: push_guard.main(argv, reader), "origin", remote)
+        return capture_main(
+            lambda argv: push_guard.main(argv, reader, activity_reader=activity), "origin", remote
+        )
 
 
 def config_guard(
     reader: push_guard.APIReader, config_reader: push_guard.ConfigReader, lines: str = ""
 ) -> tuple[int, str, str]:
+    """Run the guard in configuration mode with mocked readers."""
     with unittest.mock.patch("sys.stdin", io.StringIO(lines)):
         return capture_main(
-            lambda argv: push_guard.main(argv, reader, config_reader), "--from-config"
+            lambda argv: push_guard.main(argv, reader, config_reader, no_activity),
+            "--from-config",
         )
 
 
@@ -686,6 +728,233 @@ class PushGuardTest(unittest.TestCase):
     def test_sha256_zero_is_supported(self) -> None:
         reader = unittest.mock.Mock(return_value=pull_request())
         self.assertEqual(guard(reader, update("0" * 64, "b" * 64))[0], 1)
+
+
+class BotReviewBodyTest(unittest.TestCase):
+    """An open pull request refuses pushes while a bot review body has no human answer."""
+
+    def open_guard(self, reviews: list, comments: list) -> tuple[int, str, unittest.mock.Mock]:
+        """Push a branch whose open pull request has the given activity."""
+        activity = unittest.mock.Mock(return_value=(reviews, comments))
+        reader = unittest.mock.Mock(return_value=pull_request("open", False))
+        status, _, err = guard(reader, update(HEAD), activity=activity)
+        return status, err, activity
+
+    def test_planted_unanswered_bot_approval_body_is_refused(self) -> None:
+        """The PR 256 case: an approval body with no later answer refuses the push."""
+        status, err, activity = self.open_guard([review()], [])
+        self.assertEqual(status, 1)
+        for detail in (BRANCH, "#42", REPOSITORY, "unanswered bot review bodies (7)"):
+            self.assertIn(detail, err)
+        activity.assert_called_once_with(REPOSITORY, 42)
+
+    def test_later_human_comment_or_review_answers_the_body(self) -> None:
+        """A human issue comment or review after the bot review lets the push through."""
+        human_review = review(HUMAN, body="", submitted=ANSWERED, id=8, state="COMMENTED")
+        for reviews, comments in (([review()], [comment()]), ([review(), human_review], [])):
+            with self.subTest(reviews=reviews, comments=comments):
+                self.assertEqual(self.open_guard(reviews, comments)[:2], (0, ""))
+
+    def test_answer_must_come_after_the_review(self) -> None:
+        """An answer at or before the review time leaves the body unanswered."""
+        for created, expected in (
+            ("2026-11-09T05:50:49Z", 1),
+            (REVIEWED, 1),
+            ("2026-11-09T06:50:50+01:00", 1),
+            ("2026-11-09T05:50:51Z", 0),
+        ):
+            with self.subTest(created=created):
+                status = self.open_guard([review()], [comment(created=created)])[0]
+                self.assertEqual(status, expected)
+
+    def test_only_the_newest_answer_counts_for_every_body(self) -> None:
+        """A body posted after the last answer is refused; earlier bodies are answered."""
+        newer = review(submitted="2026-11-09T06:10:00Z", id=11)
+        status, err, _ = self.open_guard([review(), newer], [comment()])
+        self.assertEqual(status, 1)
+        self.assertIn("unanswered bot review bodies (11)", err)
+        later = comment(created="2026-11-09T06:20:00Z")
+        self.assertEqual(self.open_guard([review(), newer], [comment(), later])[:2], (0, ""))
+
+    def test_bot_comments_and_bot_reviews_are_no_answer(self) -> None:
+        """Bot activity never answers a bot review; type Bot marks a bot without [bot]."""
+        copilot = review("Copilot", submitted=ANSWERED, id=12)
+        copilot["user"]["type"] = "Bot"
+        for reviews, comments in (
+            ([review()], [comment("coderabbitai[bot]")]),
+            ([review(), copilot], []),
+        ):
+            with self.subTest(comments=comments):
+                self.assertEqual(self.open_guard(reviews, comments)[0], 1)
+
+    def test_empty_bot_bodies_and_pending_human_reviews_pass(self) -> None:
+        """Empty or blank bot bodies need no answer; a pending human draft is skipped."""
+        pending = review(HUMAN, body="draft", submitted=None, id=13, state="PENDING")
+        for body in ("", " \n\t", None):
+            with self.subTest(body=body):
+                self.assertEqual(self.open_guard([review(body=body), pending], [])[:2], (0, ""))
+
+    def test_closed_or_absent_pull_requests_read_no_reviews(self) -> None:
+        """Only an open pull request reads its review activity."""
+        activity = unittest.mock.Mock(side_effect=AssertionError("unexpected review read"))
+        for raw in ("[]", pull_request()):
+            with self.subTest(raw=raw):
+                reader = unittest.mock.Mock(return_value=raw)
+                self.assertEqual(guard(reader, update(OTHER), activity=activity)[0], 0)
+        activity.assert_not_called()
+
+    def test_reviews_come_from_the_pull_request_base_repository(self) -> None:
+        """A fork push reads the reviews where the pull request lives."""
+        activity = unittest.mock.Mock(return_value=([review()], []))
+        reader = unittest.mock.Mock(return_value=pull_request("open", False, base="FFmpeg/FFmpeg"))
+        status, _, err = guard(reader, update(HEAD), activity=activity)
+        self.assertEqual(status, 1)
+        self.assertIn("in FFmpeg/FFmpeg", err)
+        activity.assert_called_once_with("FFmpeg/FFmpeg", 42)
+
+    def test_open_pull_request_without_base_repository_fails_closed(self) -> None:
+        """An open pull request must name a valid base repository."""
+        for base in ({}, {"repo": None}, {"repo": {"full_name": "no-slash"}}):
+            payload = json.loads(pull_request("open", False))
+            payload[0]["base"] = base
+            with self.subTest(base=base):
+                with self.assertRaises(ValueError):
+                    push_guard.newest_pull_request(json.dumps(payload))
+                reader = unittest.mock.Mock(return_value=json.dumps(payload))
+                status, _, err = guard(reader, update())
+                self.assertEqual(status, 2)
+                self.assertIn("invalid pull request base repository", err)
+
+    def test_review_read_errors_fail_closed(self) -> None:
+        """Errors while reading reviews refuse the push with the cause."""
+        for error in (
+            subprocess.TimeoutExpired("gh", 20),
+            FileNotFoundError("gh missing"),
+            ValueError("more than 10 pages"),
+        ):
+            with self.subTest(error=error):
+                activity = unittest.mock.Mock(side_effect=error)
+                reader = unittest.mock.Mock(return_value=pull_request("open", False))
+                status, _, err = guard(reader, update(), activity=activity)
+                self.assertEqual(status, 2)
+                self.assertIn(f"cannot read reviews of PR #42 for {BRANCH}:", err)
+                self.assertIn("refusing (fail closed)", err)
+
+    def test_malformed_activity_fails_closed(self) -> None:
+        """Malformed authors, timestamps, bodies and ids refuse instead of passing."""
+        no_login = review()
+        no_login["user"] = {"login": ""}
+        cases = [
+            ([None], []),
+            ([no_login], []),
+            ([review(submitted="yesterday")], []),
+            ([review(submitted="2026-11-09T05:50:50")], []),
+            ([review(submitted=None)], []),
+            ([review(body=5)], []),
+            ([review(id=True)], []),
+            ([review(id="7")], []),
+            ([], [{"user": None}]),
+            ([], [comment(created="2026-11-09")]),
+        ]
+        for reviews, comments in cases:
+            with self.subTest(reviews=reviews, comments=comments):
+                with self.assertRaises(ValueError):
+                    push_guard.unanswered_bot_reviews(reviews, comments)
+                self.assertEqual(self.open_guard(reviews, comments)[0], 2)
+
+    def test_check_deadline_stops_the_review_read(self) -> None:
+        """No review read starts after the shared check deadline."""
+        reader = unittest.mock.Mock(return_value=pull_request("open", False))
+        activity = unittest.mock.Mock(return_value=([], []))
+        clock = unittest.mock.Mock(side_effect=[0, 0, push_guard.CHECK_DEADLINE + 1])
+        with unittest.mock.patch("sys.stdin", io.StringIO(update())):
+            status, _, err = capture_main(
+                lambda argv: push_guard.check_updates([REPOSITORY], reader, clock, activity)
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("check deadline of 120 s passed", err)
+        activity.assert_not_called()
+
+
+def gh_pages(*sizes: int) -> list[subprocess.CompletedProcess]:
+    """Return gh results serving list pages of the given sizes."""
+    return [
+        subprocess.CompletedProcess([], 0, stdout=json.dumps([{"id": n} for n in range(size)]))
+        for size in sizes
+    ]
+
+
+class ReviewActivityReaderTest(unittest.TestCase):
+    """The review reader pages both endpoints within fixed page and time bounds."""
+
+    def test_reads_both_endpoints_page_by_page(self) -> None:
+        """Reviews and comments are read with per_page=100 until a short page."""
+        with unittest.mock.patch(
+            "scripts.push_guard.subprocess.run", side_effect=gh_pages(100, 3, 0)
+        ) as run:
+            reviews, comments = push_guard.read_review_activity("FFmpeg/FFmpeg", 42)
+        self.assertEqual((len(reviews), len(comments)), (103, 0))
+        self.assertEqual(
+            [call.args[0][2] for call in run.call_args_list],
+            [
+                "repos/FFmpeg/FFmpeg/pulls/42/reviews?per_page=100&page=1",
+                "repos/FFmpeg/FFmpeg/pulls/42/reviews?per_page=100&page=2",
+                "repos/FFmpeg/FFmpeg/issues/42/comments?per_page=100&page=1",
+            ],
+        )
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0][3:], ["--hostname", "github.com"])
+            self.assertLessEqual(call.kwargs["timeout"], 20)
+
+    def test_page_limit_boundary(self) -> None:
+        """A short tenth page passes; a full tenth page fails closed."""
+        full = [100] * (push_guard.MAX_ACTIVITY_PAGES - 1)
+        endpoint = "repos/o/r/pulls/1/reviews"
+        with unittest.mock.patch(
+            "scripts.push_guard.subprocess.run", side_effect=gh_pages(*full, 99)
+        ):
+            entries = push_guard._read_pages(endpoint, time.monotonic() + 30)
+        self.assertEqual(len(entries), 999)
+        with (
+            unittest.mock.patch(
+                "scripts.push_guard.subprocess.run", side_effect=gh_pages(*full, 100)
+            ),
+            self.assertRaisesRegex(ValueError, "more than 10 pages"),
+        ):
+            push_guard._read_pages(endpoint, time.monotonic() + 30)
+
+    def test_non_list_pages_and_gh_errors_fail_closed(self) -> None:
+        """A page that is not a list, bad JSON or a gh failure raises."""
+        for stdout in ("{}", "null", "bad JSON"):
+            with self.subTest(stdout=stdout):
+                done = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+                with (
+                    unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=done),
+                    self.assertRaises(ValueError),
+                ):
+                    push_guard.read_review_activity(REPOSITORY, 42)
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="HTTP 404")
+        with (
+            unittest.mock.patch("scripts.push_guard.subprocess.run", return_value=failed),
+            self.assertRaisesRegex(ValueError, "HTTP 404"),
+        ):
+            push_guard.read_review_activity(REPOSITORY, 42)
+
+    def test_read_deadline_stops_before_the_next_page(self) -> None:
+        """An exhausted read deadline raises before any further gh call."""
+        deadline = push_guard.READ_DEADLINE
+        with (
+            unittest.mock.patch(
+                "scripts.push_guard.time.monotonic", side_effect=[0.0, 10.0, deadline + 1.0]
+            ),
+            unittest.mock.patch(
+                "scripts.push_guard.subprocess.run", side_effect=gh_pages(100)
+            ) as run,
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            push_guard.read_review_activity(REPOSITORY, 42)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs["timeout"], 20)
 
 
 class StdinTest(unittest.TestCase):
