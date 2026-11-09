@@ -86,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         pins = development_pins(content)
         pin_count = len(pins)
         findings.extend(pin_findings(pins))
+    except OSError as error:
+        findings.append(f"cannot read {args.requirements}: {error.strerror or error}")
     except ValueError as error:
         findings.append(str(error))
 

@@ -16,10 +16,10 @@
 # candidate replaces this shell, so its status is the hook's. With none left
 # the hook fails as a missing dependency and names what was tried.
 #
-# The first candidate is the checkout's own untracked .venv/bin/python3; a #
-# tracked .venv is refused because a committed fake interpreter would #
-# otherwise pass every gate. #
-# #
+# The first candidate is the checkout's own untracked .venv/bin/python3; a
+# tracked .venv is refused because a committed fake interpreter would
+# otherwise pass every gate.
+#
 # Every line below ends in a comment sign, blank ones included. praetorctl adopt
 # writes this file into repositories whose checkout may give it CRLF line
 # endings (core.autocrlf), and a shell reads the carriage return as part of the

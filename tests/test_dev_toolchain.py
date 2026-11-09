@@ -17,6 +17,11 @@ from scripts.check_dev_deps import pin_findings
 
 ROOT = Path(__file__).resolve().parents[1]
 
+_ALLOWED_WRAPPER = "sh .config/lefthook/python.sh"
+_SINGLE_QUOTE_RE = re.compile(r"'[^']*'")
+_DOUBLE_QUOTE_RE = re.compile(r'"[^"]*"')
+_INTERPRETER_RE = re.compile(r"(?<![\w.-])(?:python[0-9.]*|py)(?![\w.-])")
+
 
 def make_fake_venv(target_dir: Path) -> Path:
     """Create an executable fake python3 interpreter in target_dir/.venv/bin/."""
@@ -53,17 +58,50 @@ def run_python_sh(cwd: Path, ceiling: Path, *args: str) -> subprocess.CompletedP
     )
 
 
-def _direct_python_findings(makefile: str) -> list[str]:
-    """Return each Makefile line that starts Python directly."""
-    pattern = re.compile(
-        r"^(?:\t+\s*@?|.*(?:[;&|]|\bthen|\belse|\bdo|--)\s+)(?:exec\s+)?(?:python3?|py\s+-3)(?=\s)"
+def run_check_dev_deps(*args: str) -> subprocess.CompletedProcess[str]:
+    """Execute scripts/check_dev_deps.py in a subprocess with arguments."""
+    cmd = [sys.executable, "-B", str(ROOT / "scripts/check_dev_deps.py"), *args]
+    return subprocess.run(  # nosec B603
+        cmd,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
     )
+
+
+def run_with_requirements(content: str) -> subprocess.CompletedProcess[str]:
+    """Execute check_dev_deps.py against temporary requirements file content."""
+    with tempfile.TemporaryDirectory() as tmp:
+        req_file = Path(tmp) / "requirements-dev.in"
+        req_file.write_text(content, encoding="utf-8")
+        return run_check_dev_deps("--requirements", str(req_file))
+
+
+def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Execute a Git command in a subprocess under the given directory."""
+    return subprocess.run(  # nosec B603
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def _direct_python_findings(makefile: str) -> list[str]:
+    """Allow-list Makefile reader; allowed forms removed, any interpreter word left is a finding."""
     findings: list[str] = []
     for line in makefile.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if pattern.search(line):
+        rest = line.replace(_ALLOWED_WRAPPER, "")
+        rest = _SINGLE_QUOTE_RE.sub("", rest)
+        rest = _DOUBLE_QUOTE_RE.sub("", rest)
+        if _INTERPRETER_RE.search(rest):
             findings.append(line)
     return findings
 
@@ -76,14 +114,8 @@ class TestPythonShSelection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             make_fake_venv(tmp_path)
-            subprocess.run(  # nosec B603
-                ["git", "init", "-q"],
-                cwd=tmp_path,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
+            proc_git = run_git(tmp_path, "init", "-q")
+            self.assertEqual(proc_git.returncode, 0, proc_git.stderr)
             proc = run_python_sh(tmp_path, tmp_path.parent, "-c", "print('path-python')")
             self.assertEqual(proc.returncode, 0)
             self.assertEqual(proc.stdout.strip(), "venv-selected")
@@ -93,22 +125,10 @@ class TestPythonShSelection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             make_fake_venv(tmp_path)
-            subprocess.run(  # nosec B603
-                ["git", "init", "-q"],
-                cwd=tmp_path,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
-            subprocess.run(  # nosec B603
-                ["git", "add", "-f", ".venv/bin/python3"],
-                cwd=tmp_path,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
+            proc_init = run_git(tmp_path, "init", "-q")
+            self.assertEqual(proc_init.returncode, 0, proc_init.stderr)
+            proc_add = run_git(tmp_path, "add", "-f", ".venv/bin/python3")
+            self.assertEqual(proc_add.returncode, 0, proc_add.stderr)
             proc = run_python_sh(tmp_path, tmp_path.parent, "-c", "print('path-python')")
             self.assertEqual(proc.returncode, 0)
             self.assertEqual(proc.stdout.strip(), "path-python")
@@ -126,14 +146,8 @@ class TestPythonShSelection(unittest.TestCase):
         """Fall back to PATH Python when no .venv exists in a Git repository."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            subprocess.run(  # nosec B603
-                ["git", "init", "-q"],
-                cwd=tmp_path,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
+            proc_init = run_git(tmp_path, "init", "-q")
+            self.assertEqual(proc_init.returncode, 0, proc_init.stderr)
             proc = run_python_sh(tmp_path, tmp_path.parent, "-c", "print('path-python')")
             self.assertEqual(proc.returncode, 0)
             self.assertEqual(proc.stdout.strip(), "path-python")
@@ -143,9 +157,12 @@ class TestMakefilePythonGuard(unittest.TestCase):
     """Guard against direct Python invocations in Makefile recipes."""
 
     def test_real_makefile_has_no_direct_python(self) -> None:
-        """Ensure the repository Makefile contains zero direct Python invocations."""
+        """Ensure Makefile and engine.mk contain zero direct Python invocations."""
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         self.assertEqual(_direct_python_findings(makefile), [])
+        engine_mk = ROOT / ".config/praetor/engine.mk"
+        if engine_mk.exists():
+            self.assertEqual(_direct_python_findings(engine_mk.read_text(encoding="utf-8")), [])
 
     def test_planted_direct_python_detected(self) -> None:
         """Verify each planted direct Python snippet produces one finding."""
@@ -154,10 +171,18 @@ class TestMakefilePythonGuard(unittest.TestCase):
             "\t\tpython3 scripts/series.py lengths t; \\\n",
             "\t@x.py -- python3 -m unittest\n",
             "\t@if true; then python3 x.py; fi\n",
+            "\t@FOO=1 python3 x.py\n",
+            "\t@env python3 x.py\n",
+            "X := $(shell python3 -c 1)\n",
+            "\t@/usr/bin/python3 x.py\n",
+            "\t@py -3 x.py\n",
+            "\t@python3.14 x.py\n",
+            "\t@sh .config/lefthook/python.sh a.py && python b.py\n",
         ]
         for snippet in planted_snippets:
-            findings = _direct_python_findings(snippet)
-            self.assertEqual(len(findings), 1)
+            with self.subTest(snippet=snippet):
+                findings = _direct_python_findings(snippet)
+                self.assertEqual(len(findings), 1)
 
     def test_makefile_controls_give_no_findings(self) -> None:
         """Verify valid Python wrappers and comments trigger zero findings."""
@@ -165,9 +190,12 @@ class TestMakefilePythonGuard(unittest.TestCase):
             "\t@sh .config/lefthook/python.sh -B scripts/x.py\n",
             "\t\techo 'pipx install --python python3.14 semgrep' >&2; \\\n",
             "# python3 scripts/x.py\n",
+            "DIST_FILES = scripts/series.py README.md\n",
+            '\t@echo "run python3 -m venv .venv" >&2\n',
         ]
         for control in controls:
-            self.assertEqual(_direct_python_findings(control), [])
+            with self.subTest(snippet=control):
+                self.assertEqual(_direct_python_findings(control), [])
 
 
 class TestCheckDevDeps(unittest.TestCase):
@@ -175,14 +203,7 @@ class TestCheckDevDeps(unittest.TestCase):
 
     def test_real_requirements_pass(self) -> None:
         """Pass when checking the repository's real requirements-dev.in."""
-        proc = subprocess.run(  # nosec B603
-            [sys.executable, "-B", str(ROOT / "scripts/check_dev_deps.py")],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
+        proc = run_check_dev_deps()
         self.assertEqual(proc.returncode, 0)
         self.assertIn("pins and the tree-sitter C parser load", proc.stdout)
 
@@ -211,91 +232,41 @@ class TestCheckDevDeps(unittest.TestCase):
 
     def test_outdated_pin_fails(self) -> None:
         """Fail with installed version reported when a pin is outdated."""
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as req_file:
-            req_file.write("tree-sitter==0.0.1\n")
-            req_file.flush()
-            proc = subprocess.run(  # nosec B603
-                [
-                    sys.executable,
-                    "-B",
-                    str(ROOT / "scripts/check_dev_deps.py"),
-                    "--requirements",
-                    req_file.name,
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("tree-sitter==0.0.1: installed", proc.stderr)
+        proc = run_with_requirements("tree-sitter==0.0.1\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("tree-sitter==0.0.1: installed", proc.stderr)
 
     def test_missing_package_fails(self) -> None:
         """Fail when a pinned package is missing from the environment."""
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as req_file:
-            req_file.write("no-such-package-vmafx==1.0\n")
-            req_file.flush()
-            proc = subprocess.run(  # nosec B603
-                [
-                    sys.executable,
-                    "-B",
-                    str(ROOT / "scripts/check_dev_deps.py"),
-                    "--requirements",
-                    req_file.name,
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("no-such-package-vmafx==1.0: not installed", proc.stderr)
+        proc = run_with_requirements("no-such-package-vmafx==1.0\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no-such-package-vmafx==1.0: not installed", proc.stderr)
 
     def test_invalid_pin_syntax_fails(self) -> None:
         """Fail when a requirement line does not follow exact name==version."""
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as req_file:
-            req_file.write("tree-sitter>=0.26\n")
-            req_file.flush()
-            proc = subprocess.run(  # nosec B603
-                [
-                    sys.executable,
-                    "-B",
-                    str(ROOT / "scripts/check_dev_deps.py"),
-                    "--requirements",
-                    req_file.name,
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("expected name==version", proc.stderr)
+        proc = run_with_requirements("tree-sitter>=0.26\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("expected name==version", proc.stderr)
 
     def test_comment_only_requirements_passes(self) -> None:
         """Succeed with 0 pins reported for a comment-only requirements file."""
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as req_file:
-            req_file.write("# only a comment\n")
-            req_file.flush()
-            proc = subprocess.run(  # nosec B603
-                [
-                    sys.executable,
-                    "-B",
-                    str(ROOT / "scripts/check_dev_deps.py"),
-                    "--requirements",
-                    req_file.name,
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
-            self.assertEqual(proc.returncode, 0)
-            self.assertIn("0 pins", proc.stdout)
+        proc = run_with_requirements("# only a comment\n")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("0 pins", proc.stdout)
+
+    def test_unreadable_requirements_fails(self) -> None:
+        """Fail when requirements path is missing or names a directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_path = Path(tmp) / "missing.in"
+            proc_missing = run_check_dev_deps("--requirements", str(missing_path))
+            self.assertEqual(proc_missing.returncode, 1)
+            self.assertIn("cannot read", proc_missing.stderr)
+            self.assertNotIn("Traceback", proc_missing.stderr)
+
+            proc_dir = run_check_dev_deps("--requirements", tmp)
+            self.assertEqual(proc_dir.returncode, 1)
+            self.assertIn("cannot read", proc_dir.stderr)
+            self.assertNotIn("Traceback", proc_dir.stderr)
 
 
 class TestPinFindings(unittest.TestCase):
