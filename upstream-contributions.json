@@ -506,7 +506,7 @@
       "in_release": "",
       "patch": "0023-avfilter-vf_hqdn3d_vulkan-add-a-Vulkan-hqdn3d-filter.patch",
       "project": "vmafx, pelorus",
-      "note": "Part 1 of hqdn3d on the GPU, bit-exact to the CPU filter except in p012, where it writes 4095 for the 65535 that hqdn3d can write into a 12 bit plane (ADR-0004)."
+      "note": "Part 1 of hqdn3d on the GPU, bit-exact to the CPU filter except where hqdn3d writes a value above the format maximum into a 10 or 12 bit plane, which p010 and p012 store clamped to that maximum (ADR-0004)."
     }
   ]
 }
