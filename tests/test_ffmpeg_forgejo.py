@@ -2768,15 +2768,28 @@ class SweepTest(ForgejoTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("stub push", result.stdout)
 
+    def checkout_copy(self, *, validator: bool, checkout: bool = True) -> Path:
+        """Return a helper copy under scripts/, a Git checkout unless checkout is False."""
+
+        checkout_dir = self.tmp / "checkout"
+        scripts = checkout_dir / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        if checkout:
+            git(checkout_dir, "init", "-q")
+        helper = scripts / "ffmpeg-forgejo"
+        shutil.copyfile(HELPER, helper)
+        if validator:
+            shutil.copyfile(HELPER.parent / "variant_sweep.py", scripts / "variant_sweep.py")
+        return helper
+
     def test_sweep_names_missing_module(self) -> None:
         """A helper missing its validator reports the module and refuses the push."""
 
-        self.helper = self.bin_dir / "ffmpeg-forgejo"
-        shutil.copyfile(HELPER, self.helper)
+        self.helper = self.checkout_copy(validator=False)
         result = self.sweep_command("push", "--sweep", str(self.sweep))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(
-            f"sweep: missing validator: {self.bin_dir / 'variant_sweep.py'}", result.stderr
+            f"sweep: missing validator: {self.helper.parent / 'variant_sweep.py'}", result.stderr
         )
         self.assertEqual(self.sweep_requests, [])
         self.assertNotIn("stub push", result.stdout)
@@ -2784,8 +2797,7 @@ class SweepTest(ForgejoTest):
     def test_sweep_missing_sibling_rejects_cwd_decoy(self) -> None:
         """A missing sibling fails by name without executing a checkout-level decoy."""
 
-        self.helper = self.bin_dir / "ffmpeg-forgejo"
-        shutil.copyfile(HELPER, self.helper)
+        self.helper = self.checkout_copy(validator=False)
         marker = self.repo / "decoy-executed"
         (self.repo / "variant_sweep.py").write_text(
             "from pathlib import Path\n"
@@ -2801,10 +2813,91 @@ class SweepTest(ForgejoTest):
                 self.assertFalse(marker.exists(), "checkout-level decoy executed")
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn(
-                    f"sweep: missing validator: {self.bin_dir / 'variant_sweep.py'}", result.stderr
+                    f"sweep: missing validator: {self.helper.parent / 'variant_sweep.py'}",
+                    result.stderr,
                 )
                 self.assertEqual(self.sweep_requests, [])
                 self.assertNotIn("stub push", result.stdout)
+
+    def assert_guard_refused(self) -> None:
+        """Assert push and pr exit 74 naming self.helper before any request, push or Git call."""
+
+        for command in ("push", "pr"):
+            with self.subTest(command=command):
+                result = self.sweep_command(command, "--sweep", str(self.sweep))
+                self.assertEqual(result.returncode, 74, result.stderr)
+                self.assertIn(
+                    f"sweep: helper is not the repository script: {self.helper}", result.stderr
+                )
+                self.assertEqual(self.sweep_requests, [])
+                self.assertNotIn("stub push", result.stdout)
+        calls = self.tmp / "git-calls.jsonl"
+        self.assertFalse(
+            calls.exists(), calls.read_text(encoding="utf-8") if calls.exists() else ""
+        )
+
+    def test_sweep_refuses_installed_copy(self) -> None:
+        """An installed copy outside a checkout refuses push and pr even with its validator."""
+
+        self.helper = self.bin_dir / "ffmpeg-forgejo"
+        shutil.copyfile(HELPER, self.helper)
+        shutil.copyfile(HELPER.parent / "variant_sweep.py", self.bin_dir / "variant_sweep.py")
+        self.assert_guard_refused()
+
+    def test_sweep_refuses_scripts_copy_outside_checkout(self) -> None:
+        """A scripts/ffmpeg-forgejo copy outside a checkout is refused like an installed copy."""
+
+        self.helper = self.checkout_copy(validator=True, checkout=False)
+        self.assert_guard_refused()
+
+    def test_sweep_accepts_checkout_copy(self) -> None:
+        """A helper in another Git checkout passes the guard and pushes."""
+
+        self.helper = self.checkout_copy(validator=True)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+
+    def test_sweep_refuses_bare_git_marker(self) -> None:
+        """A .git that is an empty file, an empty directory or a gitdir line without
+        HEAD is refused."""
+
+        self.helper = self.checkout_copy(validator=True, checkout=False)
+        marker = self.helper.parent.parent / ".git"
+        missing = self.tmp / "missing-gitdir"
+        for shape in ("empty file", "empty directory", "gitdir without HEAD"):
+            with self.subTest(shape=shape):
+                try:
+                    if shape == "empty directory":
+                        marker.mkdir()
+                    else:
+                        marker.write_text(
+                            "" if shape == "empty file" else f"gitdir: {missing}\n",
+                            encoding="utf-8",
+                        )
+                    self.assert_guard_refused()
+                finally:
+                    if marker.is_dir():
+                        marker.rmdir()
+                    else:
+                        marker.unlink(missing_ok=True)
+                    (self.tmp / "git-calls.jsonl").unlink(missing_ok=True)
+
+    def test_sweep_accepts_gitdir_file_copy(self) -> None:
+        """A .git file naming a directory that holds HEAD passes, by absolute and by
+        relative path."""
+
+        self.helper = self.checkout_copy(validator=True, checkout=False)
+        checkout_dir = self.helper.parent.parent
+        gitdir = self.tmp / "worktree-gitdir"
+        gitdir.mkdir()
+        (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        for line in (f"gitdir: {gitdir}", "gitdir: ../worktree-gitdir"):
+            with self.subTest(line=line):
+                (checkout_dir / ".git").write_text(line + "\n", encoding="utf-8")
+                result = self.sweep_command("push", "--sweep", str(self.sweep))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("stub push", result.stdout)
 
     def test_sweep_rejects_non_table_findings(self) -> None:
         """Malformed findings and unrecognized text cannot disappear during validation."""
@@ -2849,6 +2942,8 @@ class SweepTest(ForgejoTest):
         fake = self.bin_dir / "git"
         fake.write_text(
             "#!/usr/bin/env python3\nimport json, os, sys\n"
+            f"with open({str(self.tmp / 'git-calls.jsonl')!r}, 'a', encoding='utf-8') as calls:\n"
+            "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             'if "push" in sys.argv:\n'
             f"    with open({str(self.tmp / 'push-argv.json')!r}, 'w') as record:\n"
             "        json.dump(sys.argv[1:], record)\n"
@@ -3319,9 +3414,17 @@ class SweepTest(ForgejoTest):
         self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def test_sweep_bad_disposition(self) -> None:
-        """Only the two named disposition forms are accepted."""
+        """Only the three named disposition forms are accepted."""
 
-        for value in ("ignore", "", "follow-up:", "fold later", "TODO follow-up: x"):
+        for value in (
+            "ignore",
+            "",
+            "follow-up:",
+            "fold later",
+            "TODO follow-up: x",
+            "no-variant",
+            "no-variant:",
+        ):
             with self.subTest(value=value):
                 self.sweep.write_text(
                     self.sweep.read_text(encoding="utf-8").split("|", 1)[0], encoding="utf-8"
@@ -3339,9 +3442,13 @@ class SweepTest(ForgejoTest):
                 report.write(f"| sibling.c:4 | play | discarded | no | {value} |\n")
 
     def test_sweep_reviewed(self) -> None:
-        """Reviewed fold and follow-up rows allow PR and leased push."""
+        """Reviewed fold, follow-up and no-variant rows allow PR and leased push."""
 
-        self.add_sweep_rows("fold", "follow-up: evidence/ancestor-reproducer.py")
+        self.add_sweep_rows(
+            "fold",
+            "follow-up: evidence/ancestor-reproducer.py",
+            "no-variant: pre-existing check outside the series",
+        )
         for command in ("pr", "push"):
             with self.subTest(command=command):
                 options = ["--sweep", str(self.sweep)]
