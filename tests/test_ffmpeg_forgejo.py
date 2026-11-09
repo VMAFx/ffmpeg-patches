@@ -2148,8 +2148,9 @@ class PullRequestOverlapTest(ForgejoTest):
         exits 77 without a POST.
         """
 
+        topic_head = git_output(self.repo, "rev-parse", "topic")
         stub = overlap_stub(
-            open_pulls=[open_pull(head_ref="topic")],
+            open_pulls=[open_pull(head_sha=topic_head, head_ref="topic")],
             pull_files={25612: [OVERLAP_FILE]},
         )
         proc = self.pr(stub)
