@@ -50,16 +50,15 @@ def make_fake_venv(target_dir: Path, *, version: str = "3.99") -> Path:
 def run_python_sh(
     cwd: Path, ceiling: Path, *args: str, path: str | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Execute python.sh in a subprocess under a Git ceiling directory."""
-    if path is not None:
-        sh_bin = shutil.which("sh")
-        assert sh_bin is not None  # noqa: S101
-        cmd = [sh_bin, str(ROOT / ".config/lefthook/python.sh"), *args]
-    else:
-        cmd = ["sh", str(ROOT / ".config/lefthook/python.sh"), *args]
+    """Execute python.sh under a Git ceiling directory, optionally with PATH replaced."""
+    cmd = ["sh", str(ROOT / ".config/lefthook/python.sh"), *args]
     env = isolated_git_environment()
     env["GIT_CEILING_DIRECTORIES"] = str(ceiling)
     if path is not None:
+        sh_bin = shutil.which("sh")
+        if sh_bin is None:
+            raise RuntimeError("sh is not on PATH")
+        cmd[0] = sh_bin
         env["PATH"] = path
     return subprocess.run(  # nosec B603 - fixed sh argv runs the tracked python.sh.
         cmd,
