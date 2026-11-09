@@ -128,6 +128,121 @@ def case_not_flagged_oserror_print_err():
         return 1
 """
 
+POPEN_PIPE_WAIT_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
+\"\"\"Fixture functions for popen-pipe-wait semgrep rule testing.\"\"\"
+
+import subprocess
+from subprocess import PIPE, Popen
+
+
+def case_flagged_stdout_pipe():
+    \"\"\"Flagged: stdout=PIPE then wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    proc.wait(timeout=10)
+
+
+def case_flagged_stderr_pipe():
+    \"\"\"Flagged: stderr=PIPE then wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stderr=subprocess.PIPE)
+    proc.wait(timeout=10)
+
+
+def case_flagged_with_popen():
+    \"\"\"Flagged: with Popen(... stdout=PIPE ...) as p then p.wait().\"\"\"
+    with Popen(["ls"], stdout=PIPE) as proc:
+        proc.wait(timeout=10)
+
+
+def case_ok_pipe_communicate():
+    \"\"\"OK: stdout=PIPE then communicate().\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    proc.communicate(timeout=10)
+
+
+def case_ok_devnull_wait():
+    \"\"\"OK: stdout=DEVNULL then wait().\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.DEVNULL)
+    proc.wait(timeout=10)
+
+
+def case_ok_no_pipe_wait():
+    \"\"\"OK: no pipe keyword then wait().\"\"\"
+    proc = subprocess.Popen(["ls"])
+    proc.wait(timeout=10)
+"""
+
+SUBTEST_CLEANUP_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
+\"\"\"Fixture functions for subtest-cleanup-outside-finally semgrep rule testing.\"\"\"
+
+import shutil
+from pathlib import Path
+
+path = Path("tmp")
+marker = Path("marker")
+
+
+def case_flagged_unlink_after_assert(self):
+    \"\"\"Flagged: assertion then path.unlink() in subTest body.\"\"\"
+    with self.subTest("unlink"):
+        self.assertEqual(1, 1)
+        path.unlink()
+
+
+def case_flagged_rmtree_after_assert(self):
+    \"\"\"Flagged: assertion then shutil.rmtree(path) in subTest body.\"\"\"
+    with self.subTest("rmtree"):
+        self.assertTrue(True)
+        shutil.rmtree(path)
+
+
+def case_flagged_helper_assert_rmdir(self):
+    \"\"\"Flagged: helper call self.assert_refused() then marker.rmdir().\"\"\"
+    with self.subTest("rmdir"):
+        self.assert_refused()
+        marker.rmdir()
+
+
+def case_ok_unlink_in_finally(self):
+    \"\"\"OK: path.unlink() in finally block inside subTest.\"\"\"
+    with self.subTest("unlink finally"):
+        try:
+            self.assertEqual(1, 1)
+        finally:
+            path.unlink()
+
+
+def case_ok_rmtree_in_finally(self):
+    \"\"\"OK: shutil.rmtree(path) in finally block inside subTest.\"\"\"
+    with self.subTest("rmtree finally"):
+        try:
+            self.assertTrue(True)
+        finally:
+            shutil.rmtree(path)
+
+
+def case_ok_rmdir_in_finally(self):
+    \"\"\"OK: marker.rmdir() in finally block inside subTest.\"\"\"
+    with self.subTest("rmdir finally"):
+        try:
+            self.assert_refused()
+        finally:
+            marker.rmdir()
+
+
+def case_ok_cleanup_before_assert(self):
+    \"\"\"OK: cleanup before assertion (setup).\"\"\"
+    with self.subTest("setup"):
+        path.unlink()
+        self.assertEqual(1, 1)
+
+
+def case_ok_cleanup_after_with_block(self):
+    \"\"\"OK: cleanup after with block ends.\"\"\"
+    with self.subTest("after"):
+        self.assertEqual(1, 1)
+    path.unlink()
+"""
+
 NEGATED_STATUS_FIXTURE = (
     "#!/usr/bin/env bash\n"
     "# SPDX-"
@@ -249,8 +364,24 @@ def _run_semgrep(fixture: Path, scratch: Path) -> dict:
     return data
 
 
-def _flagged_functions(results: list, source: str) -> set[str]:
-    """Collect enclosing function names for matches of oserror-swallowed-as-empty."""
+def _expected_flagged(source: str) -> set[str]:
+    """Derive expected function names starting with case_flagged_ from fixture source."""
+    tree = ast.parse(source)
+    expected: set[str] = set()
+    limit = len(tree.body)
+    for i in range(limit):
+        node = tree.body[i]
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("case_flagged_"):
+            expected.add(node.name)
+    return expected
+
+
+def _flagged_functions(
+    results: list,
+    source: str,
+    rule_id: str = "oserror-swallowed-as-empty",
+) -> set[str]:
+    """Collect enclosing function names for matches of the specified semgrep rule."""
     tree = ast.parse(source)
     funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
     flagged: set[str] = set()
@@ -258,7 +389,7 @@ def _flagged_functions(results: list, source: str) -> set[str]:
     for i in range(limit):
         item = results[i]
         check_id = item.get("check_id", "")
-        if check_id.endswith("oserror-swallowed-as-empty"):
+        if check_id.endswith(rule_id):
             start_line = item["start"]["line"]
             enclosing = _find_enclosing_function(funcs, start_line)
             if enclosing is not None:
@@ -359,3 +490,41 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertEqual(flagged_lines, expected_lines)
         scanned = [Path(p).resolve() for p in data.get("paths", {}).get("scanned", [])]
         self.assertIn(fixture_file.resolve(), scanned)
+
+    def test_popen_pipe_wait_rule(self) -> None:
+        """Rule popen-pipe-wait flags pipe wait without communicate."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        scratch_path = Path(scratch.name)
+        tests_dir = scratch_path / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        fixture_file = tests_dir / "fixture.py"
+        fixture_file.write_text(POPEN_PIPE_WAIT_FIXTURE, encoding="utf-8")
+
+        data = _run_semgrep(fixture_file, scratch_path)
+        flagged = _flagged_functions(
+            data.get("results", []),
+            POPEN_PIPE_WAIT_FIXTURE,
+            rule_id="popen-pipe-wait",
+        )
+        expected = _expected_flagged(POPEN_PIPE_WAIT_FIXTURE)
+        self.assertEqual(flagged, expected)
+
+    def test_subtest_cleanup_outside_finally_rule(self) -> None:
+        """Rule subtest-cleanup-outside-finally flags cleanup outside finally block."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        scratch_path = Path(scratch.name)
+        tests_dir = scratch_path / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        fixture_file = tests_dir / "fixture.py"
+        fixture_file.write_text(SUBTEST_CLEANUP_FIXTURE, encoding="utf-8")
+
+        data = _run_semgrep(fixture_file, scratch_path)
+        flagged = _flagged_functions(
+            data.get("results", []),
+            SUBTEST_CLEANUP_FIXTURE,
+            rule_id="subtest-cleanup-outside-finally",
+        )
+        expected = _expected_flagged(SUBTEST_CLEANUP_FIXTURE)
+        self.assertEqual(flagged, expected)

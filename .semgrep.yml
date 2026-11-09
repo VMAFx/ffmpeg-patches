@@ -198,6 +198,71 @@ rules:
           metavariable: $EMPTY
           regex: ^(\[\]|\{\}|\(\)|set\(\)|""|''|0)$
 
+  - id: popen-pipe-wait
+    languages: [python]
+    severity: ERROR
+    message: use communicate() so the pipes are read and closed.
+    paths:
+      include:
+        - scripts/
+        - tests/
+    pattern-either:
+      - pattern: |
+          $P = subprocess.Popen(..., stdout=subprocess.PIPE, ...)
+          ...
+          $P.wait(...)
+      - pattern: |
+          $P = subprocess.Popen(..., stderr=subprocess.PIPE, ...)
+          ...
+          $P.wait(...)
+      - pattern: |
+          with subprocess.Popen(..., stdout=subprocess.PIPE, ...) as $P:
+              ...
+              $P.wait(...)
+      - pattern: |
+          with subprocess.Popen(..., stderr=subprocess.PIPE, ...) as $P:
+              ...
+              $P.wait(...)
+      - pattern: |
+          with subprocess.Popen(..., stdout=subprocess.PIPE, ...) as $P:
+              ...
+          ...
+          $P.wait(...)
+      - pattern: |
+          with subprocess.Popen(..., stderr=subprocess.PIPE, ...) as $P:
+              ...
+          ...
+          $P.wait(...)
+
+  - id: subtest-cleanup-outside-finally
+    languages: [python]
+    severity: ERROR
+    message: move the cleanup into a finally block so a failed subTest does not leave state for the next one.
+    paths:
+      include:
+        - tests/
+    patterns:
+      - pattern-inside: |
+          with self.subTest(...):
+              ...
+      - pattern-inside: |
+          self.$ASSERT(...)
+          ...
+      - pattern: $X.$CLEAN(...)
+      - metavariable-regex:
+          metavariable: $ASSERT
+          regex: ^assert
+      - metavariable-regex:
+          metavariable: $CLEAN
+          regex: ^(unlink|rmdir|rmtree|remove|cleanup)$
+      - pattern-not-inside: |
+          try:
+              ...
+          finally:
+              ...
+              $X.$CLEAN(...)
+              ...
+
   # shellcheck does not flag reading $? inside a negated if (pull request 248 review, 2026-11-08).
   # Anchored at line start (no comments or strings); ";" or a newline before then; elif too.
   # Whitespace and whole comments may sit before and after then; a comment naming $? is no read.
