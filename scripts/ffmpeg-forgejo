@@ -709,13 +709,33 @@ fairy_requests() {
   return 1
 }
 
+# is_git_checkout DIR: DIR/.git is a directory holding HEAD, or a gitdir file naming a directory that holds HEAD; reads files only, runs no Git command.
+is_git_checkout() {
+  local top="$1" line="" dir
+  if [ -d "$top/.git" ]; then
+    [ -f "$top/.git/HEAD" ]
+    return
+  fi
+  [ -f "$top/.git" ] || return 1
+  IFS= read -r line < "$top/.git" || [ -n "$line" ] || return 1
+  case "$line" in
+    "gitdir: "?*) dir="${line#gitdir: }" ;;
+    *) return 1 ;;
+  esac
+  case "$dir" in
+    /*) ;;
+    *) dir="$top/$dir" ;;
+  esac
+  [ -f "$dir/HEAD" ]
+}
+
 # require_repository_helper: refuse push and pr unless this file resolves to scripts/ffmpeg-forgejo of a Git checkout.
 require_repository_helper() {
   local self top
   self="$(python3 -I -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${BASH_SOURCE[0]}")" \
     || die "sweep: cannot resolve helper path: ${BASH_SOURCE[0]}"
   top="${self%/scripts/ffmpeg-forgejo}"
-  if [ "$top" != "$self" ] && [ -e "$top/.git" ]; then
+  if [ "$top" != "$self" ] && is_git_checkout "$top"; then
     return 0
   fi
   printf 'ffmpeg-forgejo: sweep: helper is not the repository script: %s\n' "$self" >&2
