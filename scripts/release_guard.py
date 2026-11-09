@@ -122,10 +122,13 @@ def signer_identity(repository: str, ref: str) -> str:
 
 
 def cosign_arguments(args: argparse.Namespace) -> list[str]:
+    """The cosign verify-blob argv for ARGS: test key offline, else the keyless
+    release-build identity.
+    """
     command = ["cosign", "verify-blob", "--bundle", str(args.bundle)]
     if args.test_key:
         command += ["--key", str(args.test_key)]
-        command += ["--insecure-ignore-tlog=true", "--private-infrastructure=true"]
+        command += ["--insecure-ignore-tlog=true"]
     else:
         repository, ref = args.workflow_of
         command += ["--certificate-identity", signer_identity(repository, ref)]
