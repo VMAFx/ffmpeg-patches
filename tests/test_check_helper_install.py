@@ -78,6 +78,19 @@ class CheckHelperInstallTest(unittest.TestCase):
             env=isolated_git_environment() if env is None else env,
         )
 
+    def assert_stray_copy(self, entry: Path) -> subprocess.CompletedProcess[str]:
+        """Run the check, assert exit 1 with the stray-copy line for entry, and return the run."""
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"stray copy, not a symlink into {self.repo}: {entry}", proc.stderr)
+        return proc
+
+    def assert_no_stray_copy(self) -> None:
+        """Run the check and assert exit 0 with no stray-copy line on stderr."""
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("stray copy", proc.stderr)
+
     def test_absent_path_reports_skipped(self) -> None:
         """An absent helper path exits 0 and reports skipped on stdout."""
         proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
@@ -160,9 +173,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.share_dir.mkdir(parents=True)
         stale_file = self.share_dir / "test_pr_flow.sh.stale-x"
         stale_file.write_text("echo stale\n", encoding="utf-8")
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn(f"stray copy, not a symlink into {self.repo}: {stale_file}", proc.stderr)
+        proc = self.assert_stray_copy(stale_file)
         self.assertIn("helper ok:", proc.stdout)
 
     def test_backup_beside_helper_is_flagged(self) -> None:
@@ -170,9 +181,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.install_path.symlink_to(self.helper_script)
         backup_file = self.bin_dir / "ffmpeg-forgejo.bak-x"
         backup_file.write_bytes(self.helper_content)
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn(f"stray copy, not a symlink into {self.repo}: {backup_file}", proc.stderr)
+        self.assert_stray_copy(backup_file)
 
     def test_shared_symlink_into_repo_is_accepted(self) -> None:
         """A symlink in the share directory pointing into the repo exits 0."""
@@ -181,9 +190,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         repo_file = self.scripts_dir / "test_pr_flow.sh"
         repo_file.write_text("echo flow\n", encoding="utf-8")
         (self.share_dir / "test_pr_flow.sh").symlink_to(repo_file)
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("stray copy", proc.stderr)
+        self.assert_no_stray_copy()
 
     def test_shared_symlink_outside_repo_is_flagged(self) -> None:
         """A symlink in the share directory pointing outside the repo exits 1."""
@@ -193,9 +200,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.share_dir.mkdir(parents=True)
         link_path = self.share_dir / "outside.sh"
         link_path.symlink_to(outside_file)
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn(f"stray copy, not a symlink into {self.repo}: {link_path}", proc.stderr)
+        self.assert_stray_copy(link_path)
 
     def test_shared_link_to_loop_in_repo_is_flagged(self) -> None:
         """A share-dir link to a symlink loop inside the repo exits 1 as a stray copy."""
@@ -207,9 +212,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.share_dir.mkdir(parents=True)
         link_path = self.share_dir / "loop.sh"
         link_path.symlink_to(loop_a)
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn(f"stray copy, not a symlink into {self.repo}: {link_path}", proc.stderr)
+        self.assert_stray_copy(link_path)
 
     def test_shared_dangling_link_into_repo_is_flagged(self) -> None:
         """A share-dir link to a missing file inside the repo exits 1 as a stray copy."""
@@ -217,9 +220,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.share_dir.mkdir(parents=True)
         link_path = self.share_dir / "gone.sh"
         link_path.symlink_to(self.scripts_dir / "gone.sh")
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn(f"stray copy, not a symlink into {self.repo}: {link_path}", proc.stderr)
+        self.assert_stray_copy(link_path)
 
     def test_unlistable_share_dir_reports_listing_error(self) -> None:
         """A share directory that cannot be listed exits 1 with the listing error."""
@@ -266,19 +267,15 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.share_dir.mkdir(parents=True)
         unrelated = self.bin_dir / "other-tool"
         unrelated.write_text("echo other\n", encoding="utf-8")
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("stray copy", proc.stderr)
+        self.assert_no_stray_copy()
 
     def test_stray_copy_reported_when_helper_absent(self) -> None:
         """A stray copy in the share directory exits 1 even when the helper is absent."""
         self.share_dir.mkdir(parents=True)
         old_file = self.share_dir / "old.sh"
         old_file.write_text("echo old\n", encoding="utf-8")
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 1, proc.stdout)
+        proc = self.assert_stray_copy(old_file)
         self.assertIn("helper not installed at", proc.stdout)
-        self.assertIn(f"stray copy, not a symlink into {self.repo}: {old_file}", proc.stderr)
 
 
 if __name__ == "__main__":
