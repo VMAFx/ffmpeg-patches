@@ -1,6 +1,6 @@
 status = "submitted"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875"
-master_form = { base = "681025faf1add6567b1f97d2f1037d0e764afd0f", head = "9498b42443e2a930d89d55530c2c18e7973e8388" }
+master_form = { base = "681025faf1add6567b1f97d2f1037d0e764afd0f", head = "ee4d3d9579402e069816fc6409b1d50e4c32ed8f" }
 consumers = ["vmafx"]
 origin = "the VMAFx vmaf-tune workflow, which needs one per-frame QP-offset file format shared across the libx264, libsvtav1 and libaom encoders"
 notes = """
