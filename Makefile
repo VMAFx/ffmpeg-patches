@@ -2,7 +2,7 @@
 # Praetor ships one binary under two names; resolve whichever is installed.
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply filter-deps lengths lengths-local upstream-lint dist doctor
+.PHONY: all dev-deps verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply filter-deps lengths lengths-local upstream-lint dist doctor
 .PHONY: fairy-requests
 
 DOCSTRING_BASE ?= origin/main
@@ -12,13 +12,18 @@ all: build
 
 # Optional check of the installed helper executable.
 doctor:
-	@python3 -B scripts/check_helper_install.py
+	@sh .config/lefthook/python.sh -B scripts/check_helper_install.py
 
 # Optional live check; keep network access outside verify-all.
 fairy-requests:
 	@bash scripts/ffmpeg-forgejo fairy-requests --skip-unavailable
 
-verify-all: compile-context-verify caveman-sources audit docstrings semgrep test lengths-local upstream-lint
+# Fast check that the interpreter python.sh selects holds every
+# requirements-dev.in pin and loads the tree-sitter C parser, before the long unit suite.
+dev-deps:
+	@sh .config/lefthook/python.sh -B scripts/check_dev_deps.py
+
+verify-all: dev-deps compile-context-verify caveman-sources audit docstrings semgrep test lengths-local upstream-lint
 
 compile-context:
 	@$(PRAETORCTL) compile-context
@@ -47,30 +52,30 @@ semgrep:
 
 # The repository builds nothing: "build" lints the series and its metadata.
 build:
-	@python3 scripts/series.py check
+	@sh .config/lefthook/python.sh scripts/series.py check
 
 # The temporary leak guard fails a run that leaves files in its temporary directory.
 # Unit tests ignore the host git configuration, as on CI, so a test that needs a git identity fails locally too.
-test: build lint
-	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 python3 scripts/tmp_leak_guard.py -- python3 -m unittest discover -s tests
+test: dev-deps build lint
+	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh .config/lefthook/python.sh scripts/tmp_leak_guard.py -- sh .config/lefthook/python.sh -m unittest discover -s tests
 
 lint: lint-mutable-defaults
 	@ruff check scripts tests
 	@ruff format --check scripts tests
 
 lint-mutable-defaults:
-	@python3 scripts/lint_mutable_defaults.py
+	@sh .config/lefthook/python.sh scripts/lint_mutable_defaults.py
 
 # Apply the series onto a clean FFmpeg checkout at the pinned base:
 #   make apply FFMPEG_TREE=/path/to/ffmpeg
 apply:
 	@test -n "$(FFMPEG_TREE)" || { echo 'set FFMPEG_TREE to an FFmpeg checkout' >&2; exit 1; }
-	@python3 scripts/series.py apply --expect-base "$(FFMPEG_TREE)"
+	@sh .config/lefthook/python.sh scripts/series.py apply --expect-base "$(FFMPEG_TREE)"
 
 # Detect filters that call a library configure does not declare.
 filter-deps:
 	@test -n "$(FILTER_DEPS_TREE)" || { echo 'usage: make filter-deps FILTER_DEPS_TREE=<FFmpeg tree>' >&2; exit 2; }
-	@python3 scripts/filter_lib_deps.py "$(FILTER_DEPS_TREE)"
+	@sh .config/lefthook/python.sh scripts/filter_lib_deps.py "$(FILTER_DEPS_TREE)"
 
 # HISS-04 function-length gate on the applied series. It needs the series
 # applied to an FFmpeg checkout (base..HEAD, one commit per patch), so it is
@@ -78,7 +83,7 @@ filter-deps:
 #   make lengths FFMPEG_TREE=/path/to/applied-ffmpeg
 lengths:
 	@test -n "$(FFMPEG_TREE)" || { echo 'set FFMPEG_TREE to an FFmpeg checkout with the series applied' >&2; exit 1; }
-	@python3 scripts/series.py lengths "$(FFMPEG_TREE)"
+	@sh .config/lefthook/python.sh scripts/series.py lengths "$(FFMPEG_TREE)"
 
 # verify-all hook for the applied-tree length gate: run it when FFMPEG_TREE
 # names an applied checkout, otherwise skip loudly (never a silent pass) so a
@@ -86,7 +91,7 @@ lengths:
 # function. `make verify-all FFMPEG_TREE=<applied tree>` runs the full gate.
 lengths-local:
 	@if [ -n "$(FFMPEG_TREE)" ]; then \
-		python3 scripts/series.py lengths "$(FFMPEG_TREE)"; \
+		sh .config/lefthook/python.sh scripts/series.py lengths "$(FFMPEG_TREE)"; \
 	else \
 		{ \
 		  echo 'lengths-local: SKIPPED - no FFMPEG_TREE.'; \
@@ -104,7 +109,7 @@ lengths-local:
 # This optional checkout is distinct from the applied-series length checkout.
 upstream-lint:
 	@if [ -n "$(UPSTREAM_TREE)" ] && [ -n "$(UPSTREAM_BASE)" ]; then \
-		python3 scripts/upstream_lint.py --tree "$(UPSTREAM_TREE)" --base "$(UPSTREAM_BASE)"; \
+		sh .config/lefthook/python.sh scripts/upstream_lint.py --tree "$(UPSTREAM_TREE)" --base "$(UPSTREAM_BASE)"; \
 	else \
 		{ \
 		  echo 'upstream-lint: SKIPPED - both UPSTREAM_TREE and UPSTREAM_BASE required.'; \

@@ -16,6 +16,8 @@ from unittest.mock import patch
 
 import yaml
 
+from scripts.check_dev_deps import development_pins as _development_pins
+from scripts.check_dev_deps import normalize_package_name as _normalize_package_name
 from scripts.lint_mutable_defaults import PYLINT_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,26 +64,6 @@ def _series_install_findings(workflow: dict) -> list[str]:
             if step in install_steps and command == SERIES_INSTALL_COMMAND:
                 installed = True
     return findings
-
-
-def _normalize_package_name(name: str) -> str:
-    """Normalize package names according to PEP 503."""
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def _development_pins(content: str) -> set[tuple[str, str]]:
-    """Parse exact development pins, refusing every other requirement shape."""
-    pins = set()
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][A-Za-z0-9.!+_-]*)", line)
-        if match is None:
-            raise ValueError(f"expected name==version: {line!r}")
-        name, version = match.groups()
-        pins.add((_normalize_package_name(name), version))
-    return pins
 
 
 def _hashed_lock_pins(content: str) -> set[tuple[str, str]]:

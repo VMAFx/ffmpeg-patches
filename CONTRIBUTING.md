@@ -21,6 +21,8 @@ python3 -m venv .venv
 python3 -m pip install --require-hashes -r requirements-dev.txt
 ```
 
+`make verify-all` and the hooks start Python through `.config/lefthook/python.sh`, which prefers this checkout's untracked `.venv/bin/python3`; `make dev-deps` (first verify-all step) checks every `requirements-dev.in` pin and the tree-sitter C parser before the unit suite and names the install when one is missing.
+
 Pins live in `requirements-dev.in`; after editing it, recompile from the repository root with `uv pip compile --universal --generate-hashes --python-version=3.12 requirements-dev.in --output-file=requirements-dev.txt`.
 
 Run the mutable-default check directly with `python3 scripts/lint_mutable_defaults.py`
