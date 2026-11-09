@@ -131,8 +131,15 @@ def case_not_flagged_oserror_print_err():
 POPEN_PIPE_WAIT_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
 \"\"\"Fixture functions for popen-pipe-wait semgrep rule testing.\"\"\"
 
+import os
+import signal
 import subprocess
 from subprocess import PIPE, Popen
+
+
+def helper(proc, deadline):
+    \"\"\"Simulate helper reading process pipe until deadline.\"\"\"
+    pass
 
 
 def case_flagged_stdout_pipe():
@@ -151,6 +158,52 @@ def case_flagged_with_popen():
     \"\"\"Flagged: with Popen(... stdout=PIPE ...) as p then p.wait().\"\"\"
     with Popen(["ls"], stdout=PIPE) as proc:
         proc.wait(timeout=10)
+
+
+def case_flagged_signal_then_wait():
+    \"\"\"Flagged: signal sent before wait without pipe consumption.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    proc.send_signal(signal.SIGINT)
+    proc.wait(timeout=10)
+
+
+def case_flagged_pid_passed():
+    \"\"\"Flagged: pid passed to killpg before wait without pipe consumption.\"\"\"
+    proc = subprocess.Popen(["ls"], stderr=subprocess.PIPE)
+    os.killpg(proc.pid, signal.SIGTERM)
+    proc.wait(timeout=10)
+
+
+def case_ok_pipe_read_by_helper():
+    \"\"\"OK: pipe read by helper before wait in finally.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    try:
+        helper(proc, 10.0)
+    finally:
+        proc.wait(timeout=5)
+        proc.stdout.close()
+
+
+def case_ok_pipe_read_directly():
+    \"\"\"OK: pipe read directly before wait.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    proc.stdout.read()
+    proc.wait(timeout=10)
+
+
+def case_ok_pipe_iterated():
+    \"\"\"OK: pipe lines iterated before wait.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    for line in proc.stdout:
+        pass
+    proc.wait(timeout=10)
+
+
+def case_ok_wait_after_with_block():
+    \"\"\"OK: wait called after with block ends.\"\"\"
+    with Popen(["ls"], stdout=PIPE) as proc:
+        pass
+    proc.wait(timeout=10)
 
 
 def case_ok_pipe_communicate():
@@ -397,6 +450,18 @@ def _flagged_functions(
     return flagged
 
 
+def _flagged_in_fixture(source: str, rule_id: str) -> set[str]:
+    """Scan fixture source in a temporary tests directory and return flagged function names."""
+    with tempfile.TemporaryDirectory() as scratch_name:
+        scratch_path = Path(scratch_name)
+        tests_dir = scratch_path / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        fixture_file = tests_dir / "fixture.py"
+        fixture_file.write_text(source, encoding="utf-8")
+        data = _run_semgrep(fixture_file, scratch_path)
+        return _flagged_functions(data.get("results", []), source, rule_id=rule_id)
+
+
 @unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
 class SemgrepRulesTest(unittest.TestCase):
     """Verify repository semgrep rule behavior against test fixtures."""
@@ -493,38 +558,14 @@ class SemgrepRulesTest(unittest.TestCase):
 
     def test_popen_pipe_wait_rule(self) -> None:
         """Rule popen-pipe-wait flags pipe wait without communicate."""
-        scratch = tempfile.TemporaryDirectory()
-        self.addCleanup(scratch.cleanup)
-        scratch_path = Path(scratch.name)
-        tests_dir = scratch_path / "tests"
-        tests_dir.mkdir(parents=True, exist_ok=True)
-        fixture_file = tests_dir / "fixture.py"
-        fixture_file.write_text(POPEN_PIPE_WAIT_FIXTURE, encoding="utf-8")
-
-        data = _run_semgrep(fixture_file, scratch_path)
-        flagged = _flagged_functions(
-            data.get("results", []),
-            POPEN_PIPE_WAIT_FIXTURE,
-            rule_id="popen-pipe-wait",
+        self.assertEqual(
+            _flagged_in_fixture(POPEN_PIPE_WAIT_FIXTURE, "popen-pipe-wait"),
+            _expected_flagged(POPEN_PIPE_WAIT_FIXTURE),
         )
-        expected = _expected_flagged(POPEN_PIPE_WAIT_FIXTURE)
-        self.assertEqual(flagged, expected)
 
     def test_subtest_cleanup_outside_finally_rule(self) -> None:
         """Rule subtest-cleanup-outside-finally flags cleanup outside finally block."""
-        scratch = tempfile.TemporaryDirectory()
-        self.addCleanup(scratch.cleanup)
-        scratch_path = Path(scratch.name)
-        tests_dir = scratch_path / "tests"
-        tests_dir.mkdir(parents=True, exist_ok=True)
-        fixture_file = tests_dir / "fixture.py"
-        fixture_file.write_text(SUBTEST_CLEANUP_FIXTURE, encoding="utf-8")
-
-        data = _run_semgrep(fixture_file, scratch_path)
-        flagged = _flagged_functions(
-            data.get("results", []),
-            SUBTEST_CLEANUP_FIXTURE,
-            rule_id="subtest-cleanup-outside-finally",
+        self.assertEqual(
+            _flagged_in_fixture(SUBTEST_CLEANUP_FIXTURE, "subtest-cleanup-outside-finally"),
+            _expected_flagged(SUBTEST_CLEANUP_FIXTURE),
         )
-        expected = _expected_flagged(SUBTEST_CLEANUP_FIXTURE)
-        self.assertEqual(flagged, expected)
