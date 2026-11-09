@@ -93,8 +93,7 @@ jobs:
         if: github.event.pull_request.draft != true
         run: |
           semgrep --version
-          semgrep scan --config .semgrep.yml --error --metrics off --disable-version-check \
-            --sarif-output=semgrep.sarif
+          sh scripts/semgrep_scan.sh --sarif-output=semgrep.sarif
       # The findings also go to code scanning, so its alert list is read from an
       # analysis instead of answering "no analysis found". A finding still fails
       # the step above; the upload runs either way.

@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - subprocess run for semgrep CLI tool.
 import tempfile
@@ -14,6 +15,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# Semgrep prints a rule configuration warning on stderr and still exits 0.
+RULE_WARNING_RE = re.compile(r"^Rule \S+ contains .*$", re.MULTILINE)
 
 FIXTURE_SOURCE = """# SPDX-License-Identifier: EUPL-1.2
 \"\"\"Fixture functions for semgrep rule testing.\"\"\"
@@ -125,6 +128,71 @@ def case_not_flagged_oserror_print_err():
         return 1
 """
 
+NEGATED_STATUS_FIXTURE = (
+    "#!/usr/bin/env bash\n"
+    "# SPDX-"
+    "License-Identifier: EUPL-1.2\n"
+    "set -euo pipefail\n\n"
+    "f() { return 77; }\n\n"
+    "g() {\n"
+    '  if ! out="$(f)"; then\n'
+    "    rc=$?\n"
+    '    echo "$rc"\n'
+    "  fi\n"
+    "  if ! f; then\n"
+    "    local rc=$?\n"
+    "  fi\n"
+    "  if ! f; then rc=$?; fi\n"
+    "  if ! f\n"
+    "  then\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f; then echo first\n"
+    "  elif ! f; then rc=$?; fi\n"
+    "  if f; then rc=0; else rc=$?; fi\n"
+    "  f && rc=0 || rc=$?\n"
+    "  # if ! f; then rc=$?; fi\n"
+    '  echo "if ! f; then rc=$?"\n'
+    "  if ! f; then :; fi; if f; then rc=$?; fi\n"
+    "  if ! f 1; then # say why\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f 2; then\n"
+    "    # say why\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f 3;\n"
+    "  then\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f 4; # say why\n"
+    "  then rc=$?; fi\n"
+    "  if ! grep -q '#' f; then\n"
+    "    rc=$?\n"
+    "  fi\n"
+    "  if ! f 5; then # rc=$? is the negation\n"
+    "    echo none\n"
+    "  fi\n"
+    "}\n"
+)
+
+
+def _negated_status_expected_lines() -> set[int]:
+    """Return expected 1-based line numbers flagged in NEGATED_STATUS_FIXTURE."""
+    lines = NEGATED_STATUS_FIXTURE.splitlines()
+    return {
+        next(i for i, line in enumerate(lines, 1) if 'if ! out="$(f)"; then' in line),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f; then rc=$?; fi"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "elif ! f; then rc=$?; fi"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f 1; then # say why"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f 2; then"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f 3;"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! f 4; # say why"),
+        next(i for i, line in enumerate(lines, 1) if line.strip() == "if ! grep -q '#' f; then"),
+    }
+
 
 def _find_enclosing_function(
     functions: list[ast.FunctionDef],
@@ -141,7 +209,7 @@ def _find_enclosing_function(
 
 
 def _run_semgrep(fixture: Path, scratch: Path) -> dict:
-    """Run semgrep scan on a fixture inside scratch with isolated TMPDIR."""
+    """Run semgrep scan on a fixture inside scratch with isolated TMPDIR; fail on a rule warning."""
     semgrep_bin = shutil.which("semgrep")
     if semgrep_bin is None:
         raise RuntimeError("semgrep executable not found on PATH")
@@ -169,6 +237,9 @@ def _run_semgrep(fixture: Path, scratch: Path) -> dict:
     )
     if proc.returncode not in (0, 1):
         raise RuntimeError(f"semgrep exited with code {proc.returncode}: {proc.stderr}")
+    rule_warnings = RULE_WARNING_RE.findall(proc.stderr)
+    if rule_warnings:
+        raise RuntimeError(f"semgrep rule warnings for .semgrep.yml: {rule_warnings}")
     data: dict = json.loads(proc.stdout)
     if data.get("errors"):
         raise RuntimeError(f"semgrep reported execution errors: {data['errors']}")
@@ -248,3 +319,43 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertEqual(flagged, set())
         scanned = [Path(p).resolve() for p in data.get("paths", {}).get("scanned", [])]
         self.assertIn(checkpoint_file.resolve(), scanned)
+
+    def test_negated_if_status_read_rule(self) -> None:
+        """Rule flags negated if/elif status reads, not comments, strings or later statements."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        scratch_path = Path(scratch.name)
+        scripts_dir = scratch_path / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        fixture_file = scripts_dir / "fixture.sh"
+        fixture_file.write_text(NEGATED_STATUS_FIXTURE, encoding="utf-8")
+
+        data = _run_semgrep(fixture_file, scratch_path)
+        flagged_lines = {
+            item["start"]["line"]
+            for item in data.get("results", [])
+            if item.get("check_id", "").endswith("negated-if-status-read")
+        }
+        expected_lines = _negated_status_expected_lines()
+        self.assertEqual(flagged_lines, expected_lines)
+
+    def test_negated_if_status_read_rule_covers_forgejo_script(self) -> None:
+        """Rule negated-if-status-read scans ffmpeg-forgejo without extension."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        scratch_path = Path(scratch.name)
+        scripts_dir = scratch_path / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        fixture_file = scripts_dir / "ffmpeg-forgejo"
+        fixture_file.write_text(NEGATED_STATUS_FIXTURE, encoding="utf-8")
+
+        data = _run_semgrep(fixture_file, scratch_path)
+        flagged_lines = {
+            item["start"]["line"]
+            for item in data.get("results", [])
+            if item.get("check_id", "").endswith("negated-if-status-read")
+        }
+        expected_lines = _negated_status_expected_lines()
+        self.assertEqual(flagged_lines, expected_lines)
+        scanned = [Path(p).resolve() for p in data.get("paths", {}).get("scanned", [])]
+        self.assertIn(fixture_file.resolve(), scanned)
