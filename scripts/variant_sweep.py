@@ -27,6 +27,7 @@ LITERALS = re.compile(
 MACRO_STYLE = re.compile(r"[A-Z][A-Z0-9_]*", re.ASCII)
 CONTROL_HEADERS = {"if", "for", "while", "switch"}
 TABLE = "| file:line | callee | kind | same file as fix | disposition |"
+DISPOSITION = re.compile(r"fold|(?:follow-up|no-variant): \S(?:.*\S)?")
 ATTRIBUTES = {"__attribute__", "__attribute", "__declspec", "av_printf_format", "av_alloc_size"}
 MAX_REPORT_BYTES = 4 * 1024 * 1024
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
@@ -656,7 +657,7 @@ def validate_report(path: Path, sha: str) -> bool:
             continue
         if len(cells) != 5:
             return False
-        if cells[-1] != "fold" and not re.fullmatch(r"follow-up: \S(?:.*\S)?", cells[-1]):
+        if not DISPOSITION.fullmatch(cells[-1]):
             return False
         body = True
     return body
