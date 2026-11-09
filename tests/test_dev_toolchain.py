@@ -7,13 +7,14 @@ from __future__ import annotations
 import importlib.metadata
 import os
 import re
-import subprocess  # nosec B404
+import subprocess  # nosec B404 - fixed sh, git and interpreter argv in temporary test trees.
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.check_dev_deps import pin_findings
+from tests.helpers import isolated_git_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,7 +48,7 @@ def run_python_sh(cwd: Path, ceiling: Path, *args: str) -> subprocess.CompletedP
     env = dict(os.environ)
     env["GIT_CEILING_DIRECTORIES"] = str(ceiling)
     cmd = ["sh", str(ROOT / ".config/lefthook/python.sh"), *args]
-    return subprocess.run(  # nosec B603
+    return subprocess.run(  # nosec B603 - fixed sh argv runs the tracked python.sh.
         cmd,
         cwd=cwd,
         env=env,
@@ -61,7 +62,7 @@ def run_python_sh(cwd: Path, ceiling: Path, *args: str) -> subprocess.CompletedP
 def run_check_dev_deps(*args: str) -> subprocess.CompletedProcess[str]:
     """Execute scripts/check_dev_deps.py in a subprocess with arguments."""
     cmd = [sys.executable, "-B", str(ROOT / "scripts/check_dev_deps.py"), *args]
-    return subprocess.run(  # nosec B603
+    return subprocess.run(  # nosec B603 - the current interpreter runs the tracked check_dev_deps.py.
         cmd,
         cwd=ROOT,
         capture_output=True,
@@ -81,9 +82,10 @@ def run_with_requirements(content: str) -> subprocess.CompletedProcess[str]:
 
 def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Execute a Git command in a subprocess under the given directory."""
-    return subprocess.run(  # nosec B603
+    return subprocess.run(  # nosec B603 B607 - fixed git argv in a temporary test tree.
         ["git", *args],
         cwd=cwd,
+        env=isolated_git_environment(),
         capture_output=True,
         text=True,
         check=False,
@@ -216,7 +218,7 @@ class TestCheckDevDeps(unittest.TestCase):
             "sys.argv = ['check_dev_deps.py']\n"
             f"runpy.run_path({str(ROOT / 'scripts/check_dev_deps.py')!r}, run_name='__main__')\n"
         )
-        proc = subprocess.run(  # nosec B603
+        proc = subprocess.run(  # nosec B603 - the current interpreter runs a fixed inline script.
             [sys.executable, "-B", "-c", source],
             cwd=ROOT,
             capture_output=True,
