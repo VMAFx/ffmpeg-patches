@@ -174,6 +174,25 @@ def case_flagged_pid_passed():
     proc.wait(timeout=10)
 
 
+def case_flagged_wait_in_try_then_finally_kill(self):
+    \"\"\"Flagged: wait in try block then kill and wait in finally.\"\"\"
+    proc = None
+    try:
+        proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc.wait(timeout=10)
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def case_flagged_process_asserted_after_wait(self):
+    \"\"\"Flagged: process asserted after wait without pipe consumption.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    proc.wait(timeout=10)
+    self.assertIsNotNone(proc)
+
+
 def case_ok_pipe_read_by_helper():
     \"\"\"OK: pipe read by helper before wait in finally.\"\"\"
     proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
@@ -255,6 +274,13 @@ def case_flagged_helper_assert_rmdir(self):
         marker.rmdir()
 
 
+def case_flagged_conditional_cleanup_after_assert(self):
+    \"\"\"Flagged: conditional cleanup after assertion in subTest.\"\"\"
+    with self.subTest("conditional"):
+        self.assert_refused()
+        marker.rmdir() if marker.is_dir() else marker.unlink()
+
+
 def case_ok_unlink_in_finally(self):
     \"\"\"OK: path.unlink() in finally block inside subTest.\"\"\"
     with self.subTest("unlink finally"):
@@ -280,6 +306,15 @@ def case_ok_rmdir_in_finally(self):
             self.assert_refused()
         finally:
             marker.rmdir()
+
+
+def case_ok_conditional_cleanup_in_finally(self):
+    \"\"\"OK: conditional cleanup in finally block inside subTest.\"\"\"
+    with self.subTest("conditional finally"):
+        try:
+            self.assert_refused()
+        finally:
+            marker.rmdir() if marker.is_dir() else marker.unlink()
 
 
 def case_ok_cleanup_before_assert(self):
