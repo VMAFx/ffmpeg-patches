@@ -2126,15 +2126,22 @@ class PullRequestOverlapTest(ForgejoTest):
             if method == "POST" and path.endswith("/pulls")
         ]
 
+    def assert_refused_before_post(
+        self, stub: Stub, proc: subprocess.CompletedProcess[str]
+    ) -> None:
+        """Assert exit 77 naming pull #25612 and OVERLAP_FILE, with no pull-creation POST."""
+
+        self.assertEqual(proc.returncode, 77, proc.stderr)
+        self.assertIn("#25612", proc.stderr)
+        self.assertIn(OVERLAP_FILE, proc.stderr)
+        self.assertEqual(self.pull_posts(stub), [])
+
     def test_own_open_pull_with_shared_file_is_refused(self) -> None:
         """An own open pull touching the candidate file exits 77 without a POST."""
 
         stub = overlap_stub(open_pulls=[open_pull()], pull_files={25612: [OVERLAP_FILE]})
         proc = self.pr(stub)
-        self.assertEqual(proc.returncode, 77, proc.stderr)
-        self.assertIn("#25612", proc.stderr)
-        self.assertIn(OVERLAP_FILE, proc.stderr)
-        self.assertEqual(self.pull_posts(stub), [])
+        self.assert_refused_before_post(stub, proc)
 
     def test_own_open_pull_from_the_same_branch_is_refused(self) -> None:
         """An own open pull from the branch being opened (a lost create response)
@@ -2146,10 +2153,7 @@ class PullRequestOverlapTest(ForgejoTest):
             pull_files={25612: [OVERLAP_FILE]},
         )
         proc = self.pr(stub)
-        self.assertEqual(proc.returncode, 77, proc.stderr)
-        self.assertIn("#25612", proc.stderr)
-        self.assertIn(OVERLAP_FILE, proc.stderr)
-        self.assertEqual(self.pull_posts(stub), [])
+        self.assert_refused_before_post(stub, proc)
 
     def test_own_open_pull_renaming_shared_file_is_refused(self) -> None:
         """An own open pull renaming the candidate file exits 77 without a POST."""
