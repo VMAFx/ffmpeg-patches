@@ -417,7 +417,7 @@ without a series patch is a change the series does not carry.
 | [25875](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875) | `master` | open | avcodec: add a qpfile option to libaom-av1, libsvtav1 and libx264 | 0043 |
 | [25879](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25879) | `master` | open | avfilter/vf_hqdn3d_vulkan: add a Vulkan hqdn3d filter | 0023 |
 
-State read from the FFmpeg forge on 2026-11-08.
+State read from the FFmpeg forge on 2026-11-09.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned
