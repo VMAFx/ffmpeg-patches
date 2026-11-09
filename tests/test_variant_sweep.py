@@ -11,6 +11,7 @@ import subprocess  # nosec B404 - fixed interpreter argv in a temporary test tre
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from functools import partial
 from pathlib import Path
 
@@ -678,6 +679,53 @@ class SweepLimitTest(unittest.TestCase):
             ):
                 variant_sweep.sweep(str(self.repo), self.base, head)
         self.assertEqual(reads, [])
+
+
+class ValidateReportTest(unittest.TestCase):
+    """Exercise validate_report on reviewed, malformed and boundary report rows."""
+
+    def valid(self, disposition: str) -> bool:
+        """Return whether a single-row report with the given disposition is accepted."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "sweep.md"
+        sha = "0" * 40
+        report = (
+            f"class: unchecked-return\nhead: {sha}\n"
+            f"{variant_sweep.TABLE}\n"
+            "| --- | --- | --- | --- | --- |\n"
+            f"| a.c:1 | f | discarded | no | {disposition} |\n"
+        )
+        path.write_text(report, encoding="utf-8")
+        return variant_sweep.validate_report(path, sha)
+
+    def test_accepts_reviewed_dispositions(self) -> None:
+        """Reviewed fold, follow-up and reasoned no-variant dispositions are accepted."""
+        for disposition in (
+            "fold",
+            "follow-up: evidence/reproducer.py",
+            "no-variant: pre-existing allocator NULL check outside the series",
+        ):
+            with self.subTest(disposition=disposition):
+                self.assertTrue(self.valid(disposition))
+
+    def test_no_variant_needs_a_reason(self) -> None:
+        """A no-variant disposition requires a space and non-empty reason text."""
+        for disposition in (
+            "no-variant",
+            "no-variant:",
+            "no-variant:reason",
+            "no variant: reason",
+            "No-variant: reason",
+            "no-variant reason",
+            "TODO no-variant: x",
+        ):
+            with self.subTest(disposition=disposition):
+                self.assertFalse(self.valid(disposition))
+
+    def test_one_character_reason_is_enough(self) -> None:
+        """A single non-whitespace character satisfies the no-variant reason requirement."""
+        self.assertTrue(self.valid("no-variant: x"))
 
 
 if __name__ == "__main__":
