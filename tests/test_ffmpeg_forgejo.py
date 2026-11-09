@@ -2424,15 +2424,21 @@ class SweepTest(ForgejoTest):
         missing = self.tmp / "missing-gitdir"
         for shape in ("empty file", "empty directory", "gitdir without HEAD"):
             with self.subTest(shape=shape):
-                if shape == "empty directory":
-                    marker.mkdir()
-                else:
-                    marker.write_text(
-                        "" if shape == "empty file" else f"gitdir: {missing}\n",
-                        encoding="utf-8",
-                    )
-                self.assert_guard_refused()
-                marker.rmdir() if marker.is_dir() else marker.unlink()
+                try:
+                    if shape == "empty directory":
+                        marker.mkdir()
+                    else:
+                        marker.write_text(
+                            "" if shape == "empty file" else f"gitdir: {missing}\n",
+                            encoding="utf-8",
+                        )
+                    self.assert_guard_refused()
+                finally:
+                    if marker.is_dir():
+                        marker.rmdir()
+                    else:
+                        marker.unlink(missing_ok=True)
+                    (self.tmp / "git-calls.jsonl").unlink(missing_ok=True)
 
     def test_sweep_accepts_gitdir_file_copy(self) -> None:
         """A .git file naming a directory that holds HEAD passes, by absolute and by
