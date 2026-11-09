@@ -332,7 +332,7 @@ standards (HISS-21, NASA JPL Power of 10), and local verification instructions.
 
 ## Support ffmpeg-patches
 
-**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [38 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 11 merged, 24 open.
+**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [39 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 11 merged, 25 open.
 
 **What support funds.**
 - Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
@@ -415,6 +415,7 @@ without a series patch is a change the series does not carry.
 | [25708](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708) | `master` | open | avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes | 0040, 0041 |
 | [25867](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25867) | `master` | open | avfilter/vf_zscale: keep the light levels when linearising | 0014 |
 | [25875](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875) | `master` | open | avcodec: add a qpfile option to libaom-av1, libsvtav1 and libx264 | 0043 |
+| [25879](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25879) | `master` | open | avfilter/vf_hqdn3d_vulkan: add a Vulkan hqdn3d filter | 0023 |
 
 State read from the FFmpeg forge on 2026-11-08.
 <!-- upstream-contributions:end -->
