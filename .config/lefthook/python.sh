@@ -16,6 +16,11 @@
 # candidate replaces this shell, so its status is the hook's. With none left
 # the hook fails as a missing dependency and names what was tried.
 #
+# The first candidate is the checkout's own untracked .venv/bin/python3, found
+# at the Git top level so that a start from a subdirectory picks the same one;
+# a tracked .venv is refused because a committed fake interpreter would
+# otherwise pass every gate.
+#
 # Every line below ends in a comment sign, blank ones included. praetorctl adopt
 # writes this file into repositories whose checkout may give it CRLF line
 # endings (core.autocrlf), and a shell reads the carriage return as part of the
@@ -57,6 +62,9 @@ proven() { #
   [ "$minor" -ge "$floor" ] #
 } #
 #
+root=$(git rev-parse --show-toplevel 2>/dev/null) || root='' #
+venv="$root/.venv/bin/python3" #
+if [ -n "$root" ] && [ -x "$venv" ] && tracked=$(git -C "$root" ls-files -- .venv 2>/dev/null) && [ -z "$tracked" ] && proven "$venv"; then exec "$venv" "$@"; fi #
 if proven python3; then exec python3 "$@"; fi #
 if proven python; then exec python "$@"; fi #
 if proven py -3; then exec py -3 "$@"; fi #

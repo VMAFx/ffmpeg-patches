@@ -21,18 +21,28 @@ PYLINT_FLAGS = (
 
 
 def resolve_pylint() -> list[str] | None:
-    """Use exactly the pinned Pylint on PATH, or fetch that version with uvx."""
-    pylint = shutil.which("pylint")
-    if pylint:
+    """Use pinned Pylint under the active interpreter, on PATH, or via uvx."""
+
+    def _interpreter_candidate() -> list[str]:
+        """Return the active Python interpreter running Pylint as a module."""
+        return [sys.executable, "-m", "pylint"]
+
+    def _path_candidate() -> list[str] | None:
+        """Return the Pylint executable located on PATH when present."""
+        path = shutil.which("pylint")
+        return [path] if path else None
+
+    for resolve_candidate in (_interpreter_candidate, _path_candidate):
+        candidate = resolve_candidate()
+        if candidate is None:
+            continue
         try:
             version = subprocess.run(  # nosec B603 - resolved tool, fixed arguments.
-                [pylint, "--version"], capture_output=True, text=True, check=True, timeout=10
+                [*candidate, "--version"], capture_output=True, text=True, check=True, timeout=10
             )
             if version.stdout.splitlines()[:1] == [f"pylint {PYLINT_VERSION}"]:
-                return [pylint]
+                return candidate
         except (OSError, subprocess.SubprocessError):
-            # A Pylint on PATH that cannot report its version is not the pinned
-            # one; fall through to the uvx-fetched pinned version below.
             pass
     uvx = shutil.which("uvx")
     if uvx:
@@ -59,7 +69,10 @@ def main(argv: list[str] | None = None) -> int:
         command = resolve_pylint()
         if command is None:
             print(
-                f"lint-mutable-defaults: neither pylint=={PYLINT_VERSION} nor uvx found on PATH",
+                (
+                    f"lint-mutable-defaults: neither pylint=={PYLINT_VERSION} under"
+                    f" {sys.executable} or on PATH nor uvx found"
+                ),
                 file=sys.stderr,
             )
             return 1
