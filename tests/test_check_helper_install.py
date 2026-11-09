@@ -85,6 +85,12 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.assertIn(f"stray copy, not a symlink into {self.repo}: {entry}", proc.stderr)
         return proc
 
+    def assert_no_stray_copy(self) -> None:
+        """Run the check and assert exit 0 with no stray-copy line on stderr."""
+        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("stray copy", proc.stderr)
+
     def test_absent_path_reports_skipped(self) -> None:
         """An absent helper path exits 0 and reports skipped on stdout."""
         proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
@@ -184,9 +190,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         repo_file = self.scripts_dir / "test_pr_flow.sh"
         repo_file.write_text("echo flow\n", encoding="utf-8")
         (self.share_dir / "test_pr_flow.sh").symlink_to(repo_file)
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("stray copy", proc.stderr)
+        self.assert_no_stray_copy()
 
     def test_shared_symlink_outside_repo_is_flagged(self) -> None:
         """A symlink in the share directory pointing outside the repo exits 1."""
@@ -263,9 +267,7 @@ class CheckHelperInstallTest(unittest.TestCase):
         self.share_dir.mkdir(parents=True)
         unrelated = self.bin_dir / "other-tool"
         unrelated.write_text("echo other\n", encoding="utf-8")
-        proc = self.run_check("--path", str(self.install_path), "--repo", str(self.repo))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("stray copy", proc.stderr)
+        self.assert_no_stray_copy()
 
     def test_stray_copy_reported_when_helper_absent(self) -> None:
         """A stray copy in the share directory exits 1 even when the helper is absent."""
