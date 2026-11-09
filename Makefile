@@ -60,8 +60,8 @@ test: dev-deps build lint
 	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh .config/lefthook/python.sh scripts/tmp_leak_guard.py -- sh .config/lefthook/python.sh -m unittest discover -s tests
 
 lint: lint-mutable-defaults
-	@ruff check scripts tests
-	@ruff format --check scripts tests
+	@sh .config/lefthook/python.sh -m ruff check scripts tests
+	@sh .config/lefthook/python.sh -m ruff format --check scripts tests
 
 lint-mutable-defaults:
 	@sh .config/lefthook/python.sh scripts/lint_mutable_defaults.py

@@ -21,7 +21,9 @@ ROOT = Path(__file__).resolve().parent.parent
 def check_pylint_toolchain() -> str | None:
     """Return a skip reason unless the gate can resolve its pinned toolchain."""
     if gate.resolve_pylint() is None:
-        return f"neither pylint=={gate.PYLINT_VERSION} nor uvx exists on PATH"
+        return (
+            f"neither pylint=={gate.PYLINT_VERSION} under {sys.executable} or on PATH nor uvx found"
+        )
     return None
 
 
@@ -101,15 +103,34 @@ class ResolvePylintTest(unittest.TestCase):
             patch.object(gate.shutil, "which", return_value="pylint") as which,
             patch.object(gate.subprocess, "run") as run,
         ):
-            run.return_value.stdout = f"pylint {gate.PYLINT_VERSION}\nastroid 4.3.4\n"
+            run.side_effect = [
+                OSError("cannot start interpreter pylint"),
+                subprocess.CompletedProcess(
+                    ["pylint", "--version"],
+                    0,
+                    stdout=f"pylint {gate.PYLINT_VERSION}\nastroid 4.3.4\n",
+                ),
+            ]
             self.assertEqual(gate.resolve_pylint(), ["pylint"])
             which.assert_called_once_with("pylint")
-            run.assert_called_once_with(
-                ["pylint", "--version"],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=10,
+            self.assertEqual(
+                run.call_args_list,
+                [
+                    unittest.mock.call(
+                        [sys.executable, "-m", "pylint", "--version"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=10,
+                    ),
+                    unittest.mock.call(
+                        ["pylint", "--version"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=10,
+                    ),
+                ],
             )
 
     def test_nonexact_versions_are_refused(self) -> None:
@@ -145,7 +166,7 @@ class ResolvePylintTest(unittest.TestCase):
                     gate.resolve_pylint(),
                     ["uvx", "--from", f"pylint=={gate.PYLINT_VERSION}", "pylint"],
                 )
-                self.assertEqual(run.call_count, int(pylint is not None))
+                self.assertEqual(run.call_count, 1 + int(pylint is not None))
 
     def test_failed_version_check_falls_back(self) -> None:
         """Fall back when the local version command fails, times out or cannot start."""
@@ -169,10 +190,18 @@ class ResolvePylintTest(unittest.TestCase):
         """Skip fixtures with the pinned version named when neither tool is available."""
         with (
             patch.object(gate.shutil, "which", return_value=None),
-            patch.object(gate.subprocess, "run") as run,
+            patch.object(
+                gate.subprocess, "run", side_effect=OSError("no interpreter pylint")
+            ) as run,
         ):
             self.assertIn(f"pylint=={gate.PYLINT_VERSION}", check_pylint_toolchain())
-            run.assert_not_called()
+            run.assert_called_once_with(
+                [sys.executable, "-m", "pylint", "--version"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
 
     def test_unsupported_pylint_supplies_skip_reason(self) -> None:
         """Skip fixtures when only an unsupported local Pylint exists."""
@@ -190,9 +219,103 @@ class ResolvePylintTest(unittest.TestCase):
             patch.object(gate.shutil, "which", return_value="pylint"),
             patch.object(gate.subprocess, "run") as run,
         ):
-            run.return_value.stdout = f"pylint {gate.PYLINT_VERSION}\n"
+            run.side_effect = [
+                OSError("no interpreter pylint"),
+                subprocess.CompletedProcess(
+                    ["pylint", "--version"], 0, stdout=f"pylint {gate.PYLINT_VERSION}\n"
+                ),
+            ]
             self.assertEqual(gate.resolve_pylint(), ["pylint"])
-            run.assert_called_once()
+            self.assertEqual(run.call_count, 2)
+
+    def test_interpreter_pylint_at_pin_is_accepted(self) -> None:
+        """Accept pinned interpreter Pylint without querying PATH."""
+        with (
+            patch.object(gate.shutil, "which") as which,
+            patch.object(gate.subprocess, "run") as run,
+        ):
+            run.return_value = subprocess.CompletedProcess(
+                [sys.executable, "-m", "pylint", "--version"],
+                0,
+                stdout=f"pylint {gate.PYLINT_VERSION}\nastroid 4.3.4\n",
+            )
+            self.assertEqual(gate.resolve_pylint(), [sys.executable, "-m", "pylint"])
+            which.assert_not_called()
+            run.assert_called_once_with(
+                [sys.executable, "-m", "pylint", "--version"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+
+    def test_interpreter_version_mismatch_falls_back_to_path(self) -> None:
+        """Fall back to pinned PATH Pylint when interpreter Pylint version differs."""
+        path_pylint = "/custom/bin/pylint"
+        with (
+            patch.object(gate.shutil, "which", return_value=path_pylint) as which,
+            patch.object(gate.subprocess, "run") as run,
+        ):
+            run.side_effect = [
+                subprocess.CompletedProcess(
+                    [sys.executable, "-m", "pylint", "--version"],
+                    0,
+                    stdout="pylint 4.1.2\n",
+                ),
+                subprocess.CompletedProcess(
+                    [path_pylint, "--version"],
+                    0,
+                    stdout=f"pylint {gate.PYLINT_VERSION}\n",
+                ),
+            ]
+            self.assertEqual(gate.resolve_pylint(), [path_pylint])
+            which.assert_called_once_with("pylint")
+            self.assertEqual(
+                run.call_args_list,
+                [
+                    unittest.mock.call(
+                        [sys.executable, "-m", "pylint", "--version"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=10,
+                    ),
+                    unittest.mock.call(
+                        [path_pylint, "--version"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=10,
+                    ),
+                ],
+            )
+
+    def test_interpreter_oserror_and_missing_path_falls_back_to_uvx(self) -> None:
+        """Fall back to pinned uvx when interpreter probe raises OSError and PATH has no Pylint."""
+        with (
+            patch.object(gate.shutil, "which", side_effect=[None, "/usr/bin/uvx"]) as which,
+            patch.object(
+                gate.subprocess, "run", side_effect=OSError("no interpreter pylint")
+            ) as run,
+        ):
+            self.assertEqual(
+                gate.resolve_pylint(),
+                ["/usr/bin/uvx", "--from", f"pylint=={gate.PYLINT_VERSION}", "pylint"],
+            )
+            run.assert_called_once_with(
+                [sys.executable, "-m", "pylint", "--version"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                which.call_args_list,
+                [
+                    unittest.mock.call("pylint"),
+                    unittest.mock.call("uvx"),
+                ],
+            )
 
 
 class GateInvocationTest(unittest.TestCase):
