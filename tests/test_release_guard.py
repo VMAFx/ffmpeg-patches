@@ -160,6 +160,19 @@ class SignerTest(unittest.TestCase):
             ],
         )  # fmt: skip
 
+    def test_test_key_arguments_are_offline_key_only(self) -> None:
+        """The test-key path passes only the key and insecure-ignore-tlog."""
+        args = release_guard.parse_args(["verify", "S", "S.json", "--test-key", "k.pub"])
+        self.assertEqual(
+            release_guard.cosign_arguments(args),
+            [
+                "cosign", "verify-blob", "--bundle", "S.json",
+                "--key", "k.pub",
+                "--insecure-ignore-tlog=true",
+                "S",
+            ],
+        )  # fmt: skip
+
     def test_verify_needs_exactly_one_signer(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
             for extra in ([], ["--test-key", "k.pub", "--workflow-of", "o/r", "refs/tags/v1"]):
@@ -223,6 +236,28 @@ class CosignTest(unittest.TestCase):
         status, text = self.verify("signer.pub")
         self.assertEqual(status, 1)
         self.assertIn("a.tar.gz: checksum does not match", text)
+
+    def test_verify_arguments_use_no_deprecated_flag(self) -> None:
+        """Verify blob succeeds and reports no deprecated flag warning."""
+        args = release_guard.parse_args(
+            [
+                "verify",
+                str(self.files.sums),
+                str(self.bundle),
+                "--test-key",
+                str(self.scratch / "signer.pub"),
+            ]
+        )
+        result = subprocess.run(  # nosec B603 - cosign path and arguments are test fixtures.
+            release_guard.cosign_arguments(args),
+            cwd=self.scratch,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("deprecated", result.stderr.lower())
 
 
 def step(workflow: str, name: str) -> str:
