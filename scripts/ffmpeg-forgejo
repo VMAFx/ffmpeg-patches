@@ -19,6 +19,8 @@
 #                          exits 3 when Fairy is missing or no human reviewer is requested
 #                          pr/push require a sweep for the local head; every row must be fold, follow-up: <reproducer path> or no-variant: <reason>
 #                          pr/push run only as scripts/ffmpeg-forgejo of a Git checkout, directly or through a symlink (exit 74 otherwise)
+#   ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>
+#                          lists every own open pull sharing a file with the branch diff against the fetched base; exit 77 when any, 0 when none, 1 when not proven
 #   ffmpeg-forgejo issue   <title> <body-file>
 #   ffmpeg-forgejo comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head;
@@ -344,9 +346,31 @@ print("done" if settled and aged else "none")' "$rows" "$absent_age"
   echo unknown
 }
 
-# check_pull_files NUMBER CANDIDATE-FILE: refuse when one pull shares a candidate path.
+OVERLAP_CANDIDATES=""
+OVERLAP_REF=""
+
+# overlap_cleanup: remove candidate file and delete overlap base ref without altering exit status.
+overlap_cleanup() {
+  local save_status=$?
+  if [ -n "$OVERLAP_CANDIDATES" ]; then
+    rm -f "$OVERLAP_CANDIDATES"
+    OVERLAP_CANDIDATES=""
+  fi
+  if [ -n "$OVERLAP_REF" ]; then
+    if git rev-parse --quiet --verify "$OVERLAP_REF" >/dev/null; then
+      if ! git update-ref -d "$OVERLAP_REF"; then
+        printf 'ffmpeg-forgejo: cannot delete %s.\n' "$OVERLAP_REF" >&2
+      fi
+    fi
+    OVERLAP_REF=""
+  fi
+  return "$save_status"
+}
+
+# check_pull_files NUMBER CANDIDATE-FILE: check files of one pull against candidates.
 check_pull_files() {
-  local number="$1" candidates="$2" file_page out parsed count overlap
+  local number="$1" candidates="$2" file_page out parsed count
+  local -a shared=() page_shared=()
   for ((file_page = 1; file_page <= 20; file_page++)); do
     if ! out="$(api GET "/repos/$REPO/pulls/$number/files?limit=50&page=$file_page")"; then
       printf 'ffmpeg-forgejo: cannot check files of own open pull #%s.\n' "$number" >&2
@@ -369,86 +393,174 @@ for row in rows:
 raw = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")
 candidates = {os.fsdecode(name) for name in raw if name}
 print(len(rows))
-print(json.dumps(sorted(candidates.intersection(names)), ensure_ascii=False))' \
+for name in sorted(candidates.intersection(names)):
+    print(name)' \
       "$candidates" "$file_page" <<<"$out" 2>/dev/null)"; then
       printf 'ffmpeg-forgejo: cannot parse files of own open pull #%s.\n' "$number" >&2
       return 1
     fi
     count="${parsed%%$'\n'*}"
-    overlap="${parsed#*$'\n'}"
-    [ "$count" -ne 0 ] || return 0
+    [ "$count" -gt 0 ] || break
     if [ "$file_page" -eq 20 ]; then
       printf 'ffmpeg-forgejo: own open pull #%s has more than 19 pages of files; overlap not proven absent.\n' "$number" >&2
       return 1
     fi
-    if [ "$overlap" != "[]" ]; then
-      printf 'ffmpeg-forgejo: own open pull #%s shares files with this branch: %s; use --overlap-ok %s only for a deliberate stack.\n' \
-        "$number" "$overlap" "$number" >&2
-      return 77
+    if [[ "$parsed" == *$'\n'* ]]; then
+      mapfile -t page_shared <<<"${parsed#*$'\n'}"
+      shared+=("${page_shared[@]}")
     fi
   done
+  [ "${#shared[@]}" -gt 0 ] || return 0
+  python3 -c 'import json, sys; print(json.dumps(sorted(set(sys.argv[1:])), ensure_ascii=False))' "${shared[@]}"
+  return 77
 }
 
-# check_pr_overlap BRANCH LOGIN ALLOWED-NUMBERS: refuse overlap with own open pulls.
-check_pr_overlap() {
-  local branch="$1" me="$2" allowed="$3" candidates pull_page out parsed count number encoded_me rc
-  local -a numbers
-  if ! timeout 120 git fetch --quiet --no-tags "$GIT_URL" "refs/heads/$BASE"; then
-    printf 'ffmpeg-forgejo: cannot fetch %s from %s; overlap not proven absent; no pull request opened.\n' \
-      "$BASE" "$GIT_URL" >&2
-    return 1
-  fi
-  candidates="$(mktemp)"
-  if ! git diff --no-ext-diff --no-renames --name-only -z "FETCH_HEAD...$branch" -- >"$candidates"; then
-    printf 'ffmpeg-forgejo: cannot determine files in %s relative to %s; no pull request opened.\n' \
-      "$branch" "$BASE" >&2
-    rm -f "$candidates"
-    return 1
-  fi
-  encoded_me="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
-  for ((pull_page = 1; pull_page <= 20; pull_page++)); do
-    if ! out="$(api GET "/repos/$REPO/pulls?state=open&poster=$encoded_me&limit=50&page=$pull_page")"; then
-      printf 'ffmpeg-forgejo: cannot list own open pull requests; no pull request opened.\n' >&2
-      rm -f "$candidates"
-      return 1
-    fi
-    if ! parsed="$(python3 -c 'import json, sys
+# parse_open_pulls JSON: parse number, head SHA, base ref and merge base of each open pull; "-" marks a field the forge omits; error on stderr.
+parse_open_pulls() {
+  local out="$1"
+  if ! python3 -c 'import json, sys
 rows = json.load(sys.stdin)
 if not isinstance(rows, list): raise SystemExit(1)
-numbers = []
+items = []
 for row in rows:
-    number = row.get("number") if isinstance(row, dict) else None
+    if not isinstance(row, dict): raise SystemExit(1)
+    number = row.get("number")
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise SystemExit(1)
-    numbers.append(number)
-print(len(numbers))
-print(*numbers, sep="\n")' <<<"$out" 2>/dev/null)"; then
-      printf 'ffmpeg-forgejo: cannot parse own open pull requests; no pull request opened.\n' >&2
-      rm -f "$candidates"
+    head = row.get("head")
+    sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(sha, str) or not sha:
+        raise SystemExit(1)
+    base = row.get("base")
+    ref = base.get("ref") if isinstance(base, dict) else None
+    ref = ref if isinstance(ref, str) and ref and not any(c.isspace() for c in ref) else "-"
+    merge_base = row.get("merge_base")
+    merge_base = merge_base if isinstance(merge_base, str) and merge_base.isalnum() else "-"
+    items.append(f"{number} {sha} {ref} {merge_base}")
+print(len(items))
+for item in items:
+    print(item)' <<<"$out" 2>/dev/null; then
+    printf 'ffmpeg-forgejo: cannot parse own open pull requests; overlap not proven absent.\n' >&2
+    return 1
+  fi
+}
+
+# list_open_pulls LOGIN: list open pulls oldest first as NUMBER HEAD-SHA BASE-REF MERGE-BASE lines; base.sha is left out because it moves with every base commit.
+list_open_pulls() {
+  local me="$1" pull_page out parsed count encoded_me
+  encoded_me="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$me")"
+  for ((pull_page = 1; pull_page <= 20; pull_page++)); do
+    if ! out="$(api GET "/repos/$REPO/pulls?state=open&sort=oldest&poster=$encoded_me&limit=50&page=$pull_page")"; then
+      printf 'ffmpeg-forgejo: cannot list own open pull requests; overlap not proven absent.\n' >&2
+      return 1
+    fi
+    if ! parsed="$(parse_open_pulls "$out")"; then
       return 1
     fi
     count="${parsed%%$'\n'*}"
     [ "$count" -ne 0 ] || break
     if [ "$pull_page" -eq 20 ]; then
       printf 'ffmpeg-forgejo: more than 19 pages of own open pull requests; overlap not proven absent.\n' >&2
-      rm -f "$candidates"
       return 1
     fi
-    mapfile -t numbers <<<"${parsed#*$'\n'}"
-    for number in "${numbers[@]}"; do
-      if [[ " $allowed " == *" $number "* ]]; then
-        continue
-      fi
-      if check_pull_files "$number" "$candidates"; then
-        continue
-      else
-        rc=$?
-        rm -f "$candidates"
-        return "$rc"
-      fi
-    done
+    printf '%s\n' "${parsed#*$'\n'}"
   done
-  rm -f "$candidates"
+}
+
+# report_overlap_all RECORDS...: report overlapping pulls and own-open summary.
+report_overlap_all() {
+  local record rec_num rec_shared
+  local -a sorted_records=() sorted_numbers=()
+  if [ $# -eq 0 ]; then
+    echo "own-open: none"
+    return 0
+  fi
+  mapfile -t sorted_records < <(printf '%s\n' "$@" | sort -u -n -k1,1)
+  for record in "${sorted_records[@]}"; do
+    rec_num="${record%% *}"
+    rec_shared="${record#* }"
+    sorted_numbers+=("$rec_num")
+    printf 'ffmpeg-forgejo: own open pull #%s shares files with this branch: %s; use --overlap-ok %s only for a deliberate stack.\n' \
+      "$rec_num" "$rec_shared" "$rec_num" >&2
+    printf '#%s %s\n' "$rec_num" "$rec_shared"
+  done
+  echo "own-open: ${sorted_numbers[*]}"
+  return 77
+}
+
+# prepare_overlap_candidates BRANCH: fetch base into private ref and diff candidate files.
+prepare_overlap_candidates() {
+  local branch="$1"
+  OVERLAP_REF="refs/ffmpeg-forgejo/overlap-base-$$"
+  trap overlap_cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  if ! timeout 120 git fetch --quiet --no-tags --no-write-fetch-head "$GIT_URL" "+refs/heads/$BASE:$OVERLAP_REF"; then
+    printf 'ffmpeg-forgejo: cannot fetch %s from %s; overlap not proven absent.\n' "$BASE" "$GIT_URL" >&2
+    overlap_cleanup
+    return 1
+  fi
+  OVERLAP_CANDIDATES="$(mktemp)"
+  if ! git diff --no-ext-diff --no-renames --name-only -z "$OVERLAP_REF...$branch" -- >"$OVERLAP_CANDIDATES"; then
+    printf 'ffmpeg-forgejo: cannot determine files in %s relative to %s; overlap not proven absent.\n' \
+      "$branch" "$BASE" >&2
+    overlap_cleanup
+    return 1
+  fi
+}
+
+# check_pr_overlap BRANCH LOGIN ALLOWED-NUMBERS [MODE]: refuse overlap with own open pulls.
+check_pr_overlap() {
+  local branch="$1" me="$2" allowed="$3" mode="${4:-first}"
+  local round line number shared rc snapshot_a snapshot_b
+  local -a lines=() numbers=() overlapping_records=()
+  prepare_overlap_candidates "$branch" || return 1
+  for ((round = 1; round <= 3; round++)); do
+    if ! snapshot_a="$(list_open_pulls "$me")"; then
+      overlap_cleanup
+      return 1
+    fi
+    overlapping_records=()
+    numbers=()
+    if [ -n "$snapshot_a" ]; then
+      mapfile -t lines <<<"$snapshot_a"
+      for line in "${lines[@]}"; do
+        [ -n "$line" ] || continue
+        number="${line%% *}"
+        numbers+=("$number")
+        [[ " $allowed " == *" $number "* ]] && continue
+        if shared="$(check_pull_files "$number" "$OVERLAP_CANDIDATES")"; then rc=0; else rc=$?; fi
+        if [ "$rc" -eq 77 ]; then
+          if [ "$mode" = "first" ]; then
+            printf 'ffmpeg-forgejo: own open pull #%s shares files with this branch: %s; use --overlap-ok %s only for a deliberate stack.\n' \
+              "$number" "$shared" "$number" >&2
+            overlap_cleanup
+            return 77
+          fi
+          overlapping_records+=("$number $shared")
+          continue
+        elif [ "$rc" -ne 0 ]; then
+          overlap_cleanup
+          return 1
+        fi
+      done
+    fi
+    if ! snapshot_b="$(list_open_pulls "$me")"; then
+      overlap_cleanup
+      return 1
+    fi
+    if [ "$snapshot_a" = "$snapshot_b" ]; then
+      if [ "$mode" = "first" ]; then
+        overlap_cleanup
+        return 0
+      fi
+      rc=0
+      report_overlap_all "${overlapping_records[@]}" || rc=$?
+      overlap_cleanup
+      return "$rc"
+    fi
+  done
+  printf 'ffmpeg-forgejo: own open pull requests changed during 3 overlap checks; overlap not proven absent.\n' >&2
+  overlap_cleanup
+  return 1
 }
 
 # parse_page_size: parse max_response_items from /settings/api JSON on stdin.
@@ -1083,7 +1195,11 @@ for i in json.load(sys.stdin):
     [ -f "$3" ] || die "no body file $3"
     is_login "$BOT_REVIEWER" || die "not a login: $BOT_REVIEWER"
     me="$(login)"
-    check_pr_overlap "$1" "$me" "$overlap_ok"
+    if check_pr_overlap "$1" "$me" "$overlap_ok" first; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+      printf 'ffmpeg-forgejo: no pull request opened.\n' >&2
+      exit "$rc"
+    fi
     require_swept_fork_head "$me" "$1"
     body="$(mktemp)"
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
@@ -1106,6 +1222,26 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
       printf 'ffmpeg-forgejo: #%s has no requested human reviewer; pick from MAINTAINERS and git log on the touched files, then: ffmpeg-forgejo reviewers %s <login>...\n' "$n" "$n" >&2
       exit 3
     fi
+    ;;
+  overlap)
+    usage='overlap [--overlap-ok <number>]... <branch>'
+    overlap_ok=""
+    overlap_argc=$#
+    for ((overlap_i = 0; overlap_i < overlap_argc; overlap_i++)); do
+      case "${1:-}" in
+        --overlap-ok)
+          [ $# -ge 2 ] || usage_error "$usage"
+          [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage_error "$usage"
+          overlap_ok+=" $2"; shift 2 ;;
+        --*) usage_error "$usage" ;;
+        *) break ;;
+      esac
+    done
+    [ $# -eq 1 ] || usage_error "$usage"
+    me="$(login)"
+    rc=0
+    check_pr_overlap "$1" "$me" "$overlap_ok" all || rc=$?
+    exit "$rc"
     ;;
   issue)
     [ $# -eq 2 ] || die "usage: issue <title> <body-file>"

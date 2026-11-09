@@ -198,3 +198,18 @@ rules:
           metavariable: $EMPTY
           regex: ^(\[\]|\{\}|\(\)|set\(\)|""|''|0)$
 
+  # shellcheck does not flag reading $? inside a negated if (pull request 248 review, 2026-11-08).
+  # Anchored at line start (no comments or strings); ";" or a newline before then; elif too.
+  # Whitespace and whole comments may sit before and after then; a comment naming $? is no read.
+  - id: negated-if-status-read
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      $? inside "if ! cmd; then" is the status of the negation (0), not of cmd;
+      write "if cmd; then rc=0; else rc=$?; fi".
+    paths:
+      include:
+        - "*.sh"
+        - /scripts/ffmpeg-forgejo
+    pattern-regex: '(?m)^[ \t]*(?:el)?if[ \t]+![ \t][^\n;]*[;\n](?:\s|#[^\n]*\n)*then(?:\s|#[^\n]*\n)+(?:local\s+)?\w+=\$\?'
+
