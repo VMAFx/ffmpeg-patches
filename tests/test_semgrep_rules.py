@@ -137,8 +137,13 @@ import subprocess
 from subprocess import PIPE, Popen
 
 
-def helper(proc, deadline):
+def read_helper_output(proc, deadline):
     \"\"\"Simulate helper reading process pipe until deadline.\"\"\"
+    pass
+
+
+def log_process(target):
+    \"\"\"Simulate a helper that records the process and reads no pipe.\"\"\"
     pass
 
 
@@ -193,11 +198,25 @@ def case_flagged_process_asserted_after_wait(self):
     self.assertIsNotNone(proc)
 
 
+def case_flagged_unrelated_helper():
+    \"\"\"Flagged: process passed to a helper that does not read its pipes.\"\"\"
+    proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+    log_process(proc)
+    proc.wait(timeout=10)
+
+
+def case_flagged_unrelated_helper_on_pipe():
+    \"\"\"Flagged: pipe passed to a helper that does not read it.\"\"\"
+    proc = subprocess.Popen(["ls"], stderr=subprocess.PIPE)
+    log_process(proc.stderr)
+    proc.wait(timeout=10)
+
+
 def case_ok_pipe_read_by_helper():
     \"\"\"OK: pipe read by helper before wait in finally.\"\"\"
     proc = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
     try:
-        helper(proc, 10.0)
+        read_helper_output(proc, 10.0)
     finally:
         proc.wait(timeout=5)
         proc.stdout.close()
