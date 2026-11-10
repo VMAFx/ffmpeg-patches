@@ -87,6 +87,31 @@ SUBSTITUTION_TOP = {
     "f4-dot-redirect-cd-subst": (". ./cdsub.sh >/dev/null ; x=$(bash inner.sh)", "refuse"),
     "f4-path-dot-cd-subst": ("/bin/true ; . ./cdsub.sh ; x=$(bash inner.sh)", "refuse"),
 }
+EVAL_TOP = {
+    "e1-eval-dot-cd-subst": ("eval . ./cdsub.sh ; x=$(bash inner.sh)", "refuse"),
+    "e2-eval-dq-cd-subst": ('eval "cd sub" ; x=$(bash inner.sh)', "refuse"),
+    "e3-eval-sq-cd-subst": ("eval 'cd sub' ; x=$(bash inner.sh)", "refuse"),
+    "e4-eval-dq-dot-subst": ('eval "true; . ./cdsub.sh" ; x=$(bash inner.sh)', "refuse"),
+    "e5-eval-cd-bare-subst": ("eval cd sub ; x=$(bash inner.sh)", "refuse"),
+    "e6-eval-sq-cd-then-bash": ("eval 'cd sub' ; bash inner.sh", "refuse"),
+    "e7-eval-dot-cd-then-bash": ("eval . ./cdsub.sh ; bash inner.sh", "refuse"),
+    "e8-builtin-eval-dot-subst": ("builtin eval . ./cdsub.sh ; x=$(bash inner.sh)", "refuse"),
+    "e9-command-eval-cd-subst": ("command eval 'cd sub' ; x=$(bash inner.sh)", "refuse"),
+    "e10-nested-eval-cd": ("eval 'eval \"cd sub\"' ; bash inner.sh", "refuse"),
+    "e11-eval-unknown-text": ("X='cd sub'; eval \"$X\" ; bash inner.sh", "refuse"),
+    "e12-eval-backquote-text": ("eval `echo cd sub` ; bash inner.sh", "refuse"),
+    "e13-eval-pushd": ("eval 'pushd sub' ; bash inner.sh", "refuse"),
+    "e14-eval-cd-and-bash": ("eval 'cd sub' && bash inner.sh", "refuse"),
+    "e15-eval-source-subst": ("true; eval 'source ./cdsub.sh'; x=$(bash inner.sh)", "refuse"),
+    "e16-eval-body-cd-then-bash": ("eval 'cd sub; bash inner.sh'", "refuse"),
+    "a1-eval-echo-subst": ("eval echo hi ; x=$(bash inner.sh)", "allow"),
+    "a2-eval-sq-echo-bash": ("eval 'echo hi' ; bash inner.sh", "allow"),
+    "a3-eval-body-bash-then-cd": ("eval 'bash inner.sh; cd sub'", "allow"),
+    "a4-trap-dot-subst": ("trap '. ./cdsub.sh' EXIT ; x=$(bash inner.sh)", "allow"),
+    "a5-eval-ls-dot-bash": ("eval 'ls .' ; bash inner.sh", "allow"),
+    "a6-bash-then-eval-cd": ("bash inner.sh ; eval 'cd sub'", "allow"),
+    "a7-echo-eval-word-subst": ("echo eval cd ; x=$(bash inner.sh)", "refuse"),
+}
 
 
 class TestRawConfigureSource(RawConfigureGuardBase):
@@ -208,6 +233,30 @@ class TestRawConfigureSource(RawConfigureGuardBase):
                 result = self._run(command)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("source option the guard does not follow: -p", result.stderr)
+                self.assertFalse(self.marker.exists())
+
+    def test_eval_directory_change_reaches_later_stages(self) -> None:
+        """Replay every r15 top-level eval verdict without executing fixture scripts."""
+        self._setup_sources()
+        self.assertEqual(len(EVAL_TOP), 23)
+        for name, (command, want) in EVAL_TOP.items():
+            with self.subTest(shape=name):
+                result = self._run(command)
+                self.assertEqual(result.returncode, 2 if want == "refuse" else 0, result.stderr)
+                if want == "refuse":
+                    self.assertIn("relative script path after cd", result.stderr)
+                self.assertFalse(self.marker.exists())
+
+    def test_eval_body_keeps_state_before_eval(self) -> None:
+        """Keep eval entry state while tracking directory changes inside its queued body."""
+        self._setup_sources()
+        for name in ("a3-eval-body-bash-then-cd", "e16-eval-body-cd-then-bash"):
+            command, want = EVAL_TOP[name]
+            with self.subTest(shape=name):
+                result = self._run(command)
+                self.assertEqual(result.returncode, 2 if want == "refuse" else 0, result.stderr)
+                if want == "refuse":
+                    self.assertIn("relative script path after cd", result.stderr)
                 self.assertFalse(self.marker.exists())
 
     def test_source_literal_script_operand(self) -> None:

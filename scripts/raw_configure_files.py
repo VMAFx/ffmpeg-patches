@@ -22,6 +22,8 @@ relative script paths. Slash-less source operands are searched in the first 64 P
 source options other than -- (bash 5.3 -p included) are refused.
 A script path from a variable assigned in a sourced file and in its caller or another sourced
 file refuses. Any source command marks later command substitutions as after a directory change.
+An eval whose text holds $, a backquote, a directory change or another eval marks later
+relative script paths and command substitutions as after a directory change.
 """
 
 from __future__ import annotations

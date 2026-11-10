@@ -313,6 +313,8 @@ def _inspect_stage_interpreter(
         blocked, to_queue, changed = _inspect_shell_or_eval(
             words, cmd_idx, stdin_prog, assignments, file_ctx
         )
+        if name == "eval":
+            changed = _eval_text_changes_directory(words[cmd_idx + 1 :], assignments)
         return True, blocked, to_queue, changed
     return False, None, None, False
 
@@ -368,7 +370,7 @@ def _inspect_stage(
             if blocked is not None:
                 return blocked
             if to_queue is not None:
-                pending.append((to_queue, depth + 1, active_dir[0]))
+                pending.append((to_queue, depth + 1, stage_dir_changed))
             return None
         cmd_word = _substitute_literals(words[cmd_idx], assignments)
         prog_blocked = _check_program_path(cmd_word, session_cwd, stage_dir_changed, files_read)
@@ -395,16 +397,43 @@ def _inspect_pipeline(
     return None
 
 
-def _stage_changes_substitution_directory(stage: list[str], assignments: dict[str, str]) -> bool:
-    """Keep directory tokens conservative and count source only in command position."""
+def _stage_directory_change_kind(stage: list[str], assignments: dict[str, str]) -> str | None:
+    """Classify directory tokens and source or eval command positions without reading eval text."""
     if any(os.path.basename(token) in ("cd", "pushd", "popd") for token in stage):
-        return True
+        return "cd"
     words, _ = _strip_redirections(stage)
     idx = _unwrap_command(words, 0)
-    return idx < len(words) and os.path.basename(_substitute_literals(words[idx], assignments)) in (
-        "source",
-        ".",
+    if idx >= len(words):
+        return None
+    name = os.path.basename(_substitute_literals(words[idx], assignments))
+    return name if name in ("source", ".", "eval") else None
+
+
+def _eval_text_changes_directory(words: list[str], assignments: dict[str, str]) -> bool:
+    """Scan eval text once and conservatively mark unknown text or nested eval as changes."""
+    text = " ".join(words)
+    if "$" in text or "`" in text:
+        return True
+    tokenized = _tokenize_command(text)
+    if tokenized is None:
+        return True
+    pipelines, text_assignments, _, _ = tokenized
+    text_assignments = {**assignments, **text_assignments}
+    return any(
+        _stage_directory_change_kind(stage, text_assignments) is not None
+        for pipeline in pipelines
+        for stage in pipeline
     )
+
+
+def _stage_changes_substitution_directory(stage: list[str], assignments: dict[str, str]) -> bool:
+    """Track eval text changes while keeping source commands and directory tokens conservative."""
+    kind = _stage_directory_change_kind(stage, assignments)
+    if kind != "eval":
+        return kind is not None
+    words, _ = _strip_redirections(stage)
+    idx = _unwrap_command(words, 0)
+    return _eval_text_changes_directory(words[idx + 1 :], assignments)
 
 
 def _inspect(command: str, cwd: Path | None = None) -> Path | None:
