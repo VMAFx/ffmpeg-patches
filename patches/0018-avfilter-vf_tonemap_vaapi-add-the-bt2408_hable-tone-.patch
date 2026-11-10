@@ -72,7 +72,7 @@ index 4ef76ab4ae0421a98fdeca15cb0e14c28d23d66b..88505736fe1ce8aea06bc0f88c54843d
  @example
  tonemap_vaapi=format=p010:t=bt2020-10
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 047d0f1edb043efff9019ebe2f38f0aea4518558..a29004c0418e9f9d55d96d11ec7b365e26e84eca 100644
+index c19c8fe7f03c4d90c2a0e79d4d39b90c02876480..c55489d026f5887ee619278cd3e018d4c7698384 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -542,7 +542,7 @@ OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o bt2408_hable.o

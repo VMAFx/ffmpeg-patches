@@ -53,7 +53,7 @@ index 0f8ed156bbc8b1a91ed0e6c3cd6cb300e3d63509..5dcee2e40e205aad7526c74409e8f71f
  Output software pixel format of the hardware frames. Can be @code{nv12} or
  @code{p010}. Default is @code{nv12}.
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 8d072e272d6e5e1a50f856420202cb6f0084a47a..befe94a5566dcd8cfd4de33113486a710873745c 100644
+index 38ba72ae2ac80b3a03b8f4c7a8131cee642358e4..a8e9bc59e7305f19912b413c03367724f1f12d4c 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -543,7 +543,7 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2

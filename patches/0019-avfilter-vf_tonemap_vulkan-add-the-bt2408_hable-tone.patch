@@ -87,7 +87,7 @@ index 88505736fe1ce8aea06bc0f88c54843d646bdfb9..a9241fab5cf2af6ca2d11557e92c570d
  
  Transpose rows with columns in the input video and optionally flip it.
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index a29004c0418e9f9d55d96d11ec7b365e26e84eca..2d10cdb28f1221d17f3b808cda486af4a1adf856 100644
+index c55489d026f5887ee619278cd3e018d4c7698384..a92d14256431511c5f0c609eff2bd8783a531908 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -543,6 +543,7 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2
