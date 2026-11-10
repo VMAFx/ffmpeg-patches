@@ -225,7 +225,10 @@ its master_form on the last of them; the earlier ones report in-master-form
 and are included only if that form applies. A recorded `upstream_commit`
 that is an ancestor of the tested master reports the patch as upstream without
 applying it; a missing commit fails the run because its history cannot be
-checked. A `release_only` patch is reported as `release-only` and not applied.
+checked. In a shallow tree, a recorded `upstream_commit` that is present but
+not an ancestor of the tested master also fails the run, because the shallow
+boundary can hide its ancestry; fetch the full history and rerun.
+A `release_only` patch is reported as `release-only` and not applied.
 Other patches use the series form. The run reports drop candidates and
 fails on any conflict or tool error. Applying without `--master-forms`,
 including consumer and CI runs with `--expect-base`, uses only the
