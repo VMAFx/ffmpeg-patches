@@ -21,7 +21,7 @@ env:
   # The Praetor engine of this repository. No job here runs it: the local hooks
   # and `make verify-all` read this pin through .config/lefthook/engine.sh, so
   # a newer praetorctl on a workstation cannot change what the gates decide.
-  PRAETOR_REF: 7798f7767ba294dd674a4abe78428f653565c5de
+  PRAETOR_REF: a6fc702c3b00d97bebeb99fc52900cf2fb259865
 
 concurrency:
   # In a called run the context is the caller's, so the workflow name keeps a
