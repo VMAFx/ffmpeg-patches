@@ -126,7 +126,7 @@ index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..6fc2a91fd538858ccbcc73650ef61e82
  @section hwdownload
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index befe94a5566dcd8cfd4de33113486a710873745c..47de46104fb95e1ae3fbf10933c3013a0b5a9df9 100644
+index a8e9bc59e7305f19912b413c03367724f1f12d4c..432925008767032edb80d215a61dd48146bf96ab 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -346,7 +346,8 @@ OBJS-$(CONFIG_HFLIP_FILTER)                  += vf_hflip.o
