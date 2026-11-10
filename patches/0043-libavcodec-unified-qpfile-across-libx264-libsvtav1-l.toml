@@ -1,6 +1,6 @@
 status = "submitted"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875"
-master_form = { base = "681025faf1add6567b1f97d2f1037d0e764afd0f", head = "ee4d3d9579402e069816fc6409b1d50e4c32ed8f" }
+master_form = { base = "681025faf1add6567b1f97d2f1037d0e764afd0f", head = "a296bf1829878eff5f93d2aae84a61be958ca035" }
 consumers = ["vmafx"]
 origin = "the VMAFx vmaf-tune workflow, which needs one per-frame QP-offset file format shared across the libx264, libsvtav1 and libaom encoders"
 notes = """
@@ -11,8 +11,11 @@ so each encoder adapter maps it into its native ROI or per-block QP-offset API. 
 libx264 uses the shared parser and adds per-MB offsets through \
 x264_picture_t prop.quant_offsets (only when aq-mode is not 0); frame_type and \
 baseline_qp are parsed but no adapter applies them. libsvtav1 and libaom use the \
-shared parser directly. Offsets are x264 QP units, while SVT-AV1 seg_qp and \
-libaom delta_q are AV1 qindex deltas, so the same value is weaker on AV1.
+shared parser directly. All three adapters pass the offsets unchanged: x264 \
+reads them as QP deltas, SVT-AV1 seg_qp as quantizer index deltas, and libaom \
+delta_q as deltas on its 0..63 quantizer scale (libaom turns 12 into 48), so \
+this patch's comment that the same value is weaker on both AV1 encoders holds \
+for SVT-AV1 only.
 
 libaom requires one-pass encoding with -usage realtime and -cpu-used >= 7 (7 \
 or 8); two-pass encoding is refused because libaom ignores ROI maps otherwise. \
@@ -21,13 +24,22 @@ while header-only records clear ROI offsets from that frame onward.
 
 Generic: carries no VMAFx or vmaf-tune identifiers and no downstream ADR \
 references. Sent upstream as FFmpeg pull request 25875 on 2026-11-08, one \
-commit per encoder (libaomenc, libsvtav1, libx264). Its head adds what this \
-patch does not carry yet: a configure check that limits the libaom qpfile to \
-libaom 3.13.0 or newer (older libaom refuses it with ENOSYS), a libaom \
-refusal of lag-in-frames other than 0, libx264 refusals without adaptive \
-quantization (constant QP, or aq-mode 0 or aq-strength 0 without mbtree, where \
-this patch refuses aq-mode 0 only) and with interlaced encoding, and the \
-qpfile entries in doc/encoders.texi."""
+commit per encoder (libaomenc, libsvtav1, libx264). Its head a296bf1829 adds \
+what this patch does not carry yet: a configure check that limits the libaom \
+qpfile to libaom 3.13.0 or newer (older libaom refuses it with ENOSYS); a \
+libaom refusal of lag-in-frames other than 0; a libaom speed check that also \
+reads cpu-used set through aom-params; libx264 refusals without adaptive \
+quantization (constant QP, or aq-mode 0 or aq-strength 0 without mbtree, \
+where this patch refuses aq-mode 0 only) and with interlaced or \
+fake-interlaced encoding; a libsvtav1 refusal of bitrate rate control; a \
+libsvtav1 segment palette in descending order that reserves a 0 slot when \
+every value is negative; one palette for both AV1 adapters that keeps \
+distinct values when they fit; a 25-entry offset-to-segment table for the \
+libaom map, rebuilt only when the active record changes; files with only \
+header lines accepted; NUL bytes refused, blank and # lines skipped anywhere, \
+and line-numbered parse errors; frame indexes parsed as int64 up to UINT_MAX; \
+per-encoder offset units and the qpfile entries in doc/encoders.texi; and a \
+fate-qpfile-parser test."""
 
 [[exceptions]]
 rule = "HISS-04"
