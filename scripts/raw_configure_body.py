@@ -40,6 +40,9 @@ MAX_SCRIPT_FILES = 16
 MAX_PROGRAM_PEEKS = 1024
 MAX_BODY_NODES = 4 * MAX_SCRIPT_BYTES
 MAX_INLINE_BODIES = 256
+AMBIGUOUS_SCRIPT_PATH = (
+    "script path from a variable assigned in a sourced file and elsewhere; use one assignment"
+)
 STRUCTURE = frozenset(
     [
         "program",
@@ -141,6 +144,9 @@ class InspectionContext(NamedTuple):
     files_read: list[int]
     classifier: Callable[[list[str]], Path | None]
     script_dir: Path | None = None
+    source_reader: Callable[[str, bool, InspectionContext, list[str]], list[str] | str] | None = (
+        None
+    )
 
 
 @dataclass
@@ -159,10 +165,14 @@ class _Scan:
     context: InspectionContext
     budget: BodyBudget
     dir_changed: bool = False
+    source_unknown: bool = False
     candidates: list[tuple[str, bool, bool]] = field(default_factory=list)
     filtered: list[tuple[str, bool, bool]] = field(default_factory=list)
     cd_targets: list[str] = field(default_factory=list)
     literals: dict[str, str] = field(default_factory=dict)
+    assigned: set[str] = field(default_factory=set)
+    ambiguous: set[str] = field(default_factory=set)
+    source_literals: dict[int, tuple[dict[str, str], set[str]]] = field(default_factory=dict)
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
 
@@ -204,9 +214,38 @@ def _candidate_allowed(operand: str) -> bool:
 
 def _record_candidate(operand: str, is_program: bool, scan: _Scan) -> None:
     """Preserve the directory state at each concrete candidate's encounter."""
+    if _ambiguous_reference(operand, scan):
+        scan.refusal = AMBIGUOUS_SCRIPT_PATH
+        return
+    if _unknown_source_relative(operand, is_program, scan):
+        scan.refusal = (
+            "relative script path after a source the guard cannot read; use an absolute path"
+        )
+        return
     if _candidate_allowed(operand):
         changed = scan.dir_changed and not os.path.isabs(operand) and not operand.startswith("~")
         scan.candidates.append((operand, is_program, changed))
+
+
+def _ambiguous_reference(word: str, scan: _Scan) -> bool:
+    """Recognize exact simple or braced references to ambiguous assignment names."""
+    return any(
+        re.search(
+            r"\$(?:\{" + re.escape(name) + r"\}|" + re.escape(name) + r"(?![A-Za-z0-9_]))", word
+        )
+        is not None
+        for name in scan.ambiguous
+    )
+
+
+def _unknown_source_relative(operand: str, is_program: bool, scan: _Scan) -> bool:
+    """Identify relative file operands whose base an unread source may have changed."""
+    return (
+        scan.source_unknown
+        and not os.path.isabs(operand)
+        and not operand.startswith("~")
+        and (not is_program or "/" in operand)
+    )
 
 
 def _record_directory(words: list[str], idx: int, scan: _Scan) -> None:
@@ -223,14 +262,17 @@ def _record_directory(words: list[str], idx: int, scan: _Scan) -> None:
     scan.dir_changed = True
 
 
-def _queue_inline(body: str, scan: _Scan) -> None:
+def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     """Queue an inline syntax tree or record an explicit shared-budget refusal."""
     if scan.budget.inline_bodies >= MAX_INLINE_BODIES:
         scan.refusal = "more than 256 inline shell bodies"
         return
     scan.budget.inline_bodies += 1
     raw = body.encode("utf-8", "surrogateescape")
-    scan.stack.append((bash_parser().parse(raw).root_node, raw, False))
+    root = bash_parser().parse(raw).root_node
+    if source:
+        scan.source_literals[id(root)] = _literal_map(root, raw, scan.budget)
+    scan.stack.append((root, raw, False))
 
 
 def _file_target(target: str | None, scan: _Scan) -> str | None:
@@ -454,17 +496,56 @@ def _shell_command(
 ) -> str | None:
     """Inspect shell inline programs, file operands and redirected process inputs."""
     if source:
-        target, inline = words[1] if len(words) > 1 else None, False
+        target, refusal = _source_operand(words[1:])
+        if refusal is not None:
+            return refusal
+        inline = False
     else:
         target, inline = _shell_argument(words)
     if inline:
         if target is not None:
             _queue_inline(target, scan)
         return None
-    return _shell_inputs(node, raw, target, scan)
+    return _shell_inputs(node, raw, target, scan, source=source)
 
 
-def _shell_inputs(node: Any, raw: bytes, target: str | None, scan: _Scan) -> str | None:
+def _source_operand(words: list[str]) -> tuple[str | None, str | None]:
+    """Allow one leading double dash and refuse every other source option word."""
+    idx = 1 if words and words[0] == "--" else 0
+    if idx >= len(words):
+        return None, None
+    if idx == 0 and words[idx].startswith("-"):
+        return None, f"source option the guard does not follow: {words[idx]}"
+    return words[idx], None
+
+
+def _source_target(target: str | None, scan: _Scan) -> str | None:
+    """Inline readable source texts into the caller and mark unresolved directories unknown."""
+    if target is None or _ambiguous_reference(target, scan):
+        if target is not None:
+            scan.refusal = AMBIGUOUS_SCRIPT_PATH
+        return None
+    if _configure_reference(target):
+        return target
+    if _unknown_source_relative(target, False, scan):
+        return "relative script path after a source the guard cannot read; use an absolute path"
+    reader = scan.context.source_reader
+    if not _candidate_allowed(target) or reader is None:
+        _record_candidate(target, False, scan)
+        scan.dir_changed = scan.source_unknown = True
+        return None
+    changed = scan.dir_changed and not os.path.isabs(target) and not target.startswith("~")
+    texts = reader(target, changed, scan.context, scan.cd_targets)
+    if isinstance(texts, str):
+        return texts
+    for text in reversed(texts):
+        _queue_inline(text, scan, source=True)
+    return None
+
+
+def _shell_inputs(
+    node: Any, raw: bytes, target: str | None, scan: _Scan, *, source: bool = False
+) -> str | None:
     """Inspect a shell's process substitutions and plain redirected input filenames."""
     children = node.named_children
     for i in range(len(children)):
@@ -484,7 +565,7 @@ def _shell_inputs(node: Any, raw: bytes, target: str | None, scan: _Scan) -> str
                 return hit
         elif target is None and dest.type == "word":
             target = _text(dest, raw)
-    return _file_target(target, scan)
+    return _source_target(target, scan) if source else _file_target(target, scan)
 
 
 def _data_hit(text: str) -> str | None:
@@ -593,7 +674,7 @@ def _ordinary_command(words: list[str], idx: int, scan: _Scan) -> str | None:
         hit = _later_operands(words, idx, scan)
         if hit is not None:
             return hit
-    if "/" in word or _program_name_allowed(word):
+    if "/" in word or _program_name_allowed(word) or _ambiguous_reference(word, scan):
         _record_candidate(word, True, scan)
     if name in ("cd", "pushd", "popd"):
         _record_directory(words, idx, scan)
@@ -767,10 +848,11 @@ def _visit_semantics(
     return hit, children
 
 
-def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> dict[str, str]:
-    """Collect unique statement assignments with a bounded iterative syntax walk."""
+def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> tuple[dict[str, str], set[str]]:
+    """Collect unique literals and all assigned names with one bounded syntax walk."""
     stack = [root]
     assignments = []
+    assigned = set()
     for _ in range(MAX_BODY_NODES):
         if not stack or budget.nodes >= MAX_BODY_NODES:
             break
@@ -779,13 +861,35 @@ def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> dict[str, str]:
         if node.type == "variable_assignment" and node.parent.type != "command":
             value = node.child_by_field_name("value")
             if value is None or value.type != "array":
-                assignments.append(_text(node, raw))
+                assignment = _text(node, raw)
+                assignments.append(assignment)
+                name = assignment.split("=", 1)[0]
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    assigned.add(name)
         stack.extend(reversed(node.named_children))
-    return _find_literal_assignments(assignments)
+    return _find_literal_assignments(assignments), assigned
+
+
+def _merge_source_literals(node: Any, scan: _Scan) -> None:
+    """Merge sourced assignments at entry while permanently removing conflicting names."""
+    literals, assigned = scan.source_literals.pop(id(node), ({}, set()))
+    for name in assigned:
+        if name in scan.ambiguous:
+            continue
+        value = literals.get(name)
+        if name in scan.assigned and (value is None or scan.literals.get(name) != value):
+            scan.literals.pop(name, None)
+            scan.ambiguous.add(name)
+        elif value is not None:
+            scan.literals[name] = value
+    scan.assigned.update(assigned)
 
 
 def scan_body(
-    body: str, context: InspectionContext, budget: BodyBudget
+    body: str,
+    context: InspectionContext,
+    budget: BodyBudget,
+    directory_state: list[bool] | None = None,
 ) -> tuple[str | None, list[tuple[str, bool, bool]], list[str], list[tuple[str, bool, bool]]]:
     """Walk a file and inline bodies with one bounded stack and shared node accounting."""
     parser = bash_parser()
@@ -794,14 +898,17 @@ def scan_body(
     raw = body.encode("utf-8", "surrogateescape")
     scan = _Scan(context, budget, dir_changed=context.directory_changed)
     root = parser.parse(raw).root_node
-    scan.literals = _literal_map(root, raw, budget)
+    scan.literals, scan.assigned = _literal_map(root, raw, budget)
     scan.stack.append((root, raw, False))
     for _ in range(MAX_BODY_NODES):
         if not scan.stack:
+            if directory_state is not None:
+                directory_state[0] = scan.dir_changed
             return None, scan.candidates, scan.cd_targets, scan.filtered
         if budget.nodes >= MAX_BODY_NODES:
             return "shell syntax tree larger than inspect limit", [], [], []
         node, source, mode = scan.stack.pop()
+        _merge_source_literals(node, scan)
         budget.nodes += 1
         hit = _visit(node, source, mode, scan)
         if hit is not None or scan.refusal is not None:

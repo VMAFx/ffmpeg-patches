@@ -17,6 +17,11 @@ PATH lookup uses the hook process PATH, which can differ from the session shell 
 After cd to an unresolved directory, relative operands are matched against known bases only.
 Shell options that change globbing (nullglob, failglob) are not followed.
 Readers other than cat, head, tail and line-filter sed feeding a shell are refused, not read.
+A sourced file is read as the caller's shell text; an unresolved source operand refuses later
+relative script paths. Slash-less source operands are searched in the first 64 PATH entries.
+source options other than -- (bash 5.3 -p included) are refused.
+A script path from a variable assigned in a sourced file and in its caller or another sourced
+file refuses. Any source command marks later command substitutions as after a directory change.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import glob
 import itertools
 import os
 import re
+import shlex
 import shutil
 import stat
 import sys
@@ -486,6 +492,35 @@ def _prepare_nested(
     return result
 
 
+def _read_source(
+    operand: str, changed: bool, context: InspectionContext, cd_targets: list[str]
+) -> list[str] | str:
+    """Read bounded source candidates from PATH and the caller's known directory bases."""
+    paths = []
+    if "/" not in operand:
+        paths.extend(
+            path
+            for entry in os.get_exec_path()[:64]
+            if (path := context.cwd / entry / operand).is_file()
+        )
+    candidates = _candidate_paths(operand, changed, context, cd_targets)
+    if isinstance(candidates, Path):
+        if not paths or GLOB_CHARS.intersection(operand):
+            return str(candidates)
+    else:
+        paths.extend(candidates)
+    texts = []
+    for path in dict.fromkeys(paths):
+        result = _read_candidate_file(
+            _Candidate(str(path), False, False, True), context.cwd, context.files_read
+        )
+        if isinstance(result, Path):
+            return str(result)
+        if result is not None:
+            texts.append(result)
+    return texts
+
+
 def _nested_candidates(
     nested: list[tuple[str, bool, bool]],
     context: InspectionContext,
@@ -536,10 +571,14 @@ def _filtered_files_hit(
 
 
 def _body_candidates(
-    body: str, context: InspectionContext, budget: BodyBudget
+    body: str,
+    context: InspectionContext,
+    budget: BodyBudget,
+    directory_state: list[bool] | None = None,
 ) -> list[_Candidate] | Path:
     """Scan a body and check filtered text before preparing its nested candidates."""
-    hit, nested, cd_targets, filtered = scan_body(body, context, budget)
+    context = context._replace(source_reader=_read_source)
+    hit, nested, cd_targets, filtered = scan_body(body, context, budget, directory_state)
     if hit is not None:
         return Path(hit)
     filtered_hit = _filtered_files_hit(filtered, context, cd_targets)
@@ -548,10 +587,10 @@ def _body_candidates(
     return _nested_candidates(nested, context, cd_targets, budget)
 
 
-def inspect_script_file(operand: str, context: InspectionContext, is_program: bool) -> Path | None:
-    """Inspect ordered nested script files with explicit file, node and inline limits."""
-    worklist = [_Candidate(operand, is_program, context.directory_changed, True)]
-    budget = BodyBudget()
+def _inspect_files(
+    worklist: list[_Candidate], context: InspectionContext, budget: BodyBudget
+) -> Path | None:
+    """Drain ordered nested scripts without reentering any body or source inspection."""
     for _ in range(MAX_SCRIPT_FILES + 1):
         if not worklist:
             return None
@@ -572,5 +611,26 @@ def inspect_script_file(operand: str, context: InspectionContext, is_program: bo
             return Path(f"{cur.operand} ({candidates})")
         worklist.extend(reversed(candidates))
     if worklist:
-        return Path(f"{operand} (more nested scripts than inspect limit)")
+        return Path("more nested scripts than inspect limit")
     return None
+
+
+def inspect_script_file(operand: str, context: InspectionContext, is_program: bool) -> Path | None:
+    """Inspect ordered nested script files with explicit file, node and inline limits."""
+    return _inspect_files(
+        [_Candidate(operand, is_program, context.directory_changed, True)], context, BodyBudget()
+    )
+
+
+def inspect_sourced_file(operand: str, context: InspectionContext) -> tuple[Path | None, bool]:
+    """Inspect a source in its caller's scan and expose its final directory state."""
+    budget = BodyBudget()
+    directory_state = [context.directory_changed]
+    file_context = context._replace(script_dir=(context.cwd / operand).resolve().parent)
+    candidates = _body_candidates(
+        f". {shlex.quote(operand)}", file_context, budget, directory_state
+    )
+    if isinstance(candidates, Path):
+        return candidates, directory_state[0]
+    refusal = _inspect_files(list(reversed(candidates)), context, budget)
+    return refusal, directory_state[0]

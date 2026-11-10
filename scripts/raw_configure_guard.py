@@ -299,7 +299,7 @@ def _inspect_stage_interpreter(
     prev_stage: list[str] | None,
     stdin_prog: str | None,
     context: tuple[tuple[dict[str, str], dict[str, str]], tuple[Path, bool, list[int] | None]],
-) -> tuple[bool, Path | None, str | None]:
+) -> tuple[bool, Path | None, str | None, bool]:
     """Inspect shell, eval, or source stage and return handled status."""
     parse_ctx, file_ctx = context
     assignments, _ = parse_ctx
@@ -308,13 +308,13 @@ def _inspect_stage_interpreter(
         blocked, to_queue = _inspect_shell_stage(
             words[cmd_idx:], prev_stage, stdin_prog, parse_ctx, file_ctx
         )
-        return True, blocked, to_queue
+        return True, blocked, to_queue, False
     if name in ("eval", "source", "."):
-        blocked, to_queue = _inspect_shell_or_eval(
+        blocked, to_queue, changed = _inspect_shell_or_eval(
             words, cmd_idx, stdin_prog, assignments, file_ctx
         )
-        return True, blocked, to_queue
-    return False, None, None
+        return True, blocked, to_queue, changed
+    return False, None, None, False
 
 
 def _check_program_path(
@@ -360,10 +360,11 @@ def _inspect_stage(
     if cmd_idx < len(words):
         prev_stage = pipeline[idx - 1] if idx > 0 else None
         file_ctx = (session_cwd, stage_dir_changed, files_read)
-        handled, blocked, to_queue = _inspect_stage_interpreter(
+        handled, blocked, to_queue, source_changed = _inspect_stage_interpreter(
             words, cmd_idx, prev_stage, stdin_prog, (parse_ctx, file_ctx)
         )
         if handled:
+            active_dir[0] |= source_changed
             if blocked is not None:
                 return blocked
             if to_queue is not None:
@@ -394,6 +395,18 @@ def _inspect_pipeline(
     return None
 
 
+def _stage_changes_substitution_directory(stage: list[str], assignments: dict[str, str]) -> bool:
+    """Keep directory tokens conservative and count source only in command position."""
+    if any(os.path.basename(token) in ("cd", "pushd", "popd") for token in stage):
+        return True
+    words, _ = _strip_redirections(stage)
+    idx = _unwrap_command(words, 0)
+    return idx < len(words) and os.path.basename(_substitute_literals(words[idx], assignments)) in (
+        "source",
+        ".",
+    )
+
+
 def _inspect(command: str, cwd: Path | None = None) -> Path | None:
     """Walk bounded shell fragments and inline programs without recursion."""
     session_cwd = Path.cwd() if cwd is None else cwd
@@ -410,10 +423,9 @@ def _inspect(command: str, cwd: Path | None = None) -> Path | None:
             return UNPARSED
         pipelines, assignments, stdin_map, inners = tok_result
         inner_changed = changed or any(
-            os.path.basename(token) in ("cd", "pushd", "popd")
+            _stage_changes_substitution_directory(stage, assignments)
             for pipeline in pipelines
             for stage in pipeline
-            for token in stage
         )
         for inner in inners:
             pending.append((inner, depth + 1, inner_changed))

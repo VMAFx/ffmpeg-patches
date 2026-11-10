@@ -13,9 +13,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.raw_configure_body import _source_operand  # noqa: E402
 from scripts.raw_configure_files import (  # noqa: E402
     InspectionContext,
-    inspect_script_file,
+    inspect_sourced_file,
 )
 from scripts.raw_configure_unwrap import (  # noqa: E402
     _unwrap_command,
@@ -230,27 +231,31 @@ def _inspect_shell_or_eval(
     stdin_prog: str | None,
     assignments: dict[str, str],
     file_ctx: tuple[Path, bool, list[int] | None] | None = None,
-) -> tuple[Path | None, str | None]:
+) -> tuple[Path | None, str | None, bool]:
     """Process shell script operands, inline -c scripts, eval, and stdin programs."""
     name = os.path.basename(words[idx])
     if name in ("source", "."):
-        if idx + 1 < len(words):
-            target = _substitute_literals(words[idx + 1], assignments)
+        operand, option_refusal = _source_operand(
+            [_substitute_literals(word, assignments) for word in words[idx + 1 :]]
+        )
+        if option_refusal is not None:
+            return Path(option_refusal), None, False
+        if operand is not None:
+            target = operand
             if _is_configure_word(target) or not DECIDABLE_NAME.fullmatch(os.path.basename(target)):
-                return Path(target), None
+                return Path(target), None, False
             cwd, dir_changed, files_read = (
                 file_ctx if file_ctx is not None else (Path.cwd(), False, None)
             )
             read_tracker = files_read if files_read is not None else [0]
-            refusal = inspect_script_file(
+            refusal, changed = inspect_sourced_file(
                 target,
                 InspectionContext(cwd, dir_changed, read_tracker, classify_script_words),
-                is_program=False,
             )
-            return refusal, None
+            return refusal, None, changed
     elif name == "eval":
-        return None, " ".join(words[idx + 1 :])
-    return None, None
+        return None, " ".join(words[idx + 1 :]), False
+    return None, None, False
 
 
 def _assignment_blocked(word: str, assignments: dict[str, str]) -> bool:
