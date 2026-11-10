@@ -20,6 +20,18 @@ PYLINT_FLAGS = (
 )
 
 
+def _reports_pinned_version(candidate: list[str]) -> bool:
+    """Return whether the candidate starts and prints the pinned Pylint version line."""
+    try:
+        version = subprocess.run(  # nosec B603 - resolved tool, fixed arguments.
+            [*candidate, "--version"], capture_output=True, text=True, check=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Skip a candidate that cannot report its version.
+        return False
+    return version.stdout.splitlines()[:1] == [f"pylint {PYLINT_VERSION}"]
+
+
 def resolve_pylint() -> list[str] | None:
     """Use pinned Pylint under the active interpreter, on PATH, or via uvx."""
 
@@ -36,14 +48,8 @@ def resolve_pylint() -> list[str] | None:
         candidate = resolve_candidate()
         if candidate is None:
             continue
-        try:
-            version = subprocess.run(  # nosec B603 - resolved tool, fixed arguments.
-                [*candidate, "--version"], capture_output=True, text=True, check=True, timeout=10
-            )
-            if version.stdout.splitlines()[:1] == [f"pylint {PYLINT_VERSION}"]:
-                return candidate
-        except (OSError, subprocess.SubprocessError):
-            pass
+        if _reports_pinned_version(candidate):
+            return candidate
     uvx = shutil.which("uvx")
     if uvx:
         return [uvx, "--from", f"pylint=={PYLINT_VERSION}", "pylint"]
