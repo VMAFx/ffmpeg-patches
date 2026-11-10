@@ -58,7 +58,7 @@ index 06e09698a80ffd28c9c9b949c163976958604132..4ef76ab4ae0421a98fdeca15cb0e14c2
  
  @section unsharp_opencl
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index a2805605a15bbc934e6da2bb1ee780675c9d024d..047d0f1edb043efff9019ebe2f38f0aea4518558 100644
+index d79ee5cd47f832a633781155341bb6b270917f11..c19c8fe7f03c4d90c2a0e79d4d39b90c02876480 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -539,8 +539,9 @@ OBJS-$(CONFIG_TMEDIAN_FILTER)                += vf_xmedian.o framesync.o

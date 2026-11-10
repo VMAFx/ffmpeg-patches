@@ -89,7 +89,7 @@ index 3534c87c9be9374db14189a28324cf95efc4b576..1c29a51458b99c37b541946dc15497d4
  
  Draw a colored box on the input image.
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index c0731a5b0f31a6ed7059a47c6d6e06df1246d637..42e5e66e62fa739d5cf5a77e3078b936544dcbef 100644
+index 8423f4cddbd1c92daf93acb0908c284864c80c9c..8ae4e0a8c36002f901e5fa4a2ef548bff59ae488 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -295,6 +295,7 @@ OBJS-$(CONFIG_DNN_CLASSIFY_FILTER)           += vf_dnn_classify.o
@@ -737,10 +737,10 @@ index 0000000000000000000000000000000000000000..ce81cb39bbe891bee0a61fd3a80a0346
 +    FILTER_QUERY_FUNC2(query_formats),
 +};
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index f9413cd3b4158d6d3f22a8eff55ada479d283fca..e90e7f5ae6b97fbb016db395f5b97c0076350d46 100644
+index 84732a98a2bbfa8efcd241d81641acd715955f25..db310a856d0fee0cdd238dac6df3ddc253d172be 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
-@@ -485,6 +485,10 @@ FATE_FILTER-yes += fate-filter-dovi-reshape
+@@ -485,6 +485,10 @@ FATE_FILTER-$(CONFIG_DOVI_RESHAPE_FILTER) += fate-filter-dovi-reshape
  fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
  fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
  

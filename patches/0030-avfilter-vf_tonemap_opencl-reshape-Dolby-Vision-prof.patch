@@ -59,7 +59,7 @@ index e214440837b7de9c586a35d579a59f5ebd088a92..ec73d8b914e271c28b8fcc57ae0a1e39
  
  @section unsharp_opencl
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 9ea29b9f645a3ab08e1a130d6b392c29e65da7c7..6d9a9edb2c5d118892b3d04c6c7aef3d4373de79 100644
+index cf69310e9c5291ea27f6456d2d03743206a52a96..8df9a0343f1566740d4d51aa1a2a3e1d29c608c2 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -547,8 +547,10 @@ OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
