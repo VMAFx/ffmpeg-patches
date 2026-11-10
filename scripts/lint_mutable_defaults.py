@@ -26,8 +26,8 @@ def _reports_pinned_version(candidate: list[str]) -> bool:
         version = subprocess.run(  # nosec B603 - resolved tool, fixed arguments.
             [*candidate, "--version"], capture_output=True, text=True, check=True, timeout=10
         )
-    except (OSError, subprocess.SubprocessError):
-        # Skip a candidate that cannot report its version.
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        # Skip a candidate that cannot start, fails, times out or prints undecodable output.
         return False
     return version.stdout.splitlines()[:1] == [f"pylint {PYLINT_VERSION}"]
 

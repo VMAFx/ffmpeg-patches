@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import subprocess  # nosec B404 - fixture runner invokes the pinned local Ruff module.
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,29 +13,29 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def run_ruff_fixture(source: str) -> subprocess.CompletedProcess[str]:
-    """Write one temporary fixture and return its Ruff result."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        fixture = Path(tmp_dir) / "fixture.py"
-        fixture.write_text(source, encoding="utf-8")
-        return subprocess.run(  # nosec B603 - local module and explicit fixture path, no shell.
-            [
-                sys.executable,
-                "-m",
-                "ruff",
-                "check",
-                "--no-cache",
-                "--config",
-                str(ROOT / "ruff.toml"),
-                "--output-format",
-                "concise",
-                "--statistics",
-                str(fixture),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
+    """Return the Ruff result for one fixture source passed on stdin."""
+    return subprocess.run(  # nosec B603 - local module; source goes on stdin, no shell.
+        [
+            sys.executable,
+            "-m",
+            "ruff",
+            "check",
+            "--no-cache",
+            "--config",
+            str(ROOT / "ruff.toml"),
+            "--output-format",
+            "concise",
+            "--statistics",
+            "--stdin-filename",
+            "fixture.py",
+            "-",
+        ],
+        input=source,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
 
 
 class RuffPolicyTest(unittest.TestCase):
