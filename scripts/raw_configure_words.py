@@ -592,19 +592,30 @@ def _substitute_literals(word: str, assignments: dict[str, str]) -> str:
     return word
 
 
+def _shell_operand(
+    words: list[str], idx: int, c_seen: bool, s_seen: bool
+) -> tuple[str | None, bool]:
+    """Select the shell operand, with None indicating stdin when -c is absent."""
+    operand = words[idx] if idx < len(words) else None
+    if c_seen:
+        return operand, True
+    if s_seen:
+        return None, False
+    return operand, False
+
+
 def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
-    """Find a shell script path or its -c program string."""
+    """Find a shell path or -c string; None means the shell reads stdin."""
     idx = 1
     c_seen = False
+    s_seen = False
     for _ in range(min(len(words), MAX_TOKENS + 1)):
         if idx >= len(words):
             break
         word = words[idx]
-        if word == "--":
-            operand = words[idx + 1] if idx + 1 < len(words) else None
-            return operand, c_seen
-        if word == "-":
-            return word, c_seen
+        if word in ("--", "-"):
+            idx += 1
+            break
         if word in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
             idx += 2
             continue
@@ -617,10 +628,12 @@ def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
         if word.startswith("-"):
             if "c" in word[1:]:
                 c_seen = True
+            if "s" in word[1:]:
+                s_seen = True
             idx += 2 if word.endswith(("o", "O")) else 1
             continue
-        return word, c_seen
-    return None, c_seen
+        break
+    return _shell_operand(words, idx, c_seen, s_seen)
 
 
 def _program_name_allowed(name: str) -> bool:

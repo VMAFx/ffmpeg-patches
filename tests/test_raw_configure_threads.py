@@ -66,6 +66,21 @@ CASES = [
         "".join(f"/bin/true {i}\n" for i in range(20)) + "bash ./inner.sh\n",
     ),
     (22, "cd-then-c-relative", "refuse", "cmd", "cd build && bash -c 'bash driver.sh'"),
+    (23, "cat-pipe-bash-s", "refuse", "body", "cat inner.sh | bash -s x\n"),
+    (23, "bash-s-stdin-redirect", "refuse", "body", "bash -s x < inner.sh\n"),
+    (23, "sh-es-ddash-redirect", "refuse", "body", "sh -es -- x < inner.sh\n"),
+    (23, "bash-lone-dash-file", "refuse", "body", "bash - inner.sh\n"),
+    (23, "cat-clean-pipe-bash-s", "allow", "body", "cat clean.sh | bash -s x\n"),
+    (23, "bash-lone-dash-clean", "allow", "body", "bash - clean.sh\n"),
+    (23, "top-cat-pipe-bash-s", "refuse", "cmd", "cat inner.sh | bash -s x"),
+    (23, "top-bash-s-redirect", "refuse", "cmd", "bash -s x < inner.sh"),
+    (23, "top-cat-pipe-sh-s", "refuse", "cmd", "cat inner.sh | sh -s x"),
+    (23, "top-bash-es-ddash-redirect", "refuse", "cmd", "bash -es -- x < inner.sh"),
+    (23, "top-echo-pipe-bash-s", "refuse", "cmd", "echo '<cfg>' | bash -s x"),
+    (23, "top-bash-lone-dash-file", "refuse", "cmd", "bash - inner.sh"),
+    (23, "top-bash-lone-dash-clean", "allow", "cmd", "bash - clean.sh"),
+    (23, "top-bash-sc-echo", "allow", "cmd", "bash -sc 'echo hi' x"),
+    (23, "top-bash-cs-configure", "refuse", "cmd", "bash -cs '<cfg>' x"),
     (
         99,
         "agy-like-allow",
@@ -83,6 +98,7 @@ def setup(root: Path) -> dict[str, str]:
     (tree / "configure").write_text("#!/bin/sh\n", encoding="utf-8")
     cfg = f'"{tree}/configure" --x'
     (root / "inner.sh").write_text(cfg + "\n", encoding="utf-8")
+    (root / "clean.sh").write_text("echo benign\n", encoding="utf-8")
     (root / "sub").mkdir(exist_ok=True)
     (root / "sub" / "inner.sh").write_text(cfg + "\n", encoding="utf-8")
     (root / "cdsub.sh").write_text("cd sub\n", encoding="utf-8")
