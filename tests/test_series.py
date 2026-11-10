@@ -1144,14 +1144,16 @@ class MasterFormTest(SeriesTestCase):
                         return subprocess.CompletedProcess(args, *result)
                     return real_git(tree, *args, **kwargs)
 
-                with (
-                    unittest.mock.patch.object(series, "git", side_effect=failed_query),
-                    self.assertRaisesRegex(series.SeriesError, diagnostic or output) as error,
-                ):
-                    self.apply()
-                self.assertIn(self.fx.names[1], str(error.exception))
-                self.assertIn(self.fx.base, str(error.exception))
-                self.fx.reset(self.master)
+                try:
+                    with (
+                        unittest.mock.patch.object(series, "git", side_effect=failed_query),
+                        self.assertRaisesRegex(series.SeriesError, diagnostic or output) as error,
+                    ):
+                        self.apply()
+                    self.assertIn(self.fx.names[1], str(error.exception))
+                    self.assertIn(self.fx.base, str(error.exception))
+                finally:
+                    self.fx.reset(self.master)
         self.assert_clean()
 
     def test_unreachable_forge_fails_closed(self) -> None:

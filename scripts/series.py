@@ -985,12 +985,27 @@ def apply_one(tree: Path, patch: Path) -> str:
 
 
 def recorded_upstream(tree: Path, patch: Path, commit: str) -> bool:
+    """Check recorded upstream ancestry, rejecting inconclusive shallow history."""
     if git(tree, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
         raise SeriesError(f"{patch.name}: upstream commit {commit} not in the tested history")
     result = git(tree, "merge-base", "--is-ancestor", commit, "HEAD", check=False)
     if result.returncode not in (0, 1):
         raise SeriesError(f"{patch.name}: checking upstream commit {commit}: {result.stderr}")
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    shallow = git(tree, "rev-parse", "--is-shallow-repository", check=False)
+    if shallow.returncode or shallow.stdout.strip() not in ("true", "false"):
+        raise SeriesError(
+            f"{patch.name}: checking shallow history for upstream commit {commit}: "
+            f"stderr: {shallow.stderr}; stdout: {shallow.stdout}"
+        )
+    if shallow.stdout.strip() == "true":
+        raise SeriesError(
+            f"{patch.name}: upstream commit {commit} is not an ancestor of HEAD in a shallow "
+            "tree, where the shallow boundary can hide it; fetch the full history "
+            "(git fetch --unshallow) and rerun"
+        )
+    return False
 
 
 def fetch_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -> None:
