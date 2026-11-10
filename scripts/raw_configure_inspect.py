@@ -13,6 +13,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.raw_configure_files import (  # noqa: E402
+    inspect_script_file,
+)
 from scripts.raw_configure_unwrap import (  # noqa: E402
     _unwrap_command,
 )
@@ -251,6 +254,7 @@ def _inspect_shell_or_eval(
     idx: int,
     stdin_prog: str | None,
     assignments: dict[str, str],
+    file_ctx: tuple[Path, bool, list[int] | None] | None = None,
 ) -> tuple[Path | None, str | None]:
     """Process shell script operands, inline -c scripts, eval, and stdin programs."""
     name = os.path.basename(words[idx])
@@ -259,6 +263,12 @@ def _inspect_shell_or_eval(
             target = _substitute_literals(words[idx + 1], assignments)
             if _is_configure_word(target) or not DECIDABLE_NAME.fullmatch(os.path.basename(target)):
                 return Path(target), None
+            cwd, dir_changed, files_read = (
+                file_ctx if file_ctx is not None else (Path.cwd(), False, None)
+            )
+            read_tracker = files_read if files_read is not None else [0]
+            refusal = inspect_script_file(target, cwd, dir_changed, read_tracker, is_program=False)
+            return refusal, None
     elif name == "eval":
         return None, " ".join(words[idx + 1 :])
     return None, None

@@ -22,6 +22,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.raw_configure_files import (  # noqa: E402
+    inspect_script_file,
+)
 from scripts.raw_configure_inspect import (  # noqa: E402
     _classify_command,
     _inspect_shell_or_eval,
@@ -53,21 +56,24 @@ from scripts.raw_configure_words import (  # noqa: E402
 )
 
 
-def _input(client: str, payload: dict[str, Any]) -> str | None:
-    """Extract the documented shell command from the hook payload."""
+def _input(client: str, payload: dict[str, Any]) -> tuple[str | None, Path]:
+    """Extract documented command and session cwd from hook payload."""
+    raw_cwd = payload.get("cwd")
+    cwd = Path(raw_cwd) if isinstance(raw_cwd, str) and os.path.isabs(raw_cwd) else Path.cwd()
     if client == "opencode":
         if payload.get("tool") != "bash":
-            return None
+            return None, cwd
         arguments = payload.get("args")
     else:
         expected = "run_shell_command" if client == "gemini" else "Bash"
         if payload.get("tool_name") != expected:
-            return None
+            return None, cwd
         arguments = payload.get("tool_input")
     if not isinstance(arguments, dict):
-        return None
+        return None, cwd
     command = arguments.get("command")
-    return command if isinstance(command, str) and command else None
+    cmd_str = command if isinstance(command, str) and command else None
+    return cmd_str, cwd
 
 
 def _collect_extra_inners(
@@ -241,22 +247,39 @@ def _decide_shell_stdin(
     return Path(shell_word), None
 
 
+def _inspect_file_target(
+    target: str,
+    assignments: dict[str, str],
+    cwd: Path,
+    directory_changed: bool,
+    files_read: list[int] | None,
+) -> Path | None:
+    """Inspect a non-inline shell script operand or return a refusal Path."""
+    sub_target = _substitute_literals(target, assignments)
+    if _is_configure_word(sub_target) or not DECIDABLE_NAME.fullmatch(os.path.basename(sub_target)):
+        return Path(sub_target)
+    read_tracker = files_read if files_read is not None else [0]
+    return inspect_script_file(sub_target, cwd, directory_changed, read_tracker, is_program=False)
+
+
 def _inspect_shell_stage(
     shell_words: list[str],
     prev_stage: list[str] | None,
     stdin_prog: str | None,
-    assignments: dict[str, str],
-    stdin_map: dict[str, str],
+    context: tuple[dict[str, str], dict[str, str]],
+    file_ctx: tuple[Path, bool, list[int] | None] | None = None,
 ) -> tuple[Path | None, str | None]:
     """Inspect a shell stage for inline script, file operand, or stdin feeding."""
     target, inline = _shell_argument(shell_words)
     if inline and target is not None:
         return None, target
+    assignments, stdin_map = context
     if not inline and target is not None and target != "-":
-        target = _substitute_literals(target, assignments)
-        if _is_configure_word(target) or not DECIDABLE_NAME.fullmatch(os.path.basename(target)):
-            return Path(target), None
-        return None, None
+        cwd, directory_changed, files_read = (
+            file_ctx if file_ctx is not None else (Path.cwd(), False, None)
+        )
+        blocked = _inspect_file_target(target, assignments, cwd, directory_changed, files_read)
+        return blocked, None
     return _decide_shell_stdin(prev_stage, stdin_prog, assignments, stdin_map, shell_words[0])
 
 
@@ -265,56 +288,99 @@ def _inspect_stage_interpreter(
     cmd_idx: int,
     prev_stage: list[str] | None,
     stdin_prog: str | None,
-    context: tuple[dict[str, str], dict[str, str]],
+    context: tuple[tuple[dict[str, str], dict[str, str]], tuple[Path, bool, list[int] | None]],
 ) -> tuple[bool, Path | None, str | None]:
     """Inspect shell, eval, or source stage and return handled status."""
-    assignments, stdin_map = context
+    parse_ctx, file_ctx = context
+    assignments, _ = parse_ctx
     name = os.path.basename(_substitute_literals(words[cmd_idx], assignments))
     if name in SHELLS:
         blocked, to_queue = _inspect_shell_stage(
-            words[cmd_idx:], prev_stage, stdin_prog, assignments, stdin_map
+            words[cmd_idx:], prev_stage, stdin_prog, parse_ctx, file_ctx
         )
         return True, blocked, to_queue
     if name in ("eval", "source", "."):
-        blocked, to_queue = _inspect_shell_or_eval(words, cmd_idx, stdin_prog, assignments)
+        blocked, to_queue = _inspect_shell_or_eval(
+            words, cmd_idx, stdin_prog, assignments, file_ctx
+        )
         return True, blocked, to_queue
     return False, None, None
+
+
+def _check_program_path(
+    cmd_word: str,
+    cwd: Path,
+    directory_changed: bool,
+    files_read: list[int] | None,
+) -> Path | None:
+    """Inspect an executable script program path or return a refusal Path."""
+    if "/" not in cmd_word or _is_configure_word(cmd_word):
+        return None
+    if not DECIDABLE_NAME.fullmatch(os.path.basename(cmd_word)):
+        return None
+    read_tracker = files_read if files_read is not None else [0]
+    return inspect_script_file(cmd_word, cwd, directory_changed, read_tracker, is_program=True)
+
+
+def _inspect_stage(
+    idx: int,
+    pipeline: list[list[str]],
+    depth: int,
+    pending: list[tuple[str, int]],
+    context: tuple[tuple[dict[str, str], dict[str, str]], tuple[Path, list[bool], list[int]]],
+) -> Path | None:
+    """Inspect one pipeline stage and queue nested scripts or programs."""
+    parse_ctx, state = context
+    assignments, stdin_map = parse_ctx
+    session_cwd, active_dir, files_read = state
+    words, attached = _strip_redirections(pipeline[idx])
+    stdin_prog = stdin_map.get(attached[0]) if attached else None
+    cmd_idx = _unwrap_command(words, 0)
+    wrapper_blocked = _wrapper_blocked(words, cmd_idx, assignments)
+    if wrapper_blocked is not None:
+        return wrapper_blocked
+    stage_dir_changed = active_dir[0]
+    if cmd_idx < len(words):
+        prev_stage = pipeline[idx - 1] if idx > 0 else None
+        file_ctx = (session_cwd, stage_dir_changed, files_read)
+        handled, blocked, to_queue = _inspect_stage_interpreter(
+            words, cmd_idx, prev_stage, stdin_prog, (parse_ctx, file_ctx)
+        )
+        if handled:
+            if blocked is not None:
+                return blocked
+            if to_queue is not None:
+                pending.append((to_queue, depth + 1))
+            return None
+        cmd_word = _substitute_literals(words[cmd_idx], assignments)
+        prog_blocked = _check_program_path(cmd_word, session_cwd, stage_dir_changed, files_read)
+        if prog_blocked is not None:
+            return prog_blocked
+        if os.path.basename(cmd_word) in ("cd", "pushd", "popd"):
+            active_dir[0] = True
+    blocked, _ = _classify_command(words, assignments, stdin_prog)
+    return blocked
 
 
 def _inspect_pipeline(
     pipeline: list[list[str]],
     depth: int,
     pending: list[tuple[str, int]],
-    assignments: dict[str, str],
-    stdin_map: dict[str, str],
+    context: tuple[dict[str, str], dict[str, str]],
+    state: tuple[Path, list[bool], list[int]],
 ) -> Path | None:
     """Inspect pipeline stages and refuse unsafe shell execution feeds."""
-    for idx, raw_stage in enumerate(pipeline):
-        words, attached = _strip_redirections(raw_stage)
-        stdin_prog = stdin_map.get(attached[0]) if attached else None
-        cmd_idx = _unwrap_command(words, 0)
-        wrapper_blocked = _wrapper_blocked(words, cmd_idx, assignments)
-        if wrapper_blocked is not None:
-            return wrapper_blocked
-        if cmd_idx < len(words):
-            prev_stage = pipeline[idx - 1] if idx > 0 else None
-            handled, blocked, to_queue = _inspect_stage_interpreter(
-                words, cmd_idx, prev_stage, stdin_prog, (assignments, stdin_map)
-            )
-            if handled:
-                if blocked is not None:
-                    return blocked
-                if to_queue is not None:
-                    pending.append((to_queue, depth + 1))
-                continue
-        blocked, _ = _classify_command(words, assignments, stdin_prog)
+    for idx in range(len(pipeline)):
+        blocked = _inspect_stage(idx, pipeline, depth, pending, (context, state))
         if blocked is not None:
             return blocked
     return None
 
 
-def _inspect(command: str) -> Path | None:
+def _inspect(command: str, cwd: Path | None = None) -> Path | None:
     """Walk bounded shell fragments and inline programs without recursion."""
+    session_cwd = Path.cwd() if cwd is None else cwd
+    files_read = [0]
     pending = [(command, 0)]
     for _ in range(MAX_TOKENS + 1):
         if not pending:
@@ -330,8 +396,15 @@ def _inspect(command: str) -> Path | None:
             nested_err = _handle_nested_program(inner, depth + 1, pending)
             if nested_err is not None:
                 return nested_err
+        dir_changed = [False]
         for pipeline in pipelines:
-            blocked = _inspect_pipeline(pipeline, depth, pending, assignments, stdin_map)
+            blocked = _inspect_pipeline(
+                pipeline,
+                depth,
+                pending,
+                (assignments, stdin_map),
+                (session_cwd, dir_changed, files_read),
+            )
             if blocked is not None:
                 return blocked
     return Path("configure (worklist limit)")
@@ -365,10 +438,10 @@ def main(argv: list[str] | None = None) -> int:
         _print_refusal()
         return 2
     try:
-        command = _input(options.client, payload)
+        command, cwd = _input(options.client, payload)
         if command is None:
             return 0
-        blocked = _inspect(command)
+        blocked = _inspect(command, cwd)
     except Exception as exc:
         _print_refusal(f"parse error ({exc})")
         return 2
