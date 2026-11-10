@@ -1,6 +1,6 @@
 # Script-body shapes for the raw configure guard (judge-measured on real scripts, r7 corpus replay).
 # Record: a header line `=== allow <id>` or `=== refuse <id>`, then the script body verbatim up to the next header.
-# Placeholders (tests/test_raw_configure_files.py _check_parser_body): <cfg> = "<tree>/configure" --x, <tree>, <build>.
+# Placeholders (tests/raw_configure_support.py _check_parser_body): <cfg> = "<tree>/configure" --x, <tree>, <build>.
 # Lines starting with `#` before the first header are comments; inside a record every line is body text.
 === allow helper-shell-c-redirect
 inside bash -c 'echo leak > "$1/x"' -- "$A"
