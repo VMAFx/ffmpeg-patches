@@ -15,7 +15,126 @@ MAX_TOKENS = 4000
 MAX_DEPTH = 4
 MAX_SUBSHELL_DEPTH = 64
 SEPARATORS = frozenset((";", "&&", "||", "|", "&", "\n", "(", ")"))
-SHELLS = frozenset(("bash", "sh", "dash", "zsh", "ksh"))
+SHELLS = frozenset(
+    ("bash", "sh", "dash", "zsh", "ksh", "ash", "mksh", "lksh", "posh", "yash", "hush")
+)
+NON_SHELL_PROGRAMS = frozenset(
+    (
+        "python",
+        "python2",
+        "python3",
+        "pypy",
+        "pypy3",
+        "perl",
+        "ruby",
+        "node",
+        "nodejs",
+        "deno",
+        "bun",
+        "lua",
+        "luajit",
+        "php",
+        "tclsh",
+        "wish",
+        "awk",
+        "gawk",
+        "mawk",
+        "nawk",
+        "Rscript",
+        "julia",
+        "uv",
+        "make",
+        "gmake",
+    )
+)
+VERSIONED_NON_SHELL_PROGRAM = re.compile(
+    r"(?:python|pypy|perl|ruby|lua|php|tclsh|node)[0-9][0-9.]*"
+)
+BASH_BUILTINS = frozenset(
+    [
+        "alias",
+        "bg",
+        "bind",
+        "break",
+        "builtin",
+        "caller",
+        "cd",
+        "command",
+        "compgen",
+        "complete",
+        "compopt",
+        "continue",
+        "declare",
+        "dirs",
+        "disown",
+        "echo",
+        "enable",
+        "eval",
+        "exec",
+        "exit",
+        "export",
+        "false",
+        "fc",
+        "fg",
+        "getopts",
+        "hash",
+        "help",
+        "history",
+        "jobs",
+        "kill",
+        "let",
+        "local",
+        "logout",
+        "mapfile",
+        "popd",
+        "printf",
+        "pushd",
+        "pwd",
+        "read",
+        "readarray",
+        "readonly",
+        "return",
+        "set",
+        "shift",
+        "shopt",
+        "source",
+        "suspend",
+        "test",
+        "times",
+        "trap",
+        "true",
+        "type",
+        "typeset",
+        "ulimit",
+        "umask",
+        "unalias",
+        "unset",
+        "wait",
+        "[",
+        "[[",
+        ".",
+        ":",
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "case",
+        "esac",
+        "for",
+        "select",
+        "while",
+        "until",
+        "do",
+        "done",
+        "in",
+        "function",
+        "time",
+        "{",
+        "}",
+        "!",
+    ]
+)
 UNPARSED = Path("unparsed command")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=.*", re.DOTALL)
 CONFIGURE_WORD = re.compile(r"(?<![A-Za-z0-9_])configure(?![A-Za-z0-9_])")
@@ -211,6 +330,7 @@ DATA_ONLY_COMMANDS = frozenset(
         "dirname",
         "test",
         "[",
+        "[[",
         "echo",
         "printf",
         "tee",
@@ -282,6 +402,12 @@ COMMAND_PREFIX_WORDS: frozenset[str] = frozenset(
         "dash",
         "zsh",
         "ksh",
+        "ash",
+        "mksh",
+        "lksh",
+        "posh",
+        "yash",
+        "hush",
         "exec",
         "env",
         "command",
@@ -417,6 +543,21 @@ def _is_configure_word(word: str) -> bool:
     return bool(GLOB_CHARS.intersection(last)) and fnmatch.fnmatchcase("configure", last)
 
 
+def _names_configure(word: str) -> bool:
+    """Use concrete configure naming for data words, no fail-closed guess."""
+    cleaned = _clean_word(word)
+    base = os.path.basename(cleaned.translate(STRIP_CHARS))
+    if base == "configure" or _flatten(os.path.basename(cleaned)) == "configure":
+        return True
+    if ("$" in word or "`" in word) and CONFIGURE_WORD.search(word):
+        return True
+    return (
+        bool(GLOB_CHARS.intersection(base))
+        and re.search(r"[A-Za-z]", base) is not None
+        and fnmatch.fnmatchcase("configure", base)
+    )
+
+
 def _find_configure_word(words: list[str]) -> Path | None:
     """Find the first blocked configure reference across command words."""
     for word in words[: MAX_TOKENS + 1]:
@@ -449,3 +590,44 @@ def _substitute_literals(word: str, assignments: dict[str, str]) -> str:
         word = re.sub(r"\$\{" + re.escape(name) + r"\}", val, word)
         word = re.sub(r"\$" + re.escape(name) + r"(?![A-Za-z0-9_])", val, word)
     return word
+
+
+def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
+    """Find a shell script path or its -c program string."""
+    idx = 1
+    c_seen = False
+    for _ in range(min(len(words), MAX_TOKENS + 1)):
+        if idx >= len(words):
+            break
+        word = words[idx]
+        if word == "--":
+            operand = words[idx + 1] if idx + 1 < len(words) else None
+            return operand, c_seen
+        if word == "-":
+            return word, c_seen
+        if word in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            idx += 2
+            continue
+        if word.startswith("--"):
+            idx += 1
+            continue
+        if word.startswith("+"):
+            idx += 2 if word.endswith(("o", "O")) else 1
+            continue
+        if word.startswith("-"):
+            if "c" in word[1:]:
+                c_seen = True
+            idx += 2 if word.endswith(("o", "O")) else 1
+            continue
+        return word, c_seen
+    return None, c_seen
+
+
+def _program_name_allowed(name: str) -> bool:
+    """Recognize static bare external command names eligible for PATH lookup."""
+    return bool(
+        name
+        and not any(c in name for c in "/$`")
+        and name not in BASH_BUILTINS | SHELLS
+        and DECIDABLE_NAME.fullmatch(name)
+    )

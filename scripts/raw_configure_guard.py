@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -23,13 +24,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.raw_configure_files import (  # noqa: E402
+    InspectionContext,
+    _path_program,
     inspect_script_file,
 )
 from scripts.raw_configure_inspect import (  # noqa: E402
     _classify_command,
     _inspect_shell_or_eval,
-    _shell_argument,
     _wrapper_blocked,
+    classify_script_words,
 )
 from scripts.raw_configure_lex import (  # noqa: E402
     _restore_tokens,
@@ -52,14 +55,17 @@ from scripts.raw_configure_words import (  # noqa: E402
     UNPARSED,
     _find_literal_assignments,
     _is_configure_word,
+    _shell_argument,
     _substitute_literals,
 )
 
+DEADLINE_SECONDS = 10.0
 
-def _input(client: str, payload: dict[str, Any]) -> tuple[str | None, Path]:
+
+def _input(client: str, payload: dict[str, Any]) -> tuple[str | None, Path | None]:
     """Extract documented command and session cwd from hook payload."""
     raw_cwd = payload.get("cwd")
-    cwd = Path(raw_cwd) if isinstance(raw_cwd, str) and os.path.isabs(raw_cwd) else Path.cwd()
+    cwd = Path(raw_cwd) if isinstance(raw_cwd, str) and os.path.isabs(raw_cwd) else None
     if client == "opencode":
         if payload.get("tool") != "bash":
             return None, cwd
@@ -259,7 +265,11 @@ def _inspect_file_target(
     if _is_configure_word(sub_target) or not DECIDABLE_NAME.fullmatch(os.path.basename(sub_target)):
         return Path(sub_target)
     read_tracker = files_read if files_read is not None else [0]
-    return inspect_script_file(sub_target, cwd, directory_changed, read_tracker, is_program=False)
+    return inspect_script_file(
+        sub_target,
+        InspectionContext(cwd, directory_changed, read_tracker, classify_script_words),
+        is_program=False,
+    )
 
 
 def _inspect_shell_stage(
@@ -314,19 +324,26 @@ def _check_program_path(
     files_read: list[int] | None,
 ) -> Path | None:
     """Inspect an executable script program path or return a refusal Path."""
-    if "/" not in cmd_word or _is_configure_word(cmd_word):
+    if _is_configure_word(cmd_word) or "$" in cmd_word or "`" in cmd_word:
         return None
-    if not DECIDABLE_NAME.fullmatch(os.path.basename(cmd_word)):
-        return None
+    if "/" not in cmd_word:
+        path = _path_program(cmd_word)
+        if path is None:
+            return None
+        cmd_word = str(path)
     read_tracker = files_read if files_read is not None else [0]
-    return inspect_script_file(cmd_word, cwd, directory_changed, read_tracker, is_program=True)
+    return inspect_script_file(
+        cmd_word,
+        InspectionContext(cwd, directory_changed, read_tracker, classify_script_words),
+        is_program=True,
+    )
 
 
 def _inspect_stage(
     idx: int,
     pipeline: list[list[str]],
     depth: int,
-    pending: list[tuple[str, int]],
+    pending: list[tuple[str, int, bool]],
     context: tuple[tuple[dict[str, str], dict[str, str]], tuple[Path, list[bool], list[int]]],
 ) -> Path | None:
     """Inspect one pipeline stage and queue nested scripts or programs."""
@@ -350,7 +367,7 @@ def _inspect_stage(
             if blocked is not None:
                 return blocked
             if to_queue is not None:
-                pending.append((to_queue, depth + 1))
+                pending.append((to_queue, depth + 1, active_dir[0]))
             return None
         cmd_word = _substitute_literals(words[cmd_idx], assignments)
         prog_blocked = _check_program_path(cmd_word, session_cwd, stage_dir_changed, files_read)
@@ -365,7 +382,7 @@ def _inspect_stage(
 def _inspect_pipeline(
     pipeline: list[list[str]],
     depth: int,
-    pending: list[tuple[str, int]],
+    pending: list[tuple[str, int, bool]],
     context: tuple[dict[str, str], dict[str, str]],
     state: tuple[Path, list[bool], list[int]],
 ) -> Path | None:
@@ -381,22 +398,26 @@ def _inspect(command: str, cwd: Path | None = None) -> Path | None:
     """Walk bounded shell fragments and inline programs without recursion."""
     session_cwd = Path.cwd() if cwd is None else cwd
     files_read = [0]
-    pending = [(command, 0)]
+    pending = [(command, 0, cwd is None or not session_cwd.is_dir())]
     for _ in range(MAX_TOKENS + 1):
         if not pending:
             return None
-        source, depth = pending.pop()
+        source, depth, changed = pending.pop()
         if depth > MAX_DEPTH:
             return Path("configure (nesting limit)")
         tok_result = _tokenize_command(source)
         if tok_result is None:
             return UNPARSED
         pipelines, assignments, stdin_map, inners = tok_result
+        inner_changed = changed or any(
+            os.path.basename(token) in ("cd", "pushd", "popd")
+            for pipeline in pipelines
+            for stage in pipeline
+            for token in stage
+        )
         for inner in inners:
-            nested_err = _handle_nested_program(inner, depth + 1, pending)
-            if nested_err is not None:
-                return nested_err
-        dir_changed = [False]
+            pending.append((inner, depth + 1, inner_changed))
+        dir_changed = [changed]
         for pipeline in pipelines:
             blocked = _inspect_pipeline(
                 pipeline,
@@ -422,6 +443,36 @@ def _print_refusal(detail: str = "") -> None:
     )
 
 
+def _inspect_with_deadline(command: str, cwd: Path | None) -> Path | None:
+    """Run one daemon inspector and refuse filesystem stalls within the client timeout."""
+    results: list[Path | Exception | None] = []
+
+    def inspect_once() -> None:
+        """Capture the inspection result or exception without a worker call cycle."""
+        try:
+            results.append(_inspect(command, cwd))
+        except Exception as exc:
+            results.append(exc)
+
+    worker = threading.Thread(target=inspect_once, daemon=True)
+    worker.start()
+    worker.join(timeout=DEADLINE_SECONDS)
+    if worker.is_alive():
+        print(
+            "raw configure refused: inspection exceeded the 10 s deadline "
+            "(stalled filesystem or very large script); run python3 "
+            "scripts/ffmpeg_configure.py SRC_DIR BUILD_DIR -- <args>",
+            file=sys.stderr,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(2)
+    result = results[0]
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     """Read one hook payload and refuse unsafe configure execution."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -441,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         command, cwd = _input(options.client, payload)
         if command is None:
             return 0
-        blocked = _inspect(command, cwd)
+        blocked = _inspect_with_deadline(command, cwd)
     except Exception as exc:
         _print_refusal(f"parse error ({exc})")
         return 2
