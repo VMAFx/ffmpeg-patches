@@ -423,7 +423,7 @@ without a series patch is a change the series does not carry.
 | [25879](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25879) | `master` | open | avfilter/vf_hqdn3d_vulkan: add a Vulkan hqdn3d filter | 0023 |
 | [25885](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25885) | `master` | open | avfilter/vf_tonemap: add the bt2408_hable tone map | 0012, 0013 |
 
-State read from the FFmpeg forge on 2026-11-09.
+State read from the FFmpeg forge on 2026-11-11.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned
