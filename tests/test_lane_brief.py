@@ -1049,7 +1049,7 @@ class LaneBriefIsolationTest(unittest.TestCase):
 
     def test_git_unavailable_never_starts_runner(self) -> None:
         """Report unavailable Git as an isolation error without starting the runner."""
-        with patch.object(lane_isolation.subprocess, "run", side_effect=FileNotFoundError("git")):
+        with patch.object(lane_isolation.subprocess, "Popen", side_effect=FileNotFoundError("git")):
             rc, error = self.check_worktree(self.root / "missing")
         self.assertEqual(rc, 2)
         self.assertIn("lane isolation failed", error)

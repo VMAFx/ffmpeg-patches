@@ -16,7 +16,6 @@ import argparse
 import io
 import os
 import re
-import selectors
 import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
@@ -28,7 +27,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts import lane_isolation  # noqa: E402
-from scripts.process_group import kill_process_group  # noqa: E402
+from scripts.process_group import kill_process_group, read_bounded  # noqa: E402
 
 TEMPLATE = ROOT / "scripts" / "lane_brief_template.md"
 CONFIG = ROOT / ".config" / "lane-brief.yaml"
@@ -182,24 +181,9 @@ def read_runner_output(process: subprocess.Popen[bytes], deadline: float) -> byt
     """Read runner output within the byte limit and monotonic deadline."""
     if process.stdout is None:
         raise OSError("runner stdout pipe unavailable")
-    output = bytearray()
-    with selectors.DefaultSelector() as selector:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        for _ in range(RUNNER_OUTPUT_LIMIT + 2):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not selector.select(remaining):
-                raise subprocess.TimeoutExpired(process.args, RUNNER_TIMEOUT)
-            chunk = os.read(process.stdout.fileno(), 4096)
-            if not chunk:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(process.args, RUNNER_TIMEOUT)
-                process.wait(timeout=remaining)
-                return bytes(output)
-            output.extend(chunk)
-            if len(output) > RUNNER_OUTPUT_LIMIT:
-                raise ValueError(f"output exceeds {RUNNER_OUTPUT_LIMIT} bytes")
-    raise ValueError(f"output exceeds {RUNNER_OUTPUT_LIMIT} bytes")
+    return read_bounded(process, (process.stdout,), deadline, RUNNER_OUTPUT_LIMIT, RUNNER_TIMEOUT)[
+        0
+    ]
 
 
 def run_runner(argv: list[str]) -> tuple[bytes, int]:

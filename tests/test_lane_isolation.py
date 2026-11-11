@@ -9,6 +9,7 @@ import io
 import os
 import subprocess  # nosec B404 - fixture-controlled Git results and timeout exceptions.
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -372,11 +373,72 @@ class LaneIsolationTest(unittest.TestCase):
     def test_timeout(self) -> None:
         """Convert a Git timeout into a diagnostic and input error status."""
         with patch.object(
-            lane_isolation.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 30)
+            lane_isolation.subprocess, "Popen", side_effect=subprocess.TimeoutExpired("git", 30)
         ):
             rc, _, error = self.run_cli("check", self.root)
         self.assertEqual(rc, 2)
         self.assertIn("timed out after 30 seconds", error)
+
+    def test_git_output_limit_boundary(self) -> None:
+        """Accept the exact combined byte limit and reject one byte less."""
+        lane = repo(self.root / "lane")
+        argv = ["-C", str(lane), "rev-parse", "--git-common-dir"]
+        first = lane_isolation.run_git(argv)
+        n = len(first.stdout.encode()) + len(first.stderr.encode())
+        with patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", n, create=True):
+            self.assertEqual(lane_isolation.run_git(argv).stdout, first.stdout)
+        with (
+            patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", n - 1, create=True),
+            self.assertRaisesRegex(lane_isolation.IsolationError, "output exceeds"),
+        ):
+            lane_isolation.run_git(argv)
+
+    def test_git_stderr_counts_toward_limit(self) -> None:
+        """Reject Git stderr alone when it exceeds the combined byte limit."""
+        (self.root / "none").mkdir()
+        with (
+            patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", 8, create=True),
+            self.assertRaisesRegex(lane_isolation.IsolationError, "output exceeds"),
+        ):
+            lane_isolation.run_git(["-C", str(self.root / "none"), "rev-parse", "--git-common-dir"])
+
+    def test_long_ref_name_over_limit_refused(self) -> None:
+        """Refuse a marked clone whose reference name exceeds the output byte limit."""
+        lane = self.clean_clone()
+        self.assertEqual(self.run_cli("mark", lane)[0], 0)
+        sha = run_git(lane, "rev-parse", "HEAD", preserve_config=True)
+        (lane / ".git" / "packed-refs").write_text(
+            f"{sha} refs/heads/{'a' * 300}\n", encoding="utf-8"
+        )
+        with patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", 256, create=True):
+            rc, output, error = self.run_cli("check", lane)
+        self.assertEqual(rc, 2)
+        self.assertIn("output exceeds", error)
+        self.assertNotIn("lane_isolation: pass", output)
+
+    @unittest.skipUnless(os.name == "posix", "process groups need POSIX")
+    def test_git_timeout_kills_process(self) -> None:
+        """Reap the Git process after its deadline without waiting for its sleeper."""
+        real_popen = subprocess.Popen
+        processes: list[subprocess.Popen[bytes]] = []
+
+        def start_sleeper(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            """Record a real sleeping process launched with the Git process options."""
+            process = real_popen(["sh", "-c", "sleep 30"], **kwargs)
+            processes.append(process)
+            return process
+
+        started = time.monotonic()
+        with (
+            patch.object(lane_isolation, "GIT_TIMEOUT", 1),
+            patch.object(lane_isolation.subprocess, "Popen", side_effect=start_sleeper),
+            self.assertRaisesRegex(lane_isolation.IsolationError, "timed out after 1 seconds"),
+        ):
+            lane_isolation.run_git(["status"])
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(len(processes), 1)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(processes[0].pid, 0)
 
     def test_failed_or_empty_git_queries(self) -> None:
         """Reject failed Git queries and successful directory queries with no answer."""
@@ -424,7 +486,7 @@ class LaneIsolationTest(unittest.TestCase):
 
     def test_git_unavailable(self) -> None:
         """Report an unavailable Git executable as a CLI input error."""
-        with patch.object(lane_isolation.subprocess, "run", side_effect=OSError("demo error")):
+        with patch.object(lane_isolation.subprocess, "Popen", side_effect=OSError("demo error")):
             rc, _, error = self.run_cli("check", self.root)
         self.assertEqual(rc, 2)
         self.assertIn("lane_isolation: demo error", error)

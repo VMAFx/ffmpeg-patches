@@ -1,16 +1,55 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Safe process-group and process-tree termination guards."""
+"""Bounded pipe reads and safe process-group and process-tree termination guards."""
 
 from __future__ import annotations
 
 import contextlib
 import os
+import selectors
 import signal
 import subprocess  # nosec B404 - safe process tree termination on Windows.
 import sys
+import time
+from collections.abc import Sequence
+from typing import BinaryIO
 
 TASKKILL_TIMEOUT_S: float = 10.0
+
+
+def read_bounded(
+    process: subprocess.Popen[bytes],
+    streams: Sequence[BinaryIO],
+    deadline: float,
+    limit: int,
+    timeout: float,
+) -> list[bytes]:
+    """Read pipes within a shared byte limit and deadline, then reap the process."""
+    output = [bytearray() for _ in streams]
+    total = 0
+    with selectors.DefaultSelector() as selector:
+        for index, stream in enumerate(streams):
+            selector.register(stream, selectors.EVENT_READ, index)
+        for _ in range(limit + 2 * len(streams) + 2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            if not selector.get_map():
+                process.wait(timeout=remaining)
+                return [bytes(data) for data in output]
+            ready = selector.select(remaining)
+            if not ready:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            for key, _ in ready:
+                chunk = os.read(key.fd, 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError(f"output exceeds {limit} bytes")
+                output[key.data].extend(chunk)
+    raise ValueError(f"output exceeds {limit} bytes")
 
 
 def kill_process_group(process: subprocess.Popen[bytes]) -> None:

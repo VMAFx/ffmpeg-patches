@@ -14,17 +14,20 @@ import argparse
 import os
 import subprocess  # nosec B404 - fixed Git argv, no shell, bounded timeout.
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.process_group import kill_process_group, read_bounded  # noqa: E402
 from scripts.variant_sweep import git_environment  # noqa: E402
 
 MARKER = "lane.clone"
 PRIVATE_WORDS = ("embargo", "nvenc", "qsv")
 GIT_TIMEOUT = 30
+GIT_OUTPUT_LIMIT = 32 * 1024 * 1024
 MAX_REFS = 100000
 MAX_LISTED = 10
 
@@ -34,22 +37,50 @@ class IsolationError(ValueError):
 
 
 def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run Git with isolated repository paths and a bounded deadline."""
+    """Run Git with isolated repository paths, bounded output, and a deadline."""
     try:
-        return subprocess.run(  # nosec B603 B607 - fixed Git executable, explicit argv.
+        process = subprocess.Popen(  # nosec B603 B607 - fixed Git executable, explicit argv.
             ["git", *args],
             env=git_environment(),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            timeout=GIT_TIMEOUT,
+            start_new_session=True,
         )
+        completed = False
+        try:
+            stdout, stderr = read_bounded(
+                process,
+                (process.stdout, process.stderr),
+                time.monotonic() + GIT_TIMEOUT,
+                GIT_OUTPUT_LIMIT,
+                GIT_TIMEOUT,
+            )
+            completed = True
+        except ValueError as error:
+            raise IsolationError(
+                f"git {' '.join(args)}: output exceeds {GIT_OUTPUT_LIMIT} bytes"
+            ) from error
+        finally:
+            if not completed:
+                kill_process_group(process)
+            try:
+                process.wait(timeout=5)
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
     except subprocess.TimeoutExpired as error:
         raise IsolationError(
             f"git {' '.join(args)} timed out after {GIT_TIMEOUT} seconds"
         ) from error
+    return subprocess.CompletedProcess(
+        ["git", *args],
+        process.returncode,
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+    )
 
 
 def common_dir(worktree: Path) -> Path:
