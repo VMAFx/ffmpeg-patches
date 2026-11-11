@@ -409,10 +409,9 @@ FATE_PATTERNS = (
 )
 FATE_VARIABLE = re.compile(r"^\$\(([A-Z][A-Z0-9_]*)\)$")
 LAVFI_FORMAT = re.compile(r"(?:^|\s)-f\s+lavfi(?=\s|$)")
-LAVFI_INPUT = re.compile(
-    r"""(?:^|\s)-f\s+lavfi\s+(?:-(?!i\s)[\w:]+\s+(?:"[^"]*"|'[^']*'|\S+)\s+)*"""
-    r"""-i\s+["']?([a-z0-9_]+)(?=[=,;\s"']|$)"""
-)
+LAVFI_TOKEN = re.compile(r"""(?:"[^"]*"|'[^']*'|\S+)""")
+LAVFI_OPTION = re.compile(r"^-[\w:]+$")
+LAVFI_NAME = re.compile(r"""^["']?([a-z0-9_]+)(?=[=,;\s"']|$)""")
 FATE_REQUIRED = ("LAVFI_INDEV", "WRAPPED_AVFRAME_DECODER")
 
 
@@ -594,11 +593,46 @@ def _fate_video(
             )
 
 
+def _lavfi_skip(tokens: list[str], start: int) -> tuple[int, str | None]:
+    """Walk one `-f lavfi` option run to its `-i` input name without backtracking."""
+    skip = start
+    for index in range(start, len(tokens)):
+        if index < skip:
+            continue
+        token = tokens[index]
+        if token == "-i":
+            if index + 1 < len(tokens):
+                match = LAVFI_NAME.match(tokens[index + 1])
+                return index + 2, match.group(1) if match else None
+            return index + 1, None
+        if LAVFI_OPTION.match(token) and index + 1 < len(tokens):
+            skip = index + 2
+            continue
+        return index, None
+    return len(tokens), None
+
+
+def _lavfi_inputs(command: str) -> list[str]:
+    """Collect each `-f lavfi` input source name with one linear token walk."""
+    tokens = LAVFI_TOKEN.findall(command)
+    names: list[str] = []
+    cursor = 0
+    for index in range(len(tokens)):
+        if index < cursor:
+            continue
+        if tokens[index] == "-f" and index + 1 < len(tokens) and tokens[index + 1] == "lavfi":
+            stop, name = _lavfi_skip(tokens, index + 2)
+            if name is not None:
+                names.append(name)
+                cursor = stop
+    return names
+
+
 def _fate_command(
     path: str, command: FateEntry, sources: dict[str, str], report: FateReport
 ) -> bool:
     """Classify every lavfi input, counting audio-only and unclassified tests."""
-    names = LAVFI_INPUT.findall(command.command)
+    names = _lavfi_inputs(command.command)
     kinds = {sources.get(name, "unknown") for name in names}
     if not kinds or kinds - {"video", "audio"}:
         report.unclassified += 1

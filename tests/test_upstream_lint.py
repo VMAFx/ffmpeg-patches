@@ -335,6 +335,16 @@ class FateDepsTest(unittest.TestCase):
         )
         self.assertEqual(self.check_source(source).rc, 1)
 
+    def test_lavfi_input_scan_stays_linear(self) -> None:
+        """A long option run with no `-i` resolves promptly, not by backtracking."""
+        command = "-f lavfi " + '-opt "" ' * 5000 + "-vf scale"
+        self.assertEqual(upstream_lint._lavfi_inputs(command), [])
+
+    def test_lavfi_input_scan_reads_each_source(self) -> None:
+        """The linear scan returns every `-f lavfi` input across option runs."""
+        command = '-f lavfi -flags +x -i "testsrc2=s=2x2" -f lavfi -i sine=d=1'
+        self.assertEqual(upstream_lint._lavfi_inputs(command), ["testsrc2", "sine"])
+
     def test_assignment_replacement_and_nested_expansion(self) -> None:
         """Replacement removes stale targets while nested references retain provenance."""
         source = (
