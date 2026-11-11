@@ -998,8 +998,8 @@ class MasterFormTest(SeriesTestCase):
         results = series.apply_series(self.fx.root, tested, False, True, f"file://{forge}")
         self.assertEqual([s for _, s in results], ["master-form", "upstream"])
 
-    def _shallow_master_form(self) -> Path:
-        """Build a forge PR on the tested tip without fetching older history."""
+    def _shallow_master_form(self, *, depth: int | None = None) -> Path:
+        """Build a forge PR on the tested tip and optionally clone its shallow tree."""
         scratch = Path(self._scratch.name)
         later = run_git(self.fx.tree, "rev-parse", "HEAD")
         forge = scratch / "forge-shallow"
@@ -1008,8 +1008,20 @@ class MasterFormTest(SeriesTestCase):
         commit_edit(forge, 6, "int line_7 = 70;", "PR: line seven")
         self.set_form(later, run_git(forge, "rev-parse", "HEAD"))
         run_git(self.fx.tree, "branch", "-q", "-f", "tested", later)
+        tested = scratch / "shallow-master"
+        if depth is not None:
+            run_git(
+                scratch,
+                "clone",
+                "-q",
+                f"--depth={depth}",
+                "--branch",
+                "tested",
+                f"file://{self.fx.tree}",
+                str(tested),
+            )
         self.url = f"file://{forge}"
-        return scratch / "shallow-master"
+        return tested
 
     def test_hidden_upstream_ancestor_in_shallow_tree_is_a_tool_error(self) -> None:
         """Reject a present upstream commit hidden behind a shallow boundary."""
@@ -1017,18 +1029,8 @@ class MasterFormTest(SeriesTestCase):
         fixed = run_git(self.fx.tree, "rev-parse", "HEAD")
         commit_edit(self.fx.tree, 29, "int line_30 = 3000;", "later master")
         commit_edit(self.fx.tree, 10, "int line_11 = 110;", "latest master")
-        tested = self._shallow_master_form()
+        tested = self._shallow_master_form(depth=2)
         self.set_upstream(fixed)
-        run_git(
-            Path(self._scratch.name),
-            "clone",
-            "-q",
-            "--depth=2",
-            "--branch",
-            "tested",
-            f"file://{self.fx.tree}",
-            str(tested),
-        )
         run_git(tested, "fetch", "-q", "--depth=1", f"file://{self.fx.tree}", fixed)
         self.assertEqual(series.git(tested, "cat-file", "-e", f"{fixed}^{{commit}}").returncode, 0)
         self.assertEqual(
@@ -1042,6 +1044,7 @@ class MasterFormTest(SeriesTestCase):
             self.fail(f"expected ancestry error, got {[s for _, s in results]}")
         self.assertIn(self.fx.names[1], str(error.exception))
         self.assertIn(fixed, str(error.exception))
+        self.assertIn("reset the tree to the commit the run started from", str(error.exception))
         self.assertEqual(run_git(tested, "status", "--porcelain"), "")
 
     def test_ci_shallow_history_keeps_recorded_upstream_ancestor(self) -> None:
@@ -1077,18 +1080,8 @@ class MasterFormTest(SeriesTestCase):
         commit_edit(self.fx.tree, 29, "int line_30 = 300;", "side branch fix")
         fixed = run_git(self.fx.tree, "rev-parse", "HEAD")
         self.fx.reset(self.master)
-        tested = self._shallow_master_form()
+        tested = self._shallow_master_form(depth=1)
         self.set_upstream(fixed)
-        run_git(
-            Path(self._scratch.name),
-            "clone",
-            "-q",
-            "--depth=1",
-            "--branch",
-            "tested",
-            f"file://{self.fx.tree}",
-            str(tested),
-        )
         run_git(tested, "fetch", "-q", "--depth=1", f"file://{self.fx.tree}", fixed)
         self.assertEqual(
             series.git(
@@ -1108,21 +1101,33 @@ class MasterFormTest(SeriesTestCase):
         commit_edit(self.fx.tree, 29, "int line_30 = 300;", "upstream fix")
         fixed = run_git(self.fx.tree, "rev-parse", "HEAD")
         commit_edit(self.fx.tree, 29, "int line_30 = 3000;", "later master")
-        tested = self._shallow_master_form()
+        tested = self._shallow_master_form(depth=2)
         self.set_upstream(fixed)
-        run_git(
-            Path(self._scratch.name),
-            "clone",
-            "-q",
-            "--depth=2",
-            "--branch",
-            "tested",
-            f"file://{self.fx.tree}",
-            str(tested),
-        )
         self.assertEqual((tested / ".git" / "shallow").read_text(encoding="utf-8").strip(), fixed)
         results = series.apply_series(self.fx.root, tested, False, True, self.url)
         self.assertEqual([s for _, s in results], ["master-form", "upstream"])
+
+    def test_unshallow_between_probe_and_ancestry_keeps_upstream(self) -> None:
+        """Recognize upstream ancestry when a concurrent fetch unshallows the tree."""
+        self.set_upstream(self.fx.base)
+        real_git = series.git
+        probed = False
+
+        def unshallow_during_check(
+            tree: Path, *args: str, **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            """Model ancestry becoming visible before the shallow query returns."""
+            nonlocal probed
+            if args == ("rev-parse", "--is-shallow-repository"):
+                probed = True
+                return subprocess.CompletedProcess(args, 0, "false\n", "")
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                return subprocess.CompletedProcess(args, 0 if probed else 1, "", "")
+            return real_git(tree, *args, **kwargs)
+
+        with unittest.mock.patch.object(series, "git", side_effect=unshallow_during_check):
+            self.assertEqual([s for _, s in self.apply()], ["master-form", "upstream"])
+        self.assert_clean()
 
     def test_shallow_query_failure_is_not_a_fallback(self) -> None:
         """Reject failed or malformed shallow queries instead of applying the patch."""
@@ -1244,10 +1249,12 @@ class MasterFormTest(SeriesTestCase):
         self.assert_clean()
 
     def test_upstream_commit_on_side_branch_falls_through(self) -> None:
+        """Fall through for a side-branch upstream commit in full history."""
         run_git(self.fx.tree, "checkout", "-q", "-b", "side", self.fx.base)
         commit_edit(self.fx.tree, 29, "int line_30 = 300;", "side branch fix")
         self.set_upstream(run_git(self.fx.tree, "rev-parse", "HEAD"))
         self.fx.reset(self.master)
+        self.assertEqual(run_git(self.fx.tree, "rev-parse", "--is-shallow-repository"), "false")
         self.assertEqual([s for _, s in self.apply()], ["master-form", "applied"])
         self.assert_clean()
 
