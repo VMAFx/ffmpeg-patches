@@ -294,6 +294,64 @@ class LaneIsolationTest(unittest.TestCase):
         )
         self.assertFalse((self.root / "lane").exists())
 
+    def test_git_queries_avoid_path_format(self) -> None:
+        """Keep marking and refusal queries compatible with older Git versions."""
+        lane = repo(self.root / "lane")
+        real_run_git = lane_isolation.run_git
+        with patch.object(lane_isolation, "run_git", side_effect=real_run_git) as query:
+            self.assertEqual(lane_isolation.mark(lane), [])
+            self.assertEqual(lane_isolation.refusals(lane), [])
+        self.assertFalse(
+            any(
+                argument.startswith("--path-format")
+                for call in query.call_args_list
+                for argument in call.args[0]
+            ),
+            query.call_args_list,
+        )
+
+    def test_common_dir_relative_output(self) -> None:
+        """Resolve relative Git common-directory output against the queried path."""
+        with patch.object(
+            lane_isolation,
+            "run_git",
+            return_value=subprocess.CompletedProcess([], 0, "../.git\n", ""),
+        ):
+            self.assertEqual(
+                lane_isolation.common_dir(self.root / "a" / "b"),
+                Path(os.path.realpath(self.root / "a" / ".git")),
+            )
+
+    def test_common_dir_from_subdirectory(self) -> None:
+        """Resolve nested worktree paths to the same canonical common directory."""
+        lane = repo(self.root / "lane")
+        subdirectory = lane / "sub" / "deep"
+        subdirectory.mkdir(parents=True)
+        self.assertEqual(lane_isolation.common_dir(subdirectory), lane_isolation.common_dir(lane))
+        self.assertEqual(lane_isolation.common_dir(lane), Path(os.path.realpath(lane / ".git")))
+
+    @unittest.skipUnless(os.name == "posix", "directory symlinks need POSIX")
+    def test_common_dir_through_symlink(self) -> None:
+        """Resolve and mark a symlinked clone through its canonical common directory."""
+        lane = repo(self.root / "lane")
+        link = self.root / "link"
+        link.symlink_to(lane, target_is_directory=True)
+        self.assertEqual(lane_isolation.common_dir(link), Path(os.path.realpath(lane / ".git")))
+        self.assertEqual(lane_isolation.mark(link), [])
+        self.assertEqual(
+            run_git(
+                lane,
+                "config",
+                "--file",
+                str(lane / ".git" / "config"),
+                "--type=bool",
+                "--get",
+                lane_isolation.MARKER,
+                preserve_config=True,
+            ),
+            "true",
+        )
+
     def test_mark_locked_already_marked(self) -> None:
         """Accept an existing true marker while another writer holds the lock."""
         lane = repo(self.root / "lane")

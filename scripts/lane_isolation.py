@@ -11,6 +11,7 @@ Exit status: 0 on pass, 1 when refused, 2 for usage or git errors.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess  # nosec B404 - fixed Git argv, no shell, bounded timeout.
 import sys
 from pathlib import Path
@@ -53,13 +54,11 @@ def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 def common_dir(worktree: Path) -> Path:
     """Resolve the absolute Git common directory for the requested worktree."""
-    result = run_git(
-        ["-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"]
-    )
+    result = run_git(["-C", str(worktree), "rev-parse", "--git-common-dir"])
     directory = result.stdout.removesuffix("\n")
     if result.returncode != 0 or not directory:
         raise IsolationError(f"{worktree}: not a git worktree: {result.stderr.strip()}")
-    return Path(directory)
+    return Path(os.path.realpath(Path(worktree) / directory))
 
 
 def inside_work_tree(worktree: Path) -> bool:
@@ -129,7 +128,7 @@ def refusals(worktree: Path) -> list[str]:
 def mark(clone: Path) -> list[str]:
     """Mark a clone only after rejecting linked worktrees and private references."""
     common = common_dir(clone)
-    result = run_git(["-C", str(clone), "rev-parse", "--path-format=absolute", "--git-dir"])
+    result = run_git(["-C", str(clone), "rev-parse", "--absolute-git-dir"])
     directory = result.stdout.removesuffix("\n")
     if result.returncode != 0 or not directory:
         raise IsolationError(f"{clone}: cannot read git directory: {result.stderr.strip()}")
