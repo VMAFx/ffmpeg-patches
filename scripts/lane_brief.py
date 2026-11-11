@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Render or check a lane brief against repository standards.
 
+The check command with a runner first runs scripts/lane_isolation.py on the worktree.
+
 Usage: lane_brief.py render --branch B --task T --finding F --fix X --tests S --paths P --modules M
        lane_brief.py check BRIEF [--config FILE] [--runner PATH] [--worktree DIR]
 Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
@@ -25,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts import lane_isolation  # noqa: E402
 from scripts.process_group import kill_process_group  # noqa: E402
 
 TEMPLATE = ROOT / "scripts" / "lane_brief_template.md"
@@ -242,6 +245,21 @@ def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
     return 0
 
 
+def check_isolation(worktree: Path) -> int:
+    """Refuse unsafe lane worktrees before the runner can start."""
+    try:
+        lines = lane_isolation.refusals(worktree)
+    except lane_isolation.IsolationError as error:
+        print(f"lane_brief: lane isolation failed: {error}", file=sys.stderr)
+        return 2
+    if lines:
+        for line in lines[: lane_isolation.MAX_LISTED + 2]:
+            print(line, file=sys.stderr)
+        print(f"lane_brief: lane isolation refused worktree {worktree}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def check_brief(args: argparse.Namespace) -> int:
     """Validate the brief locally and run the configured runner precheck."""
     content = "".join(bounded_lines(args.brief))
@@ -252,7 +270,13 @@ def check_brief(args: argparse.Namespace) -> int:
     if result:
         return result
     if not args.runner:
-        print("lane_brief: runner check skipped: LANE_BRIEF_RUNNER unset", file=sys.stderr)
+        print(
+            "lane_brief: runner and lane isolation checks skipped: LANE_BRIEF_RUNNER unset",
+            file=sys.stderr,
+        )
+        return result
+    result = check_isolation(args.worktree)
+    if result:
         return result
     return check_runner(args.runner, args.brief, args.worktree)
 
