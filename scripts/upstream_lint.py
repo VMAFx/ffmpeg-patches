@@ -18,6 +18,11 @@ preprocessor directives, multiline signatures and ambiguous constructs are not
 interpreted as declarations. Untouched whitespace violations in changed C/header
 files are listed as pre-existing, without failing. This is a mechanical subset,
 not a replacement for upstream review or the remaining developer.texi rules.
+
+The fate-deps step checks lavfi video FATE registrations for LAVFI_INDEV and
+WRAPPED_AVFRAME_DECODER: lavfi emits wrapped_avframe video packets, so an encoder
+alone cannot satisfy decoding. Templates are reported without expansion,
+multi-file variables remain unresolved, and audio PCM decoders are not checked.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Ensure repository root is on sys.path for test/tool imports
@@ -71,6 +76,7 @@ GIT_ENVIRONMENT_NAMES = (
     "GIT_WORK_TREE",
 )
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+DIFF_COMMON = ("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames")
 MAX_PATHS = 2000
 RUN_TIMEOUT = 1800
 CLEANUP_TIMEOUT = 30
@@ -311,6 +317,7 @@ def _patcheck(tree: Path, base: str, head: str, scratch: Path) -> Step:
 
 
 def _added_lines(patch: str) -> set[int]:
+    """Collect added physical line numbers from zero-context diff hunks."""
     added = set()
     for line in patch.splitlines():
         match = HUNK.match(line)
@@ -377,17 +384,302 @@ def _changed_paths(
 
 
 def _mechanical(tree: Path, base: str, head: str) -> Step:
-    common = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"]
+    """Check added C and header lines against mechanical formatting rules."""
     names = _changed_paths(tree, base, head, "*.c", "*.h", added_or_modified=True)
     findings, reports = 0, []
     for name in names:
-        patch = _git(tree, *common, "-U0", base, head, "--", name)
+        patch = _git(tree, *DIFF_COMMON, "-U0", base, head, "--", name)
         source = _git(tree, "show", f"{head}:{name}")
         count, lines = _file_rules(name, source, _added_lines(patch))
         findings += count
         reports.extend(lines)
     reports.append(f"{findings} added-line finding(s); developer.texi: Code formatting conventions")
     return Step("developer.texi", int(findings > 0), "\n".join(reports))
+
+
+FATE_PATTERNS = (
+    ("variable", re.compile(r"^([A-Z][A-Z0-9_]*)\s*(\+=|:=|=)\s*(.*)$")),
+    ("registration", re.compile(r"^([A-Z][A-Z0-9_]*)-(\$\(.+?|yes)\s*\+=\s*(.*)$")),
+    ("command", re.compile(r"^(.+?)\s*:\s*CMD\s*=\s*(.*)$")),
+    ("open", re.compile(r"^(?:ifeq|ifneq|ifdef|ifndef)\b.*$")),
+    ("else", re.compile(r"^else\b.*$")),
+    ("close", re.compile(r"^endif\s*(?:#.*)?$")),
+    ("define", re.compile(r"^define\s+\S+.*$")),
+    ("endef", re.compile(r"^endef\s*(?:#.*)?$")),
+)
+FATE_VARIABLE = re.compile(r"^\$\(([A-Z][A-Z0-9_]*)\)$")
+LAVFI_FORMAT = re.compile(r"(?:^|\s)-f\s+lavfi(?=\s|$)")
+LAVFI_INPUT = re.compile(
+    r"""(?:^|\s)-f\s+lavfi\s+(?:-(?!i\s)[\w:]+\s+(?:"[^"]*"|'[^']*'|\S+)\s+)*"""
+    r"""-i\s+["']?([a-z0-9_]+)(?=[=,;\s"']|$)"""
+)
+FATE_REQUIRED = ("LAVFI_INDEV", "WRAPPED_AVFRAME_DECODER")
+
+
+@dataclass(frozen=True)
+class FateLine:
+    """A logical make line and its inclusive physical source range."""
+
+    text: str
+    first: int
+    last: int
+
+
+@dataclass(frozen=True)
+class FateToken:
+    """One target token with the physical lines that contributed it."""
+
+    text: str
+    lines: frozenset[int]
+
+
+@dataclass(frozen=True)
+class FateEntry:
+    """One command or registration with target provenance and dependency tokens."""
+
+    line: FateLine
+    target: FateToken
+    deps: frozenset[str] = frozenset()
+    command: str = ""
+
+
+@dataclass
+class FateFile:
+    """File-local variable state, registrations, commands and unexpanded templates."""
+
+    variables: dict[str, list[FateToken]] = field(default_factory=dict)
+    registrations: dict[str, list[FateEntry]] = field(default_factory=dict)
+    commands: dict[str, FateEntry] = field(default_factory=dict)
+    templates: list[FateLine] = field(default_factory=list)
+
+
+@dataclass
+class FateReport:
+    """Accumulate independent file diagnostics and lavfi classification counts."""
+
+    checked: int = 0
+    audio: int = 0
+    unclassified: int = 0
+    findings: int = 0
+    lines: list[str] = field(default_factory=list)
+
+
+def _fate_lines(source: str) -> list[FateLine]:
+    """Join continuations while retaining both physical endpoints."""
+    lines, parts, first = [], [], 1
+    for number, text in enumerate(source.splitlines(), 1):
+        if not parts:
+            first = number
+        continued = text.endswith("\\")
+        parts.append(text[:-1] if continued else text)
+        if not continued:
+            lines.append(FateLine(" ".join(parts).strip(), first, number))
+            parts = []
+    if parts:
+        lines.append(FateLine(" ".join(parts).strip(), first, number))
+    return lines
+
+
+def _fate_kind(line: FateLine) -> tuple[str, tuple[str, ...]]:
+    """Classify a logical line using only the supported positive patterns."""
+    for kind, pattern in FATE_PATTERNS:
+        match = pattern.fullmatch(line.text)
+        if match:
+            return kind, match.groups()
+    return "", ()
+
+
+def _fate_expand(tokens: list[FateToken], variables: dict[str, list[FateToken]]) -> list[FateToken]:
+    """Expand whole-token variable references in at most eight iterative passes."""
+    for _ in range(8):
+        expanded = []
+        for token in tokens:
+            match = FATE_VARIABLE.fullmatch(token.text)
+            replacements = variables.get(match[1], [token]) if match else [token]
+            expanded.extend(FateToken(item.text, item.lines | token.lines) for item in replacements)
+        if expanded == tokens:
+            break
+        tokens = expanded
+    return tokens
+
+
+def _fate_tokens(text: str, line: FateLine) -> list[FateToken]:
+    """Attach physical provenance to each whitespace-separated make token."""
+    return [FateToken(token, frozenset(range(line.first, line.last + 1))) for token in text.split()]
+
+
+def _fate_dependencies(text: str) -> frozenset[str]:
+    """Extract uppercase dependencies, normalizing enclosing CONFIG references."""
+    return frozenset(
+        token.removeprefix("CONFIG_") for token in re.findall(r"[A-Z][A-Z0-9_]+", text)
+    )
+
+
+def _fate_record(
+    parsed: FateFile, line: FateLine, statement: tuple[str, tuple[str, ...]], deps: frozenset[str]
+) -> None:
+    """Apply one allow-listed variable, registration or command in file order."""
+    kind, groups = statement
+    if kind == "variable":
+        name, operator, value = groups
+        tokens = _fate_tokens(value, line)
+        parsed.variables[name] = (
+            parsed.variables.get(name, []) if operator == "+=" else []
+        ) + tokens
+    elif kind in ("registration", "command"):
+        targets = groups[2] if kind == "registration" else groups[0]
+        dependencies = (
+            deps | _fate_dependencies(groups[1]) if kind == "registration" else frozenset()
+        )
+        for target in _fate_expand(_fate_tokens(targets, line), parsed.variables):
+            if target.text.startswith("fate-"):
+                entry = FateEntry(
+                    line, target, dependencies, groups[1] if kind == "command" else ""
+                )
+                if kind == "registration":
+                    parsed.registrations.setdefault(target.text, []).append(entry)
+                else:
+                    parsed.commands[target.text] = entry
+
+
+def _fate_parse(source: str) -> FateFile:
+    """Parse file-local make statements without evaluating templates or make code."""
+    parsed, conditions, depth = FateFile(), [], 0
+    for line in _fate_lines(source):
+        statement = _fate_kind(line)
+        kind, groups = statement
+        if kind == "define":
+            depth += 1
+        elif kind == "endef":
+            depth = max(0, depth - 1)
+        elif depth:
+            if kind == "command" and LAVFI_FORMAT.search(groups[1]):
+                parsed.templates.append(line)
+        elif kind == "open":
+            conditions.append(_fate_dependencies(line.text))
+        elif kind == "close":
+            if conditions:
+                conditions.pop()
+        else:
+            _fate_record(parsed, line, statement, frozenset().union(*conditions))
+    return parsed
+
+
+def _fate_touched(entry: FateEntry, added: set[int]) -> bool:
+    """Check the entry's physical range and expanded variable provenance."""
+    return bool(
+        added.intersection(range(entry.line.first, entry.line.last + 1))
+        or added & entry.target.lines
+    )
+
+
+def _fate_video(
+    path: str, command: FateEntry, registrations: list[FateEntry], touched: bool, report: FateReport
+) -> None:
+    """Report each missing video registration dependency with touched-line severity."""
+    report.checked += 1
+    name = command.target.text
+    if not registrations and touched:
+        report.lines.append(
+            f"informational: {path}:{command.line.first}: {name}: registration not found"
+        )
+    for registration in registrations:
+        missing = " ".join(dep for dep in FATE_REQUIRED if dep not in registration.deps)
+        if missing:
+            report.findings += int(touched)
+            label = "finding" if touched else "pre-existing (untouched)"
+            report.lines.append(
+                f"{label}: {path}:{registration.line.first}: {name}: "
+                f"lavfi video input needs {missing} in its registration"
+            )
+
+
+def _fate_command(
+    path: str, command: FateEntry, sources: dict[str, str], report: FateReport
+) -> bool:
+    """Classify every lavfi input, counting audio-only and unclassified tests."""
+    names = LAVFI_INPUT.findall(command.command)
+    kinds = {sources.get(name, "unknown") for name in names}
+    if not kinds or kinds - {"video", "audio"}:
+        report.unclassified += 1
+        report.lines.append(
+            f"informational: {path}:{command.line.first}: {command.target.text}: "
+            f"unclassified lavfi source: {', '.join(names) or '<unresolved>'}"
+        )
+    if "video" in kinds:
+        return True
+    if kinds == {"audio"}:
+        report.audio += 1
+    return False
+
+
+def _fate_check(
+    path: str, parsed: FateFile, added: set[int], sources: dict[str, str]
+) -> FateReport:
+    """Check parsed lavfi commands against every local registration."""
+    report = FateReport()
+    for line in parsed.templates:
+        if added.intersection(range(line.first, line.last + 1)):
+            report.lines.append(f"informational: {path}:{line.first}: template not checked")
+    for name, command in parsed.commands.items():
+        if not LAVFI_FORMAT.search(command.command):
+            continue
+        registrations = parsed.registrations.get(name, [])
+        touched = any(_fate_touched(entry, added) for entry in [command, *registrations])
+        if _fate_command(path, command, sources, report):
+            _fate_video(path, command, registrations, touched, report)
+    return report
+
+
+def _fate_file(path: str, source: str, added: set[int], sources: dict[str, str]) -> FateReport:
+    """Expose pure file parsing and checking without Git or subprocess access."""
+    return _fate_check(path, _fate_parse(source), added, sources)
+
+
+def _fate_summary(report: FateReport, rc: int = 0) -> Step:
+    """Finish every fate-deps outcome with its classification and finding totals."""
+    summary = (
+        f"{report.checked} lavfi video test(s) checked, {report.audio} audio skipped, "
+        f"{report.unclassified} unclassified, {report.findings} finding(s); "
+        "FATE dependencies: wrapped_avframe decoder"
+    )
+    return Step("fate-deps", rc or int(report.findings > 0), "\n".join([*report.lines, summary]))
+
+
+def _fate_sources(source: str) -> dict[str, str]:
+    """Read source classifications solely from upstream filter declarations."""
+    kinds = {"v": "video", "a": "audio", "av": "mixed"}
+    return {
+        name: kinds[kind]
+        for kind, name in re.findall(
+            r"extern\s+const\s+FFFilter\s+ff_(v|a|av)src_(\w+)\s*;", source
+        )
+    }
+
+
+def _fate_deps(tree: Path, base: str, head: str) -> Step:
+    """Check changed FATE makefiles with one lazily loaded upstream source catalog."""
+    report, sources, rc = FateReport(), None, 0
+    try:
+        names = _changed_paths(tree, base, head, "tests/fate/*.mak", added_or_modified=True)
+        for name in names:
+            patch = _git(tree, *DIFF_COMMON, "-U0", base, head, "--", name)
+            parsed = _fate_parse(_git(tree, "show", f"{head}:{name}"))
+            needs_sources = parsed.templates or any(
+                LAVFI_FORMAT.search(command.command) for command in parsed.commands.values()
+            )
+            if sources is None and needs_sources:
+                sources = _fate_sources(_git(tree, "show", f"{head}:libavfilter/allfilters.c"))
+            result = _fate_check(name, parsed, _added_lines(patch), sources or {})
+            report.checked += result.checked
+            report.audio += result.audio
+            report.unclassified += result.unclassified
+            report.findings += result.findings
+            report.lines.extend(result.lines)
+    except (OSError, RuntimeError, ValueError) as error:
+        rc = 2
+        report.lines.append(str(error))
+    return _fate_summary(report, rc)
 
 
 def _collect(name: str, action: Callable[[], Step]) -> Step:
@@ -398,6 +690,7 @@ def _collect(name: str, action: Callable[[], Step]) -> Step:
 
 
 def _checks(tree: Path, base: str, head: str) -> list[Step]:
+    """Collect every independent check even when another check fails."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-upstream-lint-") as directory:
         scratch = Path(directory)
         return [
@@ -405,6 +698,7 @@ def _checks(tree: Path, base: str, head: str) -> list[Step]:
             _collect("commit-msg", lambda: _commit_messages(tree, base, head, scratch)),
             _collect("patcheck", lambda: _patcheck(tree, base, head, scratch)),
             _collect("developer.texi", lambda: _mechanical(tree, base, head)),
+            _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
         ]
 
 

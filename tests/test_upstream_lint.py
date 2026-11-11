@@ -181,10 +181,221 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(upstream_lint._added_lines("@@ -2 +2,2 @@\n+a\n+b\n"), {2, 3})
 
 
+FATE_RED = (
+    "FATE_SCALE_REFUSE = fate-filter-scale-ipt-c2-refuse-rgb "
+    "fate-filter-scale-ipt-c2-refuse-range\n"
+    "FATE_SCALE_REFUSE += fate-filter-scale-bt2020c-refuse-rgb\n"
+    "FATE_FILTER-$(call ALLYES, TESTSRC2_FILTER FORMAT_FILTER SETPARAMS_FILTER "
+    "SCALE_FILTER LAVFI_INDEV WRAPPED_AVFRAME_ENCODER NULL_MUXER) += $(FATE_SCALE_REFUSE)\n"
+    "fate-filter-scale-ipt-c2-refuse-rgb: CMD = ! run $(FFMPEG) -nostdin -hide_banner "
+    '-f lavfi -i "testsrc2=s=64x64:r=1:d=1,format=yuv420p10le" '
+    '-vf "scale,format=gbrp10le" -frames:v 1 -f null none\n'
+)
+FATE_SOURCES = {"testsrc2": "video", "sine": "audio", "movie": "mixed"}
+FILTER_DECLARATIONS = (
+    "extern const FFFilter ff_vsrc_testsrc2;\n"
+    "extern const FFFilter ff_asrc_sine;\n"
+    "extern const FFFilter ff_avsrc_movie;\n"
+)
+
+
+class FateDepsTest(unittest.TestCase):
+    """Exercise lavfi dependency parsing without Git or external commands."""
+
+    def check_source(
+        self, source: str = FATE_RED, added: set[int] | None = None
+    ) -> upstream_lint.Step:
+        """Parse one changed FATE file with fixture source declarations."""
+        self.assertTrue(hasattr(upstream_lint, "_fate_file"), "fate-deps parser missing")
+        if added is None:
+            added = set(range(1, len(source.splitlines()) + 1))
+        report = upstream_lint._fate_file(
+            "tests/fate/filter-video.mak", source, added, FATE_SOURCES
+        )
+        return upstream_lint._fate_summary(report)
+
+    def test_planted_missing_decoder_fails(self) -> None:
+        """The planted encoder dependency cannot satisfy the video decoder."""
+        step = self.check_source()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count("finding:"), 1)
+        self.assertIn(":3: fate-filter-scale-ipt-c2-refuse-rgb:", step.output)
+        self.assertIn("needs WRAPPED_AVFRAME_DECODER in its registration", step.output)
+
+    def test_decoder_present_passes(self) -> None:
+        """Explicit device and decoder dependencies satisfy the registration."""
+        step = self.check_source(
+            FATE_RED.replace("NULL_MUXER", "WRAPPED_AVFRAME_DECODER NULL_MUXER")
+        )
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("1 lavfi video test(s) checked", step.output)
+        self.assertIn("0 finding(s)", step.output)
+
+    def test_untouched_gap_is_nonfailing(self) -> None:
+        """An inherited dependency gap remains visible without failing."""
+        step = self.check_source(added=set())
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("pre-existing (untouched):", step.output)
+
+    def test_non_lavfi_is_not_counted(self) -> None:
+        """Ordinary inputs stay outside the lavfi check."""
+        step = self.check_source(FATE_RED.replace("-f lavfi", "-f rawvideo"))
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 lavfi video test(s) checked", step.output)
+
+    def test_audio_is_skipped(self) -> None:
+        """Audio sources do not require the wrapped video decoder."""
+        step = self.check_source(FATE_RED.replace('"testsrc2=', '"sine='))
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("1 audio skipped", step.output)
+
+    def test_variables_append_and_group_commands(self) -> None:
+        """Appended variable targets and grouped CMD assignments expand together."""
+        source = FATE_RED.replace(
+            "fate-filter-scale-ipt-c2-refuse-rgb: CMD", "$(FATE_SCALE_REFUSE): CMD"
+        )
+        step = self.check_source(source, {2})
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count("finding:"), 1)
+        self.assertIn("fate-filter-scale-bt2020c-refuse-rgb: lavfi", step.output)
+        self.assertIn("3 lavfi video test(s) checked", step.output)
+
+    def test_continuation_line_is_touched(self) -> None:
+        """Touching any physical registration line checks its logical line."""
+        source = FATE_RED.replace("LAVFI_INDEV ", "LAVFI_INDEV \\\n    ")
+        step = self.check_source(source, {4})
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(":3: fate-filter-scale-ipt-c2-refuse-rgb:", step.output)
+
+    def test_conditional_dependency_passes(self) -> None:
+        """An enclosing CONFIG decoder condition supplies that dependency."""
+        source = FATE_RED.replace(
+            "FATE_FILTER-", "ifeq ($(CONFIG_WRAPPED_AVFRAME_DECODER),yes)\nFATE_FILTER-"
+        )
+        source = source.replace(
+            "fate-filter-scale-ipt-c2-refuse-rgb: CMD",
+            "endif\nfate-filter-scale-ipt-c2-refuse-rgb: CMD",
+        )
+        self.assertEqual(self.check_source(source).rc, 0)
+
+    def test_template_command_is_informational(self) -> None:
+        """Touched template commands request review without speculative expansion."""
+        step = self.check_source("define TEST\n" + FATE_RED + "endef\n$(eval $(call TEST))\n")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("template not checked", step.output)
+        self.assertIn("0 lavfi video test(s) checked", step.output)
+
+    def test_unknown_and_mixed_sources_are_unclassified(self) -> None:
+        """Unknown and mixed sources remain informational."""
+        for name in ("unknown", "movie"):
+            with self.subTest(name=name):
+                step = self.check_source(FATE_RED.replace('"testsrc2=', f'"{name}='))
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertIn("unclassified lavfi source", step.output)
+                self.assertIn("1 unclassified", step.output)
+
+    def test_expansion_bound_keeps_unresolved_token(self) -> None:
+        """Self-references terminate and remain unresolved after eight passes."""
+        token = upstream_lint.FateToken("$(LOOP)", frozenset({1}))
+        self.assertEqual(upstream_lint._fate_expand([token], {"LOOP": [token]}), [token])
+        self.assertEqual(upstream_lint._fate_expand([token], {}), [token])
+
+    def test_registration_macros_do_not_imply_dependencies(self) -> None:
+        """Recognized registration wrappers require explicit device and decoder deps."""
+        for middle in (
+            "$(call ALLYES, TESTSRC2_FILTER)",
+            "$(call TRANSCODE, RAWVIDEO, NUT, TESTSRC2_FILTER)",
+            "$(call FILTERFRAMECRC, TESTSRC2, SCALE_FILTER)",
+            "$(call ENCMUX, RAWVIDEO, NUT)",
+            "$(if $(CONFIG_SMALL),no,$(call ALLYES, TESTSRC2_FILTER))",
+            "yes",
+        ):
+            with self.subTest(middle=middle):
+                source = f"FATE_X-{middle} += fate-x\nfate-x: CMD = -f lavfi -i testsrc2\n"
+                step = self.check_source(source)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("needs LAVFI_INDEV WRAPPED_AVFRAME_DECODER", step.output)
+
+    def test_missing_registration_is_informational(self) -> None:
+        """A touched video command without a local registration requests review."""
+        step = self.check_source("fate-x: CMD = -f lavfi -i testsrc2\n")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("registration not found", step.output)
+
+    def test_multiple_registrations_are_checked(self) -> None:
+        """A good registration cannot mask a second registration with a gap."""
+        source = FATE_RED + "FATE_X-yes += fate-filter-scale-ipt-c2-refuse-rgb\n"
+        step = self.check_source(source, {5})
+        self.assertEqual(step.output.count("finding:"), 2)
+
+    def test_options_between_format_and_input(self) -> None:
+        """Input options and quoted option values preserve source classification."""
+        source = FATE_RED.replace(
+            "-f lavfi -i", '-f lavfi -thread_queue_size 8 -dumpgraph "a b" -i'
+        )
+        self.assertEqual(self.check_source(source).rc, 1)
+
+    def test_assignment_replacement_and_nested_expansion(self) -> None:
+        """Replacement removes stale targets while nested references retain provenance."""
+        source = (
+            "OLD = fate-old\nOLD := fate-x\nGROUP = $(OLD)\n"
+            "FATE_X-yes += $(GROUP)\n$(GROUP): CMD = -f lavfi -i testsrc2\n"
+        )
+        step = self.check_source(source, {2})
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertNotIn("fate-old", step.output)
+        self.assertIn("1 lavfi video test(s) checked", step.output)
+
+    def test_catalog_declarations_define_source_kinds(self) -> None:
+        """Only FFFilter source declarations supply video, audio and mixed names."""
+        self.assertEqual(upstream_lint._fate_sources(FILTER_DECLARATIONS), FATE_SOURCES)
+        self.assertEqual(upstream_lint._fate_sources("extern const AVFilter ff_vsrc_fake;"), {})
+
+    def test_expansion_stops_at_eight_passes(self) -> None:
+        """A chain longer than eight expansions retains its unresolved reference."""
+        variables = {
+            f"V{index}": [upstream_lint.FateToken(f"$(V{index + 1})", frozenset())]
+            for index in range(10)
+        }
+        result = upstream_lint._fate_expand(
+            [upstream_lint.FateToken("$(V0)", frozenset())], variables
+        )
+        self.assertEqual(result[0].text, "$(V8)")
+
+    def test_explicit_targets_share_command(self) -> None:
+        """A multi-target command checks each registered test separately."""
+        source = "FATE_X-yes += fate-a fate-b\nfate-a fate-b: CMD = -f lavfi -i testsrc2\n"
+        step = self.check_source(source)
+        self.assertEqual(step.output.count("finding:"), 2)
+        self.assertIn("2 lavfi video test(s) checked", step.output)
+
+    def test_nested_conditions_restore_outer_dependencies(self) -> None:
+        """Closing inner conditions preserves only still-enclosing dependency tokens."""
+        source = (
+            "ifdef CONFIG_LAVFI_INDEV\n"
+            "ifndef CONFIG_SMALL\n"
+            "ifeq ($(CONFIG_WRAPPED_AVFRAME_DECODER),yes)\n"
+            "FATE_X-yes += fate-a\nendif\nelse\n"
+            "FATE_X-yes += fate-b\nendif\nendif\n"
+            "fate-a fate-b: CMD = -f lavfi -i testsrc2\n"
+        )
+        step = self.check_source(source)
+        self.assertEqual(step.output.count("finding:"), 1)
+        self.assertIn("fate-b: lavfi video input needs WRAPPED_AVFRAME_DECODER", step.output)
+
+    def test_unrecognized_lines_are_ignored(self) -> None:
+        """Only allow-listed statements can register or assign commands."""
+        source = "# fate-x: CMD = -f lavfi -i testsrc2\ninclude other.mak\n"
+        source += "FATE_X-no += fate-x\nfate-x: CMD = -f lavfi -i testsrc2\n"
+        step = self.check_source(source)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("registration not found", step.output)
+
+
 class FixtureTest(unittest.TestCase):
     """Shared disposable Git fixture; stub the pre-commit subprocess only."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Create a minimal committed base without inheriting template hooks."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -197,6 +408,7 @@ class FixtureTest(unittest.TestCase):
         self.write("tools/check_commit_msg.sh", FAKE_MESSAGE)
         self.write("tools/patcheck", FAKE_PATCHECK)
         self.write("libavfilter/vf_x.c", SOURCE)
+        self.write("libavfilter/allfilters.c", FILTER_DECLARATIONS)
         self.commit("avfilter/vf_x: initial fixture")
         self.base = self.git("rev-parse", "HEAD").strip()
         self.real_run = upstream_lint._run
@@ -266,14 +478,46 @@ class FixtureTest(unittest.TestCase):
 class PipelineTest(FixtureTest):
     """Run Git and base tools in a throwaway repository; stub pre-commit only."""
 
-    def test_clean_commit_passes_and_collects_all_steps(self):
-        """A correctly named clean commit passes all four collected checks."""
+    def test_clean_commit_passes_and_collects_all_steps(self) -> None:
+        """A correctly named clean commit passes all five collected checks."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit()
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
+        for name in ("pre-commit", "commit-msg", "patcheck", "developer.texi", "fate-deps"):
+            self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_fate_missing_decoder_fails(self) -> None:
+        """A committed lavfi video dependency gap fails without losing other steps."""
+        self.write("tests/fate/filter-video.mak", FATE_RED)
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: fate-deps rc: 1", output)
         for name in ("pre-commit", "commit-msg", "patcheck", "developer.texi"):
             self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_fate_decoder_present_passes(self) -> None:
+        """A committed registration with both dependencies passes the pipeline."""
+        self.write(
+            "tests/fate/filter-video.mak",
+            FATE_RED.replace("NULL_MUXER", "WRAPPED_AVFRAME_DECODER NULL_MUXER"),
+        )
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: fate-deps rc: 0", output)
+
+    def test_fate_missing_allfilters_is_error(self) -> None:
+        """A needed source catalog missing at head fails the step explicitly."""
+        self.git("rm", "libavfilter/allfilters.c")
+        self.write("tests/fate/filter-video.mak", FATE_RED)
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: fate-deps rc: 2", output)
+        self.assertIn("libavfilter/allfilters.c", output)
+        self.assertIn("FATE dependencies: wrapped_avframe decoder", output)
 
     def test_bad_subject_fails_without_skipping_other_checks(self):
         """The base commit-message checker rejects the planted bad subject."""
