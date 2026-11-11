@@ -177,7 +177,7 @@ class LaneBriefTest(unittest.TestCase):
         self.addCleanup(environment.stop)
         os.environ.pop("LANE_BRIEF_RUNNER", None)
         patcher = patch.object(lane_brief, "check_isolation", return_value=0)
-        patcher.start()
+        self.isolation = patcher.start()
         self.addCleanup(patcher.stop)
 
     def run_cli(self, *args: str) -> tuple[int, str, str]:
@@ -453,6 +453,7 @@ class LaneBriefTest(unittest.TestCase):
         brief, _, _ = self.runner_fixture()
         rc, _, error = self.run_cli("check", str(brief))
         self.assertEqual(rc, 0)
+        self.isolation.assert_not_called()
         self.assertEqual(
             error, "lane_brief: runner and lane isolation checks skipped: LANE_BRIEF_RUNNER unset\n"
         )
@@ -463,6 +464,7 @@ class LaneBriefTest(unittest.TestCase):
         with patch.dict(os.environ, {"LANE_BRIEF_RUNNER": ""}):
             rc, _, error = self.run_cli("check", str(brief))
         self.assertEqual(rc, 0)
+        self.isolation.assert_not_called()
         self.assertEqual(
             error, "lane_brief: runner and lane isolation checks skipped: LANE_BRIEF_RUNNER unset\n"
         )
@@ -1024,6 +1026,7 @@ class LaneBriefIsolationTest(unittest.TestCase):
         self.assertIn(ref, error)
         self.assertFalse(self.calls.exists())
 
+    @unittest.skipUnless(os.name == "posix", "runner fixture is a POSIX shell script")
     def test_marked_clone_starts_runner(self) -> None:
         """Forward the exact brief and worktree arguments after isolation passes."""
         origin = repo(self.root / "origin")
@@ -1051,6 +1054,22 @@ class LaneBriefIsolationTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("lane isolation failed", error)
         self.assertFalse(self.calls.exists())
+
+
+@unittest.skipUnless(os.name == "posix", "runner fixture uses /bin/sh")
+class RunnerEnvironmentTest(unittest.TestCase):
+    """Check that runners inherit no caller Git repository-location overrides."""
+
+    def test_runner_drops_git_location(self) -> None:
+        """Remove caller Git directory and worktree overrides before starting a runner."""
+        with patch.dict(
+            os.environ,
+            {"GIT_DIR": "/nonexistent/private.git", "GIT_WORK_TREE": "/nonexistent/private"},
+        ):
+            result = lane_brief.run_runner(
+                ["/bin/sh", "-c", 'printf "%s %s" "${GIT_DIR-unset}" "${GIT_WORK_TREE-unset}"']
+            )
+        self.assertEqual(result, (b"unset unset", 0))
 
 
 if __name__ == "__main__":

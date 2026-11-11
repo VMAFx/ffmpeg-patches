@@ -206,6 +206,7 @@ def run_runner(argv: list[str]) -> tuple[bytes, int]:
     """Run and reap a runner while collecting bounded combined output."""
     process = subprocess.Popen(  # nosec B603 - configured runner path, explicit argv, no shell.
         argv,
+        env=lane_isolation.git_environment(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,

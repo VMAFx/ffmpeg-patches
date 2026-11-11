@@ -39,7 +39,8 @@ def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
             ["git", *args],
             env=git_environment(),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             stdin=subprocess.DEVNULL,
             timeout=GIT_TIMEOUT,
@@ -55,15 +56,26 @@ def common_dir(worktree: Path) -> Path:
     result = run_git(
         ["-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"]
     )
-    if result.returncode != 0 or not result.stdout.strip():
+    directory = result.stdout.removesuffix("\n")
+    if result.returncode != 0 or not directory:
         raise IsolationError(f"{worktree}: not a git worktree: {result.stderr.strip()}")
-    return Path(result.stdout.strip())
+    return Path(directory)
+
+
+def inside_work_tree(worktree: Path) -> bool:
+    """Check whether the requested path belongs to a checked-out worktree."""
+    result = run_git(["-C", str(worktree), "rev-parse", "--is-inside-work-tree"])
+    if result.returncode != 0:
+        raise IsolationError(f"{worktree}: cannot query work tree: {result.stderr.strip()}")
+    return result.stdout.removesuffix("\n") == "true"
 
 
 def is_lane_clone(common: Path) -> bool:
     """Read the lane marker only from the clone's own common configuration."""
     config = common / "config"
-    result = run_git(["config", "--file", str(config), "--type=bool", "--get", MARKER])
+    result = run_git(
+        ["config", "--file", str(config), "--no-includes", "--type=bool", "--get", MARKER]
+    )
     if result.returncode == 1:
         return False
     if result.returncode != 0:
@@ -73,7 +85,9 @@ def is_lane_clone(common: Path) -> bool:
 
 def private_refs(worktree: Path) -> list[str]:
     """Collect private-topic references in Git output order within the count cap."""
-    result = run_git(["-C", str(worktree), "for-each-ref", "--format=%(refname)"])
+    result = run_git(
+        ["-C", str(worktree), "for-each-ref", f"--count={MAX_REFS + 1}", "--format=%(refname)"]
+    )
     if result.returncode != 0:
         raise IsolationError(f"{worktree}: cannot list refs: {result.stderr.strip()}")
     refs = result.stdout.splitlines()
@@ -95,9 +109,13 @@ def private_refusals(worktree: Path, common: Path, refs: list[str]) -> list[str]
 
 
 def refusals(worktree: Path) -> list[str]:
-    """Return independent marker and private-reference refusals for a worktree."""
+    """Return independent worktree, marker, and private-reference refusals."""
     common = common_dir(worktree)
     lines = []
+    if not inside_work_tree(worktree):
+        lines.append(
+            f"{worktree}: not inside a work tree; hosted lanes need a checked-out worktree"
+        )
     if not is_lane_clone(common):
         lines.append(
             f"{worktree}: git common dir {common} is not a lane clone "
@@ -112,9 +130,10 @@ def mark(clone: Path) -> list[str]:
     """Mark a clone only after rejecting linked worktrees and private references."""
     common = common_dir(clone)
     result = run_git(["-C", str(clone), "rev-parse", "--path-format=absolute", "--git-dir"])
-    if result.returncode != 0 or not result.stdout.strip():
+    directory = result.stdout.removesuffix("\n")
+    if result.returncode != 0 or not directory:
         raise IsolationError(f"{clone}: cannot read git directory: {result.stderr.strip()}")
-    if Path(result.stdout.strip()) != common:
+    if Path(directory) != common:
         return [f"{clone}: is a linked worktree; mark the clone itself"]
     lines = private_refusals(clone, common, private_refs(clone))
     if lines:
@@ -122,6 +141,8 @@ def mark(clone: Path) -> list[str]:
     config = common / "config"
     result = run_git(["config", "--file", str(config), MARKER, "true"])
     if result.returncode != 0:
+        if is_lane_clone(common):
+            return []
         raise IsolationError(f"{config}: cannot set {MARKER}: {result.stderr.strip()}")
     return []
 
@@ -136,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         path = args.worktree if args.command == "check" else args.clone
         lines = refusals(path) if args.command == "check" else mark(path)
-        for line in lines[: MAX_LISTED + 2]:
+        for line in lines[: MAX_LISTED + 3]:
             print(line, file=sys.stderr)
         if lines:
             return 1

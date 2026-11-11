@@ -142,6 +142,7 @@ class LaneIsolationTest(unittest.TestCase):
                 "config",
                 "--file",
                 str(common / "config"),
+                "--no-includes",
                 "--type=bool",
                 "--get",
                 lane_isolation.MARKER,
@@ -194,6 +195,122 @@ class LaneIsolationTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("ref count exceeds cap 1", error)
 
+    def test_ref_listing_count_bound(self) -> None:
+        """Bound Git reference output to one entry past the configured cap."""
+        with (
+            patch.object(lane_isolation, "MAX_REFS", 1),
+            patch.object(
+                lane_isolation, "run_git", return_value=subprocess.CompletedProcess([], 0, "", "")
+            ) as query,
+        ):
+            self.assertEqual(lane_isolation.private_refs(self.root), [])
+        self.assertIn("--count=2", query.call_args.args[0])
+
+    def test_included_marker_never_counts(self) -> None:
+        """Reject an included marker despite an explicit include-enabled control."""
+        lane = repo(self.root / "lane")
+        included = self.root / "inc.gitconfig"
+        included.write_text("[lane]\n\tclone = true\n", encoding="utf-8")
+        config = lane / ".git" / "config"
+        run_git(
+            lane,
+            "config",
+            "--file",
+            str(config),
+            "include.path",
+            str(included),
+            preserve_config=True,
+        )
+        self.assertEqual(
+            run_git(
+                lane,
+                "config",
+                "--file",
+                str(config),
+                "--includes",
+                "--type=bool",
+                "--get",
+                lane_isolation.MARKER,
+                preserve_config=True,
+            ).strip(),
+            "true",
+        )
+        self.assertFalse(lane_isolation.is_lane_clone(lane_isolation.common_dir(lane)))
+        rc, _, error = self.run_cli("check", lane)
+        self.assertEqual(rc, 1)
+        self.assertIn("is not a lane clone", error)
+
+    def test_bare_clone_refused(self) -> None:
+        """Refuse a marked bare clone because hosted runners need a worktree."""
+        origin = repo(self.root / "origin")
+        bare = self.root / "bare.git"
+        run_git(self.root, "clone", "-q", "--bare", str(origin), str(bare), preserve_config=True)
+        self.assertEqual(lane_isolation.mark(bare), [])
+        rc, _, error = self.run_cli("check", bare)
+        self.assertEqual(rc, 1)
+        self.assertIn("not inside a work tree", error)
+
+    def test_linked_worktree_of_bare_clone_passes(self) -> None:
+        """Allow a linked worktree belonging to a marked bare clone."""
+        origin = repo(self.root / "origin")
+        bare = self.root / "bare.git"
+        run_git(self.root, "clone", "-q", "--bare", str(origin), str(bare), preserve_config=True)
+        self.assertEqual(lane_isolation.mark(bare), [])
+        worktree = linked(bare, self.root / "wt")
+        rc, _, error = self.run_cli("check", worktree)
+        self.assertEqual((rc, error), (0, ""))
+
+    def test_undecodable_private_ref_refused(self) -> None:
+        """Refuse private reference bytes that cannot be decoded as UTF-8."""
+        lane = repo(self.root / "lane")
+        self.assertEqual(lane_isolation.mark(lane), [])
+        sha = run_git(lane, "rev-parse", "HEAD", preserve_config=True).strip()
+        (lane / ".git" / "packed-refs").write_bytes(
+            sha.encode() + b" refs/heads/x\xff" + lane_isolation.PRIVATE_WORDS[-1].encode() + b"\n"
+        )
+        rc, _, error = self.run_cli("check", lane)
+        self.assertEqual(rc, 1)
+        self.assertIn(lane_isolation.PRIVATE_WORDS[-1], error)
+        self.assertNotIn("Traceback", error)
+
+    @unittest.skipUnless(os.name == "posix", "trailing-space directory names are not portable")
+    def test_trailing_space_common_dir(self) -> None:
+        """Keep a trailing space in the common directory when writing its marker."""
+        bare = self.root / "lane "
+        run_git(self.root, "init", "-q", "--bare", str(bare), preserve_config=True)
+        self.assertEqual(lane_isolation.mark(bare), [])
+        self.assertEqual(
+            run_git(
+                self.root,
+                "config",
+                "--file",
+                str(bare / "config"),
+                "--type=bool",
+                "--get",
+                lane_isolation.MARKER,
+                preserve_config=True,
+            ).strip(),
+            "true",
+        )
+        self.assertFalse((self.root / "lane").exists())
+
+    def test_mark_locked_already_marked(self) -> None:
+        """Accept an existing true marker while another writer holds the lock."""
+        lane = repo(self.root / "lane")
+        self.assertEqual(lane_isolation.mark(lane), [])
+        lock = lane / ".git" / "config.lock"
+        lock.write_text("", encoding="utf-8")
+        self.assertEqual(lane_isolation.mark(lane), [])
+        self.assertTrue(lock.exists())
+
+    def test_mark_locked_unmarked_fails(self) -> None:
+        """Refuse a locked unmarked clone without setting its marker."""
+        lane = repo(self.root / "lane")
+        (lane / ".git" / "config.lock").write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(lane_isolation.IsolationError, "cannot set"):
+            lane_isolation.mark(lane)
+        self.assertFalse(lane_isolation.is_lane_clone(lane / ".git"))
+
     def test_timeout(self) -> None:
         """Convert a Git timeout into a diagnostic and input error status."""
         with patch.object(
@@ -239,6 +356,7 @@ class LaneIsolationTest(unittest.TestCase):
             subprocess.CompletedProcess([], 0, str(common), ""),
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 128, "", "demo error"),
+            subprocess.CompletedProcess([], 1, "", ""),
         ]
         with patch.object(lane_isolation, "run_git", side_effect=replies):
             rc, _, error = self.run_cli("mark", self.root)
