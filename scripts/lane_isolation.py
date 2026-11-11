@@ -6,6 +6,7 @@
 Usage: lane_isolation.py check WORKTREE
        lane_isolation.py mark CLONE
 Exit status: 0 on pass, 1 when refused, 2 for usage or git errors.
+Runs on POSIX hosts only; elsewhere every command exits 2 before Git starts.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ GIT_TIMEOUT = 30
 GIT_OUTPUT_LIMIT = 32 * 1024 * 1024
 MAX_REFS = 100000
 MAX_LISTED = 10
+POSIX_HOST = os.name == "posix"
 
 
 class IsolationError(ValueError):
@@ -38,6 +40,8 @@ class IsolationError(ValueError):
 
 def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run Git with isolated repository paths, bounded output, and a deadline."""
+    if not POSIX_HOST:
+        raise IsolationError("git: lane isolation needs POSIX pipes and process groups")
     try:
         process = subprocess.Popen(  # nosec B603 B607 - fixed Git executable, explicit argv.
             ["git", *args],
@@ -163,7 +167,7 @@ def mark(clone: Path) -> list[str]:
     directory = result.stdout.removesuffix("\n")
     if result.returncode != 0 or not directory:
         raise IsolationError(f"{clone}: cannot read git directory: {result.stderr.strip()}")
-    if Path(directory) != common:
+    if Path(os.path.realpath(directory)) != common:
         return [f"{clone}: is a linked worktree; mark the clone itself"]
     lines = private_refusals(clone, common, private_refs(clone))
     if lines:

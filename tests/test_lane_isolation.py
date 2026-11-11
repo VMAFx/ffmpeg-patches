@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import selectors
 import subprocess  # nosec B404 - fixture-controlled Git results and timeout exceptions.
 import tempfile
 import time
@@ -15,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import lane_isolation
+from scripts.process_group import kill_process_group
 from tests.helpers import run_git
 
 
@@ -353,6 +355,36 @@ class LaneIsolationTest(unittest.TestCase):
             "true",
         )
 
+    @unittest.skipUnless(os.name == "posix", "directory symlinks need POSIX")
+    def test_mark_compares_real_git_dir(self) -> None:
+        """Mark a clone when its Git directory uses a symlinked spelling."""
+        lane = repo(self.root / "lane")
+        link = self.root / "link"
+        link.symlink_to(lane, target_is_directory=True)
+        real_run_git = lane_isolation.run_git
+
+        def symlinked_git_dir(args: list[str]) -> subprocess.CompletedProcess[str]:
+            """Return the symlinked Git directory while preserving other Git calls."""
+            if "--absolute-git-dir" in args:
+                return subprocess.CompletedProcess(args, 0, f"{link / '.git'}\n", "")
+            return real_run_git(args)
+
+        with patch.object(lane_isolation, "run_git", side_effect=symlinked_git_dir):
+            self.assertEqual(lane_isolation.mark(lane), [])
+        self.assertEqual(
+            run_git(
+                lane,
+                "config",
+                "--file",
+                str(lane / ".git" / "config"),
+                "--type=bool",
+                "--get",
+                lane_isolation.MARKER,
+                preserve_config=True,
+            ),
+            "true",
+        )
+
     def test_mark_locked_already_marked(self) -> None:
         """Accept an existing true marker while another writer holds the lock."""
         lane = repo(self.root / "lane")
@@ -379,16 +411,35 @@ class LaneIsolationTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("timed out after 30 seconds", error)
 
+    def test_non_posix_host_refused_before_git(self) -> None:
+        """Reject check and mark on non-POSIX hosts before starting Git."""
+        lane = repo(self.root / "lane")
+        with (
+            patch.object(lane_isolation, "POSIX_HOST", False),
+            patch.object(lane_isolation.subprocess, "Popen") as popen,
+        ):
+            for command in ("check", "mark"):
+                with self.subTest(command=command):
+                    rc, output, error = self.run_cli(command, lane)
+                    self.assertEqual(rc, 2)
+                    self.assertIn("needs POSIX", error)
+                    self.assertNotIn("lane_isolation: pass", output)
+            popen.assert_not_called()
+
+    def test_posix_host_flag_matches_os(self) -> None:
+        """Pin POSIX support detection to the operating system name."""
+        self.assertEqual(lane_isolation.POSIX_HOST, os.name == "posix")
+
     def test_git_output_limit_boundary(self) -> None:
         """Accept the exact combined byte limit and reject one byte less."""
         lane = repo(self.root / "lane")
         argv = ["-C", str(lane), "rev-parse", "--git-common-dir"]
         first = lane_isolation.run_git(argv)
         n = len(first.stdout.encode()) + len(first.stderr.encode())
-        with patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", n, create=True):
+        with patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", n):
             self.assertEqual(lane_isolation.run_git(argv).stdout, first.stdout)
         with (
-            patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", n - 1, create=True),
+            patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", n - 1),
             self.assertRaisesRegex(lane_isolation.IsolationError, "output exceeds"),
         ):
             lane_isolation.run_git(argv)
@@ -397,7 +448,7 @@ class LaneIsolationTest(unittest.TestCase):
         """Reject Git stderr alone when it exceeds the combined byte limit."""
         (self.root / "none").mkdir()
         with (
-            patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", 8, create=True),
+            patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", 8),
             self.assertRaisesRegex(lane_isolation.IsolationError, "output exceeds"),
         ):
             lane_isolation.run_git(["-C", str(self.root / "none"), "rev-parse", "--git-common-dir"])
@@ -410,7 +461,7 @@ class LaneIsolationTest(unittest.TestCase):
         (lane / ".git" / "packed-refs").write_text(
             f"{sha} refs/heads/{'a' * 300}\n", encoding="utf-8"
         )
-        with patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", 256, create=True):
+        with patch.object(lane_isolation, "GIT_OUTPUT_LIMIT", 256):
             rc, output, error = self.run_cli("check", lane)
         self.assertEqual(rc, 2)
         self.assertIn("output exceeds", error)
@@ -418,14 +469,23 @@ class LaneIsolationTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "process groups need POSIX")
     def test_git_timeout_kills_process(self) -> None:
-        """Reap the Git process after its deadline without waiting for its sleeper."""
+        """Prove the whole Git process group is gone after its deadline."""
         real_popen = subprocess.Popen
         processes: list[subprocess.Popen[bytes]] = []
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+
+        def kill_sleeper() -> None:
+            """Kill any surviving process group after a failed assertion."""
+            with contextlib.suppress(PermissionError):
+                kill_process_group(processes[0])
 
         def start_sleeper(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-            """Record a real sleeping process launched with the Git process options."""
-            process = real_popen(["sh", "-c", "sleep 30"], **kwargs)
+            """Launch a sleeping grandchild holding the pipe with the Git process options."""
+            process = real_popen(["sh", "-c", "sleep 30 & wait"], pass_fds=(write_end,), **kwargs)
+            os.close(write_end)
             processes.append(process)
+            self.addCleanup(kill_sleeper)
             return process
 
         started = time.monotonic()
@@ -439,6 +499,10 @@ class LaneIsolationTest(unittest.TestCase):
         self.assertEqual(len(processes), 1)
         with self.assertRaises(ProcessLookupError):
             os.kill(processes[0].pid, 0)
+        with selectors.DefaultSelector() as selector:
+            selector.register(read_end, selectors.EVENT_READ)
+            self.assertTrue(selector.select(timeout=5), "process group still holds the pipe")
+            self.assertEqual(os.read(read_end, 1), b"")
 
     def test_failed_or_empty_git_queries(self) -> None:
         """Reject failed Git queries and successful directory queries with no answer."""
