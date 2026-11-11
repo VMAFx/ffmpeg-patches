@@ -983,7 +983,7 @@ class LaneBriefIsolationTest(unittest.TestCase):
 
     def setUp(self) -> None:
         """Render a brief and create a runner that records every argument."""
-        directory = tempfile.TemporaryDirectory(dir=ROOT / ".lane")
+        directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.brief = self.root / "brief.md"
@@ -1040,6 +1040,14 @@ class LaneBriefIsolationTest(unittest.TestCase):
     def test_not_git_never_starts_runner(self) -> None:
         """Report a Git input error without starting the configured runner."""
         rc, error = self.check_worktree(self.root / "missing")
+        self.assertEqual(rc, 2)
+        self.assertIn("lane isolation failed", error)
+        self.assertFalse(self.calls.exists())
+
+    def test_git_unavailable_never_starts_runner(self) -> None:
+        """Report unavailable Git as an isolation error without starting the runner."""
+        with patch.object(lane_isolation.subprocess, "run", side_effect=FileNotFoundError("git")):
+            rc, error = self.check_worktree(self.root / "missing")
         self.assertEqual(rc, 2)
         self.assertIn("lane isolation failed", error)
         self.assertFalse(self.calls.exists())

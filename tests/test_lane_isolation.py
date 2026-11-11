@@ -16,8 +16,6 @@ from unittest.mock import patch
 from scripts import lane_isolation
 from tests.helpers import run_git
 
-ROOT = Path(__file__).resolve().parents[1]
-
 
 def repo(path: Path, *refs: str) -> Path:
     """Create a committed fixture repository with optional planted references."""
@@ -40,8 +38,8 @@ class LaneIsolationTest(unittest.TestCase):
     """Check independent marker and private-reference barriers and their limits."""
 
     def setUp(self) -> None:
-        """Keep every fixture inside the lane worktree and register cleanup."""
-        directory = tempfile.TemporaryDirectory(dir=ROOT / ".lane")
+        """Create a temporary directory for fixtures and register cleanup."""
+        directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
 
@@ -190,11 +188,11 @@ class LaneIsolationTest(unittest.TestCase):
         with patch.object(lane_isolation, "MAX_REFS", 2):
             self.assertEqual(lane_isolation.private_refs(lane), [])
         with patch.object(lane_isolation, "MAX_REFS", 1):
-            with self.assertRaisesRegex(lane_isolation.IsolationError, "1"):
+            with self.assertRaisesRegex(lane_isolation.IsolationError, "ref count exceeds cap 1$"):
                 lane_isolation.private_refs(lane)
             rc, _, error = self.run_cli("check", lane)
         self.assertEqual(rc, 2)
-        self.assertIn("1", error)
+        self.assertIn("ref count exceeds cap 1", error)
 
     def test_timeout(self) -> None:
         """Convert a Git timeout into a diagnostic and input error status."""
@@ -281,6 +279,54 @@ class LaneIsolationTest(unittest.TestCase):
         self.assertIn("1 more private refs", error)
         self.assertEqual(config.read_bytes(), before)
         self.assertFalse(lane_isolation.is_lane_clone(lane / ".git"))
+
+
+class AmbientConfigTest(unittest.TestCase):
+    """Reject ambient markers while proving each configuration source is active."""
+
+    def setUp(self) -> None:
+        """Create an unmarked repository and global config before patching the environment."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.unmarked = repo(self.root / "unmarked")
+        (self.root / "global.gitconfig").write_text("[lane]\n\tclone = true\n", encoding="utf-8")
+
+    def test_ambient_marker_never_counts(self) -> None:
+        """Refuse ambient global, counted, and parameter markers despite successful controls."""
+        sources = (
+            ("global", {"GIT_CONFIG_GLOBAL": str(self.root / "global.gitconfig")}),
+            (
+                "count",
+                {
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": lane_isolation.MARKER,
+                    "GIT_CONFIG_VALUE_0": "true",
+                },
+            ),
+            ("parameters", {"GIT_CONFIG_PARAMETERS": f"'{lane_isolation.MARKER}'='true'"}),
+        )
+        for name, mapping in sources:
+            with self.subTest(source=name), patch.dict(os.environ, mapping):
+                self.assertEqual(
+                    run_git(
+                        self.unmarked,
+                        "config",
+                        "--type=bool",
+                        "--get",
+                        lane_isolation.MARKER,
+                        preserve_config=True,
+                    ).strip(),
+                    "true",
+                )
+                self.assertFalse(
+                    lane_isolation.is_lane_clone(lane_isolation.common_dir(self.unmarked))
+                )
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    rc = lane_isolation.main(["check", str(self.unmarked)])
+                self.assertEqual(rc, 1)
+                self.assertIn("is not a lane clone", stderr.getvalue())
 
 
 if __name__ == "__main__":

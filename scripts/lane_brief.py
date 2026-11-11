@@ -249,7 +249,7 @@ def check_isolation(worktree: Path) -> int:
     """Refuse unsafe lane worktrees before the runner can start."""
     try:
         lines = lane_isolation.refusals(worktree)
-    except lane_isolation.IsolationError as error:
+    except (lane_isolation.IsolationError, OSError) as error:
         print(f"lane_brief: lane isolation failed: {error}", file=sys.stderr)
         return 2
     if lines:
