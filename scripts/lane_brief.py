@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Render or check a lane brief against repository standards.
 
+The check command with a runner first runs scripts/lane_isolation.py on the worktree.
+
 Usage: lane_brief.py render --branch B --task T --finding F --fix X --tests S --paths P --modules M
        lane_brief.py check BRIEF [--config FILE] [--runner PATH] [--worktree DIR]
 Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
@@ -14,7 +16,6 @@ import argparse
 import io
 import os
 import re
-import selectors
 import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
@@ -25,7 +26,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.process_group import kill_process_group  # noqa: E402
+from scripts import lane_isolation  # noqa: E402
+from scripts.process_group import kill_process_group, read_bounded  # noqa: E402
 
 TEMPLATE = ROOT / "scripts" / "lane_brief_template.md"
 CONFIG = ROOT / ".config" / "lane-brief.yaml"
@@ -179,30 +181,16 @@ def read_runner_output(process: subprocess.Popen[bytes], deadline: float) -> byt
     """Read runner output within the byte limit and monotonic deadline."""
     if process.stdout is None:
         raise OSError("runner stdout pipe unavailable")
-    output = bytearray()
-    with selectors.DefaultSelector() as selector:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        for _ in range(RUNNER_OUTPUT_LIMIT + 2):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not selector.select(remaining):
-                raise subprocess.TimeoutExpired(process.args, RUNNER_TIMEOUT)
-            chunk = os.read(process.stdout.fileno(), 4096)
-            if not chunk:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(process.args, RUNNER_TIMEOUT)
-                process.wait(timeout=remaining)
-                return bytes(output)
-            output.extend(chunk)
-            if len(output) > RUNNER_OUTPUT_LIMIT:
-                raise ValueError(f"output exceeds {RUNNER_OUTPUT_LIMIT} bytes")
-    raise ValueError(f"output exceeds {RUNNER_OUTPUT_LIMIT} bytes")
+    return read_bounded(process, (process.stdout,), deadline, RUNNER_OUTPUT_LIMIT, RUNNER_TIMEOUT)[
+        0
+    ]
 
 
 def run_runner(argv: list[str]) -> tuple[bytes, int]:
     """Run and reap a runner while collecting bounded combined output."""
     process = subprocess.Popen(  # nosec B603 - configured runner path, explicit argv, no shell.
         argv,
+        env=lane_isolation.git_environment(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
@@ -242,6 +230,21 @@ def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
     return 0
 
 
+def check_isolation(worktree: Path) -> int:
+    """Refuse unsafe lane worktrees before the runner can start."""
+    try:
+        lines = lane_isolation.refusals(worktree)
+    except (lane_isolation.IsolationError, OSError) as error:
+        print(f"lane_brief: lane isolation failed: {error}", file=sys.stderr)
+        return 2
+    if lines:
+        for line in lines[: lane_isolation.MAX_LISTED + 2]:
+            print(line, file=sys.stderr)
+        print(f"lane_brief: lane isolation refused worktree {worktree}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def check_brief(args: argparse.Namespace) -> int:
     """Validate the brief locally and run the configured runner precheck."""
     content = "".join(bounded_lines(args.brief))
@@ -252,7 +255,13 @@ def check_brief(args: argparse.Namespace) -> int:
     if result:
         return result
     if not args.runner:
-        print("lane_brief: runner check skipped: LANE_BRIEF_RUNNER unset", file=sys.stderr)
+        print(
+            "lane_brief: runner and lane isolation checks skipped: LANE_BRIEF_RUNNER unset",
+            file=sys.stderr,
+        )
+        return result
+    result = check_isolation(args.worktree)
+    if result:
         return result
     return check_runner(args.runner, args.brief, args.worktree)
 
