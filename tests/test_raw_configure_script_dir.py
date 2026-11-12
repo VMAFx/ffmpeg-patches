@@ -59,8 +59,8 @@ SCRIPT_DIR = {
     ),
     "override-in-env": Case(DEFAULT + SRC + RUN, 2, UNKNOWN_SOURCE, env={"LANE_TEST_DIR": "/x"}),
     "override-assigned": Case("LANE_TEST_DIR=/x\n" + DEFAULT + SRC + RUN, 2, UNKNOWN_SOURCE),
-    "override-assigned-reads-lib": Case(
-        "LANE_TEST_DIR=/x\n" + DEFAULT + SRC, 2, "tree/configure", {"tools/lib.sh": CFG}
+    "override-assigned-lib-unresolved": Case(
+        "LANE_TEST_DIR=/x\n" + DEFAULT + SRC, 2, UNKNOWN_SOURCE, {"tools/lib.sh": CFG}
     ),
     "override-sourced-before": Case(
         ". <case>/tools/pre.sh\n" + DEFAULT + SRC + RUN,
@@ -69,14 +69,14 @@ SCRIPT_DIR = {
         {"tools/pre.sh": "LANE_TEST_DIR=/x\n"},
     ),
     "cd-before-assignment": Case("cd <case>\n" + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
-    "cd-before-assignment-reads-lib": Case(
-        "cd <case>\n" + DOLLAR0 + SRC, 2, "tree/configure", {"tools/lib.sh": CFG}
+    "cd-before-assignment-lib-unresolved": Case(
+        "cd <case>\n" + DOLLAR0 + SRC, 2, UNKNOWN_SOURCE, {"tools/lib.sh": CFG}
     ),
     "unread-source-before-assignment": Case(
         '. "$UNSET_DIR/x.sh"\n' + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE
     ),
-    "unread-source-before-reads-lib": Case(
-        '. "$UNSET_DIR/x.sh"\n' + DOLLAR0 + SRC, 2, "tree/configure", {"tools/lib.sh": CFG}
+    "unread-source-before-lib-unresolved": Case(
+        '. "$UNSET_DIR/x.sh"\n' + DOLLAR0 + SRC, 2, UNKNOWN_SOURCE, {"tools/lib.sh": CFG}
     ),
     "assigned-twice": Case(DOLLAR0 + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
     "append-assignment": Case(DOLLAR0 + "HERE+=/x\n" + SRC + RUN, 2, UNKNOWN_SOURCE),
@@ -84,6 +84,15 @@ SCRIPT_DIR = {
         DOLLAR0 + SRC + 'bash "$HERE/inner.sh"\n', 2, AMBIGUOUS, {"tools/lib.sh": "HERE=/x\n"}
     ),
     "sourced-not-executed": Case(DEFAULT + SRC + RUN, 2, UNKNOWN_SOURCE, command=". tools/run.sh"),
+    "source-before-assignment": Case(SRC + DOLLAR0 + RUN, 2, UNKNOWN_SOURCE),
+    "assignment-in-function": Case("f() {\n" + DOLLAR0 + "}\n" + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "override-assigned-next-program": Case(
+        "LANE_TEST_DIR=/x\n" + DEFAULT + '"$HERE/next.sh" check\n',
+        2,
+        UNKNOWN_SOURCE,
+        {"tools/next.sh": "echo benign\n"},
+    ),
+    "override-assigned-after": Case(DEFAULT + "LANE_TEST_DIR=/x\n" + SRC + RUN, 2, UNKNOWN_SOURCE),
 }
 
 
@@ -121,8 +130,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 21 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 21)
+        """Replay all 25 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 25)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

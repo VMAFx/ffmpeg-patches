@@ -889,11 +889,22 @@ def _script_dir_names(assignments: list[str]) -> dict[str, str | None]:
     return result
 
 
-def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
-    """Mark an own-directory name assigned after a directory change or with its override assigned.
+def _top_level(node: Any) -> bool:
+    """Accept an assignment only as a statement of the file, never in a function, branch or loop."""
+    parent = node.parent
+    for _ in range(3):
+        if parent is None or parent.type not in ("variable_assignments", "declaration_command"):
+            break
+        parent = parent.parent
+    return parent is not None and parent.type == "program"
 
-    The guard still reads the file the name points at; later relative paths refuse as after
-    a source it cannot read, as they did before the name resolved.
+
+def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
+    """Resolve an own-directory name from its top-level assignment on, never before it.
+
+    After a directory change or an unread source, with its override assigned anywhere in the
+    file, or nested in a function, branch or loop, the name stays unresolved: paths built from
+    it refuse as after a source the guard cannot read.
     """
     if not scan.script_dirs:
         return
@@ -906,9 +917,17 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
         match = ASSIGNED_NAME.match(_text(assignment, raw))
         if match is None or match.group() not in scan.script_dirs:
             continue
-        override = scan.script_dirs.pop(match.group())
-        if scan.moved or (override is not None and override in scan.assigned):
+        name = match.group()
+        override = scan.script_dirs.pop(name)
+        if (
+            scan.moved
+            or scan.source_unknown
+            or (override is not None and override in scan.assigned)
+        ):
+            scan.literals.pop(name, None)
             scan.source_unknown = scan.dir_changed = True
+        elif _top_level(assignment):
+            scan.literals[name] = str(scan.context.script_dir)
 
 
 def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> tuple[list[str], set[str]]:
@@ -971,7 +990,6 @@ def scan_body(
     scan.literals = _find_literal_assignments(assignments)
     if context.script_dir is not None:
         scan.script_dirs = _script_dir_names(assignments)
-        scan.literals.update(dict.fromkeys(scan.script_dirs, str(context.script_dir)))
     scan.stack.append((root, raw, False))
     for _ in range(MAX_BODY_NODES):
         if not scan.stack:
