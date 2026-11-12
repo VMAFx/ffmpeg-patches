@@ -65,7 +65,7 @@ index a9241fab5cf2af6ca2d11557e92c570dcfc294e1..0f8ed156bbc8b1a91ed0e6c3cd6cb300
  
  @section tpad
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 2d10cdb28f1221d17f3b808cda486af4a1adf856..8d072e272d6e5e1a50f856420202cb6f0084a47a 100644
+index a92d14256431511c5f0c609eff2bd8783a531908..38ba72ae2ac80b3a03b8f4c7a8131cee642358e4 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -538,7 +538,7 @@ OBJS-$(CONFIG_TLUT2_FILTER)                  += vf_lut2.o framesync.o
@@ -1058,7 +1058,7 @@ index deeb1f01574e4912a19ec159f106f3d2cc837611..29f9c3d476b7b588a17beaff262547c7
      FILTER_INPUTS(tonemap_inputs),
      FILTER_OUTPUTS(ff_video_default_filterpad),
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index 0cbe6fc8aab682fd4618ee85c89d0b758e0de4cb..1e044fb0d4b94cb4f4f0fe3aaafc608a6dd184cc 100644
+index d95cda254ff0d5dfcb147bf424137497216642b5..e961e9b0a88f484f9bd4082757c0627558f7ce52 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
 @@ -501,6 +501,10 @@ FATE_FILTER-$(CONFIG_TONEMAP_FILTER) += fate-filter-tonemap-bt2408-hable

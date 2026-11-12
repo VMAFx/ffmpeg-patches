@@ -225,7 +225,12 @@ its master_form on the last of them; the earlier ones report in-master-form
 and are included only if that form applies. A recorded `upstream_commit`
 that is an ancestor of the tested master reports the patch as upstream without
 applying it; a missing commit fails the run because its history cannot be
-checked. A `release_only` patch is reported as `release-only` and not applied.
+checked. In a shallow tree, a recorded `upstream_commit` that is present but
+not an ancestor of the tested master also fails the run, because the shallow
+boundary can hide its ancestry; reset the tree to the commit the run started
+from, fetch the full history and rerun, because the run has already committed
+the earlier patches.
+A `release_only` patch is reported as `release-only` and not applied.
 Other patches use the series form. The run reports drop candidates and
 fails on any conflict or tool error. Applying without `--master-forms`,
 including consumer and CI runs with `--expect-base`, uses only the
@@ -418,7 +423,7 @@ without a series patch is a change the series does not carry.
 | [25879](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25879) | `master` | open | avfilter/vf_hqdn3d_vulkan: add a Vulkan hqdn3d filter | 0023 |
 | [25885](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25885) | `master` | open | avfilter/vf_tonemap: add the bt2408_hable tone map | 0012, 0013 |
 
-State read from the FFmpeg forge on 2026-11-09.
+State read from the FFmpeg forge on 2026-11-11.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned

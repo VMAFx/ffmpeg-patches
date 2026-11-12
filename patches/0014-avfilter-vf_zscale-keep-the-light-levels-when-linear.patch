@@ -26,18 +26,18 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 tests/ref/fate/filter-zscale-light-levels
 
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 7066597b2f5dbd532827536ca879850595cf16b9..a2805605a15bbc934e6da2bb1ee780675c9d024d 100644
+index 3a63c4bb1705a0a7a6de73b87b052a840cffa115..d79ee5cd47f832a633781155341bb6b270917f11 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -683,7 +683,7 @@ SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
  SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
  
  TOOLS     = graph2dot
--TESTPROGS = bt2408_hable dovi_reshape drawutils filtfmts formats integral
-+TESTPROGS = bt2408_hable dovi_reshape drawutils filtfmts formats integral zscale_light_levels
+-TESTPROGS = bt2408_hable drawutils filtfmts formats integral
++TESTPROGS = bt2408_hable drawutils filtfmts formats integral zscale_light_levels
  
+ TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
  TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
- 
 diff --git a/libavfilter/tests/zscale_light_levels.c b/libavfilter/tests/zscale_light_levels.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..3eda0579424155209e1c8ea1af00813e09303210
@@ -252,7 +252,7 @@ index b14d704663abe76de9f12124fa60d7a8a2eec4ee..80216c0f1925d67eab4ed747847bf159
          td.in = in;
          td.out = out;
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index 044c3f86a005ae222ed853cacec1c6b85183ae36..0cbe6fc8aab682fd4618ee85c89d0b758e0de4cb 100644
+index 7600997367e61b44ea9f62d964a4b67b490821c1..d95cda254ff0d5dfcb147bf424137497216642b5 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
 @@ -493,6 +493,10 @@ FATE_FILTER-yes += fate-filter-bt2408-hable

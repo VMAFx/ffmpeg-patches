@@ -169,11 +169,12 @@ class ResolvePylintTest(unittest.TestCase):
                 self.assertEqual(run.call_count, 1 + int(pylint is not None))
 
     def test_failed_version_check_falls_back(self) -> None:
-        """Fall back when the local version command fails, times out or cannot start."""
+        """Fall back when the version probe fails, times out, cannot start or cannot be decoded."""
         failures = (
             subprocess.CalledProcessError(1, ["pylint", "--version"]),
             subprocess.TimeoutExpired(["pylint", "--version"], 10),
             OSError("cannot start pylint"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
         )
         for failure in failures:
             with (

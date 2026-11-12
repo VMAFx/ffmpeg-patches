@@ -32,18 +32,18 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 tests/ref/fate/filter-bt2408-hable
 
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 42e5e66e62fa739d5cf5a77e3078b936544dcbef..ccc2e5a38c9f44da471d3a1c4a064550d11396ec 100644
+index 8ae4e0a8c36002f901e5fa4a2ef548bff59ae488..a95be8532967122a6a7787aa422b2f47d15e45ab 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -683,7 +683,7 @@ SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
  SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
  
  TOOLS     = graph2dot
--TESTPROGS = dovi_reshape drawutils filtfmts formats integral
-+TESTPROGS = bt2408_hable dovi_reshape drawutils filtfmts formats integral
+-TESTPROGS = drawutils filtfmts formats integral
++TESTPROGS = bt2408_hable drawutils filtfmts formats integral
  
+ TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
  TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
- 
 diff --git a/libavfilter/bt2408_hable.c b/libavfilter/bt2408_hable.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..6425ece06d13ca3a81ca0072a3016a93cd4ace25
@@ -481,7 +481,7 @@ index 0000000000000000000000000000000000000000..52edc725b8528815211f9cc24bae67ed
 +    return fails != 0;
 +}
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index e90e7f5ae6b97fbb016db395f5b97c0076350d46..8202144c0a4b242c548d80d87d8b1a8c0d69b8ff 100644
+index db310a856d0fee0cdd238dac6df3ddc253d172be..51d7e83e9e6a809969174d3d4be8e5e8196d33ba 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
 @@ -489,6 +489,10 @@ FATE_FILTER-$(CONFIG_DOVI_RESHAPE_FILTER) += fate-filter-dovi-reshape-graph

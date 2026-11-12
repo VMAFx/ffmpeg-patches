@@ -32,7 +32,7 @@ index 3ae400e5be3cd6df875c514c4644768059a1109c..1cdb7f2265851c5d7f5d4eb3126e72a4
  @end table
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 502ea389a44d3e3582281b626c9ce0f6ce9ec065..30dceefb667cabc558c39dba6869862b3ca37230 100644
+index a2f71978a1358a945758cf55fb9a845c79691864..a091b3ba25437a5d2286db460c6bb570c1a2c8b4 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -551,7 +551,7 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2

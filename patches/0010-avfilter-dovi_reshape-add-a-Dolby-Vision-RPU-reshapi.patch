@@ -24,31 +24,30 @@ pivot boundary, a planted wrong MMR coefficient, and the refusals.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- libavfilter/Makefile               |   2 +-
+ libavfilter/Makefile               |   1 +
  libavfilter/dovi_reshape.c         | 201 ++++++++++++++++++++++++++
  libavfilter/dovi_reshape.h         |  81 +++++++++++
  libavfilter/tests/dovi_reshape.c   | 221 +++++++++++++++++++++++++++++
  tests/fate/filter-video.mak        |   4 +
  tests/ref/fate/filter-dovi-reshape |  12 ++
- 6 files changed, 520 insertions(+), 1 deletion(-)
+ 6 files changed, 520 insertions(+)
  create mode 100644 libavfilter/dovi_reshape.c
  create mode 100644 libavfilter/dovi_reshape.h
  create mode 100644 libavfilter/tests/dovi_reshape.c
  create mode 100644 tests/ref/fate/filter-dovi-reshape
 
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index ce40cf3e65b6ced2e36988998dfc7312a587a840..c0731a5b0f31a6ed7059a47c6d6e06df1246d637 100644
+index ce40cf3e65b6ced2e36988998dfc7312a587a840..8423f4cddbd1c92daf93acb0908c284864c80c9c 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -682,7 +682,7 @@ SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
- SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
- 
+@@ -684,6 +684,7 @@ SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
  TOOLS     = graph2dot
--TESTPROGS = drawutils filtfmts formats integral
-+TESTPROGS = dovi_reshape drawutils filtfmts formats integral
+ TESTPROGS = drawutils filtfmts formats integral
  
++TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
  TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
  
+ TOOLS-$(CONFIG_LIBZMQ) += zmqsend
 diff --git a/libavfilter/dovi_reshape.c b/libavfilter/dovi_reshape.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..cb6faa138357736519201eebad3e333106ebff00
@@ -571,14 +570,14 @@ index 0000000000000000000000000000000000000000..8285ca116ac47e7ea7025659f9b6381e
 +    return fails != 0;
 +}
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index 1b04816f2f805590a4fd3ac83542d78628216ae0..f9413cd3b4158d6d3f22a8eff55ada479d283fca 100644
+index 1b04816f2f805590a4fd3ac83542d78628216ae0..84732a98a2bbfa8efcd241d81641acd715955f25 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
 @@ -481,6 +481,10 @@ fate-filter-fps-down-eof-pass: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:eo
  fate-filter-fps-start-drop: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:start_time=1.5
  fate-filter-fps-start-fill: CMD = framecrc -lavfi testsrc2=r=7:d=1.5,setpts=PTS+14,fps=3:start_time=1.5
  
-+FATE_FILTER-yes += fate-filter-dovi-reshape
++FATE_FILTER-$(CONFIG_DOVI_RESHAPE_FILTER) += fate-filter-dovi-reshape
 +fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
 +fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
 +

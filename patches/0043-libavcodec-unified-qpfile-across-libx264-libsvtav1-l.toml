@@ -1,6 +1,6 @@
 status = "submitted"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875"
-master_form = { base = "681025faf1add6567b1f97d2f1037d0e764afd0f", head = "a72d13d92972118e15328dfaf0276c8b30aa0263" }
+master_form = { base = "681025faf1add6567b1f97d2f1037d0e764afd0f", head = "b48c431d335e7dfab72b1b5fc2ca5d84f441b681" }
 consumers = ["vmafx"]
 origin = "the VMAFx vmaf-tune workflow, which needs one per-frame QP-offset file format shared across the libx264, libsvtav1 and libaom encoders"
 notes = """
@@ -26,22 +26,33 @@ while header-only records clear ROI offsets from that frame onward.
 
 Generic: carries no VMAFx or vmaf-tune identifiers and no downstream ADR \
 references. Sent upstream as FFmpeg pull request 25875 on 2026-11-08, one \
-commit per encoder (libaomenc, libsvtav1, libx264). Its head a72d13d929 adds \
+commit per encoder (libaomenc, libsvtav1, libx264). Its head b48c431d33 adds \
 what this patch does not carry yet: a configure check that limits the libaom \
 qpfile to libaom 3.13.0 or newer (older libaom refuses it with ENOSYS); a \
 libaom refusal of lag-in-frames other than 0; a libaom speed check that also \
 reads cpu-used set through aom-params; libx264 refusals without adaptive \
 quantization (constant QP, or aq-mode 0 or aq-strength 0 without mbtree, \
 where this patch refuses aq-mode 0 only) and with interlaced or \
-fake-interlaced encoding; a libsvtav1 refusal of bitrate rate control; a \
+fake-interlaced encoding; a libsvtav1 refusal of any effective rate-control mode \
+other than 0 (a bit rate without crf or qp above 0, or rc in svtav1-params); a \
 libsvtav1 segment palette in descending order that reserves a 0 slot when \
 every value is negative; one palette for both AV1 adapters that keeps \
 distinct values when they fit; a 25-entry offset-to-segment table for the \
 libaom map, rebuilt only when the active record changes; files with only \
 header lines accepted; NUL bytes refused, blank and # lines skipped anywhere, \
 and line-numbered parse errors; frame indexes parsed as int64 up to UINT_MAX; \
-per-encoder offset units and the qpfile entries in doc/encoders.texi; and a \
-fate-qpfile-parser test."""
+per-encoder offset units and the qpfile entries in doc/encoders.texi; libaom \
+error messages and documentation that ask for cpu-used 7 or more, with speeds \
+above 8 through aom-params where the linked libaom has them; a note that \
+libaom up to at least 3.15.3 checks each distinct offset against the \
+quantizer index of the previous one, so near the ends of the quantizer index \
+range an offset can be changed or dropped; a libsvtav1 refusal of internal \
+scaling (superres-mode or resize-mode other than 0), since SVT-AV1 would place \
+the map of the full-size frame on the scaled one; a libsvtav1 refusal of the \
+first pass, where SVT-AV1 can read the map at a reduced size; the libsvtav1 offsets freed \
+once their ROI events are built; a line-numbered error for an invalid last \
+record; and a fate-qpfile-parser test that also covers clearing and resumed \
+records."""
 
 [[exceptions]]
 rule = "HISS-04"
