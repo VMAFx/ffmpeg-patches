@@ -17,6 +17,7 @@ DEFAULT = 'HERE=${LANE_TEST_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
 REALPATH = 'HERE=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")\n'
 SRC = '. "$HERE/lib.sh"\n'
+UNREAD = '. "$UNSET_DIR/x.sh"\n'
 RUN = "bash inner.sh\n"
 CFG = "<cfg>\n"
 LINK = "-> ../tools/run.sh"
@@ -93,6 +94,29 @@ SCRIPT_DIR = {
         {"tools/next.sh": "echo benign\n"},
     ),
     "override-assigned-after": Case(DEFAULT + "LANE_TEST_DIR=/x\n" + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "unread-source-after-assignment-program": Case(
+        DOLLAR0 + UNREAD + '"$HERE/next.sh" check\n',
+        2,
+        UNKNOWN_SOURCE,
+        {"tools/next.sh": "echo benign\n"},
+    ),
+    "unread-source-after-assignment-lib": Case(DOLLAR0 + UNREAD + SRC, 2, UNKNOWN_SOURCE),
+    "unread-source-keeps-configure-literal": Case(
+        "CFG_PATH=<tree>/configure\n" + DOLLAR0 + UNREAD + '"$CFG_PATH" --prefix=/x\n',
+        2,
+        "tree/configure",
+    ),
+    "unread-source-keeps-plain-literal": Case(
+        "NEXT=<case>/tools/next.sh\n" + DOLLAR0 + UNREAD + 'bash "$NEXT"\n',
+        0,
+        None,
+        {"tools/next.sh": "echo benign\n"},
+    ),
+    "declare-lowercase": Case("declare -l " + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "export-assignment": Case("export " + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "local-in-function-keeps-top-level": Case(
+        DEFAULT + "f() {\n  local " + DOLLAR0.lower() + "}\n" + SRC + RUN, 0
+    ),
 }
 
 
@@ -117,6 +141,7 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
                 path.symlink_to(text[3:])
                 continue
             body = text.replace("<cfg>", f"{self.tree}/configure --prefix=/x")
+            body = body.replace("<tree>", str(self.tree))
             script = "#!/usr/bin/env bash\n" + body.replace("<case>", str(base))
             path.write_text(script, encoding="utf-8")
             path.chmod(0o755)
@@ -130,8 +155,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 25 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 25)
+        """Replay all 32 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 32)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

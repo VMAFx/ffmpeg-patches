@@ -184,6 +184,7 @@ class _Scan:
     ambiguous: set[str] = field(default_factory=set)
     source_literals: dict[int, tuple[dict[str, str], set[str]]] = field(default_factory=dict)
     script_dirs: dict[str, str | None] = field(default_factory=dict)
+    script_literals: set[str] = field(default_factory=set)
     moved: bool = False
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
@@ -544,6 +545,7 @@ def _source_target(target: str | None, scan: _Scan) -> str | None:
     reader = scan.context.source_reader
     if not _candidate_allowed(target) or reader is None:
         _record_candidate(target, False, scan)
+        _forget_script_literals(scan)
         scan.dir_changed = scan.source_unknown = True
         return None
     changed = scan.dir_changed and not os.path.isabs(target) and not target.startswith("~")
@@ -899,12 +901,20 @@ def _top_level(node: Any) -> bool:
     return parent is not None and parent.type == "program"
 
 
+def _forget_script_literals(scan: _Scan) -> None:
+    """Drop own-directory literals at an unread source, which may reassign their names."""
+    for name in scan.script_literals:
+        scan.literals.pop(name, None)
+    scan.script_literals.clear()
+
+
 def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     """Resolve an own-directory name from its top-level assignment on, never before it.
 
     After a directory change or an unread source, with its override assigned anywhere in the
-    file, or nested in a function, branch or loop, the name stays unresolved: paths built from
-    it refuse as after a source the guard cannot read.
+    file, through a declaration (declare -l or -u changes the value), or nested in a
+    function, branch or loop, the name stays unresolved: paths built from it refuse as after
+    a source the guard cannot read.
     """
     if not scan.script_dirs:
         return
@@ -919,15 +929,18 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
             continue
         name = match.group()
         override = scan.script_dirs.pop(name)
-        if (
+        uncertain = (
             scan.moved
             or scan.source_unknown
             or (override is not None and override in scan.assigned)
-        ):
+        )
+        top = _top_level(assignment)
+        if uncertain or (top and assignment.parent.type == "declaration_command"):
             scan.literals.pop(name, None)
             scan.source_unknown = scan.dir_changed = True
-        elif _top_level(assignment):
+        elif top:
             scan.literals[name] = str(scan.context.script_dir)
+            scan.script_literals.add(name)
 
 
 def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> tuple[list[str], set[str]]:
