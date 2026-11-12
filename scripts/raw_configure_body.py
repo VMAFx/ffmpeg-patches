@@ -8,6 +8,7 @@ import importlib
 import os
 import re
 import sys
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,15 @@ MAX_INLINE_BODIES = 256
 AMBIGUOUS_SCRIPT_PATH = (
     "script path from a variable assigned in a sourced file and elsewhere; use one assignment"
 )
+# Own directory of an executed script, symlinks resolved like Path.resolve():
+# $(dirname "$(readlink -f "${BASH_SOURCE[0]}")"), with realpath or $0 as variants.
+SCRIPT_DIR_VALUE = re.compile(
+    r'\$\(dirname (?:-- )?"\$\((?:readlink -f|realpath)(?: --)? '
+    r'"(?:\$\{BASH_SOURCE(?:\[0\])?\}|\$BASH_SOURCE|\$\{0\}|\$0)"\)"\)'
+)
+# ${OVERRIDE:-value} or ${OVERRIDE-value}: the value applies only while OVERRIDE is unset.
+SCRIPT_DIR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-(.+)\}")
+ASSIGNED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 STRUCTURE = frozenset(
     [
         "program",
@@ -173,6 +183,8 @@ class _Scan:
     assigned: set[str] = field(default_factory=set)
     ambiguous: set[str] = field(default_factory=set)
     source_literals: dict[int, tuple[dict[str, str], set[str]]] = field(default_factory=dict)
+    script_dirs: dict[str, str | None] = field(default_factory=dict)
+    moved: bool = False
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
 
@@ -259,7 +271,7 @@ def _record_directory(words: list[str], idx: int, scan: _Scan) -> None:
             and targets[0] not in scan.cd_targets
         ):
             scan.cd_targets.append(targets[0])
-    scan.dir_changed = True
+    scan.dir_changed = scan.moved = True
 
 
 def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
@@ -843,13 +855,64 @@ def _visit_semantics(
     elif kind == "pipeline":
         hit = _pipeline_hit(node, raw, scan)
     elif kind in ASSIGNMENTS:
+        _settle_script_dir(node, raw, scan)
         hit = _assignment_hit(node, raw)
     children = _child_modes(node, kind in DATA | ASSIGNMENTS | {"test_command", "file_redirect"})
     return hit, children
 
 
-def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> tuple[dict[str, str], set[str]]:
-    """Collect unique literals and all assigned names with one bounded syntax walk."""
+def _script_dir_value(value: str) -> tuple[bool, str | None]:
+    """Match the own-directory idiom, alone or as the default of an override unset in the env."""
+    if len(value) > 1 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    override = None
+    default = SCRIPT_DIR_DEFAULT.fullmatch(value)
+    if default is not None:
+        override, value = default.groups()
+        if override in os.environ:
+            return False, None
+    return SCRIPT_DIR_VALUE.fullmatch(value) is not None, override
+
+
+def _script_dir_names(assignments: list[str]) -> dict[str, str | None]:
+    """Map names assigned once to the own-directory idiom onto their override names."""
+    names = [match.group() if (match := ASSIGNED_NAME.match(a)) else "" for a in assignments]
+    counts = Counter(names)
+    result: dict[str, str | None] = {}
+    for i in range(len(assignments)):
+        name = names[i]
+        if not name or counts[name] != 1 or assignments[i][len(name) : len(name) + 1] != "=":
+            continue
+        matched, override = _script_dir_value(assignments[i][len(name) + 1 :])
+        if matched:
+            result[name] = override
+    return result
+
+
+def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
+    """Mark an own-directory name assigned after a directory change or with its override assigned.
+
+    The guard still reads the file the name points at; later relative paths refuse as after
+    a source it cannot read, as they did before the name resolved.
+    """
+    if not scan.script_dirs:
+        return
+    assignments = (
+        [node]
+        if node.type == "variable_assignment"
+        else [child for child in node.named_children if child.type == "variable_assignment"]
+    )
+    for assignment in assignments:
+        match = ASSIGNED_NAME.match(_text(assignment, raw))
+        if match is None or match.group() not in scan.script_dirs:
+            continue
+        override = scan.script_dirs.pop(match.group())
+        if scan.moved or (override is not None and override in scan.assigned):
+            scan.source_unknown = scan.dir_changed = True
+
+
+def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> tuple[list[str], set[str]]:
+    """Collect assignment texts and all assigned names with one bounded syntax walk."""
     stack = [root]
     assignments = []
     assigned = set()
@@ -867,6 +930,12 @@ def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> tuple[dict[str, s
                 if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                     assigned.add(name)
         stack.extend(reversed(node.named_children))
+    return assignments, assigned
+
+
+def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> tuple[dict[str, str], set[str]]:
+    """Collect unique literals and all assigned names with one bounded syntax walk."""
+    assignments, assigned = _assignment_texts(root, raw, budget)
     return _find_literal_assignments(assignments), assigned
 
 
@@ -898,7 +967,11 @@ def scan_body(
     raw = body.encode("utf-8", "surrogateescape")
     scan = _Scan(context, budget, dir_changed=context.directory_changed)
     root = parser.parse(raw).root_node
-    scan.literals, scan.assigned = _literal_map(root, raw, budget)
+    assignments, scan.assigned = _assignment_texts(root, raw, budget)
+    scan.literals = _find_literal_assignments(assignments)
+    if context.script_dir is not None:
+        scan.script_dirs = _script_dir_names(assignments)
+        scan.literals.update(dict.fromkeys(scan.script_dirs, str(context.script_dir)))
     scan.stack.append((root, raw, False))
     for _ in range(MAX_BODY_NODES):
         if not scan.stack:
