@@ -13,6 +13,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.raw_configure_body import _source_operand  # noqa: E402
+from scripts.raw_configure_files import (  # noqa: E402
+    InspectionContext,
+    inspect_sourced_file,
+)
 from scripts.raw_configure_unwrap import (  # noqa: E402
     _unwrap_command,
 )
@@ -29,49 +34,20 @@ from scripts.raw_configure_words import (  # noqa: E402
     INTERPRETER_VALUE_OPTIONS,
     INTERPRETERS,
     MAKE_VAR_ASSIGN,
-    MAX_TOKENS,
     SED_EXEC_PATTERN,
     SED_SUBST_EXEC,
     SHELLS,
+    STRIP_CHARS,
     _flatten,
     _has_command_position_configure,
     _has_configure_token,
     _interpreter_family,
     _is_configure_word,
     _long_option_values,
+    _names_configure,
+    _shell_argument,
     _substitute_literals,
 )
-
-
-def _shell_argument(words: list[str]) -> tuple[str | None, bool]:
-    """Find a shell script path or its -c program string."""
-    idx = 1
-    c_seen = False
-    for _ in range(min(len(words), MAX_TOKENS + 1)):
-        if idx >= len(words):
-            break
-        word = words[idx]
-        if word == "--":
-            operand = words[idx + 1] if idx + 1 < len(words) else None
-            return operand, c_seen
-        if word == "-":
-            return word, c_seen
-        if word in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
-            idx += 2
-            continue
-        if word.startswith("--"):
-            idx += 1
-            continue
-        if word.startswith("+"):
-            idx += 2 if word.endswith(("o", "O")) else 1
-            continue
-        if word.startswith("-"):
-            if "c" in word[1:]:
-                c_seen = True
-            idx += 2 if word.endswith(("o", "O")) else 1
-            continue
-        return word, c_seen
-    return None, c_seen
 
 
 def _check_interpreter_flag(
@@ -163,7 +139,10 @@ def _inspect_sed(words: list[str], idx: int) -> Path | None:
         if words[i] == "-e" and i + 1 >= words_len:
             continue
         m_e = SED_EXEC_PATTERN.search(script)
-        if m_e and (_is_configure_word(m_e.group(1)) or CONFIGURE_WORD.search(m_e.group(1))):
+        if m_e and (
+            CONFIGURE_WORD.search(m_e.group(1))
+            or any(_names_configure(p) for p in m_e.group(1).split())
+        ):
             return Path(script)
         if SED_SUBST_EXEC.search(script) and CONFIGURE_WORD.search(script):
             return Path(script)
@@ -251,17 +230,32 @@ def _inspect_shell_or_eval(
     idx: int,
     stdin_prog: str | None,
     assignments: dict[str, str],
-) -> tuple[Path | None, str | None]:
+    file_ctx: tuple[Path, bool, list[int] | None] | None = None,
+) -> tuple[Path | None, str | None, bool]:
     """Process shell script operands, inline -c scripts, eval, and stdin programs."""
     name = os.path.basename(words[idx])
     if name in ("source", "."):
-        if idx + 1 < len(words):
-            target = _substitute_literals(words[idx + 1], assignments)
+        operand, option_refusal = _source_operand(
+            [_substitute_literals(word, assignments) for word in words[idx + 1 :]]
+        )
+        if option_refusal is not None:
+            return Path(option_refusal), None, False
+        if operand is not None:
+            target = operand
             if _is_configure_word(target) or not DECIDABLE_NAME.fullmatch(os.path.basename(target)):
-                return Path(target), None
+                return Path(target), None, False
+            cwd, dir_changed, files_read = (
+                file_ctx if file_ctx is not None else (Path.cwd(), False, None)
+            )
+            read_tracker = files_read if files_read is not None else [0]
+            refusal, changed = inspect_sourced_file(
+                target,
+                InspectionContext(cwd, dir_changed, read_tracker, classify_script_words),
+            )
+            return refusal, None, changed
     elif name == "eval":
-        return None, " ".join(words[idx + 1 :])
-    return None, None
+        return None, " ".join(words[idx + 1 :]), False
+    return None, None, False
 
 
 def _assignment_blocked(word: str, assignments: dict[str, str]) -> bool:
@@ -463,3 +457,22 @@ def _classify_command(
     if cmd_idx >= len(words):
         return None, []
     return _classify_target(words, cmd_idx, assignments, stdin_prog), []
+
+
+def classify_script_words(words: list[str]) -> Path | None:
+    """Classify execution-capable script arguments without reentering file inspection."""
+    idx = _unwrap_command(words, 0)
+    result = _wrapper_blocked(words, idx, {})
+    if idx < len(words):
+        name = os.path.basename(words[idx])
+        if result is None:
+            _, result = _inspect_known_dispatch(name, words, idx, None, {})
+        if result is None:
+            result = _exec_option_blocked(name, words, idx, {})
+    if result is None:
+        return None
+    text = str(result)
+    literal = text.translate(STRIP_CHARS)
+    if not (CONFIGURE_WORD.search(literal) or DECIDABLE_NAME.fullmatch(os.path.basename(literal))):
+        return None
+    return result if _is_configure_word(text) or CONFIGURE_WORD.search(text) else None

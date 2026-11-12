@@ -23,6 +23,58 @@ _SINGLE_QUOTE_RE = re.compile(r"'[^']*'")
 _DOUBLE_QUOTE_RE = re.compile(r'"[^"]*"')
 _INTERPRETER_RE = re.compile(r"(?<![\w.-])(?:python[0-9.]*|py)(?![\w.-])")
 
+WALK = """\
+import sys
+import tree_sitter_bash
+from tree_sitter import Language, Parser
+
+raw = open(sys.argv[1], "rb").read()
+parser = Parser(Language(tree_sitter_bash.language()))
+stack = [parser.parse(raw).root_node]
+count = 0
+for _ in range(300000):
+    if not stack:
+        break
+    node = stack.pop()
+    row = node.start_point.row
+    children = node.children
+    for i, c in enumerate(children):
+        node.field_name_for_child(i)
+        raw[c.start_byte:c.end_byte]
+    stack.extend(reversed(children))
+    count += 1
+print("walked", count)
+"""
+
+
+class TestTreeSitterPointWalk(unittest.TestCase):
+    """Exercise native point and field access on a large Bash syntax tree."""
+
+    def test_point_walk_survives_large_body(self) -> None:
+        """Stay red on tree-sitter 0.26.0 (segfault) and green on 0.26.1."""
+        body = "#!/usr/bin/env bash\nset -euo pipefail\n"
+        for i in range(60):
+            body += (
+                f"# comment line {i} with words and $A/<label>.owner text\n"
+                f'V{i}=${{ENV{i}:-$(dirname "$(readlink -f "${{BASH_SOURCE[0]}}")")}}\n'
+                f"f{i}() {{\n"
+                f'  timeout 5s python3 -B - "${{X:-}}" "${{2:-${{wt:-}}}}" <<\'PY\'\n'
+                f"import os\nprint({i})\nPY\n}}\n"
+                f'[ -n "$V{i}" ] && W{i}="$V{i}"\n'
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "body.sh"
+            path.write_text(body, encoding="utf-8")
+            proc = subprocess.run(  # nosec B603 - fixed interpreter parses data without execution.
+                [sys.executable, "-I", "-c", WALK, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("walked", proc.stdout)
+
 
 def make_fake_interpreter(directory: Path, name: str, version: str) -> Path:
     """Create an executable fake Python interpreter script in directory/name."""

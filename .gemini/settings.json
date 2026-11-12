@@ -11,7 +11,7 @@
           },
           {
             "type": "command",
-            "command": "python3 -I \"$GEMINI_PROJECT_DIR/scripts/raw_configure_guard.py\" --client gemini || exit 2",
+            "command": "cd \"$GEMINI_PROJECT_DIR\" && sh \"$GEMINI_PROJECT_DIR/.config/lefthook/python.sh\" -I \"$GEMINI_PROJECT_DIR/scripts/raw_configure_guard.py\" --client gemini || exit 2",
             "timeout": 15000
           }
         ]

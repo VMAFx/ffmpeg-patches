@@ -11,7 +11,7 @@
           },
           {
             "type": "command",
-            "command": "python3 -I \"$CLAUDE_PROJECT_DIR/scripts/raw_configure_guard.py\" --client claude || exit 2",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && sh \"$CLAUDE_PROJECT_DIR/.config/lefthook/python.sh\" -I \"$CLAUDE_PROJECT_DIR/scripts/raw_configure_guard.py\" --client claude || exit 2",
             "timeout": 15,
             "onFailure": "block"
           }
