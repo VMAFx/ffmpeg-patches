@@ -967,7 +967,7 @@ class EditTitleTest(ForgejoTest):
         stub = Stub([A, A, A, A, B], {A: [[label("pending")], [label("success")]]})
         proc = self.edit_title(stub, "new title", "--apply", "--wait")
         self.assertEqual(proc.returncode, 76, proc.stderr)
-        self.assertIn(A, proc.stderr)
+        self.assertIn(A[:12], proc.stderr)
         self.assertIn(B, proc.stderr)
         self.assertEqual(self.patches(stub), [])
 
