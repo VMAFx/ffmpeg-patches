@@ -13,6 +13,8 @@ from tests.raw_configure_support import RawConfigureGuardBase
 
 UNKNOWN_SOURCE = "relative script path after a source the guard cannot read; use an absolute path"
 AMBIGUOUS = "assigned in a sourced file and elsewhere"
+UNRESOLVED = "own-directory name assigned in a function, branch or loop"
+BENIGN_NEXT = {"tools/next.sh": "echo benign\n"}
 DEFAULT = 'HERE=${LANE_TEST_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}\n'
 DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
 REALPATH = 'HERE=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")\n'
@@ -84,9 +86,33 @@ SCRIPT_DIR = {
     "lib-reassigns-name": Case(
         DOLLAR0 + SRC + 'bash "$HERE/inner.sh"\n', 2, AMBIGUOUS, {"tools/lib.sh": "HERE=/x\n"}
     ),
+    "lib-reassigns-name-source": Case(
+        DOLLAR0 + SRC + '. "$HERE/inner.sh"\n', 2, AMBIGUOUS, {"tools/lib.sh": "HERE=/x\n"}
+    ),
     "sourced-not-executed": Case(DEFAULT + SRC + RUN, 2, UNKNOWN_SOURCE, command=". tools/run.sh"),
     "source-before-assignment": Case(SRC + DOLLAR0 + RUN, 2, UNKNOWN_SOURCE),
-    "assignment-in-function": Case("f() {\n" + DOLLAR0 + "}\n" + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "assignment-in-function": Case("f() {\n" + DOLLAR0 + "}\n" + SRC + RUN, 2, UNRESOLVED),
+    "assignment-in-function-next-program": Case(
+        "f() {\n" + DOLLAR0 + "}\nf\n" + '"$HERE/next.sh" check\n', 2, UNRESOLVED, BENIGN_NEXT
+    ),
+    "assignment-in-branch-next-program": Case(
+        "if true; then\n" + DOLLAR0 + "fi\n" + '"$HERE/next.sh" check\n', 2, UNRESOLVED, BENIGN_NEXT
+    ),
+    "assignment-in-function-braced-default": Case(
+        "f() {\n" + DOLLAR0 + "}\nf\n" + 'bash "${HERE:-.}/next.sh"\n', 2, UNRESOLVED, BENIGN_NEXT
+    ),
+    "assignment-in-function-longer-name": Case(
+        "f() {\n" + DOLLAR0 + "}\nf\n" + 'bash "$HERE_X/next.sh"\n', 0, None, BENIGN_NEXT
+    ),
+    "local-in-function-reference": Case(
+        "f() {\n  local " + DOLLAR0.lower() + '  bash "$here/next.sh"\n}\n',
+        2,
+        UNRESOLVED,
+        BENIGN_NEXT,
+    ),
+    "local-in-function-unrelated-path": Case(
+        "f() {\n  local " + DOLLAR0.lower() + '  echo "$here"\n}\n' + RUN, 0
+    ),
     "override-assigned-next-program": Case(
         "LANE_TEST_DIR=/x\n" + DEFAULT + '"$HERE/next.sh" check\n',
         2,
@@ -155,8 +181,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 32 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 32)
+        """Replay all 39 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 39)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

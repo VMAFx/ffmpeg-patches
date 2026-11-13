@@ -44,6 +44,10 @@ MAX_INLINE_BODIES = 256
 AMBIGUOUS_SCRIPT_PATH = (
     "script path from a variable assigned in a sourced file and elsewhere; use one assignment"
 )
+UNRESOLVED_SCRIPT_DIR = (
+    "script path from an own-directory name assigned in a function, branch or loop; "
+    "assign it once at the top level"
+)
 # Own directory of an executed script, symlinks resolved like Path.resolve():
 # $(dirname "$(readlink -f "${BASH_SOURCE[0]}")"), with realpath or $0 as variants.
 SCRIPT_DIR_VALUE = re.compile(
@@ -185,6 +189,7 @@ class _Scan:
     source_literals: dict[int, tuple[dict[str, str], set[str]]] = field(default_factory=dict)
     script_dirs: dict[str, str | None] = field(default_factory=dict)
     script_literals: set[str] = field(default_factory=set)
+    unresolved_dirs: set[str] = field(default_factory=set)
     moved: bool = False
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
@@ -227,8 +232,9 @@ def _candidate_allowed(operand: str) -> bool:
 
 def _record_candidate(operand: str, is_program: bool, scan: _Scan) -> None:
     """Preserve the directory state at each concrete candidate's encounter."""
-    if _ambiguous_reference(operand, scan):
-        scan.refusal = AMBIGUOUS_SCRIPT_PATH
+    reason = _reference_refusal(operand, scan)
+    if reason is not None:
+        scan.refusal = reason
         return
     if _unknown_source_relative(operand, is_program, scan):
         scan.refusal = (
@@ -240,15 +246,21 @@ def _record_candidate(operand: str, is_program: bool, scan: _Scan) -> None:
         scan.candidates.append((operand, is_program, changed))
 
 
-def _ambiguous_reference(word: str, scan: _Scan) -> bool:
-    """Recognize exact simple or braced references to ambiguous assignment names."""
-    return any(
-        re.search(
-            r"\$(?:\{" + re.escape(name) + r"\}|" + re.escape(name) + r"(?![A-Za-z0-9_]))", word
-        )
-        is not None
-        for name in scan.ambiguous
+def _reference_refusal(word: str, scan: _Scan) -> str | None:
+    """Name the refusal for a word referencing an ambiguous or unresolved own-directory name.
+
+    Matches simple references and braced ones with or without an operator ($N, ${N},
+    ${N:-x}, ${N%/}); a longer name sharing the prefix does not match.
+    """
+    groups = (
+        (scan.ambiguous, AMBIGUOUS_SCRIPT_PATH),
+        (scan.unresolved_dirs, UNRESOLVED_SCRIPT_DIR),
     )
+    for names, reason in groups:
+        for name in names:
+            if re.search(r"\$\{?" + re.escape(name) + r"(?![A-Za-z0-9_])", word) is not None:
+                return reason
+    return None
 
 
 def _unknown_source_relative(operand: str, is_program: bool, scan: _Scan) -> bool:
@@ -534,9 +546,7 @@ def _source_operand(words: list[str]) -> tuple[str | None, str | None]:
 
 def _source_target(target: str | None, scan: _Scan) -> str | None:
     """Inline readable source texts into the caller and mark unresolved directories unknown."""
-    if target is None or _ambiguous_reference(target, scan):
-        if target is not None:
-            scan.refusal = AMBIGUOUS_SCRIPT_PATH
+    if target is None:
         return None
     if _configure_reference(target):
         return target
@@ -688,7 +698,7 @@ def _ordinary_command(words: list[str], idx: int, scan: _Scan) -> str | None:
         hit = _later_operands(words, idx, scan)
         if hit is not None:
             return hit
-    if "/" in word or _program_name_allowed(word) or _ambiguous_reference(word, scan):
+    if "/" in word or _program_name_allowed(word) or _reference_refusal(word, scan) is not None:
         _record_candidate(word, True, scan)
     if name in ("cd", "pushd", "popd"):
         _record_directory(words, idx, scan)
@@ -912,9 +922,10 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     """Resolve an own-directory name from its top-level assignment on, never before it.
 
     After a directory change or an unread source, with its override assigned anywhere in the
-    file, through a declaration (declare -l or -u changes the value), or nested in a
-    function, branch or loop, the name stays unresolved: paths built from it refuse as after
-    a source the guard cannot read.
+    file, or through a top-level declaration (declare -l or -u changes the value), the name
+    stays unresolved and later relative paths refuse as after a source the guard cannot read.
+    Nested in a function, branch or loop, the name stays unresolved and every script path
+    referencing it refuses; other paths keep their verdict.
     """
     if not scan.script_dirs:
         return
@@ -941,6 +952,8 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
         elif top:
             scan.literals[name] = str(scan.context.script_dir)
             scan.script_literals.add(name)
+        else:
+            scan.unresolved_dirs.add(name)
 
 
 def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> tuple[list[str], set[str]]:
