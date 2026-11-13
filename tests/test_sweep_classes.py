@@ -101,19 +101,31 @@ class SweepClassesTest(unittest.TestCase):
         report = self.full_report(source.replace("consume();\n", ""))
         self.assertIn("s->n++", section(report, "state-advance"))
 
-    def doc_report(self, added: str, *, unchanged: str = "") -> str:
-        """Build a library floor, version guard, and Texi section fixture."""
+    def doc_report(
+        self,
+        added: str,
+        *,
+        unchanged: str = "",
+        name: str = "libfoo",
+        configure: str = (
+            'enabled libfoo && require_pkg_config libfoo "foo >= 1.2.0" foo.h foo_init\n'
+        ),
+        source_files: dict[str, str] | None = None,
+    ) -> str:
+        """Build committed Texi, configure, Makefile, and encoder source fixtures."""
         (self.repo / "doc").mkdir()
         (self.repo / "libavcodec").mkdir()
-        (self.repo / "configure").write_text(
-            'enabled libfoo && require_pkg_config libfoo "foo >= 1.2.0" foo.h foo_init\n',
-            encoding="utf-8",
-        )
-        (self.repo / "libavcodec/libfoo.c").write_text(
-            "#if FOO_CHECK_VERSION(1, 6, 0)\n#endif\n", encoding="utf-8"
-        )
+        (self.repo / "configure").write_text(configure, encoding="utf-8")
+        if source_files is None:
+            source_files = {"libfoo.c": "#if FOO_CHECK_VERSION(1, 6, 0)\n#endif\n"}
+        filenames = tuple(source_files)
+        for index in range(len(filenames)):
+            filename = filenames[index]
+            (self.repo / "libavcodec" / filename).write_text(
+                source_files[filename], encoding="utf-8"
+            )
         texi = self.repo / "doc/encoders.texi"
-        content = "@section libfoo\n@subsection Options\n" + unchanged
+        content = f"@section {name}\n@subsection Options\n" + unchanged
         texi.write_text(content, encoding="utf-8")
         self.base = self.commit_head("int f(void) { return 0; }\n")
         texi.write_text(content + added, encoding="utf-8")
@@ -152,12 +164,171 @@ class SweepClassesTest(unittest.TestCase):
         self.assertNotIn("supports values", claims)
 
     def test_doc_unknown_library_and_floor(self) -> None:
-        """Claims without a section or configured floor retain explicit unknown values."""
-        report = self.doc_report("@section libbar\n64x64 cells | claim\n")
-        self.assertIn(r"64x64 cells \| claim | libbar | unknown | TODO | TODO |", report)
+        """Unresolved sections and missing sections retain explicit unknown values."""
+        report = self.doc_report("@section libnone\n64x64 cells | claim\n")
+        self.assertIn(r"64x64 cells \| claim | unknown | unknown | TODO | TODO |", report)
         (self.repo / "doc/encoders.texi").write_text("64x64 cells\n", encoding="utf-8")
         report = self.full_report("int f(void) { return 0; }\n")
         self.assertIn("64x64 cells | unknown | unknown | TODO | TODO |", report)
+
+    def test_doc_encoder_dependency_and_objects(self) -> None:
+        """Encoder dependencies and all existing Makefile objects resolve head versions."""
+        report = self.doc_report(
+            "64x64 cells\n",
+            name="libfoo-av1",
+            configure=(
+                'libfoo_av1_encoder_deps="libfoo"\n'
+                'enabled libfoo && require_pkg_config libfoo "foo >= 2.0.0" foo.h foo_init\n'
+            ),
+            source_files={
+                "Makefile": "OBJS-$(CONFIG_LIBFOO_AV1_ENCODER)         += libfooenc.o libfoo.o\n",
+                "libfooenc.c": "#if FOO_CHECK_VERSION(3, 1, 0)\n#endif\n",
+                "libfoo.c": "#if FOO_CHECK_VERSION(3, 1, 0)\n#endif\n",
+                "unrelated.c": "#if FOO_CHECK_VERSION(9, 9, 9)\n#endif\n",
+            },
+        )
+        self.assertIn(
+            "| libfoo (libfoo-av1) | 2.0.0, 3.1.0 | TODO | TODO |",
+            section(report, "doc-claims"),
+        )
+
+    def test_doc_comma_section_and_build_guards(self) -> None:
+        """Comma sections resolve their first encoder and combine configure/build floors."""
+        report = self.doc_report(
+            "64x64 cells\n",
+            name="libbar, libbarrgb",
+            configure=(
+                'libbar_encoder_deps="libbar"\n'
+                'require_cpp_condition libbar bar.h "BAR_BUILD >= 155"\n'
+            ),
+            source_files={
+                "Makefile": "OBJS-$(CONFIG_LIBBAR_ENCODER) += libbar.o\n",
+                "libbar.c": "#if BAR_BUILD >= 161\n#endif\n",
+            },
+        )
+        self.assertIn(
+            "| libbar | BAR_BUILD >= 155, BAR_BUILD >= 161 | TODO | TODO |",
+            section(report, "doc-claims"),
+        )
+
+    def test_doc_missing_object_and_disallowed_macro(self) -> None:
+        """Missing head objects and macros outside the version allow-list add no values."""
+        report = self.doc_report(
+            "64x64 cells\n",
+            configure="require_pkg_config libfoo foo foo.h foo_init\n",
+            source_files={
+                "Makefile": "OBJS-$(CONFIG_LIBFOO_ENCODER) += missing.o libfooenc.o\n",
+                "libfooenc.c": "#if HAVE_FOO >= 1\n#endif\n",
+                "libfoo.c": "#if FOO_CHECK_VERSION(9, 9, 9)\n#endif\n",
+            },
+        )
+        self.assertIn("| libfoo | unknown | TODO | TODO |", report)
+
+    def test_doc_cpp_requirement_fallback(self) -> None:
+        """A CPP requirement alone resolves a library without a dependency or pkg floor."""
+        report = self.doc_report(
+            "64x64 cells\n",
+            configure='require_cpp_condition libfoo foo.h "FOO_BUILD >= 155"\n',
+            source_files={"libfoo.c": "#if FOO_BUILD >= 161\n#endif\n"},
+        )
+        self.assertIn("| libfoo | FOO_BUILD >= 155, FOO_BUILD >= 161 | TODO | TODO |", report)
+
+    def test_doc_ordered_version_shapes(self) -> None:
+        """All floor and guard shapes retain distinct values in the required order."""
+        report = self.doc_report(
+            "64x64 cells\n",
+            configure=(
+                'require_pkg_config libfoo "foo >= 2.0.0" foo.h foo_init\n'
+                'require_pkg_config libfoo "foo >= 2.1.0" foo.h foo_init\n'
+                'require_cpp_condition libfoo foo.h "FOO_BUILD >= 155"\n'
+                'require_pkg_config libother "other >= 9.0.0" other.h init\n'
+            ),
+            source_files={
+                "Makefile": "OBJS-$(CONFIG_LIBFOO_ENCODER) += first.o second.o\n",
+                "first.c": "#if FOO_BUILD >= 161\n#elif FOO_CHECK_VERSION(3, 1, 0)\n#endif\n",
+                "second.c": (
+                    "#if FOO_CHECK_VERSION(3, 2, 0)\n#elif FOO_BUILD < 158\n"
+                    "#elif FOO_VERSION >= 4 && FOO_VERSION_MAJOR < 5\n"
+                    "#elif FOO_API_VERSION >= 6\n#elif HAVE_FOO >= 1\n#endif\n"
+                    "int value = FOO_BUILD >= 999;\n"
+                ),
+            },
+        )
+        self.assertIn(
+            "| 2.0.0, 2.1.0, FOO_BUILD >= 155, 3.1.0, 3.2.0, FOO_BUILD >= 161, "
+            "FOO_BUILD < 158, FOO_VERSION >= 4, FOO_VERSION_MAJOR < 5, "
+            "FOO_API_VERSION >= 6 | TODO | TODO |",
+            report,
+        )
+
+    def test_doc_comparison_claim(self) -> None:
+        """One added comparison claim produces exactly one row."""
+        claims = section(self.doc_report("Speeds above 8 can be set.\n"), "doc-claims")
+        self.assertEqual(claims.count("| TODO | TODO |"), 1)
+        self.assertIn("| Speeds above 8 can be set. |", claims)
+
+    def test_doc_version_bound_claim(self) -> None:
+        """One added version-bound claim produces exactly one row."""
+        claims = section(self.doc_report("Needs 1.2 or newer.\n"), "doc-claims")
+        self.assertEqual(claims.count("| TODO | TODO |"), 1)
+        self.assertIn("| Needs 1.2 or newer. |", claims)
+
+    def test_doc_range_claim(self) -> None:
+        """One added signed-range claim produces exactly one row."""
+        claims = section(self.doc_report("Offsets are clipped to -12..12.\n"), "doc-claims")
+        self.assertEqual(claims.count("| TODO | TODO |"), 1)
+        self.assertIn("| Offsets are clipped to -12..12. |", claims)
+
+    def test_doc_size_claim(self) -> None:
+        """One added size claim produces exactly one row."""
+        claims = section(self.doc_report("A line longer than 1 MiB is refused.\n"), "doc-claims")
+        self.assertEqual(claims.count("| TODO | TODO |"), 1)
+        self.assertIn("| A line longer than 1 MiB is refused. |", claims)
+
+    def test_doc_claim_shape_allowlist_boundaries(self) -> None:
+        """Allowed variants match while numberless and overly distant comparisons fail."""
+        examples = (
+            "below two",
+            "over 2",
+            "under 2",
+            "exceed 2",
+            "exceeds 2",
+            "greater than 2",
+            "less than 2",
+            "more than 2",
+            "fewer than 2",
+            "higher than 2",
+            "lower than a total of two",
+            "1.2 or older",
+            "1.2 or later",
+            "1.2 or earlier",
+            "1.2 or above",
+            "1.2 or below",
+            "newer than 1",
+            "older than 1.2",
+            "-12 to 12",
+            "-12 .. -1",
+            "1KiB",
+            "1 GiB",
+            "1 KB",
+            "1 MB",
+            "1 GB",
+            "1 byte",
+            "2 bytes",
+            "1 bit",
+            "2 bits",
+            "ABOVE EIGHT",
+        )
+        claims = section(self.doc_report("\n".join(examples) + "\n"), "doc-claims")
+        self.assertEqual(claims.count("| TODO | TODO |"), len(examples))
+
+    def test_doc_claim_shape_negatives(self) -> None:
+        """Numberless comparisons, distant numbers, and unlisted shapes produce no hits."""
+        report = self.doc_report(
+            "above the threshold\nunder the hood\nabove a total of exactly 8\n"
+            "1 widget\n1.2 or compatible\nFOO_BUILD >= 161\n"
+        )
+        self.assertIn("no hits", section(report, "doc-claims"))
 
     def test_doc_distinct_guards(self) -> None:
         """Repeated version guards are deduplicated in the oldest-version list."""
@@ -372,6 +543,14 @@ class PlantedReplayTest(unittest.TestCase):
         """The planted base compared with itself produces no hits in every class."""
         report = self.replay(PLANTED_BASE)
         self.assertEqual(report.count("no hits"), 3)
+
+    def test_libaom_comparison_claim(self) -> None:
+        """The fixed head resolves the above-eight claim to libaom and its 2.0.0 floor."""
+        self.assertRegex(
+            section(self.replay(FIXED_HEAD), "doc-claims"),
+            r"\| doc/encoders\.texi:\d+ \| [^\n|]*above 8[^\n|]* \| "
+            r"libaom[^|]* \| [^|]*2\.0\.0[^|]* \|",
+        )
 
 
 if __name__ == "__main__":

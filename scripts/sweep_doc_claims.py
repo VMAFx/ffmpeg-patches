@@ -15,6 +15,8 @@ if str(ROOT) not in sys.path:
 
 from scripts.variant_sweep import (  # noqa: E402
     MAX_REPORT_BYTES,
+    MAX_SOURCE_BYTES,
+    MAX_SOURCE_COUNT,
     REPORT_TABLES,
     added_lines,
     check_deadline,
@@ -29,12 +31,27 @@ NUMBER = (
 )
 CLAIM = re.compile(
     rf"\b\d+x\d+\b|\b(?:at most|up to|at least|no more than|maximum|minimum)"
-    rf"(?:\W+\w+){{0,3}}?\W+{NUMBER}\b|\b(?:averag|approximat|round|clamp|truncat|smallest|largest)\w*",
+    rf"(?:\W+\w+){{0,3}}?\W+{NUMBER}\b|\b(?:averag|approximat|round|clamp|truncat|smallest|largest)\w*"
+    rf"|\b(?:above|below|over|under|exceeds?|greater than|less than|more than|fewer than|"
+    rf"higher than|lower than)(?:\W+\w+){{0,3}}?\W+{NUMBER}\b"
+    r"|\b\d+(?:\.\d+)+\s+or\s+(?:newer|older|later|earlier|above|below)\b"
+    r"|\b(?:newer|older) than\s+\d+(?:\.\d+)*\b"
+    r"|-?\d+\s*\.\.\s*-?\d+|-?\d+\s+to\s+-?\d+"
+    r"|\b\d+\s*(?:KiB|MiB|GiB|KB|MB|GB|bytes?|bits?)\b",
     re.I,
 )
-SECTION = re.compile(r"^@section\s+(\S+)")
+SECTION = re.compile(r"^@section[ \t]+([^\r\n]+)")
 FLOOR = re.compile(r'require_pkg_config\s+(\w+)\s+"[^"\s]+\s+>=\s*([^"\s]+)"')
+CPP_FLOOR = re.compile(
+    r'require_cpp_condition[ \t]+(\w+)[ \t]+\S+[ \t]+"'
+    r'([A-Z][A-Z0-9_]*)[ \t]*>=[ \t]*(\d+)"'
+)
 GUARD = re.compile(r"\b[A-Z][A-Z0-9_]*_CHECK_VERSION\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
+CONDITION = re.compile(r"^[ \t]*#[ \t]*(?:if|elif)\b([^\n]*)", re.M)
+BUILD_GUARD = re.compile(
+    r"\b([A-Z][A-Z0-9_]*_(?:BUILD|VERSION|VERSION_MAJOR|API_VERSION))"
+    r"[ \t]*(>=|<)[ \t]*(\d+)\b"
+)
 TABLE = REPORT_TABLES["doc-claims"]
 
 
@@ -42,33 +59,81 @@ def find_claims(source: str, changed: dict[int, str]) -> list[tuple[int, str, st
     """Select allowed added claim lines and their nearest preceding encoder section."""
     library = "unknown"
     claims = []
-    for number, line in enumerate(source.splitlines(), 1):
+    check_limit("source size", len(source.encode()), MAX_SOURCE_BYTES)
+    lines = source.splitlines()
+    for index in range(len(lines)):
+        number, line = index + 1, lines[index]
         section = SECTION.match(line)
         if section:
-            library = section[1]
+            library = section[1].split(",", 1)[0].strip()
         if number in changed and CLAIM.search(line):
             claims.append((number, line.strip().replace("|", r"\|"), library))
     return claims
 
 
-def library_versions(library: str, sources: dict[str, str]) -> str:
-    """Combine the configured version floor with distinct encoder version guards."""
-    floors = {match[1]: match[2] for match in FLOOR.finditer(sources.get("configure", ""))}
-    if library == "unknown" or library not in floors:
+def resolve_library(name: str, configure: str) -> str:
+    """Resolve the first section name through encoder dependencies or library checks."""
+    if name == "unknown":
         return "unknown"
-    versions = [floors[library]]
-    for match in GUARD.finditer(sources.get(f"libavcodec/{library}.c", "")):
-        version = ".".join(match.groups())
-        if version not in versions:
-            versions.append(version)
-    return ", ".join(versions)
+    encoder = re.escape(name.replace("-", "_"))
+    dependency = re.search(rf'^{encoder}_encoder_deps="([A-Za-z0-9_]+)(?=[ "])', configure, re.M)
+    if dependency:
+        return dependency[1]
+    requirement = re.search(
+        rf"\brequire_(?:pkg_config|cpp_condition)[ \t]+{re.escape(name)}[ \t]+", configure
+    )
+    return name if requirement else "unknown"
 
 
-def version_sources(
-    directory: str, head: str, libraries: set[str], deadline: float
-) -> dict[str, str]:
-    """Read only existing configure and encoder blobs needed by selected claims."""
-    wanted = {"configure"} | {f"libavcodec/{name}.c" for name in libraries if name != "unknown"}
+def encoder_sources(name: str, makefile: str) -> list[str]:
+    """Map an encoder to allow-listed Makefile object paths or its legacy source path."""
+    encoder = re.escape(name.replace("-", "_").upper())
+    objects = re.search(
+        rf"^[ \t]*OBJS-\$\(CONFIG_{encoder}_ENCODER\)[ \t]*\+=[ \t]*"
+        r"((?:[A-Za-z0-9_]+\.o[ \t]*)+)$",
+        makefile,
+        re.M,
+    )
+    if objects is None:
+        return [f"libavcodec/{name}.c"]
+    names = objects[1].split()
+    return [f"libavcodec/{names[index][:-2]}.c" for index in range(len(names))]
+
+
+def source_versions(source: str) -> list[str]:
+    """Collect version-call guards before allow-listed comparisons on conditional lines."""
+    calls = GUARD.findall(source)
+    versions = [".".join(calls[index]) for index in range(len(calls))]
+    comparisons = BUILD_GUARD.findall("\n".join(CONDITION.findall(source)))
+    versions.extend(" ".join(comparisons[index]) for index in range(len(comparisons)))
+    return versions
+
+
+def library_versions(name: str, sources: dict[str, str]) -> str:
+    """Combine distinct pkg-config floors, CPP floors, version calls, and build guards."""
+    configure = sources.get("configure", "")
+    library = resolve_library(name, configure)
+    if library == "unknown":
+        return "unknown"
+    floors = FLOOR.findall(configure)
+    versions = [floors[index][1] for index in range(len(floors)) if floors[index][0] == library]
+    cpp = CPP_FLOOR.findall(configure)
+    versions.extend(
+        f"{cpp[index][1]} >= {cpp[index][2]}"
+        for index in range(len(cpp))
+        if cpp[index][0] == library
+    )
+    paths = encoder_sources(name, sources.get("libavcodec/Makefile", ""))
+    source = "\n".join(sources.get(paths[index], "") for index in range(len(paths)))
+    versions.extend(source_versions(source))
+    return ", ".join(dict.fromkeys(versions)) or "unknown"
+
+
+def read_existing_sources(
+    directory: str, head: str, wanted: set[str], sources: dict[str, str], deadline: float
+) -> None:
+    """Read requested blobs that exist at head without consulting working-tree sources."""
+    check_limit("source count", len(wanted | sources.keys()), MAX_SOURCE_COUNT)
     listing = git(
         directory,
         "ls-tree",
@@ -80,14 +145,40 @@ def version_sources(
         *sorted(wanted),
         deadline=deadline,
     )
-    paths = {name for name in listing.split("\0") if name in wanted}
+    read_sources(directory, head, set(listing.split("\0")) & wanted, sources, deadline)
+
+
+def version_sources(
+    directory: str, head: str, libraries: set[str], deadline: float
+) -> dict[str, str]:
+    """Read head configure, Makefile, and existing sources for the selected encoder names."""
     sources: dict[str, str] = {}
-    read_sources(directory, head, paths, sources, deadline)
+    read_existing_sources(directory, head, {"configure", "libavcodec/Makefile"}, sources, deadline)
+    names = sorted(libraries - {"unknown"})
+    check_limit("source count", len(names), MAX_SOURCE_COUNT)
+    wanted: set[str] = set()
+    for index in range(len(names)):
+        check_deadline(deadline)
+        if resolve_library(names[index], sources.get("configure", "")) != "unknown":
+            wanted.update(encoder_sources(names[index], sources.get("libavcodec/Makefile", "")))
+    if wanted:
+        read_existing_sources(directory, head, wanted, sources, deadline)
     return sources
 
 
+def claim_row(claim: tuple[str, int, str, str], sources: dict[str, str]) -> str:
+    """Render an escaped row naming the resolved library and its encoder when different."""
+    path, number, text, name = claim
+    library = resolve_library(name, sources.get("configure", ""))
+    if library not in ("unknown", name):
+        library = f"{library} ({name})"
+    library = library.replace("|", r"\|")
+    oldest = library_versions(name, sources)
+    return f"| {path}:{number} | {text} | {library} | {oldest} | TODO | TODO |"
+
+
 def sweep(directory: str, base: str, head: str, deadline: float) -> str:
-    """Render bounded documentation rows with library floors and reviewer placeholders."""
+    """Render bounded documentation rows with resolved libraries and ordered version evidence."""
     diff = git(
         directory,
         "diff",
@@ -105,11 +196,18 @@ def sweep(directory: str, base: str, head: str, deadline: float) -> str:
     sources: dict[str, str] = {}
     read_sources(directory, head, set(changed), sources, deadline)
     claims = []
-    for path, source in sorted(sources.items()):
+    paths = sorted(sources)
+    for index in range(len(paths)):
+        path = paths[index]
         check_deadline(deadline)
-        claims.extend((path, *claim) for claim in find_claims(source, changed[path]))
+        selected = find_claims(sources[path], changed[path])
+        claims.extend((path, *selected[index]) for index in range(len(selected)))
     versions = (
-        version_sources(directory, head, {row[3] for row in claims}, deadline) if claims else {}
+        version_sources(
+            directory, head, {claims[index][3] for index in range(len(claims))}, deadline
+        )
+        if claims
+        else {}
     )
     lines = [
         "class: doc-claims",
@@ -119,10 +217,9 @@ def sweep(directory: str, base: str, head: str, deadline: float) -> str:
         "| --- | --- | --- | --- | --- | --- |",
     ]
     size = len(("\n".join(lines) + "\n").encode())
-    for path, number, text, library in claims:
+    for index in range(len(claims)):
         check_deadline(deadline)
-        oldest = library_versions(library, versions)
-        row = f"| {path}:{number} | {text} | {library} | {oldest} | TODO | TODO |"
+        row = claim_row(claims[index], versions)
         size += len((row + "\n").encode())
         check_limit("report size", size, MAX_REPORT_BYTES)
         lines.append(row)
