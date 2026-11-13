@@ -1,6 +1,6 @@
 status = "submitted"
 upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25053"
-master_form = { base = "1ade940d09711e5a269c403dba5f46a1f9eb2279", head = "ce9da09f5df5bcda6567cf1c85b0abfb4bd26db8" }
+master_form = { base = "1ade940d09711e5a269c403dba5f46a1f9eb2279", head = "98bbaeb8c8c1450e0c2c3e2232bbd8d00d2831d3" }
 consumers = ["pelorus"]
 origin = "found by the Pelorus GPU lane (CUDA frames through an independent Vulkan device and back to CUDA, Pelorus #296)"
 notes = """
