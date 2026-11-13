@@ -8,7 +8,8 @@ import importlib
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -43,6 +44,26 @@ MAX_INLINE_BODIES = 256
 AMBIGUOUS_SCRIPT_PATH = (
     "script path from a variable assigned in a sourced file and elsewhere; use one assignment"
 )
+UNRESOLVED_SCRIPT_DIR = (
+    "script path from an own-directory name assigned in a function, branch or loop; "
+    "assign it once at the top level"
+)
+UNKNOWN_SOURCE_PATH = (
+    "relative script path after a source the guard cannot read; use an absolute path"
+)
+UNSUBSTITUTED_SCRIPT_PATH = (
+    "script path from an own-directory name with an expansion the guard cannot substitute; "
+    "use plain $NAME or ${NAME} and no other expansion"
+)
+# Own directory of an executed script, symlinks resolved like Path.resolve():
+# $(dirname "$(readlink -f "${BASH_SOURCE[0]}")"), with realpath or $0 as variants.
+SCRIPT_DIR_VALUE = re.compile(
+    r'\$\(dirname (?:-- )?"\$\((?:readlink -f|realpath)(?: --)? '
+    r'"(?:\$\{BASH_SOURCE(?:\[0\])?\}|\$BASH_SOURCE|\$\{0\}|\$0)"\)"\)'
+)
+# ${OVERRIDE:-value} or ${OVERRIDE-value}: the value applies only while OVERRIDE is unset.
+SCRIPT_DIR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-(.+)\}")
+ASSIGNED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 STRUCTURE = frozenset(
     [
         "program",
@@ -173,6 +194,11 @@ class _Scan:
     assigned: set[str] = field(default_factory=set)
     ambiguous: set[str] = field(default_factory=set)
     source_literals: dict[int, tuple[dict[str, str], set[str]]] = field(default_factory=dict)
+    script_dirs: dict[str, str | None] = field(default_factory=dict)
+    script_literals: set[str] = field(default_factory=set)
+    unresolved_dirs: set[str] = field(default_factory=set)
+    pending: list[tuple[str, bool, bool, frozenset[str]]] = field(default_factory=list)
+    moved: bool = False
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
 
@@ -213,29 +239,75 @@ def _candidate_allowed(operand: str) -> bool:
 
 
 def _record_candidate(operand: str, is_program: bool, scan: _Scan) -> None:
-    """Preserve the directory state at each concrete candidate's encounter."""
-    if _ambiguous_reference(operand, scan):
-        scan.refusal = AMBIGUOUS_SCRIPT_PATH
+    """Preserve the directory state at each concrete candidate's encounter.
+
+    Words arrive with plain references to resolved own-directory names substituted, so a
+    reference still left (an operator form such as ${N%/}) refuses.
+    """
+    reason = _reference_refusal(operand, scan)
+    if reason is not None:
+        scan.refusal = reason
         return
     if _unknown_source_relative(operand, is_program, scan):
-        scan.refusal = (
-            "relative script path after a source the guard cannot read; use an absolute path"
-        )
+        scan.refusal = UNKNOWN_SOURCE_PATH
         return
     if _candidate_allowed(operand):
         changed = scan.dir_changed and not os.path.isabs(operand) and not operand.startswith("~")
         scan.candidates.append((operand, is_program, changed))
+        return
+    if _referenced(operand, scan.script_literals):
+        scan.refusal = UNSUBSTITUTED_SCRIPT_PATH
+        return
+    unsettled = _referenced(operand, scan.script_dirs)
+    if unsettled:
+        scan.pending.append((operand, is_program, scan.dir_changed, unsettled))
 
 
-def _ambiguous_reference(word: str, scan: _Scan) -> bool:
-    """Recognize exact simple or braced references to ambiguous assignment names."""
-    return any(
-        re.search(
-            r"\$(?:\{" + re.escape(name) + r"\}|" + re.escape(name) + r"(?![A-Za-z0-9_]))", word
-        )
-        is not None
-        for name in scan.ambiguous
+def _referenced(word: str, names: Iterable[str]) -> frozenset[str]:
+    """Return the names a word references.
+
+    Matches simple references and braced ones with or without an operator ($N, ${N},
+    ${N:-x}, ${N%/}); a longer name sharing the prefix does not match.
+    """
+    return frozenset(
+        name
+        for name in names
+        if re.search(r"\$\{?" + re.escape(name) + r"(?![A-Za-z0-9_])", word) is not None
     )
+
+
+def _reference_refusal(word: str, scan: _Scan) -> str | None:
+    """Name the refusal for a word referencing an ambiguous or unresolved own-directory name."""
+    if _referenced(word, scan.ambiguous):
+        return AMBIGUOUS_SCRIPT_PATH
+    if _referenced(word, scan.unresolved_dirs):
+        return UNRESOLVED_SCRIPT_DIR
+    return None
+
+
+def _settle_pending(scan: _Scan) -> str | None:
+    """Recheck script paths walked before their own-directory name was assigned.
+
+    A function body is walked at its definition, so a reference in it can precede an
+    assignment that runs before the call. A name that ended nested refuses as unresolved, one
+    that ended uncertain refuses as after an unread source, and one resolved at the top level
+    turns the reference into a concrete candidate. A word that still holds an expansion after
+    substitution (an operator form such as ${N:-x}, or another variable) refuses, since the
+    guard cannot name the file it runs.
+    """
+    for operand, is_program, dir_changed, names in scan.pending:
+        reason = _reference_refusal(operand, scan)
+        if reason is not None:
+            return reason
+        if not names <= scan.script_literals:
+            return UNKNOWN_SOURCE_PATH
+        resolved = _substitute_literals(operand, scan.literals)
+        if "$" in resolved or "`" in resolved:
+            return UNSUBSTITUTED_SCRIPT_PATH
+        if _candidate_allowed(resolved):
+            changed = dir_changed and not os.path.isabs(resolved) and not resolved.startswith("~")
+            scan.candidates.append((resolved, is_program, changed))
+    return None
 
 
 def _unknown_source_relative(operand: str, is_program: bool, scan: _Scan) -> bool:
@@ -259,7 +331,7 @@ def _record_directory(words: list[str], idx: int, scan: _Scan) -> None:
             and targets[0] not in scan.cd_targets
         ):
             scan.cd_targets.append(targets[0])
-    scan.dir_changed = True
+    scan.dir_changed = scan.moved = True
 
 
 def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
@@ -521,17 +593,16 @@ def _source_operand(words: list[str]) -> tuple[str | None, str | None]:
 
 def _source_target(target: str | None, scan: _Scan) -> str | None:
     """Inline readable source texts into the caller and mark unresolved directories unknown."""
-    if target is None or _ambiguous_reference(target, scan):
-        if target is not None:
-            scan.refusal = AMBIGUOUS_SCRIPT_PATH
+    if target is None:
         return None
     if _configure_reference(target):
         return target
     if _unknown_source_relative(target, False, scan):
-        return "relative script path after a source the guard cannot read; use an absolute path"
+        return UNKNOWN_SOURCE_PATH
     reader = scan.context.source_reader
     if not _candidate_allowed(target) or reader is None:
         _record_candidate(target, False, scan)
+        _forget_script_literals(scan)
         scan.dir_changed = scan.source_unknown = True
         return None
     changed = scan.dir_changed and not os.path.isabs(target) and not target.startswith("~")
@@ -674,7 +745,7 @@ def _ordinary_command(words: list[str], idx: int, scan: _Scan) -> str | None:
         hit = _later_operands(words, idx, scan)
         if hit is not None:
             return hit
-    if "/" in word or _program_name_allowed(word) or _ambiguous_reference(word, scan):
+    if "/" in word or _program_name_allowed(word) or _reference_refusal(word, scan) is not None:
         _record_candidate(word, True, scan)
     if name in ("cd", "pushd", "popd"):
         _record_directory(words, idx, scan)
@@ -843,13 +914,97 @@ def _visit_semantics(
     elif kind == "pipeline":
         hit = _pipeline_hit(node, raw, scan)
     elif kind in ASSIGNMENTS:
+        _settle_script_dir(node, raw, scan)
         hit = _assignment_hit(node, raw)
     children = _child_modes(node, kind in DATA | ASSIGNMENTS | {"test_command", "file_redirect"})
     return hit, children
 
 
-def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> tuple[dict[str, str], set[str]]:
-    """Collect unique literals and all assigned names with one bounded syntax walk."""
+def _script_dir_value(value: str) -> tuple[bool, str | None]:
+    """Match the own-directory idiom, alone or as the default of an override unset in the env."""
+    if len(value) > 1 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    override = None
+    default = SCRIPT_DIR_DEFAULT.fullmatch(value)
+    if default is not None:
+        override, value = default.groups()
+        if override in os.environ:
+            return False, None
+    return SCRIPT_DIR_VALUE.fullmatch(value) is not None, override
+
+
+def _script_dir_names(assignments: list[str]) -> dict[str, str | None]:
+    """Map names assigned once to the own-directory idiom onto their override names."""
+    names = [match.group() if (match := ASSIGNED_NAME.match(a)) else "" for a in assignments]
+    counts = Counter(names)
+    result: dict[str, str | None] = {}
+    for i in range(len(assignments)):
+        name = names[i]
+        if not name or counts[name] != 1 or assignments[i][len(name) : len(name) + 1] != "=":
+            continue
+        matched, override = _script_dir_value(assignments[i][len(name) + 1 :])
+        if matched:
+            result[name] = override
+    return result
+
+
+def _top_level(node: Any) -> bool:
+    """Accept an assignment only as a statement of the file, never in a function, branch or loop."""
+    parent = node.parent
+    for _ in range(3):
+        if parent is None or parent.type not in ("variable_assignments", "declaration_command"):
+            break
+        parent = parent.parent
+    return parent is not None and parent.type == "program"
+
+
+def _forget_script_literals(scan: _Scan) -> None:
+    """Drop own-directory literals at an unread source, which may reassign their names."""
+    for name in scan.script_literals:
+        scan.literals.pop(name, None)
+    scan.script_literals.clear()
+
+
+def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
+    """Resolve an own-directory name from its top-level assignment on, never before it.
+
+    After a directory change or an unread source, with its override assigned anywhere in the
+    file, or through a top-level declaration (declare -l or -u changes the value), the name
+    stays unresolved and later relative paths refuse as after a source the guard cannot read.
+    Nested in a function, branch or loop, the name stays unresolved and every script path
+    referencing it refuses; other paths keep their verdict.
+    """
+    if not scan.script_dirs:
+        return
+    assignments = (
+        [node]
+        if node.type == "variable_assignment"
+        else [child for child in node.named_children if child.type == "variable_assignment"]
+    )
+    for assignment in assignments:
+        match = ASSIGNED_NAME.match(_text(assignment, raw))
+        if match is None or match.group() not in scan.script_dirs:
+            continue
+        name = match.group()
+        override = scan.script_dirs.pop(name)
+        uncertain = (
+            scan.moved
+            or scan.source_unknown
+            or (override is not None and override in scan.assigned)
+        )
+        top = _top_level(assignment)
+        if uncertain or (top and assignment.parent.type == "declaration_command"):
+            scan.literals.pop(name, None)
+            scan.source_unknown = scan.dir_changed = True
+        elif top:
+            scan.literals[name] = str(scan.context.script_dir)
+            scan.script_literals.add(name)
+        else:
+            scan.unresolved_dirs.add(name)
+
+
+def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> tuple[list[str], set[str]]:
+    """Collect assignment texts and all assigned names with one bounded syntax walk."""
     stack = [root]
     assignments = []
     assigned = set()
@@ -867,6 +1022,12 @@ def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> tuple[dict[str, s
                 if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                     assigned.add(name)
         stack.extend(reversed(node.named_children))
+    return assignments, assigned
+
+
+def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> tuple[dict[str, str], set[str]]:
+    """Collect unique literals and all assigned names with one bounded syntax walk."""
+    assignments, assigned = _assignment_texts(root, raw, budget)
     return _find_literal_assignments(assignments), assigned
 
 
@@ -885,6 +1046,18 @@ def _merge_source_literals(node: Any, scan: _Scan) -> None:
     scan.assigned.update(assigned)
 
 
+def _finish(
+    scan: _Scan, directory_state: list[bool] | None
+) -> tuple[str | None, list[tuple[str, bool, bool]], list[str], list[tuple[str, bool, bool]]]:
+    """Settle pending references and return the file's verdict and candidates."""
+    refusal = _settle_pending(scan)
+    if refusal is not None:
+        return refusal, [], [], []
+    if directory_state is not None:
+        directory_state[0] = scan.dir_changed
+    return None, scan.candidates, scan.cd_targets, scan.filtered
+
+
 def scan_body(
     body: str,
     context: InspectionContext,
@@ -898,13 +1071,14 @@ def scan_body(
     raw = body.encode("utf-8", "surrogateescape")
     scan = _Scan(context, budget, dir_changed=context.directory_changed)
     root = parser.parse(raw).root_node
-    scan.literals, scan.assigned = _literal_map(root, raw, budget)
+    assignments, scan.assigned = _assignment_texts(root, raw, budget)
+    scan.literals = _find_literal_assignments(assignments)
+    if context.script_dir is not None:
+        scan.script_dirs = _script_dir_names(assignments)
     scan.stack.append((root, raw, False))
     for _ in range(MAX_BODY_NODES):
         if not scan.stack:
-            if directory_state is not None:
-                directory_state[0] = scan.dir_changed
-            return None, scan.candidates, scan.cd_targets, scan.filtered
+            return _finish(scan, directory_state)
         if budget.nodes >= MAX_BODY_NODES:
             return "shell syntax tree larger than inspect limit", [], [], []
         node, source, mode = scan.stack.pop()
@@ -915,4 +1089,4 @@ def scan_body(
             return hit or scan.refusal, [], [], []
     if scan.stack:
         return "shell syntax tree larger than inspect limit", [], [], []
-    return None, scan.candidates, scan.cd_targets, scan.filtered
+    return _finish(scan, directory_state)
