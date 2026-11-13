@@ -513,6 +513,37 @@ class LaneBriefTest(unittest.TestCase):
         )
         self.assertNotIn("<modules>", brief.read_text(encoding="utf-8"))
 
+    def test_brief_without_import_style_refused(self) -> None:
+        """Accept complete briefs and reject briefs missing the import-style module."""
+        content = self.rendered()
+        brief = self.root / "brief.md"
+        brief.write_text(content, encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 0, error)
+        brief.write_text(content.replace("tests.test_import_style", ""), encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 1)
+        self.assertIn("missing required line: tests.test_import_style", error)
+        self.assertIn("python -m unittest tests.test_import_style", content)
+
+    def test_import_style_requirement_is_exact_module_name(self) -> None:
+        """Reject the path form and accept the dotted module with a trailing flag."""
+        content = self.rendered()
+        brief = self.root / "brief.md"
+        brief.write_text(
+            content.replace("tests.test_import_style", "tests/test_import_style.py"),
+            encoding="utf-8",
+        )
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 1)
+        self.assertIn("missing required line: tests.test_import_style", error)
+        brief.write_text(
+            content.replace("tests.test_import_style", "tests.test_import_style -v"),
+            encoding="utf-8",
+        )
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 0, error)
+
     def test_each_missing_required_line_fails(self) -> None:
         """Reject each independently removed required substring."""
         content = self.rendered()
@@ -663,6 +694,7 @@ class LaneBriefTest(unittest.TestCase):
                 "ruff format --check scripts tests",
                 "docstring_diff.py --cached",
                 "no commit, no push",
+                "tests.test_import_style",
             ],
         )
 
