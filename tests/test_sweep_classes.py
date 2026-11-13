@@ -11,8 +11,8 @@ import subprocess  # nosec B404 - fixed local interpreter argv, bounded timeout.
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 from scripts import sweep_doc_claims, sweep_state_advance, variant_sweep
 from tests import test_variant_sweep as fixtures
@@ -412,7 +412,7 @@ class SweepRegressionTest(unittest.TestCase):
             "int f(void) { if (r < 0) return r; s->n++; return 0; }\n"
             "int g(void) { if (r < 0) return r; s->m--; return 0; }\n"
         )
-        with mock.patch.object(
+        with unittest.mock.patch.object(
             sweep_state_advance, "mask_literals", wraps=sweep_state_advance.mask_literals
         ) as mask:
             self.assertEqual(
@@ -499,8 +499,8 @@ class SweepRegressionTest(unittest.TestCase):
             return f"class: {name}\nhead: {head}\nno hits\n"
 
         with (
-            mock.patch.object(variant_sweep, "sweep", side_effect=unchecked) as first,
-            mock.patch.object(variant_sweep, "sweep_class", side_effect=extra) as others,
+            unittest.mock.patch.object(variant_sweep, "sweep", side_effect=unchecked) as first,
+            unittest.mock.patch.object(variant_sweep, "sweep_class", side_effect=extra) as others,
         ):
             variant_sweep.sweep_all("unused", sha, sha)
         self.assertEqual(first.call_count, 1)
@@ -672,8 +672,8 @@ class ReplayValidationTest(unittest.TestCase):
         """A replay directory without a Git marker fails before reading objects."""
         with (
             tempfile.TemporaryDirectory() as directory,
-            mock.patch.object(os.environ, "get", return_value=directory),
-            mock.patch.object(
+            unittest.mock.patch.object(os.environ, "get", return_value=directory),
+            unittest.mock.patch.object(
                 variant_sweep, "git", side_effect=AssertionError("object lookup before validation")
             ) as git,
         ):
@@ -693,9 +693,9 @@ class ReplayValidationTest(unittest.TestCase):
             ):
                 with (
                     self.subTest(base=base, head=head),
-                    mock.patch.object(os.environ, "get", return_value=directory),
-                    mock.patch(__name__ + ".PLANTED_BASE", base),
-                    mock.patch.object(
+                    unittest.mock.patch.object(os.environ, "get", return_value=directory),
+                    unittest.mock.patch(__name__ + ".PLANTED_BASE", base),
+                    unittest.mock.patch.object(
                         variant_sweep,
                         "git",
                         side_effect=AssertionError("object lookup before validation"),
