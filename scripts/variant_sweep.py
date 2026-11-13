@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import importlib.util
 import json
 import os
 import re
@@ -28,6 +29,16 @@ MACRO_STYLE = re.compile(r"[A-Z][A-Z0-9_]*", re.ASCII)
 CONTROL_HEADERS = {"if", "for", "while", "switch"}
 TABLE = "| file:line | callee | kind | same file as fix | disposition |"
 DISPOSITION = re.compile(r"fold|(?:follow-up|no-variant): \S(?:.*\S)?")
+REPORT_TABLES = {
+    "unchecked-return": TABLE,
+    "state-advance": "| file:line | expression | first earlier error return line | disposition |",
+    "doc-claims": "| file:line | claim text | library | oldest | newest | disposition |",
+}
+VERSION = r"(?:[A-Z][A-Z0-9_]* (?:>=|<) \d+|(?!TODO\b)[^\s,;|]+)"
+DOC_DISPOSITION = re.compile(
+    rf"no-claim: \S(?:.*\S)?|checked: [\w.-]+ {VERSION}(?:, {VERSION})* {VERSION} "
+    r"[^\s;|]+:[1-9]\d*(?:; [^\s;|]+:[1-9]\d*)*"
+)
 ATTRIBUTES = {"__attribute__", "__attribute", "__declspec", "av_printf_format", "av_alloc_size"}
 MAX_REPORT_BYTES = 4 * 1024 * 1024
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
@@ -569,10 +580,11 @@ def render_report(
     return report
 
 
-def sweep(directory: str, base: str, head: str) -> str:
-    """Resolve revisions and sweep within one shared wall-clock and input budget."""
+def sweep(directory: str, base: str, head: str, deadline: float | None = None) -> str:
+    """Resolve revisions and sweep within the supplied or a new wall-clock budget."""
 
-    deadline = time.monotonic() + MAX_SWEEP_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + MAX_SWEEP_SECONDS
     check_deadline(deadline)
     base = git(
         directory,
@@ -663,6 +675,94 @@ def validate_report(path: Path, sha: str) -> bool:
     return body
 
 
+def reviewed_row(line: str, bug_class: str) -> bool:
+    """Require reviewed dispositions and completed version cells for checked doc rows."""
+    if not line.startswith("|") or not line.endswith("|"):
+        return False
+    cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line)[1:-1]]
+    if len(cells) != REPORT_TABLES[bug_class].count("|") - 1:
+        return False
+    pattern = DOC_DISPOSITION if bug_class == "doc-claims" else DISPOSITION
+    if (
+        bug_class == "doc-claims"
+        and cells[-1].startswith("checked:")
+        and any(not cell or re.search(r"\bTODO\b", cell) for cell in cells[3:5])
+    ):
+        return False
+    return pattern.fullmatch(cells[-1]) is not None
+
+
+def validate_section(lines: list[str], bug_class: str, sha: str) -> bool:
+    """Validate one exact-head section with its own header and exclusive body form."""
+    heads = [line.removeprefix("head: ") for line in lines if line.startswith("head:")]
+    table = REPORT_TABLES[bug_class]
+    if heads != [sha] or lines.count(table) != 1:
+        return False
+    rows = 0
+    empty = 0
+    width = table.count("|") - 1
+    separator = "| " + " | ".join(["---"] * width) + " |"
+    for line in lines:
+        if not line.strip() or line in {table, separator}:
+            continue
+        if line.startswith(("head: ", "base: ", "targets: ")):
+            continue
+        if line == "no hits":
+            empty += 1
+        elif reviewed_row(line, bug_class):
+            rows += 1
+        else:
+            return False
+    return (rows > 0 and empty == 0) or (rows == 0 and empty == 1)
+
+
+def validate_full_report(path: Path, sha: str) -> bool:
+    """Require exactly three distinct reviewed sections, each for the requested head."""
+    with path.open("rb") as stream:
+        data = stream.read(MAX_REPORT_BYTES + 1)
+    check_limit("report size", len(data), MAX_REPORT_BYTES)
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in data.decode("utf-8").splitlines():
+        if line.startswith("class:"):
+            current = line.removeprefix("class: ")
+            if current not in REPORT_TABLES or current in sections:
+                return False
+            sections[current] = []
+        elif current is None:
+            if line.strip():
+                return False
+        else:
+            sections[current].append(line)
+    return sections.keys() == REPORT_TABLES.keys() and all(
+        validate_section(lines, name, sha) for name, lines in sections.items()
+    )
+
+
+def sweep_class(name: str, directory: str, base: str, head: str, deadline: float) -> str:
+    """Load an additional sweep by sibling file path only when all classes are run."""
+    path = Path(__file__).with_name(f"sweep_{name}.py")
+    spec = importlib.util.spec_from_file_location(f"_ffmpeg_sweep_{name}", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load sweep: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.sweep(directory, base, head, deadline)
+
+
+def sweep_all(directory: str, base: str, head: str) -> str:
+    """Run all three class sweeps within one aggregate wall-clock budget."""
+    deadline = time.monotonic() + MAX_SWEEP_SECONDS
+    report = sweep(directory, base, head, deadline=deadline)
+    metadata = report.splitlines()
+    base = metadata[1].removeprefix("base: ")
+    head = metadata[2].removeprefix("head: ")
+    for name in ("state_advance", "doc_claims"):
+        report += "\n" + sweep_class(name, directory, base, head, deadline)
+        check_limit("report size", len(report.encode("utf-8")), MAX_REPORT_BYTES)
+    return report
+
+
 def write_report(output: Path, report: str) -> None:
     """Stage the complete report beside its destination and atomically publish it."""
 
@@ -683,13 +783,16 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-C", dest="directory", default=".")
-    parser.add_argument("--class", dest="bug_class", choices=("unchecked-return",), required=True)
+    parser.add_argument(
+        "--class", dest="bug_class", choices=("unchecked-return", "all"), required=True
+    )
     parser.add_argument("base")
     parser.add_argument("head")
     parser.add_argument("-o", dest="output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        write_report(args.output, sweep(args.directory, args.base, args.head))
+        runner = sweep_all if args.bug_class == "all" else sweep
+        write_report(args.output, runner(args.directory, args.base, args.head))
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
         print(f"variant_sweep: {error}", file=sys.stderr)
         return 1
