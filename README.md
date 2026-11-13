@@ -337,7 +337,7 @@ standards (HISS-21, NASA JPL Power of 10), and local verification instructions.
 
 ## Support ffmpeg-patches
 
-**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [40 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 11 merged, 26 open.
+**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [40 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 12 merged, 25 open.
 
 **What support funds.**
 - Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
@@ -408,7 +408,7 @@ without a series patch is a change the series does not carry.
 | [25475](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25475) | `master` | open | avformat: fix GCC 14 and 16 -Wformat-truncation warnings in dashenc, matroskaenc and smoothstreamingenc | none |
 | [25476](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25476) | `master` | open | avformat: fix GCC 14 and 16 warnings in mpegts, nspdec and rtsp | none |
 | [25477](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477) | `master` | open | avcodec/ffv1enc: move float remap scratch off the stack | none |
-| [25478](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25478) | `master` | open | avcodec/aac: fix GCC 14 and 16 -Wstringop-overflow warnings in aacenc and aacsbr | none |
+| [25478](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25478) | `master` | merged 2026-11-12 (`25cc947f444f`), in no release yet | avcodec/aac: fix GCC 14 and 16 -Wstringop-overflow warnings in aacenc and aacsbr | none |
 | [25479](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25479) | `master` | open | avcodec: fix GCC 14 and 16 warnings in a64multienc, h264dec, vlc and wmadec | none |
 | [25480](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25480) | `master` | open | avcodec/vvc: fix GCC 14 and 16 -Wstack-usage warnings in scaled prediction and checkasm | none |
 | [25481](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25481) | `master` | open | tests/checkasm: move large scratch buffers to the heap | none |
@@ -423,7 +423,7 @@ without a series patch is a change the series does not carry.
 | [25879](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25879) | `master` | open | avfilter/vf_hqdn3d_vulkan: add a Vulkan hqdn3d filter | 0023 |
 | [25885](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25885) | `master` | open | avfilter/vf_tonemap: add the bt2408_hable tone map | 0012, 0013 |
 
-State read from the FFmpeg forge on 2026-11-11.
+State read from the FFmpeg forge on 2026-11-13.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned

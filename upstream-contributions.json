@@ -1,5 +1,5 @@
 {
-  "checked": "2026-11-11",
+  "checked": "2026-11-13",
   "contributions": [
     {
       "number": 24045,
@@ -344,9 +344,9 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25478",
       "title": "avcodec/aac: fix GCC 14 and 16 -Wstringop-overflow warnings in aacenc and aacsbr",
       "base": "master",
-      "state": "open",
-      "merged_at": "",
-      "merged_commit": "",
+      "state": "merged",
+      "merged_at": "2026-11-12T00:49:39Z",
+      "merged_commit": "25cc947f444feb547d6ef19db9ccf0d02a05d689",
       "in_release": "",
       "patch": "",
       "project": "vmafx",
