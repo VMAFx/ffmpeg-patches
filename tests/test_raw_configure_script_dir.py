@@ -14,6 +14,7 @@ from tests.raw_configure_support import RawConfigureGuardBase
 UNKNOWN_SOURCE = "relative script path after a source the guard cannot read; use an absolute path"
 AMBIGUOUS = "assigned in a sourced file and elsewhere"
 UNRESOLVED = "own-directory name assigned in a function, branch or loop"
+UNSUBSTITUTED = "expansion the guard cannot substitute"
 BENIGN_NEXT = {"tools/next.sh": "echo benign\n"}
 DEFAULT = 'HERE=${LANE_TEST_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}\n'
 DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
@@ -171,6 +172,21 @@ SCRIPT_DIR = {
     "function-source-before-assignment": Case(
         'load() {\n  . "$HERE/lib.sh"\n}\n' + DOLLAR0 + "load\n", 2, UNKNOWN_SOURCE
     ),
+    "function-before-assignment-operator-form": Case(
+        'run_next() {\n  "${HERE:-.}/next.sh" check\n}\n' + DOLLAR0 + "run_next\n",
+        2,
+        UNSUBSTITUTED,
+        {"tools/next.sh": CFG},
+    ),
+    "top-level-operator-form": Case(
+        DOLLAR0 + '"${HERE%/}/next.sh" check\n', 2, UNSUBSTITUTED, {"tools/next.sh": CFG}
+    ),
+    "function-before-assignment-partial-expansion": Case(
+        'run_next() {\n  bash "$HERE/$NEXT_NAME.sh"\n}\n' + DOLLAR0 + "run_next\n",
+        2,
+        UNSUBSTITUTED,
+        BENIGN_NEXT,
+    ),
 }
 
 
@@ -209,8 +225,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 46 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 46)
+        """Replay all 49 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 49)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

@@ -51,6 +51,10 @@ UNRESOLVED_SCRIPT_DIR = (
 UNKNOWN_SOURCE_PATH = (
     "relative script path after a source the guard cannot read; use an absolute path"
 )
+UNSUBSTITUTED_SCRIPT_PATH = (
+    "script path from an own-directory name with an expansion the guard cannot substitute; "
+    "use plain $NAME or ${NAME} and no other expansion"
+)
 # Own directory of an executed script, symlinks resolved like Path.resolve():
 # $(dirname "$(readlink -f "${BASH_SOURCE[0]}")"), with realpath or $0 as variants.
 SCRIPT_DIR_VALUE = re.compile(
@@ -235,7 +239,11 @@ def _candidate_allowed(operand: str) -> bool:
 
 
 def _record_candidate(operand: str, is_program: bool, scan: _Scan) -> None:
-    """Preserve the directory state at each concrete candidate's encounter."""
+    """Preserve the directory state at each concrete candidate's encounter.
+
+    Words arrive with plain references to resolved own-directory names substituted, so a
+    reference still left (an operator form such as ${N%/}) refuses.
+    """
     reason = _reference_refusal(operand, scan)
     if reason is not None:
         scan.refusal = reason
@@ -246,6 +254,9 @@ def _record_candidate(operand: str, is_program: bool, scan: _Scan) -> None:
     if _candidate_allowed(operand):
         changed = scan.dir_changed and not os.path.isabs(operand) and not operand.startswith("~")
         scan.candidates.append((operand, is_program, changed))
+        return
+    if _referenced(operand, scan.script_literals):
+        scan.refusal = UNSUBSTITUTED_SCRIPT_PATH
         return
     unsettled = _referenced(operand, scan.script_dirs)
     if unsettled:
@@ -280,7 +291,9 @@ def _settle_pending(scan: _Scan) -> str | None:
     A function body is walked at its definition, so a reference in it can precede an
     assignment that runs before the call. A name that ended nested refuses as unresolved, one
     that ended uncertain refuses as after an unread source, and one resolved at the top level
-    turns the reference into a concrete candidate.
+    turns the reference into a concrete candidate. A word that still holds an expansion after
+    substitution (an operator form such as ${N:-x}, or another variable) refuses, since the
+    guard cannot name the file it runs.
     """
     for operand, is_program, dir_changed, names in scan.pending:
         reason = _reference_refusal(operand, scan)
@@ -289,6 +302,8 @@ def _settle_pending(scan: _Scan) -> str | None:
         if not names <= scan.script_literals:
             return UNKNOWN_SOURCE_PATH
         resolved = _substitute_literals(operand, scan.literals)
+        if "$" in resolved or "`" in resolved:
+            return UNSUBSTITUTED_SCRIPT_PATH
         if _candidate_allowed(resolved):
             changed = dir_changed and not os.path.isabs(resolved) and not resolved.startswith("~")
             scan.candidates.append((resolved, is_program, changed))
