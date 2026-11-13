@@ -966,7 +966,7 @@ try:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    valid = module.validate_report(pathlib.Path(sys.argv[1]), sys.argv[2])
+    valid = module.validate_full_report(pathlib.Path(sys.argv[1]), sys.argv[2])
 except (AttributeError, ImportError, OSError, UnicodeError, RuntimeError) as error:
     print(f"sweep: {error}", file=sys.stderr)
     valid = False

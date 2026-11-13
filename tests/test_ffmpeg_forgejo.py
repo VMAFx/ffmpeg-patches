@@ -113,6 +113,28 @@ def git_output(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def full_sweep_report(sha: str) -> str:
+    """Build a reviewed empty report for all three sweep classes at one head."""
+
+    return (
+        "class: unchecked-return\n"
+        f"head: {sha}\n\n"
+        "| file:line | callee | kind | same file as fix | disposition |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "no hits\n\n"
+        "class: state-advance\n"
+        f"head: {sha}\n\n"
+        "| file:line | expression | first earlier error return line | disposition |\n"
+        "| --- | --- | --- | --- |\n"
+        "no hits\n\n"
+        "class: doc-claims\n"
+        f"head: {sha}\n\n"
+        "| file:line | claim text | library | oldest | newest | disposition |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "no hits\n"
+    )
+
+
 OTHER = other_status("pending", "2026-11-06T08:00:00Z")
 ChangedFile = str | dict[str, str]
 
@@ -542,7 +564,7 @@ class ForgejoTest(unittest.TestCase):
         git(self.repo, *commit, "topic")
         self.sweep = self.tmp / "sweep.md"
         sha = git_output(self.repo, "rev-parse", "topic")
-        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
+        self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
 
     def command_environment(
         self,
@@ -2033,9 +2055,7 @@ class FairyRequestTestBase(unittest.TestCase):
             tool.chmod(0o755)
         (self.tmp / "body.md").write_text(BODY, encoding="utf-8")
         self.sweep = self.tmp / "sweep.md"
-        self.sweep.write_text(
-            f"class: unchecked-return\nhead: {FAIRY_FIXTURE_HEAD}\nno hits\n", encoding="utf-8"
-        )
+        self.sweep.write_text(full_sweep_report(FAIRY_FIXTURE_HEAD), encoding="utf-8")
 
     def run_command(
         self, stub: Stub, *args: str, env_updates: dict[str, str] | None = None
@@ -2505,7 +2525,7 @@ class PullRequestOverlapTest(ForgejoTest):
             "new topic",
         )
         sha = git_output(self.repo, "rev-parse", "topic")
-        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
+        self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
         stub = overlap_stub(
             reviewers=[["alice"]], open_pulls=[open_pull()], pull_files={25612: ["upstream-file"]}
         )
@@ -3344,7 +3364,7 @@ class SweepTest(ForgejoTest):
             "qualify  the close\nerrors",
         )
         sha = git_output(self.repo, "rev-parse", "topic")
-        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
+        self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
         result = self.promise_push(self.promise_stub(), self.promise_file())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.tmp / "push-argv.json").exists())
@@ -3366,7 +3386,7 @@ class SweepTest(ForgejoTest):
             "qualify the close errors",
         )
         sha = git_output(self.repo, "rev-parse", "topic")
-        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
+        self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
         stub = self.large_promise_stub()
         self.assertGreater(len(json.dumps(stub.comments[25619])), 200 * 1024)
         result = self.promise_push(stub, self.promise_file())
@@ -3591,7 +3611,7 @@ class SweepTest(ForgejoTest):
                 message,
             )
         sha = git_output(self.repo, "rev-parse", "topic")
-        self.sweep.write_text(f"class: unchecked-return\nhead: {sha}\nno hits\n", encoding="utf-8")
+        self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
         self.assert_promise_refused(
             self.promise_stub(),
             self.promise_file("81815: qualify close errors\n"),
@@ -3656,7 +3676,7 @@ class SweepTest(ForgejoTest):
     def test_sweep_head_mismatch(self) -> None:
         """A reviewed report for another commit is stale."""
 
-        self.sweep.write_text(f"class: unchecked-return\nhead: {A}\nno hits\n", encoding="utf-8")
+        self.sweep.write_text(full_sweep_report(A), encoding="utf-8")
         self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def test_sweep_missing_class(self) -> None:
@@ -3675,7 +3695,7 @@ class SweepTest(ForgejoTest):
         self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def test_sweep_bad_disposition(self) -> None:
-        """Only the three named disposition forms are accepted."""
+        """Complete reports reject dispositions outside the three named forms."""
 
         for value in (
             "ignore",
@@ -3688,19 +3708,81 @@ class SweepTest(ForgejoTest):
         ):
             with self.subTest(value=value):
                 self.sweep.write_text(
-                    self.sweep.read_text(encoding="utf-8").split("|", 1)[0], encoding="utf-8"
+                    full_sweep_report(git_output(self.repo, "rev-parse", "topic")), encoding="utf-8"
                 )
                 self.add_sweep_rows(value)
                 self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def add_sweep_rows(self, *values: str) -> None:
-        """Append table headers and planted disposition rows."""
+        """Replace the unchecked-return no-hits marker with planted disposition rows."""
 
-        with self.sweep.open("a") as report:
-            report.write("| file:line | callee | kind | same file as fix | disposition |\n")
-            report.write("| --- | --- | --- | --- | --- |\n")
-            for value in values:
-                report.write(f"| sibling.c:4 | play | discarded | no | {value} |\n")
+        rows = "".join(f"| sibling.c:4 | play | discarded | no | {value} |\n" for value in values)
+        self.sweep.write_text(
+            self.sweep.read_text(encoding="utf-8").replace("no hits\n", rows, 1),
+            encoding="utf-8",
+        )
+
+    def test_sweep_rejects_single_class_report(self) -> None:
+        """A single reviewed class refuses PR and leased push."""
+
+        sha = git_output(self.repo, "rev-parse", "topic")
+        report = full_sweep_report(sha).split("\n\nclass: state-advance", 1)[0] + "\n"
+        self.sweep.write_text(report, encoding="utf-8")
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+        result = self.sweep_command("push", "--lease", A, "--sweep", str(self.sweep))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sweep rejected", result.stderr)
+
+    def test_sweep_rejects_duplicate_and_unknown_class(self) -> None:
+        """Duplicate and unknown classes refuse PR and leased push."""
+
+        sha = git_output(self.repo, "rev-parse", "topic")
+        report = full_sweep_report(sha)
+        state_section = report.split("class: state-advance", 1)[1].split("class: doc-claims", 1)[0]
+        for invalid in (
+            report + "\nclass: state-advance" + state_section,
+            report.replace("class: state-advance", "class: unknown-class"),
+        ):
+            with self.subTest(report=invalid):
+                self.sweep.write_text(invalid, encoding="utf-8")
+                self.assert_sweep_refused("--sweep", str(self.sweep))
+                result = self.sweep_command("push", "--lease", A, "--sweep", str(self.sweep))
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("sweep rejected", result.stderr)
+
+    def test_sweep_rejects_one_section_on_other_head(self) -> None:
+        """A stale doc-claims head refuses PR and leased push."""
+
+        sha = git_output(self.repo, "rev-parse", "topic")
+        report = full_sweep_report(sha).replace(
+            f"class: doc-claims\nhead: {sha}", f"class: doc-claims\nhead: {A}"
+        )
+        self.sweep.write_text(report, encoding="utf-8")
+        self.assert_sweep_refused("--sweep", str(self.sweep))
+        result = self.sweep_command("push", "--lease", A, "--sweep", str(self.sweep))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sweep rejected", result.stderr)
+
+    def test_sweep_accepts_rows_in_later_section(self) -> None:
+        """Reviewed state-advance rows allow PR and leased push."""
+
+        sha = git_output(self.repo, "rev-parse", "topic")
+        prefix, later = full_sweep_report(sha).split("class: state-advance", 1)
+        report = (
+            prefix
+            + "class: state-advance"
+            + later.replace("no hits\n", "| f.c:9 | ctx->n++ | 7 | fold |\n", 1)
+        )
+        self.sweep.write_text(report, encoding="utf-8")
+        for command in ("pr", "push"):
+            with self.subTest(command=command):
+                options = ["--sweep", str(self.sweep)]
+                if command == "push":
+                    options = ["--lease", A, *options]
+                result = self.sweep_command(command, *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if command == "push":
+                    self.assertIn("stub push", result.stdout)
 
     def test_sweep_reviewed(self) -> None:
         """Reviewed fold, follow-up and no-variant rows allow PR and leased push."""
