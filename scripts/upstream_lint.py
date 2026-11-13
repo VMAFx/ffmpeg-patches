@@ -22,7 +22,8 @@ not a replacement for upstream review or the remaining developer.texi rules.
 The fate-deps step checks lavfi video FATE registrations for LAVFI_INDEV and
 WRAPPED_AVFRAME_DECODER: lavfi emits wrapped_avframe video packets, so an encoder
 alone cannot satisfy decoding. Templates are reported without expansion,
-multi-file variables remain unresolved, and audio PCM decoders are not checked.
+macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
+multi-file variables are reported unresolved, and audio PCM decoders are not checked.
 """
 
 from __future__ import annotations
@@ -407,9 +408,9 @@ FATE_PATTERNS = (
     ("define", re.compile(r"^define\s+\S+.*$")),
     ("endef", re.compile(r"^endef\s*(?:#.*)?$")),
 )
-FATE_VARIABLE = re.compile(r"^\$\(([A-Z][A-Z0-9_]*)\)$")
+FATE_VARIABLE = re.compile(r"\$\(([A-Z][A-Z0-9_]*)\)")
+FATE_TOKEN_BUDGET = 4096
 LAVFI_FORMAT = re.compile(r"(?:^|\s)-f\s+lavfi(?=\s|$)")
-LAVFI_TOKEN = re.compile(r"""(?:"[^"]*"|'[^']*'|\S+)""")
 LAVFI_OPTION = re.compile(r"^-[\w:]+$")
 LAVFI_NAME = re.compile(r"""^["']?([a-z0-9_]+)(?=[=,;\s"']|$)""")
 FATE_REQUIRED = ("LAVFI_INDEV", "WRAPPED_AVFRAME_DECODER")
@@ -440,6 +441,8 @@ class FateEntry:
     target: FateToken
     deps: frozenset[str] = frozenset()
     command: str = ""
+    provenance: frozenset[int] = frozenset()
+    classified: bool = True
 
 
 @dataclass
@@ -448,8 +451,21 @@ class FateFile:
 
     variables: dict[str, list[FateToken]] = field(default_factory=dict)
     registrations: dict[str, list[FateEntry]] = field(default_factory=dict)
-    commands: dict[str, FateEntry] = field(default_factory=dict)
+    commands: dict[str, list[FateEntry]] = field(default_factory=dict)
     templates: list[FateLine] = field(default_factory=list)
+    simple: set[str] = field(default_factory=set)
+    overflows: set[int] = field(default_factory=set)
+    macros: frozenset[str] = frozenset()
+    needs_macros: bool = False
+
+
+@dataclass(frozen=True)
+class FateContext:
+    """Inject base source, deletion positions and macros into the pure file checker."""
+
+    base: str | None = None
+    deleted: frozenset[int] = frozenset()
+    macros: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -460,7 +476,28 @@ class FateReport:
     audio: int = 0
     unclassified: int = 0
     findings: int = 0
+    unresolved: int = 0
     lines: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FateCondition:
+    """One conditional branch with explicit polarity and source provenance."""
+
+    deps: frozenset[str]
+    positive: bool | None
+    lines: frozenset[int]
+    active: bool = True
+
+
+def _fate_uncomment(text: str) -> str:
+    """Strip only make comments whose hash is preceded by an even backslash run."""
+    slashes = 0
+    for index, char in enumerate(text):
+        if char == "#" and slashes % 2 == 0:
+            return text[:index]
+        slashes = slashes + 1 if char == "\\" else 0
+    return text
 
 
 def _fate_lines(source: str) -> list[FateLine]:
@@ -472,10 +509,10 @@ def _fate_lines(source: str) -> list[FateLine]:
         continued = text.endswith("\\")
         parts.append(text[:-1] if continued else text)
         if not continued:
-            lines.append(FateLine(" ".join(parts).strip(), first, number))
+            lines.append(FateLine(_fate_uncomment(" ".join(parts)).strip(), first, number))
             parts = []
     if parts:
-        lines.append(FateLine(" ".join(parts).strip(), first, number))
+        lines.append(FateLine(_fate_uncomment(" ".join(parts)).strip(), first, number))
     return lines
 
 
@@ -488,14 +525,63 @@ def _fate_kind(line: FateLine) -> tuple[str, tuple[str, ...]]:
     return "", ()
 
 
-def _fate_expand(tokens: list[FateToken], variables: dict[str, list[FateToken]]) -> list[FateToken]:
-    """Expand whole-token variable references in at most eight iterative passes."""
+def _fate_replace(
+    token: FateToken, variables: dict[str, list[FateToken]], remaining: int
+) -> tuple[str, frozenset[int], int]:
+    """Substitute embedded references only after checking each replacement's budget."""
+    parts, lines, cursor, cost = [], token.lines, 0, 1
+    for match in FATE_VARIABLE.finditer(token.text):
+        replacements = variables.get(match[1])
+        if replacements is None:
+            continue
+        cost += max(1, len(replacements)) - 1
+        if cost > remaining:
+            return token.text, token.lines, cost
+        parts.extend((token.text[cursor : match.start()], " ".join(t.text for t in replacements)))
+        lines |= frozenset().union(*(t.lines for t in replacements))
+        cursor = match.end()
+    parts.append(token.text[cursor:])
+    return "".join(parts), lines, cost
+
+
+def _fate_expand_pass(
+    tokens: list[FateToken], variables: dict[str, list[FateToken]]
+) -> list[FateToken] | None:
+    """Build one bounded expansion pass while retaining individual target provenance."""
+    expanded: list[FateToken] = []
+    spent = 0
+    for token in tokens:
+        match = FATE_VARIABLE.fullmatch(token.text)
+        replacements = variables.get(match[1]) if match else None
+        if replacements is not None:
+            spent += len(replacements)
+            if spent > FATE_TOKEN_BUDGET:
+                return None
+            expanded.extend(FateToken(t.text, t.lines | token.lines) for t in replacements)
+            continue
+        text, lines, cost = _fate_replace(token, variables, FATE_TOKEN_BUDGET - spent)
+        spent += cost
+        if spent > FATE_TOKEN_BUDGET:
+            return None
+        for item in re.finditer(r"\S+", text):
+            if len(expanded) == FATE_TOKEN_BUDGET:
+                return None
+            expanded.append(FateToken(item[0], lines))
+    return expanded
+
+
+def _fate_expand(
+    tokens: list[FateToken],
+    variables: dict[str, list[FateToken]],
+    overflows: set[int] | None = None,
+) -> list[FateToken]:
+    """Expand whole and embedded variables within eight passes and a total token budget."""
     for _ in range(8):
-        expanded = []
-        for token in tokens:
-            match = FATE_VARIABLE.fullmatch(token.text)
-            replacements = variables.get(match[1], [token]) if match else [token]
-            expanded.extend(FateToken(item.text, item.lines | token.lines) for item in replacements)
+        expanded = _fate_expand_pass(tokens, variables)
+        if expanded is None or any(t.text == "$(EXPANSION_OVER_BUDGET)" for t in tokens):
+            if overflows is not None:
+                overflows.update(number for token in tokens for number in token.lines)
+            break
         if expanded == tokens:
             break
         tokens = expanded
@@ -503,47 +589,164 @@ def _fate_expand(tokens: list[FateToken], variables: dict[str, list[FateToken]])
 
 
 def _fate_tokens(text: str, line: FateLine) -> list[FateToken]:
-    """Attach physical provenance to each whitespace-separated make token."""
-    return [FateToken(token, frozenset(range(line.first, line.last + 1))) for token in text.split()]
+    """Attach physical provenance to make tokens within the expansion budget."""
+    tokens: list[FateToken] = []
+    lines = frozenset(range(line.first, line.last + 1))
+    for match in re.finditer(r"\S+", text):
+        if len(tokens) == FATE_TOKEN_BUDGET:
+            return [FateToken("$(EXPANSION_OVER_BUDGET)", lines)]
+        tokens.append(FateToken(match[0], lines))
+    return tokens
 
 
 def _fate_dependencies(text: str) -> frozenset[str]:
-    """Extract uppercase dependencies, normalizing enclosing CONFIG references."""
+    """Extract only literal uppercase dependency words outside make expressions."""
+    plain, depth = [], 0
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        plain.append(char if depth == 0 and char not in "$()" else " ")
     return frozenset(
-        token.removeprefix("CONFIG_") for token in re.findall(r"[A-Z][A-Z0-9_]+", text)
+        word.removeprefix("CONFIG_")
+        for word in "".join(plain).replace(",", " ").split()
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", word)
     )
 
 
+def _fate_arguments(text: str) -> list[str]:
+    """Split make arguments on top-level commas with one bounded character walk."""
+    parts, start, depth = [], 0, 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+        if depth < 0:
+            return []
+    return [*parts, text[start:].strip()] if depth == 0 else []
+
+
+def _fate_guard(text: str, macros: frozenset[str]) -> tuple[frozenset[str], bool]:
+    """Grant only positive ALLYES wrappers, ignoring conditions in supported if forms."""
+    for _ in range(8):
+        if text == "yes":
+            return frozenset(), True
+        if not (text.startswith("$(") and text.endswith(")")):
+            break
+        args = _fate_arguments(text[2:-1])
+        if not args:
+            break
+        call = re.fullmatch(r"call\s+([A-Z][A-Z0-9_]*)", args[0])
+        if call and call[1] in {"ALLYES", *macros}:
+            words = " ".join(args[1:])
+            return _fate_dependencies(words), True
+        if args[0].startswith("if ") and len(args) == 3 and args[1] == "no":
+            text = args[2]
+        elif args[0].startswith("if ") and len(args) == 2:
+            text = args[1]
+        else:
+            break
+    return frozenset(), False
+
+
+def _fate_condition(line: FateLine) -> FateCondition:
+    """Recognize only the six allow-listed make condition polarities."""
+    positive: bool | None = None
+    variable = ""
+    direct = re.fullmatch(r"(ifdef|ifndef)\s+([A-Z][A-Z0-9_]*)", line.text)
+    compare = re.fullmatch(
+        r"(ifeq|ifneq)\s*\(\s*\$\(([A-Z][A-Z0-9_]*)\)\s*,\s*(yes)?\s*\)", line.text
+    )
+    if direct:
+        variable, positive = direct[2], direct[1] == "ifdef"
+    elif compare:
+        variable = compare[2]
+        positive = (compare[1] == "ifeq") == (compare[3] == "yes")
+    return FateCondition(
+        _fate_dependencies(variable), positive, frozenset(range(line.first, line.last + 1))
+    )
+
+
+def _fate_scope(conditions: list[list[FateCondition]]) -> tuple[frozenset[str], frozenset[int]]:
+    """Combine current branch dependencies and enclosing conditional provenance."""
+    frames = [frame for group in conditions for frame in group]
+    deps = frozenset().union(*(f.deps for f in frames if f.positive == f.active))
+    return deps, frozenset().union(*(f.lines for f in frames))
+
+
+def _fate_branch(conditions: list[list[FateCondition]], kind: str, line: FateLine) -> None:
+    """Update branch groups so a single endif closes an entire else-if chain."""
+    if kind == "open":
+        conditions.append([_fate_condition(line)])
+    elif kind == "close" and conditions:
+        conditions.pop()
+    elif kind == "else" and conditions:
+        conditions[-1][-1].active = False
+        tail = line.text[4:].strip()
+        if tail:
+            conditions[-1].append(_fate_condition(FateLine(tail, line.first, line.last)))
+
+
+def _fate_assign(parsed: FateFile, line: FateLine, groups: tuple[str, ...]) -> None:
+    """Preserve recursive assignment flavor and expand simple values immediately."""
+    name, operator, value = groups
+    if operator != "+=":
+        parsed.simple.discard(name)
+    if operator == ":=":
+        parsed.simple.add(name)
+    tokens = _fate_tokens(value, line)
+    if name in parsed.simple:
+        tokens = _fate_expand(tokens, parsed.variables, parsed.overflows)
+    previous = parsed.variables.get(name, []) if operator == "+=" else []
+    if len(previous) + len(tokens) > FATE_TOKEN_BUDGET:
+        parsed.overflows.add(line.first)
+        tokens = [FateToken(f"$({name})", frozenset({line.first}))]
+        previous = []
+    parsed.variables[name] = previous + tokens
+
+
 def _fate_record(
-    parsed: FateFile, line: FateLine, statement: tuple[str, tuple[str, ...]], deps: frozenset[str]
+    parsed: FateFile,
+    line: FateLine,
+    statement: tuple[str, tuple[str, ...]],
+    scope: tuple[frozenset[str], frozenset[int]],
 ) -> None:
-    """Apply one allow-listed variable, registration or command in file order."""
+    """Record every local command variant and registration with dependency provenance."""
     kind, groups = statement
     if kind == "variable":
-        name, operator, value = groups
-        tokens = _fate_tokens(value, line)
-        parsed.variables[name] = (
-            parsed.variables.get(name, []) if operator == "+=" else []
-        ) + tokens
+        _fate_assign(parsed, line, groups)
     elif kind in ("registration", "command"):
         targets = groups[2] if kind == "registration" else groups[0]
-        dependencies = (
-            deps | _fate_dependencies(groups[1]) if kind == "registration" else frozenset()
-        )
-        for target in _fate_expand(_fate_tokens(targets, line), parsed.variables):
-            if target.text.startswith("fate-"):
-                entry = FateEntry(
-                    line, target, dependencies, groups[1] if kind == "command" else ""
-                )
-                if kind == "registration":
-                    parsed.registrations.setdefault(target.text, []).append(entry)
-                else:
-                    parsed.commands[target.text] = entry
+        guard = _fate_expand(_fate_tokens(groups[1], line), parsed.variables, parsed.overflows)
+        guard_text = " ".join(t.text for t in guard)
+        calls = re.findall(r"\$\(call\s+([A-Z][A-Z0-9_]*)", guard_text)
+        if kind == "registration" and any(name != "ALLYES" for name in calls):
+            parsed.needs_macros = True
+        dependencies, classified = _fate_guard(guard_text, parsed.macros)
+        provenance = scope[1] | frozenset().union(*(t.lines for t in guard))
+        for target in _fate_expand(_fate_tokens(targets, line), parsed.variables, parsed.overflows):
+            if not (target.text.startswith("fate-") or "$(" in target.text):
+                continue
+            entry = FateEntry(
+                line,
+                target,
+                scope[0] | dependencies,
+                groups[1] if kind == "command" else "",
+                provenance,
+                classified,
+            )
+            entries = parsed.registrations if kind == "registration" else parsed.commands
+            entries.setdefault(target.text, []).append(entry)
 
 
-def _fate_parse(source: str) -> FateFile:
-    """Parse file-local make statements without evaluating templates or make code."""
-    parsed, conditions, depth = FateFile(), [], 0
+def _fate_parse(source: str, macros: frozenset[str] = frozenset()) -> FateFile:
+    """Parse bounded file-local make statements without executing templates or code."""
+    parsed, conditions, depth = FateFile(macros=macros), [], 0
     for line in _fate_lines(source):
         statement = _fate_kind(line)
         kind, groups = statement
@@ -554,47 +757,76 @@ def _fate_parse(source: str) -> FateFile:
         elif depth:
             if kind == "command" and LAVFI_FORMAT.search(groups[1]):
                 parsed.templates.append(line)
-        elif kind == "open":
-            conditions.append(_fate_dependencies(line.text))
-        elif kind == "close":
-            if conditions:
-                conditions.pop()
+        elif kind in ("open", "close", "else"):
+            _fate_branch(conditions, kind, line)
         else:
-            _fate_record(parsed, line, statement, frozenset().union(*conditions))
+            _fate_record(parsed, line, statement, _fate_scope(conditions))
     return parsed
 
 
 def _fate_touched(entry: FateEntry, added: set[int]) -> bool:
-    """Check the entry's physical range and expanded variable provenance."""
+    """Check registration lines plus target, variable and conditional provenance."""
     return bool(
         added.intersection(range(entry.line.first, entry.line.last + 1))
-        or added & entry.target.lines
+        or added & (entry.target.lines | entry.provenance)
     )
 
 
 def _fate_video(
-    path: str, command: FateEntry, registrations: list[FateEntry], touched: bool, report: FateReport
+    path: str,
+    command: FateEntry,
+    registrations: list[FateEntry],
+    touched: set[int],
+    report: FateReport,
 ) -> None:
-    """Report each missing video registration dependency with touched-line severity."""
-    report.checked += 1
+    """Assess missing dependencies independently for each registration variant."""
     name = command.target.text
-    if not registrations and touched:
+    if not registrations and _fate_touched(command, touched):
         report.lines.append(
             f"informational: {path}:{command.line.first}: {name}: registration not found"
         )
     for registration in registrations:
         missing = " ".join(dep for dep in FATE_REQUIRED if dep not in registration.deps)
         if missing:
-            report.findings += int(touched)
-            label = "finding" if touched else "pre-existing (untouched)"
+            changed = _fate_touched(registration, touched)
+            report.findings += int(changed)
+            label = "finding" if changed else "pre-existing (untouched)"
             report.lines.append(
                 f"{label}: {path}:{registration.line.first}: {name}: "
                 f"lavfi video input needs {missing} in its registration"
             )
 
 
+def _lavfi_words(command: str) -> list[str]:
+    """Join adjacent shell fragments with one linear, non-backtracking character walk."""
+    words, parts, quote, escaped, active = [], [], "", False, False
+    for char in command:
+        if escaped:
+            parts.append(char)
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped, active = True, True
+        elif quote:
+            if char == quote:
+                quote = ""
+            else:
+                parts.append(char)
+        elif char in "\"'":
+            quote, active = char, True
+        elif char.isspace():
+            if active:
+                words.append("".join(parts))
+                parts, active = [], False
+        else:
+            parts.append(char)
+            active = True
+    if active:
+        words.append("".join(parts))
+    return words
+
+
 def _lavfi_skip(tokens: list[str], start: int) -> tuple[int, str | None]:
-    """Walk one `-f lavfi` option run to its `-i` input name without backtracking."""
+    """Walk input options, consuming values only when the next word is not an option."""
     skip = start
     for index in range(start, len(tokens)):
         if index < skip:
@@ -602,79 +834,144 @@ def _lavfi_skip(tokens: list[str], start: int) -> tuple[int, str | None]:
         token = tokens[index]
         if token == "-i":
             if index + 1 < len(tokens):
-                match = LAVFI_NAME.match(tokens[index + 1])
-                return index + 2, match.group(1) if match else None
+                return index + 2, tokens[index + 1]
             return index + 1, None
-        if LAVFI_OPTION.match(token) and index + 1 < len(tokens):
-            skip = index + 2
-            continue
-        return index, None
+        if token == "-f" or not LAVFI_OPTION.fullmatch(token):
+            return index, None
+        skip = index + 1
+        if skip < len(tokens) and not tokens[skip].startswith("-"):
+            skip += 1
     return len(tokens), None
 
 
+def _lavfi_graph(graph: str) -> list[str]:
+    """Collect the first filter of every chain that has no input label."""
+    names = []
+    for raw in graph.split(";"):
+        chain = raw.lstrip()
+        if chain.startswith("["):
+            continue
+        match = LAVFI_NAME.match(chain)
+        names.append(match[1] if match else "<unresolved>")
+    return names
+
+
 def _lavfi_inputs(command: str) -> list[str]:
-    """Collect each `-f lavfi` input source name with one linear token walk."""
-    tokens = LAVFI_TOKEN.findall(command)
+    """Collect all unlabelled lavfi chain sources with a linear shell-word walk."""
+    tokens = _lavfi_words(command)
     names: list[str] = []
     cursor = 0
     for index in range(len(tokens)):
         if index < cursor:
             continue
         if tokens[index] == "-f" and index + 1 < len(tokens) and tokens[index + 1] == "lavfi":
-            stop, name = _lavfi_skip(tokens, index + 2)
-            if name is not None:
-                names.append(name)
+            stop, graph = _lavfi_skip(tokens, index + 2)
+            if graph is not None:
+                names.extend(_lavfi_graph(graph))
                 cursor = stop
     return names
+
+
+def _fate_kinds(command: FateEntry, sources: dict[str, str]) -> set[str]:
+    """Classify every source in one command variant without changing report counts."""
+    return {sources.get(name, "unknown") for name in _lavfi_inputs(command.command)}
 
 
 def _fate_command(
     path: str, command: FateEntry, sources: dict[str, str], report: FateReport
 ) -> bool:
-    """Classify every lavfi input, counting audio-only and unclassified tests."""
+    """Classify every lavfi chain, counting audio-only and unclassified variants."""
     names = _lavfi_inputs(command.command)
     kinds = {sources.get(name, "unknown") for name in names}
+    if "video" in kinds:
+        return True
     if not kinds or kinds - {"video", "audio"}:
         report.unclassified += 1
         report.lines.append(
             f"informational: {path}:{command.line.first}: {command.target.text}: "
             f"unclassified lavfi source: {', '.join(names) or '<unresolved>'}"
         )
-    if "video" in kinds:
-        return True
     if kinds == {"audio"}:
         report.audio += 1
     return False
 
 
-def _fate_check(
-    path: str, parsed: FateFile, added: set[int], sources: dict[str, str]
-) -> FateReport:
-    """Check parsed lavfi commands against every local registration."""
-    report = FateReport()
+def _fate_diagnostics(path: str, parsed: FateFile, touched: set[int], report: FateReport) -> None:
+    """Report touched unresolved targets, templates and bounded expansion failures."""
     for line in parsed.templates:
-        if added.intersection(range(line.first, line.last + 1)):
+        if touched.intersection(range(line.first, line.last + 1)):
             report.lines.append(f"informational: {path}:{line.first}: template not checked")
-    for name, command in parsed.commands.items():
-        if not LAVFI_FORMAT.search(command.command):
+    for number in sorted(parsed.overflows):
+        report.lines.append(
+            f"informational: {path}:{number}: expansion over {FATE_TOKEN_BUDGET} tokens"
+        )
+    for entries in (parsed.registrations, parsed.commands):
+        for name, variants in entries.items():
+            for entry in variants:
+                if entries is parsed.registrations and not entry.classified:
+                    report.lines.append(
+                        f"informational: {path}:{entry.line.first}: {name}: "
+                        "registration guard not classified"
+                    )
+                if "$(" in name and _fate_touched(entry, touched):
+                    report.unresolved += 1
+                    report.lines.append(
+                        f"informational: {path}:{entry.line.first}: unresolved target {name}"
+                    )
+
+
+def _fate_check(
+    path: str,
+    parsed: FateFile,
+    added: set[int],
+    sources: dict[str, str],
+    base: FateFile | None = None,
+) -> FateReport:
+    """Check each registration against all video variants and its own touched provenance."""
+    report = FateReport()
+    _fate_diagnostics(path, parsed, added, report)
+    for name, variants in parsed.commands.items():
+        if "$(" in name:
             continue
+        video = [
+            entry
+            for entry in variants
+            if LAVFI_FORMAT.search(entry.command) and _fate_command(path, entry, sources, report)
+        ]
+        if not video:
+            continue
+        report.checked += 1
+        old_video = base is not None and any(
+            "video" in _fate_kinds(entry, sources) for entry in base.commands.get(name, [])
+        )
+        newly_video = not old_video and any(_fate_touched(entry, added) for entry in video)
         registrations = parsed.registrations.get(name, [])
-        touched = any(_fate_touched(entry, added) for entry in [command, *registrations])
-        if _fate_command(path, command, sources, report):
-            _fate_video(path, command, registrations, touched, report)
+        touched = added | ({entry.line.first for entry in registrations} if newly_video else set())
+        _fate_video(path, video[0], registrations, touched, report)
     return report
 
 
-def _fate_file(path: str, source: str, added: set[int], sources: dict[str, str]) -> FateReport:
-    """Expose pure file parsing and checking without Git or subprocess access."""
-    return _fate_check(path, _fate_parse(source), added, sources)
+def _fate_file(
+    path: str,
+    source: str,
+    added: set[int],
+    sources: dict[str, str],
+    context: FateContext | None = None,
+) -> FateReport:
+    """Expose pure head/base parsing, injected catalogs and deletion-aware checking."""
+    context = context or FateContext()
+    base = _fate_parse(context.base, context.macros) if context.base is not None else None
+    return _fate_check(
+        path, _fate_parse(source, context.macros), added | context.deleted, sources, base
+    )
 
 
 def _fate_summary(report: FateReport, rc: int = 0) -> Step:
     """Finish every fate-deps outcome with its classification and finding totals."""
     summary = (
         f"{report.checked} lavfi video test(s) checked, {report.audio} audio skipped, "
-        f"{report.unclassified} unclassified, {report.findings} finding(s); "
+        f"{report.unclassified} unclassified, {report.unresolved} unresolved, "
+        f"{report.findings} finding(s); "
         "FATE dependencies: wrapped_avframe decoder"
     )
     return Step("fate-deps", rc or int(report.findings > 0), "\n".join([*report.lines, summary]))
@@ -691,25 +988,68 @@ def _fate_sources(source: str) -> dict[str, str]:
     }
 
 
+def _fate_macros(source: str) -> frozenset[str]:
+    """Read final direct ALLYES wrapper definitions from head tests/Makefile."""
+    names = set()
+    for line in _fate_lines(source):
+        kind, groups = _fate_kind(line)
+        if kind != "variable":
+            continue
+        name, operator, value = groups
+        names.discard(name)
+        if operator == "=" and value.startswith("$(") and value.endswith(")"):
+            args = _fate_arguments(value[2:-1])
+            if args and args[0] == "call ALLYES":
+                names.add(name)
+    return frozenset(names)
+
+
+def _fate_deleted_lines(patch: str) -> set[int]:
+    """Map deletion-only hunks to their new-file position, including continuations."""
+    deleted = set()
+    for line in patch.splitlines():
+        match = HUNK.match(line)
+        if match and match[2] == "0":
+            deleted.add(max(1, int(match[1])))
+    return deleted
+
+
+def _fate_merge(report: FateReport, result: FateReport) -> None:
+    """Accumulate one file's independent diagnostics and all classification totals."""
+    report.checked += result.checked
+    report.audio += result.audio
+    report.unclassified += result.unclassified
+    report.unresolved += result.unresolved
+    report.findings += result.findings
+    report.lines.extend(result.lines)
+
+
 def _fate_deps(tree: Path, base: str, head: str) -> Step:
-    """Check changed FATE makefiles with one lazily loaded upstream source catalog."""
-    report, sources, rc = FateReport(), None, 0
+    """Check changed FATE files with lazily loaded head filter and macro catalogs."""
+    report, sources, macros, rc = FateReport(), None, None, 0
     try:
         names = _changed_paths(tree, base, head, "tests/fate/*.mak", added_or_modified=True)
+        existing = set(
+            _git(tree, "ls-tree", "-r", "--name-only", base, "--", "tests/fate").splitlines()
+        )
         for name in names:
             patch = _git(tree, *DIFF_COMMON, "-U0", base, head, "--", name)
-            parsed = _fate_parse(_git(tree, "show", f"{head}:{name}"))
+            source = _git(tree, "show", f"{head}:{name}")
+            old = _git(tree, "show", f"{base}:{name}") if name in existing else None
+            parsed = _fate_parse(source, macros or frozenset())
+            if macros is None and parsed.needs_macros:
+                macros = _fate_macros(_git(tree, "show", f"{head}:tests/Makefile"))
+                parsed = _fate_parse(source, macros)
             needs_sources = parsed.templates or any(
-                LAVFI_FORMAT.search(command.command) for command in parsed.commands.values()
+                LAVFI_FORMAT.search(entry.command)
+                for variants in parsed.commands.values()
+                for entry in variants
             )
             if sources is None and needs_sources:
                 sources = _fate_sources(_git(tree, "show", f"{head}:libavfilter/allfilters.c"))
-            result = _fate_check(name, parsed, _added_lines(patch), sources or {})
-            report.checked += result.checked
-            report.audio += result.audio
-            report.unclassified += result.unclassified
-            report.findings += result.findings
-            report.lines.extend(result.lines)
+            touched = _added_lines(patch) | _fate_deleted_lines(patch)
+            old_parsed = _fate_parse(old, macros or frozenset()) if old is not None else None
+            _fate_merge(report, _fate_check(name, parsed, touched, sources or {}, old_parsed))
     except (OSError, RuntimeError, ValueError) as error:
         rc = 2
         report.lines.append(str(error))

@@ -326,7 +326,8 @@ class FateDepsTest(unittest.TestCase):
         """A good registration cannot mask a second registration with a gap."""
         source = FATE_RED + "FATE_X-yes += fate-filter-scale-ipt-c2-refuse-rgb\n"
         step = self.check_source(source, {5})
-        self.assertEqual(step.output.count("finding:"), 2)
+        self.assertEqual(step.output.count("finding:"), 1)
+        self.assertIn("pre-existing (untouched)", step.output)
 
     def test_options_between_format_and_input(self) -> None:
         """Input options and quoted option values preserve source classification."""
@@ -400,6 +401,180 @@ class FateDepsTest(unittest.TestCase):
         step = self.check_source(source)
         self.assertEqual(step.rc, 0, step.output)
         self.assertIn("registration not found", step.output)
+
+    def test_branch_polarity_and_else(self) -> None:
+        """Only the true dependency branch grants guards, including chained else."""
+        registration = "FATE_X-$(call ALLYES, LAVFI_INDEV) += fate-x\n"
+        command = "fate-x: CMD = -f lavfi -i testsrc2\n"
+        cases = (
+            ("ifdef CONFIG_WRAPPED_AVFRAME_DECODER", "else\n", 1),
+            ("ifndef CONFIG_WRAPPED_AVFRAME_DECODER", "", 1),
+            ("ifneq ($(CONFIG_WRAPPED_AVFRAME_DECODER),yes)", "", 1),
+            ("ifeq ($(CONFIG_WRAPPED_AVFRAME_DECODER),)", "", 1),
+            ("ifndef CONFIG_WRAPPED_AVFRAME_DECODER", "else\n", 0),
+            ("ifneq ($(CONFIG_WRAPPED_AVFRAME_DECODER),)", "", 0),
+            ("ifeq ($(CONFIG_WRAPPED_AVFRAME_DECODER),maybe)", "", 1),
+            ("ifdef CONFIG_SMALL", "else ifeq ($(CONFIG_WRAPPED_AVFRAME_DECODER),yes)\n", 0),
+        )
+        for condition, branch, rc in cases:
+            with self.subTest(condition=condition, branch=branch):
+                source = condition + "\n" + branch + registration + "endif\n" + command
+                self.assertEqual(self.check_source(source).rc, rc)
+        source = "ifdef CONFIG_SMALL\nelse ifdef CONFIG_WRAPPED_AVFRAME_DECODER\n"
+        source += registration + "endif\n" + registration + command
+        self.assertEqual(self.check_source(source).rc, 1)
+
+    def test_positive_registration_guard_allowlist(self) -> None:
+        """Negative and unknown guards cannot supply dependencies from conditions."""
+        command = "fate-x: CMD = -f lavfi -i testsrc2\n"
+        cases = (
+            ("$(if $(CONFIG_WRAPPED_AVFRAME_DECODER),no,yes)", 1, False),
+            (
+                "$(if $(CONFIG_SMALL),no,$(call ALLYES, WRAPPED_AVFRAME_DECODER LAVFI_INDEV))",
+                0,
+                False,
+            ),
+            ("$(if $(CONFIG_SMALL),$(call ALLYES, WRAPPED_AVFRAME_DECODER LAVFI_INDEV))", 0, False),
+            ("$(mystery WRAPPED_AVFRAME_DECODER LAVFI_INDEV)", 1, True),
+        )
+        for guard, rc, unknown in cases:
+            with self.subTest(guard=guard):
+                step = self.check_source(f"FATE_X-{guard} += fate-x\n" + command)
+                self.assertEqual(step.rc, rc, step.output)
+                self.assertEqual("registration guard not classified" in step.output, unknown)
+                if guard.startswith("$(if $(CONFIG_WRAPPED"):
+                    self.assertIn("needs LAVFI_INDEV WRAPPED_AVFRAME_DECODER", step.output)
+        macros = upstream_lint._fate_macros(
+            "YES = $(call ALLYES, $(1))\nNO = $(call ALLYES, $(1))\nNO = no\n"
+        )
+        self.assertEqual(macros, frozenset({"YES"}))
+        source = "FATE_X-$(call YES, LAVFI_INDEV WRAPPED_AVFRAME_DECODER) += fate-x\n"
+        report = upstream_lint._fate_file(
+            "tests/fate/x.mak",
+            source + command,
+            {1, 2},
+            FATE_SOURCES,
+            upstream_lint.FateContext(macros=macros),
+        )
+        self.assertEqual(upstream_lint._fate_summary(report).rc, 0)
+
+    def test_trailing_comments_supply_no_dependencies(self) -> None:
+        """Unescaped make comments grant nothing while escaped hashes survive."""
+        source = "FATE_X-$(call ALLYES, LAVFI_INDEV) # WRAPPED_AVFRAME_DECODER += fate-x\n"
+        step = self.check_source(source + "fate-x: CMD = -f lavfi -i testsrc2\n")
+        self.assertNotIn("finding:", step.output)
+        source = "ifdef CONFIG_LAVFI_INDEV # WRAPPED_AVFRAME_DECODER\n"
+        source += "FATE_X-yes += fate-x\nendif\nfate-x: CMD = -f lavfi -i testsrc2\n"
+        step = self.check_source(source)
+        self.assertEqual(step.rc, 1)
+        self.assertIn("needs WRAPPED_AVFRAME_DECODER", step.output)
+        lines = upstream_lint._fate_lines("X = a\\#b # WRAPPED_AVFRAME_DECODER\n")
+        self.assertEqual(lines[0].text, "X = a\\#b")
+
+    def test_variable_dependencies_and_assignment_flavor(self) -> None:
+        """Embedded dependency variables expand and simple assignments freeze values."""
+        source = "DEPS = WRAPPED_AVFRAME_DECODER LAVFI_INDEV\n"
+        source += "FATE_X-$(call ALLYES, $(DEPS)) += fate-x\nfate-x: CMD = -f lavfi -i testsrc2\n"
+        self.assertEqual(self.check_source(source).rc, 0)
+        source = "OLD = fate-old\nG := $(OLD)\nG += $(OLD)\nOLD = fate-new\n"
+        source += "FATE_X-yes += $(G)\nfate-old: CMD = -f lavfi -i testsrc2\n"
+        parsed = upstream_lint._fate_parse(source)
+        self.assertIn("fate-old", parsed.registrations)
+        self.assertNotIn("fate-new", parsed.registrations)
+        source = "OLD = fate-old\nG = $(OLD)\nG += $(OLD)\nOLD = fate-new\n"
+        source += "FATE_X-yes += $(G)\nfate-new: CMD = -f lavfi -i testsrc2\n"
+        self.assertIn("fate-new", upstream_lint._fate_parse(source).registrations)
+        source = "DEPS = LAVFI_INDEV WRAPPED_AVFRAME_DECODER\n"
+        source += "FATE_X-$(call ALLYES,$(DEPS)) += fate-x\nfate-x: CMD = -f lavfi -i testsrc2\n"
+        self.assertEqual(self.check_source(source).rc, 0)
+
+    def test_total_expansion_budget(self) -> None:
+        """Doubling expansions stop before allocating beyond the token budget."""
+        source = "V0 = fate-x\n"
+        source += "".join(f"V{i} = " + f"$(V{i - 1}) " * 8 + "\n" for i in range(1, 8))
+        source += "FATE_X-yes += $(V7)\nfate-x: CMD = -f lavfi -i testsrc2\n"
+        step = self.check_source(source)
+        self.assertIn("expansion over 4096 tokens", step.output)
+        source += "FATE_Y-$(call ALLYES, $(V7)) += fate-y\n"
+        self.assertIn("expansion over 4096 tokens", self.check_source(source).output)
+        token = upstream_lint.FateToken("$(DEPS)", frozenset({1}))
+        leaf = upstream_lint.FateToken("fate-x", frozenset({2}))
+        overflow: set[int] = set()
+        result = upstream_lint._fate_expand([token], {"DEPS": [leaf] * 4096}, overflow)
+        self.assertEqual(len(result), 4096)
+        self.assertEqual(overflow, set())
+        result = upstream_lint._fate_expand([token], {"DEPS": [leaf] * 4097}, overflow)
+        self.assertEqual(result, [token])
+        self.assertEqual(overflow, {1})
+
+    def test_unresolved_target_is_reported(self) -> None:
+        """Touched cross-file target references remain visible and counted."""
+        source = "FATE_X-yes += $(FATE_GROUP)\n$(FATE_GROUP): CMD = -f lavfi -i testsrc2\n"
+        step = self.check_source(source)
+        self.assertIn("unresolved target $(FATE_GROUP)", step.output)
+        self.assertIn("2 unresolved", step.output)
+        self.assertNotIn("unresolved target", self.check_source(source, set()).output)
+
+    def test_all_command_variants_checked(self) -> None:
+        """A later audio command cannot conceal an earlier video variant."""
+        source = "FATE_X-yes += fate-x\nifdef CONFIG_SMALL\n"
+        source += "fate-x: CMD = -f lavfi -i testsrc2\nelse\n"
+        source += "fate-x: CMD = -f lavfi -i sine\nendif\n"
+        self.assertEqual(self.check_source(source).rc, 1)
+        self.assertEqual(self.check_source(source.replace("testsrc2", "sine")).rc, 0)
+
+    def test_lavfi_options_fragments_and_chain_sources(self) -> None:
+        """Flag options, adjacent quotes and every unlabelled chain preserve video."""
+        for value in (
+            "-re -i testsrc2",
+            '-thread_queue_size ""8 -i testsrc2',
+            '-i "sine [a]; testsrc2 [v]"',
+        ):
+            with self.subTest(value=value):
+                source = "FATE_X-yes += fate-x\nfate-x: CMD = -f lavfi " + value + "\n"
+                self.assertEqual(self.check_source(source).rc, 1)
+        command = "-f lavfi " + '-opt ""8 ' * 5000 + '-i "sine [a]; testsrc2 [v]"'
+        self.assertEqual(upstream_lint._lavfi_inputs(command), ["sine", "testsrc2"])
+        self.assertEqual(upstream_lint._lavfi_inputs('-f lavfi -i "sine; [a]volume"'), ["sine"])
+        source = 'FATE_X-yes += fate-x\nfate-x: CMD = -f lavfi -i "unknown; testsrc2"\n'
+        step = self.check_source(source)
+        self.assertEqual(step.rc, 1)
+        self.assertIn("0 unclassified", step.output)
+
+    def test_registration_specific_touch_and_deletions(self) -> None:
+        """Sibling edits stay informational and newly video commands or removals block."""
+        source = "FATE_X-yes += fate-x\n"
+        source += "FATE_Y-$(call ALLYES, LAVFI_INDEV WRAPPED_AVFRAME_DECODER) += fate-x\n"
+        source += "fate-x: CMD = -f lavfi -i testsrc2\n"
+        step = self.check_source(source, {2})
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("pre-existing (untouched)", step.output)
+        path = "tests/fate/filter-video.mak"
+        for base, expected in ((source, 0), (source.replace("-f lavfi", "-f rawvideo"), 1)):
+            with self.subTest(base=base):
+                head = source.replace("-i testsrc2", "-re -i testsrc2")
+                report = upstream_lint._fate_file(
+                    path, head, {3}, FATE_SOURCES, upstream_lint.FateContext(base=base)
+                )
+                self.assertEqual(upstream_lint._fate_summary(report).rc, expected)
+        head = "FATE_X-$(call ALLYES, LAVFI_INDEV) += fate-x\nfate-x: CMD = -f lavfi -i testsrc2\n"
+        base = head.replace("LAVFI_INDEV", "LAVFI_INDEV WRAPPED_AVFRAME_DECODER")
+        report = upstream_lint._fate_file(
+            path,
+            head,
+            set(),
+            FATE_SOURCES,
+            upstream_lint.FateContext(base=base, deleted=frozenset({1})),
+        )
+        self.assertEqual(upstream_lint._fate_summary(report).rc, 1)
+        for head, touched in (
+            ("DEPS = LAVFI_INDEV\nFATE_X-$(call ALLYES, $(DEPS)) += fate-x\n", {1}),
+            ("ifndef CONFIG_WRAPPED_AVFRAME_DECODER\nFATE_X-yes += fate-x\nendif\n", {1}),
+        ):
+            with self.subTest(head=head):
+                self.assertEqual(
+                    self.check_source(head + "fate-x: CMD = -f lavfi -i testsrc2\n", touched).rc, 1
+                )
 
 
 class FixtureTest(unittest.TestCase):
@@ -528,6 +703,55 @@ class PipelineTest(FixtureTest):
         self.assertIn("step: fate-deps rc: 2", output)
         self.assertIn("libavfilter/allfilters.c", output)
         self.assertIn("FATE dependencies: wrapped_avframe decoder", output)
+
+    def test_fate_deleted_dependency_continuation(self) -> None:
+        """Deleting a dependency continuation blocks until the guard is restored."""
+        path = "tests/fate/filter-video.mak"
+        good = (
+            "FATE_X-$(call ALLYES, LAVFI_INDEV \\\n"
+            " WRAPPED_AVFRAME_DECODER \\\n NULL_MUXER) += fate-x\n"
+            "fate-x: CMD = -f lavfi -i testsrc2\n"
+        )
+        self.write(path, good)
+        self.commit()
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write(path, good.replace(" WRAPPED_AVFRAME_DECODER \\\n", ""))
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: fate-deps rc: 1", output)
+        self.write(path, good)
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+
+    def test_fate_macro_catalog_and_missing_file(self) -> None:
+        """Head macro definitions grant only ALLYES wrappers and missing catalogs fail."""
+        self.write("tests/Makefile", "ALLYES = $(strip $(1))\nVIDEO = $(call ALLYES, $(1))\n")
+        self.write(
+            "tests/fate/filter-video.mak",
+            "FATE_X-$(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER) += fate-x\n"
+            "fate-x: CMD = -f lavfi -i testsrc2\n",
+        )
+        self.write(
+            "tests/fate/other.mak",
+            "GUARD = $(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER)\n"
+            "FATE_Y-$(GUARD) += fate-y\nfate-y: CMD = -f lavfi -i testsrc2\n",
+        )
+        self.commit()
+        with unittest.mock.patch.object(upstream_lint, "_git", wraps=upstream_lint._git) as git:
+            rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        catalog_reads = [
+            call for call in git.call_args_list if call.args[-1].endswith(":tests/Makefile")
+        ]
+        self.assertEqual(len(catalog_reads), 1)
+        self.git("rm", "tests/Makefile")
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: fate-deps rc: 2", output)
+        self.assertIn("tests/Makefile", output)
 
     def test_bad_subject_fails_without_skipping_other_checks(self):
         """The base commit-message checker rejects the planted bad subject."""
