@@ -825,23 +825,23 @@ def _lavfi_words(command: str) -> list[str]:
     return words
 
 
-def _lavfi_skip(tokens: list[str], start: int) -> tuple[int, str | None]:
+def _lavfi_skip(words: list[str], start: int) -> tuple[int, str | None]:
     """Walk input options, consuming values only when the next word is not an option."""
     skip = start
-    for index in range(start, len(tokens)):
+    for index in range(start, len(words)):
         if index < skip:
             continue
-        token = tokens[index]
-        if token == "-i":
-            if index + 1 < len(tokens):
-                return index + 2, tokens[index + 1]
+        word = words[index]
+        if word == "-i":
+            if index + 1 < len(words):
+                return index + 2, words[index + 1]
             return index + 1, None
-        if token == "-f" or not LAVFI_OPTION.fullmatch(token):
+        if word == "-f" or not LAVFI_OPTION.fullmatch(word):
             return index, None
         skip = index + 1
-        if skip < len(tokens) and not tokens[skip].startswith("-"):
+        if skip < len(words) and not words[skip].startswith("-"):
             skip += 1
-    return len(tokens), None
+    return len(words), None
 
 
 def _lavfi_graph(graph: str) -> list[str]:
@@ -858,14 +858,14 @@ def _lavfi_graph(graph: str) -> list[str]:
 
 def _lavfi_inputs(command: str) -> list[str]:
     """Collect all unlabelled lavfi chain sources with a linear shell-word walk."""
-    tokens = _lavfi_words(command)
+    words = _lavfi_words(command)
     names: list[str] = []
     cursor = 0
-    for index in range(len(tokens)):
+    for index in range(len(words)):
         if index < cursor:
             continue
-        if tokens[index] == "-f" and index + 1 < len(tokens) and tokens[index + 1] == "lavfi":
-            stop, graph = _lavfi_skip(tokens, index + 2)
+        if words[index] == "-f" and index + 1 < len(words) and words[index + 1] == "lavfi":
+            stop, graph = _lavfi_skip(words, index + 2)
             if graph is not None:
                 names.extend(_lavfi_graph(graph))
                 cursor = stop
