@@ -7,8 +7,8 @@ export const RawConfigureGuard = async ({ directory, worktree }) => ({
   "tool.execute.before": async (input, output) => {
     if (input.tool !== "bash") return
     const result = spawnSync(
-      "python3",
-      ["-I", join(worktree, "scripts/raw_configure_guard.py"), "--client", "opencode"],
+      "sh",
+      [join(worktree, ".config/lefthook/python.sh"), "-I", join(worktree, "scripts/raw_configure_guard.py"), "--client", "opencode"],
       {
         cwd: worktree,
         input: JSON.stringify({ tool: input.tool, args: output.args, cwd: output.args.workdir ?? directory }),

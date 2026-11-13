@@ -20,7 +20,9 @@ from unittest.mock import Mock, patch
 
 import yaml
 
-from scripts import lane_brief
+from scripts import lane_brief, lane_isolation
+from tests.helpers import run_git
+from tests.test_lane_isolation import repo
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "scripts" / "lane_brief_template.md"
@@ -174,6 +176,9 @@ class LaneBriefTest(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
         os.environ.pop("LANE_BRIEF_RUNNER", None)
+        patcher = patch.object(lane_brief, "check_isolation", return_value=0)
+        self.isolation = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_cli(self, *args: str) -> tuple[int, str, str]:
         """Capture the command result and both output streams."""
@@ -448,7 +453,10 @@ class LaneBriefTest(unittest.TestCase):
         brief, _, _ = self.runner_fixture()
         rc, _, error = self.run_cli("check", str(brief))
         self.assertEqual(rc, 0)
-        self.assertEqual(error, "lane_brief: runner check skipped: LANE_BRIEF_RUNNER unset\n")
+        self.isolation.assert_not_called()
+        self.assertEqual(
+            error, "lane_brief: runner and lane isolation checks skipped: LANE_BRIEF_RUNNER unset\n"
+        )
 
     def test_runner_empty_environment(self) -> None:
         """Treat an empty runner environment value as unset."""
@@ -456,7 +464,10 @@ class LaneBriefTest(unittest.TestCase):
         with patch.dict(os.environ, {"LANE_BRIEF_RUNNER": ""}):
             rc, _, error = self.run_cli("check", str(brief))
         self.assertEqual(rc, 0)
-        self.assertEqual(error, "lane_brief: runner check skipped: LANE_BRIEF_RUNNER unset\n")
+        self.isolation.assert_not_called()
+        self.assertEqual(
+            error, "lane_brief: runner and lane isolation checks skipped: LANE_BRIEF_RUNNER unset\n"
+        )
 
     def test_local_failure_does_not_call_runner(self) -> None:
         """Reject a locally invalid brief before invoking the runner."""
@@ -967,6 +978,98 @@ class CredentialStubGapsTest(unittest.TestCase):
                     credential_stub_gaps(tests_dir, []),
                     (["tests.test_locked"], []),
                 )
+
+
+class LaneBriefIsolationTest(unittest.TestCase):
+    """Verify isolation blocks runner execution before its precheck starts."""
+
+    def setUp(self) -> None:
+        """Render a brief and create a runner that records every argument."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.brief = self.root / "brief.md"
+        self.assertEqual(lane_brief.main(ARGS[:] + ["-o", str(self.brief)]), 0)
+        self.calls = self.root / "args"
+        self.runner = self.root / "runner.sh"
+        self.runner.write_text(
+            '#!/bin/sh\ndir=$(dirname "$0")\nprintf "%s\\n" "$@" >> "$dir/args"\n',
+            encoding="utf-8",
+        )
+        self.runner.chmod(0o755)
+
+    def check_worktree(self, worktree: Path) -> tuple[int, str]:
+        """Check a worktree with the real isolation check and a recording runner."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = lane_brief.main(
+                [
+                    "check",
+                    str(self.brief),
+                    "--runner",
+                    str(self.runner),
+                    "--worktree",
+                    str(worktree),
+                    "--config",
+                    str(CONFIG),
+                ]
+            )
+        return rc, stderr.getvalue()
+
+    def test_planted_main_never_starts_runner(self) -> None:
+        """Reject the planted unmarked main checkout before starting its runner."""
+        ref = f"refs/heads/local/{lane_isolation.PRIVATE_WORDS[0]}-topic"
+        main = repo(self.root / "main", ref)
+        rc, error = self.check_worktree(main)
+        self.assertEqual(rc, 1)
+        self.assertIn("lane isolation refused worktree", error)
+        self.assertIn(ref, error)
+        self.assertFalse(self.calls.exists())
+
+    @unittest.skipUnless(os.name == "posix", "runner fixture is a POSIX shell script")
+    def test_marked_clone_starts_runner(self) -> None:
+        """Forward the exact brief and worktree arguments after isolation passes."""
+        origin = repo(self.root / "origin")
+        lane = self.root / "lane"
+        run_git(self.root, "clone", "-q", str(origin), str(lane), preserve_config=True)
+        self.assertEqual(lane_isolation.mark(lane), [])
+        rc, error = self.check_worktree(lane)
+        self.assertEqual((rc, error), (0, ""))
+        self.assertEqual(
+            self.calls.read_text(encoding="utf-8").splitlines(),
+            ["--check-brief", str(self.brief), str(lane)],
+        )
+
+    def test_not_git_never_starts_runner(self) -> None:
+        """Report a Git input error without starting the configured runner."""
+        rc, error = self.check_worktree(self.root / "missing")
+        self.assertEqual(rc, 2)
+        self.assertIn("lane isolation failed", error)
+        self.assertFalse(self.calls.exists())
+
+    def test_git_unavailable_never_starts_runner(self) -> None:
+        """Report unavailable Git as an isolation error without starting the runner."""
+        with patch.object(lane_isolation.subprocess, "Popen", side_effect=FileNotFoundError("git")):
+            rc, error = self.check_worktree(self.root / "missing")
+        self.assertEqual(rc, 2)
+        self.assertIn("lane isolation failed", error)
+        self.assertFalse(self.calls.exists())
+
+
+@unittest.skipUnless(os.name == "posix", "runner fixture uses /bin/sh")
+class RunnerEnvironmentTest(unittest.TestCase):
+    """Check that runners inherit no caller Git repository-location overrides."""
+
+    def test_runner_drops_git_location(self) -> None:
+        """Remove caller Git directory and worktree overrides before starting a runner."""
+        with patch.dict(
+            os.environ,
+            {"GIT_DIR": "/nonexistent/private.git", "GIT_WORK_TREE": "/nonexistent/private"},
+        ):
+            result = lane_brief.run_runner(
+                ["/bin/sh", "-c", 'printf "%s %s" "${GIT_DIR-unset}" "${GIT_WORK_TREE-unset}"']
+            )
+        self.assertEqual(result, (b"unset unset", 0))
 
 
 if __name__ == "__main__":

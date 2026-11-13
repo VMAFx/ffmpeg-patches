@@ -11,7 +11,7 @@
           },
           {
             "type": "command",
-            "command": "python3 -I \"$(git rev-parse --show-toplevel)/scripts/raw_configure_guard.py\" --client codex || exit 2",
+            "command": "r=$(git rev-parse --show-toplevel) && cd \"$r\" && sh \"$r/.config/lefthook/python.sh\" -I \"$r/scripts/raw_configure_guard.py\" --client codex || exit 2",
             "timeout": 15
           }
         ]

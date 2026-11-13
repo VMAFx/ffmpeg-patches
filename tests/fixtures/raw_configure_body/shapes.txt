@@ -1,0 +1,104 @@
+# Script-body shapes for the raw configure guard (judge-measured on real scripts, r7 corpus replay).
+# Record: a header line `=== allow <id>` or `=== refuse <id>`, then the script body verbatim up to the next header.
+# Placeholders (tests/raw_configure_support.py _check_parser_body): <cfg> = "<tree>/configure" --x, <tree>, <build>.
+# Lines starting with `#` before the first header are comments; inside a record every line is body text.
+=== allow helper-shell-c-redirect
+inside bash -c 'echo leak > "$1/x"' -- "$A"
+=== allow find-lname-glob
+find "$pd/fd" -maxdepth 1 -lname "$ROOT/*" -printf '%l\n'
+=== allow quoted-program-operand
+in_job opencode "touch \"\$HOME/.opencode/.gitignore\""
+=== allow helper-shell-c-test
+sandboxed "$lane" bash -c 'test ! -S "$HOME/.gnupg/S.gpg-agent" && echo ok'
+=== allow trap-program
+trap 'printf "%s\t%s\n" "$label" "$(cat "$A/$label.rc" 2>/dev/null)" >> "$A/runs.tsv"' EXIT
+=== allow tar-wildcards
+tar -x -C "$STAGE" "${tar_excludes[@]}" --wildcards 'opt/rocm/*'
+=== allow continued-quoted-operand
+run_case 0 "same rev" \
+  "${same_rev} bash '${deliverables}' <'${work}/body.md'"
+=== allow helper-sh-c-redirect
+seen "rewrite" sh -c "echo rewritten > '$state/bin/agentapi'"
+=== allow grep-escaped-dot-in-substitution
+check "$([ "$(grep -c 'dist/chunk\.js' "$st/err")" -ge 1 ] && echo ok || echo none)" ok "chunk named"
+=== allow assignment-substitution-quoted-path
+rc=$(run exec -c 'mcp_servers.sneaky.command="/bin/sneaky"' job)
+=== allow assignment-substitution-herestring
+found=$(grep -q 'internal/forge/github_test\.go' <<< "$out" && echo yes || echo no)
+=== allow assignment-substitution-double-star
+tracked=$(git ls-files -- "$local_root" "$local_root/**")
+=== allow assignment-spaced-url
+mksysnum="go run mksysnum.go 'https://example.org/blob_plain/HEAD:/sys/kern/syscalls.master'"
+=== allow assignment-substitution-sh-c
+rc=$(in_job opencode sh -c "getent hosts example.org > '$A/dns.out' 2>&1; echo \$? >> '$A/dns.out'")
+=== allow assignment-apostrophe
+quoted="$tmp/it's"
+=== allow function-assignments-then-while
+f() {
+  scan_files=() scan_scanned=0
+
+  while IFS= read -r -d '' f; do
+    n=1
+  done < x
+}
+=== allow assignments-then-command
+a=() b=0
+echo hi
+=== refuse quoted-operand-configure
+run "<tree>/configure --x"
+=== refuse quoted-shell-c-subtoken
+run "bash -c '<tree>/configure --x'"
+=== refuse helper-shell-c-configure
+inside bash -c '<cfg>' -- "$A"
+=== refuse helper-sh-c-double-quoted
+seen "x" sh -c "cd /tmp && <tree>/configure --x"
+=== refuse helper-shell-file-target
+sandboxed "$lane" bash inner.sh
+=== refuse trap-configure
+trap '<cfg>' EXIT
+=== refuse trap-double-dash-configure
+trap -- '<cfg>' INT TERM
+=== refuse later-operand-configure
+foo <tree>/configure
+=== refuse later-operand-letter-glob
+foo <tree>/conf*
+=== refuse shell-glob-operand
+bash <tree>/conf*
+=== refuse array-assignment-configure
+cmd=(<tree>/configure --x)
+=== refuse assignment-configure
+x=<tree>/configure
+=== refuse assignment-dynamic-configure
+x="$SRC/configure"
+=== refuse assignment-spaced-configure
+x="cd /tmp && <tree>/configure --x"
+=== refuse assignments-then-configure
+x=() y=0
+<cfg>
+=== refuse function-assignments-then-if-bare
+f() {
+  a=() b=0
+  if true; then configure --x; fi
+}
+=== refuse function-assignments-then-while-configure
+f() {
+  a=() b=0
+
+  while true; do
+    <cfg>
+  done
+}
+=== refuse function-assignments-then-for-bare
+f() {
+  a=() b=0
+  for i in 1; do configure --x; done
+}
+=== refuse function-assignments-then-until
+f() {
+  a=() b=0
+  until false; do <cfg>; done
+}
+=== refuse substitution-in-assignment
+rc=$(<cfg>)
+=== refuse substitution-in-helper-operand
+check "$(<cfg>)" ok

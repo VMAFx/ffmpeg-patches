@@ -90,3 +90,29 @@ class RawConfigureGuardBase(unittest.TestCase):
                     self.assertIn("configure", result.stderr)
                     self.assertIn(remedy, result.stderr)
                     self.assertFalse(self.marker.exists())
+
+    def _assert_allowed(
+        self, cases: tuple[tuple[str, Path], ...], env: dict[str, str] | None = None
+    ) -> None:
+        """Verify the guard allows safe commands across all supported clients."""
+        for client in CLIENTS:
+            for command, cwd in cases:
+                with self.subTest(client=client, command=command):
+                    result = self.run_guard(client, self.payload(client, command, cwd), env=env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(self.marker.exists())
+
+    def _check_parser_body(self, body: str, *, refused: bool, reason: str | None = None) -> None:
+        """Inspect a fixture body across clients without executing the script."""
+        cfg = f'"{self.tree}/configure" --x'
+        body = body.replace("<cfg>", cfg).replace("<tree>", str(self.tree))
+        body = body.replace("<build>", str(self.build))
+        script = self.root / "parser_body.sh"
+        script.write_text(body, encoding="utf-8")
+        (self.root / "inner.sh").write_text(cfg + "\n", encoding="utf-8")
+        assertion = self._assert_refused if refused else self._assert_allowed
+        assertion(((f"bash {script}", self.root),))
+        if reason is not None:
+            for client in CLIENTS:
+                result = self.run_guard(client, self.payload(client, f"bash {script}", self.root))
+                self.assertIn(reason, result.stderr)

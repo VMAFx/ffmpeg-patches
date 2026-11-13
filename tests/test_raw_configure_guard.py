@@ -4,13 +4,17 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import subprocess  # nosec B404 - fixed guard and shell-hook commands, never configure.
 import tempfile
+import time
 from pathlib import Path
+from unittest.mock import patch
 
+from scripts import raw_configure_guard
 from tests.helpers import isolated_git_environment
 from tests.raw_configure_support import CLIENTS, CONFIGS, ROOT, RawConfigureGuardBase
 
@@ -209,7 +213,7 @@ class RawConfigureGuardTest(RawConfigureGuardBase):
                     },
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn(str(missing / "scripts/raw_configure_guard.py"), result.stderr)
+                self.assertIn(str(missing), result.stderr)
 
     def test_opencode_plugin_wiring(self) -> None:
         """Verify the project plugin refuses blocks and has valid JavaScript syntax."""
@@ -312,3 +316,45 @@ class RawConfigureGuardTest(RawConfigureGuardBase):
             ("x " * 4001, self.tree),
         )
         self._assert_refused(cases, remedy="--body-file")
+
+
+class ReviewRoundGuardTest(RawConfigureGuardBase):
+    """Exercise r9 sed data and the bounded inspection deadline."""
+
+    def test_sed_data_and_exec(self) -> None:
+        """Allow literal sed edits and refuse explicit configure execution."""
+        commands = (
+            (
+                'sed -i \'s|if "/" in w and "\\$" not in w and DECIDABLE_NAME.fullmatch(o'
+                's.path.basename(w) or "-\\*"): return "path:" + w|b = os.path.basename('
+                'w)\\n        if "/" in w and "$" not in w and b and DECIDABLE_NAME.full'
+                'match(b) and re.search(r"[A-Za-z0-9]", b): return "path:" + w|\' f.py'
+            ),
+            "sed -i '1i cd /x; read only.' /x/b.md",
+            "sed -i 's#a#b#' f.py",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.run_guard("claude", self.payload("claude", command, self.root))
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_refused(
+            (("sed -n '1e ./configure' f", self.root), ("sed -n '1e ./conf*' f", self.root))
+        )
+
+    def test_inspection_deadline(self) -> None:
+        """Exit with a deadline refusal when the inspection worker stalls."""
+        payload = json.dumps(self.payload("claude", "echo clean", self.root)).encode()
+        stdin = io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8")
+        stderr = io.StringIO()
+        with (
+            patch.object(raw_configure_guard, "DEADLINE_SECONDS", 0.2),
+            patch.object(raw_configure_guard, "_inspect", side_effect=lambda *args: time.sleep(2)),
+            patch.object(raw_configure_guard.os, "_exit", side_effect=SystemExit(2)) as exit_mock,
+            patch.object(raw_configure_guard.sys, "stdin", stdin),
+            patch.object(raw_configure_guard.sys, "stderr", stderr),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            raw_configure_guard.main(["--client", "claude"])
+        self.assertEqual(caught.exception.code, 2)
+        exit_mock.assert_called_once_with(2)
+        self.assertIn("deadline", stderr.getvalue())

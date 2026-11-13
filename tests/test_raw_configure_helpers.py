@@ -29,6 +29,16 @@ class RawConfigureHelperTest(RawConfigureGuardBase):
             (["bash", "--", "script"], ("script", False)),
             (["bash", "script.sh"], ("script.sh", False)),
             (["bash"], (None, False)),
+            (["bash", "-s", "x"], (None, False)),
+            (["bash", "-es", "--", "x"], (None, False)),
+            (["bash", "-s", "-", "x"], (None, False)),
+            (["sh", "-so", "pipefail", "x"], (None, False)),
+            (["bash", "-", "script"], ("script", False)),
+            (["bash", "-"], (None, False)),
+            (["bash", "-", "-s"], ("-s", False)),
+            (["bash", "-sc", "X", "x"], ("X", True)),
+            (["bash", "-cs", "X"], ("X", True)),
+            (["bash", "-s", "-c", "X"], ("X", True)),
         )
         for words, expected in cases:
             with self.subTest(words=words):
