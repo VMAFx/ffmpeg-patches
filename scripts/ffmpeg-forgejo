@@ -31,6 +31,9 @@
 #                          Without Autolabel, edit-body requires at least one terminal status and the newest status to be at least 30 minutes old.
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
+#   ffmpeg-forgejo edit-title [--apply] [--wait] --head <sha> <number> <title>
+#                          dry run by default; --apply changes the title and reads it back.
+#                          Fires an "edited" event like edit-body, so waits for Autolabel before editing.
 # Evidence test claims start with `- test:` or `test:` after optional whitespace.
 # Every such line needs head=<7-40 hex> and tree=<path>; other lines are ignored.
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
@@ -131,13 +134,14 @@ token_login() {
   printf '%s\n' "$validated"
 }
 
-json_body() { # json_body KEY=VALUE... ; values starting with @ are read from that file
+# json_body KEY=VALUE...: encode literal titles; other values starting with @ name files.
+json_body() {
   python3 -c '
 import json, sys
 out = {}
 for arg in sys.argv[1:]:
     k, v = arg.split("=", 1)
-    out[k] = open(v[1:], encoding="utf-8").read() if v.startswith("@") else v
+    out[k] = open(v[1:], encoding="utf-8").read() if k != "title" and v.startswith("@") else v
 print(json.dumps(out))' "$@"
 }
 
@@ -345,6 +349,78 @@ print("done" if settled and aged else "none")' "$rows" "$absent_age"
   done
   echo unknown
 }
+
+# wait_autolabel_done NUMBER WAIT: refuse or poll until Autolabel finishes on a stable head.
+wait_autolabel_done() {
+  local wait="$2" i sha state
+  # The head is read again after the status check: a push in between starts a new Autolabel
+  # run, and the finished statuses of the old head must not clear the edit. Forgejo's PR edit
+  # takes no expected head, so a push landing between this last read and the PATCH still races.
+  for ((i = 1; i <= 80; i++)); do
+    sha="$(head_sha "$1")"
+    state="$(autolabel_state "$sha")"
+    if [ "$state" = "done" ]; then
+      [ "$(head_sha "$1")" = "$sha" ] && break
+      state="superseded by a new push"
+    fi
+    if [ "$wait" = 0 ] || [ "$i" = 80 ]; then
+      printf 'ffmpeg-forgejo: Autolabel for head %s is %s; a body edit now cancels it. Retry after it finishes, or use --wait.\n' "$sha" "$state" >&2
+      exit 75
+    fi
+    sleep "${FFMPEG_FORGEJO_POLL:-15}"
+  done
+}
+
+# validate_title TITLE: reject blank, multiline or over-255-character titles with exit 64.
+validate_title() {
+  python3 -c 'import sys
+title = sys.argv[1]
+if not title.strip():
+    raise SystemExit("ffmpeg-forgejo: title must not be empty or whitespace only")
+if "\n" in title or "\r" in title:
+    raise SystemExit("ffmpeg-forgejo: title must be a single line")
+if len(title) > 255:
+    raise SystemExit("ffmpeg-forgejo: title must be at most 255 characters")' "$1" || exit 64
+}
+
+# pull_title NUMBER: read a string title with a trailing dot to preserve terminal newlines.
+pull_title() {
+  api GET "/repos/$REPO/pulls/$1" | python3 -c 'import json,sys
+title = json.load(sys.stdin)["title"]
+if not isinstance(title, str):
+    raise SystemExit("invalid pull title")
+sys.stdout.write(title + ".")'
+}
+
+# edit_title NUMBER TITLE HEAD APPLY WAIT: guard a title edit, default to dry run and verify writes.
+edit_title() (
+  local number="$1" title="$2" head="$3" apply="$4" wait="$5" old actual body out
+  require_tested_head "$number" "$head"
+  wait_autolabel_done "$number" "$wait"
+  require_tested_head "$number" "$head"
+  old="$(pull_title "$number")" || die "cannot read current title of #$number"
+  old="${old%.}"
+  if [ "$old" = "$title" ]; then
+    printf 'ffmpeg-forgejo: #%s title already reads: %s\n' "$number" "$title"
+    exit 0
+  fi
+  if [ "$apply" = 0 ]; then
+    printf 'ffmpeg-forgejo: dry run, would change the title of #%s from: %s\n' "$number" "$old"
+    printf 'ffmpeg-forgejo: dry run, to: %s\n' "$title"
+    exit 0
+  fi
+  body="$(mktemp)"
+  trap 'rm -f "$body"' EXIT
+  json_body "title=$title" >"$body"
+  out="$(api PATCH "/repos/$REPO/pulls/$number" "$body")" || exit 1
+  actual="$(pull_title "$number")" || die "title read-back failed: expected: $title; got: <unreadable>"
+  actual="${actual%.}"
+  if [ "$actual" != "$title" ]; then
+    die "title read-back mismatch: expected: $title; got: $actual"
+  fi
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])' <<<"$out"
+  printf 'ffmpeg-forgejo: title read back: %s\n' "$title"
+)
 
 OVERLAP_CANDIDATES=""
 OVERLAP_REF=""
@@ -1281,27 +1357,33 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ -f "$2" ] || die "no body file $2"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
-    # The head is read again after the status check: a push in between starts a new Autolabel
-    # run, and the finished statuses of the old head must not clear the edit. Forgejo's PR edit
-    # takes no expected head, so a push landing between this last read and the PATCH still races.
-    for ((i = 1; i <= 80; i++)); do
-      sha="$(head_sha "$1")"
-      state="$(autolabel_state "$sha")"
-      if [ "$state" = "done" ]; then
-        [ "$(head_sha "$1")" = "$sha" ] && break
-        state="superseded by a new push"
-      fi
-      if [ "$wait" = 0 ] || [ "$i" = 80 ]; then
-        printf 'ffmpeg-forgejo: Autolabel for head %s is %s; a body edit now cancels it. Retry after it finishes, or use --wait.\n' "$sha" "$state" >&2
-        exit 75
-      fi
-      sleep "${FFMPEG_FORGEJO_POLL:-15}"
-    done
+    wait_autolabel_done "$1" "$wait"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     body="$(mktemp)"
     json_body "body=@$2" >"$body"
     api PATCH "/repos/$REPO/pulls/$1" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
     rm -f "$body"
+    ;;
+  edit-title)
+    usage='edit-title [--apply] [--wait] --head <sha> <number> <title>'
+    apply=0; wait=0; head=""
+    title_argc=$#
+    for ((title_i = 0; title_i < title_argc; title_i++)); do
+      case "${1:-}" in
+        --apply) apply=1; shift ;;
+        --wait) wait=1; shift ;;
+        --head)
+          [ $# -ge 2 ] && [ -z "$head" ] || usage_error "$usage"
+          [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] || usage_error "$usage"
+          head="$2"; shift 2 ;;
+        -*) usage_error "$usage" ;;
+        *) break ;;
+      esac
+    done
+    [ $# -eq 2 ] && [ -n "$head" ] || usage_error "$usage"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
+    validate_title "$2"
+    edit_title "$1" "$2" "$head" "$apply" "$wait"
     ;;
   reviewers)
     [ $# -ge 1 ] || die "usage: reviewers <number> [<login>...]"

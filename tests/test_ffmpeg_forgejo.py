@@ -30,7 +30,7 @@ BODY = "new body\nline two\n"
 NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset(
-    {"comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap"}
+    {"comment", "edit-body", "edit-title", "issue", "pr", "push", "fairy-reviews", "overlap"}
 )
 
 
@@ -165,7 +165,7 @@ class Stub:
         reviewers: list[list[str]] | None = None,
         **kwargs: object,
     ):
-        """Initialize scripted responses and persistent requested team reviewers."""
+        """Initialize scripted responses, title edits and persistent requested team reviewers."""
 
         heads = heads or [A]
         polls = polls or {}
@@ -197,6 +197,8 @@ class Stub:
         self.request_status = 201
         self.branch_head = kwargs.get("branch_head")
         self.branch_status = int(kwargs.get("branch_status", 200))
+        self.title = kwargs.get("title", "old title")
+        self.ignore_title_patch = bool(kwargs.get("ignore_title_patch", False))
 
     def head(self) -> object:
         """Return the next scripted pull head, repeating the last."""
@@ -217,12 +219,13 @@ class Stub:
         return full[(page - 1) * limit : page * limit]
 
     def pull(self) -> dict:
-        """Return scripted user reviewers and the persisted requested team state."""
+        """Return the title, scripted user reviewers and persisted requested team state."""
 
         reviewers = self.reviewers[min(self.reviewer_reads, len(self.reviewers) - 1)]
         self.reviewer_reads += 1
         return {
             "number": 1,
+            "title": self.title,
             "head": {"sha": self.head()},
             "html_url": "stub/pulls/1",
             "requested_reviewers": [
@@ -462,10 +465,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(404, {})
 
     def do_PATCH(self) -> None:
-        """Record and acknowledge pull-body edits."""
+        """Record pull edits and persist title changes unless configured to ignore them."""
 
         data = self.rfile.read(int(self.headers["Content-Length"])).decode()
-        self.stub().requests.append(("PATCH", self.path, data))
+        stub = self.stub()
+        stub.requests.append(("PATCH", self.path, data))
+        payload = json.loads(data)
+        if "title" in payload and not stub.ignore_title_patch:
+            stub.title = payload["title"]
         self.reply(200, {"html_url": "stub/pulls/1"})
 
 
@@ -906,6 +913,180 @@ class FairyReviewsTest(ForgejoTest):
                 proc = self.run_command(stub, "fairy-reviews", "1")
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, "")
+
+
+class EditTitleTest(ForgejoTest):
+    """Exercise guarded title edits, dry runs and exact read-back verification."""
+
+    def edit_title(
+        self, stub: Stub, title: str = "new title", *args: str, head: str = A[:12]
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a title edit with a tested head and the shared pull number."""
+
+        return self.run_command(stub, "edit-title", *args, "--head", head, "1", title)
+
+    def patches(self, stub: Stub) -> list[dict]:
+        """Return complete JSON payloads from recorded PATCH requests."""
+
+        return [json.loads(data) for method, _, data in stub.requests if method == "PATCH"]
+
+    def test_dry_run(self) -> None:
+        """A safe title edit defaults to a dry run without any PATCH."""
+
+        stub = Stub([A], {A: [[label("success"), OTHER]]})
+        proc = self.edit_title(stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("dry run, would change the title of #1 from: old title", proc.stdout)
+        self.assertIn("dry run, to: new title", proc.stdout)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_apply(self) -> None:
+        """Apply sends only the title and proves it by reading the pull again."""
+
+        stub = Stub([A], {A: [[label("success"), OTHER]]})
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [{"title": "new title"}])
+        self.assertEqual(proc.stdout, "stub/pulls/1\nffmpeg-forgejo: title read back: new title\n")
+        self.assertEqual(stub.requests[-1][:2], ("GET", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1"))
+
+    def test_head_mismatch(self) -> None:
+        """A mismatched head refuses before Autolabel checks or a PATCH."""
+
+        stub = Stub([A], {A: [[label("success")]]})
+        proc = self.edit_title(stub, "new title", "--apply", head=B[:12])
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(B[:12], proc.stderr)
+        self.assertIn(A, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertEqual(len(stub.requests), 1)
+
+    def test_head_moves_during_wait(self) -> None:
+        """The second tested-head check rejects a push during Autolabel checks."""
+
+        stub = Stub([A, A, A, A, B], {A: [[label("pending")], [label("success")]]})
+        proc = self.edit_title(stub, "new title", "--apply", "--wait")
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(A, proc.stderr)
+        self.assertIn(B, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_pending(self) -> None:
+        """A running Autolabel job refuses an applied title change with exit 75."""
+
+        stub = Stub([A], {A: [[label("pending"), OTHER]]})
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 75, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_unchanged_title(self) -> None:
+        """An exact current title succeeds without an unnecessary PATCH."""
+
+        stub = Stub([A], {A: [[label("success")]]}, title="new title")
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "ffmpeg-forgejo: #1 title already reads: new title\n")
+        self.assertEqual(self.patches(stub), [])
+
+    def test_readback_mismatch(self) -> None:
+        """An ignored title PATCH fails with both expected and actual titles."""
+
+        stub = Stub([A], {A: [[label("success")]]}, ignore_title_patch=True)
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(self.patches(stub), [{"title": "new title"}])
+        self.assertIn("old title", proc.stderr)
+        self.assertIn("new title", proc.stderr)
+
+    def test_invalid_titles(self) -> None:
+        """Blank, multiline and overlong titles fail validation before any request."""
+
+        for title, reason in (
+            ("", "empty"),
+            (" \t ", "whitespace"),
+            ("first\nsecond", "single line"),
+            ("first\rsecond", "single line"),
+            ("x" * 256, "255 characters"),
+        ):
+            with self.subTest(title=title):
+                stub = Stub()
+                proc = self.edit_title(stub, title, "--apply")
+                self.assertEqual(proc.returncode, 64, proc.stderr)
+                self.assertIn(reason, proc.stderr)
+                self.assertEqual(stub.requests, [])
+
+    def test_title_length_boundary(self) -> None:
+        """Exactly 255 Unicode characters are accepted without changing the title."""
+
+        title = "é" * 255
+        stub = Stub([A], {A: [[label("success")]]})
+        proc = self.edit_title(stub, title)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(title, proc.stdout)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_invalid_options(self) -> None:
+        """Missing or malformed heads, unknown options and wrong counts fail usage."""
+
+        for args in (
+            ("1", "new title"),
+            ("--head", "xyz", "1", "new title"),
+            ("--unknown", "--head", A, "1", "new title"),
+            ("--head", A, "1"),
+            ("--head", A, "1", "new title", "extra"),
+        ):
+            with self.subTest(args=args):
+                stub = Stub()
+                proc = self.run_command(stub, "edit-title", "--apply", *args)
+                self.assertEqual(proc.returncode, 64, proc.stderr)
+                self.assertIn("usage: edit-title", proc.stderr)
+                self.assertEqual(stub.requests, [])
+
+    def test_not_pull_request(self) -> None:
+        """An issue without a pull head refuses with exit 76 and no PATCH."""
+
+        stub = Stub(pull_status=404)
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("not a pull request", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_pull_read_failure(self) -> None:
+        """A failed live-head read exits 1 without any PATCH."""
+
+        stub = Stub(pull_status=500)
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("cannot read the head", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_literal_title(self) -> None:
+        """Leading at signs, quotes and shell syntax stay literal JSON title values."""
+
+        title = '@literal "title" $(false) `false` \\ é'
+        stub = Stub([A], {A: [[label("success")]]})
+        proc = self.edit_title(stub, title, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [{"title": title}])
+        self.assertIn(f"title read back: {title}", proc.stdout)
+
+    def test_readback_preserves_newlines(self) -> None:
+        """A trailing newline on the returned title cannot pass an exact comparison."""
+
+        stub = Stub([A], {A: [[label("success")]]}, title="new title\n", ignore_title_patch=True)
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("title read-back mismatch", proc.stderr)
+        self.assertEqual(self.patches(stub), [{"title": "new title"}])
+
+    def test_invalid_number(self) -> None:
+        """A nonnumeric pull number fails before any request."""
+
+        stub = Stub()
+        proc = self.run_command(stub, "edit-title", "--apply", "--head", A, "bad", "new title")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("not a PR number: bad", proc.stderr)
+        self.assertEqual(stub.requests, [])
 
 
 class EditBodyTest(ForgejoTest):
@@ -3526,6 +3707,31 @@ class MutantTest(unittest.TestCase):
             with self.subTest(mutant=name):
                 self.assertEqual(source.count(old), 1, "mutation site missing")
                 with mutant_case(source, old, new, EditBodyTest, "Mutated") as case:
+                    result = unittest.TestResult()
+                    case(test_name).run(result)
+                    self.assertTrue(result.failures or result.errors, f"{name} survived")
+
+
+class EditTitleMutantTest(unittest.TestCase):
+    """Require title-edit cases to kill each planted safety-check defect."""
+
+    def test_every_mutant_is_caught(self) -> None:
+        """Missing head, dry-run and read-back guards fail their selected title cases."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        mutations = (
+            (
+                '  require_tested_head "$number" "$head"\n  wait_autolabel_done',
+                "  wait_autolabel_done",
+                "test_head_mismatch",
+            ),
+            ('if [ "$apply" = 0 ]; then', "if false; then", "test_dry_run"),
+            ('if [ "$actual" != "$title" ]; then', "if false; then", "test_readback_mismatch"),
+        )
+        for name, (old, new, test_name) in enumerate(mutations):
+            with self.subTest(mutant=name):
+                self.assertEqual(source.count(old), 1, "mutation site missing")
+                with mutant_case(source, old, new, EditTitleTest, "MutatedTitle") as case:
                     result = unittest.TestResult()
                     case(test_name).run(result)
                     self.assertTrue(result.failures or result.errors, f"{name} survived")
