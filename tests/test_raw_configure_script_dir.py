@@ -23,6 +23,7 @@ UNREAD = '. "$UNSET_DIR/x.sh"\n'
 RUN = "bash inner.sh\n"
 CFG = "<cfg>\n"
 LINK = "-> ../tools/run.sh"
+RUN_NEXT = 'run_next() {\n  "$HERE/next.sh" check\n}\n'
 
 
 class Case(NamedTuple):
@@ -143,6 +144,33 @@ SCRIPT_DIR = {
     "local-in-function-keeps-top-level": Case(
         DEFAULT + "f() {\n  local " + DOLLAR0.lower() + "}\n" + SRC + RUN, 0
     ),
+    "function-before-branch-assignment": Case(
+        RUN_NEXT + "if true; then\n" + DOLLAR0 + "fi\nrun_next\n", 2, UNRESOLVED, BENIGN_NEXT
+    ),
+    "function-before-function-assignment": Case(
+        'run_next() {\n  bash "${HERE}/next.sh"\n}\nf() {\n' + DOLLAR0 + "}\nf\nrun_next\n",
+        2,
+        UNRESOLVED,
+        BENIGN_NEXT,
+    ),
+    "function-before-assignment-longer-name": Case(
+        'run_next() {\n  "$HERE_X/next.sh"\n}\nif true; then\n' + DOLLAR0 + "fi\nrun_next\n",
+        0,
+        None,
+        BENIGN_NEXT,
+    ),
+    "function-before-top-level-configure": Case(
+        RUN_NEXT + DOLLAR0 + "run_next\n", 2, "tools/next.sh", {"tools/next.sh": CFG}
+    ),
+    "function-before-top-level-benign": Case(
+        RUN_NEXT + DOLLAR0 + "run_next\n", 0, None, BENIGN_NEXT
+    ),
+    "function-before-uncertain-assignment": Case(
+        RUN_NEXT + "cd <case>\n" + DOLLAR0 + "run_next\n", 2, UNKNOWN_SOURCE, BENIGN_NEXT
+    ),
+    "function-source-before-assignment": Case(
+        'load() {\n  . "$HERE/lib.sh"\n}\n' + DOLLAR0 + "load\n", 2, UNKNOWN_SOURCE
+    ),
 }
 
 
@@ -181,8 +209,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 39 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 39)
+        """Replay all 46 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 46)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

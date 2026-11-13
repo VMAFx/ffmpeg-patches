@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -47,6 +47,9 @@ AMBIGUOUS_SCRIPT_PATH = (
 UNRESOLVED_SCRIPT_DIR = (
     "script path from an own-directory name assigned in a function, branch or loop; "
     "assign it once at the top level"
+)
+UNKNOWN_SOURCE_PATH = (
+    "relative script path after a source the guard cannot read; use an absolute path"
 )
 # Own directory of an executed script, symlinks resolved like Path.resolve():
 # $(dirname "$(readlink -f "${BASH_SOURCE[0]}")"), with realpath or $0 as variants.
@@ -190,6 +193,7 @@ class _Scan:
     script_dirs: dict[str, str | None] = field(default_factory=dict)
     script_literals: set[str] = field(default_factory=set)
     unresolved_dirs: set[str] = field(default_factory=set)
+    pending: list[tuple[str, bool, bool, frozenset[str]]] = field(default_factory=list)
     moved: bool = False
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
@@ -237,29 +241,57 @@ def _record_candidate(operand: str, is_program: bool, scan: _Scan) -> None:
         scan.refusal = reason
         return
     if _unknown_source_relative(operand, is_program, scan):
-        scan.refusal = (
-            "relative script path after a source the guard cannot read; use an absolute path"
-        )
+        scan.refusal = UNKNOWN_SOURCE_PATH
         return
     if _candidate_allowed(operand):
         changed = scan.dir_changed and not os.path.isabs(operand) and not operand.startswith("~")
         scan.candidates.append((operand, is_program, changed))
+        return
+    unsettled = _referenced(operand, scan.script_dirs)
+    if unsettled:
+        scan.pending.append((operand, is_program, scan.dir_changed, unsettled))
 
 
-def _reference_refusal(word: str, scan: _Scan) -> str | None:
-    """Name the refusal for a word referencing an ambiguous or unresolved own-directory name.
+def _referenced(word: str, names: Iterable[str]) -> frozenset[str]:
+    """Return the names a word references.
 
     Matches simple references and braced ones with or without an operator ($N, ${N},
     ${N:-x}, ${N%/}); a longer name sharing the prefix does not match.
     """
-    groups = (
-        (scan.ambiguous, AMBIGUOUS_SCRIPT_PATH),
-        (scan.unresolved_dirs, UNRESOLVED_SCRIPT_DIR),
+    return frozenset(
+        name
+        for name in names
+        if re.search(r"\$\{?" + re.escape(name) + r"(?![A-Za-z0-9_])", word) is not None
     )
-    for names, reason in groups:
-        for name in names:
-            if re.search(r"\$\{?" + re.escape(name) + r"(?![A-Za-z0-9_])", word) is not None:
-                return reason
+
+
+def _reference_refusal(word: str, scan: _Scan) -> str | None:
+    """Name the refusal for a word referencing an ambiguous or unresolved own-directory name."""
+    if _referenced(word, scan.ambiguous):
+        return AMBIGUOUS_SCRIPT_PATH
+    if _referenced(word, scan.unresolved_dirs):
+        return UNRESOLVED_SCRIPT_DIR
+    return None
+
+
+def _settle_pending(scan: _Scan) -> str | None:
+    """Recheck script paths walked before their own-directory name was assigned.
+
+    A function body is walked at its definition, so a reference in it can precede an
+    assignment that runs before the call. A name that ended nested refuses as unresolved, one
+    that ended uncertain refuses as after an unread source, and one resolved at the top level
+    turns the reference into a concrete candidate.
+    """
+    for operand, is_program, dir_changed, names in scan.pending:
+        reason = _reference_refusal(operand, scan)
+        if reason is not None:
+            return reason
+        if not names <= scan.script_literals:
+            return UNKNOWN_SOURCE_PATH
+        resolved = _substitute_literals(operand, scan.literals)
+        if _candidate_allowed(resolved):
+            changed = dir_changed and not os.path.isabs(resolved) and not resolved.startswith("~")
+            scan.candidates.append((resolved, is_program, changed))
     return None
 
 
@@ -551,7 +583,7 @@ def _source_target(target: str | None, scan: _Scan) -> str | None:
     if _configure_reference(target):
         return target
     if _unknown_source_relative(target, False, scan):
-        return "relative script path after a source the guard cannot read; use an absolute path"
+        return UNKNOWN_SOURCE_PATH
     reader = scan.context.source_reader
     if not _candidate_allowed(target) or reader is None:
         _record_candidate(target, False, scan)
@@ -999,6 +1031,18 @@ def _merge_source_literals(node: Any, scan: _Scan) -> None:
     scan.assigned.update(assigned)
 
 
+def _finish(
+    scan: _Scan, directory_state: list[bool] | None
+) -> tuple[str | None, list[tuple[str, bool, bool]], list[str], list[tuple[str, bool, bool]]]:
+    """Settle pending references and return the file's verdict and candidates."""
+    refusal = _settle_pending(scan)
+    if refusal is not None:
+        return refusal, [], [], []
+    if directory_state is not None:
+        directory_state[0] = scan.dir_changed
+    return None, scan.candidates, scan.cd_targets, scan.filtered
+
+
 def scan_body(
     body: str,
     context: InspectionContext,
@@ -1019,9 +1063,7 @@ def scan_body(
     scan.stack.append((root, raw, False))
     for _ in range(MAX_BODY_NODES):
         if not scan.stack:
-            if directory_state is not None:
-                directory_state[0] = scan.dir_changed
-            return None, scan.candidates, scan.cd_targets, scan.filtered
+            return _finish(scan, directory_state)
         if budget.nodes >= MAX_BODY_NODES:
             return "shell syntax tree larger than inspect limit", [], [], []
         node, source, mode = scan.stack.pop()
@@ -1032,4 +1074,4 @@ def scan_body(
             return hit or scan.refusal, [], [], []
     if scan.stack:
         return "shell syntax tree larger than inspect limit", [], [], []
-    return None, scan.candidates, scan.cd_targets, scan.filtered
+    return _finish(scan, directory_state)
