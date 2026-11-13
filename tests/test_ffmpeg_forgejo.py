@@ -1044,6 +1044,8 @@ class EditTitleTest(ForgejoTest):
         stub = Stub([A], {A: [[label("pending"), OTHER]]})
         proc = self.edit_title(stub, "new title", "--apply")
         self.assertEqual(proc.returncode, 75, proc.stderr)
+        self.assertIn("an edit of the pull request now cancels it", proc.stderr)
+        self.assertNotIn("body edit", proc.stderr)
         self.assertEqual(self.patches(stub), [])
 
     def test_unchanged_title(self) -> None:
@@ -1232,6 +1234,17 @@ class EditBodyTest(ForgejoTest):
         self.assert_refused(Stub([A], {A: [[label("pending"), OTHER]]}))
         stub = Stub([A], {A: [[other_status("success", NOW)]]})
         self.assertEqual(self.run_helper(stub, env_updates={"FFMPEG_FORGEJO_NOW": NOW}), 75)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_pending_refusal_names_pull_request_edit(self) -> None:
+        """Pending Autolabel refuses a body edit with a shared pull-request diagnostic."""
+
+        stub = Stub([A], {A: [[label("pending"), OTHER]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 75, proc.stderr)
+        self.assertIn("an edit of the pull request now cancels it", proc.stderr)
         self.assertEqual(self.patches(stub), [])
 
     def test_fresh_head_without_autolabel_is_refused(self) -> None:

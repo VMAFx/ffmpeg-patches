@@ -365,7 +365,7 @@ wait_autolabel_done() {
       state="superseded by a new push"
     fi
     if [ "$wait" = 0 ] || [ "$i" = 80 ]; then
-      printf 'ffmpeg-forgejo: Autolabel for head %s is %s; a body edit now cancels it. Retry after it finishes, or use --wait.\n' "$sha" "$state" >&2
+      printf 'ffmpeg-forgejo: Autolabel for head %s is %s; an edit of the pull request now cancels it. Retry after it finishes, or use --wait.\n' "$sha" "$state" >&2
       exit 75
     fi
     sleep "${FFMPEG_FORGEJO_POLL:-15}"
