@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import importlib.util
 import io
 import os
 import re
@@ -585,6 +586,53 @@ class LaneBriefTest(unittest.TestCase):
                         "missing required line: -m unittest tests.test_import_style", error
                     )
 
+    def test_import_style_similar_module_refused(self) -> None:
+        """Reject similarly named modules instead of the required unittest module."""
+        template = self.rendered()
+        invocation = "-m unittest tests.test_import_style"
+        required = lane_brief.read_required(CONFIG)
+        for suffix in ("s", "_extra", ".py", "2"):
+            with self.subTest(module=f"tests.test_import_style{suffix}"):
+                content = template.replace(invocation, invocation + suffix)
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    rc = lane_brief.check(content, "brief", required)
+                self.assertEqual(rc, 1)
+                self.assertIn(f"missing required line: {invocation}", error.getvalue())
+
+    def test_entry_boundary_characters(self) -> None:
+        """Accept only allowed entry endings and search beyond rejected occurrences."""
+        item = "required entry"
+        for follower in (" ", "\n", "\t", "", "`", '"', ")", ",", ":", ";", ". ", "."):
+            with self.subTest(accepted=follower):
+                self.assertTrue(lane_brief.has_entry(item + follower, item))
+        for follower in ("s", "_", "2", "-", "/", ".p"):
+            with self.subTest(refused=follower):
+                self.assertFalse(lane_brief.has_entry(item + follower, item))
+        self.assertTrue(lane_brief.has_entry(f"{item}s then {item} ", item))
+
+    def test_plain_substring_mutant_killed(self) -> None:
+        """Expose the similar-module false acceptance when plain matching is restored."""
+        source = (ROOT / "scripts" / "lane_brief.py").read_text(encoding="utf-8")
+        original = "not has_entry(content, item)"
+        self.assertEqual(source.count(original), 1)
+        mutant_path = self.root / "lane_brief_mutant.py"
+        mutant_path.write_text(source.replace(original, "item not in content"), encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("lane_brief_mutant", mutant_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        mutant = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mutant)
+        content = self.rendered().replace("tests.test_import_style", "tests.test_import_styles")
+        required = lane_brief.read_required(CONFIG)
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(mutant.check(content, "mutant", required), 0)
+            self.assertEqual(lane_brief.check(content, "real", required), 1)
+        self.assertEqual(
+            error.getvalue(), "real: missing required line: -m unittest tests.test_import_style\n"
+        )
+
     def test_each_missing_required_line_fails(self) -> None:
         """Reject each independently removed required substring."""
         content = self.rendered()
@@ -743,7 +791,7 @@ class LaneBriefTest(unittest.TestCase):
         """Accept maximum list and item lengths and reject values above them."""
         config = self.root / "config.yaml"
         brief = self.root / "brief.md"
-        brief.write_text("a" * 201, encoding="utf-8")
+        brief.write_text("a " + "a" * 200, encoding="utf-8")
         for count, length, expected, reason in (
             (32, 1, 0, ""),
             (33, 1, 2, "32 items"),

@@ -1,10 +1,11 @@
 ---
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-# Fixed substrings every lane brief must hold under required (at most 32, each at most 200 characters),
-# and excluded test modules under credential_stub_tests.
+# Each required entry must appear followed by a token boundary: whitespace, end of text,
+# or a closing character (` " ) , : ;), including a period followed by whitespace or end of text.
+# At most 32 entries, each at most 200 characters; excluded modules under credential_stub_tests.
 # scripts/lane_brief.py checks this list and can invoke the lane runner precheck;
-# the lane wrapper refuses a brief that lacks a required substring at launch.
+# the lane wrapper refuses a brief that lacks a required entry with a token boundary at launch.
 # Lanes edit test modules; mixed `import x` / `from x import` forms fail the repository gate, so every brief runs the import-style test; the entry names the unittest invocation so prose module mentions do not satisfy it.
 required:
   - "docstrings: every public function you add OR touch"
