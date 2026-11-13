@@ -59,6 +59,8 @@ def process_alive(pid: int) -> bool:
     stat = Path(f"/proc/{pid}/stat")
     try:
         state = stat.read_text(encoding="utf-8").rpartition(")")[2].split()[0]
+    except ProcessLookupError:
+        return False
     except FileNotFoundError:
         return True
     return state not in {"Z", "X"}
@@ -250,6 +252,11 @@ class LaneBriefTest(unittest.TestCase):
             read_stat.side_effect = FileNotFoundError
             self.assertTrue(process_alive(123))
         with patch("os.kill", side_effect=ProcessLookupError):
+            self.assertFalse(process_alive(123))
+
+    def test_process_alive_reaped_during_read(self) -> None:
+        """Treat a process reaped during the procfs read as gone."""
+        with patch("os.kill"), patch.object(Path, "read_text", side_effect=ProcessLookupError):
             self.assertFalse(process_alive(123))
 
     def constant_names(self, tree: ast.Module) -> set[str]:
