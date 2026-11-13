@@ -5,14 +5,16 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - fixed local interpreter argv, bounded timeout.
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from scripts import variant_sweep
+from scripts import sweep_doc_claims, sweep_state_advance, variant_sweep
 from tests import test_variant_sweep as fixtures
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "variant_sweep.py"
@@ -352,6 +354,184 @@ class SweepClassesTest(unittest.TestCase):
         self.assertTrue(variant_sweep.validate_full_report(self.output, self.base))
 
 
+class SweepRegressionTest(unittest.TestCase):
+    """Exercise review regressions directly without external repositories."""
+
+    def test_version_guards_ignore_noncode(self) -> None:
+        """Only active guards survive comments and string or character literals."""
+        source = (
+            "/* FOO_CHECK_VERSION(99, 0, 0) */\n"
+            "// FOO_CHECK_VERSION(98, 0, 0)\n"
+            'const char *s = "FOO_CHECK_VERSION(97, 0, 0)";\n'
+            "int c = 'FOO_CHECK_VERSION(96, 0, 0)';\n"
+            "/*\n#if FOO_BUILD >= 200\n*/\n"
+            "#if FOO_CHECK_VERSION(2, 0, 0)\n#endif\n"
+            "#if FOO_BUILD >= 164 /* note */\n#endif\n"
+        )
+        self.assertEqual(sweep_doc_claims.source_versions(source), ["2.0.0", "FOO_BUILD >= 164"])
+
+    def test_wrapped_claim_changed_spans(self) -> None:
+        """Wrapped claims report the first changed line within their complete span."""
+        source = "Speeds above\n8 can be set.\n"
+        for changed, expected in (
+            ({2: "8 can be set."}, [(2, "Speeds above 8 can be set.", "unknown")]),
+            (
+                {1: "Speeds above", 2: "8 can be set."},
+                [(1, "Speeds above 8 can be set.", "unknown")],
+            ),
+            ({}, []),
+        ):
+            with self.subTest(changed=changed):
+                self.assertEqual(sweep_doc_claims.find_claims(source, changed), expected)
+
+    def test_claim_paragraph_boundaries(self) -> None:
+        """Blank lines and Texi directives prevent claims spanning separate paragraphs."""
+        for source in ("Speeds above\n\n8 can be set.\n", "Speeds above\n@item 8\n"):
+            with self.subTest(source=source):
+                self.assertEqual(sweep_doc_claims.find_claims(source, {1: "Speeds above"}), [])
+
+    def test_single_line_claim_keeps_row(self) -> None:
+        """A single changed claim preserves its line, escaped text, and section."""
+        source = "@section libfoo, libfoorgb\n  Speeds above 8 | options.  \n"
+        self.assertEqual(
+            sweep_doc_claims.find_claims(source, {2: "  Speeds above 8 | options.  "}),
+            [(2, r"Speeds above 8 \| options.", "libfoo")],
+        )
+
+    def test_wrapped_matches_merge_on_changed_line(self) -> None:
+        """Matches sharing a row line merge their lowest through highest spanned lines."""
+        source = "Speeds above\n8 and up to\n16 are allowed.\n"
+        self.assertEqual(
+            sweep_doc_claims.find_claims(source, {2: "8 and up to"}),
+            [(2, "Speeds above 8 and up to 16 are allowed.", "unknown")],
+        )
+
+    def test_state_shared_file_scan(self) -> None:
+        """Two touched functions retain their hits with one update-operator mask."""
+        source = (
+            "int f(void) { if (r < 0) return r; s->n++; return 0; }\n"
+            "int g(void) { if (r < 0) return r; s->m--; return 0; }\n"
+        )
+        with mock.patch.object(
+            sweep_state_advance, "mask_literals", wraps=sweep_state_advance.mask_literals
+        ) as mask:
+            self.assertEqual(
+                sweep_state_advance.find_hits(source, {1: "", 2: ""}),
+                [(1, "s->n++", 1), (2, "s->m--", 2)],
+            )
+        self.assertEqual(mask.call_count, 1)
+
+    def test_state_expired_body_deadline(self) -> None:
+        """An expired deadline refuses a touched body before scanning its updates."""
+        source = "int f(void) { if (r < 0) return r; s->n++; return 0; }\n"
+        with self.assertRaisesRegex(RuntimeError, "deadline exceeded"):
+            sweep_state_advance.find_hits(source, {1: ""}, deadline=0.0)
+
+    def test_body_scan_without_shared_data(self) -> None:
+        """Direct body callers preserve absolute line numbers without a shared file scan."""
+        source = (
+            "int f(void) { return 0; }\n"
+            "int g(void) {\nif (r < 0) return r;\ns->n++;\nreturn 0;\n}\n"
+        )
+        tokens, _, bodies = variant_sweep.parse_source(source)
+        _, opening, closing = bodies[1]
+        self.assertEqual(
+            sweep_state_advance.body_hits(source, tokens, opening, closing), [(4, "s->n++", 3)]
+        )
+
+    def test_subscripted_member_updates(self) -> None:
+        """Member arrays accept updates through nested subscripts and calls."""
+        for expression in (
+            "s->counts[i]++",
+            "++s->counts[i]",
+            "s->frames[idx].pts += 1",
+            "s->a[f(i)]--",
+            "s->m[i][j] -= n",
+            "s->a[index[j + f(k)]]++",
+            "s[i].n++",
+        ):
+            with self.subTest(expression=expression):
+                source = f"int f(void) {{ if (r < 0) return r; {expression}; return 0; }}\n"
+                self.assertEqual(
+                    sweep_state_advance.find_hits(source, {1: ""}), [(1, expression, 1)]
+                )
+
+    def test_subscripted_member_negatives(self) -> None:
+        """Bare arrays, assignments, and updates preceding error returns stay unreported."""
+        for expression in ("counts[i]++", "s->a[i] = 0"):
+            with self.subTest(expression=expression):
+                source = f"int f(void) {{ if (r < 0) return r; {expression}; return 0; }}\n"
+                self.assertEqual(sweep_state_advance.find_hits(source, {1: ""}), [])
+        for expression in (
+            "s->counts[i]++",
+            "++s->counts[i]",
+            "s->frames[idx].pts += 1",
+            "s->a[f(i)]--",
+            "s->m[i][j] -= n",
+        ):
+            with self.subTest(before_error=expression):
+                source = f"int f(void) {{ {expression}; if (r < 0) return r; return 0; }}\n"
+                self.assertEqual(sweep_state_advance.find_hits(source, {1: ""}), [])
+
+    def test_member_chain_bounds(self) -> None:
+        """Unmatched subscripts stop before the bracket and suffix links remain excluded."""
+        for values, start, end, expected in (
+            (["s", "->", "a", "[", "i"], 0, 5, 3),
+            (["s", "->", "a", "[", "i", "]"], 0, 5, 3),
+            (["s", "->", "a", ".", "n"], 2, 5, None),
+        ):
+            with self.subTest(values=values, end=end):
+                self.assertEqual(sweep_state_advance.member_end(values, start, end), expected)
+
+    def test_all_classes_share_deadline(self) -> None:
+        """Unchecked, state, and documentation sweeps receive one aggregate deadline."""
+        deadlines = []
+        sha = "0" * 40
+
+        def unchecked(directory, base, head, deadline=None):
+            """Record the unchecked deadline and return resolved metadata."""
+            deadlines.append(deadline)
+            return f"class: unchecked-return\nbase: {sha}\nhead: {sha}\n"
+
+        def extra(name, directory, base, head, deadline):
+            """Record each additional class deadline without reading a repository."""
+            deadlines.append(deadline)
+            return f"class: {name}\nhead: {head}\nno hits\n"
+
+        with (
+            mock.patch.object(variant_sweep, "sweep", side_effect=unchecked) as first,
+            mock.patch.object(variant_sweep, "sweep_class", side_effect=extra) as others,
+        ):
+            variant_sweep.sweep_all("unused", sha, sha)
+        self.assertEqual(first.call_count, 1)
+        self.assertEqual(others.call_count, 2)
+        self.assertEqual(len(deadlines), 3)
+        self.assertIsInstance(deadlines[0], float)
+        self.assertEqual(deadlines, [deadlines[0]] * 3)
+
+    def test_checked_doc_version_cells(self) -> None:
+        """Checked rows require populated version cells without unresolved TODO words."""
+        disposition = "checked: libfoo 1.2.0 2.0.0 upstream/file.c:7"
+        for oldest, newest, accepted in (
+            ("1.2.0", "TODO", False),
+            ("TODO", "2.0.0", False),
+            ("", "2.0.0", False),
+            ("1.2.0", "", False),
+            ("1.2.0, TODO", "2.0.0", False),
+            ("1.2.0", "2.0.0 (TODO)", False),
+            ("1.2.0", "2.0.0", True),
+            ("TODOish", "2.0.0", True),
+        ):
+            with self.subTest(oldest=oldest, newest=newest):
+                row = f"| doc/a.texi:3 | 64x64 | libfoo | {oldest} | {newest} | {disposition} |"
+                self.assertEqual(variant_sweep.reviewed_row(row, "doc-claims"), accepted)
+
+    def test_no_claim_keeps_unresolved_versions(self) -> None:
+        """No-claim dispositions still accept TODO version cells."""
+        row = "| doc/a.texi:3 | 64x64 | libfoo | TODO | TODO | no-claim: prose only |"
+        self.assertTrue(variant_sweep.reviewed_row(row, "doc-claims"))
+
+
 class FullReportTest(unittest.TestCase):
     """Reject incomplete or unreviewed full reports without importing sweep modules."""
 
@@ -485,14 +665,60 @@ class FullReportTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class ReplayValidationTest(unittest.TestCase):
+    """Refuse invalid replay inputs before any object lookup or CLI invocation."""
+
+    def test_replay_requires_git_tree(self) -> None:
+        """A replay directory without a Git marker fails before reading objects."""
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(os.environ, "get", return_value=directory),
+            mock.patch.object(
+                variant_sweep, "git", side_effect=AssertionError("object lookup before validation")
+            ) as git,
+        ):
+            with self.assertRaisesRegex(AssertionError, "not a Git tree"):
+                PlantedReplayTest().replay(FIXED_HEAD)
+            git.assert_not_called()
+
+    def test_replay_requires_full_object_ids(self) -> None:
+        """Malformed base or head IDs fail before reading objects in a valid tree."""
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, ".git").touch()
+            for base, head in (
+                (PLANTED_BASE, "--option"),
+                (PLANTED_BASE, "a" * 39),
+                (PLANTED_BASE, "A" * 40),
+                ("a" * 39, FIXED_HEAD),
+            ):
+                with (
+                    self.subTest(base=base, head=head),
+                    mock.patch.object(os.environ, "get", return_value=directory),
+                    mock.patch(__name__ + ".PLANTED_BASE", base),
+                    mock.patch.object(
+                        variant_sweep,
+                        "git",
+                        side_effect=AssertionError("object lookup before validation"),
+                    ) as git,
+                ):
+                    with self.assertRaisesRegex(AssertionError, "full lowercase object IDs"):
+                        PlantedReplayTest().replay(head)
+                    git.assert_not_called()
+
+
 class PlantedReplayTest(unittest.TestCase):
     """Replay supplied FFmpeg objects only when the dispatcher provides a tree."""
 
     def replay(self, head: str) -> str:
-        """Run all classes when the external tree and both objects are available."""
+        """Validate the replay tree and full object IDs before running all classes."""
         tree = os.environ.get("FFMPEG_QPFILE_TREE")
         if not tree:
             self.skipTest("FFMPEG_QPFILE_TREE unset; dispatcher supplies the FFmpeg tree")
+        tree = str(Path(tree).resolve())
+        if not Path(tree, ".git").exists():
+            self.fail("FFMPEG_QPFILE_TREE is not a Git tree")
+        if not all(re.fullmatch(r"[0-9a-f]{40}", revision) for revision in (PLANTED_BASE, head)):
+            self.fail("replay requires full lowercase object IDs")
         for revision in (PLANTED_BASE, head):
             try:
                 variant_sweep.git(tree, "cat-file", "-e", f"{revision}^{{commit}}")

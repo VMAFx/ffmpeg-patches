@@ -580,10 +580,11 @@ def render_report(
     return report
 
 
-def sweep(directory: str, base: str, head: str) -> str:
-    """Resolve revisions and sweep within one shared wall-clock and input budget."""
+def sweep(directory: str, base: str, head: str, deadline: float | None = None) -> str:
+    """Resolve revisions and sweep within the supplied or a new wall-clock budget."""
 
-    deadline = time.monotonic() + MAX_SWEEP_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + MAX_SWEEP_SECONDS
     check_deadline(deadline)
     base = git(
         directory,
@@ -675,13 +676,19 @@ def validate_report(path: Path, sha: str) -> bool:
 
 
 def reviewed_row(line: str, bug_class: str) -> bool:
-    """Require the selected class schema and a fully reviewed row disposition."""
+    """Require reviewed dispositions and completed version cells for checked doc rows."""
     if not line.startswith("|") or not line.endswith("|"):
         return False
     cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line)[1:-1]]
     if len(cells) != REPORT_TABLES[bug_class].count("|") - 1:
         return False
     pattern = DOC_DISPOSITION if bug_class == "doc-claims" else DISPOSITION
+    if (
+        bug_class == "doc-claims"
+        and cells[-1].startswith("checked:")
+        and any(not cell or re.search(r"\bTODO\b", cell) for cell in cells[3:5])
+    ):
+        return False
     return pattern.fullmatch(cells[-1]) is not None
 
 
@@ -744,12 +751,12 @@ def sweep_class(name: str, directory: str, base: str, head: str, deadline: float
 
 
 def sweep_all(directory: str, base: str, head: str) -> str:
-    """Append the two additional class sections to the unchanged unchecked sweep."""
-    report = sweep(directory, base, head)
+    """Run all three class sweeps within one aggregate wall-clock budget."""
+    deadline = time.monotonic() + MAX_SWEEP_SECONDS
+    report = sweep(directory, base, head, deadline=deadline)
     metadata = report.splitlines()
     base = metadata[1].removeprefix("base: ")
     head = metadata[2].removeprefix("head: ")
-    deadline = time.monotonic() + MAX_SWEEP_SECONDS
     for name in ("state_advance", "doc_claims"):
         report += "\n" + sweep_class(name, directory, base, head, deadline)
         check_limit("report size", len(report.encode("utf-8")), MAX_REPORT_BYTES)

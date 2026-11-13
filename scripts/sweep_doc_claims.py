@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,22 +53,56 @@ BUILD_GUARD = re.compile(
     r"\b([A-Z][A-Z0-9_]*_(?:BUILD|VERSION|VERSION_MAJOR|API_VERSION))"
     r"[ \t]*(>=|<)[ \t]*(\d+)\b"
 )
+NONCODE = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', re.S)
 TABLE = REPORT_TABLES["doc-claims"]
 
 
+def claim_paragraphs(lines: list[str]) -> Iterator[list[int]]:
+    """Group consecutive nonblank lines, starting fresh at each Texi directive."""
+    paragraph = []
+    for number, line in enumerate(lines, 1):
+        if paragraph and (not line.strip() or line.lstrip().startswith("@")):
+            yield paragraph
+            paragraph = []
+        if line.strip():
+            paragraph.append(number)
+    if paragraph:
+        yield paragraph
+
+
+def paragraph_claims(
+    lines: list[str], paragraph: list[int], changed: dict[int, str]
+) -> dict[int, tuple[int, int]]:
+    """Map changed claim row lines to the union of their matched line spans."""
+    text = " ".join(lines[number - 1].strip() for number in paragraph)
+    numbers = [number for number in paragraph for _ in range(len(lines[number - 1].strip()) + 1)]
+    spans = {}
+    for match in CLAIM.finditer(text):
+        first, last = numbers[match.start()], numbers[match.end() - 1]
+        touched = [number for number in range(first, last + 1) if number in changed]
+        if touched:
+            row = touched[0]
+            low, high = spans.get(row, (first, last))
+            spans[row] = (min(low, first), max(high, last))
+    return spans
+
+
 def find_claims(source: str, changed: dict[int, str]) -> list[tuple[int, str, str]]:
-    """Select allowed added claim lines and their nearest preceding encoder section."""
+    """Select changed claim spans across paragraphs with their row's encoder section."""
     library = "unknown"
+    libraries = []
     claims = []
     check_limit("source size", len(source.encode()), MAX_SOURCE_BYTES)
     lines = source.splitlines()
-    for index in range(len(lines)):
-        number, line = index + 1, lines[index]
+    for line in lines:
         section = SECTION.match(line)
         if section:
             library = section[1].split(",", 1)[0].strip()
-        if number in changed and CLAIM.search(line):
-            claims.append((number, line.strip().replace("|", r"\|"), library))
+        libraries.append(library)
+    for paragraph in claim_paragraphs(lines):
+        for number, (first, last) in sorted(paragraph_claims(lines, paragraph, changed).items()):
+            text = " ".join(line.strip() for line in lines[first - 1 : last])
+            claims.append((number, text.replace("|", r"\|"), libraries[number - 1]))
     return claims
 
 
@@ -100,8 +135,14 @@ def encoder_sources(name: str, makefile: str) -> list[str]:
     return [f"libavcodec/{names[index][:-2]}.c" for index in range(len(names))]
 
 
+def mask_noncode(source: str) -> str:
+    """Blank C comments and literals, preserving offsets, newlines, and directives."""
+    return NONCODE.sub(lambda match: re.sub(r"[^\n]", " ", match[0]), source)
+
+
 def source_versions(source: str) -> list[str]:
-    """Collect version-call guards before allow-listed comparisons on conditional lines."""
+    """Collect active version-call guards before comparisons on conditional lines."""
+    source = mask_noncode(source)
     calls = GUARD.findall(source)
     versions = [".".join(calls[index]) for index in range(len(calls))]
     comparisons = BUILD_GUARD.findall("\n".join(CONDITION.findall(source)))

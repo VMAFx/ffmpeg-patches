@@ -3440,7 +3440,7 @@ class SweepTest(ForgejoTest):
         self.assert_sweep_refused("--sweep", str(self.sweep))
 
     def test_sweep_bad_disposition(self) -> None:
-        """Only the three named disposition forms are accepted."""
+        """Complete reports reject dispositions outside the three named forms."""
 
         for value in (
             "ignore",
@@ -3453,7 +3453,7 @@ class SweepTest(ForgejoTest):
         ):
             with self.subTest(value=value):
                 self.sweep.write_text(
-                    self.sweep.read_text(encoding="utf-8").split("|", 1)[0], encoding="utf-8"
+                    full_sweep_report(git_output(self.repo, "rev-parse", "topic")), encoding="utf-8"
                 )
                 self.add_sweep_rows(value)
                 self.assert_sweep_refused("--sweep", str(self.sweep))

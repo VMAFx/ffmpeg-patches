@@ -9,6 +9,7 @@ import bisect
 import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -31,18 +32,50 @@ TABLE = REPORT_TABLES["state-advance"]
 UPDATE_OPERATORS = re.compile(r"\+\+|--|\+=|-=")
 
 
+class BodyScan(NamedTuple):
+    """Hold shared token values, operator offsets, and line mapping for body scans."""
+
+    values: list[str]
+    operators: set[int]
+    newlines: list[int]
+    line_offset: int = 0
+
+
+def chain_end(values: list[str], start: int, end: int) -> int:
+    """Consume one member link or balanced subscript, stopping on incomplete input."""
+    if (
+        values[start] in {".", "->"}
+        and start + 1 < end
+        and re.fullmatch(IDENTIFIER, values[start + 1])
+    ):
+        return start + 2
+    if values[start] != "[":
+        return start
+    depth = 0
+    for index in range(start, end):
+        depth += (values[index] == "[") - (values[index] == "]")
+        if depth == 0:
+            return index + 1
+    return start
+
+
 def member_end(values: list[str], start: int, end: int) -> int | None:
-    """Find a complete identifier/member chain, excluding partial suffix matches."""
+    """Find a subscripted chain with a member link, excluding partial suffix matches."""
     if not re.fullmatch(IDENTIFIER, values[start]):
         return None
     if start and values[start - 1] in {".", "->"}:
         return None
     tail = start + 1
-    for index in range(tail, end - 1, 2):
-        if values[index] not in {".", "->"} or not re.fullmatch(IDENTIFIER, values[index + 1]):
+    linked = False
+    for index in range(tail, end):
+        if index < tail:
+            continue
+        following = chain_end(values, index, end)
+        if following == index:
             break
-        tail = index + 2
-    return tail if tail > start + 1 else None
+        linked |= values[index] in {".", "->"}
+        tail = following
+    return tail if linked else None
 
 
 def operand_end(values: list[str], start: int, end: int) -> int:
@@ -79,41 +112,70 @@ def update_span(
     return None
 
 
-def body_hits(
-    source: str, tokens: list[re.Match], opening: int, closing: int
-) -> list[tuple[int, str, int]]:
-    """List updates only after the first completed nonempty, nonzero return."""
-    values = [token[0] for token in tokens]
-    operators = {match.start() for match in UPDATE_OPERATORS.finditer(mask_literals(source))}
-    newlines = [match.start() for match in re.finditer("\n", source)]
-    first_error = None
+def scan_body(source: str, tokens: list[re.Match], opening: int, closing: int) -> BodyScan:
+    """Build body-local scan data for callers without a shared file scan."""
+    start, end = tokens[opening].start(), tokens[closing].end()
+    body = source[start:end]
+    return BodyScan(
+        [""] * opening + [token[0] for token in tokens[opening : closing + 1]],
+        {start + match.start() for match in UPDATE_OPERATORS.finditer(mask_literals(body))},
+        [start + match.start() for match in re.finditer("\n", body)],
+        source.count("\n", 0, start),
+    )
+
+
+def first_error_return(values: list[str], start: int, end: int) -> tuple[int, int] | None:
+    """Locate the first completed nonempty, nonzero return within a body."""
     returning = None
-    hits = []
-    for index in range(opening + 1, closing):
+    for index in range(start, end):
         if values[index] == "return":
             returning = index
         elif values[index] == ";" and returning is not None:
-            expression = values[returning + 1 : index]
-            if first_error is None and expression not in ([], ["0"]):
-                first_error = bisect.bisect_left(newlines, tokens[returning].start()) + 1
+            if values[returning + 1 : index] not in ([], ["0"]):
+                return returning, index
             returning = None
-        if first_error is None:
-            continue
+    return None
+
+
+def body_hits(
+    source: str,
+    tokens: list[re.Match],
+    opening: int,
+    closing: int,
+    scan: BodyScan | None = None,
+) -> list[tuple[int, str, int]]:
+    """Use shared or body-local scan data to list updates after the first error return."""
+    values, operators, newlines, line_offset = scan or scan_body(source, tokens, opening, closing)
+    error = first_error_return(values, opening + 1, closing)
+    if error is None:
+        return []
+    returning, completed = error
+    first_error = bisect.bisect_left(newlines, tokens[returning].start()) + 1 + line_offset
+    hits = []
+    for index in range(completed + 1, closing):
         span = update_span(tokens, values, operators, index, closing)
         if span is not None:
             start, end = span
-            line = bisect.bisect_left(newlines, tokens[start].start()) + 1
+            line = bisect.bisect_left(newlines, tokens[start].start()) + 1 + line_offset
             expression = source[tokens[start].start() : tokens[end - 1].end()]
             hits.append((line, " ".join(expression.split()).replace("|", r"\|"), first_error))
     return hits
 
 
 def find_hits(
-    source: str, changed: dict[int, str], deleted: set[int] | None = None
+    source: str,
+    changed: dict[int, str],
+    deleted: set[int] | None = None,
+    deadline: float | None = None,
 ) -> list[tuple[int, str, int]]:
-    """Inspect whole touched bodies using shared masked C tokenization and parsing."""
+    """Inspect touched bodies within an optional deadline using one shared file scan."""
     tokens, _, bodies = parse_source(source)
     newlines = [match.start() for match in re.finditer("\n", source)]
+    scan = BodyScan(
+        [token[0] for token in tokens],
+        {match.start() for match in UPDATE_OPERATORS.finditer(mask_literals(source))},
+        newlines,
+    )
     hits = []
     for _, opening, closing in bodies:
         first = bisect.bisect_left(newlines, tokens[opening].start()) + 1
@@ -121,7 +183,9 @@ def find_hits(
         touched = any(first <= line <= last for line in changed)
         touched |= any(first <= anchor < last for anchor in deleted or ())
         if touched:
-            hits.extend(body_hits(source, tokens, opening, closing))
+            if deadline is not None:
+                check_deadline(deadline)
+            hits.extend(body_hits(source, tokens, opening, closing, scan))
     return hits
 
 
@@ -160,7 +224,9 @@ def sweep(directory: str, base: str, head: str, deadline: float) -> str:
     size = len(("\n".join(lines) + "\n").encode())
     for path, source in sorted(sources.items()):
         check_deadline(deadline)
-        for line, expression, earlier in find_hits(source, changed[path], deleted.get(path)):
+        for line, expression, earlier in find_hits(
+            source, changed[path], deleted.get(path), deadline
+        ):
             row = f"| {path}:{line} | {expression} | {earlier} | TODO |"
             size += len((row + "\n").encode())
             check_limit("report size", size, MAX_REPORT_BYTES)
