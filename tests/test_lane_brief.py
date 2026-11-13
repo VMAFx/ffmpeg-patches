@@ -523,7 +523,7 @@ class LaneBriefTest(unittest.TestCase):
         brief.write_text(content.replace("tests.test_import_style", ""), encoding="utf-8")
         rc, _, error = self.run_cli("check", str(brief))
         self.assertEqual(rc, 1)
-        self.assertIn("missing required line: tests.test_import_style", error)
+        self.assertIn("missing required line: -m unittest tests.test_import_style", error)
         self.assertIn("python -m unittest tests.test_import_style", content)
 
     def test_import_style_requirement_is_exact_module_name(self) -> None:
@@ -536,13 +536,54 @@ class LaneBriefTest(unittest.TestCase):
         )
         rc, _, error = self.run_cli("check", str(brief))
         self.assertEqual(rc, 1)
-        self.assertIn("missing required line: tests.test_import_style", error)
+        self.assertIn("missing required line: -m unittest tests.test_import_style", error)
         brief.write_text(
             content.replace("tests.test_import_style", "tests.test_import_style -v"),
             encoding="utf-8",
         )
         rc, _, error = self.run_cli("check", str(brief))
         self.assertEqual(rc, 0, error)
+
+    def test_import_style_prose_mention_refused(self) -> None:
+        """Reject a brief naming the import-style module only in its task text."""
+        content = self.rendered().replace("python -m unittest tests.test_import_style", "")
+        content = content.replace("task: work", "task: inspect tests.test_import_style")
+        self.assertIn("task: inspect tests.test_import_style", content)
+        brief = self.root / "brief.md"
+        brief.write_text(content, encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 1)
+        self.assertIn("missing required line: -m unittest tests.test_import_style", error)
+
+    def test_import_style_accepts_real_invocations(self) -> None:
+        """Accept supported invocations and reject the import-style module after another module."""
+        content = self.rendered()
+        brief = self.root / "brief.md"
+        for invocation, expected in (
+            ("python -m unittest tests.test_import_style", 0),
+            ("/usr/bin/python3 -B -m unittest tests.test_import_style -v", 0),
+            (
+                "/usr/bin/python3 -B -m unittest tests.test_import_style "
+                "tests.test_sweep_classes -v",
+                0,
+            ),
+            (
+                "/usr/bin/python3 -B -m unittest tests.test_sweep_classes "
+                "tests.test_import_style -v",
+                1,
+            ),
+        ):
+            with self.subTest(invocation=invocation):
+                brief.write_text(
+                    content.replace("python -m unittest tests.test_import_style", invocation),
+                    encoding="utf-8",
+                )
+                rc, _, error = self.run_cli("check", str(brief))
+                self.assertEqual(rc, expected, error)
+                if expected:
+                    self.assertIn(
+                        "missing required line: -m unittest tests.test_import_style", error
+                    )
 
     def test_each_missing_required_line_fails(self) -> None:
         """Reject each independently removed required substring."""
@@ -694,7 +735,7 @@ class LaneBriefTest(unittest.TestCase):
                 "ruff format --check scripts tests",
                 "docstring_diff.py --cached",
                 "no commit, no push",
-                "tests.test_import_style",
+                "-m unittest tests.test_import_style",
             ],
         )
 

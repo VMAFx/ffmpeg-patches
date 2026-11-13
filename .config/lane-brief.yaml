@@ -5,7 +5,7 @@
 # and excluded test modules under credential_stub_tests.
 # scripts/lane_brief.py checks this list and can invoke the lane runner precheck;
 # the lane wrapper refuses a brief that lacks a required substring at launch.
-# Lanes edit test modules; mixed `import x` / `from x import` forms fail the repository gate, so every brief runs the import-style test.
+# Lanes edit test modules; mixed `import x` / `from x import` forms fail the repository gate, so every brief runs the import-style test; the entry names the unittest invocation so prose module mentions do not satisfy it.
 required:
   - "docstrings: every public function you add OR touch"
   - "one-line docstring on every new test function"
@@ -13,7 +13,7 @@ required:
   - "ruff format --check scripts tests"
   - "docstring_diff.py --cached"
   - "no commit, no push"
-  - "tests.test_import_style"
+  - "-m unittest tests.test_import_style"
 
 # test modules whose tests exec a stub credential helper;
 # the lane runner refuses a brief that runs one of them (by module, path or unittest discover);
