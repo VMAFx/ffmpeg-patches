@@ -50,11 +50,18 @@ ARGS = [
 ]
 
 
-def process_alive(pid: int) -> bool:
-    """Return whether a process exists and has not exited."""
+def _signal_probe(pid: int) -> bool:
+    """Return whether the signal probe finds the process."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
+        return False
+    return True
+
+
+def process_alive(pid: int) -> bool:
+    """Return whether a process exists and has not exited."""
+    if not _signal_probe(pid):
         return False
     stat = Path(f"/proc/{pid}/stat")
     try:
@@ -62,7 +69,8 @@ def process_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except FileNotFoundError:
-        return True
+        # No stat entry: procfs absent, or the process was reaped after the first probe.
+        return _signal_probe(pid)
     return state not in {"Z", "X"}
 
 
@@ -258,6 +266,24 @@ class LaneBriefTest(unittest.TestCase):
         """Treat a process reaped during the procfs read as gone."""
         with patch("os.kill"), patch.object(Path, "read_text", side_effect=ProcessLookupError):
             self.assertFalse(process_alive(123))
+
+    def test_process_alive_reaped_before_read(self) -> None:
+        """Treat a process reaped before the procfs read as gone."""
+        with (
+            patch("os.kill", side_effect=[None, ProcessLookupError]) as signal_probe,
+            patch.object(Path, "read_text", side_effect=FileNotFoundError),
+        ):
+            self.assertFalse(process_alive(123))
+            self.assertEqual(signal_probe.call_count, 2)
+
+    def test_process_alive_without_procfs(self) -> None:
+        """Treat a process passing both signal probes as alive without procfs."""
+        with (
+            patch("os.kill") as signal_probe,
+            patch.object(Path, "read_text", side_effect=FileNotFoundError),
+        ):
+            self.assertTrue(process_alive(123))
+            self.assertEqual(signal_probe.call_count, 2)
 
     def constant_names(self, tree: ast.Module) -> set[str]:
         """Collect module-level constant names from assignments."""
