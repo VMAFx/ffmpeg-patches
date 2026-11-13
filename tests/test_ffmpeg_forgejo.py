@@ -151,6 +151,8 @@ class Stub:
     """Forgejo API stub.
 
     heads: head sha returned by successive GET /pulls/1 (the last one repeats).
+    titles: optional titles for successive GET /pulls/1; an independent counter repeats the last.
+    A non-ignored title PATCH overrides scripted titles for every later read.
     polls: sha -> list of status lists, one per poll (page 1 starts a poll; the last repeats).
     fail_status: answer the status endpoint with HTTP 500.
     pull_status: answer GET /pulls/1 with this HTTP status instead of a pull.
@@ -163,9 +165,10 @@ class Stub:
         polls: dict[str, list[list[dict]]] | None = None,
         pull_status: int = 200,
         reviewers: list[list[str]] | None = None,
+        titles: list[object] | None = None,
         **kwargs: object,
     ):
-        """Initialize scripted responses, title edits and persistent requested team reviewers."""
+        """Initialize scripted heads and titles, edits and persistent requested team reviewers."""
 
         heads = heads or [A]
         polls = polls or {}
@@ -185,6 +188,7 @@ class Stub:
         self.fail_comments: set[int] = set()
         self.paginate_large_comments = bool(kwargs.get("paginate_large_comments", False))
         self.head_reads = 0
+        self.title_reads = 0
         self.reviewer_reads = 0
         self.poll_index = {sha: -1 for sha in polls}
         self.requests: list[tuple[str, str, str]] = []
@@ -198,7 +202,17 @@ class Stub:
         self.branch_head = kwargs.get("branch_head")
         self.branch_status = int(kwargs.get("branch_status", 200))
         self.title = kwargs.get("title", "old title")
+        self.titles = titles
         self.ignore_title_patch = bool(kwargs.get("ignore_title_patch", False))
+
+    def next_title(self) -> object:
+        """Return the next scripted or persisted title, counting each pull read separately."""
+
+        title = self.title
+        if self.titles:
+            title = self.titles[min(self.title_reads, len(self.titles) - 1)]
+        self.title_reads += 1
+        return title
 
     def head(self) -> object:
         """Return the next scripted pull head, repeating the last."""
@@ -219,13 +233,13 @@ class Stub:
         return full[(page - 1) * limit : page * limit]
 
     def pull(self) -> dict:
-        """Return the title, scripted user reviewers and persisted requested team state."""
+        """Return the scripted title and head, user reviewers and persisted requested team state."""
 
         reviewers = self.reviewers[min(self.reviewer_reads, len(self.reviewers) - 1)]
         self.reviewer_reads += 1
         return {
             "number": 1,
-            "title": self.title,
+            "title": self.next_title(),
             "head": {"sha": self.head()},
             "html_url": "stub/pulls/1",
             "requested_reviewers": [
@@ -473,6 +487,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = json.loads(data)
         if "title" in payload and not stub.ignore_title_patch:
             stub.title = payload["title"]
+            stub.titles = None
         self.reply(200, {"html_url": "stub/pulls/1"})
 
 
@@ -941,7 +956,7 @@ class EditTitleTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [])
 
     def test_apply(self) -> None:
-        """Apply sends only the title and proves it by reading the pull again."""
+        """Apply reads the pull four times before PATCH and verifies the title afterward."""
 
         stub = Stub([A], {A: [[label("success"), OTHER]]})
         proc = self.edit_title(stub, "new title", "--apply")
@@ -949,6 +964,36 @@ class EditTitleTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [{"title": "new title"}])
         self.assertEqual(proc.stdout, "stub/pulls/1\nffmpeg-forgejo: title read back: new title\n")
         self.assertEqual(stub.requests[-1][:2], ("GET", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1"))
+        patch_index = next(i for i, (method, _, _) in enumerate(stub.requests) if method == "PATCH")
+        pull_reads = [
+            path
+            for method, path, _ in stub.requests[:patch_index]
+            if method == "GET" and path.endswith("/pulls/1")
+        ]
+        self.assertEqual(len(pull_reads), 4)
+
+    def test_title_uses_tested_head_response(self) -> None:
+        """The accepted head's matching title ends the edit before a changed-head response."""
+
+        stub = Stub([A, B], titles=["new title", "old title"])
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.requests, [("GET", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1", "")])
+        self.assertEqual(proc.stdout, "ffmpeg-forgejo: #1 title already reads: new title\n")
+        self.assertEqual(self.patches(stub), [])
+
+    def test_title_ignores_unchecked_response(self) -> None:
+        """Reads 1 and 4 hold the old title; wait reads 2 and 3 and read-back 5 hold the new."""
+
+        stub = Stub(
+            [A],
+            {A: [[label("success")]]},
+            titles=["old title", "new title", "new title", "old title", "new title"],
+        )
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [{"title": "new title"}])
+        self.assertNotIn("already reads", proc.stdout)
 
     def test_head_mismatch(self) -> None:
         """A mismatched head refuses before Autolabel checks or a PATCH."""
@@ -964,7 +1009,7 @@ class EditTitleTest(ForgejoTest):
     def test_head_moves_during_wait(self) -> None:
         """The second tested-head check rejects a push during Autolabel checks."""
 
-        stub = Stub([A, A, A, A, A, B], {A: [[label("pending")], [label("success")]]})
+        stub = Stub([A, A, A, A, B], {A: [[label("pending")], [label("success")]]})
         proc = self.edit_title(stub, "new title", "--apply", "--wait")
         self.assertEqual(proc.returncode, 76, proc.stderr)
         self.assertIn(A[:12], proc.stderr)
@@ -3745,7 +3790,7 @@ class EditTitleMutantTest(unittest.TestCase):
     """Require title-edit cases to kill each planted safety-check defect."""
 
     def test_every_mutant_is_caught(self) -> None:
-        """Missing head, dry-run, read-back and early no-op guards fail selected cases."""
+        """Head, dry-run, read-back, early no-op and same-response title guards kill defects."""
 
         source = HELPER.read_text(encoding="utf-8")
         mutations = (
@@ -3761,6 +3806,11 @@ class EditTitleMutantTest(unittest.TestCase):
                 '  title_unchanged "$number" "$title" && exit 0\n  wait_autolabel_done',
                 "  wait_autolabel_done",
                 "test_unchanged_title_skips_pending_autolabel",
+            ),
+            (
+                'old="$(parse_pull_title <<<"$TESTED_PULL_BODY")"',
+                'old="$(pull_title "$number")"',
+                "test_title_uses_tested_head_response",
             ),
         )
         for name, (old, new, test_name) in enumerate(mutations):
