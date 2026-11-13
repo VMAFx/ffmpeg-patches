@@ -494,9 +494,11 @@ class FateDepsTest(unittest.TestCase):
         source += "".join(f"V{i} = " + f"$(V{i - 1}) " * 8 + "\n" for i in range(1, 8))
         source += "FATE_X-yes += $(V7)\nfate-x: CMD = -f lavfi -i testsrc2\n"
         step = self.check_source(source)
-        self.assertIn("expansion over 4096 tokens", step.output)
+        self.assertIn("expansion over 4096 tokens or 65536 characters", step.output)
         source += "FATE_Y-$(call ALLYES, $(V7)) += fate-y\n"
-        self.assertIn("expansion over 4096 tokens", self.check_source(source).output)
+        self.assertIn(
+            "expansion over 4096 tokens or 65536 characters", self.check_source(source).output
+        )
         token = upstream_lint.FateToken("$(DEPS)", frozenset({1}))
         leaf = upstream_lint.FateToken("fate-x", frozenset({2}))
         overflow: set[int] = set()
@@ -506,6 +508,76 @@ class FateDepsTest(unittest.TestCase):
         result = upstream_lint._fate_expand([token], {"DEPS": [leaf] * 4097}, overflow)
         self.assertEqual(result, [token])
         self.assertEqual(overflow, {1})
+
+    def test_adjacent_substitution_character_budget(self) -> None:
+        """Adjacent substitutions and stored values obey an inclusive character budget."""
+        budget = getattr(upstream_lint, "FATE_CHAR_BUDGET", 65536)
+        message = "expansion over 4096 tokens or 65536 characters"
+        # Fail safely on an unfixed parser before attempting the explosive chain.
+        oversized = "VALUE := " + "x" * (budget + 1) + "\n"
+        self.assertIn(message, self.check_source(oversized).output)
+        for operator in (":=", "="):
+            with self.subTest(operator=operator):
+                source = f"V0 {operator} x\n"
+                source += "".join(f"V{i} {operator} $(V{i - 1})$(V{i - 1})\n" for i in range(1, 31))
+                if operator == "=":
+                    # Cross the character limit without extending the eight-pass cap.
+                    source += "V30 := $(V30)\n"
+                source += "FATE_X-yes += $(V30)\nfate-x: CMD = -f lavfi -i testsrc2\n"
+                self.assertIn(message, self.check_source(source).output)
+                parsed = upstream_lint._fate_parse(source)
+                self.assertTrue(parsed.overflows)
+                self.assertTrue(
+                    all(
+                        sum(len(token.text) for token in value) <= budget
+                        for value in parsed.variables.values()
+                    )
+                )
+                source = f"VALUE {operator} " + "x" * budget + "\n"
+                parsed = upstream_lint._fate_parse(source)
+                self.assertEqual(
+                    [token.text for token in parsed.variables["VALUE"]], ["x" * budget]
+                )
+                self.assertFalse(parsed.overflows)
+                source = source.rstrip("\n") + "x\n"
+                parsed = upstream_lint._fate_parse(source)
+                self.assertIn(1, parsed.overflows)
+                self.assertIn(message, self.check_source(source).output)
+                self.assertLessEqual(sum(len(t.text) for t in parsed.variables["VALUE"]), budget)
+        half = upstream_lint.FateToken("x" * (budget // 2), frozenset({2}))
+        token = upstream_lint.FateToken("$(HALF)$(HALF)", frozenset({1}))
+        variables = {"HALF": [half]}
+        self.assertEqual(
+            upstream_lint._fate_expand_pass([token], variables),
+            [upstream_lint.FateToken("x" * budget, frozenset({1, 2}))],
+        )
+        token = upstream_lint.FateToken(token.text + "x", token.lines)
+        self.assertIsNone(upstream_lint._fate_expand_pass([token], variables))
+        self.assertIsNone(upstream_lint._fate_expand_pass([half, half], {}))
+        overflow: set[int] = set()
+        upstream_lint._fate_expand([token], variables, overflow)
+        self.assertEqual(overflow, {1})
+
+    def test_simple_assignment_keeps_undefined_reference_unresolved(self) -> None:
+        """Simple assignments freeze undefined whole and embedded references permanently."""
+        for value in ("fate-$(NAME)", "$(NAME)"):
+            with self.subTest(value=value):
+                source = f"GROUP := {value}\nNAME = new\nFATE_X-yes += $(GROUP)\n"
+                source += "fate-: CMD = -f lavfi -i testsrc2\n"
+                parsed = upstream_lint._fate_parse(source)
+                self.assertNotIn("fate-new", parsed.registrations)
+                self.assertNotIn("new", parsed.registrations)
+                frozen = value.replace("$(NAME)", "$(:=NAME)")
+                self.assertIn(frozen, parsed.registrations)
+                step = self.check_source(source)
+                self.assertIn(f"unresolved target {frozen}", step.output)
+                self.assertIn("1 unresolved", step.output)
+        source = "NAME = old\nGROUP := fate-$(NAME)\nNAME = new\n"
+        source += "FATE_X-yes += $(GROUP)\nfate-old: CMD = -f lavfi -i testsrc2\n"
+        parsed = upstream_lint._fate_parse(source)
+        self.assertIn("fate-old", parsed.registrations)
+        self.assertNotIn("fate-new", parsed.registrations)
+        self.assertIn("0 unresolved", self.check_source(source).output)
 
     def test_unresolved_target_is_reported(self) -> None:
         """Touched cross-file target references remain visible and counted."""

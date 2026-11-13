@@ -410,6 +410,7 @@ FATE_PATTERNS = (
 )
 FATE_VARIABLE = re.compile(r"\$\(([A-Z][A-Z0-9_]*)\)")
 FATE_TOKEN_BUDGET = 4096
+FATE_CHAR_BUDGET = 65536
 LAVFI_FORMAT = re.compile(r"(?:^|\s)-f\s+lavfi(?=\s|$)")
 LAVFI_OPTION = re.compile(r"^-[\w:]+$")
 LAVFI_NAME = re.compile(r"""^["']?([a-z0-9_]+)(?=[=,;\s"']|$)""")
@@ -525,48 +526,73 @@ def _fate_kind(line: FateLine) -> tuple[str, tuple[str, ...]]:
     return "", ()
 
 
+def _fate_characters(tokens: list[FateToken]) -> int:
+    """Count token characters including the spaces needed to join them."""
+    return sum(len(token.text) for token in tokens) + max(0, len(tokens) - 1)
+
+
 def _fate_replace(
-    token: FateToken, variables: dict[str, list[FateToken]], remaining: int
-) -> tuple[str, frozenset[int], int]:
-    """Substitute embedded references only after checking each replacement's budget."""
-    parts, lines, cursor, cost = [], token.lines, 0, 1
+    token: FateToken, variables: dict[str, list[FateToken]], remaining: int, characters: int
+) -> tuple[str, frozenset[int], int] | None:
+    """Substitute embedded references only after checking token and character budgets."""
+    parts, lines, cursor, cost, size = [], token.lines, 0, 1, 0
     for match in FATE_VARIABLE.finditer(token.text):
         replacements = variables.get(match[1])
         if replacements is None:
             continue
         cost += max(1, len(replacements)) - 1
-        if cost > remaining:
-            return token.text, token.lines, cost
+        size += match.start() - cursor + _fate_characters(replacements)
+        if cost > remaining or size > characters:
+            return None
         parts.extend((token.text[cursor : match.start()], " ".join(t.text for t in replacements)))
         lines |= frozenset().union(*(t.lines for t in replacements))
         cursor = match.end()
+    if cost > remaining or size + len(token.text) - cursor > characters:
+        return None
     parts.append(token.text[cursor:])
     return "".join(parts), lines, cost
+
+
+def _fate_expand_token(
+    token: FateToken, variables: dict[str, list[FateToken]], remaining: int, characters: int
+) -> tuple[list[FateToken], int] | None:
+    """Expand one token's whole or embedded references within both remaining budgets."""
+    match = FATE_VARIABLE.fullmatch(token.text)
+    replacements = variables.get(match[1]) if match else None
+    if replacements is not None:
+        if len(replacements) > remaining or _fate_characters(replacements) > characters:
+            return None
+        return [FateToken(t.text, t.lines | token.lines) for t in replacements], len(replacements)
+    result = _fate_replace(token, variables, remaining, characters)
+    if result is None:
+        return None
+    text, lines, cost = result
+    expanded: list[FateToken] = []
+    for item in re.finditer(r"\S+", text):
+        if len(expanded) == remaining:
+            return None
+        expanded.append(FateToken(item[0], lines))
+    return expanded, cost
 
 
 def _fate_expand_pass(
     tokens: list[FateToken], variables: dict[str, list[FateToken]]
 ) -> list[FateToken] | None:
-    """Build one bounded expansion pass while retaining individual target provenance."""
+    """Bound each expansion pass by tokens and characters while retaining provenance."""
     expanded: list[FateToken] = []
-    spent = 0
+    spent = characters = 0
     for token in tokens:
-        match = FATE_VARIABLE.fullmatch(token.text)
-        replacements = variables.get(match[1]) if match else None
-        if replacements is not None:
-            spent += len(replacements)
-            if spent > FATE_TOKEN_BUDGET:
-                return None
-            expanded.extend(FateToken(t.text, t.lines | token.lines) for t in replacements)
-            continue
-        text, lines, cost = _fate_replace(token, variables, FATE_TOKEN_BUDGET - spent)
-        spent += cost
-        if spent > FATE_TOKEN_BUDGET:
+        result = _fate_expand_token(
+            token, variables, FATE_TOKEN_BUDGET - spent, FATE_CHAR_BUDGET - characters
+        )
+        if result is None:
             return None
-        for item in re.finditer(r"\S+", text):
-            if len(expanded) == FATE_TOKEN_BUDGET:
-                return None
-            expanded.append(FateToken(item[0], lines))
+        replacements, cost = result
+        spent += cost
+        characters += _fate_characters(replacements) + bool(expanded and replacements)
+        if characters > FATE_CHAR_BUDGET:
+            return None
+        expanded.extend(replacements)
     return expanded
 
 
@@ -575,7 +601,7 @@ def _fate_expand(
     variables: dict[str, list[FateToken]],
     overflows: set[int] | None = None,
 ) -> list[FateToken]:
-    """Expand whole and embedded variables within eight passes and a total token budget."""
+    """Expand whole and embedded variables within eight passes and both size budgets."""
     for _ in range(8):
         expanded = _fate_expand_pass(tokens, variables)
         if expanded is None or any(t.text == "$(EXPANSION_OVER_BUDGET)" for t in tokens):
@@ -692,8 +718,16 @@ def _fate_branch(conditions: list[list[FateCondition]], kind: str, line: FateLin
             conditions[-1].append(_fate_condition(FateLine(tail, line.first, line.last)))
 
 
+def _fate_freeze(token: FateToken, variables: dict[str, list[FateToken]]) -> FateToken:
+    """Freeze undefined references while retaining unresolved target syntax and provenance."""
+    text = FATE_VARIABLE.sub(
+        lambda match: match[0] if match[1] in variables else f"$(:={match[1]})", token.text
+    )
+    return FateToken(text, token.lines)
+
+
 def _fate_assign(parsed: FateFile, line: FateLine, groups: tuple[str, ...]) -> None:
-    """Preserve recursive assignment flavor and expand simple values immediately."""
+    """Expand simple values now, freezing undefined $(NAME) references as $(:=NAME)."""
     name, operator, value = groups
     if operator != "+=":
         parsed.simple.discard(name)
@@ -702,8 +736,10 @@ def _fate_assign(parsed: FateFile, line: FateLine, groups: tuple[str, ...]) -> N
     tokens = _fate_tokens(value, line)
     if name in parsed.simple:
         tokens = _fate_expand(tokens, parsed.variables, parsed.overflows)
+        tokens = [_fate_freeze(token, parsed.variables) for token in tokens]
     previous = parsed.variables.get(name, []) if operator == "+=" else []
-    if len(previous) + len(tokens) > FATE_TOKEN_BUDGET:
+    characters = _fate_characters(previous) + _fate_characters(tokens) + bool(previous and tokens)
+    if len(previous) + len(tokens) > FATE_TOKEN_BUDGET or characters > FATE_CHAR_BUDGET:
         parsed.overflows.add(line.first)
         tokens = [FateToken(f"$({name})", frozenset({line.first}))]
         previous = []
@@ -896,6 +932,20 @@ def _fate_command(
     return False
 
 
+def _fate_target_diagnostics(
+    path: str, entry: FateEntry, touched: set[int], report: FateReport, registration: bool
+) -> None:
+    """Report one unclassified registration or touched unresolved target."""
+    name = entry.target.text
+    if registration and not entry.classified:
+        report.lines.append(
+            f"informational: {path}:{entry.line.first}: {name}: registration guard not classified"
+        )
+    if "$(" in name and _fate_touched(entry, touched):
+        report.unresolved += 1
+        report.lines.append(f"informational: {path}:{entry.line.first}: unresolved target {name}")
+
+
 def _fate_diagnostics(path: str, parsed: FateFile, touched: set[int], report: FateReport) -> None:
     """Report touched unresolved targets, templates and bounded expansion failures."""
     for line in parsed.templates:
@@ -903,21 +953,15 @@ def _fate_diagnostics(path: str, parsed: FateFile, touched: set[int], report: Fa
             report.lines.append(f"informational: {path}:{line.first}: template not checked")
     for number in sorted(parsed.overflows):
         report.lines.append(
-            f"informational: {path}:{number}: expansion over {FATE_TOKEN_BUDGET} tokens"
+            f"informational: {path}:{number}: expansion over {FATE_TOKEN_BUDGET} tokens "
+            f"or {FATE_CHAR_BUDGET} characters"
         )
     for entries in (parsed.registrations, parsed.commands):
-        for name, variants in entries.items():
+        for variants in entries.values():
             for entry in variants:
-                if entries is parsed.registrations and not entry.classified:
-                    report.lines.append(
-                        f"informational: {path}:{entry.line.first}: {name}: "
-                        "registration guard not classified"
-                    )
-                if "$(" in name and _fate_touched(entry, touched):
-                    report.unresolved += 1
-                    report.lines.append(
-                        f"informational: {path}:{entry.line.first}: unresolved target {name}"
-                    )
+                _fate_target_diagnostics(
+                    path, entry, touched, report, entries is parsed.registrations
+                )
 
 
 def _fate_check(
