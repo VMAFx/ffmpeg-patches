@@ -526,6 +526,46 @@ class SweepRegressionTest(unittest.TestCase):
                 row = f"| doc/a.texi:3 | 64x64 | libfoo | {oldest} | {newest} | {disposition} |"
                 self.assertEqual(variant_sweep.reviewed_row(row, "doc-claims"), accepted)
 
+    def test_checked_accepts_build_comparisons(self) -> None:
+        """Checked rows accept build comparisons and mixed oldest-version lists."""
+        for library, oldest, evidence in (
+            ("libbar", "BAR_BUILD >= 155, BAR_BUILD >= 161", "upstream/file.c:7"),
+            ("libfoo", "FOO_BUILD < 200", "upstream/file.c:7"),
+            ("libfoo", "1.2.0, FOO_BUILD >= 200", "upstream/file.c:7; upstream/other.c:9"),
+        ):
+            with self.subTest(oldest=oldest):
+                disposition = f"checked: {library} {oldest} 2.0.0 {evidence}"
+                row = f"| doc/a.texi:3 | 64x64 | {library} | {oldest} | 2.0.0 | {disposition} |"
+                self.assertTrue(variant_sweep.reviewed_row(row, "doc-claims"))
+
+    def test_checked_producer_round_trip(self) -> None:
+        """Checked rows accept the exact oldest value emitted by the library producer."""
+        sources = {
+            "configure": (
+                'libbar_encoder_deps="libbar"\n'
+                'require_cpp_condition libbar bar.h "BAR_BUILD >= 155"\n'
+            ),
+            "libavcodec/Makefile": "OBJS-$(CONFIG_LIBBAR_ENCODER) += libbar.o\n",
+            "libavcodec/libbar.c": "#if BAR_BUILD >= 161\n#endif\n",
+        }
+        oldest = sweep_doc_claims.library_versions("libbar", sources)
+        self.assertEqual(oldest, "BAR_BUILD >= 155, BAR_BUILD >= 161")
+        disposition = f"checked: libbar {oldest} 2.0.0 upstream/file.c:7"
+        row = f"| doc/a.texi:3 | 64x64 | libbar | {oldest} | 2.0.0 | {disposition} |"
+        self.assertTrue(variant_sweep.reviewed_row(row, "doc-claims"))
+
+    def test_checked_rejects_malformed_comparisons(self) -> None:
+        """Checked rows reject missing comparison values, spacing, TODOs, and evidence."""
+        for disposition in (
+            "checked: libbar BAR_BUILD >= 2.0.0 upstream/file.c:7",
+            "checked: libbar BAR_BUILD >=155 2.0.0 upstream/file.c:7",
+            "checked: libbar BAR_BUILD >= 155, TODO 2.0.0 upstream/file.c:7",
+            "checked: libbar BAR_BUILD >= 155 2.0.0",
+        ):
+            with self.subTest(disposition=disposition):
+                row = f"| doc/a.texi:3 | 64x64 | libbar | 1.2.0 | 2.0.0 | {disposition} |"
+                self.assertFalse(variant_sweep.reviewed_row(row, "doc-claims"))
+
     def test_no_claim_keeps_unresolved_versions(self) -> None:
         """No-claim dispositions still accept TODO version cells."""
         row = "| doc/a.texi:3 | 64x64 | libfoo | TODO | TODO | no-claim: prose only |"

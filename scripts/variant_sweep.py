@@ -34,7 +34,7 @@ REPORT_TABLES = {
     "state-advance": "| file:line | expression | first earlier error return line | disposition |",
     "doc-claims": "| file:line | claim text | library | oldest | newest | disposition |",
 }
-VERSION = r"(?!TODO\b)[^\s,;|]+"
+VERSION = r"(?:[A-Z][A-Z0-9_]* (?:>=|<) \d+|(?!TODO\b)[^\s,;|]+)"
 DOC_DISPOSITION = re.compile(
     rf"no-claim: \S(?:.*\S)?|checked: [\w.-]+ {VERSION}(?:, {VERSION})* {VERSION} "
     r"[^\s;|]+:[1-9]\d*(?:; [^\s;|]+:[1-9]\d*)*"
