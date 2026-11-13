@@ -392,18 +392,26 @@ if not isinstance(title, str):
 sys.stdout.write(title + ".")'
 }
 
-# edit_title NUMBER TITLE HEAD APPLY WAIT: guard a title edit, default to dry run and verify writes.
-edit_title() (
-  local number="$1" title="$2" head="$3" apply="$4" wait="$5" old actual body out
-  require_tested_head "$number" "$head"
-  wait_autolabel_done "$number" "$wait"
-  require_tested_head "$number" "$head"
+# title_unchanged NUMBER TITLE: set old to the current title and report an exact match.
+title_unchanged() {
+  local number="$1" title="$2"
   old="$(pull_title "$number")" || die "cannot read current title of #$number"
   old="${old%.}"
   if [ "$old" = "$title" ]; then
     printf 'ffmpeg-forgejo: #%s title already reads: %s\n' "$number" "$title"
-    exit 0
+    return 0
   fi
+  return 1
+}
+
+# edit_title NUMBER TITLE HEAD APPLY WAIT: guard a title edit, default to dry run and verify writes.
+edit_title() (
+  local number="$1" title="$2" head="$3" apply="$4" wait="$5" old actual body out
+  require_tested_head "$number" "$head"
+  title_unchanged "$number" "$title" && exit 0
+  wait_autolabel_done "$number" "$wait"
+  require_tested_head "$number" "$head"
+  title_unchanged "$number" "$title" && exit 0
   if [ "$apply" = 0 ]; then
     printf 'ffmpeg-forgejo: dry run, would change the title of #%s from: %s\n' "$number" "$old"
     printf 'ffmpeg-forgejo: dry run, to: %s\n' "$title"

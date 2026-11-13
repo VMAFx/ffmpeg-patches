@@ -964,7 +964,7 @@ class EditTitleTest(ForgejoTest):
     def test_head_moves_during_wait(self) -> None:
         """The second tested-head check rejects a push during Autolabel checks."""
 
-        stub = Stub([A, A, A, A, B], {A: [[label("pending")], [label("success")]]})
+        stub = Stub([A, A, A, A, A, B], {A: [[label("pending")], [label("success")]]})
         proc = self.edit_title(stub, "new title", "--apply", "--wait")
         self.assertEqual(proc.returncode, 76, proc.stderr)
         self.assertIn(A[:12], proc.stderr)
@@ -987,6 +987,35 @@ class EditTitleTest(ForgejoTest):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "ffmpeg-forgejo: #1 title already reads: new title\n")
         self.assertEqual(self.patches(stub), [])
+
+    def test_unchanged_title_skips_pending_autolabel(self) -> None:
+        """An unchanged title succeeds before polling a pending Autolabel job."""
+
+        stub = Stub([A], {A: [[label("pending")]]}, title="new title")
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "ffmpeg-forgejo: #1 title already reads: new title\n")
+        self.assertEqual(self.patches(stub), [])
+        self.assertEqual(stub.poll_index[A], -1)
+
+    def test_unchanged_title_with_wait_does_not_poll(self) -> None:
+        """Wait mode returns an unchanged title without any Autolabel poll."""
+
+        stub = Stub([A], {A: [[label("pending")]]}, title="new title")
+        proc = self.edit_title(stub, "new title", "--apply", "--wait")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertEqual(stub.poll_index[A], -1)
+
+    def test_unchanged_title_still_checks_head(self) -> None:
+        """An unchanged title still rejects a mismatched head before any wait."""
+
+        stub = Stub([A], {A: [[label("pending")]]}, title="new title")
+        proc = self.edit_title(stub, "new title", "--apply", head=B[:12])
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertEqual(len(stub.requests), 1)
+        self.assertEqual(stub.poll_index[A], -1)
 
     def test_readback_mismatch(self) -> None:
         """An ignored title PATCH fails with both expected and actual titles."""
@@ -3716,17 +3745,23 @@ class EditTitleMutantTest(unittest.TestCase):
     """Require title-edit cases to kill each planted safety-check defect."""
 
     def test_every_mutant_is_caught(self) -> None:
-        """Missing head, dry-run and read-back guards fail their selected title cases."""
+        """Missing head, dry-run, read-back and early no-op guards fail selected cases."""
 
         source = HELPER.read_text(encoding="utf-8")
         mutations = (
             (
-                '  require_tested_head "$number" "$head"\n  wait_autolabel_done',
-                "  wait_autolabel_done",
+                '  require_tested_head "$number" "$head"\n'
+                '  title_unchanged "$number" "$title" && exit 0\n  wait_autolabel_done',
+                '  title_unchanged "$number" "$title" && exit 0\n  wait_autolabel_done',
                 "test_head_mismatch",
             ),
             ('if [ "$apply" = 0 ]; then', "if false; then", "test_dry_run"),
             ('if [ "$actual" != "$title" ]; then', "if false; then", "test_readback_mismatch"),
+            (
+                '  title_unchanged "$number" "$title" && exit 0\n  wait_autolabel_done',
+                "  wait_autolabel_done",
+                "test_unchanged_title_skips_pending_autolabel",
+            ),
         )
         for name, (old, new, test_name) in enumerate(mutations):
             with self.subTest(mutant=name):
