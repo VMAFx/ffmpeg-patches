@@ -611,6 +611,17 @@ class LaneBriefTest(unittest.TestCase):
                 self.assertFalse(lane_brief.has_entry(item + follower, item))
         self.assertTrue(lane_brief.has_entry(f"{item}s then {item} ", item))
 
+    def test_entry_adjacent_occurrences_use_real_suffix(self) -> None:
+        """Check adjacent occurrences against their real suffixes in the original text."""
+        item = "-m unittest tests.test_import_style"
+        self.assertFalse(lane_brief.has_entry(item + item + "s", item))
+        self.assertTrue(lane_brief.has_entry(item + item + " ", item))
+
+    def test_entry_overlapping_occurrence_counts(self) -> None:
+        """Accept an overlapping occurrence that ends at an allowed token boundary."""
+        self.assertTrue(lane_brief.has_entry("aaaa", "aaa"))
+        self.assertFalse(lane_brief.has_entry("aaab", "aaa"))
+
     def test_plain_substring_mutant_killed(self) -> None:
         """Expose the similar-module false acceptance when plain matching is restored."""
         source = (ROOT / "scripts" / "lane_brief.py").read_text(encoding="utf-8")

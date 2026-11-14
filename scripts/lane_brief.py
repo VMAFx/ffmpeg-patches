@@ -135,8 +135,18 @@ def ends_token(rest: str) -> bool:
 
 
 def has_entry(content: str, item: str) -> bool:
-    """Return whether any occurrence of an entry ends at an allowed token boundary."""
-    return any(ends_token(rest) for rest in content.split(item)[1:])
+    """Return False for an empty entry or whether any occurrence ends at a token boundary."""
+    if not item:
+        return False
+    start = 0
+    for _ in range(len(content) - len(item) + 1):
+        index = content.find(item, start)
+        if index < 0:
+            return False
+        if ends_token(content[index + len(item) :]):
+            return True
+        start = index + 1
+    return False
 
 
 def check(content: str, label: str, required: list[str]) -> int:
