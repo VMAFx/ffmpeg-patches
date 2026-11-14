@@ -55,11 +55,16 @@ UNSUBSTITUTED_SCRIPT_PATH = (
     "script path from an own-directory name with an expansion the guard cannot substitute; "
     "use plain $NAME or ${NAME} and no other expansion"
 )
-# Own directory of an executed script, symlinks resolved like Path.resolve():
-# $(dirname "$(readlink -f "${BASH_SOURCE[0]}")"), with realpath or $0 as variants.
-SCRIPT_DIR_VALUE = re.compile(
+_SCRIPT_DIR_DIRNAME = (
     r'\$\(dirname (?:-- )?"\$\((?:readlink -f|realpath)(?: --)? '
     r'"(?:\$\{BASH_SOURCE(?:\[0\])?\}|\$BASH_SOURCE|\$\{0\}|\$0)"\)"\)'
+)
+# Own directory of an executed script, symlinks resolved like Path.resolve():
+# $(dirname "$(readlink -f "${BASH_SOURCE[0]}")") (with realpath or $0 as variants)
+# or $(cd "<dirname>" && pwd) around that dirname value.
+# The cd form has the same value: readlink -f or realpath already resolves every symlink.
+SCRIPT_DIR_VALUE = re.compile(
+    rf'(?:{_SCRIPT_DIR_DIRNAME}|\$\(cd (?:-P )?(?:-- )?"{_SCRIPT_DIR_DIRNAME}" && pwd(?: -P)?\))'
 )
 # ${OVERRIDE:-value} or ${OVERRIDE-value}: the value applies only while OVERRIDE is unset.
 SCRIPT_DIR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-(.+)\}")
