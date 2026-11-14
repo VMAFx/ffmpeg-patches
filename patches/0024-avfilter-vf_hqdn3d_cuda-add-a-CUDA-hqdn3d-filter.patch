@@ -26,10 +26,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  doc/filters.texi                  |  32 ++
  libavfilter/Makefile              |   5 +
  libavfilter/allfilters.c          |   1 +
- libavfilter/tests/hqdn3d_vulkan.c | 230 ++++++---
- libavfilter/vf_hqdn3d_cuda.c      | 787 ++++++++++++++++++++++++++++++
+ libavfilter/tests/hqdn3d_vulkan.c | 232 ++++++---
+ libavfilter/vf_hqdn3d_cuda.c      | 792 ++++++++++++++++++++++++++++++
  libavfilter/vf_hqdn3d_cuda.cu     | 458 +++++++++++++++++
- 7 files changed, 1456 insertions(+), 59 deletions(-)
+ 7 files changed, 1462 insertions(+), 60 deletions(-)
  create mode 100644 libavfilter/vf_hqdn3d_cuda.c
  create mode 100644 libavfilter/vf_hqdn3d_cuda.cu
 
@@ -47,7 +47,7 @@ index 231c6b67c5dd7564633dc0801adc81cf676ea575..c8c4e002e95f06aac7a5e2caccd0d2a9
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 51b54e51363147a4b1a1e6ac18abef5d0e33a5fc..5b2969e9a0271508c201df519cc71cb746949ae7 100644
+index 20fd10c7f159d3450599317937944a81257574a5..c77fb72188d1abbe09d72ada1cf43298d9d7c6b4 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15792,6 +15792,38 @@ The command accepts the same syntax of the corresponding option.
@@ -125,7 +125,7 @@ index 3211fc02153db11796ab388a28faa82e1c465f53..3cacb97a8fbfc2e5e0880aa1048f2459
  extern const FFFilter ff_vf_hqx;
  extern const FFFilter ff_vf_hstack;
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
-index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e029b1542c 100644
+index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bbfda09351 100644
 --- a/libavfilter/tests/hqdn3d_vulkan.c
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
 @@ -22,11 +22,15 @@
@@ -348,7 +348,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      AVBufferRef *upload_ctxs[5];
      AVFilterGraph *cpu_graph, *gpu_graph;
      AVFilterContext *cpu_src, *cpu_sink, *gpu_src, *gpu_sink;
-@@ -545,7 +592,7 @@ static int run_format_step(ResetTest *t, int n, enum AVPixelFormat fmt,
+@@ -554,7 +601,7 @@ static int run_format_step(ResetTest *t, int n, enum AVPixelFormat fmt,
              memset(sw_f->data[p] + y * sw_f->linesize[p], 0, FFABS(sw_f->linesize[p]));
      }
  
@@ -357,7 +357,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      av_frame_free(&sw_f);
      if (err < 0) {
          av_frame_free(&out);
-@@ -592,7 +639,8 @@ static int run_first_frame_step(ResetTest *t, int n, uint32_t *seed, int *is_sam
+@@ -601,7 +648,8 @@ static int run_first_frame_step(ResetTest *t, int n, uint32_t *seed, int *is_sam
      if (err < 0)
          goto end;
  
@@ -367,7 +367,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      if (err < 0)
          goto end;
  
-@@ -632,11 +680,13 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
+@@ -641,11 +689,13 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
      const AVPixFmtDescriptor *desc;
      int err, refused_err = 0, refused = 0;
  
@@ -383,7 +383,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      if (err < 0)
          goto end;
  
-@@ -662,7 +712,7 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
+@@ -671,7 +721,7 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
              memset(sw_f->data[p] + y * sw_f->linesize[p], 0, FFABS(sw_f->linesize[p]));
      }
  
@@ -392,7 +392,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      av_frame_free(&sw_f);
      if (err < 0)
          goto end;
-@@ -711,11 +761,13 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
+@@ -720,11 +770,13 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
      AVFrame *sw_f = NULL, *gpu_in_vk = NULL, *gpu_out_vk = NULL, *sw_out = NULL;
      int err;
  
@@ -408,7 +408,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      if (err < 0)
          goto end;
  
-@@ -756,7 +808,7 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
+@@ -765,7 +817,7 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
          }
  
          sw_f->pts = n;
@@ -417,7 +417,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
          if (err < 0)
              goto end;
  
-@@ -862,7 +914,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref)
+@@ -872,7 +924,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
      AVFrame *sw_f = NULL, *cpu_out = NULL, *gpu_out = NULL;
      int err;
  
@@ -427,7 +427,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      if (err < 0)
          goto end;
  
-@@ -870,7 +923,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref)
+@@ -880,7 +933,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
      if (err < 0)
          goto end;
  
@@ -437,7 +437,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      if (err < 0)
          goto end;
  
-@@ -914,57 +968,111 @@ end:
+@@ -924,58 +978,112 @@ end:
      return err;
  }
  
@@ -513,7 +513,8 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      return 0;
  }
  
--/* Verify parity on resets, first frame larger than link, format rejection, negative result, and F1/F4 cases. */
+-/* Verify parity on resets, first frame larger than link, format rejection, negative result,
+- * and F1/F4 cases; exit nonzero on an error or when a compared frame differs. */
 +/* Return the first built backend in the default device preference order. */
 +static enum AVHWDeviceType get_default_hw_type(void)
 +{
@@ -560,11 +561,12 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
 +#endif
 +}
 +
-+/* Verify GPU reset parity and run Vulkan-specific regression steps when selected. */
++/* Verify GPU reset parity and run Vulkan-specific regression steps when selected;
++ * exit nonzero on an error or when a compared frame differs. */
  int main(int argc, char **argv)
  {
      ResetTest t = { 0 };
-@@ -975,11 +1083,12 @@ int main(int argc, char **argv)
+@@ -986,11 +1094,12 @@ int main(int argc, char **argv)
      int refused_10 = 0, refused_444 = 0;
  
      if (argc > 2) {
@@ -580,7 +582,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
  
      av_log_set_level(AV_LOG_ERROR);
  
-@@ -997,6 +1106,9 @@ int main(int argc, char **argv)
+@@ -1008,6 +1117,9 @@ int main(int argc, char **argv)
              goto end;
      }
  
@@ -590,7 +592,7 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      err = run_first_frame_step(&t, 14, &seed, &first_same);
      if (err < 0)
          goto end;
-@@ -1014,15 +1126,15 @@ int main(int argc, char **argv)
+@@ -1025,15 +1137,15 @@ int main(int argc, char **argv)
              goto end;
      }
  
@@ -604,17 +606,17 @@ index 8a6a0a56a84b99e5a62485e5809b0982c5687ff1..aa2eebaf37fe4beb07d0091c6ec7a2e0
      if (err < 0)
          goto end;
  
--    err = run_neg_step(t.vk_device_ref);
-+    err = run_neg_step(t.device_ref);
+-    err = run_neg_step(t.vk_device_ref, &t.diffs);
++    err = run_neg_step(t.device_ref, &t.diffs);
  
  end:
      if (err < 0)
 diff --git a/libavfilter/vf_hqdn3d_cuda.c b/libavfilter/vf_hqdn3d_cuda.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..1eda9aabfa2706a68469de33bad2d46265ed34d0
+index 0000000000000000000000000000000000000000..a80111e8cf3f23a859503f8e054f54c171c094df
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_cuda.c
-@@ -0,0 +1,787 @@
+@@ -0,0 +1,792 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -656,6 +658,11 @@ index 0000000000000000000000000000000000000000..1eda9aabfa2706a68469de33bad2d462
 +#include "hqdn3d_coefs.h"
 +
 +#include "cuda/load_helper.h"
++
++/* FFmpeg releases without the frame parameter check on filter inputs lack this flag. */
++#ifndef FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE
++#define FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE 0
++#endif
 +
 +#define DIV_UP(a, b) ( ((a) + (b) - 1) / (b) )
 +#define BLOCK_SIZE 128
@@ -1400,7 +1407,7 @@ index 0000000000000000000000000000000000000000..1eda9aabfa2706a68469de33bad2d462
 +    FILTER_INPUTS(hqdn3d_cuda_inputs),
 +    FILTER_OUTPUTS(hqdn3d_cuda_outputs),
 +    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_CUDA),
-+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE | FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE,
 +};
 diff --git a/libavfilter/vf_hqdn3d_cuda.cu b/libavfilter/vf_hqdn3d_cuda.cu
 new file mode 100644

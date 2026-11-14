@@ -33,18 +33,24 @@ frame size whose sample buffers exceed the device's
 maxStorageBufferRange. A failed initialization, or a failed
 reallocation after a size change, is final.
 
-This is the content of FFmpeg pull request 25879, adapted to the 9.0
-release: the fail path discards the execution context with
-ff_vk_exec_discard_deps(), the host wait after each submission orders
-the temporal history between frames (this release has no timeline
-semaphore on FFVkExecContext), the filter does not declare
-FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE, which this release does not have,
-and the Changelog is left alone.
+This is the content of FFmpeg pull request 25879 at head af1b930ea6,
+adapted to the 9.0 release, which has no timeline semaphore on
+FFVkExecContext and no FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE. Every frame
+records on one execution context, a buffer memory barrier makes the
+previous frame's temporal history writes visible to the compute shaders,
+and the host waits after each submission. A recording that is not
+submitted is ended and its dependencies are discarded with
+ff_vk_exec_discard_deps(); after that, or after a failed submission, an
+empty queue submission signals the context fence, so the next
+ff_vk_exec_start() on the context finds the fence signalled. The filter
+does not declare FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE, and the Changelog is
+left alone.
 
 libavfilter/tests/hqdn3d_vulkan runs hqdn3d and hqdn3d_vulkan side by
 side on frames of three sizes and compares every output frame; it also
 checks the first-frame size change, the format refusal, the p012 clamp
-and a temporal result below zero. It runs under fate-hw as
+and a temporal result below zero, and exits nonzero on an error or when
+a compared frame differs. It runs under fate-hw as
 fate-filter-hqdn3d-vulkan when hqdn3d_vulkan and hqdn3d are enabled.
 
 The filter ports GPL code and therefore depends on --enable-gpl, as
@@ -58,15 +64,15 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/allfilters.c                      |    1 +
  libavfilter/hqdn3d_coefs.c                    |   58 +
  libavfilter/hqdn3d_coefs.h                    |   57 +
- libavfilter/tests/hqdn3d_vulkan.c             | 1032 +++++++++++++++++
+ libavfilter/tests/hqdn3d_vulkan.c             | 1043 +++++++++++++++++
  libavfilter/vf_hqdn3d.c                       |   33 +-
- libavfilter/vf_hqdn3d_vulkan.c                |  891 ++++++++++++++
+ libavfilter/vf_hqdn3d_vulkan.c                |  925 +++++++++++++++
  libavfilter/vulkan/Makefile                   |    2 +
  .../vulkan/hqdn3d_horizontal.comp.glsl        |  160 +++
  libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  233 ++++
  tests/fate/hw.mak                             |    4 +
  tests/ref/fate/filter-hqdn3d-vulkan           |   21 +
- 14 files changed, 2512 insertions(+), 31 deletions(-)
+ 14 files changed, 2557 insertions(+), 31 deletions(-)
  create mode 100644 libavfilter/hqdn3d_coefs.c
  create mode 100644 libavfilter/hqdn3d_coefs.h
  create mode 100644 libavfilter/tests/hqdn3d_vulkan.c
@@ -88,7 +94,7 @@ index b1656f0f803081cecc0f9ac7136c2d08d0494ca1..231c6b67c5dd7564633dc0801adc81cf
  iccgen_filter_deps="lcms2"
  identity_filter_select="scene_sad"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..51b54e51363147a4b1a1e6ac18abef5d0e33a5fc 100644
+index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..20fd10c7f159d3450599317937944a81257574a5 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15792,6 +15792,52 @@ The command accepts the same syntax of the corresponding option.
@@ -107,7 +113,7 @@ index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..51b54e51363147a4b1a1e6ac18abef5d
 +The filter refuses a frame whose software format differs from the link's.
 +The filter also refuses a device on which one of these shader or storage
 +features is not enabled: @code{shaderInt16}, @code{storageBuffer16BitAccess},
-+@code{scalarBlockLayout}, @code{runtimeDescriptorArray},
++@code{scalarBlockLayout},
 +@code{shaderStorageImageReadWithoutFormat}, or
 +@code{shaderStorageImageWriteWithoutFormat}. A device that FFmpeg creates
 +enables each of them that the hardware supports; a device the application
@@ -307,10 +313,10 @@ index 0000000000000000000000000000000000000000..3399d70ec3d321ab51a61b99f1dabdb5
 +#endif /* AVFILTER_HQDN3D_COEFS_H */
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982c5687ff1
+index 0000000000000000000000000000000000000000..8c259b6396453291b26b60b8f7c96cb323bf602f
 --- /dev/null
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
-@@ -0,0 +1,1032 @@
+@@ -0,0 +1,1043 @@
 +/*
 + * Copyright (c) 2026 Lusoris
 + *
@@ -771,7 +777,16 @@ index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982
 +    AVBufferRef *upload_ctxs[5];
 +    AVFilterGraph *cpu_graph, *gpu_graph;
 +    AVFilterContext *cpu_src, *cpu_sink, *gpu_src, *gpu_sink;
++    int diffs; /* compared frames that differ from the CPU filter */
 +} ResetTest;
++
++/* Return the status word of one CPU/GPU comparison and count a mismatch in *diffs. */
++static const char *same_word(int same, int *diffs)
++{
++    if (!same)
++        (*diffs)++;
++    return same ? "same" : "DIFF";
++}
 +
 +/* Run one frame through CPU and GPU pipelines, verify pixel equality, and print status line. */
 +static int process_one_frame(ResetTest *t, int n, uint32_t *seed, int *is_same)
@@ -799,7 +814,7 @@ index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982
 +
 +    *is_same = compare_planes(cpu_out, gpu_out);
 +    printf("%d %d %d %s\n", n, gpu_out->width, gpu_out->height,
-+           *is_same ? "same" : "DIFF");
++           same_word(*is_same, &t->diffs));
 +    fflush(stdout);
 +
 +    av_frame_free(&cpu_out);
@@ -923,7 +938,7 @@ index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982
 +
 +    *is_same = compare_planes(cpu_out, gpu_out);
 +    printf("%d %d %d first %s\n", n, gpu_out->width, gpu_out->height,
-+           *is_same ? "same" : "DIFF");
++           same_word(*is_same, &t->diffs));
 +    fflush(stdout);
 +
 +end:
@@ -1165,8 +1180,9 @@ index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982
 +}
 +
 +/* Frame 1 drives the temporal result at luma (0,1) to -1, which hqdn3d stores
-+ * as 65535. Print the CPU luma and whether the GPU output matches the CPU. */
-+static int run_neg_step(AVBufferRef *vk_device_ref)
++ * as 65535. Print the CPU luma and whether the GPU output matches the CPU, and
++ * count a mismatch in *diffs. */
++static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
 +{
 +    AVBufferRef *frames_ref = NULL;
 +    AVFilterGraph *cpu_graph = NULL, *gpu_graph = NULL;
@@ -1207,7 +1223,7 @@ index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982
 +        y0 = (const uint16_t *)cpu_out->data[0];
 +        y1 = (const uint16_t *)(cpu_out->data[0] + cpu_out->linesize[0]);
 +        printf("neg %d %d %d %s luma %d %d %d %d\n", n, gpu_out->width, gpu_out->height,
-+               compare_planes(cpu_out, gpu_out) ? "same" : "DIFF",
++               same_word(compare_planes(cpu_out, gpu_out), diffs),
 +               y0[0], y0[1], y1[0], y1[1]);
 +        fflush(stdout);
 +
@@ -1277,7 +1293,8 @@ index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982
 +    return 0;
 +}
 +
-+/* Verify parity on resets, first frame larger than link, format rejection, negative result, and F1/F4 cases. */
++/* Verify parity on resets, first frame larger than link, format rejection, negative result,
++ * and F1/F4 cases; exit nonzero on an error or when a compared frame differs. */
 +int main(int argc, char **argv)
 +{
 +    ResetTest t = { 0 };
@@ -1335,13 +1352,13 @@ index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982
 +    if (err < 0)
 +        goto end;
 +
-+    err = run_neg_step(t.vk_device_ref);
++    err = run_neg_step(t.vk_device_ref, &t.diffs);
 +
 +end:
 +    if (err < 0)
 +        fprintf(stderr, "Test failed: %s (%d)\n", err_to_name(err), err);
 +    cleanup_all(&t);
-+    return err < 0;
++    return err < 0 || t.diffs > 0;
 +}
 diff --git a/libavfilter/vf_hqdn3d.c b/libavfilter/vf_hqdn3d.c
 index 98c05e886c20dea9b4adff6f6075afb4abbfe204..d066a0e75bb927300a19ccddfb80ba21f8ad92e8 100644
@@ -1407,10 +1424,10 @@ index 98c05e886c20dea9b4adff6f6075afb4abbfe204..d066a0e75bb927300a19ccddfb80ba21
  static int config_input(AVFilterLink *inlink)
 diff --git a/libavfilter/vf_hqdn3d_vulkan.c b/libavfilter/vf_hqdn3d_vulkan.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e056580ac6b70
+index 0000000000000000000000000000000000000000..461fe552ff87f6fda2a39b594a5a9233d4968c6c
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_vulkan.c
-@@ -0,0 +1,891 @@
+@@ -0,0 +1,925 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -1435,6 +1452,7 @@ index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e0565
 + */
 +
 +#include <float.h>
++#include "libavutil/internal.h"
 +#include "libavutil/mem.h"
 +#include "libavutil/opt.h"
 +#include "libavutil/pixdesc.h"
@@ -1749,10 +1767,8 @@ index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e0565
 +    const VkPhysicalDevice16BitStorageFeatures *s16;
 +    const VkPhysicalDeviceVulkan12Features *v12;
 +    const VkPhysicalDeviceScalarBlockLayoutFeatures *sbl;
-+    const VkPhysicalDeviceDescriptorIndexingFeatures *di;
 +    int has_storageBuffer16BitAccess;
 +    int has_scalarBlockLayout;
-+    int has_runtimeDescriptorArray;
 +
 +    if (!feats->shaderInt16) {
 +        av_log(ctx, AV_LOG_ERROR, "Vulkan device lacks required feature: shaderInt16\n");
@@ -1785,14 +1801,6 @@ index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e0565
 +        return AVERROR(ENOTSUP);
 +    }
 +
-+    di = ff_vk_find_struct(pnext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES);
-+    has_runtimeDescriptorArray = (v12 && v12->runtimeDescriptorArray) ||
-+                                 (di && di->runtimeDescriptorArray);
-+    if (!has_runtimeDescriptorArray) {
-+        av_log(ctx, AV_LOG_ERROR, "Vulkan device lacks required feature: runtimeDescriptorArray\n");
-+        return AVERROR(ENOTSUP);
-+    }
-+
 +    return 0;
 +}
 +
@@ -1814,7 +1822,8 @@ index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e0565
 +        return AVERROR(ENOTSUP);
 +    }
 +
-+    err = ff_vk_exec_pool_init(vkctx, s->qf, &s->e, s->qf->num * 4, 0, 0, 0, NULL);
++    /* One execution context keeps frames on one queue so history barriers order prior frames. */
++    err = ff_vk_exec_pool_init(vkctx, s->qf, &s->e, 1, 0, 0, 0, NULL);
 +    if (err < 0)
 +        return err;
 +
@@ -2080,13 +2089,26 @@ index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e0565
 +    return 0;
 +}
 +
-+/* Create image views and insert pipeline barriers transitioning input and output frame images. */
++/* Create views, transition frames, and make prior-frame history writes visible to this frame. */
 +static int setup_views_and_barriers(HQDN3DVulkanContext *s, FFVkExecContext *exec,
 +                                    AVFrame *in, AVFrame *out,
 +                                    VkImageView *in_views, VkImageView *out_views)
 +{
 +    FFVulkanContext *vkctx = &s->vkctx;
 +    VkImageMemoryBarrier2 img_bar[AV_NUM_DATA_POINTERS * 2];
++    VkBufferMemoryBarrier2 hist_bar = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
++        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
++                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .buffer = s->frame_ant_buf.buf,
++        .offset = 0,
++        .size = s->frame_ant_buf.size,
++    };
 +    int nb_img_bar = 0;
 +    int err;
 +
@@ -2118,6 +2140,8 @@ index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e0565
 +                        VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED);
 +    vkctx->vkfn.CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo) {
 +        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++        .pBufferMemoryBarriers = &hist_bar,
++        .bufferMemoryBarrierCount = 1,
 +        .pImageMemoryBarriers = img_bar,
 +        .imageMemoryBarrierCount = nb_img_bar,
 +    });
@@ -2156,8 +2180,37 @@ index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e0565
 +    return 0;
 +}
 +
-+/* Record one frame, submit it and wait for it on the host; the host wait also orders this
-+ * frame's temporal history writes before the next frame. Discard the recording on error. */
++/* Signal the context fence with an empty queue submission after an aborted or failed submit. */
++static void signal_exec_fence(HQDN3DVulkanContext *s, FFVkExecContext *exec)
++{
++    FFVulkanContext *vkctx = &s->vkctx;
++    VkResult ret;
++
++#if FF_API_VULKAN_SYNC_QUEUES
++FF_DISABLE_DEPRECATION_WARNINGS
++    vkctx->hwctx->lock_queue(vkctx->device, exec->qf, exec->qi);
++FF_ENABLE_DEPRECATION_WARNINGS
++#endif
++    ret = vkctx->vkfn.QueueSubmit2(exec->queue, 0, NULL, exec->fence);
++#if FF_API_VULKAN_SYNC_QUEUES
++FF_DISABLE_DEPRECATION_WARNINGS
++    vkctx->hwctx->unlock_queue(vkctx->device, exec->qf, exec->qi);
++FF_ENABLE_DEPRECATION_WARNINGS
++#endif
++    if (ret != VK_SUCCESS)
++        av_log(s, AV_LOG_ERROR, "Unable to signal the execution fence: %s\n",
++               ff_vk_ret2str(ret));
++}
++
++/* End an unsubmitted command buffer, discard its dependencies, and signal its fence. */
++static void abort_recording(HQDN3DVulkanContext *s, FFVkExecContext *exec)
++{
++    s->vkctx.vkfn.EndCommandBuffer(exec->buf);
++    ff_vk_exec_discard_deps(&s->vkctx, exec);
++    signal_exec_fence(s, exec);
++}
++
++/* Record one frame, submit, and wait on host; on error, drop recording and signal its fence. */
 +static int exec_filter(HQDN3DVulkanContext *s, AVFrame *in, AVFrame *out)
 +{
 +    FFVulkanContext *vkctx = &s->vkctx;
@@ -2171,23 +2224,21 @@ index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e0565
 +        return err;
 +
 +    err = setup_views_and_barriers(s, exec, in, out, in_views, out_views);
-+    if (err < 0)
-+        goto fail;
-+
-+    err = dispatch_passes(s, exec, in, out, in_views, out_views, in->width, in->height);
-+    if (err < 0)
-+        goto fail;
++    if (err >= 0)
++        err = dispatch_passes(s, exec, in, out, in_views, out_views, in->width, in->height);
++    if (err < 0) {
++        abort_recording(s, exec);
++        return err;
++    }
 +
 +    err = ff_vk_exec_submit(vkctx, exec);
-+    if (err < 0)
++    if (err < 0) {
++        signal_exec_fence(s, exec);
 +        return err;
++    }
 +    ff_vk_exec_wait(vkctx, exec);
 +
 +    return 0;
-+
-+fail:
-+    ff_vk_exec_discard_deps(vkctx, exec);
-+    return err;
 +}
 +
 +/* Validate incoming frame, lazily initialize pipelines, execute filter, and push output frame. */

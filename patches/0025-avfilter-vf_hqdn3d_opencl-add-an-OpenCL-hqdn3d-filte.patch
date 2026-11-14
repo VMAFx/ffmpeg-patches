@@ -29,8 +29,8 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/opencl/hqdn3d.cl      | 315 ++++++++++++
  libavfilter/opencl_source.h       |   1 +
  libavfilter/tests/hqdn3d_vulkan.c |  23 +-
- libavfilter/vf_hqdn3d_opencl.c    | 810 ++++++++++++++++++++++++++++++
- 8 files changed, 1185 insertions(+), 1 deletion(-)
+ libavfilter/vf_hqdn3d_opencl.c    | 815 ++++++++++++++++++++++++++++++
+ 8 files changed, 1190 insertions(+), 1 deletion(-)
  create mode 100644 libavfilter/opencl/hqdn3d.cl
  create mode 100644 libavfilter/vf_hqdn3d_opencl.c
 
@@ -47,7 +47,7 @@ index c8c4e002e95f06aac7a5e2caccd0d2a93dee366d..d386cc831d5e7265f8f73f42692a91ea
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 5b2969e9a0271508c201df519cc71cb746949ae7..cb6e920d984551bb4f09b580c37fbb3dbfd83a50 100644
+index c77fb72188d1abbe09d72ada1cf43298d9d7c6b4..0a85746f13ce5de161588bc55691a94ea7637e8d 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15824,6 +15824,39 @@ The filter accepts the same options as @ref{hqdn3d}:
@@ -456,7 +456,7 @@ index 4a7b945e029fbff9a5795481d455dc5afd90d90b..65546425d65f6c3ffc71e9ffe7ad88c5
  extern const char *ff_source_nlmeans_cl;
  extern const char *ff_source_overlay_cl;
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
-index aa2eebaf37fe4beb07d0091c6ec7a2e029b1542c..d3b1c72b34abe48357b646e2cedf16fc3ae075e7 100644
+index ecff5faf835edcb47801345f212b53bbfda09351..e3184e8bb5503774515cab7b1f04e70b74de4aaa 100644
 --- a/libavfilter/tests/hqdn3d_vulkan.c
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
 @@ -107,6 +107,10 @@ static enum AVPixelFormat get_gpu_pix_fmt(enum AVHWDeviceType hw_type)
@@ -481,7 +481,7 @@ index aa2eebaf37fe4beb07d0091c6ec7a2e029b1542c..d3b1c72b34abe48357b646e2cedf16fc
  #endif
      default:
          return NULL;
-@@ -1033,6 +1041,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
+@@ -1043,6 +1051,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
      return AV_HWDEVICE_TYPE_VULKAN;
  #elif CONFIG_HQDN3D_CUDA_FILTER
      return AV_HWDEVICE_TYPE_CUDA;
@@ -490,7 +490,7 @@ index aa2eebaf37fe4beb07d0091c6ec7a2e029b1542c..d3b1c72b34abe48357b646e2cedf16fc
  #else
      return AV_HWDEVICE_TYPE_NONE;
  #endif
-@@ -1062,6 +1072,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+@@ -1072,6 +1082,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
  #endif
      }
  
@@ -508,7 +508,7 @@ index aa2eebaf37fe4beb07d0091c6ec7a2e029b1542c..d3b1c72b34abe48357b646e2cedf16fc
  #if CONFIG_HQDN3D_VULKAN_FILTER
      *hw_type = AV_HWDEVICE_TYPE_VULKAN;
      *dev_idx = strncmp(arg, "vk:", 3) == 0 ? arg + 3 : arg;
-@@ -1083,7 +1104,7 @@ int main(int argc, char **argv)
+@@ -1094,7 +1115,7 @@ int main(int argc, char **argv)
      int refused_10 = 0, refused_444 = 0;
  
      if (argc > 2) {
@@ -519,10 +519,10 @@ index aa2eebaf37fe4beb07d0091c6ec7a2e029b1542c..d3b1c72b34abe48357b646e2cedf16fc
      err = parse_device_arg(argc >= 2 ? argv[1] : NULL, &t.hw_type, &dev_idx);
 diff --git a/libavfilter/vf_hqdn3d_opencl.c b/libavfilter/vf_hqdn3d_opencl.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..4ba48b78055d4b087a1a583c91711b6c748d146a
+index 0000000000000000000000000000000000000000..b9ea7a15fc2bb6a046adeb854b16b13111fe9ac2
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_opencl.c
-@@ -0,0 +1,810 @@
+@@ -0,0 +1,815 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -563,6 +563,11 @@ index 0000000000000000000000000000000000000000..4ba48b78055d4b087a1a583c91711b6c
 +#include "video.h"
 +#include "vf_hqdn3d.h"
 +#include "hqdn3d_coefs.h"
++
++/* FFmpeg releases without the frame parameter check on filter inputs lack this flag. */
++#ifndef FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE
++#define FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE 0
++#endif
 +
 +typedef struct HQDN3DOpenCLContext {
 +    OpenCLFilterContext ocf;
@@ -1330,6 +1335,6 @@ index 0000000000000000000000000000000000000000..4ba48b78055d4b087a1a583c91711b6c
 +    FILTER_INPUTS(hqdn3d_opencl_inputs),
 +    FILTER_OUTPUTS(hqdn3d_opencl_outputs),
 +    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
-+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE | FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE,
 +    .process_command = &process_command,
 +};

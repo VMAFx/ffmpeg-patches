@@ -18,7 +18,7 @@ Signed-off-by: lusoris <lusoris@proton.me>
  3 files changed, 25 insertions(+), 6 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 1d18c9732202214b27b246902be08914d8a9f92a..150d8ffe42ecbdf3a356ec696dd711a36cd4eeb8 100644
+index cfd3ce3ff4bbba3fc2c19dc81d73ee90eff2ae68..936173d2dc09e50d8f02e8a43afdd2a252b6fd6a 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -28673,8 +28673,10 @@ It accepts the following parameters:
