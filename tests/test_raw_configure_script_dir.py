@@ -15,15 +15,19 @@ UNKNOWN_SOURCE = "relative script path after a source the guard cannot read; use
 AMBIGUOUS = "assigned in a sourced file and elsewhere"
 UNRESOLVED = "own-directory name assigned in a function, branch or loop"
 UNSUBSTITUTED = "expansion the guard cannot substitute"
+REBOUND = "can rebind the commands of the idiom"
+NEWLINE = "directory path holds a newline"
 BENIGN_NEXT = {"tools/next.sh": "echo benign\n"}
 DEFAULT = 'HERE=${LANE_TEST_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}\n'
 DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
 REALPATH = 'HERE=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")\n'
 CDPWD = 'HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
+THERE = 'THERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
 CDPWD_P = 'HERE="$(cd -P -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")" && pwd -P)"\n'
 CD_LINK_DIR = 'HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)\n'
 CD_EXTRA = 'HERE=$(cd "$(dirname "$(readlink -f "$0")")" && cd sub && pwd)\n'
 SRC = '. "$HERE/lib.sh"\n'
+SRC_THERE = '. "$THERE/lib.sh"\n'
 UNREAD = '. "$UNSET_DIR/x.sh"\n'
 RUN = "bash inner.sh\n"
 CFG = "<cfg>\n"
@@ -203,6 +207,57 @@ SCRIPT_DIR = {
     ),
     "cd-link-dir-unresolved": Case(CD_LINK_DIR + SRC + RUN, 2, UNKNOWN_SOURCE),
     "cd-extra-command-unresolved": Case(CD_EXTRA + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "cd-pwd-two-names": Case(CDPWD + THERE + SRC_THERE + RUN, 0),
+    "cd-pwd-two-names-lib-runs-configure": Case(
+        CDPWD + THERE + SRC_THERE, 2, "tree/configure", {"tools/lib.sh": CFG}
+    ),
+    "subst-cd-keeps-relative-paths": Case("X=$(cd sub && bash ./inner.sh)\n", 2, "tree/configure"),
+    "subst-cd-leaves-caller-dir": Case("X=$(cd sub && pwd)\n" + RUN, 0),
+    "subshell-cd-leaves-caller-dir": Case("(cd sub && true)\n" + RUN, 0),
+    "process-subst-cd-leaves-caller-dir": Case("true <(cd sub && pwd)\n" + RUN, 0),
+    "brace-group-cd-moves-caller": Case("{ cd sub; }\n" + RUN, 2, "tree/configure"),
+    "shadowed-pwd": Case('pwd() { echo "<case>/sub"; }\n' + CDPWD + SRC + RUN, 2, REBOUND),
+    "shadowed-dirname": Case(
+        'dirname() { echo "<case>/sub"; }\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "shadowed-cd-function-keyword": Case(
+        'function cd { builtin cd "<case>/sub"; }\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "shadowed-realpath": Case(
+        'realpath() { echo "<case>/sub/x"; }\n' + REALPATH + SRC + RUN, 2, REBOUND
+    ),
+    "shadowed-readlink-in-sourced-file": Case(
+        '. "<case>/tools/shadow.sh"\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+        {"tools/shadow.sh": 'readlink() { echo "<case>/sub/x"; }\n'},
+    ),
+    "alias-before": Case(
+        "shopt -s expand_aliases\nalias pwd='echo <case>/sub'\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "enable-before": Case("enable -n pwd\n" + CDPWD + SRC + RUN, 2, REBOUND),
+    "hash-p-before": Case("hash -p /bin/echo dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "path-before": Case("PATH=<case>/bin:$PATH\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "export-path-before": Case("export PATH=<case>/bin:$PATH\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "path-same-statement": Case("PATH=<case>/bin " + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unset-path-before": Case("unset PATH\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-v-path-before": Case(
+        "printf -v PATH '%s' <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "nameref-path-before": Case(
+        "declare -n P=PATH\nP=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "bash-func-in-environment": Case(
+        DOLLAR0 + SRC + RUN, 2, REBOUND, env={"BASH_FUNC_dirname%%": "() {  echo /x; }"}
+    ),
+    "bash-env-in-environment": Case(
+        DOLLAR0 + SRC + RUN, 2, REBOUND, env={"BASH_ENV": "/nonexistent/rc"}
+    ),
+    "path-after-idiom": Case(DOLLAR0 + "PATH=<case>/bin:$PATH\n" + SRC + RUN, 0),
+    "path-command-prefix": Case("PATH=/usr/bin:/bin true\n" + DOLLAR0 + SRC + RUN, 0),
+    "unrelated-function": Case("helper() { echo hi; }\n" + DOLLAR0 + SRC + RUN, 0),
+    "pwd-function-after-idiom": Case(CDPWD + "pwd() { echo x; }\n" + SRC + RUN, 0),
+    "hash-r-before": Case("hash -r\n" + DOLLAR0 + SRC + RUN, 0),
 }
 
 
@@ -241,8 +296,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 55 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 55)
+        """Replay all 83 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 83)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
@@ -251,6 +306,37 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
                 if case.reason is not None:
                     self.assertIn(case.reason, result.stderr)
                 self.assertFalse(self.marker.exists())
+
+    def test_newline_script_dir_refuses(self) -> None:
+        """Refuse own-directory references when the script directory path holds a newline."""
+        for i, form in enumerate((DOLLAR0, CDPWD)):
+            with self.subTest(i=i):
+                base = self._case_dir(
+                    f"newline-{i}",
+                    Case(
+                        form + SRC + RUN,
+                        2,
+                        files={
+                            "tools/lib.sh": CFG,
+                            "tools\n/run.sh": form + SRC + RUN,
+                            "tools\n/lib.sh": "X=1\n",
+                            "tools\n/inner.sh": "echo benign\n",
+                        },
+                    ),
+                )
+                result = self._run(base / "tools\n", "bash ./run.sh")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(NEWLINE, result.stderr)
+                self.assertFalse(self.marker.exists())
+
+    def test_unsuffixed_sibling_of_newline_dir_allowed(self) -> None:
+        """Allow an unsuffixed sibling directory when only the newline directory holds configure."""
+        base = self._case_dir(
+            "newline-sibling", Case(DOLLAR0 + SRC + RUN, 0, files={"tools\n/lib.sh": CFG})
+        )
+        result = self._run(base / "tools", "bash ./run.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.marker.exists())
 
     def test_unreadable_script_dir_source_refuses(self) -> None:
         """Keep refusing a resolved source the guard cannot read or that is no regular file."""

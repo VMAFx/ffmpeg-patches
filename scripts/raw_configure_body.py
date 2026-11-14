@@ -48,6 +48,14 @@ UNRESOLVED_SCRIPT_DIR = (
     "script path from an own-directory name assigned in a function, branch or loop; "
     "assign it once at the top level"
 )
+NEWLINE_SCRIPT_DIR = (
+    "script path from an own-directory name whose directory path holds a newline, "
+    "which command substitution can strip; use an absolute path"
+)
+REBOUND_SCRIPT_DIR = (
+    "script path from an own-directory name assigned after a shell function, alias, enable, "
+    "hash or PATH change that can rebind the commands of the idiom; use an absolute path"
+)
 UNKNOWN_SOURCE_PATH = (
     "relative script path after a source the guard cannot read; use an absolute path"
 )
@@ -69,6 +77,12 @@ SCRIPT_DIR_VALUE = re.compile(
 # ${OVERRIDE:-value} or ${OVERRIDE-value}: the value applies only while OVERRIDE is unset.
 SCRIPT_DIR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-(.+)\}")
 ASSIGNED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PLAIN_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+PATH_WORD = re.compile(r"PATH(?:\+?=.*)?", re.DOTALL)
+SUBSHELLS = frozenset(["command_substitution", "process_substitution", "subshell"])
+IDIOM_COMMANDS = frozenset(["cd", "pwd", "dirname", "readlink", "realpath"])
+REBINDING_COMMANDS = frozenset(["alias", "enable", "hash"])
+PATH_WRITERS = frozenset(["read", "printf", "mapfile", "readarray", "getopts", "let"])
 STRUCTURE = frozenset(
     [
         "program",
@@ -184,6 +198,13 @@ class BodyBudget:
     peeks: int = 0
 
 
+class _DirState(NamedTuple):
+    """Caller directory state restored after a subshell's children."""
+
+    dir_changed: bool
+    moved: bool
+
+
 @dataclass
 class _Scan:
     """Keep one file's ordered traversal and candidate state."""
@@ -202,8 +223,10 @@ class _Scan:
     script_dirs: dict[str, str | None] = field(default_factory=dict)
     script_literals: set[str] = field(default_factory=set)
     unresolved_dirs: set[str] = field(default_factory=set)
+    refused_dirs: dict[str, str] = field(default_factory=dict)
     pending: list[tuple[str, bool, bool, frozenset[str]]] = field(default_factory=list)
     moved: bool = False
+    rebound: bool = False
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
 
@@ -282,11 +305,14 @@ def _referenced(word: str, names: Iterable[str]) -> frozenset[str]:
 
 
 def _reference_refusal(word: str, scan: _Scan) -> str | None:
-    """Name the refusal for a word referencing an ambiguous or unresolved own-directory name."""
+    """Name the refusal for a word referencing an ambiguous, unresolved or refused script dir."""
     if _referenced(word, scan.ambiguous):
         return AMBIGUOUS_SCRIPT_PATH
     if _referenced(word, scan.unresolved_dirs):
         return UNRESOLVED_SCRIPT_DIR
+    refused = _referenced(word, scan.refused_dirs)
+    if refused:
+        return scan.refused_dirs[min(refused)]
     return None
 
 
@@ -692,11 +718,22 @@ def _assignment_hit(node: Any, raw: bytes) -> str | None:
     return None
 
 
+def _note_rebinding_command(words: list[str], idx: int, name: str, scan: _Scan) -> None:
+    """Record commands that alias, disable, hash or write PATH before the idiom runs."""
+    args = words[idx + 1 :]
+    hash_reset = name == "hash" and all(w == "-r" for w in args)
+    rebinds = name in REBINDING_COMMANDS and not hash_reset
+    writes_path = name in PATH_WRITERS and any(PATH_WORD.fullmatch(w) is not None for w in args)
+    if rebinds or writes_path:
+        scan.rebound = True
+
+
 def _inspect_command(node: Any, raw: bytes, scan: _Scan) -> str | None:
     """Classify command position, wrappers and executable paths without following call cycles."""
     words, idx, name = _command_info(node, raw, scan.literals)
     if idx >= len(words):
         return None
+    _note_rebinding_command(words, idx, name, scan)
     if name in SHELLS:
         return _shell_command(node, raw, words[idx:], scan)
     if name in ("source", "."):
@@ -886,7 +923,10 @@ def _child_modes(node: Any, data_only: bool) -> list[tuple[Any, bool]]:
 
 
 def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
-    """Apply the explicit grammar allow-list and push children in source order."""
+    """Apply the grammar allow-list, push children in order and restore subshell directories."""
+    if isinstance(node, _DirState):
+        scan.dir_changed, scan.moved = node
+        return None
     kind = node.type
     if kind == "ERROR":
         return _error_hit(node, raw)
@@ -896,12 +936,23 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
         return None
     if kind in ("command_substitution", "process_substitution"):
         data_only = False
+    entry = _DirState(scan.dir_changed, scan.moved)
     hit, children = _visit_semantics(node, raw, data_only, scan)
+    if kind in SUBSHELLS:
+        scan.stack.append((entry, raw, False))
     for i in range(len(children) - 1, -1, -1):
         child, mode = children[i]
         if not child.is_missing:
             scan.stack.append((child, raw, mode))
     return hit
+
+
+def _note_function(node: Any, raw: bytes, scan: _Scan) -> None:
+    """Record functions that name an idiom command or use a non-plain function name."""
+    first = node.named_children[0] if node.named_children else None
+    name = _text(first, raw) if first is not None and first.type == "word" else ""
+    if name in IDIOM_COMMANDS or PLAIN_FUNCTION.fullmatch(name) is None:
+        scan.rebound = True
 
 
 def _visit_semantics(
@@ -921,6 +972,8 @@ def _visit_semantics(
     elif kind in ASSIGNMENTS:
         _settle_script_dir(node, raw, scan)
         hit = _assignment_hit(node, raw)
+    elif kind == "function_definition":
+        _note_function(node, raw, scan)
     children = _child_modes(node, kind in DATA | ASSIGNMENTS | {"test_command", "file_redirect"})
     return hit, children
 
@@ -970,42 +1023,77 @@ def _forget_script_literals(scan: _Scan) -> None:
     scan.script_literals.clear()
 
 
+def _note_path_words(node: Any, raw: bytes, scan: _Scan) -> None:
+    """Record PATH declarations, unsets and nameref flags before own-directory resolution."""
+    if node.type not in ("declaration_command", "unset_command"):
+        return
+    for child in node.named_children:
+        text = _text(child, raw)
+        is_decl = node.type == "declaration_command"
+        nameref = is_decl and child.type == "word" and text.startswith("-") and "n" in text
+        if (child.type == "variable_name" and text == "PATH") or nameref:
+            scan.rebound = True
+            return
+
+
+def _script_dir_refusal(scan: _Scan) -> str | None:
+    """Refuse own-directory resolution for newline paths or rebound idiom commands."""
+    if "\n" in str(scan.context.script_dir):
+        return NEWLINE_SCRIPT_DIR
+    if scan.rebound:
+        return REBOUND_SCRIPT_DIR
+    return None
+
+
+def _assignment_nodes(node: Any) -> list[Any]:
+    """Return a variable assignment or the assignment children of a compound statement."""
+    if node.type == "variable_assignment":
+        return [node]
+    return [child for child in node.named_children if child.type == "variable_assignment"]
+
+
+def _store_script_dir(assignment: Any, name: str, override: str | None, scan: _Scan) -> None:
+    """Store a resolved own-directory literal or mark the assignment uncertain or nested."""
+    overridden = override is not None and override in scan.assigned
+    uncertain = scan.moved or scan.source_unknown or overridden
+    top = _top_level(assignment)
+    if uncertain or (top and assignment.parent.type == "declaration_command"):
+        scan.literals.pop(name, None)
+        scan.source_unknown = scan.dir_changed = True
+    elif top:
+        scan.literals[name] = str(scan.context.script_dir)
+        scan.script_literals.add(name)
+    else:
+        scan.unresolved_dirs.add(name)
+
+
 def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     """Resolve an own-directory name from its top-level assignment on, never before it.
 
-    After a directory change or an unread source, with its override assigned anywhere in the
-    file, or through a top-level declaration (declare -l or -u changes the value), the name
-    stays unresolved and later relative paths refuse as after a source the guard cannot read.
-    Nested in a function, branch or loop, the name stays unresolved and every script path
-    referencing it refuses; other paths keep their verdict.
+    Non-prefix PATH changes, declarations, unsets or namerefs mark idiom commands rebound.
+    A directory path holding a newline or an assignment after rebinding refuses every script
+    path referencing the name. After a directory change or unread source, with its override
+    assigned, or through a top-level declaration, later relative paths refuse; nested in a
+    function, branch or loop, every script path referencing the name refuses.
     """
     if not scan.script_dirs:
         return
-    assignments = (
-        [node]
-        if node.type == "variable_assignment"
-        else [child for child in node.named_children if child.type == "variable_assignment"]
-    )
-    for assignment in assignments:
+    _note_path_words(node, raw, scan)
+    for assignment in _assignment_nodes(node):
         match = ASSIGNED_NAME.match(_text(assignment, raw))
-        if match is None or match.group() not in scan.script_dirs:
+        name = match.group() if match is not None else ""
+        if name == "PATH" and assignment.parent.type != "command":
+            scan.rebound = True
             continue
-        name = match.group()
+        if name not in scan.script_dirs:
+            continue
         override = scan.script_dirs.pop(name)
-        uncertain = (
-            scan.moved
-            or scan.source_unknown
-            or (override is not None and override in scan.assigned)
-        )
-        top = _top_level(assignment)
-        if uncertain or (top and assignment.parent.type == "declaration_command"):
+        reason = _script_dir_refusal(scan)
+        if reason is not None:
             scan.literals.pop(name, None)
-            scan.source_unknown = scan.dir_changed = True
-        elif top:
-            scan.literals[name] = str(scan.context.script_dir)
-            scan.script_literals.add(name)
-        else:
-            scan.unresolved_dirs.add(name)
+            scan.refused_dirs[name] = reason
+            continue
+        _store_script_dir(assignment, name, override, scan)
 
 
 def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> tuple[list[str], set[str]]:
@@ -1063,6 +1151,12 @@ def _finish(
     return None, scan.candidates, scan.cd_targets, scan.filtered
 
 
+def _environment_rebinds() -> bool:
+    """Detect environment startup files or exported Bash functions that can rebind commands."""
+    has_func = any(key.startswith("BASH_FUNC_") for key in os.environ)
+    return "BASH_ENV" in os.environ or "ENV" in os.environ or has_func
+
+
 def scan_body(
     body: str,
     context: InspectionContext,
@@ -1080,6 +1174,7 @@ def scan_body(
     scan.literals = _find_literal_assignments(assignments)
     if context.script_dir is not None:
         scan.script_dirs = _script_dir_names(assignments)
+        scan.rebound = _environment_rebinds()
     scan.stack.append((root, raw, False))
     for _ in range(MAX_BODY_NODES):
         if not scan.stack:
