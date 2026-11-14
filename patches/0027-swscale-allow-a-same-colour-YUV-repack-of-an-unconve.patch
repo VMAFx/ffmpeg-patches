@@ -10,29 +10,44 @@ That also refuses conversions that apply no colour matrix at all, such
 as repacking a Dolby Vision profile 5 base layer (IPT-C2) from
 yuv420p10le to p010 for hwupload.
 
-Accept such a frame when both sides are YUV and agree in colour space,
-range, chroma location, primaries and transfer; only the pixel layout,
-depth or size differ, and the colour space test is repeated with a
-convertible stand-in so every other check still applies. Conversions to
-RGB, to another matrix or to another range stay refused.
+Accept such a frame when both sides are YUV with three colour
+components and agree in colour space, range, primaries and transfer;
+only the pixel layout, depth, size or chroma siting differ, and the
+colour space test is repeated with a convertible stand-in so every
+other check still applies. Conversions to RGB, to another matrix or to
+another range stay refused.
+
+The chroma location is left out of the check: sanitize_fmt() clears
+the location of a side without subsampling, so a 4:2:0 to 4:4:4
+conversion would otherwise be refused, and moving the chroma samples
+applies no colour matrix.
+
+The stand-in is offered only when the gamma flag is unset. With it, a
+scaled conversion runs through RGBA64 in a cascade, which applies the
+colour matrix of the source colour space; swscale has none for IPT-C2
+or BT.2020 CL, and the cascade would use the coefficients
+sws_getCoefficients() returns instead.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- libswscale/format.h  | 23 +++++++++++++++++++++++
- libswscale/swscale.c | 20 +++++++++++++++++---
- 2 files changed, 40 insertions(+), 3 deletions(-)
+ libswscale/format.h  | 27 +++++++++++++++++++++++++++
+ libswscale/swscale.c | 25 ++++++++++++++++++++++++-
+ 2 files changed, 51 insertions(+), 1 deletion(-)
 
 diff --git a/libswscale/format.h b/libswscale/format.h
-index ea2ab7dc41a0796f25f316b92b8798b6ddd1a3ef..27f1d889077654e1206325c0d606c8930c125825 100644
+index ea2ab7dc41a0796f25f316b92b8798b6ddd1a3ef..f947891b888b52b5d9ac07f7ade233d000a63144 100644
 --- a/libswscale/format.h
 +++ b/libswscale/format.h
-@@ -135,6 +135,29 @@ static inline int ff_fmt_equal(const SwsFormat *fmt1, const SwsFormat *fmt2)
+@@ -135,6 +135,33 @@ static inline int ff_fmt_equal(const SwsFormat *fmt1, const SwsFormat *fmt2)
             ff_color_equal(&fmt1->color, &fmt2->color);
  }
  
 +/**
-+ * A repack/rescale between two YUV layouts of the same colour applies no
-+ * matrix, so a colour space swscale cannot convert may pass through.
++ * A repack or rescale between two YUV layouts of the same colour applies no
++ * colour matrix, so a colour space swscale cannot convert may pass through.
++ * Both formats need three colour components and the same colour space,
++ * range, primaries and transfer. The chroma location may differ, since
++ * chroma siting is resampled without a colour matrix.
 + */
 +static inline int ff_fmt_same_color(const SwsFormat *a, const SwsFormat *b)
 +{
@@ -46,10 +61,11 @@ index ea2ab7dc41a0796f25f316b92b8798b6ddd1a3ef..27f1d889077654e1206325c0d606c893
 +        return 0;
 +    if (desc_b->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_XYZ | AV_PIX_FMT_FLAG_PAL))
 +        return 0;
++    if (desc_a->nb_components < 3 || desc_b->nb_components < 3)
++        return 0;
 +
 +    return a->csp   == b->csp   &&
 +           a->range == b->range &&
-+           a->loc   == b->loc   &&
 +           ff_color_equal(&a->color, &b->color);
 +}
 +
@@ -57,19 +73,26 @@ index ea2ab7dc41a0796f25f316b92b8798b6ddd1a3ef..27f1d889077654e1206325c0d606c893
  {
      const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
 diff --git a/libswscale/swscale.c b/libswscale/swscale.c
-index 969456efcce030a7a7df16bd26b608b4de4e42ea..8e328b81499f1d277f79d89249dd6733d5a4103e 100644
+index 969456efcce030a7a7df16bd26b608b4de4e42ea..ec1fb6ada467cd795d6a693cd896bb5c5d405c29 100644
 --- a/libswscale/swscale.c
 +++ b/libswscale/swscale.c
-@@ -1457,6 +1457,22 @@ static int validate_params(SwsContext *ctx)
+@@ -1439,6 +1439,29 @@ process_frame:
      return 0;
  }
  
-+static int test_frame_fmt(const SwsBackend backends, const SwsFormat *src,
-+                          const SwsFormat *dst, int *src_ok, int *dst_ok)
++/**
++ * Retest the source and destination format of one field after a failed
++ * test. A YUV pair of the same colour is tested again with BT.2020 NCL
++ * standing in for its colour space, so a colour space swscale cannot
++ * convert may still be repacked or rescaled. Gamma-correct scaling converts
++ * through RGB with the colour matrix, so it gets no stand-in.
++ */
++static int test_frame_fmt(const SwsContext *ctx, const SwsBackend backends,
++                          const SwsFormat *src, const SwsFormat *dst,
++                          int *src_ok, int *dst_ok)
 +{
-+    *src_ok = ff_test_fmt(backends, src, 0);
-+    *dst_ok = ff_test_fmt(backends, dst, 1);
-+    if ((!*src_ok || !*dst_ok) && ff_fmt_same_color(src, dst)) {
++    if ((!*src_ok || !*dst_ok) && !ctx->gamma_flag &&
++        ff_fmt_same_color(src, dst)) {
 +        SwsFormat s_test = *src;
 +        SwsFormat d_test = *dst;
 +        s_test.csp = AVCOL_SPC_BT2020_NCL;
@@ -80,17 +103,15 @@ index 969456efcce030a7a7df16bd26b608b4de4e42ea..8e328b81499f1d277f79d89249dd6733
 +    return (*src_ok && *dst_ok) || ff_fmt_equal(src, dst);
 +}
 +
- int sws_frame_setup(SwsContext *ctx, const AVFrame *dst, const AVFrame *src)
+ static int validate_params(SwsContext *ctx)
  {
-     SwsInternal *s = sws_internal(ctx);
-@@ -1510,9 +1526,7 @@ int sws_frame_setup(SwsContext *ctx, const AVFrame *dst, const AVFrame *src)
-             goto fail;
-         }
+ #define VALIDATE(field, min, max) \
+@@ -1512,7 +1535,7 @@ int sws_frame_setup(SwsContext *ctx, const AVFrame *dst, const AVFrame *src)
  
--        src_ok = ff_test_fmt(backends, &src_fmt, 0);
--        dst_ok = ff_test_fmt(backends, &dst_fmt, 1);
+         src_ok = ff_test_fmt(backends, &src_fmt, 0);
+         dst_ok = ff_test_fmt(backends, &dst_fmt, 1);
 -        if ((!src_ok || !dst_ok) && !ff_fmt_equal(&src_fmt, &dst_fmt)) {
-+        if (!test_frame_fmt(backends, &src_fmt, &dst_fmt, &src_ok, &dst_ok)) {
++        if (!test_frame_fmt(ctx, backends, &src_fmt, &dst_fmt, &src_ok, &dst_ok)) {
              err_msg = src_ok ? "Unsupported output" : "Unsupported input";
              ret = AVERROR(ENOTSUP);
              goto fail;
