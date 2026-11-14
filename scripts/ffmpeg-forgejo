@@ -977,7 +977,7 @@ merge_settings_neutral() {
   merge_info_attributes_neutral
 }
 
-# neutral_merge_tree REF SHA: run attribute-neutral merge-tree into MERGE_TREE_OUT with a byte cap.
+# neutral_merge_tree REF SHA: run attribute- and rename-neutral merge-tree into MERGE_TREE_OUT with a byte cap.
 neutral_merge_tree() {
   local ref="$1" sha="$2" empty size
   local -a pipe_status=()
@@ -991,8 +991,9 @@ neutral_merge_tree() {
     printf 'ffmpeg-forgejo: cannot create temporary file; merge with the live base not proven.\n' >&2
     exit 1
   fi
-  if timeout 120 git -c core.attributesFile=/dev/null --attr-source="$empty" \
-    merge-tree --write-tree --name-only --no-messages "$ref" "$sha" \
+  # Pin rename detection to git's documented defaults so a local diff.renames or diff.renameLimit cannot change the result.
+  if timeout 120 git -c core.attributesFile=/dev/null -c merge.renames=true -c merge.renameLimit=7000 \
+    --attr-source="$empty" merge-tree --write-tree --name-only --no-messages "$ref" "$sha" \
     | head -c "$((MERGE_TREE_MAX_BYTES + 1))" >"$MERGE_TREE_OUT"; then
     pipe_status=(0 0)
   else

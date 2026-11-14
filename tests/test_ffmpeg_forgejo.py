@@ -1817,9 +1817,14 @@ class FairyRequestTestBase(unittest.TestCase):
             "secret-tool": "printf 'fixture-token\\n'",
             "git": (
                 'case "$1" in fetch|diff) exit 0;; '
+                "config) exit 1;; "
+                "hash-object) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904;; "
                 "merge-tree) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; "
+                '-c) case " $* " in *" merge-tree "*)'
+                " echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; esac; exit 97;; "
                 "update-ref) exit 0;; "
-                f"rev-parse) echo {FAIRY_FIXTURE_HEAD};; *) exit 97;; esac"
+                'rev-parse) if [ "$2" = --git-path ]; then echo "$PWD/fixture-git-dir/$3"; '
+                f"else echo {FAIRY_FIXTURE_HEAD}; fi;; *) exit 97;; esac"
             ),
         }.items():
             tool = self.bin_dir / name
@@ -3188,6 +3193,73 @@ class SweepTest(ForgejoTest):
         ]
         self.assertEqual(len(pulls_posts), 1)
         self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_accepts_rename_when_diff_renames_disabled(self) -> None:
+        """Allow push when topic renames a file edited on live base and diff.renames is false."""
+
+        lines = [f"line {number}\n" for number in range(1, 201)]
+        self._prepare_topic_renames([("rename_src.txt", "rename_dst.txt", lines, None)])
+        edited = list(lines)
+        edited[99] = "upstream line 100\n"
+        advance_upstream(self.tmp, self.upstream, "rename_src.txt", "".join(edited))
+        git(self.repo, "config", "diff.renames", "false")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_accepts_inexact_renames_with_low_diff_rename_limit(self) -> None:
+        """Allow push across two inexact renames when local diff.renameLimit is 1."""
+
+        lines_1 = [f"a1 line {number}\n" for number in range(1, 201)]
+        lines_2 = [f"a2 line {number}\n" for number in range(1, 201)]
+        self._prepare_topic_renames(
+            [
+                ("a1.txt", "b1.txt", lines_1, "a1 topic line 1\n"),
+                ("a2.txt", "b2.txt", lines_2, "a2 topic line 1\n"),
+            ]
+        )
+        edited_1 = list(lines_1)
+        edited_1[99] = "a1 upstream line 100\n"
+        edited_2 = list(lines_2)
+        edited_2[99] = "a2 upstream line 100\n"
+        advance_upstream(self.tmp, self.upstream, "a1.txt", "".join(edited_1))
+        advance_upstream(self.tmp, self.upstream, "a2.txt", "".join(edited_2))
+        git(self.repo, "config", "diff.renameLimit", "1")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def _prepare_topic_renames(self, renames: list[tuple[str, str, list[str], str | None]]) -> None:
+        """Seed upstream files, rename them on topic, and refresh the sweep report."""
+
+        for src, _, base_lines, _ in renames:
+            advance_upstream(self.tmp, self.upstream, src, "".join(base_lines))
+        git(self.repo, "fetch", "-q", str(self.upstream), "+refs/heads/master:refs/heads/master")
+        git(self.repo, "reset", "--hard", "master")
+        for src, dst, _, topic_first_line in renames:
+            git(self.repo, "mv", src, dst)
+            if topic_first_line is not None:
+                target = self.repo / dst
+                lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+                lines[0] = topic_first_line
+                target.write_text("".join(lines), encoding="utf-8")
+                git(self.repo, "add", dst)
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "rename on topic",
+        )
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
 
     def test_push_refuses_unrecorded_own_next_push_promise(self) -> None:
         """An own next-push promise blocks a push without a promise file."""
