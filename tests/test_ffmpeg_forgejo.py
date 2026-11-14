@@ -3027,6 +3027,11 @@ class SweepTest(ForgejoTest):
             f"with open({str(self.tmp / 'git-calls.jsonl')!r}, 'a', encoding='utf-8') as calls:\n"
             "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             'if "merge-tree" in sys.argv:\n'
+            f"    with open({str(self.tmp / 'merge-tree-env.jsonl')!r}, 'a',"
+            " encoding='utf-8') as env_log:\n"
+            '        env_log.write(json.dumps({"GIT_ATTR_NOSYSTEM":'
+            ' os.environ.get("GIT_ATTR_NOSYSTEM"), "GIT_GRAFT_FILE":'
+            ' os.environ.get("GIT_GRAFT_FILE")}) + "\\n")\n'
             '    mode = os.environ.get("STUB_MERGE_TREE")\n'
             '    if mode == "fail":\n'
             "        sys.exit(128)\n"
@@ -3177,6 +3182,73 @@ class SweepTest(ForgejoTest):
         self.assertIn(base_sha[:12], result.stderr)
         self.assertIn(OVERLAP_FILE, result.stderr)
         self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_conflict_ignores_local_replace_ref(self) -> None:
+        """Ignore local replace refs when checking live-base conflicts."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        new_blob = git_output(self.upstream, "rev-parse", f"{base_sha}:{OVERLAP_FILE}")
+        old_blob = git_output(self.upstream, "rev-parse", f"{base_sha}~1:{OVERLAP_FILE}")
+        git(self.repo, "update-ref", f"refs/replace/{new_blob}", old_blob)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_conflict_ignores_info_grafts(self) -> None:
+        """Ignore repository info/grafts parent overrides when checking live-base conflicts."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        topic_head = git_output(self.repo, "rev-parse", "topic")
+        graft_path = self.repo / git_output(self.repo, "rev-parse", "--git-path", "info/grafts")
+        graft_path.parent.mkdir(parents=True, exist_ok=True)
+        graft_path.write_text(f"{topic_head} {base_sha}\n", encoding="utf-8")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_conflict_ignores_graft_file_env(self) -> None:
+        """Ignore GIT_GRAFT_FILE overrides when checking live-base conflicts."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        topic_head = git_output(self.repo, "rev-parse", "topic")
+        graft_path = self.tmp / "grafts"
+        graft_path.write_text(f"{topic_head} {base_sha}\n", encoding="utf-8")
+        result = self.sweep_command(
+            "push",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"GIT_GRAFT_FILE": str(graft_path)},
+        )
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_merge_tree_ignores_system_attributes(self) -> None:
+        """System attributes are root-owned, so the test checks the merge-tree environment."""
+
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        lines = (self.tmp / "merge-tree-env.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(lines), 1)
+        for line in lines:
+            self.assertEqual(
+                json.loads(line),
+                {"GIT_ATTR_NOSYSTEM": "1", "GIT_GRAFT_FILE": "/dev/null"},
+            )
         self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
 
     def test_pr_accepts_live_base_advanced_without_conflict(self) -> None:
