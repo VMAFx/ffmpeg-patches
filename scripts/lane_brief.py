@@ -4,6 +4,7 @@
 """Render or check a lane brief against repository standards.
 
 The check command with a runner first runs scripts/lane_isolation.py on the worktree.
+Required entries must end at an allowed token boundary.
 
 Usage: lane_brief.py render --branch B --task T --finding F --fix X --tests S --paths P --modules M
        lane_brief.py check BRIEF [--config FILE] [--runner PATH] [--worktree DIR]
@@ -38,6 +39,9 @@ MAX_LINES = 10000
 MAX_LINE_SIZE = 65536
 RUNNER_TIMEOUT = 120
 RUNNER_OUTPUT_LIMIT = 65536
+# Allow-list of characters that end a required entry; whitespace, end of text,
+# and a period followed by whitespace or end of text also end it.
+ENTRY_ENDINGS = '`"),:;'
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -123,9 +127,25 @@ def validate_required(path: Path, document: object) -> list[str]:
     return result
 
 
+def ends_token(rest: str) -> bool:
+    """Return whether text after an entry begins with an allowed token boundary."""
+    if not rest or rest[0].isspace() or rest[0] in ENTRY_ENDINGS:
+        return True
+    return rest[0] == "." and (len(rest) == 1 or rest[1].isspace())
+
+
+def has_entry(content: str, item: str) -> bool:
+    """Return whether any occurrence of an entry ends at an allowed token boundary."""
+    return any(ends_token(rest) for rest in content.split(item)[1:])
+
+
 def check(content: str, label: str, required: list[str]) -> int:
     """Print each missing requirement and unfilled placeholder."""
-    errors = [f"{label}: missing required line: {item}" for item in required if item not in content]
+    errors = [
+        f"{label}: missing required line: {item}"
+        for item in required
+        if not has_entry(content, item)
+    ]
     errors.extend(
         f"{label}: unfilled placeholder <{name}>" for name in NAMES if f"<{name}>" in content
     )
