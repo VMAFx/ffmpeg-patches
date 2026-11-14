@@ -622,6 +622,17 @@ class LaneBriefTest(unittest.TestCase):
         self.assertTrue(lane_brief.has_entry("aaaa", "aaa"))
         self.assertFalse(lane_brief.has_entry("aaab", "aaa"))
 
+    def test_entry_suffix_check_reads_two_characters(self) -> None:
+        """Pass at most two trailing characters to the token-boundary check."""
+        content = "a" * 59_999 + "\n"
+        with patch.object(lane_brief, "ends_token", wraps=lane_brief.ends_token) as spy:
+            self.assertTrue(lane_brief.has_entry(content, "a"))
+            spy.assert_called()
+            self.assertTrue(lane_brief.has_entry("aaaa", "aaa"))
+            self.assertFalse(lane_brief.has_entry("aaab", "aaa"))
+        for call in spy.call_args_list:
+            self.assertLessEqual(len(call.args[0]), 2)
+
     def test_plain_substring_mutant_killed(self) -> None:
         """Expose the similar-module false acceptance when plain matching is restored."""
         source = (ROOT / "scripts" / "lane_brief.py").read_text(encoding="utf-8")

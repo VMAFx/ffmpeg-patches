@@ -143,7 +143,8 @@ def has_entry(content: str, item: str) -> bool:
         index = content.find(item, start)
         if index < 0:
             return False
-        if ends_token(content[index + len(item) :]):
+        end = index + len(item)
+        if ends_token(content[end : end + 2]):
             return True
         start = index + 1
     return False
