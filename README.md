@@ -188,8 +188,9 @@ The forge helper scripts share configuration through environment variables, impl
 The checks cover:
 
 - `make test`: series check, ruff, mutable defaults and the unit tests of
-  `scripts/series.py`. The unit-test run fails when it leaves files in its
-  temporary directory (`scripts/tmp_leak_guard.py`).
+  `scripts/series.py`, which run in `UNIT_JOBS` worker processes (default 4),
+  one test module per task, through unittest-parallel. The unit-test run fails
+  when it leaves files in its temporary directory (`scripts/tmp_leak_guard.py`).
 - REUSE compliance runs in the [REUSE workflow](.github/workflows/reuse.yml); the local `reuse-lint` hook in `lefthook.yml` runs `reuse lint` when REUSE 6.x is installed.
 - `python3 scripts/lint_mutable_defaults.py` (also `make lint-mutable-defaults`): Pylint checks Python sources for `dangerous-default-value` (W0102), including defaults bound to identifiers that ruff B006 misses. The script's `PYLINT_VERSION` pins Pylint; it uses that exact version on PATH or fetches it with `uvx`.
 - `make filter-deps FILTER_DEPS_TREE=<FFmpeg tree>`: scans filter source calls against configure declarations and conditional library link edges.
