@@ -2787,6 +2787,23 @@ class OverlapVerbTest(ForgejoTest):
         self.assertEqual(pr_proc.returncode, 1, pr_proc.stderr)
         self.assertIn("no pull request opened", pr_proc.stderr)
 
+    def test_overlap_unreachable_upstream_fails_closed(self) -> None:
+        """The overlap verb fails closed when the live base cannot be fetched."""
+
+        missing = self.tmp / "missing.git"
+        proc = self.run_command(
+            overlap_stub(),
+            "overlap",
+            "topic",
+            env_updates={"FFMPEG_FORGEJO_GIT": str(missing)},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(
+            f"cannot fetch master from {missing}; overlap not proven absent",
+            proc.stderr,
+        )
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
 
 class SweepTest(ForgejoTest):
     """Require a reviewed sweep before either outbound operation."""
