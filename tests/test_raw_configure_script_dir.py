@@ -258,6 +258,56 @@ SCRIPT_DIR = {
     "unrelated-function": Case("helper() { echo hi; }\n" + DOLLAR0 + SRC + RUN, 0),
     "pwd-function-after-idiom": Case(CDPWD + "pwd() { echo x; }\n" + SRC + RUN, 0),
     "hash-r-before": Case("hash -r\n" + DOLLAR0 + SRC + RUN, 0),
+    "for-path-before": Case(
+        "for PATH in <case>/bin; do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "for-path-positional-before": Case("for PATH; do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "select-path-before": Case(
+        "select PATH in <case>/bin; do break; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "colon-path-prefix-before": Case("PATH=<case>/bin :\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "export-path-prefix-before": Case(
+        "PATH=<case>/bin export Y=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "eval-path-prefix-before": Case(
+        "PATH=<case>/bin eval true\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "dot-path-prefix-before": Case(
+        'PATH=<case>/bin . "<case>/tools/empty.sh"\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+        {"tools/empty.sh": "X=1\n"},
+    ),
+    "c-style-for-path-before": Case(
+        "for ((PATH=1; PATH<2; PATH++)); do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "arith-path-before": Case("(( PATH=1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "arith-subscript-path-before": Case("(( PATH[0]=1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "arith-expansion-path-before": Case(": $((PATH=5))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "assign-default-path-before": Case(": ${PATH:=<case>/bin}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "assign-default-plain-path-before": Case(
+        ": ${PATH=<case>/bin}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "wait-p-path-before": Case("wait -p PATH\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "compgen-v-path-before": Case(
+        "compgen -V PATH -W <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "coproc-path-before": Case("coproc PATH { true; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "read-subscript-path-before": Case("read PATH[0]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unset-quoted-path-before": Case("unset 'PATH'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unset-double-quoted-path-before": Case('unset "PATH"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unset-split-quoted-path-before": Case('unset P"ATH"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "export-quoted-path-before": Case(
+        "export 'PATH=<case>/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "declare-quoted-path-before": Case(
+        'declare "PATH=<case>/bin"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "for-other-before": Case("for d in a b; do :; done\n" + DOLLAR0 + SRC + RUN, 0),
+    "function-path-prefix-before": Case("f() { :; }\nPATH=<case>/bin f\n" + DOLLAR0 + SRC + RUN, 0),
+    "default-expansion-path-before": Case(": ${PATH:-<case>/bin}\n" + DOLLAR0 + SRC + RUN, 0),
+    "arith-other-before": Case("(( n=1 ))\n" + DOLLAR0 + SRC + RUN, 0),
+    "for-path-after-idiom": Case(DOLLAR0 + "for PATH in <case>/bin; do :; done\n" + SRC + RUN, 0),
 }
 
 
@@ -296,8 +346,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 83 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 83)
+        """Replay all 110 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 110)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

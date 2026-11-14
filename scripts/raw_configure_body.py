@@ -78,11 +78,37 @@ SCRIPT_DIR_VALUE = re.compile(
 SCRIPT_DIR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-(.+)\}")
 ASSIGNED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PLAIN_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
-PATH_WORD = re.compile(r"PATH(?:\+?=.*)?", re.DOTALL)
+PATH_WORD = re.compile(r"PATH(?:\[[^\]]*\])?(?:\+?=.*)?", re.DOTALL)
 SUBSHELLS = frozenset(["command_substitution", "process_substitution", "subshell"])
 IDIOM_COMMANDS = frozenset(["cd", "pwd", "dirname", "readlink", "realpath"])
 REBINDING_COMMANDS = frozenset(["alias", "enable", "hash"])
-PATH_WRITERS = frozenset(["read", "printf", "mapfile", "readarray", "getopts", "let"])
+PATH_WRITERS = frozenset(
+    ["read", "printf", "mapfile", "readarray", "getopts", "let", "wait", "compgen", "coproc"]
+)
+# Assignments before these persist in POSIX mode, and eval and source bodies see them in every mode.
+SPECIAL_BUILTINS = frozenset(
+    [
+        ".",
+        ":",
+        "break",
+        "continue",
+        "eval",
+        "exec",
+        "exit",
+        "export",
+        "readonly",
+        "return",
+        "set",
+        "shift",
+        "source",
+        "times",
+        "trap",
+        "unset",
+    ]
+)
+ARITHMETIC = frozenset(["binary_expression", "postfix_expression", "unary_expression"])
+ASSIGNING_EXPANSIONS = frozenset(["=", ":="])
+PATH_OPERANDS = frozenset(["variable_name", "word", "subscript"])
 STRUCTURE = frozenset(
     [
         "program",
@@ -955,10 +981,40 @@ def _note_function(node: Any, raw: bytes, scan: _Scan) -> None:
         scan.rebound = True
 
 
+def _path_operands(node: Any) -> Iterable[Any]:
+    """Select syntax children whose variable names can bind PATH."""
+    kind = node.type
+    if kind == "for_statement":
+        return node.children_by_field_name("variable")
+    if kind in ARITHMETIC:
+        return node.named_children
+    if kind == "expansion" and any(c.type in ASSIGNING_EXPANSIONS for c in node.children):
+        return node.named_children
+    if (
+        kind == "variable_assignment"
+        and node.parent is not None
+        and node.parent.type == "c_style_for_statement"
+    ):
+        return node.named_children[:1]
+    return ()
+
+
+def _note_path_write(node: Any, raw: bytes, scan: _Scan) -> None:
+    """Record loop variables, arithmetic operands and assign-default expansions binding PATH."""
+    for operand in _path_operands(node):
+        if operand.type not in PATH_OPERANDS:
+            continue
+        match = ASSIGNED_NAME.match(_text(operand, raw))
+        if match is not None and match.group() == "PATH":
+            scan.rebound = True
+            return
+
+
 def _visit_semantics(
     node: Any, raw: bytes, data_only: bool, scan: _Scan
 ) -> tuple[str | None, list[tuple[Any, bool]]]:
     """Dispatch execution checks while keeping data traversal limited to substitutions."""
+    _note_path_write(node, raw, scan)
     kind = node.type
     if data_only:
         return None, _child_modes(node, True)
@@ -1023,17 +1079,44 @@ def _forget_script_literals(scan: _Scan) -> None:
     scan.script_literals.clear()
 
 
+def _declaration_words(node: Any, raw: bytes) -> list[str]:
+    """Unquote declaration or unset operands after merging adjacent child spans."""
+    spans: list[tuple[int, int]] = []
+    for child in node.named_children:
+        if spans and spans[-1][1] == child.start_byte:
+            spans[-1] = (spans[-1][0], child.end_byte)
+        else:
+            spans.append((child.start_byte, child.end_byte))
+    words: list[str] = []
+    for start, end in spans:
+        text = raw[start:end].decode("utf-8", "surrogateescape")
+        tokens = _tokens(text)
+        words.extend(tokens if tokens is not None else [text.translate(STRIP_CHARS)])
+    return words
+
+
 def _note_path_words(node: Any, raw: bytes, scan: _Scan) -> None:
     """Record PATH declarations, unsets and nameref flags before own-directory resolution."""
     if node.type not in ("declaration_command", "unset_command"):
         return
+    has_path = any(PATH_WORD.fullmatch(w) is not None for w in _declaration_words(node, raw))
+    if has_path:
+        scan.rebound = True
+        return
     for child in node.named_children:
         text = _text(child, raw)
-        is_decl = node.type == "declaration_command"
-        nameref = is_decl and child.type == "word" and text.startswith("-") and "n" in text
-        if (child.type == "variable_name" and text == "PATH") or nameref:
+        nameref = child.type == "word" and text.startswith("-") and "n" in text
+        if node.type == "declaration_command" and nameref:
             scan.rebound = True
             return
+
+
+def _path_binding_persists(assignment: Any, raw: bytes, scan: _Scan) -> bool:
+    """PATH assignment outside a command, or a prefix of a special builtin."""
+    return (
+        assignment.parent.type != "command"
+        or _command_info(assignment.parent, raw, scan.literals)[2] in SPECIAL_BUILTINS
+    )
 
 
 def _script_dir_refusal(scan: _Scan) -> str | None:
@@ -1070,11 +1153,13 @@ def _store_script_dir(assignment: Any, name: str, override: str | None, scan: _S
 def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     """Resolve an own-directory name from its top-level assignment on, never before it.
 
-    Non-prefix PATH changes, declarations, unsets or namerefs mark idiom commands rebound.
-    A directory path holding a newline or an assignment after rebinding refuses every script
-    path referencing the name. After a directory change or unread source, with its override
-    assigned, or through a top-level declaration, later relative paths refuse; nested in a
-    function, branch or loop, every script path referencing the name refuses.
+    PATH writes by loops, arithmetic, assign-default expansions, writer builtins, declarations,
+    unsets, namerefs, quoted declaration operands and special-builtin prefixes mark idiom
+    commands rebound; prefixes of other commands do not. A directory path holding a newline or
+    an assignment after rebinding refuses every script path referencing the name. After a
+    directory change or unread source, with its override assigned, or through a top-level
+    declaration, later relative paths refuse; nested in a function, branch or loop, every
+    script path referencing the name refuses.
     """
     if not scan.script_dirs:
         return
@@ -1082,7 +1167,7 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     for assignment in _assignment_nodes(node):
         match = ASSIGNED_NAME.match(_text(assignment, raw))
         name = match.group() if match is not None else ""
-        if name == "PATH" and assignment.parent.type != "command":
+        if name == "PATH" and _path_binding_persists(assignment, raw, scan):
             scan.rebound = True
             continue
         if name not in scan.script_dirs:
