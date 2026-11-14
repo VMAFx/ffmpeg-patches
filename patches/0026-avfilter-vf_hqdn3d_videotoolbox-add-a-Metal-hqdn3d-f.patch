@@ -18,20 +18,19 @@ The accepted formats are the planar 4:2:0 yuv420p and the two-plane
 formats of the VideoToolbox frames context: nv12, nv16 and nv24 at 8
 bits, p010, p210 and p410 at 10 bits, p216 and p416 at 16 bits.
 
-tools/hqdn3d_reset_test now also runs the Metal filter with a vt
-argument.
+libavfilter/tests/hqdn3d_vulkan now also runs the Metal filter with a
+vt argument.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
  configure                                     |    1 +
  doc/filters.texi                              |   33 +
- libavfilter/Makefile                          |    4 +
+ libavfilter/Makefile                          |    5 +
  libavfilter/allfilters.c                      |    1 +
  .../metal/vf_hqdn3d_videotoolbox.metal        |  325 +++++
+ libavfilter/tests/hqdn3d_vulkan.c             |   23 +-
  libavfilter/vf_hqdn3d_videotoolbox.m          | 1075 +++++++++++++++++
- tools/Makefile                                |    1 +
- tools/hqdn3d_reset_test.c                     |   63 +-
- 8 files changed, 1487 insertions(+), 16 deletions(-)
+ 7 files changed, 1462 insertions(+), 1 deletion(-)
  create mode 100644 libavfilter/metal/vf_hqdn3d_videotoolbox.metal
  create mode 100644 libavfilter/vf_hqdn3d_videotoolbox.m
 
@@ -48,7 +47,7 @@ index d386cc831d5e7265f8f73f42692a91ea57bdf4cb..0ebe83a5ae70d894b284b8715cc98628
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 863863b8fbce453eacf4da88bf5ea9881eb12fd0..e214440837b7de9c586a35d579a59f5ebd088a92 100644
+index cb6e920d984551bb4f09b580c37fbb3dbfd83a50..88fb668f3fdeb9341d1b42f58d9d7b6b27a53062 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15857,6 +15857,39 @@ The filter accepts the same options as @ref{hqdn3d}:
@@ -92,7 +91,7 @@ index 863863b8fbce453eacf4da88bf5ea9881eb12fd0..e214440837b7de9c586a35d579a59f5e
  @section hqdn3d_vulkan
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index e56c74a5112d13865067a14ccd1b82c99dcd4fa1..cf69310e9c5291ea27f6456d2d03743206a52a96 100644
+index 37c210380446026e543d1489223afb25297a1272..8d7568de568e0883c932f9e884d17f5505c9c36a 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -349,6 +349,10 @@ OBJS-$(CONFIG_HISTOGRAM_FILTER)              += vf_histogram.o
@@ -106,6 +105,14 @@ index e56c74a5112d13865067a14ccd1b82c99dcd4fa1..cf69310e9c5291ea27f6456d2d037432
  OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER)          += vf_hqdn3d_vulkan.o hqdn3d_coefs.o vulkan.o vulkan_filter.o
  OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
  OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
+@@ -699,6 +703,7 @@ TOOLS-$(CONFIG_LIBZMQ) += zmqsend
+ # hqdn3d_vulkan also tests the other hqdn3d GPU filters; list it once.
+ TESTPROGS-$(CONFIG_HQDN3D_CUDA_FILTER) += hqdn3d_vulkan
+ TESTPROGS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_vulkan
++TESTPROGS-$(CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER) += hqdn3d_vulkan
+ TESTPROGS-yes := $(sort $(TESTPROGS-yes))
+ 
+ clean::
 diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
 index 81c1f2c8a8d38e38b40a2b6bfb3e8f05fbbbc627..5ecf9a8698318dd84d5d3723df2053a2c9f20304 100644
 --- a/libavfilter/allfilters.c
@@ -449,6 +456,68 @@ index 0000000000000000000000000000000000000000..30f3e40acfd806be2a861a553a721ebd
 +                                    coef_tables, params, (int)x, max_norm);
 +    }
 +}
+diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
+index d3b1c72b34abe48357b646e2cedf16fc3ae075e7..7cf7963540ec3e593a0df740899d469bf8f0c3f8 100644
+--- a/libavfilter/tests/hqdn3d_vulkan.c
++++ b/libavfilter/tests/hqdn3d_vulkan.c
+@@ -111,6 +111,10 @@ static enum AVPixelFormat get_gpu_pix_fmt(enum AVHWDeviceType hw_type)
+ #if CONFIG_HQDN3D_OPENCL_FILTER
+     case AV_HWDEVICE_TYPE_OPENCL:
+         return AV_PIX_FMT_OPENCL;
++#endif
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
++        return AV_PIX_FMT_VIDEOTOOLBOX;
+ #endif
+     default:
+         return AV_PIX_FMT_NONE;
+@@ -365,6 +369,10 @@ static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
+ #if CONFIG_HQDN3D_OPENCL_FILTER
+     case AV_HWDEVICE_TYPE_OPENCL:
+         return "hqdn3d_opencl";
++#endif
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
++        return "hqdn3d_videotoolbox";
+ #endif
+     default:
+         return NULL;
+@@ -1043,6 +1051,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
+     return AV_HWDEVICE_TYPE_CUDA;
+ #elif CONFIG_HQDN3D_OPENCL_FILTER
+     return AV_HWDEVICE_TYPE_OPENCL;
++#elif CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+ #else
+     return AV_HWDEVICE_TYPE_NONE;
+ #endif
+@@ -1083,6 +1093,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+ #endif
+     }
+ 
++    if (strcmp(arg, "vt") == 0 || strncmp(arg, "vt:", 3) == 0) {
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++        *hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
++        *dev_idx = arg[2] == ':' ? arg + 3 : NULL;
++        return 0;
++#else
++        fprintf(stderr, "VideoToolbox support is not built\n");
++        return AVERROR(ENOSYS);
++#endif
++    }
++
+ #if CONFIG_HQDN3D_VULKAN_FILTER
+     *hw_type = AV_HWDEVICE_TYPE_VULKAN;
+     *dev_idx = strncmp(arg, "vk:", 3) == 0 ? arg + 3 : arg;
+@@ -1104,7 +1125,7 @@ int main(int argc, char **argv)
+     int refused_10 = 0, refused_444 = 0;
+ 
+     if (argc > 2) {
+-        fprintf(stderr, "Usage: %s [[vk:|cuda:|ocl:]device index]\n", argv[0]);
++        fprintf(stderr, "Usage: %s [[vk:|cuda:|ocl:]device index | vt[:index]]\n", argv[0]);
+         return 1;
+     }
+     err = parse_device_arg(argc >= 2 ? argv[1] : NULL, &t.hw_type, &dev_idx);
 diff --git a/libavfilter/vf_hqdn3d_videotoolbox.m b/libavfilter/vf_hqdn3d_videotoolbox.m
 new file mode 100644
 index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e7679273cc0ff1
@@ -1530,126 +1599,3 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +    .flags_internal  = FF_FILTER_FLAG_HWFRAME_AWARE,
 +    .process_command = process_command,
 +};
-diff --git a/tools/Makefile b/tools/Makefile
-index 4929128fdaf11dc7b09d5bff4b7c71ba315e2131..672647e7913d7f7408e12cdea7e62f426efab9ef 100644
---- a/tools/Makefile
-+++ b/tools/Makefile
-@@ -2,6 +2,7 @@ TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher
- TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
- TOOLS-$(CONFIG_HQDN3D_CUDA_FILTER)   += hqdn3d_reset_test
- TOOLS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_reset_test
-+TOOLS-$(CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER) += hqdn3d_reset_test
- TOOLS-yes := $(sort $(TOOLS-yes))
- TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
- TOOLS-$(CONFIG_ZLIB) += cws2fws
-diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
-index 413fd848807edf68c4ff17d40a8804659b98babb..88cfbd76fca2e093b14bb543a3728c41b5ef868e 100644
---- a/tools/hqdn3d_reset_test.c
-+++ b/tools/hqdn3d_reset_test.c
-@@ -118,6 +118,10 @@ static int create_gpu_frames_ctx(AVBufferRef *device_ref, int w, int h,
- #if CONFIG_HQDN3D_OPENCL_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-         hwfc->format = AV_PIX_FMT_OPENCL;
-+#endif
-+#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
-+        hwfc->format = AV_PIX_FMT_VIDEOTOOLBOX;
- #endif
-     hwfc->sw_format = sw_format;
-     hwfc->width     = w;
-@@ -303,6 +307,10 @@ static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
- #if CONFIG_HQDN3D_OPENCL_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-         par->format = AV_PIX_FMT_OPENCL;
-+#endif
-+#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
-+        par->format = AV_PIX_FMT_VIDEOTOOLBOX;
- #endif
-     par->width         = 128;
-     par->height        = 72;
-@@ -336,6 +344,10 @@ static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
- #if CONFIG_HQDN3D_OPENCL_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-         return "hqdn3d_opencl";
-+#endif
-+#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
-+        return "hqdn3d_videotoolbox";
- #endif
-     return NULL;
- }
-@@ -552,6 +564,30 @@ static int setup_all(const char *dev_idx,
-     return 0;
- }
- 
-+static int parse_default_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const char **dev_idx)
-+{
-+#if CONFIG_HQDN3D_VULKAN_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_VULKAN;
-+    *dev_idx = arg;
-+    return 0;
-+#elif CONFIG_HQDN3D_CUDA_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_CUDA;
-+    *dev_idx = arg;
-+    return 0;
-+#elif CONFIG_HQDN3D_OPENCL_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_OPENCL;
-+    *dev_idx = arg;
-+    return 0;
-+#elif CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-+    *dev_idx = arg;
-+    return 0;
-+#else
-+    av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
-+    return AVERROR(ENOSYS);
-+#endif
-+}
-+
- static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const char **dev_idx)
- {
-     if (strncmp(arg, "cuda:", 5) == 0) {
-@@ -584,23 +620,18 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
-         return AVERROR(ENOSYS);
- #endif
-     }
--
--#if CONFIG_HQDN3D_VULKAN_FILTER
--    *hw_type = AV_HWDEVICE_TYPE_VULKAN;
--    *dev_idx = arg;
--    return 0;
--#elif CONFIG_HQDN3D_CUDA_FILTER
--    *hw_type = AV_HWDEVICE_TYPE_CUDA;
--    *dev_idx = arg;
--    return 0;
--#elif CONFIG_HQDN3D_OPENCL_FILTER
--    *hw_type = AV_HWDEVICE_TYPE_OPENCL;
--    *dev_idx = arg;
--    return 0;
-+    if (strcmp(arg, "vt") == 0 || strncmp(arg, "vt:", 3) == 0) {
-+#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+        *hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-+        *dev_idx = (arg[2] == ':') ? arg + 3 : NULL;
-+        return 0;
- #else
--    av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
--    return AVERROR(ENOSYS);
-+        av_log(NULL, AV_LOG_ERROR, "VideoToolbox backend not built\n");
-+        return AVERROR(ENOSYS);
- #endif
-+    }
-+
-+    return parse_default_device_arg(arg, hw_type, dev_idx);
- }
- 
- int main(int argc, char **argv)
-@@ -616,7 +647,7 @@ int main(int argc, char **argv)
-     int err, any_diff = 0, frames_ok = 0;
- 
-     if (argc < 2) {
--        fprintf(stderr, "Usage: %s <[cuda:|vk:|ocl:]device index>\n", argv[0]);
-+        fprintf(stderr, "Usage: %s <[cuda:|vk:|ocl:|vt]device index>\n", argv[0]);
-         return 1;
-     }
- 

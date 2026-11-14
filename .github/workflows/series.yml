@@ -196,10 +196,14 @@ jobs:
         working-directory: build
         run: make -j"$(nproc)" build 2>&1 | tee build.log
       - name: Run the FATE tests that need no samples
+        # fate-filter-hqdn3d-vulkan (0023) runs libavfilter/tests/hqdn3d_vulkan,
+        # which needs a Vulkan device and exits nonzero without one; the parity
+        # step below runs it on lavapipe.
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         working-directory: build
         run: |
-          mapfile -t targets < <(make -s fate-list | grep '^fate-')
+          mapfile -t targets < <(make -s fate-list | grep '^fate-' \
+            | grep -vx 'fate-filter-hqdn3d-vulkan')
           if [ "${#targets[@]}" -eq 0 ]; then
             echo "::error::FFmpeg listed no FATE target"
             exit 1
@@ -215,6 +219,8 @@ jobs:
         # is not used: it offers FFmpeg no planar or semi-planar image format.
         # The loaders see only those drivers; the step fails when FFmpeg opens
         # another device or when a device case is skipped instead of run.
+        # fate-filter-hqdn3d-vulkan and the in-graph reset cases run
+        # libavfilter/tests/hqdn3d_vulkan on the same devices.
         if: >-
           github.event.pull_request.draft != true && env.IN_SCOPE == 'true' &&
           (needs.scope.result != 'success' || needs.scope.outputs.parity == 'true')
@@ -245,14 +251,19 @@ jobs:
           }
           probe vulkan=vk:0 llvmpipe
           probe opencl=ocl:0.0 rusticl
+          if ! make -C build fate-filter-hqdn3d-vulkan 2>&1 | tee fate-hqdn3d.log; then
+            echo "::error::fate-filter-hqdn3d-vulkan failed on lavapipe"
+            exit 1
+          fi
+          export HQDN3D_RESET_TOOL="$PWD/build/libavfilter/tests/hqdn3d_vulkan"
           python3 -m unittest -v -k matches_cpu -k temporal_only -k graph_rebuild \
-            -k unsupported_format -k planted -k MismatchRule \
+            -k in_graph_resize -k unsupported_format -k planted -k MismatchRule \
             tests.test_hqdn3d_vulkan tests.test_hqdn3d_opencl 2>&1 | tee parity.log
           hqdn3d=${PIPESTATUS[0]}
           python3 -m unittest -v tests.test_tonemap_vulkan tests.test_tonemap_opencl 2>&1 \
             | tee -a parity.log
           tonemap=${PIPESTATUS[0]}
-          if grep -E "skipped 'set (VK|OCL)_" parity.log; then
+          if grep -E "skipped 'set (VK|OCL)_|skipped 'set HQDN3D_RESET_TOOL" parity.log; then
             echo "::error::a device case was skipped instead of run"
             exit 1
           fi

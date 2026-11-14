@@ -64,6 +64,33 @@ CPU = (
     "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
 )
 RESET_TOOL = os.environ.get("HQDN3D_RESET_TOOL", "")
+RESET_LINES = tuple(
+    f"{group * 4 + frame} {width} {height} same"
+    for group, (width, height) in enumerate(((128, 72), (96, 56), (160, 96)))
+    for frame in range(4)
+)
+
+
+def reset_output_problems(returncode: int, stdout: str) -> list[str]:
+    """Return why a reset program run fails; an empty list when it passes."""
+    problems = [f"exit status {returncode}"] if returncode else []
+    lines = stdout.splitlines()
+    for index, expected in enumerate(RESET_LINES):
+        actual = lines[index] if index < len(lines) else "<missing>"
+        if actual != expected:
+            problems.append(f"line {index}: expected {expected!r}, got {actual!r}")
+            break
+    for index, line in enumerate(lines):
+        if "DIFF" in line.split():
+            problems.append(f"line {index}: contains DIFF: {line}")
+    return problems
+
+
+def assert_reset_output(case: unittest.TestCase, done: subprocess.CompletedProcess[bytes]) -> None:
+    """Assert reset output passes, reporting decoded stdout and stderr on failure."""
+    stdout = done.stdout.decode(errors="replace")
+    stderr = done.stderr.decode(errors="replace")
+    case.assertEqual(reset_output_problems(done.returncode, stdout), [], stdout + stderr)
 
 
 def isolated_git_environment(
@@ -194,8 +221,9 @@ class Hqdn3dDeviceMixin:
 
     @unittest.skipUnless(RESET_TOOL, "set HQDN3D_RESET_TOOL")
     def test_state_resets_on_in_graph_resize(self) -> None:
+        """Require all frames to match after each in-graph size change."""
         done = run_reset(RESET_TOOL, self.reset_device)
-        self.assertEqual(done.returncode, 0, done.stdout.decode() + done.stderr.decode())
+        assert_reset_output(self, done)
 
     def test_planted_wrong_strength_is_refused(self) -> None:
         cpu_chain, _ = self.runner.chains("yuv420p", "")

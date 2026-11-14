@@ -10,8 +10,8 @@ so the high-depth planar cases are 16-bit; a format the filter does not take
 (rgba) must be refused.
 
 Temporal state must reset where the CPU filter resets it: on a graph rebuild
-and on an in-graph frame size change, which tools/hqdn3d_reset_test checks
-with an ocl:<platform>.<device> argument.
+and on an in-graph frame size change, which libavfilter/tests/hqdn3d_vulkan
+checks with an ocl:<platform>.<device> argument.
 
 The planted wrong case is a luma strength of 4.5 against the CPU default of
 4, which the comparison must refuse.
@@ -20,8 +20,10 @@ The device cases need an FFmpeg built with the series and an OpenCL device:
 
     OCL_FFMPEG=/path/to/ffmpeg OCL_DEVICE=2.0 python3 -m unittest tests.test_hqdn3d_opencl
 
-The in-graph reset case also needs HQDN3D_RESET_TOOL=/path/to/tools/hqdn3d_reset_test.
-Without the variables the cases are skipped.
+The in-graph reset case also needs
+HQDN3D_RESET_TOOL=/path/to/libavfilter/tests/hqdn3d_vulkan (make
+libavfilter/tests/hqdn3d_vulkan in the FFmpeg build). Without the variables
+the cases are skipped.
 """
 
 from __future__ import annotations
