@@ -589,10 +589,34 @@ def _body_candidates(
     return _nested_candidates(nested, context, cd_targets, budget)
 
 
+def _candidate_key(candidate: _Candidate, cwd: Path) -> _Candidate:
+    """Compute deduplication key with operand normalized to resolved filesystem path."""
+    try:
+        path = Path(candidate.operand)
+        resolved = (path if path.is_absolute() else cwd / path).resolve()
+        return candidate._replace(operand=str(resolved))
+    except (OSError, RuntimeError):
+        return candidate
+
+
+def _unseen_candidates(
+    candidates: list[_Candidate], cwd: Path, seen: set[_Candidate]
+) -> list[_Candidate]:
+    """Filter candidates whose resolved keys are not yet in the visited set."""
+    fresh: list[_Candidate] = []
+    for candidate in candidates:
+        key = _candidate_key(candidate, cwd)
+        if key not in seen:
+            seen.add(key)
+            fresh.append(candidate)
+    return fresh
+
+
 def _inspect_files(
     worklist: list[_Candidate], context: InspectionContext, budget: BodyBudget
 ) -> Path | None:
-    """Drain ordered nested scripts without reentering any body or source inspection."""
+    """Drain ordered nested scripts inspecting each distinct candidate once."""
+    seen: set[_Candidate] = {_candidate_key(item, context.cwd) for item in worklist}
     for _ in range(MAX_SCRIPT_FILES + 1):
         if not worklist:
             return None
@@ -611,7 +635,7 @@ def _inspect_files(
         candidates = _body_candidates(res, file_context, budget)
         if isinstance(candidates, Path):
             return Path(f"{cur.operand} ({candidates})")
-        worklist.extend(reversed(candidates))
+        worklist.extend(reversed(_unseen_candidates(candidates, context.cwd, seen)))
     if worklist:
         return Path("more nested scripts than inspect limit")
     return None
