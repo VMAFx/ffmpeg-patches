@@ -590,10 +590,10 @@ def _body_candidates(
 
 
 def _candidate_key(candidate: _Candidate, cwd: Path) -> _Candidate:
-    """Compute deduplication key with operand normalized to resolved filesystem path."""
+    """Key a candidate by resolved path; a path that does not exist keeps its literal operand."""
     try:
         path = Path(candidate.operand)
-        resolved = (path if path.is_absolute() else cwd / path).resolve()
+        resolved = (path if path.is_absolute() else cwd / path).resolve(strict=True)
         return candidate._replace(operand=str(resolved))
     except (OSError, RuntimeError):
         return candidate
@@ -616,7 +616,8 @@ def _inspect_files(
     worklist: list[_Candidate], context: InspectionContext, budget: BodyBudget
 ) -> Path | None:
     """Drain ordered nested scripts inspecting each distinct candidate once."""
-    seen: set[_Candidate] = {_candidate_key(item, context.cwd) for item in worklist}
+    seen: set[_Candidate] = set()
+    worklist = _unseen_candidates(worklist, context.cwd, seen)
     for _ in range(MAX_SCRIPT_FILES + 1):
         if not worklist:
             return None
