@@ -17,21 +17,20 @@ The OpenCL frames context has no LSB-aligned 10- or 12-bit planar
 format, so the high-depth planar formats are the 16-bit ones; p010,
 p012 and p016 are accepted.
 
-tools/hqdn3d_reset_test now also runs the OpenCL filter with an
+libavfilter/tests/hqdn3d_vulkan now also runs the OpenCL filter with an
 ocl:<platform>.<device> argument.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- configure                      |   1 +
- doc/filters.texi               |  33 ++
- libavfilter/Makefile           |   1 +
- libavfilter/allfilters.c       |   1 +
- libavfilter/opencl/hqdn3d.cl   | 315 +++++++++++++
- libavfilter/opencl_source.h    |   1 +
- libavfilter/vf_hqdn3d_opencl.c | 810 +++++++++++++++++++++++++++++++++
- tools/Makefile                 |   1 +
- tools/hqdn3d_reset_test.c      |  28 +-
- 9 files changed, 1190 insertions(+), 1 deletion(-)
+ configure                         |   1 +
+ doc/filters.texi                  |  33 ++
+ libavfilter/Makefile              |   2 +
+ libavfilter/allfilters.c          |   1 +
+ libavfilter/opencl/hqdn3d.cl      | 315 ++++++++++++
+ libavfilter/opencl_source.h       |   1 +
+ libavfilter/tests/hqdn3d_vulkan.c |  23 +-
+ libavfilter/vf_hqdn3d_opencl.c    | 810 ++++++++++++++++++++++++++++++
+ 8 files changed, 1185 insertions(+), 1 deletion(-)
  create mode 100644 libavfilter/opencl/hqdn3d.cl
  create mode 100644 libavfilter/vf_hqdn3d_opencl.c
 
@@ -48,7 +47,7 @@ index c8c4e002e95f06aac7a5e2caccd0d2a93dee366d..d386cc831d5e7265f8f73f42692a91ea
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index cc502dca5c1cef042a5a9588e77dec0bd168db3d..863863b8fbce453eacf4da88bf5ea9881eb12fd0 100644
+index 5b2969e9a0271508c201df519cc71cb746949ae7..cb6e920d984551bb4f09b580c37fbb3dbfd83a50 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15824,6 +15824,39 @@ The filter accepts the same options as @ref{hqdn3d}:
@@ -92,7 +91,7 @@ index cc502dca5c1cef042a5a9588e77dec0bd168db3d..863863b8fbce453eacf4da88bf5ea988
  @section hqdn3d_vulkan
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index f079baf63b8ed372adc9ecadf72e30f68f04b23e..e56c74a5112d13865067a14ccd1b82c99dcd4fa1 100644
+index 0dd379ad13056b96742fe656badb784bb847a648..37c210380446026e543d1489223afb25297a1272 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -348,6 +348,7 @@ OBJS-$(CONFIG_HISTEQ_FILTER)                 += vf_histeq.o
@@ -103,6 +102,14 @@ index f079baf63b8ed372adc9ecadf72e30f68f04b23e..e56c74a5112d13865067a14ccd1b82c9
  OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER)          += vf_hqdn3d_vulkan.o hqdn3d_coefs.o vulkan.o vulkan_filter.o
  OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
  OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
+@@ -697,6 +698,7 @@ TOOLS-$(CONFIG_LIBZMQ) += zmqsend
+ 
+ # hqdn3d_vulkan also tests the other hqdn3d GPU filters; list it once.
+ TESTPROGS-$(CONFIG_HQDN3D_CUDA_FILTER) += hqdn3d_vulkan
++TESTPROGS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_vulkan
+ TESTPROGS-yes := $(sort $(TESTPROGS-yes))
+ 
+ clean::
 diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
 index 3cacb97a8fbfc2e5e0880aa1048f2459f9200884..81c1f2c8a8d38e38b40a2b6bfb3e8f05fbbbc627 100644
 --- a/libavfilter/allfilters.c
@@ -448,6 +455,68 @@ index 4a7b945e029fbff9a5795481d455dc5afd90d90b..65546425d65f6c3ffc71e9ffe7ad88c5
  extern const char *ff_source_neighbor_cl;
  extern const char *ff_source_nlmeans_cl;
  extern const char *ff_source_overlay_cl;
+diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
+index aa2eebaf37fe4beb07d0091c6ec7a2e029b1542c..d3b1c72b34abe48357b646e2cedf16fc3ae075e7 100644
+--- a/libavfilter/tests/hqdn3d_vulkan.c
++++ b/libavfilter/tests/hqdn3d_vulkan.c
+@@ -107,6 +107,10 @@ static enum AVPixelFormat get_gpu_pix_fmt(enum AVHWDeviceType hw_type)
+ #if CONFIG_HQDN3D_CUDA_FILTER
+     case AV_HWDEVICE_TYPE_CUDA:
+         return AV_PIX_FMT_CUDA;
++#endif
++#if CONFIG_HQDN3D_OPENCL_FILTER
++    case AV_HWDEVICE_TYPE_OPENCL:
++        return AV_PIX_FMT_OPENCL;
+ #endif
+     default:
+         return AV_PIX_FMT_NONE;
+@@ -357,6 +361,10 @@ static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
+ #if CONFIG_HQDN3D_CUDA_FILTER
+     case AV_HWDEVICE_TYPE_CUDA:
+         return "hqdn3d_cuda";
++#endif
++#if CONFIG_HQDN3D_OPENCL_FILTER
++    case AV_HWDEVICE_TYPE_OPENCL:
++        return "hqdn3d_opencl";
+ #endif
+     default:
+         return NULL;
+@@ -1033,6 +1041,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
+     return AV_HWDEVICE_TYPE_VULKAN;
+ #elif CONFIG_HQDN3D_CUDA_FILTER
+     return AV_HWDEVICE_TYPE_CUDA;
++#elif CONFIG_HQDN3D_OPENCL_FILTER
++    return AV_HWDEVICE_TYPE_OPENCL;
+ #else
+     return AV_HWDEVICE_TYPE_NONE;
+ #endif
+@@ -1062,6 +1072,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+ #endif
+     }
+ 
++    if (strncmp(arg, "ocl:", 4) == 0) {
++#if CONFIG_HQDN3D_OPENCL_FILTER
++        *hw_type = AV_HWDEVICE_TYPE_OPENCL;
++        *dev_idx = arg + 4;
++        return 0;
++#else
++        fprintf(stderr, "OpenCL support is not built\n");
++        return AVERROR(ENOSYS);
++#endif
++    }
++
+ #if CONFIG_HQDN3D_VULKAN_FILTER
+     *hw_type = AV_HWDEVICE_TYPE_VULKAN;
+     *dev_idx = strncmp(arg, "vk:", 3) == 0 ? arg + 3 : arg;
+@@ -1083,7 +1104,7 @@ int main(int argc, char **argv)
+     int refused_10 = 0, refused_444 = 0;
+ 
+     if (argc > 2) {
+-        fprintf(stderr, "Usage: %s [[vk:|cuda:]device index]\n", argv[0]);
++        fprintf(stderr, "Usage: %s [[vk:|cuda:|ocl:]device index]\n", argv[0]);
+         return 1;
+     }
+     err = parse_device_arg(argc >= 2 ? argv[1] : NULL, &t.hw_type, &dev_idx);
 diff --git a/libavfilter/vf_hqdn3d_opencl.c b/libavfilter/vf_hqdn3d_opencl.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..4ba48b78055d4b087a1a583c91711b6c748d146a
@@ -1264,89 +1333,3 @@ index 0000000000000000000000000000000000000000..4ba48b78055d4b087a1a583c91711b6c
 +    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 +    .process_command = &process_command,
 +};
-diff --git a/tools/Makefile b/tools/Makefile
-index d49d458ad8ea26d1492e96de23ccab8983c39685..4929128fdaf11dc7b09d5bff4b7c71ba315e2131 100644
---- a/tools/Makefile
-+++ b/tools/Makefile
-@@ -1,6 +1,7 @@
- TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher uncoded_frame
- TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
- TOOLS-$(CONFIG_HQDN3D_CUDA_FILTER)   += hqdn3d_reset_test
-+TOOLS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_reset_test
- TOOLS-yes := $(sort $(TOOLS-yes))
- TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
- TOOLS-$(CONFIG_ZLIB) += cws2fws
-diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
-index f190a36388631bd2a8591a4682a1f7afc2b6912c..413fd848807edf68c4ff17d40a8804659b98babb 100644
---- a/tools/hqdn3d_reset_test.c
-+++ b/tools/hqdn3d_reset_test.c
-@@ -114,6 +114,10 @@ static int create_gpu_frames_ctx(AVBufferRef *device_ref, int w, int h,
- #if CONFIG_HQDN3D_VULKAN_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
-         hwfc->format = AV_PIX_FMT_VULKAN;
-+#endif
-+#if CONFIG_HQDN3D_OPENCL_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-+        hwfc->format = AV_PIX_FMT_OPENCL;
- #endif
-     hwfc->sw_format = sw_format;
-     hwfc->width     = w;
-@@ -295,6 +299,10 @@ static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
- #if CONFIG_HQDN3D_VULKAN_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
-         par->format = AV_PIX_FMT_VULKAN;
-+#endif
-+#if CONFIG_HQDN3D_OPENCL_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-+        par->format = AV_PIX_FMT_OPENCL;
- #endif
-     par->width         = 128;
-     par->height        = 72;
-@@ -324,6 +332,10 @@ static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
- #if CONFIG_HQDN3D_VULKAN_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_VULKAN)
-         return "hqdn3d_vulkan";
-+#endif
-+#if CONFIG_HQDN3D_OPENCL_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-+        return "hqdn3d_opencl";
- #endif
-     return NULL;
- }
-@@ -560,6 +572,16 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
- #else
-         av_log(NULL, AV_LOG_ERROR, "Vulkan backend not built\n");
-         return AVERROR(ENOSYS);
-+#endif
-+    }
-+    if (strncmp(arg, "ocl:", 4) == 0) {
-+#if CONFIG_HQDN3D_OPENCL_FILTER
-+        *hw_type = AV_HWDEVICE_TYPE_OPENCL;
-+        *dev_idx = arg + 4;
-+        return 0;
-+#else
-+        av_log(NULL, AV_LOG_ERROR, "OpenCL backend not built\n");
-+        return AVERROR(ENOSYS);
- #endif
-     }
- 
-@@ -571,6 +593,10 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
-     *hw_type = AV_HWDEVICE_TYPE_CUDA;
-     *dev_idx = arg;
-     return 0;
-+#elif CONFIG_HQDN3D_OPENCL_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_OPENCL;
-+    *dev_idx = arg;
-+    return 0;
- #else
-     av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
-     return AVERROR(ENOSYS);
-@@ -590,7 +616,7 @@ int main(int argc, char **argv)
-     int err, any_diff = 0, frames_ok = 0;
- 
-     if (argc < 2) {
--        fprintf(stderr, "Usage: %s <[cuda:|vk:]device index>\n", argv[0]);
-+        fprintf(stderr, "Usage: %s <[cuda:|vk:|ocl:]device index>\n", argv[0]);
-         return 1;
-     }
- 

@@ -22,10 +22,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 libavfilter/opencl/tonemap_peak.cl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 1cdb7f2265851c5d7f5d4eb3126e72a42605c330..9ebe763b81e117e042d557ce723a8a2e837eb9b6 100644
+index 655053dcfbfe7949b4c73157b3ba3553ec266f70..b9aac6e6d84f67bae1aecc912a080f31377262ad 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -28663,14 +28663,22 @@ It accepts the following parameters:
+@@ -28672,14 +28672,22 @@ It accepts the following parameters:
  @item tonemap
  Specify the tone-mapping operator to be used. Same as tonemap option in @ref{tonemap}.
  With @code{bt2408_hable}, the output is in BT.709 primaries whatever
@@ -52,7 +52,7 @@ index 1cdb7f2265851c5d7f5d4eb3126e72a42605c330..9ebe763b81e117e042d557ce723a8a2e
  @item param
  Tune the tone mapping algorithm. same as param option in @ref{tonemap}.
  
-@@ -28689,6 +28697,10 @@ The tonemapping algorithm parameters is fine-tuned per each scene. And a thresho
+@@ -28698,6 +28706,10 @@ The tonemapping algorithm parameters is fine-tuned per each scene. And a thresho
  is used to detect whether the scene has changed or not. If the distance between
  the current frame average brightness and the current running average exceeds
  a threshold value, we would re-calculate scene average and peak brightness.
@@ -64,7 +64,7 @@ index 1cdb7f2265851c5d7f5d4eb3126e72a42605c330..9ebe763b81e117e042d557ce723a8a2e
  
  @item format
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index a091b3ba25437a5d2286db460c6bb570c1a2c8b4..251d86938fbb06dd07c098f6f2741b4b45702960 100644
+index 14cf4ca500e08e40095411e83e8d43a6f321ad18..7d89ec3d2f15a2ef2dd09b931f8e713097f5cd86 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -550,7 +550,8 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2

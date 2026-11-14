@@ -18,10 +18,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  3 files changed, 25 insertions(+), 6 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index ec73d8b914e271c28b8fcc57ae0a1e39777a862a..3ae400e5be3cd6df875c514c4644768059a1109c 100644
+index 1d18c9732202214b27b246902be08914d8a9f92a..150d8ffe42ecbdf3a356ec696dd711a36cd4eeb8 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -28664,8 +28664,10 @@ It accepts the following parameters:
+@@ -28673,8 +28673,10 @@ It accepts the following parameters:
  Specify the tone-mapping operator to be used. Same as tonemap option in @ref{tonemap}.
  With @code{bt2408_hable}, the output is in BT.709 primaries whatever
  @option{primaries} says, the options @option{param}, @option{desat} and
@@ -35,7 +35,7 @@ index ec73d8b914e271c28b8fcc57ae0a1e39777a862a..3ae400e5be3cd6df875c514c46447680
  colorspace @code{ipt-c2}) directly and applies the RPU reshape in the kernel.
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 8df9a0343f1566740d4d51aa1a2a3e1d29c608c2..a2f71978a1358a945758cf55fb9a845c79691864 100644
+index df4d55c48d898a002d4c4aa75bd66b59827ee35a..80ef9a6c8b50c5884b754081b0d0797a35327881 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -547,7 +547,7 @@ OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o

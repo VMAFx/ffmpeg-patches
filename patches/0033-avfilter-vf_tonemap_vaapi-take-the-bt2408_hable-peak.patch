@@ -17,10 +17,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  3 files changed, 23 insertions(+), 3 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 3ae400e5be3cd6df875c514c4644768059a1109c..1cdb7f2265851c5d7f5d4eb3126e72a42605c330 100644
+index 150d8ffe42ecbdf3a356ec696dd711a36cd4eeb8..655053dcfbfe7949b4c73157b3ba3553ec266f70 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -29076,7 +29076,9 @@ and @option{matrix} say; @option{format} must be an 8-bit RGB format such as
+@@ -29085,7 +29085,9 @@ and @option{matrix} say; @option{format} must be an 8-bit RGB format such as
  
  @item peak
  Override the signal peak for @code{tonemap=bt2408_hable}, in units of
@@ -32,7 +32,7 @@ index 3ae400e5be3cd6df875c514c4644768059a1109c..1cdb7f2265851c5d7f5d4eb3126e72a4
  @end table
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index a2f71978a1358a945758cf55fb9a845c79691864..a091b3ba25437a5d2286db460c6bb570c1a2c8b4 100644
+index 80ef9a6c8b50c5884b754081b0d0797a35327881..14cf4ca500e08e40095411e83e8d43a6f321ad18 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -551,7 +551,7 @@ OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o bt2

@@ -11,60 +11,70 @@ that both filters share one implementation, and it takes the same
 options and commands.
 
 The output is bit-exact to hqdn3d for the planar 8, 10, 12 and 16 bit
-formats and for nv12, p010, p012 and p016. The one exception: where the
-CPU filter writes a value above the format maximum into a 10 or 12 bit
-plane, p010 and p012 cannot store it, and this filter writes the format
-maximum instead.
+formats, and for nv12, p010, p012 and p016 against hqdn3d on the
+equivalent planar format. As in hqdn3d, a planar output sample is
+narrowed to the width of its 8 or 16 bit container, so a temporal
+result below zero is stored as hqdn3d stores it. The one exception:
+where the CPU filter writes a value above the format maximum into a 10
+or 12 bit plane, p010 and p012 cannot store it, and this filter writes
+the format maximum instead.
 
 The temporal state is dropped where hqdn3d drops it: on graph
-configuration and on a change of frame size or format within the
-stream. After such a change the output frames come from a frames
-context of the new size, so libavfilter users that send frames of a new
-size into a running graph get output of that size, as with hqdn3d.
+configuration and on a change of frame size within the stream. After a
+size change, and for a first frame whose size differs from the link,
+the output frames come from a frames context of the frame size. A
+frame whose format differs from the link's, the first frame included,
+is refused with AVERROR(EINVAL), as hqdn3d refuses a change of format
+within the stream.
 
-tools/hqdn3d_reset_test runs hqdn3d and hqdn3d_vulkan side by side on
-frames of three sizes and compares every output frame.
+At initialization the filter refuses with AVERROR(ENOTSUP) a device
+created without a shader or storage feature the shaders use, and a
+frame size whose sample buffers exceed the device's
+maxStorageBufferRange. A failed initialization, or a failed
+reallocation after a size change, is final.
+
+This is the content of FFmpeg pull request 25879, adapted to the 9.0
+release: the fail path discards the execution context with
+ff_vk_exec_discard_deps(), the host wait after each submission orders
+the temporal history between frames (this release has no timeline
+semaphore on FFVkExecContext), the filter does not declare
+FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE, which this release does not have,
+and the Changelog is left alone.
+
+libavfilter/tests/hqdn3d_vulkan runs hqdn3d and hqdn3d_vulkan side by
+side on frames of three sizes and compares every output frame; it also
+checks the first-frame size change, the format refusal, the p012 clamp
+and a temporal result below zero. It runs under fate-hw as
+fate-filter-hqdn3d-vulkan when hqdn3d_vulkan and hqdn3d are enabled.
 
 The filter ports GPL code and therefore depends on --enable-gpl, as
 hqdn3d does.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- Makefile                                      |   2 +
- configure                                     |   1 +
- doc/filters.texi                              |  37 +
- libavfilter/Makefile                          |   3 +-
- libavfilter/allfilters.c                      |   1 +
- libavfilter/hqdn3d_coefs.c                    |  58 ++
- libavfilter/hqdn3d_coefs.h                    |  38 +
- libavfilter/vf_hqdn3d.c                       |  33 +-
- libavfilter/vf_hqdn3d_vulkan.c                | 759 ++++++++++++++++++
- libavfilter/vulkan/Makefile                   |   2 +
- .../vulkan/hqdn3d_horizontal.comp.glsl        | 150 ++++
- libavfilter/vulkan/hqdn3d_vertical.comp.glsl  | 203 +++++
- tools/Makefile                                |   1 +
- tools/hqdn3d_reset_test.c                     | 540 +++++++++++++
- 14 files changed, 1797 insertions(+), 31 deletions(-)
+ configure                                     |    1 +
+ doc/filters.texi                              |   46 +
+ libavfilter/Makefile                          |    4 +-
+ libavfilter/allfilters.c                      |    1 +
+ libavfilter/hqdn3d_coefs.c                    |   58 +
+ libavfilter/hqdn3d_coefs.h                    |   57 +
+ libavfilter/tests/hqdn3d_vulkan.c             | 1032 +++++++++++++++++
+ libavfilter/vf_hqdn3d.c                       |   33 +-
+ libavfilter/vf_hqdn3d_vulkan.c                |  891 ++++++++++++++
+ libavfilter/vulkan/Makefile                   |    2 +
+ .../vulkan/hqdn3d_horizontal.comp.glsl        |  160 +++
+ libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  233 ++++
+ tests/fate/hw.mak                             |    4 +
+ tests/ref/fate/filter-hqdn3d-vulkan           |   21 +
+ 14 files changed, 2512 insertions(+), 31 deletions(-)
  create mode 100644 libavfilter/hqdn3d_coefs.c
  create mode 100644 libavfilter/hqdn3d_coefs.h
+ create mode 100644 libavfilter/tests/hqdn3d_vulkan.c
  create mode 100644 libavfilter/vf_hqdn3d_vulkan.c
  create mode 100644 libavfilter/vulkan/hqdn3d_horizontal.comp.glsl
  create mode 100644 libavfilter/vulkan/hqdn3d_vertical.comp.glsl
- create mode 100644 tools/hqdn3d_reset_test.c
+ create mode 100644 tests/ref/fate/filter-hqdn3d-vulkan
 
-diff --git a/Makefile b/Makefile
-index ca55556cee61f26f56f1f9fc2c6f2082d5fb00c5..33a1a38de2f214a9cbc7bed3be1c1d11c9e20774 100644
---- a/Makefile
-+++ b/Makefile
-@@ -90,6 +90,8 @@ tools/scale_slice_test$(EXESUF): ELIBS = $(FF_EXTRALIBS)
- tools/sofa2wavs$(EXESUF): ELIBS = $(FF_EXTRALIBS)
- tools/uncoded_frame$(EXESUF): $(FF_DEP_LIBS)
- tools/uncoded_frame$(EXESUF): ELIBS = $(FF_EXTRALIBS)
-+tools/hqdn3d_reset_test$(EXESUF): $(FF_DEP_LIBS)
-+tools/hqdn3d_reset_test$(EXESUF): ELIBS = $(FF_EXTRALIBS)
- tools/target_dec_%_fuzzer$(EXESUF): $(FF_DEP_LIBS)
- tools/target_dem_%_fuzzer$(EXESUF): $(FF_DEP_LIBS)
- 
 diff --git a/configure b/configure
 index b1656f0f803081cecc0f9ac7136c2d08d0494ca1..231c6b67c5dd7564633dc0801adc81cf676ea575 100755
 --- a/configure
@@ -78,10 +88,10 @@ index b1656f0f803081cecc0f9ac7136c2d08d0494ca1..231c6b67c5dd7564633dc0801adc81cf
  iccgen_filter_deps="lcms2"
  identity_filter_select="scene_sad"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..6fc2a91fd538858ccbcc73650ef61e820417a2fb 100644
+index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..51b54e51363147a4b1a1e6ac18abef5d0e33a5fc 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -15792,6 +15792,43 @@ The command accepts the same syntax of the corresponding option.
+@@ -15792,6 +15792,52 @@ The command accepts the same syntax of the corresponding option.
  If the specified expression is not valid, it is kept at its current
  value.
  
@@ -89,10 +99,19 @@ index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..6fc2a91fd538858ccbcc73650ef61e82
 +@section hqdn3d_vulkan
 +
 +Apply a High Quality 3D Denoiser using Vulkan compute shaders.
-+The output is bit-exact to the CPU @ref{hqdn3d} filter. The one exception is
++The output is bit-exact to the CPU @ref{hqdn3d} filter. For semiplanar inputs,
++the reference is the CPU filter on the equivalent planar format. The one exception is
 +@samp{p010} and @samp{p012}: where the CPU filter writes a value above the
 +format maximum, which these formats cannot store, this filter writes the
 +format maximum.
++The filter refuses a frame whose software format differs from the link's.
++The filter also refuses a device on which one of these shader or storage
++features is not enabled: @code{shaderInt16}, @code{storageBuffer16BitAccess},
++@code{scalarBlockLayout}, @code{runtimeDescriptorArray},
++@code{shaderStorageImageReadWithoutFormat}, or
++@code{shaderStorageImageWriteWithoutFormat}. A device that FFmpeg creates
++enables each of them that the hardware supports; a device the application
++creates must enable them itself, as support by the physical device is not enough.
 +
 +Supported input hardware frame software formats:
 +@itemize
@@ -126,7 +145,7 @@ index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..6fc2a91fd538858ccbcc73650ef61e82
  @section hwdownload
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index a8e9bc59e7305f19912b413c03367724f1f12d4c..432925008767032edb80d215a61dd48146bf96ab 100644
+index a8e9bc59e7305f19912b413c03367724f1f12d4c..38d39d201689bda9164e885366cce28fbc98aaee 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -346,7 +346,8 @@ OBJS-$(CONFIG_HFLIP_FILTER)                  += vf_hflip.o
@@ -139,6 +158,14 @@ index a8e9bc59e7305f19912b413c03367724f1f12d4c..432925008767032edb80d215a61dd481
  OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
  OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
  OBJS-$(CONFIG_HSVHOLD_FILTER)                += vf_hsvkey.o
+@@ -689,6 +690,7 @@ TESTPROGS = bt2408_hable drawutils filtfmts formats integral zscale_light_levels
+ 
+ TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
+ TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
++TESTPROGS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_vulkan
+ 
+ TOOLS-$(CONFIG_LIBZMQ) += zmqsend
+ 
 diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
 index c98adbeee9576cf80dd46848b17bfe6ec90a469e..3211fc02153db11796ab388a28faa82e1c465f53 100644
 --- a/libavfilter/allfilters.c
@@ -217,10 +244,10 @@ index 0000000000000000000000000000000000000000..b2d82451eae66c8611322334a9e800da
 +}
 diff --git a/libavfilter/hqdn3d_coefs.h b/libavfilter/hqdn3d_coefs.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0e098ac6b9b759433d01907cd5dd41c6392c0bc8
+index 0000000000000000000000000000000000000000..3399d70ec3d321ab51a61b99f1dabdb5bbb76895
 --- /dev/null
 +++ b/libavfilter/hqdn3d_coefs.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,57 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -255,10 +282,1067 @@ index 0000000000000000000000000000000000000000..0e098ac6b9b759433d01907cd5dd41c6
 +
 +#define HQDN3D_LUT_BITS(depth) ((depth) == 16 ? 8 : 4)
 +
++/**
++ * Fill unset (zero) denoise strength entries derived from luma spatial strength.
++ *
++ * Fills zero entries in strength using default ratios based on luma spatial.
++ *
++ * @param strength array of 4 denoising strengths in [0, DBL_MAX], indexed in order
++ *                 LUMA_SPATIAL (0), LUMA_TMP (1), CHROMA_SPATIAL (2), and CHROMA_TMP (3)
++ */
 +void ff_hqdn3d_default_strengths(double strength[4]);
++
++/**
++ * Precalculate coefficient lookup table for spatial or temporal filtering.
++ *
++ * Builds a coefficient lookup table of (512 << HQDN3D_LUT_BITS(depth)) entries.
++ * Upon return, ct[0] holds !!dist25 (1 if enabled/non-zero, 0 if disabled).
++ *
++ * @param dist25 denoising strength parameter, internally clamped to 252.0
++ * @param depth  pixel bit depth determining LUT precision via HQDN3D_LUT_BITS(depth)
++ * @param ct     lookup table destination buffer of size (512 << HQDN3D_LUT_BITS(depth)) int16_t
++ */
 +void ff_hqdn3d_precalc_coefs(double dist25, int depth, int16_t *ct);
 +
 +#endif /* AVFILTER_HQDN3D_COEFS_H */
+diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a6a0a56a84b99e5a62485e5809b0982c5687ff1
+--- /dev/null
++++ b/libavfilter/tests/hqdn3d_vulkan.c
+@@ -0,0 +1,1032 @@
++/*
++ * Copyright (c) 2026 Lusoris
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include "libavutil/avstring.h"
++#include "libavutil/channel_layout.h"
++#include "libavutil/common.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_vulkan.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavfilter/avfilter.h"
++#include "libavfilter/buffersink.h"
++#include "libavfilter/buffersrc.h"
++
++/* Return test frame dimensions for frame index n across three distinct resolution buckets. */
++static void get_frame_dims(int n, int *w, int *h)
++{
++    if (n < 4) {
++        *w = 128;
++        *h = 72;
++    } else if (n < 8) {
++        *w = 96;
++        *h = 56;
++    } else {
++        *w = 160;
++        *h = 96;
++    }
++}
++
++/* Generate pseudo-random byte using linear congruential generator and advance 32-bit state. */
++static uint8_t lcg_rand(uint32_t *state)
++{
++    *state = *state * 1664525u + 1013904223u;
++    return (uint8_t)(*state >> 16);
++}
++
++/* Allocate YUV420P frame with index-based dimensions and fill planes with deterministic noise. */
++static int create_input_frame(int n, uint32_t *seed, AVFrame **out_frame)
++{
++    int w, h, err;
++    AVFrame *f = av_frame_alloc();
++    if (!f)
++        return AVERROR(ENOMEM);
++
++    get_frame_dims(n, &w, &h);
++    f->format = AV_PIX_FMT_YUV420P;
++    f->width  = w;
++    f->height = h;
++    f->pts    = n;
++
++    err = av_frame_get_buffer(f, 0);
++    if (err < 0) {
++        av_frame_free(&f);
++        return err;
++    }
++
++    for (int p = 0; p < 3; p++) {
++        int pw = (p == 0) ? w : AV_CEIL_RSHIFT(w, 1);
++        int ph = (p == 0) ? h : AV_CEIL_RSHIFT(h, 1);
++        for (int y = 0; y < ph; y++) {
++            uint8_t *dst = f->data[p] + y * f->linesize[p];
++            for (int x = 0; x < pw; x++)
++                dst[x] = lcg_rand(seed);
++        }
++    }
++
++    *out_frame = f;
++    return 0;
++}
++
++/* Create and initialize Vulkan hardware frames context with storage and transfer usage flags. */
++static int create_vk_frames_ctx(AVBufferRef *device_ref, int w, int h,
++                                enum AVPixelFormat sw_format, AVBufferRef **frames_out)
++{
++    AVBufferRef *frames_ref = av_hwframe_ctx_alloc(device_ref);
++    AVHWFramesContext *hwfc;
++    AVVulkanFramesContext *vk_hwfc;
++    int err;
++
++    if (!frames_ref)
++        return AVERROR(ENOMEM);
++
++    hwfc = (AVHWFramesContext *)frames_ref->data;
++    hwfc->format    = AV_PIX_FMT_VULKAN;
++    hwfc->sw_format = sw_format;
++    hwfc->width     = w;
++    hwfc->height    = h;
++
++    vk_hwfc = hwfc->hwctx;
++    vk_hwfc->tiling = VK_IMAGE_TILING_OPTIMAL;
++    vk_hwfc->usage  = VK_IMAGE_USAGE_SAMPLED_BIT |
++                      VK_IMAGE_USAGE_STORAGE_BIT |
++                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++
++    err = av_hwframe_ctx_init(frames_ref);
++    if (err < 0) {
++        av_buffer_unref(&frames_ref);
++        return err;
++    }
++
++    *frames_out = frames_ref;
++    return 0;
++}
++
++/* Allocate GPU frame from hardware frames context, upload software frame data, and copy props. */
++static int upload_vk_frame(AVBufferRef *frames_ref, AVFrame *sw_in, AVFrame **vk_out)
++{
++    AVFrame *vk_f = av_frame_alloc();
++    int err;
++
++    if (!vk_f)
++        return AVERROR(ENOMEM);
++
++    err = av_hwframe_get_buffer(frames_ref, vk_f, 0);
++    if (err < 0) {
++        av_frame_free(&vk_f);
++        return err;
++    }
++
++    err = av_hwframe_transfer_data(vk_f, sw_in, 0);
++    if (err < 0) {
++        av_frame_free(&vk_f);
++        return err;
++    }
++
++    err = av_frame_copy_props(vk_f, sw_in);
++    if (err < 0) {
++        av_frame_free(&vk_f);
++        return err;
++    }
++
++    *vk_out = vk_f;
++    return 0;
++}
++
++/* Transfer frame pixels from Vulkan hardware surface to a new software frame in the frames context format. */
++static int download_vk_frame(AVFrame *vk_in, AVFrame **sw_out)
++{
++    AVFrame *sw_f = av_frame_alloc();
++    int err;
++
++    if (!sw_f)
++        return AVERROR(ENOMEM);
++
++    sw_f->format = ((AVHWFramesContext *)vk_in->hw_frames_ctx->data)->sw_format;
++    err = av_hwframe_transfer_data(sw_f, vk_in, 0);
++    if (err < 0) {
++        av_frame_free(&sw_f);
++        return err;
++    }
++
++    err = av_frame_copy_props(sw_f, vk_in);
++    if (err < 0) {
++        av_frame_free(&sw_f);
++        return err;
++    }
++
++    *sw_out = sw_f;
++    return 0;
++}
++
++/* Compare pixel data plane-by-plane between CPU and GPU frames, returning 1 if identical or 0. */
++static int compare_planes(const AVFrame *cpu_f, const AVFrame *gpu_f)
++{
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(cpu_f->format);
++
++    if (!desc || cpu_f->format != gpu_f->format ||
++        cpu_f->width != gpu_f->width || cpu_f->height != gpu_f->height)
++        return 0;
++
++    for (int p = 0; p < 3; p++) {
++        int bytes = av_image_get_linesize(cpu_f->format, cpu_f->width, p);
++        int ph = (p == 0) ? cpu_f->height : AV_CEIL_RSHIFT(cpu_f->height, desc->log2_chroma_h);
++
++        if (bytes <= 0)
++            return 0;
++
++        for (int y = 0; y < ph; y++) {
++            const uint8_t *c = cpu_f->data[p] + y * cpu_f->linesize[p];
++            const uint8_t *g = gpu_f->data[p] + y * gpu_f->linesize[p];
++            if (memcmp(c, g, bytes) != 0)
++                return 0;
++        }
++    }
++    return 1;
++}
++
++/* Connect source to middle filter, middle to sink, and validate complete filter graph layout. */
++static int link_and_config(AVFilterGraph *graph, AVFilterContext *src,
++                           AVFilterContext *mid, AVFilterContext *sink)
++{
++    int err = avfilter_link(src, 0, mid, 0);
++    if (err < 0)
++        return err;
++
++    err = avfilter_link(mid, 0, sink, 0);
++    if (err < 0)
++        return err;
++
++    return avfilter_graph_config(graph, NULL);
++}
++
++/* Build CPU filter graph with buffer source, hqdn3d filter, and sink, returning 0 on success. */
++static int init_cpu_graph(AVFilterGraph **graph_out,
++                          AVFilterContext **src_out,
++                          AVFilterContext **sink_out,
++                          int w, int h, enum AVPixelFormat fmt)
++{
++    AVFilterGraph *graph = avfilter_graph_alloc();
++    const AVFilter *buf_filt = avfilter_get_by_name("buffer");
++    const AVFilter *hq_filt = avfilter_get_by_name("hqdn3d");
++    const AVFilter *sink_filt = avfilter_get_by_name("buffersink");
++    AVFilterContext *src_ctx = NULL, *hq_ctx = NULL, *sink_ctx = NULL;
++    char args[128];
++    int err;
++
++    if (!graph)
++        return AVERROR(ENOMEM);
++
++    if (!buf_filt || !hq_filt || !sink_filt) {
++        if (!buf_filt)
++            av_log(NULL, AV_LOG_ERROR, "filter %s not available\n", "buffer");
++        if (!hq_filt)
++            av_log(NULL, AV_LOG_ERROR, "filter %s not available\n", "hqdn3d");
++        if (!sink_filt)
++            av_log(NULL, AV_LOG_ERROR, "filter %s not available\n", "buffersink");
++        avfilter_graph_free(&graph);
++        return AVERROR_FILTER_NOT_FOUND;
++    }
++
++    snprintf(args, sizeof(args),
++             "video_size=%dx%d:pix_fmt=%s:time_base=1/25:pixel_aspect=1/1",
++             w, h, av_get_pix_fmt_name(fmt));
++    err = avfilter_graph_create_filter(&src_ctx, buf_filt, "in", args, NULL, graph);
++    if (err < 0) {
++        avfilter_graph_free(&graph);
++        return err;
++    }
++
++    err = avfilter_graph_create_filter(&hq_ctx, hq_filt, "hqdn3d", NULL, NULL, graph);
++    if (err < 0) {
++        avfilter_graph_free(&graph);
++        return err;
++    }
++
++    err = avfilter_graph_create_filter(&sink_ctx, sink_filt, "out", NULL, NULL, graph);
++    if (err < 0) {
++        avfilter_graph_free(&graph);
++        return err;
++    }
++
++    err = link_and_config(graph, src_ctx, hq_ctx, sink_ctx);
++    if (err < 0) {
++        avfilter_graph_free(&graph);
++        return err;
++    }
++
++    *graph_out = graph;
++    *src_out = src_ctx;
++    *sink_out = sink_ctx;
++    return 0;
++}
++
++/* Configure Vulkan buffer source with hardware frames context and video stream parameters. */
++static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
++                              AVBufferRef *initial_frames_ref, AVFilterContext **src_out)
++{
++    AVHWFramesContext *hwfc = (AVHWFramesContext *)initial_frames_ref->data;
++    AVFilterContext *src_ctx = avfilter_graph_alloc_filter(graph, buf_filt, "in");
++    AVBufferSrcParameters *par = av_buffersrc_parameters_alloc();
++    int err;
++
++    if (!src_ctx || !par) {
++        av_free(par);
++        return AVERROR(ENOMEM);
++    }
++    par->format        = AV_PIX_FMT_VULKAN;
++    par->width         = hwfc->width;
++    par->height        = hwfc->height;
++    par->time_base     = (AVRational){ 1, 25 };
++    par->sample_aspect_ratio = (AVRational){ 1, 1 };
++    par->hw_frames_ctx = initial_frames_ref;
++
++    err = av_buffersrc_parameters_set(src_ctx, par);
++    av_free(par);
++    if (err < 0)
++        return err;
++
++    err = avfilter_init_dict(src_ctx, NULL);
++    if (err < 0)
++        return err;
++
++    *src_out = src_ctx;
++    return 0;
++}
++
++/* Build GPU filter graph linking Vulkan buffer source, hqdn3d_vulkan filter, and buffer sink. */
++static int init_gpu_graph(AVFilterGraph **graph_out,
++                          AVFilterContext **src_out,
++                          AVFilterContext **sink_out,
++                          AVBufferRef *vk_device_ref,
++                          AVBufferRef *initial_frames_ref)
++{
++    AVFilterGraph *graph = avfilter_graph_alloc();
++    const AVFilter *buf_filt = avfilter_get_by_name("buffer");
++    const AVFilter *hq_filt = avfilter_get_by_name("hqdn3d_vulkan");
++    const AVFilter *sink_filt = avfilter_get_by_name("buffersink");
++    AVFilterContext *src_ctx = NULL, *hq_ctx = NULL, *sink_ctx = NULL;
++    int err;
++
++    if (!graph)
++        return AVERROR(ENOMEM);
++
++    if (!buf_filt || !hq_filt || !sink_filt) {
++        if (!buf_filt)
++            av_log(NULL, AV_LOG_ERROR, "filter %s not available\n", "buffer");
++        if (!hq_filt)
++            av_log(NULL, AV_LOG_ERROR, "filter %s not available\n", "hqdn3d_vulkan");
++        if (!sink_filt)
++            av_log(NULL, AV_LOG_ERROR, "filter %s not available\n", "buffersink");
++        avfilter_graph_free(&graph);
++        return AVERROR_FILTER_NOT_FOUND;
++    }
++
++    err = init_gpu_buffersrc(graph, buf_filt, initial_frames_ref, &src_ctx);
++    if (err < 0) {
++        avfilter_graph_free(&graph);
++        return err;
++    }
++
++    hq_ctx = avfilter_graph_alloc_filter(graph, hq_filt, "hqdn3d_vulkan");
++    if (!hq_ctx) {
++        avfilter_graph_free(&graph);
++        return AVERROR(ENOMEM);
++    }
++    hq_ctx->hw_device_ctx = av_buffer_ref(vk_device_ref);
++    err = avfilter_init_dict(hq_ctx, NULL);
++    if (err < 0) {
++        avfilter_graph_free(&graph);
++        return err;
++    }
++
++    err = avfilter_graph_create_filter(&sink_ctx, sink_filt, "out", NULL, NULL, graph);
++    if (err < 0) {
++        avfilter_graph_free(&graph);
++        return err;
++    }
++
++    err = link_and_config(graph, src_ctx, hq_ctx, sink_ctx);
++    if (err < 0) {
++        avfilter_graph_free(&graph);
++        return err;
++    }
++
++    *graph_out = graph;
++    *src_out = src_ctx;
++    *sink_out = sink_ctx;
++    return 0;
++}
++
++/* Push software frame into CPU graph, retrieve denoised output frame, and return 0 on success. */
++static int run_cpu_step(AVFilterContext *cpu_src, AVFilterContext *cpu_sink,
++                        AVFrame *sw_frame, AVFrame **cpu_out)
++{
++    AVFrame *cpu_in = av_frame_clone(sw_frame);
++    AVFrame *out = av_frame_alloc();
++    int err;
++
++    if (!cpu_in || !out) {
++        av_frame_free(&cpu_in);
++        av_frame_free(&out);
++        return AVERROR(ENOMEM);
++    }
++
++    err = av_buffersrc_add_frame(cpu_src, cpu_in);
++    av_frame_free(&cpu_in);
++    if (err < 0) {
++        av_frame_free(&out);
++        return err;
++    }
++
++    err = av_buffersink_get_frame(cpu_sink, out);
++    if (err < 0) {
++        av_frame_free(&out);
++        return err;
++    }
++
++    *cpu_out = out;
++    return 0;
++}
++
++/* Upload the software frame, run the GPU graph and download the output. */
++static int run_gpu_step(AVFilterContext *gpu_src, AVFilterContext *gpu_sink,
++                        AVBufferRef *upload_ctx, AVFrame *sw_frame,
++                        AVFrame **gpu_out_sw)
++{
++    AVFrame *gpu_in_vk = NULL;
++    AVFrame *gpu_out_vk = av_frame_alloc();
++    int err;
++
++    if (!gpu_out_vk)
++        return AVERROR(ENOMEM);
++
++    err = upload_vk_frame(upload_ctx, sw_frame, &gpu_in_vk);
++    if (err < 0) {
++        av_frame_free(&gpu_out_vk);
++        return err;
++    }
++
++    err = av_buffersrc_add_frame(gpu_src, gpu_in_vk);
++    av_frame_free(&gpu_in_vk);
++    if (err < 0) {
++        av_frame_free(&gpu_out_vk);
++        return err;
++    }
++
++    err = av_buffersink_get_frame(gpu_sink, gpu_out_vk);
++    if (err < 0) {
++        av_frame_free(&gpu_out_vk);
++        return err;
++    }
++
++    err = download_vk_frame(gpu_out_vk, gpu_out_sw);
++    av_frame_free(&gpu_out_vk);
++    if (err < 0)
++        return err;
++
++    return 0;
++}
++
++typedef struct ResetTest {
++    AVBufferRef *vk_device_ref;
++    AVBufferRef *upload_ctxs[5];
++    AVFilterGraph *cpu_graph, *gpu_graph;
++    AVFilterContext *cpu_src, *cpu_sink, *gpu_src, *gpu_sink;
++} ResetTest;
++
++/* Run one frame through CPU and GPU pipelines, verify pixel equality, and print status line. */
++static int process_one_frame(ResetTest *t, int n, uint32_t *seed, int *is_same)
++{
++    AVFrame *sw_frame = NULL, *cpu_out = NULL, *gpu_out = NULL;
++    int bucket = (n < 4) ? 0 : ((n < 8) ? 1 : 2);
++    int err;
++
++    err = create_input_frame(n, seed, &sw_frame);
++    if (err < 0)
++        return err;
++
++    err = run_cpu_step(t->cpu_src, t->cpu_sink, sw_frame, &cpu_out);
++    if (err < 0) {
++        av_frame_free(&sw_frame);
++        return err;
++    }
++
++    err = run_gpu_step(t->gpu_src, t->gpu_sink, t->upload_ctxs[bucket], sw_frame, &gpu_out);
++    av_frame_free(&sw_frame);
++    if (err < 0) {
++        av_frame_free(&cpu_out);
++        return err;
++    }
++
++    *is_same = compare_planes(cpu_out, gpu_out);
++    printf("%d %d %d %s\n", n, gpu_out->width, gpu_out->height,
++           *is_same ? "same" : "DIFF");
++    fflush(stdout);
++
++    av_frame_free(&cpu_out);
++    av_frame_free(&gpu_out);
++    return 0;
++}
++
++/* Return short symbolic name for common error codes without platform strerror variances. */
++static const char *err_to_name(int err)
++{
++    if (err == AVERROR(EINVAL))
++        return "EINVAL";
++    if (err == AVERROR(ENOTSUP))
++        return "ENOTSUP";
++    if (err == AVERROR(ENOMEM))
++        return "ENOMEM";
++    if (err == AVERROR_EXTERNAL)
++        return "EXTERNAL";
++    return "other";
++}
++
++/* Filter must reject in-stream format change with AVERROR(EINVAL); return any other error. */
++static int run_format_step(ResetTest *t, int n, enum AVPixelFormat fmt,
++                           AVBufferRef *frames_ref, int *refused)
++{
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
++    /* Drop the endianness suffix so the output matches the reference on any host. */
++    const char *format_name = fmt == AV_PIX_FMT_YUV420P10 ? "yuv420p10" :
++                              av_get_pix_fmt_name(fmt);
++    AVFrame *sw_f = av_frame_alloc();
++    AVFrame *gpu_in_vk = NULL;
++    AVFrame *out = av_frame_alloc();
++    int err, refused_err = 0;
++
++    if (!desc || !sw_f || !out) {
++        av_frame_free(&sw_f);
++        av_frame_free(&out);
++        return AVERROR(ENOMEM);
++    }
++
++    sw_f->format = fmt;
++    sw_f->width  = 160;
++    sw_f->height = 96;
++    sw_f->pts    = n;
++
++    err = av_frame_get_buffer(sw_f, 0);
++    if (err < 0) {
++        av_frame_free(&sw_f);
++        av_frame_free(&out);
++        return err;
++    }
++
++    for (int p = 0; p < desc->nb_components && sw_f->data[p]; p++) {
++        int plane_h = (p == 1 || p == 2) ? AV_CEIL_RSHIFT(sw_f->height, desc->log2_chroma_h) : sw_f->height;
++        for (int y = 0; y < plane_h; y++)
++            memset(sw_f->data[p] + y * sw_f->linesize[p], 0, FFABS(sw_f->linesize[p]));
++    }
++
++    err = upload_vk_frame(frames_ref, sw_f, &gpu_in_vk);
++    av_frame_free(&sw_f);
++    if (err < 0) {
++        av_frame_free(&out);
++        return err;
++    }
++
++    err = av_buffersrc_add_frame(t->gpu_src, gpu_in_vk);
++    av_frame_free(&gpu_in_vk);
++    if (err < 0 && err != AVERROR(EAGAIN)) {
++        refused_err = err;
++        *refused = 1;
++    } else {
++        err = av_buffersink_get_frame(t->gpu_sink, out);
++        if (err < 0 && err != AVERROR(EAGAIN)) {
++            refused_err = err;
++            *refused = 1;
++        } else {
++            *refused = 0;
++        }
++    }
++    av_frame_free(&out);
++
++    if (*refused)
++        printf("%d 160 96 %s refused %s\n", n, format_name,
++               err_to_name(refused_err));
++    else
++        printf("%d 160 96 %s accepted\n", n, format_name);
++    fflush(stdout);
++    return 0;
++}
++
++/* Run a first frame larger than the link through fresh CPU/GPU graphs, verifying parity. */
++static int run_first_frame_step(ResetTest *t, int n, uint32_t *seed, int *is_same)
++{
++    AVFilterGraph *cpu_graph = NULL, *gpu_graph = NULL;
++    AVFilterContext *cpu_src = NULL, *cpu_sink = NULL;
++    AVFilterContext *gpu_src = NULL, *gpu_sink = NULL;
++    AVFrame *sw_frame = NULL, *cpu_out = NULL, *gpu_out = NULL;
++    int err;
++
++    *is_same = 0;
++
++    err = init_cpu_graph(&cpu_graph, &cpu_src, &cpu_sink, 128, 72, AV_PIX_FMT_YUV420P);
++    if (err < 0)
++        goto end;
++
++    err = init_gpu_graph(&gpu_graph, &gpu_src, &gpu_sink, t->vk_device_ref, t->upload_ctxs[0]);
++    if (err < 0)
++        goto end;
++
++    err = create_input_frame(n, seed, &sw_frame);
++    if (err < 0)
++        goto end;
++
++    err = run_cpu_step(cpu_src, cpu_sink, sw_frame, &cpu_out);
++    if (err < 0)
++        goto end;
++
++    err = run_gpu_step(gpu_src, gpu_sink, t->upload_ctxs[2], sw_frame, &gpu_out);
++    if (err < 0)
++        goto end;
++
++    *is_same = compare_planes(cpu_out, gpu_out);
++    printf("%d %d %d first %s\n", n, gpu_out->width, gpu_out->height,
++           *is_same ? "same" : "DIFF");
++    fflush(stdout);
++
++end:
++    av_frame_free(&sw_frame);
++    av_frame_free(&cpu_out);
++    av_frame_free(&gpu_out);
++    avfilter_graph_free(&cpu_graph);
++    avfilter_graph_free(&gpu_graph);
++    return err;
++}
++
++/* Test whether a first frame with format mismatch against link format is refused. */
++static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
++{
++    AVFilterGraph *graph = NULL;
++    AVFilterContext *gpu_src = NULL, *gpu_sink = NULL;
++    AVBufferRef *link_frames_ref = NULL;
++    AVFrame *sw_f = NULL, *gpu_in_vk = NULL, *gpu_out = NULL;
++    const AVPixFmtDescriptor *desc;
++    int err, refused_err = 0, refused = 0;
++
++    err = create_vk_frames_ctx(vk_device_ref, 160, 96, AV_PIX_FMT_YUV420P, &link_frames_ref);
++    if (err < 0)
++        goto end;
++
++    err = init_gpu_graph(&graph, &gpu_src, &gpu_sink, vk_device_ref, link_frames_ref);
++    if (err < 0)
++        goto end;
++
++    sw_f = av_frame_alloc();
++    gpu_out = av_frame_alloc();
++    if (!sw_f || !gpu_out) {
++        err = AVERROR(ENOMEM);
++        goto end;
++    }
++
++    sw_f->format = AV_PIX_FMT_YUV444P;
++    sw_f->width  = 160;
++    sw_f->height = 96;
++    sw_f->pts    = 0;
++
++    err = av_frame_get_buffer(sw_f, 0);
++    if (err < 0)
++        goto end;
++
++    desc = av_pix_fmt_desc_get(AV_PIX_FMT_YUV444P);
++    for (int p = 0; p < desc->nb_components && sw_f->data[p]; p++) {
++        for (int y = 0; y < sw_f->height; y++)
++            memset(sw_f->data[p] + y * sw_f->linesize[p], 0, FFABS(sw_f->linesize[p]));
++    }
++
++    err = upload_vk_frame(upload_ctx_444, sw_f, &gpu_in_vk);
++    av_frame_free(&sw_f);
++    if (err < 0)
++        goto end;
++
++    err = av_buffersrc_add_frame(gpu_src, gpu_in_vk);
++    av_frame_free(&gpu_in_vk);
++    if (err < 0 && err != AVERROR(EAGAIN)) {
++        refused_err = err;
++        refused = 1;
++    } else {
++        err = av_buffersink_get_frame(gpu_sink, gpu_out);
++        if (err < 0 && err != AVERROR(EAGAIN)) {
++            refused_err = err;
++            refused = 1;
++        } else {
++            refused = 0;
++        }
++    }
++
++    if (refused)
++        printf("f1 160 96 yuv444p refused %s\n", err_to_name(refused_err));
++    else
++        printf("f1 160 96 yuv444p accepted\n");
++    fflush(stdout);
++
++    err = 0;
++
++end:
++    av_frame_free(&sw_f);
++    av_frame_free(&gpu_in_vk);
++    av_frame_free(&gpu_out);
++    av_buffer_unref(&link_frames_ref);
++    avfilter_graph_free(&graph);
++    return err;
++}
++
++/* Frame 0 has a black first column and frames 1 and 2 are at the p012 maximum.
++ * On this input hqdn3d on yuv420p12le computes 4096 in frames 1 and 2, which
++ * p012 cannot hold. Print the smallest and largest sample and the OR of the
++ * low 4 bits of each output frame. */
++static int run_f4_step(AVBufferRef *vk_device_ref)
++{
++    AVBufferRef *frames_ref = NULL;
++    AVFilterGraph *graph = NULL;
++    AVFilterContext *gpu_src = NULL, *gpu_sink = NULL;
++    AVFrame *sw_f = NULL, *gpu_in_vk = NULL, *gpu_out_vk = NULL, *sw_out = NULL;
++    int err;
++
++    err = create_vk_frames_ctx(vk_device_ref, 160, 96, AV_PIX_FMT_P012, &frames_ref);
++    if (err < 0)
++        goto end;
++
++    err = init_gpu_graph(&graph, &gpu_src, &gpu_sink, vk_device_ref, frames_ref);
++    if (err < 0)
++        goto end;
++
++    sw_f = av_frame_alloc();
++    gpu_out_vk = av_frame_alloc();
++    sw_out = av_frame_alloc();
++    if (!sw_f || !gpu_out_vk || !sw_out) {
++        err = AVERROR(ENOMEM);
++        goto end;
++    }
++
++    sw_f->format = AV_PIX_FMT_P012;
++    sw_f->width  = 160;
++    sw_f->height = 96;
++
++    err = av_frame_get_buffer(sw_f, 0);
++    if (err < 0)
++        goto end;
++
++    for (int n = 0; n < 3; n++) {
++        uint32_t min_val = 0xFFFF;
++        uint32_t max_val = 0;
++        uint32_t low_or = 0;
++
++        err = av_frame_make_writable(sw_f);
++        if (err < 0)
++            goto end;
++
++        for (int y = 0; y < 96; y++) {
++            uint16_t *dst = (uint16_t *)(sw_f->data[0] + y * sw_f->linesize[0]);
++            for (int x = 0; x < 160; x++)
++                dst[x] = (n == 0 && x == 0) ? 0 : 0xFFF0;
++        }
++        for (int y = 0; y < 48; y++) {
++            uint16_t *dst = (uint16_t *)(sw_f->data[1] + y * sw_f->linesize[1]);
++            for (int x = 0; x < 160; x++)
++                dst[x] = (n == 0 && x < 2) ? 0 : 0xFFF0;
++        }
++
++        sw_f->pts = n;
++        err = upload_vk_frame(frames_ref, sw_f, &gpu_in_vk);
++        if (err < 0)
++            goto end;
++
++        err = av_buffersrc_add_frame(gpu_src, gpu_in_vk);
++        av_frame_free(&gpu_in_vk);
++        if (err < 0)
++            goto end;
++
++        err = av_buffersink_get_frame(gpu_sink, gpu_out_vk);
++        if (err < 0)
++            goto end;
++
++        sw_out->format = AV_PIX_FMT_P012;
++        sw_out->width  = 160;
++        sw_out->height = 96;
++        err = av_hwframe_transfer_data(sw_out, gpu_out_vk, 0);
++        av_frame_unref(gpu_out_vk);
++        if (err < 0)
++            goto end;
++
++        for (int y = 0; y < 96; y++) {
++            const uint16_t *src = (const uint16_t *)(sw_out->data[0] + y * sw_out->linesize[0]);
++            for (int x = 0; x < 160; x++) {
++                uint16_t v = src[x];
++                if (v < min_val)
++                    min_val = v;
++                if (v > max_val)
++                    max_val = v;
++                low_or |= (v & 0xFu);
++            }
++        }
++        for (int y = 0; y < 48; y++) {
++            const uint16_t *src = (const uint16_t *)(sw_out->data[1] + y * sw_out->linesize[1]);
++            for (int x = 0; x < 160; x++) {
++                uint16_t v = src[x];
++                if (v < min_val)
++                    min_val = v;
++                if (v > max_val)
++                    max_val = v;
++                low_or |= (v & 0xFu);
++            }
++        }
++
++        printf("p012 %d min %u max %u low %u\n", n, min_val, max_val, low_or);
++        fflush(stdout);
++        av_frame_unref(sw_out);
++    }
++
++    err = 0;
++
++end:
++    av_frame_free(&sw_f);
++    av_frame_free(&gpu_in_vk);
++    av_frame_free(&gpu_out_vk);
++    av_frame_free(&sw_out);
++    av_buffer_unref(&frames_ref);
++    avfilter_graph_free(&graph);
++    return err;
++}
++
++/* Fill a 2x2 yuv420p12 frame: frame 0 all zero, frame 1 luma top row at 4095. */
++static int create_neg_frame(int n, AVFrame **out_frame)
++{
++    AVFrame *f = av_frame_alloc();
++    int err;
++
++    if (!f)
++        return AVERROR(ENOMEM);
++
++    f->format = AV_PIX_FMT_YUV420P12;
++    f->width  = 2;
++    f->height = 2;
++    f->pts    = n;
++
++    err = av_frame_get_buffer(f, 0);
++    if (err < 0) {
++        av_frame_free(&f);
++        return err;
++    }
++
++    memset(f->data[0], 0, FFABS(f->linesize[0]));
++    memset(f->data[0] + f->linesize[0], 0, FFABS(f->linesize[0]));
++    memset(f->data[1], 0, FFABS(f->linesize[1]));
++    memset(f->data[2], 0, FFABS(f->linesize[2]));
++
++    if (n == 1) {
++        ((uint16_t *)f->data[0])[0] = 4095;
++        ((uint16_t *)f->data[0])[1] = 4095;
++    }
++
++    *out_frame = f;
++    return 0;
++}
++
++/* Frame 1 drives the temporal result at luma (0,1) to -1, which hqdn3d stores
++ * as 65535. Print the CPU luma and whether the GPU output matches the CPU. */
++static int run_neg_step(AVBufferRef *vk_device_ref)
++{
++    AVBufferRef *frames_ref = NULL;
++    AVFilterGraph *cpu_graph = NULL, *gpu_graph = NULL;
++    AVFilterContext *cpu_src = NULL, *cpu_sink = NULL;
++    AVFilterContext *gpu_src = NULL, *gpu_sink = NULL;
++    AVFrame *sw_f = NULL, *cpu_out = NULL, *gpu_out = NULL;
++    int err;
++
++    err = create_vk_frames_ctx(vk_device_ref, 2, 2, AV_PIX_FMT_YUV420P12, &frames_ref);
++    if (err < 0)
++        goto end;
++
++    err = init_cpu_graph(&cpu_graph, &cpu_src, &cpu_sink, 2, 2, AV_PIX_FMT_YUV420P12);
++    if (err < 0)
++        goto end;
++
++    err = init_gpu_graph(&gpu_graph, &gpu_src, &gpu_sink, vk_device_ref, frames_ref);
++    if (err < 0)
++        goto end;
++
++    for (int n = 0; n < 2; n++) {
++        const uint16_t *y0;
++        const uint16_t *y1;
++
++        err = create_neg_frame(n, &sw_f);
++        if (err < 0)
++            goto end;
++
++        err = run_cpu_step(cpu_src, cpu_sink, sw_f, &cpu_out);
++        if (err < 0)
++            goto end;
++
++        err = run_gpu_step(gpu_src, gpu_sink, frames_ref, sw_f, &gpu_out);
++        av_frame_free(&sw_f);
++        if (err < 0)
++            goto end;
++
++        y0 = (const uint16_t *)cpu_out->data[0];
++        y1 = (const uint16_t *)(cpu_out->data[0] + cpu_out->linesize[0]);
++        printf("neg %d %d %d %s luma %d %d %d %d\n", n, gpu_out->width, gpu_out->height,
++               compare_planes(cpu_out, gpu_out) ? "same" : "DIFF",
++               y0[0], y0[1], y1[0], y1[1]);
++        fflush(stdout);
++
++        av_frame_free(&cpu_out);
++        av_frame_free(&gpu_out);
++    }
++
++    err = 0;
++
++end:
++    av_frame_free(&sw_f);
++    av_frame_free(&cpu_out);
++    av_frame_free(&gpu_out);
++    av_buffer_unref(&frames_ref);
++    avfilter_graph_free(&cpu_graph);
++    avfilter_graph_free(&gpu_graph);
++    return err;
++}
++
++/* Release all Vulkan hardware upload contexts, filter graphs, and device context reference. */
++static void cleanup_all(ResetTest *t)
++{
++    for (int i = 0; i < 5; i++)
++        av_buffer_unref(&t->upload_ctxs[i]);
++    avfilter_graph_free(&t->cpu_graph);
++    avfilter_graph_free(&t->gpu_graph);
++    av_buffer_unref(&t->vk_device_ref);
++}
++
++/* Initialize Vulkan hardware device, upload frames contexts for each test bucket, and graphs. */
++static int setup_all(const char *dev_idx, ResetTest *t)
++{
++    int err;
++
++    err = av_hwdevice_ctx_create(&t->vk_device_ref, AV_HWDEVICE_TYPE_VULKAN, dev_idx, NULL, 0);
++    if (err < 0)
++        return err;
++
++    err = create_vk_frames_ctx(t->vk_device_ref, 128, 72, AV_PIX_FMT_YUV420P, &t->upload_ctxs[0]);
++    if (err < 0)
++        return err;
++
++    err = create_vk_frames_ctx(t->vk_device_ref, 96, 56, AV_PIX_FMT_YUV420P, &t->upload_ctxs[1]);
++    if (err < 0)
++        return err;
++
++    err = create_vk_frames_ctx(t->vk_device_ref, 160, 96, AV_PIX_FMT_YUV420P, &t->upload_ctxs[2]);
++    if (err < 0)
++        return err;
++
++    err = create_vk_frames_ctx(t->vk_device_ref, 160, 96, AV_PIX_FMT_YUV420P10, &t->upload_ctxs[3]);
++    if (err < 0)
++        return err;
++
++    err = create_vk_frames_ctx(t->vk_device_ref, 160, 96, AV_PIX_FMT_YUV444P, &t->upload_ctxs[4]);
++    if (err < 0)
++        return err;
++
++    err = init_cpu_graph(&t->cpu_graph, &t->cpu_src, &t->cpu_sink, 128, 72, AV_PIX_FMT_YUV420P);
++    if (err < 0)
++        return err;
++
++    err = init_gpu_graph(&t->gpu_graph, &t->gpu_src, &t->gpu_sink, t->vk_device_ref, t->upload_ctxs[0]);
++    if (err < 0)
++        return err;
++
++    return 0;
++}
++
++/* Verify parity on resets, first frame larger than link, format rejection, negative result, and F1/F4 cases. */
++int main(int argc, char **argv)
++{
++    ResetTest t = { 0 };
++    const char *dev_idx = NULL;
++    uint32_t seed = 0x12345678;
++    int err;
++    int first_same = 0;
++    int refused_10 = 0, refused_444 = 0;
++
++    if (argc > 2) {
++        fprintf(stderr, "Usage: %s [vulkan device index]\n", argv[0]);
++        return 1;
++    }
++    if (argc >= 2)
++        dev_idx = (strncmp(argv[1], "vk:", 3) == 0) ? argv[1] + 3 : argv[1];
++
++    av_log_set_level(AV_LOG_ERROR);
++
++    err = setup_all(dev_idx, &t);
++    if (err < 0) {
++        fprintf(stderr, "Setup failed: %s (%d)\n", err_to_name(err), err);
++        cleanup_all(&t);
++        return 1;
++    }
++
++    for (int n = 0; n < 12; n++) {
++        int is_same = 0;
++        err = process_one_frame(&t, n, &seed, &is_same);
++        if (err < 0)
++            goto end;
++    }
++
++    err = run_first_frame_step(&t, 14, &seed, &first_same);
++    if (err < 0)
++        goto end;
++
++    /* Test yuv420p10 first and abort if accepted, avoiding chroma buffer overflow from yuv444p on unpatched filters. */
++    err = run_format_step(&t, 12, AV_PIX_FMT_YUV420P10, t.upload_ctxs[3], &refused_10);
++    if (err < 0)
++        goto end;
++    if (!refused_10) {
++        printf("13 160 96 yuv444p skipped\n");
++        fflush(stdout);
++    } else {
++        err = run_format_step(&t, 13, AV_PIX_FMT_YUV444P, t.upload_ctxs[4], &refused_444);
++        if (err < 0)
++            goto end;
++    }
++
++    err = run_f1_step(t.vk_device_ref, t.upload_ctxs[4]);
++    if (err < 0)
++        goto end;
++
++    err = run_f4_step(t.vk_device_ref);
++    if (err < 0)
++        goto end;
++
++    err = run_neg_step(t.vk_device_ref);
++
++end:
++    if (err < 0)
++        fprintf(stderr, "Test failed: %s (%d)\n", err_to_name(err), err);
++    cleanup_all(&t);
++    return err < 0;
++}
 diff --git a/libavfilter/vf_hqdn3d.c b/libavfilter/vf_hqdn3d.c
 index 98c05e886c20dea9b4adff6f6075afb4abbfe204..d066a0e75bb927300a19ccddfb80ba21f8ad92e8 100644
 --- a/libavfilter/vf_hqdn3d.c
@@ -323,10 +1407,10 @@ index 98c05e886c20dea9b4adff6f6075afb4abbfe204..d066a0e75bb927300a19ccddfb80ba21
  static int config_input(AVFilterLink *inlink)
 diff --git a/libavfilter/vf_hqdn3d_vulkan.c b/libavfilter/vf_hqdn3d_vulkan.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c75705b47723f
+index 0000000000000000000000000000000000000000..62648bdfd95a84d3794c111fd34e056580ac6b70
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_vulkan.c
-@@ -0,0 +1,759 @@
+@@ -0,0 +1,891 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -387,6 +1471,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    FFVulkanContext vkctx;
 +
 +    int initialized;
++    int init_error;
 +    FFVkExecPool e;
 +    AVVulkanDeviceQueueFamily *qf;
 +
@@ -404,7 +1489,6 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    int is_msb;
 +    int is_semiplanar;
 +    int width, height;
-+    enum AVPixelFormat sw_format;
 +
 +    int spatial_enabled[2];
 +    int first_frame;
@@ -412,6 +1496,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    AVBufferRef *out_frames_ref;
 +} HQDN3DVulkanContext;
 +
++/* Check if pixel format is supported, set depth/MSB/semiplanar properties, return 0 or ENOSYS. */
 +static int validate_format(AVFilterContext *ctx, enum AVPixelFormat sw_format,
 +                           int *depth, int *is_msb, int *is_semiplanar)
 +{
@@ -468,6 +1553,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    }
 +}
 +
++/* Set default filter strengths and initialize the Vulkan context, returning 0 on success. */
 +static av_cold int hqdn3d_vulkan_init(AVFilterContext *ctx)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
@@ -482,6 +1568,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return ff_vk_filter_init(ctx);
 +}
 +
++/* Free GPU coefficient lookup table, horizontal intermediate, and temporal history buffers. */
 +static void free_buffers(AVFilterContext *ctx)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
@@ -492,6 +1579,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    ff_vk_free_buf(vkctx, &s->frame_ant_buf);
 +}
 +
++/* Release execution pool, compute shaders, buffers, output frames context, and Vulkan state. */
 +static av_cold void hqdn3d_vulkan_uninit(AVFilterContext *ctx)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
@@ -507,6 +1595,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    s->initialized = 0;
 +}
 +
++/* Map coefficient buffer, precalculate LUT tables for all four channels, and unmap buffer. */
 +static int calc_coefs(AVFilterContext *ctx)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
@@ -530,6 +1619,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return ff_vk_unmap_buffer(&s->vkctx, &s->tables_buf, 1);
 +}
 +
++/* Allocate Vulkan storage buffers for coefficient LUTs, intermediate rows, and history frame. */
 +static int init_buffers(AVFilterContext *ctx, int w, int h)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
@@ -540,7 +1630,20 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    int ch = AV_CEIL_RSHIFT(h, s->vsub);
 +    size_t samples = (size_t)w * h + (size_t)2 * cw * ch;
 +    size_t data_sz = samples * sizeof(uint16_t);
++    uint32_t limit = vkctx->props.properties.limits.maxStorageBufferRange;
 +    int err;
++
++    if (tables_sz > limit) {
++        av_log(ctx, AV_LOG_ERROR, "LUT tables need %zu bytes, above the device limit of %u\n",
++               tables_sz, limit);
++        return AVERROR(ENOTSUP);
++    }
++
++    if (data_sz > limit) {
++        av_log(ctx, AV_LOG_ERROR, "Frame of %dx%d needs %zu bytes per buffer, above the device limit of %u\n",
++               w, h, data_sz, limit);
++        return AVERROR(ENOTSUP);
++    }
 +
 +    err = ff_vk_create_buf(vkctx, &s->tables_buf, tables_sz, NULL, NULL,
 +                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -563,6 +1666,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return 0;
 +}
 +
++/* Compile and link the horizontal filtering compute shader pipeline and register execution. */
 +static int init_pipeline_horizontal(AVFilterContext *ctx, int planes)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
@@ -571,11 +1675,13 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +        { .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  .stages = VK_SHADER_STAGE_COMPUTE_BIT, .elems = planes },
 +        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .stages = VK_SHADER_STAGE_COMPUTE_BIT, .elems = 1 },
 +        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .stages = VK_SHADER_STAGE_COMPUTE_BIT, .elems = 1 },
-+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .stages = VK_SHADER_STAGE_COMPUTE_BIT, .elems = 1 },
 +    };
 +    int err;
 +
-+    err = ff_vk_shader_load(&s->shd_horizontal, VK_SHADER_STAGE_COMPUTE_BIT, NULL,
++    SPEC_LIST_CREATE(sl, 1, 1*sizeof(uint32_t))
++    SPEC_LIST_ADD(sl, 0, 32, planes);
++
++    err = ff_vk_shader_load(&s->shd_horizontal, VK_SHADER_STAGE_COMPUTE_BIT, sl,
 +                            (uint32_t[]){ 1, 32, 1 }, 0);
 +    if (err < 0)
 +        return err;
@@ -595,6 +1701,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return ff_vk_shader_register_exec(vkctx, &s->e, &s->shd_horizontal);
 +}
 +
++/* Compile and link the vertical/temporal compute shader pipeline and register execution. */
 +static int init_pipeline_vertical(AVFilterContext *ctx, int planes)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
@@ -608,7 +1715,10 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    };
 +    int err;
 +
-+    err = ff_vk_shader_load(&s->shd_vertical, VK_SHADER_STAGE_COMPUTE_BIT, NULL,
++    SPEC_LIST_CREATE(sl, 1, 1*sizeof(uint32_t))
++    SPEC_LIST_ADD(sl, 0, 32, planes);
++
++    err = ff_vk_shader_load(&s->shd_vertical, VK_SHADER_STAGE_COMPUTE_BIT, sl,
 +                            (uint32_t[]){ 32, 1, 1 }, 0);
 +    if (err < 0)
 +        return err;
@@ -628,12 +1738,75 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return ff_vk_shader_register_exec(vkctx, &s->e, &s->shd_vertical);
 +}
 +
++/* Verify that the Vulkan device was created with all required shader and storage features enabled. */
++static int check_device_features(AVFilterContext *ctx)
++{
++    HQDN3DVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    const VkPhysicalDeviceFeatures *feats = &vkctx->hwctx->device_features.features;
++    const void *pnext = vkctx->hwctx->device_features.pNext;
++    const VkPhysicalDeviceVulkan11Features *v11;
++    const VkPhysicalDevice16BitStorageFeatures *s16;
++    const VkPhysicalDeviceVulkan12Features *v12;
++    const VkPhysicalDeviceScalarBlockLayoutFeatures *sbl;
++    const VkPhysicalDeviceDescriptorIndexingFeatures *di;
++    int has_storageBuffer16BitAccess;
++    int has_scalarBlockLayout;
++    int has_runtimeDescriptorArray;
++
++    if (!feats->shaderInt16) {
++        av_log(ctx, AV_LOG_ERROR, "Vulkan device lacks required feature: shaderInt16\n");
++        return AVERROR(ENOTSUP);
++    }
++    if (!feats->shaderStorageImageReadWithoutFormat) {
++        av_log(ctx, AV_LOG_ERROR, "Vulkan device lacks required feature: shaderStorageImageReadWithoutFormat\n");
++        return AVERROR(ENOTSUP);
++    }
++    if (!feats->shaderStorageImageWriteWithoutFormat) {
++        av_log(ctx, AV_LOG_ERROR, "Vulkan device lacks required feature: shaderStorageImageWriteWithoutFormat\n");
++        return AVERROR(ENOTSUP);
++    }
++
++    v11 = ff_vk_find_struct(pnext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
++    s16 = ff_vk_find_struct(pnext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES);
++    has_storageBuffer16BitAccess = (v11 && v11->storageBuffer16BitAccess) ||
++                                   (s16 && s16->storageBuffer16BitAccess);
++    if (!has_storageBuffer16BitAccess) {
++        av_log(ctx, AV_LOG_ERROR, "Vulkan device lacks required feature: storageBuffer16BitAccess\n");
++        return AVERROR(ENOTSUP);
++    }
++
++    v12 = ff_vk_find_struct(pnext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
++    sbl = ff_vk_find_struct(pnext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES);
++    has_scalarBlockLayout = (v12 && v12->scalarBlockLayout) ||
++                            (sbl && sbl->scalarBlockLayout);
++    if (!has_scalarBlockLayout) {
++        av_log(ctx, AV_LOG_ERROR, "Vulkan device lacks required feature: scalarBlockLayout\n");
++        return AVERROR(ENOTSUP);
++    }
++
++    di = ff_vk_find_struct(pnext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES);
++    has_runtimeDescriptorArray = (v12 && v12->runtimeDescriptorArray) ||
++                                 (di && di->runtimeDescriptorArray);
++    if (!has_runtimeDescriptorArray) {
++        av_log(ctx, AV_LOG_ERROR, "Vulkan device lacks required feature: runtimeDescriptorArray\n");
++        return AVERROR(ENOTSUP);
++    }
++
++    return 0;
++}
++
++/* Find compute queue, initialize execution pool, allocate buffers, and compile shader pipelines. */
 +static int init_filter(AVFilterContext *ctx, AVFrame *in)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
 +    FFVulkanContext *vkctx = &s->vkctx;
 +    const int planes = av_pix_fmt_count_planes(s->vkctx.output_format);
 +    int err;
++
++    err = check_device_features(ctx);
++    if (err < 0)
++        return err;
 +
 +    s->qf = ff_vk_qf_find(vkctx, VK_QUEUE_COMPUTE_BIT, 0);
 +    if (!s->qf) {
@@ -666,6 +1839,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return 0;
 +}
 +
++/* Populate shader push constant structure with plane dimensions, buffer offsets, and bit depth. */
 +static void prepare_push_data(HQDN3DVulkanContext *s, HQDN3DShaderPushData *pd, int p, int w, int h)
 +{
 +    int lut_bits = HQDN3D_LUT_BITS(s->depth);
@@ -719,6 +1893,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    }
 +}
 +
++/* Bind input image views, coefficient tables, and horizontal intermediate buffer to descriptors. */
 +static int update_descriptors_horizontal(HQDN3DVulkanContext *s, FFVkExecContext *exec,
 +                                         AVFrame *in, VkImageView *in_views)
 +{
@@ -731,14 +1906,11 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +                                          &s->tables_buf, 0, s->tables_buf.size, VK_FORMAT_UNDEFINED);
 +    if (err < 0)
 +        return err;
-+    err = ff_vk_shader_update_desc_buffer(vkctx, exec, &s->shd_horizontal, 0, 2, 0,
-+                                          &s->h_buf, 0, s->h_buf.size, VK_FORMAT_UNDEFINED);
-+    if (err < 0)
-+        return err;
-+    return ff_vk_shader_update_desc_buffer(vkctx, exec, &s->shd_horizontal, 0, 3, 0,
-+                                           &s->frame_ant_buf, 0, s->frame_ant_buf.size, VK_FORMAT_UNDEFINED);
++    return ff_vk_shader_update_desc_buffer(vkctx, exec, &s->shd_horizontal, 0, 2, 0,
++                                           &s->h_buf, 0, s->h_buf.size, VK_FORMAT_UNDEFINED);
 +}
 +
++/* Bind input and output image views, LUTs, intermediate, and history buffers to descriptors. */
 +static int update_descriptors_vertical(HQDN3DVulkanContext *s, FFVkExecContext *exec,
 +                                       AVFrame *in, AVFrame *out,
 +                                       VkImageView *in_views, VkImageView *out_views)
@@ -762,6 +1934,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +                                           &s->frame_ant_buf, 0, s->frame_ant_buf.size, VK_FORMAT_UNDEFINED);
 +}
 +
++/* Record horizontal and vertical compute dispatches separated by a pipeline memory barrier. */
 +static int dispatch_passes(HQDN3DVulkanContext *s, FFVkExecContext *exec,
 +                           AVFrame *in, AVFrame *out,
 +                           VkImageView *in_views, VkImageView *out_views,
@@ -820,6 +1993,7 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return 0;
 +}
 +
++/* Allocate and initialize output Vulkan hardware frames context matching input properties. */
 +static int create_out_frames_ctx(AVFilterContext *ctx, AVFrame *in)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
@@ -858,39 +2032,55 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return 0;
 +}
 +
++/* Check format, size output if first frame differs from link, reset buffers on size changes. */
 +static int check_format_and_size(AVFilterContext *ctx, AVFrame *in)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
 +    AVHWFramesContext *hwfc = (AVHWFramesContext *)in->hw_frames_ctx->data;
 +    int err;
 +
++    if (hwfc->sw_format != s->vkctx.input_format) {
++        av_log(ctx, AV_LOG_ERROR, "Input pixel format changed from %s to %s\n",
++               av_get_pix_fmt_name(s->vkctx.input_format), av_get_pix_fmt_name(hwfc->sw_format));
++        return AVERROR(EINVAL);
++    }
++
 +    err = validate_format(ctx, hwfc->sw_format, &s->depth, &s->is_msb, &s->is_semiplanar);
 +    if (err < 0)
 +        return err;
 +
-+    if (in->width != s->width || in->height != s->height || hwfc->sw_format != s->sw_format) {
++    if (!s->initialized) {
++        s->hsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_w;
++        s->vsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_h;
++    }
++
++    if (in->width != s->width || in->height != s->height) {
 +        if (s->initialized) {
 +            free_buffers(ctx);
 +            err = init_buffers(ctx, in->width, in->height);
 +            if (err < 0)
-+                return err;
++                return s->init_error = err;
 +            err = calc_coefs(ctx);
 +            if (err < 0)
-+                return err;
++                return s->init_error = err;
++            err = create_out_frames_ctx(ctx, in);
++            if (err < 0)
++                return s->init_error = err;
++            s->first_frame = 1;
++        } else if (in->width  != ctx->outputs[0]->w ||
++                   in->height != ctx->outputs[0]->h) {
++            /* The first frame may differ from the configured link size. */
 +            err = create_out_frames_ctx(ctx, in);
 +            if (err < 0)
 +                return err;
-+            s->first_frame = 1;
 +        }
-+        s->sw_format = hwfc->sw_format;
 +        s->width = in->width;
 +        s->height = in->height;
-+        s->hsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_w;
-+        s->vsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_h;
 +    }
 +    return 0;
 +}
 +
++/* Create image views and insert pipeline barriers transitioning input and output frame images. */
 +static int setup_views_and_barriers(HQDN3DVulkanContext *s, FFVkExecContext *exec,
 +                                    AVFrame *in, AVFrame *out,
 +                                    VkImageView *in_views, VkImageView *out_views)
@@ -934,33 +2124,40 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return 0;
 +}
 +
-+static AVFrame *alloc_output_frame(HQDN3DVulkanContext *s, AVFilterLink *outlink, AVFrame *in)
++/* Allocate an output frame and copy input frame properties. */
++static int alloc_output_frame(HQDN3DVulkanContext *s, AVFilterLink *outlink, AVFrame *in, AVFrame **out_ret)
 +{
 +    AVFrame *out;
-+    int err;
 +
 +    if (s->out_frames_ref) {
++        int err;
++
 +        out = av_frame_alloc();
 +        if (!out)
-+            return NULL;
++            return AVERROR(ENOMEM);
 +        err = av_hwframe_get_buffer(s->out_frames_ref, out, 0);
 +        if (err < 0) {
 +            av_frame_free(&out);
-+            return NULL;
++            return err;
 +        }
 +    } else {
 +        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
 +        if (!out)
-+            return NULL;
++            return AVERROR(ENOMEM);
 +    }
 +
-+    if (av_frame_copy_props(out, in) < 0) {
++    int err = av_frame_copy_props(out, in);
++    if (err < 0) {
 +        av_frame_free(&out);
-+        return NULL;
++        return err;
 +    }
-+    return out;
++
++    *out_ret = out;
++    return 0;
 +}
 +
++/* Record one frame, submit it and wait for it on the host; the host wait also orders this
++ * frame's temporal history writes before the next frame. Discard the recording on error. */
 +static int exec_filter(HQDN3DVulkanContext *s, AVFrame *in, AVFrame *out)
 +{
 +    FFVulkanContext *vkctx = &s->vkctx;
@@ -969,15 +2166,17 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    FFVkExecContext *exec = ff_vk_exec_get(vkctx, &s->e);
 +    int err;
 +
-+    ff_vk_exec_start(vkctx, exec);
++    err = ff_vk_exec_start(vkctx, exec);
++    if (err < 0)
++        return err;
 +
 +    err = setup_views_and_barriers(s, exec, in, out, in_views, out_views);
 +    if (err < 0)
-+        return err;
++        goto fail;
 +
 +    err = dispatch_passes(s, exec, in, out, in_views, out_views, in->width, in->height);
 +    if (err < 0)
-+        return err;
++        goto fail;
 +
 +    err = ff_vk_exec_submit(vkctx, exec);
 +    if (err < 0)
@@ -985,8 +2184,13 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    ff_vk_exec_wait(vkctx, exec);
 +
 +    return 0;
++
++fail:
++    ff_vk_exec_discard_deps(vkctx, exec);
++    return err;
 +}
 +
++/* Validate incoming frame, lazily initialize pipelines, execute filter, and push output frame. */
 +static int hqdn3d_vulkan_filter_frame(AVFilterLink *link, AVFrame *in)
 +{
 +    AVFilterContext *ctx = link->dst;
@@ -994,6 +2198,12 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    AVFilterLink *outlink = ctx->outputs[0];
 +    AVFrame *out;
 +    int err;
++
++    /* A failed initialization or resize is terminal. */
++    if (s->init_error < 0) {
++        av_frame_free(&in);
++        return s->init_error;
++    }
 +
 +    err = check_format_and_size(ctx, in);
 +    if (err < 0) {
@@ -1004,15 +2214,16 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    if (!s->initialized) {
 +        err = init_filter(ctx, in);
 +        if (err < 0) {
++            s->init_error = err;
 +            av_frame_free(&in);
 +            return err;
 +        }
 +    }
 +
-+    out = alloc_output_frame(s, outlink, in);
-+    if (!out) {
++    err = alloc_output_frame(s, outlink, in, &out);
++    if (err < 0) {
 +        av_frame_free(&in);
-+        return AVERROR(ENOMEM);
++        return err;
 +    }
 +
 +    err = exec_filter(s, in, out);
@@ -1027,11 +2238,16 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    return ff_filter_frame(outlink, out);
 +}
 +
++/* Apply a runtime command and recompute the lookup tables if the filter is initialized;
++ * return the stored error after a failed initialization or resize. */
 +static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
 +                           char *res, int res_len, int flags)
 +{
 +    HQDN3DVulkanContext *s = ctx->priv;
 +    int ret;
++
++    if (s->init_error < 0)
++        return s->init_error;
 +
 +    ret = ff_filter_process_command(ctx, cmd, args, res, res_len, flags);
 +    if (ret < 0)
@@ -1087,24 +2303,24 @@ index 0000000000000000000000000000000000000000..c5ce889c93aad697025fa70ae97c7570
 +    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 +};
 diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
-index f81542dcb9d8e40debcb11dd5eddb8ff34e4fa3e..5fe5056d9bc32425c0d4d1edf37a43b4da4da986 100644
+index f81542dcb9d8e40debcb11dd5eddb8ff34e4fa3e..4434028f839d0495c0c861eed63b581bd38f3a54 100644
 --- a/libavfilter/vulkan/Makefile
 +++ b/libavfilter/vulkan/Makefile
-@@ -19,6 +19,8 @@ OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER) += vulkan/interlace.comp.spv.o
- OBJS-$(CONFIG_XFADE_VULKAN_FILTER) += vulkan/xfade.comp.spv.o
- OBJS-$(CONFIG_TONEMAP_VULKAN_FILTER) += vulkan/bt2408_hable.comp.spv.o \
-                                         vulkan/tonemap_peak.comp.spv.o
-+OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER)  += vulkan/hqdn3d_horizontal.comp.spv.o \
-+                                        vulkan/hqdn3d_vertical.comp.spv.o
- OBJS-$(CONFIG_NLMEANS_VULKAN_FILTER) += vulkan/nlmeans_horizontal.comp.spv.o \
-                                         vulkan/nlmeans_vertical.comp.spv.o \
-                                         vulkan/nlmeans_weights.comp.spv.o \
+@@ -8,6 +8,8 @@ OBJS-$(CONFIG_BWDIF_VULKAN_FILTER) += vulkan/bwdif.comp.spv.o
+ OBJS-$(CONFIG_CHROMABER_VULKAN_FILTER) += vulkan/chromaber.comp.spv.o
+ OBJS-$(CONFIG_COLOR_VULKAN_FILTER) += vulkan/color.comp.spv.o
+ OBJS-$(CONFIG_GBLUR_VULKAN_FILTER) += vulkan/gblur.comp.spv.o
++OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER) += vulkan/hqdn3d_horizontal.comp.spv.o \
++                                       vulkan/hqdn3d_vertical.comp.spv.o
+ OBJS-$(CONFIG_SCALE_VULKAN_FILTER) += vulkan/scale.comp.spv.o \
+                                       vulkan/debayer.comp.spv.o
+ OBJS-$(CONFIG_SCDET_VULKAN_FILTER) += vulkan/scdet.comp.spv.o
 diff --git a/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl b/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl
 new file mode 100644
-index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478add94cd3
+index 0000000000000000000000000000000000000000..22193402437fab2d94548bcde5054e0067f76849
 --- /dev/null
 +++ b/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,160 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -1138,7 +2354,9 @@ index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478
 +
 +layout (local_size_x_id = 253, local_size_y_id = 254, local_size_z_id = 255) in;
 +
-+layout (set = 0, binding = 0) uniform readonly uimage2D in_img[];
++/* The filter sets this to the plane count of the frame format. */
++layout (constant_id = 0) const uint planes = 3;
++layout (set = 0, binding = 0) uniform readonly uimage2D in_img[planes];
 +
 +layout (set = 0, binding = 1, scalar) readonly buffer TablesBuffer {
 +    int16_t coef_tables[];
@@ -1146,10 +2364,6 @@ index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478
 +
 +layout (set = 0, binding = 2, scalar) buffer HBuffer {
 +    uint16_t h_data[];
-+};
-+
-+layout (set = 0, binding = 3, scalar) buffer FrameAntBuffer {
-+    uint16_t frame_ant_data[];
 +};
 +
 +layout (push_constant, scalar) uniform PushConsts {
@@ -1170,6 +2384,17 @@ index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478
 +    uint spatial_enabled;
 +};
 +
++/* Keep indices constant and the last branch inside the array for two-plane formats. */
++uint load_planar(ivec2 c)
++{
++    if (plane_idx == 0u)
++        return imageLoad(in_img[0], c).x;
++    else if (plane_idx == 1u)
++        return imageLoad(in_img[1], c).x;
++    else
++        return imageLoad(in_img[planes - 1u], c).x;
++}
++
 +uint load_sample(uint raw, uint s_depth, uint s_msb)
 +{
 +    uint shift = 16u - s_depth;
@@ -1182,6 +2407,7 @@ index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478
 +{
 +    int d = (int(prev_val) - int(cur_val)) >> (8 - int(l_bits));
 +    int center = 256 << int(l_bits);
++    d = clamp(d, -center, center - 1);
 +    int idx = int(t_offset) + center + d;
 +    int coef = int(coef_tables[idx]);
 +    return uint(int(cur_val) + coef);
@@ -1190,12 +2416,12 @@ index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478
 +void process_planar_row(uint y)
 +{
 +    uint h_row_start = h_offset_u + y * width;
-+    uint raw0 = imageLoad(in_img[plane_idx], ivec2(0, int(y))).x;
++    uint raw0 = load_planar(ivec2(0, int(y)));
 +    uint pixel_ant = load_sample(raw0, depth, is_msb);
 +
 +    if (y == 0u) {
 +        for (uint x = 0u; x < width; x++) {
-+            uint raw = imageLoad(in_img[plane_idx], ivec2(int(x), 0)).x;
++            uint raw = load_planar(ivec2(int(x), 0));
 +            uint cur = load_sample(raw, depth, is_msb);
 +            pixel_ant = lowpass(pixel_ant, cur, spatial_offset, lut_bits);
 +            h_data[h_row_start + x] = uint16_t(pixel_ant);
@@ -1203,7 +2429,7 @@ index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478
 +    } else {
 +        h_data[h_row_start + 0u] = uint16_t(pixel_ant);
 +        for (uint x = 0u; x + 1u < width; x++) {
-+            uint raw = imageLoad(in_img[plane_idx], ivec2(int(x + 1u), int(y))).x;
++            uint raw = load_planar(ivec2(int(x + 1u), int(y)));
 +            uint cur = load_sample(raw, depth, is_msb);
 +            pixel_ant = lowpass(pixel_ant, cur, spatial_offset, lut_bits);
 +            h_data[h_row_start + x + 1u] = uint16_t(pixel_ant);
@@ -1257,10 +2483,10 @@ index 0000000000000000000000000000000000000000..5703c12c985b69263ca0e1f632693478
 +}
 diff --git a/libavfilter/vulkan/hqdn3d_vertical.comp.glsl b/libavfilter/vulkan/hqdn3d_vertical.comp.glsl
 new file mode 100644
-index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4f0e179f3
+index 0000000000000000000000000000000000000000..2a4d78e11e1780e44a412e2594cad292e2a4c25b
 --- /dev/null
 +++ b/libavfilter/vulkan/hqdn3d_vertical.comp.glsl
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,233 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -1294,8 +2520,10 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +
 +layout (local_size_x_id = 253, local_size_y_id = 254, local_size_z_id = 255) in;
 +
-+layout (set = 0, binding = 0) uniform readonly  uimage2D in_img[];
-+layout (set = 0, binding = 1) uniform writeonly uimage2D out_img[];
++/* The filter sets this to the plane count of the frame format. */
++layout (constant_id = 0) const uint planes = 3;
++layout (set = 0, binding = 0) uniform readonly  uimage2D in_img[planes];
++layout (set = 0, binding = 1) uniform writeonly uimage2D out_img[planes];
 +
 +layout (set = 0, binding = 2, scalar) readonly buffer TablesBuffer {
 +    int16_t coef_tables[];
@@ -1327,6 +2555,28 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +    uint spatial_enabled;
 +};
 +
++/* Keep indices constant and the last branch inside the array for two-plane formats. */
++uint load_planar(ivec2 c)
++{
++    if (plane_idx == 0u)
++        return imageLoad(in_img[0], c).x;
++    else if (plane_idx == 1u)
++        return imageLoad(in_img[1], c).x;
++    else
++        return imageLoad(in_img[planes - 1u], c).x;
++}
++
++void store_planar(ivec2 c, uint v)
++{
++    uvec4 texel = uvec4(v, 0, 0, 0);
++    if (plane_idx == 0u)
++        imageStore(out_img[0], c, texel);
++    else if (plane_idx == 1u)
++        imageStore(out_img[1], c, texel);
++    else
++        imageStore(out_img[planes - 1u], c, texel);
++}
++
 +uint load_sample(uint raw, uint s_depth, uint s_msb)
 +{
 +    uint shift = 16u - s_depth;
@@ -1339,13 +2589,19 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +{
 +    uint shift = 16u - s_depth;
 +    uint stored = val >> shift;
-+    return (s_msb != 0u) ? (stored << shift) : stored;
++    /* MSB-packed formats cannot hold a code above the depth maximum. */
++    if (s_msb != 0u && shift != 0u)
++        stored = min(stored, (1u << s_depth) - 1u);
++    uint packed = (s_msb != 0u) ? (stored << shift) : stored;
++    /* Narrow to the container width as the CPU filter does. */
++    return packed & ((s_depth == 8u) ? 0xFFu : 0xFFFFu);
 +}
 +
 +int lowpass(int prev_val, int cur_val, uint t_offset, uint l_bits)
 +{
 +    int d = (prev_val - cur_val) >> (8 - int(l_bits));
 +    int center = 256 << int(l_bits);
++    d = clamp(d, -center, center - 1);
 +    int idx = int(t_offset) + center + d;
 +    int coef = int(coef_tables[idx]);
 +    return cur_val + coef;
@@ -1354,14 +2610,14 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +void process_planar_temporal(uint x)
 +{
 +    for (uint y = 0u; y < height; y++) {
-+        uint raw = imageLoad(in_img[plane_idx], ivec2(int(x), int(y))).x;
++        uint raw = load_planar(ivec2(int(x), int(y)));
 +        int cur = int(load_sample(raw, depth, is_msb));
 +        uint fa_idx = frame_ant_offset_u + y * width + x;
 +        int prev_ant = (first_frame != 0u) ? cur : int(frame_ant_data[fa_idx]);
 +        int tmp = lowpass(prev_ant, cur, temporal_offset, lut_bits);
 +        frame_ant_data[fa_idx] = uint16_t(tmp);
 +        uint out_val = store_sample(uint(tmp), depth, is_msb);
-+        imageStore(out_img[plane_idx], ivec2(int(x), int(y)), uvec4(out_val, 0, 0, 0));
++        store_planar(ivec2(int(x), int(y)), out_val);
 +    }
 +}
 +
@@ -1398,7 +2654,7 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +        uint fa_idx = frame_ant_offset_u + y * width + x;
 +        int prev_ant;
 +        if (first_frame != 0u) {
-+            uint raw = imageLoad(in_img[plane_idx], ivec2(int(x), int(y))).x;
++            uint raw = load_planar(ivec2(int(x), int(y)));
 +            prev_ant = int(load_sample(raw, depth, is_msb));
 +        } else {
 +            prev_ant = int(frame_ant_data[fa_idx]);
@@ -1406,7 +2662,7 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +        int temp_tmp = lowpass(prev_ant, spat_tmp, temporal_offset, lut_bits);
 +        frame_ant_data[fa_idx] = uint16_t(temp_tmp);
 +        uint out_val = store_sample(uint(temp_tmp), depth, is_msb);
-+        imageStore(out_img[plane_idx], ivec2(int(x), int(y)), uvec4(out_val, 0, 0, 0));
++        store_planar(ivec2(int(x), int(y)), out_val);
 +    }
 +}
 +
@@ -1464,559 +2720,43 @@ index 0000000000000000000000000000000000000000..02a20b003ee10e8f5b439a9d61bb94a4
 +            process_planar_spatial(x);
 +    }
 +}
-diff --git a/tools/Makefile b/tools/Makefile
-index 7ae6e3cb75ddc662576808f41e0bc103c82d992c..7803174689408946cf14662f10fce5f6fcc0d98b 100644
---- a/tools/Makefile
-+++ b/tools/Makefile
-@@ -1,4 +1,5 @@
- TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher uncoded_frame
-+TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
- TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
- TOOLS-$(CONFIG_ZLIB) += cws2fws
+diff --git a/tests/fate/hw.mak b/tests/fate/hw.mak
+index 0f126892fd1a92d2e79edf229deeccb96e559c30..bb60d3ccc29550b00071f7c6149ea5f074cf2674 100644
+--- a/tests/fate/hw.mak
++++ b/tests/fate/hw.mak
+@@ -3,4 +3,8 @@ fate-hwdevice: libavutil/tests/hwdevice$(EXESUF)
+ fate-hwdevice: CMD = run libavutil/tests/hwdevice$(EXESUF)
+ fate-hwdevice: CMP = null
  
-diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
++FATE_HW-$(call ALLYES, HQDN3D_VULKAN_FILTER HQDN3D_FILTER) += fate-filter-hqdn3d-vulkan
++fate-filter-hqdn3d-vulkan: libavfilter/tests/hqdn3d_vulkan$(EXESUF)
++fate-filter-hqdn3d-vulkan: CMD = run libavfilter/tests/hqdn3d_vulkan$(EXESUF)
++
+ FATE_HW-$(CONFIG_AVUTIL) += $(FATE_HWCONTEXT)
+diff --git a/tests/ref/fate/filter-hqdn3d-vulkan b/tests/ref/fate/filter-hqdn3d-vulkan
 new file mode 100644
-index 0000000000000000000000000000000000000000..725e7a6a5329443de6a0ccbb440a0c30bf46b3a8
+index 0000000000000000000000000000000000000000..acd77334243c23508942e547d3633259126ffe35
 --- /dev/null
-+++ b/tools/hqdn3d_reset_test.c
-@@ -0,0 +1,540 @@
-+/*
-+ * Copyright (c) 2026 Lusoris
-+ *
-+ * This file is part of FFmpeg.
-+ *
-+ * FFmpeg is free software; you can redistribute it and/or
-+ * modify it under the terms of the GNU Lesser General Public
-+ * License as published by the Free Software Foundation; either
-+ * version 2.1 of the License, or (at your option) any later version.
-+ *
-+ * FFmpeg is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-+ * Lesser General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU Lesser General Public
-+ * License along with FFmpeg; if not, write to the Free Software
-+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-+ */
-+
-+#include <stdio.h>
-+#include <stdlib.h>
-+#include <string.h>
-+#include <stdint.h>
-+#include "libavutil/avstring.h"
-+#include "libavutil/channel_layout.h"
-+#include "libavutil/common.h"
-+#include "libavutil/hwcontext.h"
-+#include "libavutil/hwcontext_vulkan.h"
-+#include "libavutil/imgutils.h"
-+#include "libavutil/log.h"
-+#include "libavutil/mem.h"
-+#include "libavutil/opt.h"
-+#include "libavutil/pixdesc.h"
-+#include "libavfilter/avfilter.h"
-+#include "libavfilter/buffersink.h"
-+#include "libavfilter/buffersrc.h"
-+
-+static void get_frame_dims(int n, int *w, int *h)
-+{
-+    if (n < 4) {
-+        *w = 128;
-+        *h = 72;
-+    } else if (n < 8) {
-+        *w = 96;
-+        *h = 56;
-+    } else {
-+        *w = 160;
-+        *h = 96;
-+    }
-+}
-+
-+static uint8_t lcg_rand(uint32_t *state)
-+{
-+    *state = *state * 1664525u + 1013904223u;
-+    return (uint8_t)(*state >> 16);
-+}
-+
-+static int create_input_frame(int n, uint32_t *seed, AVFrame **out_frame)
-+{
-+    int w, h, err;
-+    AVFrame *f = av_frame_alloc();
-+    if (!f)
-+        return AVERROR(ENOMEM);
-+
-+    get_frame_dims(n, &w, &h);
-+    f->format = AV_PIX_FMT_YUV420P;
-+    f->width  = w;
-+    f->height = h;
-+    f->pts    = n;
-+
-+    err = av_frame_get_buffer(f, 0);
-+    if (err < 0) {
-+        av_frame_free(&f);
-+        return err;
-+    }
-+
-+    for (int p = 0; p < 3; p++) {
-+        int pw = (p == 0) ? w : AV_CEIL_RSHIFT(w, 1);
-+        int ph = (p == 0) ? h : AV_CEIL_RSHIFT(h, 1);
-+        for (int y = 0; y < ph; y++) {
-+            uint8_t *dst = f->data[p] + y * f->linesize[p];
-+            for (int x = 0; x < pw; x++)
-+                dst[x] = lcg_rand(seed);
-+        }
-+    }
-+
-+    *out_frame = f;
-+    return 0;
-+}
-+
-+static int create_vk_frames_ctx(AVBufferRef *device_ref, int w, int h,
-+                                enum AVPixelFormat sw_format, AVBufferRef **frames_out)
-+{
-+    AVBufferRef *frames_ref = av_hwframe_ctx_alloc(device_ref);
-+    AVHWFramesContext *hwfc;
-+    AVVulkanFramesContext *vk_hwfc;
-+    int err;
-+
-+    if (!frames_ref)
-+        return AVERROR(ENOMEM);
-+
-+    hwfc = (AVHWFramesContext *)frames_ref->data;
-+    hwfc->format    = AV_PIX_FMT_VULKAN;
-+    hwfc->sw_format = sw_format;
-+    hwfc->width     = w;
-+    hwfc->height    = h;
-+
-+    vk_hwfc = hwfc->hwctx;
-+    vk_hwfc->tiling = VK_IMAGE_TILING_OPTIMAL;
-+    vk_hwfc->usage  = VK_IMAGE_USAGE_SAMPLED_BIT |
-+                      VK_IMAGE_USAGE_STORAGE_BIT |
-+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-+
-+    err = av_hwframe_ctx_init(frames_ref);
-+    if (err < 0) {
-+        av_buffer_unref(&frames_ref);
-+        return err;
-+    }
-+
-+    *frames_out = frames_ref;
-+    return 0;
-+}
-+
-+static int upload_vk_frame(AVBufferRef *frames_ref, AVFrame *sw_in, AVFrame **vk_out)
-+{
-+    AVFrame *vk_f = av_frame_alloc();
-+    int err;
-+
-+    if (!vk_f)
-+        return AVERROR(ENOMEM);
-+
-+    err = av_hwframe_get_buffer(frames_ref, vk_f, 0);
-+    if (err < 0) {
-+        av_frame_free(&vk_f);
-+        return err;
-+    }
-+
-+    err = av_hwframe_transfer_data(vk_f, sw_in, 0);
-+    if (err < 0) {
-+        av_frame_free(&vk_f);
-+        return err;
-+    }
-+
-+    err = av_frame_copy_props(vk_f, sw_in);
-+    if (err < 0) {
-+        av_frame_free(&vk_f);
-+        return err;
-+    }
-+
-+    *vk_out = vk_f;
-+    return 0;
-+}
-+
-+static int download_vk_frame(AVFrame *vk_in, AVFrame **sw_out)
-+{
-+    AVFrame *sw_f = av_frame_alloc();
-+    int err;
-+
-+    if (!sw_f)
-+        return AVERROR(ENOMEM);
-+
-+    sw_f->format = AV_PIX_FMT_YUV420P;
-+    err = av_hwframe_transfer_data(sw_f, vk_in, 0);
-+    if (err < 0) {
-+        av_frame_free(&sw_f);
-+        return err;
-+    }
-+
-+    err = av_frame_copy_props(sw_f, vk_in);
-+    if (err < 0) {
-+        av_frame_free(&sw_f);
-+        return err;
-+    }
-+
-+    *sw_out = sw_f;
-+    return 0;
-+}
-+
-+static int compare_planes(const AVFrame *cpu_f, const AVFrame *gpu_f)
-+{
-+    if (cpu_f->width != gpu_f->width || cpu_f->height != gpu_f->height)
-+        return 0;
-+
-+    for (int p = 0; p < 3; p++) {
-+        int pw = (p == 0) ? cpu_f->width : AV_CEIL_RSHIFT(cpu_f->width, 1);
-+        int ph = (p == 0) ? cpu_f->height : AV_CEIL_RSHIFT(cpu_f->height, 1);
-+        for (int y = 0; y < ph; y++) {
-+            const uint8_t *c = cpu_f->data[p] + y * cpu_f->linesize[p];
-+            const uint8_t *g = gpu_f->data[p] + y * gpu_f->linesize[p];
-+            if (memcmp(c, g, pw) != 0)
-+                return 0;
-+        }
-+    }
-+    return 1;
-+}
-+
-+static int link_and_config(AVFilterGraph *graph, AVFilterContext *src,
-+                           AVFilterContext *mid, AVFilterContext *sink)
-+{
-+    int err = avfilter_link(src, 0, mid, 0);
-+    if (err < 0)
-+        return err;
-+
-+    err = avfilter_link(mid, 0, sink, 0);
-+    if (err < 0)
-+        return err;
-+
-+    return avfilter_graph_config(graph, NULL);
-+}
-+
-+static int init_cpu_graph(AVFilterGraph **graph_out,
-+                          AVFilterContext **src_out,
-+                          AVFilterContext **sink_out)
-+{
-+    AVFilterGraph *graph = avfilter_graph_alloc();
-+    const AVFilter *buf_filt = avfilter_get_by_name("buffer");
-+    const AVFilter *hq_filt = avfilter_get_by_name("hqdn3d");
-+    const AVFilter *sink_filt = avfilter_get_by_name("buffersink");
-+    AVFilterContext *src_ctx = NULL, *hq_ctx = NULL, *sink_ctx = NULL;
-+    char args[128];
-+    int err;
-+
-+    if (!graph || !buf_filt || !hq_filt || !sink_filt)
-+        return AVERROR(ENOMEM);
-+
-+    snprintf(args, sizeof(args),
-+             "video_size=128x72:pix_fmt=yuv420p:time_base=1/25:pixel_aspect=1/1");
-+    err = avfilter_graph_create_filter(&src_ctx, buf_filt, "in", args, NULL, graph);
-+    if (err < 0) {
-+        avfilter_graph_free(&graph);
-+        return err;
-+    }
-+
-+    err = avfilter_graph_create_filter(&hq_ctx, hq_filt, "hqdn3d", NULL, NULL, graph);
-+    if (err < 0) {
-+        avfilter_graph_free(&graph);
-+        return err;
-+    }
-+
-+    err = avfilter_graph_create_filter(&sink_ctx, sink_filt, "out", NULL, NULL, graph);
-+    if (err < 0) {
-+        avfilter_graph_free(&graph);
-+        return err;
-+    }
-+
-+    err = link_and_config(graph, src_ctx, hq_ctx, sink_ctx);
-+    if (err < 0) {
-+        avfilter_graph_free(&graph);
-+        return err;
-+    }
-+
-+    *graph_out = graph;
-+    *src_out = src_ctx;
-+    *sink_out = sink_ctx;
-+    return 0;
-+}
-+
-+static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
-+                              AVBufferRef *initial_frames_ref, AVFilterContext **src_out)
-+{
-+    AVFilterContext *src_ctx = avfilter_graph_alloc_filter(graph, buf_filt, "in");
-+    AVBufferSrcParameters *par = av_buffersrc_parameters_alloc();
-+    int err;
-+
-+    if (!src_ctx || !par) {
-+        av_free(par);
-+        return AVERROR(ENOMEM);
-+    }
-+    par->format        = AV_PIX_FMT_VULKAN;
-+    par->width         = 128;
-+    par->height        = 72;
-+    par->time_base     = (AVRational){ 1, 25 };
-+    par->sample_aspect_ratio = (AVRational){ 1, 1 };
-+    par->hw_frames_ctx = initial_frames_ref;
-+
-+    err = av_buffersrc_parameters_set(src_ctx, par);
-+    av_free(par);
-+    if (err < 0)
-+        return err;
-+
-+    err = avfilter_init_dict(src_ctx, NULL);
-+    if (err < 0)
-+        return err;
-+
-+    *src_out = src_ctx;
-+    return 0;
-+}
-+
-+static int init_gpu_graph(AVFilterGraph **graph_out,
-+                          AVFilterContext **src_out,
-+                          AVFilterContext **sink_out,
-+                          AVBufferRef *vk_device_ref,
-+                          AVBufferRef *initial_frames_ref)
-+{
-+    AVFilterGraph *graph = avfilter_graph_alloc();
-+    const AVFilter *buf_filt = avfilter_get_by_name("buffer");
-+    const AVFilter *hq_filt = avfilter_get_by_name("hqdn3d_vulkan");
-+    const AVFilter *sink_filt = avfilter_get_by_name("buffersink");
-+    AVFilterContext *src_ctx = NULL, *hq_ctx = NULL, *sink_ctx = NULL;
-+    int err;
-+
-+    if (!graph || !buf_filt || !hq_filt || !sink_filt)
-+        return AVERROR(ENOMEM);
-+
-+    err = init_gpu_buffersrc(graph, buf_filt, initial_frames_ref, &src_ctx);
-+    if (err < 0) {
-+        avfilter_graph_free(&graph);
-+        return err;
-+    }
-+
-+    hq_ctx = avfilter_graph_alloc_filter(graph, hq_filt, "hqdn3d_vulkan");
-+    if (!hq_ctx) {
-+        avfilter_graph_free(&graph);
-+        return AVERROR(ENOMEM);
-+    }
-+    hq_ctx->hw_device_ctx = av_buffer_ref(vk_device_ref);
-+    err = avfilter_init_dict(hq_ctx, NULL);
-+    if (err < 0) {
-+        avfilter_graph_free(&graph);
-+        return err;
-+    }
-+
-+    err = avfilter_graph_create_filter(&sink_ctx, sink_filt, "out", NULL, NULL, graph);
-+    if (err < 0) {
-+        avfilter_graph_free(&graph);
-+        return err;
-+    }
-+
-+    err = link_and_config(graph, src_ctx, hq_ctx, sink_ctx);
-+    if (err < 0) {
-+        avfilter_graph_free(&graph);
-+        return err;
-+    }
-+
-+    *graph_out = graph;
-+    *src_out = src_ctx;
-+    *sink_out = sink_ctx;
-+    return 0;
-+}
-+
-+static int run_cpu_step(AVFilterContext *cpu_src, AVFilterContext *cpu_sink,
-+                        AVFrame *sw_frame, AVFrame **cpu_out)
-+{
-+    AVFrame *cpu_in = av_frame_clone(sw_frame);
-+    AVFrame *out = av_frame_alloc();
-+    int err;
-+
-+    if (!cpu_in || !out) {
-+        av_frame_free(&cpu_in);
-+        av_frame_free(&out);
-+        return AVERROR(ENOMEM);
-+    }
-+
-+    err = av_buffersrc_add_frame(cpu_src, cpu_in);
-+    av_frame_free(&cpu_in);
-+    if (err < 0) {
-+        av_frame_free(&out);
-+        return err;
-+    }
-+
-+    err = av_buffersink_get_frame(cpu_sink, out);
-+    if (err < 0) {
-+        av_frame_free(&out);
-+        return err;
-+    }
-+
-+    *cpu_out = out;
-+    return 0;
-+}
-+
-+static int run_gpu_step(AVFilterContext *gpu_src, AVFilterContext *gpu_sink,
-+                        AVBufferRef *upload_ctx, AVFrame *sw_frame,
-+                        AVFrame **gpu_out_sw)
-+{
-+    AVFrame *gpu_in_vk = NULL;
-+    AVFrame *gpu_out_vk = av_frame_alloc();
-+    int err;
-+
-+    if (!gpu_out_vk)
-+        return AVERROR(ENOMEM);
-+
-+    err = upload_vk_frame(upload_ctx, sw_frame, &gpu_in_vk);
-+    if (err < 0) {
-+        av_frame_free(&gpu_out_vk);
-+        return err;
-+    }
-+
-+    err = av_buffersrc_add_frame(gpu_src, gpu_in_vk);
-+    av_frame_free(&gpu_in_vk);
-+    if (err < 0) {
-+        av_frame_free(&gpu_out_vk);
-+        return err;
-+    }
-+
-+    err = av_buffersink_get_frame(gpu_sink, gpu_out_vk);
-+    if (err < 0) {
-+        av_frame_free(&gpu_out_vk);
-+        return err;
-+    }
-+
-+    err = download_vk_frame(gpu_out_vk, gpu_out_sw);
-+    av_frame_free(&gpu_out_vk);
-+    if (err < 0)
-+        return err;
-+
-+    return 0;
-+}
-+
-+static int process_one_frame(AVFilterContext *cpu_src, AVFilterContext *cpu_sink,
-+                             AVFilterContext *gpu_src, AVFilterContext *gpu_sink,
-+                             AVBufferRef **upload_ctxs, int n,
-+                             uint32_t *seed, int *is_same)
-+{
-+    AVFrame *sw_frame = NULL, *cpu_out = NULL, *gpu_out = NULL;
-+    int bucket = (n < 4) ? 0 : ((n < 8) ? 1 : 2);
-+    int err;
-+
-+    err = create_input_frame(n, seed, &sw_frame);
-+    if (err < 0)
-+        return err;
-+
-+    err = run_cpu_step(cpu_src, cpu_sink, sw_frame, &cpu_out);
-+    if (err < 0) {
-+        av_frame_free(&sw_frame);
-+        return err;
-+    }
-+
-+    err = run_gpu_step(gpu_src, gpu_sink, upload_ctxs[bucket], sw_frame, &gpu_out);
-+    av_frame_free(&sw_frame);
-+    if (err < 0) {
-+        av_frame_free(&cpu_out);
-+        return err;
-+    }
-+
-+    *is_same = compare_planes(cpu_out, gpu_out);
-+    printf("%d %d %d %s\n", n, gpu_out->width, gpu_out->height,
-+           *is_same ? "same" : "DIFF");
-+    fflush(stdout);
-+
-+    av_frame_free(&cpu_out);
-+    av_frame_free(&gpu_out);
-+    return 0;
-+}
-+
-+static void cleanup_all(AVBufferRef **vk_device_ref,
-+                        AVBufferRef **upload_ctxs,
-+                        AVFilterGraph **cpu_graph,
-+                        AVFilterGraph **gpu_graph)
-+{
-+    for (int i = 0; i < 3; i++)
-+        av_buffer_unref(&upload_ctxs[i]);
-+    avfilter_graph_free(cpu_graph);
-+    avfilter_graph_free(gpu_graph);
-+    av_buffer_unref(vk_device_ref);
-+}
-+
-+static int setup_all(const char *dev_idx,
-+                     AVBufferRef **vk_device_ref,
-+                     AVBufferRef **upload_ctxs,
-+                     AVFilterGraph **cpu_graph,
-+                     AVFilterContext **cpu_src,
-+                     AVFilterContext **cpu_sink,
-+                     AVFilterGraph **gpu_graph,
-+                     AVFilterContext **gpu_src,
-+                     AVFilterContext **gpu_sink)
-+{
-+    int err;
-+
-+    err = av_hwdevice_ctx_create(vk_device_ref, AV_HWDEVICE_TYPE_VULKAN, dev_idx, NULL, 0);
-+    if (err < 0)
-+        return err;
-+
-+    err = create_vk_frames_ctx(*vk_device_ref, 128, 72, AV_PIX_FMT_YUV420P, &upload_ctxs[0]);
-+    if (err < 0)
-+        return err;
-+
-+    err = create_vk_frames_ctx(*vk_device_ref, 96, 56, AV_PIX_FMT_YUV420P, &upload_ctxs[1]);
-+    if (err < 0)
-+        return err;
-+
-+    err = create_vk_frames_ctx(*vk_device_ref, 160, 96, AV_PIX_FMT_YUV420P, &upload_ctxs[2]);
-+    if (err < 0)
-+        return err;
-+
-+    err = init_cpu_graph(cpu_graph, cpu_src, cpu_sink);
-+    if (err < 0)
-+        return err;
-+
-+    err = init_gpu_graph(gpu_graph, gpu_src, gpu_sink, *vk_device_ref, upload_ctxs[0]);
-+    if (err < 0)
-+        return err;
-+
-+    return 0;
-+}
-+
-+int main(int argc, char **argv)
-+{
-+    AVBufferRef *vk_device_ref = NULL;
-+    AVBufferRef *upload_ctxs[3] = { NULL, NULL, NULL };
-+    AVFilterGraph *cpu_graph = NULL, *gpu_graph = NULL;
-+    AVFilterContext *cpu_src = NULL, *cpu_sink = NULL;
-+    AVFilterContext *gpu_src = NULL, *gpu_sink = NULL;
-+    const char *dev_idx;
-+    uint32_t seed = 0x12345678;
-+    int err, any_diff = 0, frames_ok = 0;
-+
-+    if (argc < 2) {
-+        fprintf(stderr, "Usage: %s <vulkan device index>\n", argv[0]);
-+        return 1;
-+    }
-+    dev_idx = (strncmp(argv[1], "vk:", 3) == 0) ? argv[1] + 3 : argv[1];
-+
-+    av_log_set_level(AV_LOG_ERROR);
-+
-+    err = setup_all(dev_idx, &vk_device_ref, upload_ctxs,
-+                    &cpu_graph, &cpu_src, &cpu_sink,
-+                    &gpu_graph, &gpu_src, &gpu_sink);
-+    if (err < 0) {
-+        cleanup_all(&vk_device_ref, upload_ctxs, &cpu_graph, &gpu_graph);
-+        return 1;
-+    }
-+
-+    for (int n = 0; n < 12; n++) {
-+        int is_same = 0;
-+        err = process_one_frame(cpu_src, cpu_sink, gpu_src, gpu_sink,
-+                                upload_ctxs, n, &seed, &is_same);
-+        if (err < 0) {
-+            any_diff = 1;
-+            break;
-+        }
-+        frames_ok++;
-+        if (!is_same)
-+            any_diff = 1;
-+    }
-+
-+    cleanup_all(&vk_device_ref, upload_ctxs, &cpu_graph, &gpu_graph);
-+    return (frames_ok == 12 && !any_diff) ? 0 : 1;
-+}
++++ b/tests/ref/fate/filter-hqdn3d-vulkan
+@@ -0,0 +1,21 @@
++0 128 72 same
++1 128 72 same
++2 128 72 same
++3 128 72 same
++4 96 56 same
++5 96 56 same
++6 96 56 same
++7 96 56 same
++8 160 96 same
++9 160 96 same
++10 160 96 same
++11 160 96 same
++14 160 96 first same
++12 160 96 yuv420p10 refused EINVAL
++13 160 96 yuv444p refused EINVAL
++f1 160 96 yuv444p refused EINVAL
++p012 0 min 0 max 65520 low 0
++p012 1 min 65520 max 65520 low 0
++p012 2 min 65520 max 65520 low 0
++neg 0 2 2 same luma 0 0 0 0
++neg 1 2 2 same luma 4095 4095 65535 0
