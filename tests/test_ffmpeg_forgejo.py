@@ -3021,6 +3021,20 @@ class SweepTest(ForgejoTest):
             "#!/usr/bin/env python3\nimport json, os, sys\n"
             f"with open({str(self.tmp / 'git-calls.jsonl')!r}, 'a', encoding='utf-8') as calls:\n"
             "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            'if "merge-tree" in sys.argv:\n'
+            '    mode = os.environ.get("STUB_MERGE_TREE")\n'
+            '    if mode == "fail":\n'
+            "        sys.exit(128)\n"
+            '    if mode == "flood":\n'
+            '        buf = memoryview(b"a" * (2 * 1024 * 1024))\n'
+            "        try:\n"
+            "            for _ in range(2 * 1024 * 1024):\n"
+            "                if not buf:\n"
+            "                    break\n"
+            "                buf = buf[os.write(1, buf):]\n"
+            "        except BrokenPipeError:\n"
+            "            pass\n"
+            "        sys.exit(0)\n"
             'if "push" in sys.argv:\n'
             f"    with open({str(self.tmp / 'push-argv.json')!r}, 'w') as record:\n"
             "        json.dump(sys.argv[1:], record)\n"
@@ -3082,6 +3096,97 @@ class SweepTest(ForgejoTest):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("merge with the live base not proven", result.stderr)
         self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_failed_merge_tree(self) -> None:
+        """Refuse push when git merge-tree fails with an unexpected status."""
+
+        result = self.sweep_command(
+            "push",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"STUB_MERGE_TREE": "fail"},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("merge-tree failed with status 128", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_oversized_merge_tree_output(self) -> None:
+        """Refuse push when git merge-tree output exceeds the byte cap."""
+
+        result = self.sweep_command(
+            "push",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"STUB_MERGE_TREE": "flood"},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("merge-tree output exceeds 1048576 bytes", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_merge_driver_setting(self) -> None:
+        """Refuse push when local Git config defines a custom merge driver."""
+
+        git(self.repo, "config", "merge.fixture.driver", "true")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(
+            "merge setting merge.fixture.driver may change the merge result",
+            result.stderr,
+        )
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_accepts_neutral_merge_setting(self) -> None:
+        """Allow push when local Git config sets an allow-listed merge option."""
+
+        git(self.repo, "config", "merge.conflictStyle", "diff3")
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_local_info_attributes(self) -> None:
+        """Refuse push when the repository info/attributes file defines attributes."""
+
+        attr_path = self.repo / git_output(self.repo, "rev-parse", "--git-path", "info/attributes")
+        attr_path.parent.mkdir(parents=True, exist_ok=True)
+        attr_path.write_text("* merge=union\n", encoding="utf-8")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("sets attributes", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_conflict_ignores_worktree_union_attribute(self) -> None:
+        """Ignore worktree .gitattributes union rules when checking live-base conflicts."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        (self.repo / ".gitattributes").write_text(f"{OVERLAP_FILE} merge=union\n", encoding="utf-8")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_pr_accepts_live_base_advanced_without_conflict(self) -> None:
+        """Allow PR creation when the live upstream base advanced without conflicting."""
+
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        stub = Stub(reviewers=[["alice"]])
+        result = self.sweep_command("pr", "--sweep", str(self.sweep), stub=stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pulls_posts = [
+            (method, path, body)
+            for method, path, body in self.sweep_requests
+            if method == "POST" and path.endswith("/pulls")
+        ]
+        self.assertEqual(len(pulls_posts), 1)
         self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
 
     def test_push_refuses_unrecorded_own_next_push_promise(self) -> None:
