@@ -197,8 +197,8 @@ jobs:
         run: make -j"$(nproc)" build 2>&1 | tee build.log
       - name: Run the FATE tests that need no samples
         # fate-filter-hqdn3d-vulkan (0023) runs libavfilter/tests/hqdn3d_vulkan,
-        # which needs a Vulkan device and exits nonzero without one; the parity
-        # step below runs it on lavapipe.
+        # which needs a Vulkan device and exits nonzero without one; the next
+        # step runs it on lavapipe.
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         working-directory: build
         run: |
@@ -210,6 +210,31 @@ jobs:
           fi
           echo "FATE targets: ${#targets[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           make -j"$(nproc)" -k "${targets[@]}" 2>&1 | tee -a build.log
+      - name: Run fate-filter-hqdn3d-vulkan on lavapipe
+        # The FATE step above leaves out fate-filter-hqdn3d-vulkan (0023), as
+        # libavfilter/tests/hqdn3d_vulkan needs a Vulkan device. The hosted
+        # runner has no GPU, so Mesa lavapipe runs it on the CPU. The step runs
+        # for every pull request in series scope, not only in GPU parity scope.
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
+        run: |
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+          lvp=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' | head -1)
+          if [ -z "$lvp" ]; then
+            echo "::error::lavapipe is not installed"
+            exit 1
+          fi
+          export VK_DRIVER_FILES="$lvp"
+          if ! build/ffmpeg -hide_banner -nostdin -v verbose -init_hw_device vulkan=vk:0 \
+            -f lavfi -i nullsrc=d=0.04 -f null - > probe.log 2>&1 \
+            || ! grep -qi llvmpipe probe.log; then
+            cat probe.log
+            echo "::error::vulkan=vk:0 did not open llvmpipe"
+            exit 1
+          fi
+          if ! make -C build fate-filter-hqdn3d-vulkan 2>&1 | tee fate-hqdn3d.log; then
+            echo "::error::fate-filter-hqdn3d-vulkan failed on lavapipe"
+            exit 1
+          fi
       - name: Compare the hqdn3d and tonemap GPU filters with the CPU filters on software devices
         # ADR-0004: the GPU hqdn3d filters must give the CPU filter's samples;
         # tonemap_opencl and tonemap_vulkan must stay within one code value of
@@ -219,8 +244,8 @@ jobs:
         # is not used: it offers FFmpeg no planar or semi-planar image format.
         # The loaders see only those drivers; the step fails when FFmpeg opens
         # another device or when a device case is skipped instead of run.
-        # fate-filter-hqdn3d-vulkan and the in-graph reset cases run
-        # libavfilter/tests/hqdn3d_vulkan on the same devices.
+        # The in-graph reset cases run libavfilter/tests/hqdn3d_vulkan on
+        # the same devices; the step before runs fate-filter-hqdn3d-vulkan.
         if: >-
           github.event.pull_request.draft != true && env.IN_SCOPE == 'true' &&
           (needs.scope.result != 'success' || needs.scope.outputs.parity == 'true')
@@ -251,10 +276,6 @@ jobs:
           }
           probe vulkan=vk:0 llvmpipe
           probe opencl=ocl:0.0 rusticl
-          if ! make -C build fate-filter-hqdn3d-vulkan 2>&1 | tee fate-hqdn3d.log; then
-            echo "::error::fate-filter-hqdn3d-vulkan failed on lavapipe"
-            exit 1
-          fi
           export HQDN3D_RESET_TOOL="$PWD/build/libavfilter/tests/hqdn3d_vulkan"
           python3 -m unittest -v -k matches_cpu -k temporal_only -k graph_rebuild \
             -k in_graph_resize -k unsupported_format -k planted -k MismatchRule \
