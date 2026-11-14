@@ -12,14 +12,14 @@ must give the format maximum and every other sample must match.
 
 Temporal state must reset where the CPU filter resets it: on a graph rebuild
 (a resolution switch in the input) and on an in-graph frame size change,
-which the tools/hqdn3d_reset_test driver of the patch exercises. The rebuild
-source joins a 320x184 and a 160x96 part with the concat demuxer. The parts
-are MJPEG, whose frame header carries the frame size: concat keeps the stream
-parameters of the first part, so a codec without an in-band size (FFV1)
-would decode the second part at 320x184, no rebuild would happen, and the
-output would depend on decoder threading. -noautoscale keeps the CLI from
-scaling the second part back to 320x184 for the encoder, so the output length
-proves the rebuild.
+which the libavfilter/tests/hqdn3d_vulkan program of the patch exercises; it
+must exit 0 and print the 12 frames of three sizes as same. The rebuild source
+joins a 320x184 and a 160x96 part with the concat demuxer. The parts are MJPEG,
+whose frame header carries the frame size: concat keeps the stream parameters
+of the first part, so a codec without an in-band size (FFV1) would decode the
+second part at 320x184, no rebuild would happen, and the output would depend on
+decoder threading. -noautoscale keeps the CLI from scaling the second part
+back to 320x184 for the encoder, so the output length proves the rebuild.
 
 The planted wrong cases are a luma strength of 4.5 against the CPU default of
 4, which the comparison must refuse, and an FFV1 rebuild source, whose output
@@ -29,9 +29,10 @@ The device cases need an FFmpeg built with the series and a Vulkan device:
 
     VK_FFMPEG=/path/to/ffmpeg VK_DEVICE=0 python3 -m unittest tests.test_hqdn3d_vulkan
 
-The in-graph reset case also needs HQDN3D_RESET_TOOL=/path/to/tools/hqdn3d_reset_test
-(make tools/hqdn3d_reset_test in the FFmpeg build). Without the variables
-the cases are skipped.
+The in-graph reset case also needs
+HQDN3D_RESET_TOOL=/path/to/libavfilter/tests/hqdn3d_vulkan
+(make libavfilter/tests/hqdn3d_vulkan in the FFmpeg build). Without the
+variables the cases are skipped.
 """
 
 from __future__ import annotations
