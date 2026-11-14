@@ -18,6 +18,7 @@
 #                          (exit 77); --overlap-ok permits exactly that PR;
 #                          exits 3 when Fairy is missing or no human reviewer is requested
 #                          pr/push require a sweep for the local head; every row must be fold, follow-up: <reproducer path> or no-variant: <reason>
+#                          pr/push refuse (exit 73) a swept head that does not merge cleanly into the live $FFMPEG_FORGEJO_BASE fetched from FFMPEG_FORGEJO_GIT
 #                          pr/push run only as scripts/ffmpeg-forgejo of a Git checkout, directly or through a symlink (exit 74 otherwise)
 #   ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>
 #                          lists every own open pull sharing a file with the branch diff against the fetched base; exit 77 when any, 0 when none, 1 when not proven
@@ -488,12 +489,18 @@ report_overlap_all() {
   return 77
 }
 
+# fetch_base_ref REF: fetch the configured upstream base branch into REF.
+fetch_base_ref() {
+  local ref="$1"
+  timeout 120 git fetch --quiet --no-tags --no-write-fetch-head "$GIT_URL" "+refs/heads/$BASE:$ref"
+}
+
 # prepare_overlap_candidates BRANCH: fetch base into private ref and diff candidate files.
 prepare_overlap_candidates() {
   local branch="$1"
   OVERLAP_REF="refs/ffmpeg-forgejo/overlap-base-$$"
   trap overlap_cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
-  if ! timeout 120 git fetch --quiet --no-tags --no-write-fetch-head "$GIT_URL" "+refs/heads/$BASE:$OVERLAP_REF"; then
+  if ! fetch_base_ref "$OVERLAP_REF"; then
     printf 'ffmpeg-forgejo: cannot fetch %s from %s; overlap not proven absent.\n' "$BASE" "$GIT_URL" >&2
     overlap_cleanup
     return 1
@@ -885,6 +892,60 @@ PY
   SWEPT_SHA="$sha"
 }
 
+MERGE_BASE_REF=""
+
+# merge_base_cleanup: delete live merge-base ref without altering exit status.
+merge_base_cleanup() {
+  local save_status=$?
+  if [ -n "$MERGE_BASE_REF" ]; then
+    if git rev-parse --quiet --verify "$MERGE_BASE_REF" >/dev/null; then
+      if ! git update-ref -d "$MERGE_BASE_REF"; then
+        printf 'ffmpeg-forgejo: cannot delete %s.\n' "$MERGE_BASE_REF" >&2
+      fi
+    fi
+    MERGE_BASE_REF=""
+  fi
+  return "$save_status"
+}
+
+# require_clean_merge SHA: refuse outbound push or PR when SHA conflicts with the live base.
+require_clean_merge() {
+  local sha="$1" ref out rc base_sha paths
+  ref="refs/ffmpeg-forgejo/merge-base-$$"
+  MERGE_BASE_REF="$ref"
+  trap merge_base_cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  if ! fetch_base_ref "$ref"; then
+    printf 'ffmpeg-forgejo: cannot fetch %s from %s; merge with the live base not proven.\n' \
+      "$BASE" "$GIT_URL" >&2
+    merge_base_cleanup
+    exit 1
+  fi
+  if out="$(timeout 120 git merge-tree --write-tree --name-only --no-messages "$ref" "$sha")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    merge_base_cleanup
+    trap - EXIT
+    return 0
+  fi
+  if [ "$rc" -eq 1 ]; then
+    base_sha="$(timeout 120 git rev-parse --verify "$ref")" || { merge_base_cleanup; exit 1; }
+    paths="$(python3 -I -c \
+      'import sys; print(" ".join(dict.fromkeys(filter(None, sys.stdin.read().split("\n")[1:]))))' \
+      <<<"$out")" || { merge_base_cleanup; exit 1; }
+    merge_base_cleanup
+    printf 'ffmpeg-forgejo: %s does not merge cleanly into live %s at %s; conflicting files: %s; rebase onto the live base and sweep again.\n' \
+      "${sha:0:12}" "$BASE" "${base_sha:0:12}" "$paths" >&2
+    exit 73
+  fi
+  merge_base_cleanup
+  printf 'ffmpeg-forgejo: merge-tree failed with status %s; merge with the live base not proven.\n' \
+    "$rc" >&2
+  exit 1
+}
+
 # select_promise_pull BRANCH LOGIN: reject malformed rows before selecting an own PR.
 select_promise_pull() {
   python3 -I -c '
@@ -1164,6 +1225,7 @@ for i in json.load(sys.stdin):
     done
     [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: $usage"
     require_sweep "$sweep" "$1"
+    require_clean_merge "$SWEPT_SHA"
     me="$(login)"
     rb="${2:-$1}"
     require_promises "$rb" "$promises" "$me"
@@ -1192,6 +1254,7 @@ for i in json.load(sys.stdin):
     done
     [ $# -eq 3 ] || usage_error "$usage"
     require_sweep "$sweep" "$1"
+    require_clean_merge "$SWEPT_SHA"
     [ -f "$3" ] || die "no body file $3"
     is_login "$BOT_REVIEWER" || die "not a login: $BOT_REVIEWER"
     me="$(login)"

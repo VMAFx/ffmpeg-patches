@@ -135,6 +135,31 @@ def full_sweep_report(sha: str) -> str:
     )
 
 
+def advance_upstream(tmp: Path, upstream: Path, path: str, text: str) -> str:
+    """Clone upstream under tmp, commit text at path on master, and push."""
+
+    work = Path(tempfile.mkdtemp(prefix="upstream-work-", dir=tmp))
+    git(tmp, "clone", "-q", str(upstream), str(work))
+    target = work / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    git(work, "add", path)
+    git(
+        work,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgSign=false",
+        "commit",
+        "-qm",
+        "advance upstream",
+    )
+    git(work, "push", "-q", "origin", "master")
+    return git_output(work, "rev-parse", "HEAD")
+
+
 OTHER = other_status("pending", "2026-11-06T08:00:00Z")
 ChangedFile = str | dict[str, str]
 
@@ -1792,6 +1817,8 @@ class FairyRequestTestBase(unittest.TestCase):
             "secret-tool": "printf 'fixture-token\\n'",
             "git": (
                 'case "$1" in fetch|diff) exit 0;; '
+                "merge-tree) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; "
+                "update-ref) exit 0;; "
                 f"rev-parse) echo {FAIRY_FIXTURE_HEAD};; *) exit 97;; esac"
             ),
         }.items():
@@ -2296,7 +2323,10 @@ class PullRequestOverlapTest(ForgejoTest):
             env_updates={"FFMPEG_FORGEJO_GIT": missing},
         )
         self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn(f"cannot fetch master from {missing}; overlap not proven absent", proc.stderr)
+        self.assertIn(
+            f"cannot fetch master from {missing}; merge with the live base not proven",
+            proc.stderr,
+        )
         self.assertEqual(self.pull_posts(stub), [])
 
     def test_other_login_overlap_allows_creation(self) -> None:
@@ -2757,6 +2787,23 @@ class OverlapVerbTest(ForgejoTest):
         self.assertEqual(pr_proc.returncode, 1, pr_proc.stderr)
         self.assertIn("no pull request opened", pr_proc.stderr)
 
+    def test_overlap_unreachable_upstream_fails_closed(self) -> None:
+        """The overlap verb fails closed when the live base cannot be fetched."""
+
+        missing = self.tmp / "missing.git"
+        proc = self.run_command(
+            overlap_stub(),
+            "overlap",
+            "topic",
+            env_updates={"FFMPEG_FORGEJO_GIT": str(missing)},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(
+            f"cannot fetch master from {missing}; overlap not proven absent",
+            proc.stderr,
+        )
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
 
 class SweepTest(ForgejoTest):
     """Require a reviewed sweep before either outbound operation."""
@@ -2958,7 +3005,11 @@ class SweepTest(ForgejoTest):
         self.assertIn("report size limit", result.stderr)
 
     def sweep_command(
-        self, command: str, *options: str, stub: Stub | None = None
+        self,
+        command: str,
+        *options: str,
+        stub: Stub | None = None,
+        env_updates: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Attempt an outbound operation with API and Git push stubbed."""
 
@@ -2982,9 +3033,56 @@ class SweepTest(ForgejoTest):
         positional = ["topic"]
         if command == "pr":
             positional += ["title", str(self.tmp / "body.md")]
-        result = self.run_command(stub, command, *options, *positional)
+        result = self.run_command(stub, command, *options, *positional, env_updates=env_updates)
         self.sweep_requests = stub.requests
         return result
+
+    def test_push_refuses_head_conflicting_with_live_base(self) -> None:
+        """Refuse push when the swept head conflicts with the live upstream base."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_pr_refuses_head_conflicting_with_live_base(self) -> None:
+        """Refuse PR creation when the swept head conflicts with the live upstream base."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        result = self.sweep_command("pr", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.sweep_requests))
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_accepts_live_base_advanced_without_conflict(self) -> None:
+        """Allow push when the live upstream base advanced without conflicting."""
+
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_unfetchable_live_base(self) -> None:
+        """Refuse push when the live upstream base cannot be fetched."""
+
+        result = self.sweep_command(
+            "push",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"FFMPEG_FORGEJO_GIT": str(self.tmp / "missing.git")},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("merge with the live base not proven", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
 
     def test_push_refuses_unrecorded_own_next_push_promise(self) -> None:
         """An own next-push promise blocks a push without a promise file."""
