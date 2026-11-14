@@ -17,6 +17,7 @@ UNRESOLVED = "own-directory name assigned in a function, branch or loop"
 UNSUBSTITUTED = "expansion the guard cannot substitute"
 REBOUND = "can rebind the commands of the idiom"
 NEWLINE = "directory path holds a newline"
+NEWLINE_NAME = "resolved script file name holds a newline"
 BENIGN_NEXT = {"tools/next.sh": "echo benign\n"}
 DEFAULT = 'HERE=${LANE_TEST_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}\n'
 DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
@@ -308,6 +309,51 @@ SCRIPT_DIR = {
     "default-expansion-path-before": Case(": ${PATH:-<case>/bin}\n" + DOLLAR0 + SRC + RUN, 0),
     "arith-other-before": Case("(( n=1 ))\n" + DOLLAR0 + SRC + RUN, 0),
     "for-path-after-idiom": Case(DOLLAR0 + "for PATH in <case>/bin; do :; done\n" + SRC + RUN, 0),
+    "let-comma-path-before": Case("let '0,PATH=1'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "let-increment-path-before": Case("let PATH++\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "let-expansion-before": Case('let "$X"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "let-other-before": Case("let 'n=1'\n" + DOLLAR0 + SRC + RUN, 0),
+    "printf-attached-path-before": Case(
+        "printf -vPATH '%s' <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "read-attached-path-before": Case(
+        "read -raPATH <<< <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "printf-attached-other-before": Case("printf -vX '%s' 1\n" + DOLLAR0 + SRC + RUN, 0),
+    "arith-literal-value-path-before": Case(
+        "x='PATH=7'\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "test-eq-path-before": Case("[[ 1 -eq PATH=7 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "subscript-path-before": Case("a[PATH=7]=v\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "substring-offset-path-before": Case(
+        's=abc\n: "${s:PATH=1:1}"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "integer-assign-path-before": Case(
+        "declare -i n\nn='PATH=7'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "echo-path-read-before": Case('echo "PATH is $PATH"\n' + DOLLAR0 + SRC + RUN, 0),
+    "path-compare-before": Case("[[ $PATH == /x ]]\n" + DOLLAR0 + SRC + RUN, 0),
+    "builtin-export-path-before": Case(
+        "builtin export PATH=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "command-export-path-before": Case(
+        "command export PATH=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "builtin-declare-nameref-before": Case(
+        "builtin declare -n P=PATH\nP=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "builtin-export-other-before": Case("builtin export X=1\n" + DOLLAR0 + SRC + RUN, 0),
+    "declare-quoted-nameref-before": Case(
+        'declare "-n" P=PATH\nP=<case>/bin\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "declare-quoted-integer-before": Case('declare "-i" n=1\n' + DOLLAR0 + SRC + RUN, 0),
+    "export-n-other-before": Case("export -n X\n" + DOLLAR0 + SRC + RUN, 0),
+    "newline-name-symlink": Case(
+        DOLLAR0 + SRC + RUN,
+        2,
+        NEWLINE_NAME,
+        {"tools/\n": DOLLAR0 + SRC + RUN, "tools/run.sh": "-> \n", "lib.sh": CFG},
+    ),
 }
 
 
@@ -346,8 +392,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 110 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 110)
+        """Replay all 132 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 132)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

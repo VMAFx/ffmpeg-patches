@@ -52,6 +52,11 @@ NEWLINE_SCRIPT_DIR = (
     "script path from an own-directory name whose directory path holds a newline, "
     "which command substitution can strip; use an absolute path"
 )
+# Refusal when the resolved script file name holds a newline command substitution strips.
+NEWLINE_SCRIPT_NAME = (
+    "script path from an own-directory name whose resolved script file name holds a newline, "
+    "which command substitution can strip; use an absolute path"
+)
 REBOUND_SCRIPT_DIR = (
     "script path from an own-directory name assigned after a shell function, alias, enable, "
     "hash or PATH change that can rebind the commands of the idiom; use an absolute path"
@@ -79,11 +84,27 @@ SCRIPT_DIR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-(.+)\}")
 ASSIGNED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PLAIN_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 PATH_WORD = re.compile(r"PATH(?:\[[^\]]*\])?(?:\+?=.*)?", re.DOTALL)
+# PATH as a whole identifier in arithmetic let operands.
+PATH_TOKEN = re.compile(r"(?<![A-Za-z0-9_])PATH(?![A-Za-z0-9_])")
+# Writer option cluster with the PATH target name attached (-vPATH, -raPATH, -pPATH, -VPATH).
+ATTACHED_PATH_OPTION = re.compile(r"-[A-Za-z]+PATH(?:\[[^\]]*\])?")
+# Arithmetic assignment, increment or decrement of PATH in literal text.
+PATH_ARITH_WRITE = re.compile(
+    r"(?<![A-Za-z0-9_])PATH\s*(?:\[[^\]]*\])?\s*(?:\*\*|<<|>>|[-+*/%&|^])?=(?!=)"
+    r"|(?:\+\+|--)\s*PATH(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])PATH\s*(?:\+\+|--)"
+)
+# Terminal syntax spans whose literal text can feed arithmetic evaluation.
+LITERAL_TEXT = frozenset(["word", "raw_string", "string_content", "ansi_c_string", "ERROR"])
+# Shell builtins that declare, export, freeze or unset variable bindings.
+DECLARATION_BUILTINS = frozenset(["declare", "typeset", "local", "export", "readonly", "unset"])
+# Declaration builtins whose -n flag creates a nameref variable.
+NAMEREF_BUILTINS = frozenset(["declare", "typeset", "local"])
 SUBSHELLS = frozenset(["command_substitution", "process_substitution", "subshell"])
 IDIOM_COMMANDS = frozenset(["cd", "pwd", "dirname", "readlink", "realpath"])
 REBINDING_COMMANDS = frozenset(["alias", "enable", "hash"])
 PATH_WRITERS = frozenset(
-    ["read", "printf", "mapfile", "readarray", "getopts", "let", "wait", "compgen", "coproc"]
+    ["read", "printf", "mapfile", "readarray", "getopts", "wait", "compgen", "coproc"]
 )
 # Assignments before these persist in POSIX mode, and eval and source bodies see them in every mode.
 SPECIAL_BUILTINS = frozenset(
@@ -210,6 +231,7 @@ class InspectionContext(NamedTuple):
     files_read: list[int]
     classifier: Callable[[list[str]], Path | None]
     script_dir: Path | None = None
+    script_path: Path | None = None
     source_reader: Callable[[str, bool, InspectionContext, list[str]], list[str] | str] | None = (
         None
     )
@@ -744,12 +766,31 @@ def _assignment_hit(node: Any, raw: bytes) -> str | None:
     return None
 
 
+def _declaration_rebinds(name: str, operands: list[str]) -> bool:
+    """Match a PATH operand, or nameref option of declare, typeset or local, after quote removal."""
+    has_path = any(PATH_WORD.fullmatch(w) is not None for w in operands)
+    has_nameref = name in NAMEREF_BUILTINS and any(w.startswith("-") and "n" in w for w in operands)
+    return has_path or has_nameref
+
+
+def _writes_path(name: str, args: list[str]) -> bool:
+    """Match a writer builtin, let operand or wrapped declaration that can bind PATH."""
+    if name in PATH_WRITERS:
+        return any(
+            PATH_WORD.fullmatch(w) is not None or ATTACHED_PATH_OPTION.fullmatch(w) is not None
+            for w in args
+        )
+    if name == "let":
+        return any(PATH_TOKEN.search(w) is not None or "$" in w or "`" in w for w in args)
+    return name in DECLARATION_BUILTINS and _declaration_rebinds(name, args)
+
+
 def _note_rebinding_command(words: list[str], idx: int, name: str, scan: _Scan) -> None:
     """Record commands that alias, disable, hash or write PATH before the idiom runs."""
     args = words[idx + 1 :]
     hash_reset = name == "hash" and all(w == "-r" for w in args)
     rebinds = name in REBINDING_COMMANDS and not hash_reset
-    writes_path = name in PATH_WRITERS and any(PATH_WORD.fullmatch(w) is not None for w in args)
+    writes_path = _writes_path(name, args)
     if rebinds or writes_path:
         scan.rebound = True
 
@@ -954,10 +995,11 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
         scan.dir_changed, scan.moved = node
         return None
     kind = node.type
-    if kind == "ERROR":
-        return _error_hit(node, raw)
     if kind not in STRUCTURE | ASSIGNMENTS | DATA | LEAVES | SPECIAL:
         return f"unsupported shell syntax {kind} near line {node.start_point.row + 1}"
+    _note_path_write(node, raw, scan)
+    if kind == "ERROR":
+        return _error_hit(node, raw)
     if kind in LEAVES:
         return None
     if kind in ("command_substitution", "process_substitution"):
@@ -1000,7 +1042,10 @@ def _path_operands(node: Any) -> Iterable[Any]:
 
 
 def _note_path_write(node: Any, raw: bytes, scan: _Scan) -> None:
-    """Record loop variables, arithmetic operands and assign-default expansions binding PATH."""
+    """Record literal arithmetic text, loop variables, arithmetic and expansions binding PATH."""
+    if node.type in LITERAL_TEXT and PATH_ARITH_WRITE.search(_text(node, raw)) is not None:
+        scan.rebound = True
+        return
     for operand in _path_operands(node):
         if operand.type not in PATH_OPERANDS:
             continue
@@ -1014,7 +1059,6 @@ def _visit_semantics(
     node: Any, raw: bytes, data_only: bool, scan: _Scan
 ) -> tuple[str | None, list[tuple[Any, bool]]]:
     """Dispatch execution checks while keeping data traversal limited to substitutions."""
-    _note_path_write(node, raw, scan)
     kind = node.type
     if data_only:
         return None, _child_modes(node, True)
@@ -1097,18 +1141,11 @@ def _declaration_words(node: Any, raw: bytes) -> list[str]:
 
 def _note_path_words(node: Any, raw: bytes, scan: _Scan) -> None:
     """Record PATH declarations, unsets and nameref flags before own-directory resolution."""
-    if node.type not in ("declaration_command", "unset_command"):
+    if node.type not in ("declaration_command", "unset_command") or not node.children:
         return
-    has_path = any(PATH_WORD.fullmatch(w) is not None for w in _declaration_words(node, raw))
-    if has_path:
+    keyword = _text(node.children[0], raw)
+    if _declaration_rebinds(keyword, _declaration_words(node, raw)):
         scan.rebound = True
-        return
-    for child in node.named_children:
-        text = _text(child, raw)
-        nameref = child.type == "word" and text.startswith("-") and "n" in text
-        if node.type == "declaration_command" and nameref:
-            scan.rebound = True
-            return
 
 
 def _path_binding_persists(assignment: Any, raw: bytes, scan: _Scan) -> bool:
@@ -1123,6 +1160,8 @@ def _script_dir_refusal(scan: _Scan) -> str | None:
     """Refuse own-directory resolution for newline paths or rebound idiom commands."""
     if "\n" in str(scan.context.script_dir):
         return NEWLINE_SCRIPT_DIR
+    if scan.context.script_path is not None and "\n" in scan.context.script_path.name:
+        return NEWLINE_SCRIPT_NAME
     if scan.rebound:
         return REBOUND_SCRIPT_DIR
     return None
@@ -1153,13 +1192,14 @@ def _store_script_dir(assignment: Any, name: str, override: str | None, scan: _S
 def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     """Resolve an own-directory name from its top-level assignment on, never before it.
 
-    PATH writes by loops, arithmetic, assign-default expansions, writer builtins, declarations,
+    PATH writes by loops, arithmetic, literal arithmetic text, assign-default expansions,
+    writer builtins, attached writer options, let operands, declarations, wrapped declarations,
     unsets, namerefs, quoted declaration operands and special-builtin prefixes mark idiom
-    commands rebound; prefixes of other commands do not. A directory path holding a newline or
-    an assignment after rebinding refuses every script path referencing the name. After a
-    directory change or unread source, with its override assigned, or through a top-level
-    declaration, later relative paths refuse; nested in a function, branch or loop, every
-    script path referencing the name refuses.
+    commands rebound; prefixes of other commands do not. A directory path or resolved script
+    file name holding a newline, or an assignment after rebinding, refuses every script path
+    referencing the name. After a directory change or unread source, with its override
+    assigned, or through a top-level declaration, later relative paths refuse; nested in a
+    function, branch or loop, every script path referencing the name refuses.
     """
     if not scan.script_dirs:
         return
