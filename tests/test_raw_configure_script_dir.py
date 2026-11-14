@@ -19,6 +19,10 @@ BENIGN_NEXT = {"tools/next.sh": "echo benign\n"}
 DEFAULT = 'HERE=${LANE_TEST_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}\n'
 DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
 REALPATH = 'HERE=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")\n'
+CDPWD = 'HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
+CDPWD_P = 'HERE="$(cd -P -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")" && pwd -P)"\n'
+CD_LINK_DIR = 'HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)\n'
+CD_EXTRA = 'HERE=$(cd "$(dirname "$(readlink -f "$0")")" && cd sub && pwd)\n'
 SRC = '. "$HERE/lib.sh"\n'
 UNREAD = '. "$UNSET_DIR/x.sh"\n'
 RUN = "bash inner.sh\n"
@@ -187,6 +191,18 @@ SCRIPT_DIR = {
         UNSUBSTITUTED,
         BENIGN_NEXT,
     ),
+    "cd-pwd-form": Case(CDPWD + SRC + RUN, 0),
+    "cd-pwd-physical": Case(CDPWD_P + SRC + RUN, 0),
+    "cd-pwd-lib-runs-configure": Case(CDPWD + SRC, 2, "tree/configure", {"tools/lib.sh": CFG}),
+    "cd-pwd-symlink-reads-target-dir": Case(
+        CDPWD + SRC,
+        2,
+        "tree/configure",
+        {"link/run.sh": LINK, "tools/lib.sh": CFG},
+        command="bash link/run.sh",
+    ),
+    "cd-link-dir-unresolved": Case(CD_LINK_DIR + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "cd-extra-command-unresolved": Case(CD_EXTRA + SRC + RUN, 2, UNKNOWN_SOURCE),
 }
 
 
@@ -225,8 +241,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 49 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 49)
+        """Replay all 55 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 55)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
