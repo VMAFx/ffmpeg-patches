@@ -74,6 +74,23 @@ def _compiler() -> str:
     return str(Path(compiler).absolute())
 
 
+def _header_present(header: str) -> bool:
+    """Return whether cc preprocesses a translation unit that includes header."""
+    try:
+        compiler = _compiler()
+    except FileNotFoundError:
+        return False
+    proc = subprocess.run(  # nosec B603 - compiler argv is fixed; header name comes from tests.
+        [compiler, "-E", "-x", "c", "-o", os.devnull, "-"],
+        input=f"#include <{header}>\n",
+        text=True,
+        timeout=COMPILE_DEADLINE,
+        check=False,
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
 def _required_markers(fault: str) -> tuple[str, ...]:
     """Return the stderr substrings required for a configured fault."""
     if not fault:
@@ -104,7 +121,7 @@ def fault_problems(fault: str, run: FaultRun) -> list[str]:
 def build_layer(directory: Path) -> Path:
     """Compile the Vulkan fault layer shared object and write its manifest."""
     lib = (directory / "libvk_fault.so").resolve()
-    subprocess.run(  # nosec B603 - compiler argv uses fixture-controlled flags and paths.
+    proc = subprocess.run(  # nosec B603 - compiler argv uses fixture-controlled flags and paths.
         [
             _compiler(),
             "-std=c17",
@@ -121,9 +138,14 @@ def build_layer(directory: Path) -> Path:
             str(LAYER_SOURCE),
         ],
         timeout=COMPILE_DEADLINE,
-        check=True,
+        check=False,
         capture_output=True,
+        text=True,
     )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"cc exited {proc.returncode} on {LAYER_SOURCE.name}: {proc.stderr[-2000:]}"
+        )
     manifest = {
         "file_format_version": "1.2.0",
         "layer": {
@@ -261,12 +283,43 @@ class FaultRuleTest(unittest.TestCase):
         self.assertNotEqual(compiler, "/nonexistent/evil-cc")
         self.assertTrue(Path(compiler).is_absolute(), compiler)
 
-    @unittest.skipUnless(shutil.which("cc"), "no C compiler cc on PATH")
     def test_build_layer_compiles_without_device(self) -> None:
-        """Compile the Vulkan fault layer shared object without a Vulkan device."""
+        """Build the fault layer with no device; skip without Vulkan headers outside the VK job."""
+        if not (FFMPEG and DEVICE) and not _header_present("vulkan/vulkan.h"):
+            self.skipTest(
+                "no cc or Vulkan headers; VK_FFMPEG and VK_DEVICE make the build mandatory"
+            )
         with tempfile.TemporaryDirectory() as tmp:
             lib = build_layer(Path(tmp)) / "libvk_fault.so"
             self.assertTrue(lib.is_file())
+
+    @unittest.skipUnless(shutil.which("cc"), "no C compiler cc on PATH")
+    def test_header_probe_finds_a_standard_header(self) -> None:
+        """Report a standard C header as present when cc exists."""
+        self.assertTrue(_header_present("stddef.h"))
+
+    @unittest.skipUnless(shutil.which("cc"), "no C compiler cc on PATH")
+    def test_header_probe_misses_an_absent_header(self) -> None:
+        """Report a header no system ships as absent."""
+        self.assertFalse(_header_present("vmafx_absent_header_0023.h"))
+
+    def test_header_probe_without_compiler_is_false(self) -> None:
+        """Report every header as absent when cc is not on PATH."""
+        with unittest.mock.patch.object(shutil, "which", return_value=None):
+            self.assertFalse(_header_present("stddef.h"))
+
+    @unittest.skipUnless(shutil.which("cc"), "no C compiler cc on PATH")
+    def test_build_failure_names_the_compiler_error(self) -> None:
+        """Raise with the compiler stderr when the fault layer does not compile."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad.c"
+            bad.write_text("#error planted_0023_build_failure\n", encoding="utf-8")
+            with (
+                unittest.mock.patch(__name__ + ".LAYER_SOURCE", bad),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                build_layer(Path(tmp))
+            self.assertIn("planted_0023_build_failure", str(raised.exception))
 
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")
