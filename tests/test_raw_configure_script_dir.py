@@ -150,7 +150,7 @@ SCRIPT_DIR = {
         None,
         {"tools/next.sh": "echo benign\n"},
     ),
-    "declare-lowercase": Case("declare -l " + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "declare-lowercase": Case("declare -l " + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "export-assignment": Case("export " + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
     "local-in-function-keeps-top-level": Case(
         DEFAULT + "f() {\n  local " + DOLLAR0.lower() + "}\n" + SRC + RUN, 0
@@ -256,10 +256,10 @@ SCRIPT_DIR = {
         DOLLAR0 + SRC + RUN, 2, REBOUND, env={"BASH_ENV": "/nonexistent/rc"}
     ),
     "path-after-idiom": Case(DOLLAR0 + "PATH=<case>/bin:$PATH\n" + SRC + RUN, 0),
-    "path-command-prefix": Case("PATH=/usr/bin:/bin true\n" + DOLLAR0 + SRC + RUN, 0),
+    "path-command-prefix": Case("PATH=/usr/bin:/bin true\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "unrelated-function": Case("helper() { echo hi; }\n" + DOLLAR0 + SRC + RUN, 0),
     "pwd-function-after-idiom": Case(CDPWD + "pwd() { echo x; }\n" + SRC + RUN, 0),
-    "hash-r-before": Case("hash -r\n" + DOLLAR0 + SRC + RUN, 0),
+    "hash-r-before": Case("hash -r\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "for-path-before": Case(
         "for PATH in <case>/bin; do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
@@ -305,22 +305,26 @@ SCRIPT_DIR = {
     "declare-quoted-path-before": Case(
         'declare "PATH=<case>/bin"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
-    "for-other-before": Case("for d in a b; do :; done\n" + DOLLAR0 + SRC + RUN, 0),
-    "function-path-prefix-before": Case("f() { :; }\nPATH=<case>/bin f\n" + DOLLAR0 + SRC + RUN, 0),
-    "default-expansion-path-before": Case(": ${PATH:-<case>/bin}\n" + DOLLAR0 + SRC + RUN, 0),
-    "arith-other-before": Case("(( n=1 ))\n" + DOLLAR0 + SRC + RUN, 0),
+    "for-other-before": Case("for d in a b; do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "function-path-prefix-before": Case(
+        "f() { :; }\nPATH=<case>/bin f\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "default-expansion-path-before": Case(
+        ": ${PATH:-<case>/bin}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "arith-other-before": Case("(( n=1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "for-path-after-idiom": Case(DOLLAR0 + "for PATH in <case>/bin; do :; done\n" + SRC + RUN, 0),
     "let-comma-path-before": Case("let '0,PATH=1'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "let-increment-path-before": Case("let PATH++\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "let-expansion-before": Case('let "$X"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
-    "let-other-before": Case("let 'n=1'\n" + DOLLAR0 + SRC + RUN, 0),
+    "let-other-before": Case("let 'n=1'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "printf-attached-path-before": Case(
         "printf -vPATH '%s' <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
     "read-attached-path-before": Case(
         "read -raPATH <<< <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
-    "printf-attached-other-before": Case("printf -vX '%s' 1\n" + DOLLAR0 + SRC + RUN, 0),
+    "printf-attached-other-before": Case("printf -vX '%s' 1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "arith-literal-value-path-before": Case(
         "x='PATH=7'\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
@@ -332,8 +336,8 @@ SCRIPT_DIR = {
     "integer-assign-path-before": Case(
         "declare -i n\nn='PATH=7'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
-    "echo-path-read-before": Case('echo "PATH is $PATH"\n' + DOLLAR0 + SRC + RUN, 0),
-    "path-compare-before": Case("[[ $PATH == /x ]]\n" + DOLLAR0 + SRC + RUN, 0),
+    "echo-path-read-before": Case('echo "PATH is $PATH"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "path-compare-before": Case("[[ $PATH == /x ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "builtin-export-path-before": Case(
         "builtin export PATH=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
@@ -343,12 +347,12 @@ SCRIPT_DIR = {
     "builtin-declare-nameref-before": Case(
         "builtin declare -n P=PATH\nP=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
-    "builtin-export-other-before": Case("builtin export X=1\n" + DOLLAR0 + SRC + RUN, 0),
+    "builtin-export-other-before": Case("builtin export X=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "declare-quoted-nameref-before": Case(
         'declare "-n" P=PATH\nP=<case>/bin\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
-    "declare-quoted-integer-before": Case('declare "-i" n=1\n' + DOLLAR0 + SRC + RUN, 0),
-    "export-n-other-before": Case("export -n X\n" + DOLLAR0 + SRC + RUN, 0),
+    "declare-quoted-integer-before": Case('declare "-i" n=1\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "export-n-other-before": Case("export -n X\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "bash-argv0-before": Case(
         "BASH_ARGV0=<case>/other/anchor.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
@@ -377,7 +381,7 @@ SCRIPT_DIR = {
     "printf-attached-argv0-before": Case(
         "printf -vBASH_ARGV0 '%s' <case>/other/anchor.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
-    "lc-all-prefix-before": Case("LC_ALL=C true\n" + DOLLAR0 + SRC + RUN, 0),
+    "lc-all-prefix-before": Case("LC_ALL=C true\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "undocumented-bash-name-before": Case("BASH_CMDS_X=1\n" + DOLLAR0 + SRC + RUN, 0),
     "echo-path-assign-before": Case("echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "printf-path-assign-before": Case(
@@ -562,18 +566,79 @@ SCRIPT_DIR = {
     ),
     "r8-bare-ref-let": Case("x=${missing:-PATH=7}\nlet y=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "r8-positional-arith": Case(": $(( $1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
-    "r8-safe-integer-literal-sum": Case('declare -i n\nn="1+2"\n' + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-printf-literal-dest": Case("printf -v x '%s' y\n" + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-read-dynamic-prompt": Case('m=hi\nread -r -p "$m" x <<< y\n' + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-integer-number": Case("declare -i n\nn=3\n" + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-arith-read-only": Case("p=1\nq=2\n: $((p+q))\n" + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-array-element": Case("declare -a a\na[0]=x\n" + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-dbracket-literal": Case("[[ 1 -eq 1 ]]\n" + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-dbracket-argc": Case("[[ $# -eq 0 ]]\n" + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-assoc-dynamic-subscript": Case("declare -A m\nm[$PWD]=1\n" + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-arith-status": Case(": $(( $? + 1 ))\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-integer-literal-sum": Case(
+        'declare -i n\nn="1+2"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-safe-printf-literal-dest": Case("printf -v x '%s' y\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-read-dynamic-prompt": Case(
+        'm=hi\nread -r -p "$m" x <<< y\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-safe-integer-number": Case("declare -i n\nn=3\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-arith-read-only": Case("p=1\nq=2\n: $((p+q))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-array-element": Case("declare -a a\na[0]=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-dbracket-literal": Case("[[ 1 -eq 1 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-dbracket-argc": Case("[[ $# -eq 0 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-assoc-dynamic-subscript": Case(
+        "declare -A m\nm[$PWD]=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-safe-arith-status": Case(": $(( $? + 1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "r8-safe-string-append": Case("n=1\nn+=x\n" + DOLLAR0 + SRC + RUN, 0),
-    "r8-safe-literal-int-ref": Case("x=3\n: $((x + 1))\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-literal-int-ref": Case("x=3\n: $((x + 1))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-cr-read-herestring-arith": Case(
+        'x=3\np=BASH_\nq=ARGV0\nread -r x <<< "${p}${q}=7"\n: $((x))\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r9-cr-read-herestring-arith-cdpwd": Case(
+        'x=3\np=BASH_\nq=ARGV0\nread -r x <<< "${p}${q}=7"\n: $((x))\n' + CDPWD + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r9-cr-unset-assoc-subscript": Case(
+        "declare -A a\nunset a\np=BASH_\nq=ARGV0\na[${p}${q}=7]=v\n" + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r9-cr-unset-assoc-subscript-cdpwd": Case(
+        "declare -A a\nunset a\np=BASH_\nq=ARGV0\na[${p}${q}=7]=v\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r9-cr-printf-percent-n": Case("printf '%n' BASH_ARGV0\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-cr-printf-percent-n-cdpwd": Case(
+        "printf '%n' BASH_ARGV0\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r9-cr-subshell-assoc-subscript": Case(
+        "(declare -A a)\np=BASH_\nq=ARGV0\na[${p}${q}=7]=v\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r9-cr-subshell-assoc-subscript-cdpwd": Case(
+        "(declare -A a)\np=BASH_\nq=ARGV0\na[${p}${q}=7]=v\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r9-allow-set-euo-pipefail": Case("set -euo pipefail\n" + DOLLAR0 + SRC + RUN, 0),
+    "r9-allow-set-o-pairs": Case("set -o errexit -o nounset\n" + CDPWD + SRC + RUN, 0),
+    "r9-allow-static-assigns": Case(
+        "a=1\nb=x/y\nc='lit'\nd=\"$a-${b}\"\ne=$'t'\nf=\n" + DOLLAR0 + SRC + RUN, 0
+    ),
+    "r9-allow-plain-assign-list": Case("a=1 b=2\n" + DOLLAR0 + SRC + RUN, 0),
+    "r9-allow-comment-colon-true": Case("# setup\n:\ntrue\n" + DOLLAR0 + SRC + RUN, 0),
+    "r9-allow-source-before": Case(
+        ". <case>/tools/pre.sh\n" + DOLLAR0 + SRC + RUN, 0, None, {"tools/pre.sh": "X=1\n"}
+    ),
+    "r9-sourced-echo-before": Case(". <case>/tools/inner.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-cd-or-exit": Case("cd <case> || exit 1\n" + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "r9-echo-names-line": Case("echo hi\n" + DOLLAR0 + SRC + RUN, 2, "after line 2 (echo)"),
+    "r9-set-o-posix": Case("set -o posix\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-set-x": Case("set -x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-set-a": Case("set -a\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-quoted-set": Case("'set' -e\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-default-expansion-value": Case("X=${Y:-z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-command-substitution-value": Case("X=$(true)\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-cdpath-assign": Case("CDPATH=/x\n" + CDPWD + SRC + RUN, 2, REBOUND),
+    "r9-env-name-assign": Case("LANE_X=2\n" + DOLLAR0 + SRC + RUN, 2, REBOUND, env={"LANE_X": "1"}),
+    "r9-redirected-true": Case("true > /dev/null\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-prefix-assign-true": Case("X=1 true\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-if-compound": Case("if true; then :; fi\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-array-assign": Case("a=(x)\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-subscript-assign": Case("a[0]=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-function-named-set": Case("set() { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
 }
 
 
@@ -621,8 +686,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 211 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 211)
+        """Replay all 242 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 242)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

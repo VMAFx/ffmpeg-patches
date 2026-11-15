@@ -57,9 +57,15 @@ NEWLINE_SCRIPT_NAME = (
     "script path from an own-directory name whose resolved script file name holds a newline, "
     "which command substitution can strip; use an absolute path"
 )
+# Refusal when a top-level statement before the assignment falls outside the allow-list.
+PREFIX_SCRIPT_DIR = (
+    "script path from an own-directory name assigned after line {line} ({shape}), a statement "
+    "outside the own-directory allow-list that can rebind the commands of the idiom; assign the "
+    "name above that statement or use an absolute path"
+)
 REBOUND_SCRIPT_DIR = (
-    "script path from an own-directory name assigned after a shell function, alias, enable, "
-    "hash or bash variable change that can rebind the commands of the idiom; use an absolute path"
+    "script path from an own-directory name with BASH_ENV, ENV or an exported BASH_FUNC_ "
+    "function in the environment that can rebind the commands of the idiom; use an absolute path"
 )
 UNKNOWN_SOURCE_PATH = (
     "relative script path after a source the guard cannot read; use an absolute path"
@@ -199,76 +205,31 @@ BASH_VARIABLES = frozenset(
         "UID",
     }
 )
-# Identifier operand with an optional subscript and optional assignment or append value.
-VARIABLE_WORD = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?(?:\+?=.*)?", re.DOTALL)
-# Whole shell identifier in arithmetic let operands.
-IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
-# Writer option cluster with its target variable name and optional subscript attached.
-ATTACHED_OPTION = re.compile(r"-([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?")
-# Arithmetic assignment, increment or decrement of an identifier in literal text.
-VARIABLE_ARITH_WRITE = re.compile(
-    r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])"
-    r"\s*(?:\[[^\]]*\]\s*)?(?:\*\*|<<|>>|[-+*/%&|^])?=(?!=)"
-    r"|(?:\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])"
-    r"|(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])\s*(?:\+\+|--)"
-)
-# Numeric parameter and length expansions permitted inside arithmetic text.
-NUMERIC_EXPANSION = re.compile(r"(?<!\\)(?:\$[#?$!]|\$\{#[A-Za-z_][A-Za-z0-9_]*\})")
-# Signed or unsigned decimal integer literal accepted for identifier reads in arithmetic.
-DECIMAL_INTEGER = re.compile(r"[+-]?(?:0|[1-9][0-9]*)")
-# Plain arithmetic assignment tail excluding equality and compound operators.
-PLAIN_ASSIGN_TAIL = re.compile(r"(?:\s*\[[^\]]*\])?\s*=(?!=)")
-# Parameter name and optional subscript before a substring expansion colon.
-SUBSTRING_HEAD = re.compile(
-    rb"\$\{(?:[@*]|[0-9]+|[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\n]*\])?):(?![-=+?])"
-)
-# Integer comparison operators whose operands inside [[ ]] evaluate as arithmetic.
-ARITH_TEST_OPERATORS = frozenset(["-eq", "-ne", "-lt", "-le", "-gt", "-ge"])
-# Writer builtin option specs: (destination flags, value flags, operand slice).
-WRITER_SPECS: dict[str, tuple[str, str, slice]] = {
-    "read": ("a", "dinNptu", slice(None)),
-    "mapfile": ("", "dnOsuCc", slice(0, 1)),
-    "readarray": ("", "dnOsuCc", slice(0, 1)),
-    "getopts": ("", "", slice(1, 2)),
-    "wait": ("p", "", slice(0, 0)),
-    "compgen": ("V", "oAGWFCXPS", slice(0, 0)),
-}
-# Terminal syntax spans whose literal text can feed arithmetic evaluation.
-LITERAL_TEXT = frozenset(["word", "raw_string", "string_content", "ansi_c_string", "ERROR"])
-# Shell builtins that declare, export, freeze or unset variable bindings.
-DECLARATION_BUILTINS = frozenset(["declare", "typeset", "local", "export", "readonly", "unset"])
-# Declaration builtins whose -n flag creates a nameref variable.
-NAMEREF_BUILTINS = frozenset(["declare", "typeset", "local"])
 SUBSHELLS = frozenset(["command_substitution", "process_substitution", "subshell"])
 IDIOM_COMMANDS = frozenset(["cd", "pwd", "dirname", "readlink", "realpath"])
-REBINDING_COMMANDS = frozenset(["alias", "enable", "hash"])
-PATH_WRITERS = frozenset(
-    ["read", "printf", "mapfile", "readarray", "getopts", "wait", "compgen", "coproc"]
+BLOCKED_FUNCTIONS = IDIOM_COMMANDS | frozenset(
+    ["set", "cd", ".", "source", "true", ":", "exit", "builtin", "command"]
 )
-# Assignments before these persist in POSIX mode, and eval and source bodies see them in every mode.
-SPECIAL_BUILTINS = frozenset(
+SHAPE_DISALLOWED = re.compile(r"[^A-Za-z0-9_.:-]")
+DECLARATION_FLAGS = re.compile(r"-[rgx]+")
+PLAIN_WORD = re.compile(r"[A-Za-z0-9_./:@%+,=~^-]+")
+PLAIN_EXPANSION = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])\}")
+SET_FLAGS = re.compile(r"[-+][eu]+")
+SET_OPTION_CLUSTER = re.compile(r"[-+][eu]*o")
+EXIT_STATUS = re.compile(r"[0-9]+")
+SET_OPTIONS = frozenset(["pipefail", "errexit", "nounset"])
+COMMAND_ARG_TYPES = frozenset(
     [
-        ".",
-        ":",
-        "break",
-        "continue",
-        "eval",
-        "exec",
-        "exit",
-        "export",
-        "readonly",
-        "return",
-        "set",
-        "shift",
-        "source",
-        "times",
-        "trap",
-        "unset",
+        "word",
+        "string",
+        "raw_string",
+        "simple_expansion",
+        "expansion",
+        "number",
+        "concatenation",
+        "ansi_c_string",
     ]
 )
-ARITHMETIC = frozenset(["binary_expression", "postfix_expression", "unary_expression"])
-ASSIGNING_EXPANSIONS = frozenset(["=", ":="])
-PATH_OPERANDS = frozenset(["variable_name", "word", "subscript"])
 STRUCTURE = frozenset(
     [
         "program",
@@ -414,8 +375,7 @@ class _Scan:
     pending: list[tuple[str, bool, bool, frozenset[str]]] = field(default_factory=list)
     moved: bool = False
     rebound: bool = False
-    assoc_arrays: set[str] = field(default_factory=set)
-    integers: set[str] = field(default_factory=set)
+    prefix: str | None = None
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
 
@@ -907,256 +867,11 @@ def _assignment_hit(node: Any, raw: bytes) -> str | None:
     return None
 
 
-def _names_bash_variable(word: str) -> bool:
-    """Match an assignment or target operand naming a documented bash variable."""
-    match = VARIABLE_WORD.fullmatch(word)
-    return match is not None and match.group(1) in BASH_VARIABLES
-
-
-def _attached_bash_variable(word: str) -> bool:
-    """Match a writer option cluster with a documented bash variable attached."""
-    match = ATTACHED_OPTION.fullmatch(word)
-    if match is None:
-        return False
-    cluster = match.group(1)
-    return any(
-        cluster[:i].isalpha() and cluster[i:] in BASH_VARIABLES for i in range(1, len(cluster))
-    )
-
-
-def _arith_writes_bash_variable(text: str) -> bool:
-    """Match an arithmetic write to a documented bash variable in literal text."""
-    return any(
-        (match.group(1) or match.group(2) or match.group(3)) in BASH_VARIABLES
-        for match in VARIABLE_ARITH_WRITE.finditer(text)
-    )
-
-
-def _arith_rebinds(text: str, literals: dict[str, str] | None = None) -> bool:
-    """Refuse arithmetic text with non-numeric expansions, writes or non-integer reads."""
-    cleaned = NUMERIC_EXPANSION.sub(" 0 ", text)
-    if "$" in cleaned or "`" in cleaned:
-        return True
-    unquoted = cleaned.translate(STRIP_CHARS)
-    if _arith_writes_bash_variable(unquoted):
-        return True
-    known = literals or {}
-    for match in IDENTIFIER.finditer(unquoted):
-        if PLAIN_ASSIGN_TAIL.match(unquoted, match.end()) is not None:
-            continue
-        if DECIMAL_INTEGER.fullmatch(known.get(match.group(), "")) is None:
-            return True
-    return False
-
-
-def _integer_value_rebinds(text: str, literals: dict[str, str] | None = None) -> bool:
-    """Refuse an integer-attributed value holding an expansion or rebinding arithmetic."""
-    return "$" in text or "`" in text or _arith_rebinds(text, literals)
-
-
-def _parse_subscript_target(word: str) -> tuple[str, str] | None:
-    """Split a single name[subscript] target with balanced brackets into name and index."""
-    match = ASSIGNED_NAME.match(word)
-    if match is None or match.end() >= len(word) or word[match.end()] != "[":
-        return None
-    depth = 0
-    start = match.end()
-    for idx in range(start, len(word)):
-        depth += (word[idx] == "[") - (word[idx] == "]")
-        if depth == 0:
-            return (match.group(), word[start + 1 : -1]) if idx == len(word) - 1 else None
-    return None
-
-
-def _destination_rebinds(dest: str, scan: _Scan | None = None, *, writer: bool = False) -> bool:
-    """Refuse dynamic, bash-variable, integer-writer or unsafe-subscript destinations."""
-    parsed = _parse_subscript_target(dest)
-    if parsed is not None:
-        base, sub = parsed
-        assoc = scan.assoc_arrays if scan is not None else ()
-        int_write = writer and scan is not None and base in scan.integers
-        sub_write = base not in assoc and _arith_rebinds(sub, scan.literals if scan else None)
-        return base in BASH_VARIABLES or int_write or sub_write
-    int_scalar = writer and scan is not None and dest in scan.integers
-    return "$" in dest or "`" in dest or _names_bash_variable(dest) or int_scalar
-
-
-def _split_assignment_word(word: str) -> tuple[str, bool, str]:
-    """Split an operand at the first top-level equals sign outside brackets."""
-    depth = 0
-    for idx, ch in enumerate(word):
-        if ch == "[":
-            depth += 1
-        elif ch == "]" and depth > 0:
-            depth -= 1
-        elif ch == "=" and depth == 0:
-            return word[:idx].removesuffix("+"), True, word[idx + 1 :]
-    if "=" in word and depth > 0:
-        head, _, tail = word.partition("=")
-        return head.removesuffix("+"), True, tail
-    return word, False, ""
-
-
-def _declaration_flags(name: str, operands: list[str]) -> tuple[bool, bool, bool]:
-    """Collect integer, associative-array and rebinding-option flags from a declaration."""
-    is_int = False
-    is_assoc = False
-    rebinds = False
-    for word in operands:
-        if word == "--":
-            break
-        if not word.startswith(("-", "+")) or word in ("-", "+"):
-            continue
-        rebinds |= "$" in word or "`" in word
-        if name in NAMEREF_BUILTINS and word.startswith("-"):
-            is_int |= "i" in word[1:]
-            is_assoc |= "A" in word[1:]
-            rebinds |= "n" in word[1:]
-    return is_int, is_assoc, rebinds
-
-
-def _record_declared_name(base: str, is_int: bool, is_assoc: bool, scan: _Scan | None) -> bool:
-    """Store declared array or integer attributes on _Scan and report integer status."""
-    if scan is not None and base:
-        if is_assoc:
-            scan.assoc_arrays.add(base)
-        if is_int:
-            scan.integers.add(base)
-    return is_int or (scan is not None and base in scan.integers)
-
-
-def _declaration_rebinds(
-    name: str,
-    operands: list[str],
-    scan: _Scan | None = None,
-    raw_operands: list[str] | None = None,
-) -> bool:
-    """Record declaration attributes and match dynamic, bash-variable or integer writes."""
-    is_int, is_assoc, rebinds = _declaration_flags(name, operands)
-    in_options = True
-    literals = scan.literals if scan is not None else None
-    for word, raw_word in zip(operands, raw_operands or operands, strict=False):
-        if in_options and word == "--":
-            in_options = False
-            continue
-        if in_options and word.startswith(("-", "+")) and word not in ("-", "+"):
-            continue
-        in_options = False
-        target, has_eq, _ = _split_assignment_word(word)
-        _, _, raw_val = _split_assignment_word(raw_word)
-        match = VARIABLE_WORD.fullmatch(target)
-        base = match.group(1) if match is not None else ""
-        int_target = _record_declared_name(base, is_int, is_assoc, scan)
-        rebinds |= _destination_rebinds(target, scan)
-        if has_eq and int_target:
-            rebinds |= _integer_value_rebinds(raw_val, literals)
-    return rebinds
-
-
-def _printf_writes_bash_variable(args: list[str], scan: _Scan | None = None) -> bool:
-    """Match a printf -v option whose separate or attached target rebinds or is dynamic."""
-    dests: list[str] = []
-    take_next = False
-    for arg in args:
-        if take_next:
-            dests.append(arg)
-            take_next = False
-        elif not arg.startswith("-") or arg in ("-", "--"):
-            break
-        elif arg == "-v":
-            take_next = True
-        elif arg.startswith("-v"):
-            dests.append(arg[2:])
-        elif "$" in arg or "`" in arg or _attached_bash_variable(arg):
-            return True
-    return any(_destination_rebinds(dest, scan, writer=True) for dest in dests)
-
-
-def _consume_writer_flag(
-    arg: str, dest_opts: str, val_opts: str
-) -> tuple[tuple[str, ...], str | None, bool]:
-    """Parse one writer option cluster for an attached destination, value need or expansion."""
-    for pos, ch in enumerate(arg[1:], start=1):
-        tail = arg[pos + 1 :]
-        if ch in dest_opts and tail:
-            return (tail,), None, False
-        if ch in dest_opts:
-            return (), "dest", False
-        if ch in val_opts:
-            return (), ("val" * (not tail) or None), False
-        if not ch.isalpha():
-            return (), None, ch in ("$", "`")
-    return (), None, False
-
-
-def _writer_destinations(spec: tuple[str, str, slice], args: list[str]) -> tuple[list[str], bool]:
-    """Extract destination words and dynamic-flag state for a writer builtin."""
-    dest_opts, val_opts, op_slice = spec
-    dests: list[str] = []
-    operands: list[str] = []
-    in_options = True
-    want: str | None = None
-    dynamic = False
-    for arg in args:
-        if want is not None:
-            if want == "dest":
-                dests.append(arg)
-            want = None
-        elif not in_options or not arg.startswith("-") or arg == "-":
-            in_options = False
-            operands.append(arg)
-        elif arg == "--":
-            in_options = False
-        else:
-            attached, want, dyn = _consume_writer_flag(arg, dest_opts, val_opts)
-            dynamic |= dyn
-            dests.extend(attached)
-    dests.extend(operands[op_slice])
-    return dests, dynamic
-
-
-def _writes_path(
-    name: str,
-    args: list[str],
-    scan: _Scan | None = None,
-    raw_args: list[str] | None = None,
-) -> bool:
-    """Match a writer builtin, let operand or wrapped declaration binding a bash variable."""
-    if name == "printf":
-        return _printf_writes_bash_variable(args, scan)
-    if name in WRITER_SPECS:
-        dests, dynamic = _writer_destinations(WRITER_SPECS[name], args)
-        return dynamic or any(_destination_rebinds(dest, scan, writer=True) for dest in dests)
-    if name in PATH_WRITERS:
-        return any(_names_bash_variable(w) or _attached_bash_variable(w) for w in args)
-    if name == "let":
-        literals = scan.literals if scan is not None else None
-        source = raw_args if raw_args is not None else args
-        return any(
-            "$" in w or "`" in w or any(ident in BASH_VARIABLES for ident in IDENTIFIER.findall(w))
-            for w in args
-        ) or any(_arith_rebinds(w, literals) for w in source if w != "--")
-    return name in DECLARATION_BUILTINS and _declaration_rebinds(name, args, scan, raw_args)
-
-
-def _note_rebinding_command(node: Any, raw: bytes, words: list[str], idx: int, scan: _Scan) -> None:
-    """Record commands that alias, disable, hash or write a bash variable before the idiom."""
-    name = os.path.basename(words[idx])
-    args = words[idx + 1 :]
-    raw_args = _command_words(node, raw)[idx + 1 :]
-    hash_reset = name == "hash" and all(w == "-r" for w in args)
-    rebinds = name in REBINDING_COMMANDS and not hash_reset
-    writes_path = _writes_path(name, args, scan, raw_args)
-    if rebinds or writes_path:
-        scan.rebound = True
-
-
 def _inspect_command(node: Any, raw: bytes, scan: _Scan) -> str | None:
     """Classify command position, wrappers and executable paths without following call cycles."""
     words, idx, name = _command_info(node, raw, scan.literals)
     if idx >= len(words):
         return None
-    _note_rebinding_command(node, raw, words, idx, scan)
     if name in SHELLS:
         return _shell_command(node, raw, words[idx:], scan)
     if name in ("source", "."):
@@ -1345,6 +1060,315 @@ def _child_modes(node: Any, data_only: bool) -> list[tuple[Any, bool]]:
     return result
 
 
+def _plain_expansion(node: Any, raw: bytes) -> bool:
+    """Accept a braced variable or special-parameter expansion with no operator."""
+    return not node.has_error and PLAIN_EXPANSION.fullmatch(_text(node, raw)) is not None
+
+
+def _plain_string(node: Any, raw: bytes) -> bool:
+    """Accept a double-quoted string built only from literal text and plain expansions."""
+    for child in node.named_children:
+        if child.has_error:
+            return False
+        if child.type in ("string_content", "simple_expansion"):
+            continue
+        if child.type != "expansion" or not _plain_expansion(child, raw):
+            return False
+    return True
+
+
+def _plain_part(node: Any, raw: bytes) -> bool:
+    """Accept one static or plain-expansion value part outside arrays and substitutions."""
+    if node.has_error:
+        return False
+    kind = node.type
+    if kind == "word":
+        return not node.named_children and PLAIN_WORD.fullmatch(_text(node, raw)) is not None
+    if kind in ("raw_string", "ansi_c_string", "number", "simple_expansion"):
+        return True
+    if kind == "expansion":
+        return _plain_expansion(node, raw)
+    return kind == "string" and _plain_string(node, raw)
+
+
+def _plain_value(node: Any, raw: bytes) -> bool:
+    """Accept an absent value, a plain part or a concatenation of plain parts."""
+    if node is None:
+        return True
+    if node.has_error or node.type == "array":
+        return False
+    if node.type == "concatenation":
+        named = node.named_children
+        return (
+            bool(named)
+            and len(node.children) == len(named)
+            and all(_plain_part(child, raw) for child in named)
+        )
+    return _plain_part(node, raw)
+
+
+def _plain_assignment_name(node: Any, raw: bytes) -> bool:
+    """Accept a plain variable_name target outside BASH_VARIABLES and os.environ."""
+    name_node = node.child_by_field_name("name")
+    if name_node is None or name_node.type != "variable_name":
+        return False
+    name = _text(name_node, raw)
+    if ASSIGNED_NAME.fullmatch(name) is None:
+        return False
+    return name not in BASH_VARIABLES and name not in os.environ
+
+
+def _plain_assignment(node: Any, raw: bytes) -> bool:
+    """Accept a command-free scalar assignment with a plain operator and value."""
+    parent = node.parent
+    if node.type != "variable_assignment" or node.has_error or parent is None:
+        return False
+    if parent.type not in ("program", "variable_assignments"):
+        return False
+    children = node.children
+    if len(children) not in (2, 3) or children[1].type not in ("=", "+="):
+        return False
+    return _plain_assignment_name(node, raw) and _plain_value(
+        node.child_by_field_name("value"), raw
+    )
+
+
+def _own_dir_assignment(node: Any, raw: bytes, scan: _Scan) -> bool:
+    """Accept a scalar assignment binding a known own-directory name to the idiom."""
+    if node.type != "variable_assignment" or node.has_error:
+        return False
+    name_node = node.child_by_field_name("name")
+    value = node.child_by_field_name("value")
+    if name_node is None or name_node.type != "variable_name" or value is None:
+        return False
+    if len(node.children) != 3 or node.children[1].type != "=":
+        return False
+    return _text(name_node, raw) in scan.script_dirs and _script_dir_value(_text(value, raw))[0]
+
+
+def _own_dir_declaration(node: Any, raw: bytes, scan: _Scan) -> bool:
+    """Accept a declaration of one own-directory assignment with optional -[rgx]+ flags."""
+    children = node.children
+    if len(children) < 2 or children[0].is_named:
+        return False
+    for flag in children[1:-1]:
+        if flag.type != "word" or DECLARATION_FLAGS.fullmatch(_text(flag, raw)) is None:
+            return False
+    return _own_dir_assignment(children[-1], raw, scan)
+
+
+def _allowed_assignments(node: Any, raw: bytes, scan: _Scan) -> bool:
+    """Accept compound variable_assignments whose members are own-directory or plain."""
+    children = node.children
+    return bool(children) and all(
+        _own_dir_assignment(child, raw, scan) or _plain_assignment(child, raw) for child in children
+    )
+
+
+def _part_dash_state(part: Any, raw: bytes) -> bool | None:
+    """Classify a plain part as empty (None), dash-prefixed (True) or other (False)."""
+    kind = part.type
+    text = _text(part, raw)
+    if kind in ("raw_string", "ansi_c_string"):
+        inner = text[1:-1] if kind == "raw_string" else text[2:-1]
+        if not inner:
+            return None
+        return inner.startswith("-") or (kind == "ansi_c_string" and inner.startswith("\\"))
+    if kind == "string":
+        if not part.named_children:
+            return None
+        first = part.named_children[0]
+        return first.type == "string_content" and _text(first, raw).startswith("-")
+    return text.startswith("-")
+
+
+def _starts_with_dash(node: Any, raw: bytes) -> bool:
+    """Detect whether a plain operand starts with a literal or ANSI-escaped dash."""
+    parts = node.named_children if node.type == "concatenation" else [node]
+    for part in parts:
+        state = _part_dash_state(part, raw)
+        if state is not None:
+            return state
+    return False
+
+
+def _allowed_set(args: list[Any], raw: bytes) -> bool:
+    """Accept non-empty set flags from [-+][eu]+ and [-+][eu]*o pipefail|errexit|nounset."""
+    if not args:
+        return False
+    want_option = False
+    for arg in args:
+        word = _text(arg, raw) if arg.type == "word" else ""
+        if want_option:
+            if word not in SET_OPTIONS:
+                return False
+            want_option = False
+        elif SET_OPTION_CLUSTER.fullmatch(word) is not None:
+            want_option = True
+        elif SET_FLAGS.fullmatch(word) is None:
+            return False
+    return not want_option
+
+
+def _allowed_cd(args: list[Any], raw: bytes) -> bool:
+    """Accept cd with an optional -P, -L or -- flag and at most one non-oldpwd plain target."""
+    idx = 0
+    dashdash = False
+    if args and args[0].type == "word" and _text(args[0], raw) in ("-P", "-L", "--"):
+        dashdash = _text(args[0], raw) == "--"
+        idx = 1
+    rest = args[idx:]
+    if not rest:
+        return True
+    if len(rest) > 1 or not _plain_value(rest[0], raw):
+        return False
+    if not dashdash and _starts_with_dash(rest[0], raw):
+        return False
+    return _tokens(_text(rest[0], raw)) != ["-"]
+
+
+def _allowed_source(args: list[Any], raw: bytes) -> bool:
+    """Accept source or dot with a single non-option plain path operand."""
+    return len(args) == 1 and _plain_value(args[0], raw) and not _starts_with_dash(args[0], raw)
+
+
+def _allowed_exit(args: list[Any], raw: bytes) -> bool:
+    """Accept exit with no status or a single unquoted non-negative integer status."""
+    return not args or (len(args) == 1 and EXIT_STATUS.fullmatch(_text(args[0], raw)) is not None)
+
+
+def _allowed_command_args(name: str, args: list[Any], raw: bytes) -> bool:
+    """Validate arguments for an allow-listed top-level builtin or utility."""
+    if name == "set":
+        return _allowed_set(args, raw)
+    if name == "cd":
+        return _allowed_cd(args, raw)
+    if name in (".", "source"):
+        return _allowed_source(args, raw)
+    if name in ("true", ":"):
+        return not args
+    return name == "exit" and _allowed_exit(args, raw)
+
+
+def _command_head_name(node: Any, raw: bytes) -> str | None:
+    """Extract an unquoted command word when no prefix or redirect wraps the command."""
+    parent = node.parent
+    if node.type != "command" or (parent is not None and parent.type == "redirected_statement"):
+        return None
+    named = node.named_children
+    if not named or len(node.children) != len(named) or named[0].type != "command_name":
+        return None
+    head = named[0].children
+    return _text(head[0], raw) if len(head) == 1 and head[0].type == "word" else None
+
+
+def _allowed_command(node: Any, raw: bytes) -> bool:
+    """Accept an unredirected allow-listed command with plain-typed argument nodes."""
+    if node.has_error:
+        return False
+    name = _command_head_name(node, raw)
+    if name is None:
+        return False
+    args = node.named_children[1:]
+    if any(arg.type not in COMMAND_ARG_TYPES or arg.has_error for arg in args):
+        return False
+    return _allowed_command_args(name, args, raw)
+
+
+def _allowed_function(node: Any, raw: bytes) -> bool:
+    """Accept an unredirected plain function definition that shadows no idiom or builtin."""
+    name_node = node.child_by_field_name("name")
+    body_node = node.child_by_field_name("body")
+    if name_node is None or name_node.type != "word" or body_node is None:
+        return False
+    allowed_parts = {name_node, body_node}
+    if body_node.type == "redirected_statement" or any(
+        c not in allowed_parts and c.type != "comment" for c in node.named_children
+    ):
+        return False
+    name = _text(name_node, raw)
+    return PLAIN_FUNCTION.fullmatch(name) is not None and name not in BLOCKED_FUNCTIONS
+
+
+def _step_list_node(current: Any, raw: bytes, stack: list[Any]) -> bool:
+    """Validate one list node's operators and queue nested && or || sublists."""
+    if current.has_error or not current.named_children:
+        return False
+    for child in current.children:
+        if child.type in ("&&", "||", "comment"):
+            continue
+        if child.type == "list":
+            stack.append(child)
+        elif not child.is_named or not _allowed_command(child, raw):
+            return False
+    return True
+
+
+def _allowed_list(node: Any, raw: bytes) -> bool:
+    """Walk an && or || command list with a bounded explicit stack."""
+    stack = [node]
+    for _ in range(MAX_BODY_NODES):
+        if not stack:
+            return True
+        if not _step_list_node(stack.pop(), raw, stack):
+            return False
+    return False
+
+
+def _assignment_statement_allowed(node: Any, raw: bytes, scan: _Scan) -> bool:
+    """Accept top-level own-directory or plain assignment statements."""
+    kind = node.type
+    if kind == "variable_assignment":
+        return _own_dir_assignment(node, raw, scan) or _plain_assignment(node, raw)
+    if kind == "declaration_command":
+        return _own_dir_declaration(node, raw, scan)
+    return kind == "variable_assignments" and _allowed_assignments(node, raw, scan)
+
+
+def _statement_allowed(node: Any, raw: bytes, scan: _Scan) -> bool:
+    """Decide whether a top-level statement belongs to the own-directory allow-list."""
+    if node.has_error or (node.next_sibling is not None and node.next_sibling.type == "&"):
+        return False
+    kind = node.type
+    if kind == "comment" or _assignment_statement_allowed(node, raw, scan):
+        return True
+    if kind == "command":
+        return _allowed_command(node, raw)
+    if kind == "function_definition":
+        return _allowed_function(node, raw)
+    return kind == "list" and _allowed_list(node, raw)
+
+
+def _statement_shape(node: Any, raw: bytes) -> str:
+    """Format a disallowed top-level statement's command word or syntax node type."""
+    name_node = node.child_by_field_name("name") if node.type == "command" else None
+    source = _text(name_node, raw) if name_node is not None else node.type
+    return SHAPE_DISALLOWED.sub("", source)[:32] or node.type
+
+
+def _note_statement(node: Any, raw: bytes, scan: _Scan) -> None:
+    """Record the first top-level statement outside the allow-list before own-dir resolution."""
+    if not scan.script_dirs or scan.prefix is not None:
+        return
+    if not _statement_allowed(node, raw, scan):
+        scan.prefix = PREFIX_SCRIPT_DIR.format(
+            line=node.start_point.row + 1,
+            shape=_statement_shape(node, raw),
+        )
+
+
+def _push_visit_children(
+    kind: str, entry: _DirState, children: list[tuple[Any, bool]], raw: bytes, scan: _Scan
+) -> None:
+    """Restore subshell directory state after pushing non-missing child syntax nodes."""
+    if kind in SUBSHELLS:
+        scan.stack.append((entry, raw, False))
+    for i in range(len(children) - 1, -1, -1):
+        child, mode = children[i]
+        if not child.is_missing:
+            scan.stack.append((child, raw, mode))
+
+
 def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
     """Apply the grammar allow-list, push children in order and restore subshell directories."""
     if isinstance(node, _DirState):
@@ -1353,7 +1377,8 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
     kind = node.type
     if kind not in STRUCTURE | ASSIGNMENTS | DATA | LEAVES | SPECIAL:
         return f"unsupported shell syntax {kind} near line {node.start_point.row + 1}"
-    _note_path_write(node, raw, scan)
+    if node.parent is not None and node.parent.type == "program":
+        _note_statement(node, raw, scan)
     if kind == "ERROR":
         return _error_hit(node, raw)
     if kind in LEAVES:
@@ -1362,185 +1387,8 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
         data_only = False
     entry = _DirState(scan.dir_changed, scan.moved)
     hit, children = _visit_semantics(node, raw, data_only, scan)
-    if kind in SUBSHELLS:
-        scan.stack.append((entry, raw, False))
-    for i in range(len(children) - 1, -1, -1):
-        child, mode = children[i]
-        if not child.is_missing:
-            scan.stack.append((child, raw, mode))
+    _push_visit_children(kind, entry, children, raw, scan)
     return hit
-
-
-def _note_function(node: Any, raw: bytes, scan: _Scan) -> None:
-    """Record functions that name an idiom command or use a non-plain function name."""
-    first = node.named_children[0] if node.named_children else None
-    name = _text(first, raw) if first is not None and first.type == "word" else ""
-    if name in IDIOM_COMMANDS or PLAIN_FUNCTION.fullmatch(name) is None:
-        scan.rebound = True
-
-
-def _path_operands(node: Any) -> Iterable[Any]:
-    """Select syntax children whose variable names can bind PATH."""
-    kind = node.type
-    if kind == "for_statement":
-        return node.children_by_field_name("variable")
-    if kind in ARITHMETIC:
-        return node.named_children
-    if kind == "expansion" and any(c.type in ASSIGNING_EXPANSIONS for c in node.children):
-        return node.named_children
-    if (
-        kind == "variable_assignment"
-        and node.parent is not None
-        and node.parent.type == "c_style_for_statement"
-    ):
-        return node.named_children[:1]
-    return ()
-
-
-def _span_between(
-    node: Any, raw: bytes, openers: tuple[str, ...], closers: tuple[str, ...]
-) -> str | None:
-    """Decode the raw byte slice between the first opener and last closer child token."""
-    start: int | None = None
-    end: int | None = None
-    for child in node.children:
-        if start is None and child.type in openers and not child.is_missing:
-            start = child.end_byte
-        elif start is not None and child.type in closers and not child.is_missing:
-            end = child.start_byte
-    if start is None:
-        return None
-    return raw[start : end if end is not None else node.end_byte].decode("utf-8", "surrogateescape")
-
-
-def _indirect_assign_rebinds(node: Any, raw: bytes, scan: _Scan) -> bool:
-    """Match ${!v=...} and ${!v:=...} indirect assignment expansions."""
-    children = node.children
-    if len(children) < 4 or children[0].type != "${" or children[1].type != "!":
-        return False
-    if not any(child.type in ASSIGNING_EXPANSIONS for child in children[2:]):
-        return False
-    target_node = children[2]
-    if target_node.type != "variable_name":
-        return True
-    resolved = scan.literals.get(_text(target_node, raw))
-    return resolved is None or _destination_rebinds(resolved, scan, writer=True)
-
-
-def _closing_brace_byte(raw: bytes, start: int) -> int:
-    """Find the matching closing brace byte of a parameter expansion with bounded scan."""
-    limit = min(len(raw), start + MAX_SCRIPT_BYTES)
-    pos = start
-    depth = 1
-    for _ in range(limit - start):
-        if pos >= limit:
-            break
-        if raw[pos] == 92:
-            pos += 2
-        elif raw[pos : pos + 2] == b"${":
-            depth += 1
-            pos += 2
-        elif raw[pos] == 125:
-            depth -= 1
-            if depth == 0:
-                return pos
-            pos += 1
-        else:
-            pos += 1
-    return limit
-
-
-def _split_substring_spec(spec: str) -> list[str]:
-    """Split a parameter substring tail into offset and optional length expressions."""
-    parens = 0
-    ternaries = 0
-    for idx, ch in enumerate(spec):
-        parens = max(0, parens + (ch in "([{") - (ch in ")]}"))
-        if parens > 0:
-            continue
-        if ch == "?":
-            ternaries += 1
-        elif ch == ":" and ternaries > 0:
-            ternaries -= 1
-        elif ch == ":":
-            return [spec[:idx], spec[idx + 1 :]]
-    return [spec]
-
-
-def _substring_rebinds(node: Any, raw: bytes, scan: _Scan) -> bool:
-    """Match rebinding arithmetic in ${NAME:offset} and ${NAME:offset:length}."""
-    head = (
-        SUBSTRING_HEAD.search(raw, node.start_byte, node.end_byte)
-        if node.type == "ERROR"
-        else SUBSTRING_HEAD.match(raw, node.start_byte)
-    )
-    if head is None:
-        return False
-    end = _closing_brace_byte(raw, head.end())
-    spec = raw[head.end() : end].decode("utf-8", "surrogateescape")
-    return any(_arith_rebinds(part, scan.literals) for part in _split_substring_spec(spec))
-
-
-def _in_double_bracket(node: Any) -> bool:
-    """Check whether a syntax node sits inside a [[ ]] conditional command."""
-    parent = node.parent
-    for _ in range(64):
-        if parent is None or parent.type in SUBSHELLS:
-            return False
-        if parent.type == "test_command":
-            return bool(parent.children and parent.children[0].type == "[[")
-        parent = parent.parent
-    return False
-
-
-def _dbracket_arith_rebinds(node: Any, raw: bytes, scan: _Scan) -> bool:
-    """Match rebinding arithmetic operands of integer comparisons inside [[ ]]."""
-    if node.type != "binary_expression" or not _in_double_bracket(node):
-        return False
-    for child in node.children:
-        if child.type == "test_operator" and _text(child, raw) in ARITH_TEST_OPERATORS:
-            left = raw[node.start_byte : child.start_byte].decode("utf-8", "surrogateescape")
-            right = raw[child.end_byte : node.end_byte].decode("utf-8", "surrogateescape")
-            return _arith_rebinds(left, scan.literals) or _arith_rebinds(right, scan.literals)
-    return False
-
-
-def _node_arith_rebinds(node: Any, raw: bytes, scan: _Scan) -> bool:
-    """Check arithmetic syntax nodes, subscripts, [[ ]] comparisons and substrings."""
-    kind = node.type
-    expr: str | None = None
-    if kind == "arithmetic_expansion":
-        expr = _span_between(node, raw, ("$((", "$["), ("))", "]"))
-    elif kind == "c_style_for_statement" or (
-        kind == "compound_statement" and node.children and node.children[0].type == "(("
-    ):
-        expr = _span_between(node, raw, ("((",), ("))",))
-    elif kind == "subscript":
-        name_node = node.child_by_field_name("name")
-        if name_node is None or _text(name_node, raw) not in scan.assoc_arrays:
-            expr = _span_between(node, raw, ("[",), ("]",))
-    if expr is not None:
-        return _arith_rebinds(expr, scan.literals)
-    if kind in ("expansion", "ERROR"):
-        return _indirect_assign_rebinds(node, raw, scan) or _substring_rebinds(node, raw, scan)
-    return _dbracket_arith_rebinds(node, raw, scan)
-
-
-def _note_path_write(node: Any, raw: bytes, scan: _Scan) -> None:
-    """Record literal, loop, arithmetic, subscript and expansion writes before idiom."""
-    if node.type in LITERAL_TEXT and _arith_writes_bash_variable(_text(node, raw)):
-        scan.rebound = True
-        return
-    if _node_arith_rebinds(node, raw, scan):
-        scan.rebound = True
-        return
-    for operand in _path_operands(node):
-        if operand.type not in PATH_OPERANDS:
-            continue
-        match = ASSIGNED_NAME.match(_text(operand, raw))
-        if match is not None and match.group() in BASH_VARIABLES:
-            scan.rebound = True
-            return
 
 
 def _visit_semantics(
@@ -1560,8 +1408,6 @@ def _visit_semantics(
     elif kind in ASSIGNMENTS:
         _settle_script_dir(node, raw, scan)
         hit = _assignment_hit(node, raw)
-    elif kind == "function_definition":
-        _note_function(node, raw, scan)
     children = _child_modes(node, kind in DATA | ASSIGNMENTS | {"test_command", "file_redirect"})
     return hit, children
 
@@ -1611,73 +1457,6 @@ def _forget_script_literals(scan: _Scan) -> None:
     scan.script_literals.clear()
 
 
-def _declaration_words(node: Any, raw: bytes) -> list[str]:
-    """Unquote declaration or unset operands after merging adjacent child spans."""
-    spans: list[tuple[int, int, bool]] = []
-    for child in node.named_children:
-        assignment = child.type == "variable_assignment"
-        if spans and not assignment and not spans[-1][2] and spans[-1][1] == child.start_byte:
-            spans[-1] = (spans[-1][0], child.end_byte, False)
-        else:
-            spans.append((child.start_byte, child.end_byte, assignment))
-    words: list[str] = []
-    for start, end, assignment in spans:
-        text = raw[start:end].decode("utf-8", "surrogateescape")
-        tokens = [text] if assignment else _tokens(text)
-        words.extend(tokens if tokens is not None else [text.translate(STRIP_CHARS)])
-    return words
-
-
-def _note_path_words(node: Any, raw: bytes, scan: _Scan) -> None:
-    """Record bash variable declarations, unsets, attributes and dynamic targets."""
-    if node.type not in ("declaration_command", "unset_command") or not node.children:
-        return
-    keyword = _text(node.children[0], raw)
-    raw_words = _declaration_words(node, raw)
-    words = [_substitute_literals(word, scan.literals) for word in raw_words]
-    if _declaration_rebinds(keyword, words, scan, raw_words):
-        scan.rebound = True
-
-
-def _path_binding_persists(assignment: Any, raw: bytes, scan: _Scan) -> bool:
-    """Match a bash variable assignment outside a command or before a special builtin."""
-    return (
-        assignment.parent.type != "command"
-        or _command_info(assignment.parent, raw, scan.literals)[2] in SPECIAL_BUILTINS
-    )
-
-
-def _array_element_rebinds(elem: Any, name: str, raw: bytes, scan: _Scan) -> bool:
-    """Check subscript and integer-value arithmetic inside a compound array element."""
-    text = _text(elem, raw)
-    val_text = text
-    if text.startswith("["):
-        head, has_eq, tail = _split_assignment_word(text)
-        if has_eq:
-            val_text = tail
-        if (
-            head.endswith("]")
-            and name not in scan.assoc_arrays
-            and _arith_rebinds(head[1:-1], scan.literals)
-        ):
-            return True
-    return name in scan.integers and _integer_value_rebinds(val_text, scan.literals)
-
-
-def _assignment_rebinds(assignment: Any, name: str, raw: bytes, scan: _Scan) -> bool:
-    """Check persistent variable, array-element and integer-attribute assignment writes."""
-    if not _path_binding_persists(assignment, raw, scan):
-        return False
-    if name in BASH_VARIABLES:
-        return True
-    value = assignment.child_by_field_name("value")
-    if value is None:
-        return False
-    if value.type == "array":
-        return any(_array_element_rebinds(c, name, raw, scan) for c in value.named_children)
-    return name in scan.integers and _integer_value_rebinds(_text(value, raw), scan.literals)
-
-
 def _script_dir_refusal(scan: _Scan) -> str | None:
     """Refuse own-directory resolution for newline paths or rebound idiom commands."""
     if "\n" in str(scan.context.script_dir):
@@ -1714,27 +1493,25 @@ def _store_script_dir(assignment: Any, name: str, override: str | None, scan: _S
 def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     """Resolve an own-directory name from its top-level assignment on, never before it.
 
-    Documented bash variable writes by loops, arithmetic, literal arithmetic text, assign-default
-    expansions, writer builtins, attached writer options, let operands, declarations, wrapped
-    declarations, unsets, namerefs, quoted declaration operands and special-builtin prefixes
-    mark idiom commands rebound; prefixes of other commands do not. A directory path or
-    resolved script file name holding a newline, or an assignment after rebinding, refuses
-    every script path referencing the name. After a directory change or unread source, with
-    its override assigned, or through a top-level declaration, later relative paths refuse;
-    nested in a function, branch or loop, every script path referencing the name refuses.
+    A top-level statement outside the own-directory allow-list before the assignment, or
+    BASH_ENV, ENV or an exported BASH_FUNC_ function in the environment, marks idiom commands
+    rebound and refuses top-level resolution. A directory path or resolved script file name
+    holding a newline refuses every script path referencing the name. After a directory change
+    or unread source, with its override assigned, or through a top-level declaration, later
+    relative paths refuse; nested in a function, branch or loop, every script path referencing
+    the name refuses.
     """
     if not scan.script_dirs:
         return
-    _note_path_words(node, raw, scan)
     for assignment in _assignment_nodes(node):
         match = ASSIGNED_NAME.match(_text(assignment, raw))
         name = match.group() if match is not None else ""
-        if _assignment_rebinds(assignment, name, raw, scan):
-            scan.rebound = True
         if name not in scan.script_dirs:
             continue
         override = scan.script_dirs.pop(name)
         reason = _script_dir_refusal(scan)
+        if reason is None and scan.prefix is not None and _top_level(assignment):
+            reason = scan.prefix
         if reason is not None:
             scan.literals.pop(name, None)
             scan.refused_dirs[name] = reason
