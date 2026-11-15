@@ -800,7 +800,9 @@ class ClaimScopeTest(unittest.TestCase):
         self.assertIsNone(upstream_lint.scope_claim("avcodec/x: rename y\n"))
 
     def test_source_hunks_counts_only_non_test_source_files(self) -> None:
-        """Source hunks count library sources while ignoring docs, tests and deletions."""
+        """Source hunks count library sources while ignoring docs, tests and a
+        deletion without its old path.
+        """
         two_source = "+++ b/libavcodec/x.c\n@@ -3 +3 @@\n-a\n+b\n@@ -9 +9 @@\n-c\n+d\n"
         self.assertEqual(upstream_lint.source_hunks(two_source), 2)
         source_and_doc = (
@@ -811,6 +813,163 @@ class ClaimScopeTest(unittest.TestCase):
             "+++ b/libavcodec/tests/x.c\n@@ -3 +3 @@\n-a\n+b\n+++ /dev/null\n@@ -3 +0,0 @@\n-c\n"
         )
         self.assertEqual(upstream_lint.source_hunks(test_and_deleted), 0)
+
+    def test_scope_claim_matches_across_line_breaks(self) -> None:
+        """Line-wrapped quantified site phrases still match across newlines."""
+        first = "avcodec/x: update y\n\nCheck all three\ncallers before returning.\n"
+        self.assertEqual(upstream_lint.scope_claim(first), "all three\ncallers")
+        second = "avcodec/x: update y\n\nUpdate both call\nsites in the decoder.\n"
+        self.assertEqual(upstream_lint.scope_claim(second), "both call\nsites")
+
+    def test_every_and_each_take_singular_site_nouns(self) -> None:
+        """Singular site nouns after every or each return their scope phrase."""
+        cases = (
+            ("avcodec/x: clamp y in each branch\n", "each branch"),
+            ("avcodec/x: free frame on every error path\n", "every error path"),
+            ("avcodec/x: check return value at each site\n", "each site"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.scope_claim(message), expected)
+
+    def test_scope_claim_two_word_boundary(self) -> None:
+        """At most two intervening words separate the quantifier from its noun."""
+        hit = "avcodec/x: check all three inner callers\n"
+        self.assertEqual(upstream_lint.scope_claim(hit), "all three inner callers")
+        too_far = "avcodec/x: check all of the three callers\n"
+        self.assertIsNone(upstream_lint.scope_claim(too_far))
+        non_site = "avcodec/x: both decoders use the same table\n"
+        self.assertIsNone(upstream_lint.scope_claim(non_site))
+
+    def test_scope_claim_ignores_signoff_in_any_case(self) -> None:
+        """Signed-off-by lines in any letter case are excluded from scope matching."""
+        for prefix in ("Signed-off-by", "signed-off-by"):
+            with self.subTest(prefix=prefix):
+                message = f"avcodec/x: update y\n\n{prefix}: Both Loops <x@invalid>\n"
+                self.assertIsNone(upstream_lint.scope_claim(message))
+
+    def test_lowercase_signoff_verification_words_ignored(self) -> None:
+        """Lowercase signed-off-by trailers cannot trigger verification claims."""
+        message = "avcodec/x: update y\n\nsigned-off-by: Fully Tested <x@invalid>\n"
+        self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_negated_and_argued_claims_pass(self) -> None:
+        """Negated verification phrases and argued safety statements pass."""
+        messages = (
+            "avcodec/x: fix y\n\nNo regression testing is possible without hardware.\n",
+            "avcodec/x: free buffer\n\nFreeing here is completely safe because p is NULL.\n",
+            "avcodec/x: fix y\n\nThis fallback path was never fully tested by FATE.\n",
+            "avcodec/x: fix y\n\nThis path has not been fully tested.\n",
+            "avcodec/x: fix y\n\nThis path cannot be fully tested without hardware.\n",
+            "avcodec/x: fix y\n\nIt is 100% safe since p is NULL.\n",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_negation_must_precede_the_claim(self) -> None:
+        """An earlier negation or test note does not excuse a blanket claim."""
+        first = "avcodec/x: fix y\n\nThis is not slow and fully tested.\n"
+        self.assertEqual(upstream_lint.unverified_claim(first), "fully tested")
+        second = "avcodec/x: fix y\n\nNo regression testing; all FATE tests pass.\n"
+        self.assertEqual(upstream_lint.unverified_claim(second), "all FATE tests pass")
+
+    def test_more_blanket_claims_detected(self) -> None:
+        """Expanded blanket test, verification and regression phrases fail."""
+        cases = (
+            ("avcodec/x: update y\n\nEvery test passed.\n", "Every test passed"),
+            ("avcodec/x: update y\n\nAll unit tests pass.\n", "All unit tests pass"),
+            ("avcodec/x: update y\n\nThoroughly verified.\n", "Thoroughly verified"),
+            (
+                "avcodec/x: optimize loop\n\nRuns 2x faster with no performance regressions.\n",
+                "no performance regressions",
+            ),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.unverified_claim(message), expected)
+
+    def test_no_regressions_and_100_percent_safe_detected(self) -> None:
+        """Unargued no-regressions and 100%-safe claims return their phrase."""
+        first = "avcodec/x: fix y\n\nNo regressions.\n"
+        self.assertEqual(upstream_lint.unverified_claim(first), "No regressions")
+        second = "avcodec/x: fix y\n\n100% safe.\n"
+        self.assertEqual(upstream_lint.unverified_claim(second), "100% safe")
+
+    def test_source_hunks_reads_headers_outside_hunk_bodies(self) -> None:
+        """Added +++ and removed --- C lines inside a hunk do not reset headers."""
+        added_plus = (
+            "diff --git a/libavcodec/x.c b/libavcodec/x.c\n"
+            "--- a/libavcodec/x.c\n"
+            "+++ b/libavcodec/x.c\n"
+            "@@ -3 +3 @@\n"
+            "-a\n"
+            "+++ ptr;\n"
+            "@@ -9 +9 @@\n"
+            "-c\n"
+            "+d\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(added_plus), 2)
+        removed_minus = added_plus.replace("-a\n+++ ptr;\n", "--- ptr;\n+a\n")
+        self.assertEqual(upstream_lint.source_hunks(removed_minus), 2)
+
+    def test_source_hunks_counts_deleted_source_files(self) -> None:
+        """Deleted library sources count their hunks while deleted tests do not."""
+        deleted_and_modified = (
+            "diff --git a/libavcodec/old.c b/libavcodec/old.c\n"
+            "deleted file mode 100644\n"
+            "--- a/libavcodec/old.c\n"
+            "+++ /dev/null\n"
+            "@@ -1,4 +0,0 @@\n"
+            "-int ff_old(void) { return 0; }\n"
+            "diff --git a/libavcodec/new.c b/libavcodec/new.c\n"
+            "--- a/libavcodec/new.c\n"
+            "+++ b/libavcodec/new.c\n"
+            "@@ -3 +3 @@\n"
+            "-return 1;\n"
+            "+return 2;\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(deleted_and_modified), 2)
+        second = (
+            "diff --git a/libavcodec/x.c b/libavcodec/x.c\n"
+            "--- a/libavcodec/x.c\n"
+            "+++ b/libavcodec/x.c\n"
+            "@@ -3 +3 @@\n"
+            "-a\n"
+            "+b\n"
+            "diff --git a/libavcodec/y.c b/libavcodec/y.c\n"
+            "--- a/libavcodec/y.c\n"
+            "+++ /dev/null\n"
+            "@@ -3 +0,0 @@\n"
+            "-c\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(second), 2)
+        deleted_test = second.replace("libavcodec/y.c", "libavcodec/tests/y.c")
+        self.assertEqual(upstream_lint.source_hunks(deleted_test), 1)
+
+    def test_source_hunks_fftools_added_and_empty(self) -> None:
+        """Context-bearing fftools diffs and added files count; empty diffs give 0."""
+        fftools = (
+            "diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c\n"
+            "--- a/fftools/ffmpeg.c\n"
+            "+++ b/fftools/ffmpeg.c\n"
+            "@@ -3,2 +3,2 @@\n"
+            " a\n"
+            "-b\n"
+            "+c\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(fftools), 1)
+        added_file = (
+            "diff --git a/libavcodec/n.c b/libavcodec/n.c\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/libavcodec/n.c\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+a\n"
+            "+b\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(added_file), 1)
+        self.assertEqual(upstream_lint.source_hunks(""), 0)
 
 
 class FixtureTest(unittest.TestCase):
@@ -1039,6 +1198,7 @@ class PipelineTest(FixtureTest):
         self.commit("avfilter/vf_x: clamp y in both loops")
         rc, output = self.check("--claim-reason", "  ")
         self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
 
     def test_two_hunk_scope_claim_passes(self) -> None:
         """A multi-site claim backed by two source hunks passes without a waiver."""
@@ -1050,6 +1210,53 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: claim-scope rc: 0", output)
+
+    def test_renamed_two_hunk_scope_claim_passes(self) -> None:
+        """A renamed file with two source hunks satisfies a multi-site scope claim."""
+        grown = "".join(f"int ff_f{i}(void)\n{{\n    return {i};\n}}\n\n" for i in range(8))
+        self.write("libavfilter/vf_x.c", grown)
+        self.commit("avfilter/vf_x: grow fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("mv", "libavfilter/vf_x.c", "libavfilter/vf_y.c")
+        updated = grown.replace("return 1;", "return 11;").replace("return 6;", "return 66;")
+        self.write("libavfilter/vf_y.c", updated)
+        self.commit("avfilter/vf_y: update both functions")
+        _, output = self.check()
+        self.assertIn("step: claim-scope rc: 0", output)
+
+    def test_renamed_single_hunk_scope_claim_fails(self) -> None:
+        """A renamed file with one source hunk still fails a multi-site scope claim."""
+        grown = "".join(f"int ff_f{i}(void)\n{{\n    return {i};\n}}\n\n" for i in range(8))
+        self.write("libavfilter/vf_x.c", grown)
+        self.commit("avfilter/vf_x: grow fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("mv", "libavfilter/vf_x.c", "libavfilter/vf_y.c")
+        self.write("libavfilter/vf_y.c", grown.replace("return 1;", "return 11;"))
+        self.commit("avfilter/vf_y: clamp y in both loops")
+        _, output = self.check()
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn("changes 1 source hunk", output)
+
+    def test_unverified_claim_with_waived_scope_claim_fails(self) -> None:
+        """Waiving a scope claim still fails when the commit makes a blanket claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in both loops\n\nPasses all FATE tests.")
+        rc, output = self.check("--claim-reason", "one macro")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn('claims "Passes all FATE tests"', output)
+        self.assertIn("waived: one macro", output)
+
+    def test_claim_scope_commit_cap(self) -> None:
+        """Exceeding MAX_CLAIM_COMMITS fails the claim-scope step with rc 2."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: first update")
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 3"))
+        self.commit("avfilter/vf_x: second update")
+        with unittest.mock.patch.object(upstream_lint, "MAX_CLAIM_COMMITS", 1):
+            _, output = self.check()
+        self.assertIn("step: claim-scope rc: 2", output)
+        self.assertIn("MAX_CLAIM_COMMITS=1: 2", output)
 
     def test_fate_missing_decoder_fails(self) -> None:
         """A committed lavfi video dependency gap fails without losing other steps."""
