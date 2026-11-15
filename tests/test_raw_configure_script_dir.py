@@ -752,7 +752,7 @@ SCRIPT_DIR = {
     "r11-env-name-own-dir": Case(
         'LANE_X=$(dirname "$(readlink -f "$0")")\n. "$LANE_X/lib.sh"\n' + RUN,
         2,
-        REBOUND,
+        UNKNOWN_SOURCE,
         env={"LANE_X": "/x"},
     ),
     "r11-plain-own-dir-name": Case(
