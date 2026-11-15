@@ -30,7 +30,9 @@ diagnostic flag (-W...) together with workaround wording (workaround, false
 positive, silence, suppress, spurious) unless the message carries a GCC
 Bugzilla, LLVM bug, llvm-project issue or Compiler Explorer URL, or a line
 starting `Reproducer:`; diagnostics named without a flag and workarounds
-described in other words are not detected.
+described in other words are not detected. The two-word phrases match across a
+line break, and a flag suffix may contain `#`, uppercase letters, digits, `+`,
+`_`, `=` and `-`.
 """
 
 from __future__ import annotations
@@ -101,9 +103,10 @@ C_NONCODE = re.compile(
     r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
     re.DOTALL | re.MULTILINE,
 )
-DIAGNOSTIC_FLAG = re.compile(r"(?<![\w-])-W[a-z0-9][a-z0-9=-]*")
+DIAGNOSTIC_FLAG = re.compile(r"(?<![\w-])-W[A-Za-z0-9#][A-Za-z0-9#+=_-]*")
 WORKAROUND_WORDING = re.compile(
-    r"\b(work(s|ed)?[ -]?around|false[ -]positives?|silence[sd]?|suppress(es|ed)?|spurious)\b",
+    r"\b(work(s|ed)?(?:\s+|-)?around|false(?:\s+|-)positives?"
+    r"|silence[sd]?|suppress(es|ed)?|spurious)\b",
     re.IGNORECASE,
 )
 DIAGNOSTIC_CITATION = re.compile(

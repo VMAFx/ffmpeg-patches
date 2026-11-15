@@ -703,6 +703,40 @@ class DiagnosticCitationTest(unittest.TestCase):
                     upstream_lint.uncited_diagnostic(prefix + trailer), "-Wmaybe-uninitialized"
                 )
 
+    def test_hash_flag_detected(self) -> None:
+        """Clang flags containing a hash in the suffix are detected."""
+        message = "avutil/x: silence -W#warnings\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-W#warnings")
+
+    def test_uppercase_flag_detected(self) -> None:
+        """Clang flags containing uppercase letters in the suffix are detected."""
+        message = "avutil/x: silence -WCFString-literal\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-WCFString-literal")
+
+    def test_plus_flag_detected_whole(self) -> None:
+        """Flags containing plus signs return the whole flag token."""
+        message = "avcodec/x: silence -Wc++11-compat\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wc++11-compat")
+
+    def test_lowercase_w_not_a_flag(self) -> None:
+        """Lowercase -w is a general compiler option, not a named diagnostic flag."""
+        message = "avcodec/x: silence warnings with -w\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_wrapped_false_positive_detected(self) -> None:
+        """Line-wrapped false positive wording still triggers the citation check."""
+        message = (
+            "avcodec/x: avoid -Wmaybe-uninitialized\n\nGCC reports a false\npositive for ctx.\n"
+        )
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
+
+    def test_wrapped_work_around_detected(self) -> None:
+        """Line-wrapped work around wording still triggers the citation check."""
+        message = (
+            "avcodec/x: init ctx for -Wmaybe-uninitialized\n\nThis is a work\naround for GCC 14.\n"
+        )
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
+
 
 class FixtureTest(unittest.TestCase):
     """Shared disposable Git fixture; stub the pre-commit subprocess only."""
