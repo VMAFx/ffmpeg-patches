@@ -232,8 +232,12 @@ LOADER_VARIABLES = frozenset(
 )
 SUBSHELLS = frozenset(["command_substitution", "process_substitution", "subshell"])
 IDIOM_COMMANDS = frozenset(["cd", "pwd", "dirname", "readlink", "realpath"])
-BLOCKED_FUNCTIONS = IDIOM_COMMANDS | frozenset(
-    ["set", "cd", ".", "source", "true", ":", "exit", "builtin", "command"]
+# Builtins heading allow-listed statements or own-directory declarations; functions shadow them.
+DECLARATION_KEYWORDS = frozenset(["declare", "typeset", "export", "readonly", "local"])
+BLOCKED_FUNCTIONS = (
+    IDIOM_COMMANDS
+    | DECLARATION_KEYWORDS
+    | frozenset(["set", "cd", ".", "source", "true", ":", "exit", "builtin", "command"])
 )
 SHAPE_DISALLOWED = re.compile(r"[^A-Za-z0-9_.:-]")
 DECLARATION_FLAGS = re.compile(r"-[rgx]+")
@@ -1166,8 +1170,18 @@ def _plain_assignment(node: Any, raw: bytes) -> bool:
     )
 
 
+def _protected_name(name: str) -> bool:
+    """Identify a Bash, environment or loader variable name that an assignment must not target."""
+    return (
+        name in BASH_VARIABLES
+        or name in os.environ
+        or name.startswith("LD_")
+        or name in LOADER_VARIABLES
+    )
+
+
 def _own_dir_assignment(node: Any, raw: bytes, scan: _Scan) -> bool:
-    """Accept a scalar assignment binding a known own-directory name to the idiom."""
+    """Accept a scalar assignment binding a non-protected own-directory name to the idiom."""
     if node.type != "variable_assignment" or node.has_error:
         return False
     name_node = node.child_by_field_name("name")
@@ -1176,7 +1190,10 @@ def _own_dir_assignment(node: Any, raw: bytes, scan: _Scan) -> bool:
         return False
     if len(node.children) != 3 or node.children[1].type != "=":
         return False
-    return _text(name_node, raw) in scan.script_dirs and _script_dir_value(_text(value, raw))[0]
+    name = _text(name_node, raw)
+    if _protected_name(name):
+        return False
+    return name in scan.script_dirs and _script_dir_value(_text(value, raw))[0]
 
 
 def _own_dir_declaration(node: Any, raw: bytes, scan: _Scan) -> bool:
@@ -1191,14 +1208,8 @@ def _own_dir_declaration(node: Any, raw: bytes, scan: _Scan) -> bool:
 
 
 def _allowed_export_name(name: str) -> bool:
-    """Accept an exported variable name outside Bash, environment and loader variables."""
-    return (
-        ASSIGNED_NAME.fullmatch(name) is not None
-        and name not in BASH_VARIABLES
-        and name not in os.environ
-        and not name.startswith("LD_")
-        and name not in LOADER_VARIABLES
-    )
+    """Accept an exported variable identifier that is not a protected name."""
+    return ASSIGNED_NAME.fullmatch(name) is not None and not _protected_name(name)
 
 
 def _allowed_export_assignment(node: Any, raw: bytes) -> bool:
@@ -1510,13 +1521,18 @@ def _script_dir_value(value: str) -> tuple[bool, str | None]:
 
 
 def _script_dir_names(assignments: list[str]) -> dict[str, str | None]:
-    """Map names assigned once to the own-directory idiom onto their override names."""
+    """Map non-protected names assigned once to the own-directory idiom onto their overrides."""
     names = [match.group() if (match := ASSIGNED_NAME.match(a)) else "" for a in assignments]
     counts = Counter(names)
     result: dict[str, str | None] = {}
     for i in range(len(assignments)):
         name = names[i]
-        if not name or counts[name] != 1 or assignments[i][len(name) : len(name) + 1] != "=":
+        if (
+            not name
+            or _protected_name(name)
+            or counts[name] != 1
+            or assignments[i][len(name) : len(name) + 1] != "="
+        ):
             continue
         matched, override = _script_dir_value(assignments[i][len(name) + 1 :])
         if matched:

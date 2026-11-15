@@ -35,6 +35,10 @@ RUN = "bash inner.sh\n"
 CFG = "<cfg>\n"
 LINK = "-> ../tools/run.sh"
 RUN_NEXT = 'run_next() {\n  "$HERE/next.sh" check\n}\n'
+HASH_DIRNAME = "{ builtin hash -p <case>/bin/dirname dirname; }\n"
+OTHER_DIRNAME = {"bin/dirname": "echo <case>/other\n", "other/lib.sh": CFG}
+ARGV0_OWN = 'BASH_ARGV0=$(dirname "$(readlink -f "$0")")\n'
+ROOT_LIB = {"lib.sh": CFG}
 
 
 class Case(NamedTuple):
@@ -687,6 +691,73 @@ SCRIPT_DIR = {
     "r10-function-printed-argv0": Case(
         "f() { printf '%s' 'BASH_ARGV0=/x'; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
+    "r11-export-keyword-fn": Case(
+        "function export " + HASH_DIRNAME + "export LANE=ok\n" + CDPWD + SRC + RUN,
+        2,
+        REBOUND,
+        OTHER_DIRNAME,
+    ),
+    "r11-export-keyword-fn-bare": Case(
+        "function export " + HASH_DIRNAME + "export LANE\n" + CDPWD + SRC + RUN,
+        2,
+        REBOUND,
+        OTHER_DIRNAME,
+    ),
+    "r11-export-keyword-fn-dollar0": Case(
+        "function export " + HASH_DIRNAME + "export LANE=ok\n" + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+        OTHER_DIRNAME,
+    ),
+    "r11-export-paren-fn": Case(
+        "export() " + HASH_DIRNAME + "export LANE=ok\n" + CDPWD + SRC + RUN, 2, None, OTHER_DIRNAME
+    ),
+    "r11-export-keyword-fn-noop": Case(
+        "function export { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r11-declare-keyword-fn": Case("function declare { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r11-typeset-keyword-fn": Case("function typeset { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r11-readonly-keyword-fn": Case("function readonly { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r11-local-keyword-fn": Case("function local { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r11-local-own-dir": Case("local " + DOLLAR0 + SRC + RUN, 2),
+    "r11-export-flag-own-dir": Case(
+        'export -r HERE=$(dirname "$(readlink -f "$0")")\n' + SRC + RUN, 2
+    ),
+    "r11-readonly-flag-own-dir": Case(
+        'readonly -x HERE=$(dirname "$(readlink -f "$0")")\n' + SRC + RUN, 2
+    ),
+    "r11-argv0-own-dir": Case(ARGV0_OWN + CDPWD + SRC + RUN, 2, REBOUND, ROOT_LIB),
+    "r11-argv0-own-dir-dollar0": Case(ARGV0_OWN + DOLLAR0 + SRC + RUN, 2, REBOUND, ROOT_LIB),
+    "r11-path-own-dir": Case(
+        'PATH=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-ifs-own-dir": Case(
+        'IFS=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-cdpath-own-dir": Case(
+        'CDPATH=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-bash-env-own-dir": Case(
+        'BASH_ENV=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-home-own-dir": Case(
+        'HOME=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-ld-preload-own-dir": Case(
+        'LD_PRELOAD=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-loader-own-dir": Case(
+        'GCONV_PATH=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-env-name-own-dir": Case(
+        'LANE_X=$(dirname "$(readlink -f "$0")")\n. "$LANE_X/lib.sh"\n' + RUN,
+        2,
+        REBOUND,
+        env={"LANE_X": "/x"},
+    ),
+    "r11-plain-own-dir-name": Case(
+        'TOP=$(dirname "$(readlink -f "$0")")\n. "$TOP/lib.sh"\n' + RUN, 0
+    ),
 }
 
 
@@ -734,8 +805,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 276 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 276)
+        """Replay all 299 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 299)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
