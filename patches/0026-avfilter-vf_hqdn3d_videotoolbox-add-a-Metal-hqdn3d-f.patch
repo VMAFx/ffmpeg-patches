@@ -457,7 +457,7 @@ index 0000000000000000000000000000000000000000..30f3e40acfd806be2a861a553a721ebd
 +    }
 +}
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
-index aa67569236091c1e613be30b029b334e910c643d..aa25e87a53b3507866f7d082e5d918540e016956 100644
+index 8050b17cefaf1665d0d608eec88f522d88673dd3..9ac064436c816bef93ac1625049a06367de49bb0 100644
 --- a/libavfilter/tests/hqdn3d_vulkan.c
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
 @@ -111,6 +111,10 @@ static enum AVPixelFormat get_gpu_pix_fmt(enum AVHWDeviceType hw_type)
@@ -482,7 +482,7 @@ index aa67569236091c1e613be30b029b334e910c643d..aa25e87a53b3507866f7d082e5d91854
  #endif
      default:
          return NULL;
-@@ -1060,6 +1068,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
+@@ -1131,6 +1139,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
      return AV_HWDEVICE_TYPE_CUDA;
  #elif CONFIG_HQDN3D_OPENCL_FILTER
      return AV_HWDEVICE_TYPE_OPENCL;
@@ -491,7 +491,7 @@ index aa67569236091c1e613be30b029b334e910c643d..aa25e87a53b3507866f7d082e5d91854
  #else
      return AV_HWDEVICE_TYPE_NONE;
  #endif
-@@ -1100,6 +1110,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+@@ -1171,6 +1181,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
  #endif
      }
  
@@ -509,7 +509,7 @@ index aa67569236091c1e613be30b029b334e910c643d..aa25e87a53b3507866f7d082e5d91854
  #if CONFIG_HQDN3D_VULKAN_FILTER
      *hw_type = AV_HWDEVICE_TYPE_VULKAN;
      *dev_idx = strncmp(arg, "vk:", 3) == 0 ? arg + 3 : arg;
-@@ -1122,7 +1143,7 @@ int main(int argc, char **argv)
+@@ -1193,7 +1214,7 @@ int main(int argc, char **argv)
      int refused_10 = 0, refused_444 = 0;
  
      if (argc > 2) {

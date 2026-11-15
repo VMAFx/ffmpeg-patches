@@ -11,14 +11,18 @@ A horizontal kernel filters each row into an intermediate buffer; a
 vertical kernel filters each column and applies the temporal lowpass
 against the previous output. The temporal state is dropped where
 hqdn3d drops it, and after a frame size change inside a running graph
-the output frames come from a frames context of the new size.
+the output frames come from a frames context of the new size. When the
+size or the software format changes, the buffers are sized for the
+chroma subsampling of the new format.
 
 p012 is not accepted: hwupload_cuda converts it to p016, so that path
 cannot be exercised.
 
 libavfilter/tests/hqdn3d_vulkan now also runs the CUDA filter with a
 cuda:<index> argument, and builds when only one of the two GPU filters
-is enabled.
+is enabled. With cuda:<index> it also sends a 128x72 yuv444p frame
+after the 160x96 yuv420p frames, so that the size and the chroma
+subsampling change together inside one graph.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
@@ -26,10 +30,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  doc/filters.texi                  |  32 ++
  libavfilter/Makefile              |   5 +
  libavfilter/allfilters.c          |   1 +
- libavfilter/tests/hqdn3d_vulkan.c | 233 ++++++---
+ libavfilter/tests/hqdn3d_vulkan.c | 306 +++++++++---
  libavfilter/vf_hqdn3d_cuda.c      | 805 ++++++++++++++++++++++++++++++
  libavfilter/vf_hqdn3d_cuda.cu     | 458 +++++++++++++++++
- 7 files changed, 1476 insertions(+), 60 deletions(-)
+ 7 files changed, 1549 insertions(+), 60 deletions(-)
  create mode 100644 libavfilter/vf_hqdn3d_cuda.c
  create mode 100644 libavfilter/vf_hqdn3d_cuda.cu
 
@@ -125,7 +129,7 @@ index 3211fc02153db11796ab388a28faa82e1c465f53..3cacb97a8fbfc2e5e0880aa1048f2459
  extern const FFFilter ff_vf_hqx;
  extern const FFFilter ff_vf_hstack;
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
-index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd0cd55022 100644
+index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..1dc5e6c2ddc7a954eef427c1d6e4eac03a11d44a 100644
 --- a/libavfilter/tests/hqdn3d_vulkan.c
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
 @@ -22,11 +22,15 @@
@@ -367,7 +371,85 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
      if (err < 0)
          goto end;
  
-@@ -644,11 +692,13 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
+@@ -634,6 +682,77 @@ end:
+     return err;
+ }
+ 
++/* Allocate a 128x72 YUV444P frame and fill its three planes with deterministic noise. */
++static int create_444_frame(int n, uint32_t *seed, AVFrame **out_frame)
++{
++    AVFrame *f = av_frame_alloc();
++    int err;
++
++    if (!f)
++        return AVERROR(ENOMEM);
++
++    f->format = AV_PIX_FMT_YUV444P;
++    f->width  = 128;
++    f->height = 72;
++    f->pts    = n;
++
++    err = av_frame_get_buffer(f, 0);
++    if (err < 0) {
++        av_frame_free(&f);
++        return err;
++    }
++
++    for (int p = 0; p < 3; p++) {
++        for (int y = 0; y < f->height; y++) {
++            uint8_t *dst = f->data[p] + y * f->linesize[p];
++            for (int x = 0; x < f->width; x++)
++                dst[x] = lcg_rand(seed);
++        }
++    }
++
++    *out_frame = f;
++    return 0;
++}
++
++/* CUDA only: send a 128x72 yuv444p frame into the running GPU graph after the
++ * 160x96 yuv420p frames, so that the size and the chroma subsampling change
++ * together, and compare it with a fresh CPU graph; the filter must size its
++ * buffers for the new subsampling. Other device types return 0 at once. */
++static int run_cuda_change_step(ResetTest *t, int n, uint32_t *seed)
++{
++    AVFilterGraph *cpu_graph = NULL;
++    AVFilterContext *cpu_src = NULL, *cpu_sink = NULL;
++    AVBufferRef *upload_ctx = NULL;
++    AVFrame *sw_frame = NULL, *cpu_out = NULL, *gpu_out = NULL;
++    int err;
++
++    if (t->hw_type != AV_HWDEVICE_TYPE_CUDA)
++        return 0;
++
++    err = init_cpu_graph(&cpu_graph, &cpu_src, &cpu_sink, 128, 72, AV_PIX_FMT_YUV444P);
++    if (err >= 0)
++        err = create_gpu_frames_ctx(t->device_ref, 128, 72, AV_PIX_FMT_YUV444P,
++                                    t->hw_type, &upload_ctx);
++    if (err >= 0)
++        err = create_444_frame(n, seed, &sw_frame);
++    if (err >= 0)
++        err = run_cpu_step(cpu_src, cpu_sink, sw_frame, &cpu_out);
++    if (err >= 0)
++        err = run_gpu_step(t->gpu_src, t->gpu_sink, upload_ctx, sw_frame, &gpu_out);
++    if (err >= 0) {
++        printf("%d %d %d yuv444p %s\n", n, gpu_out->width, gpu_out->height,
++               same_word(compare_planes(cpu_out, gpu_out), &t->diffs));
++        fflush(stdout);
++    }
++
++    av_frame_free(&sw_frame);
++    av_frame_free(&cpu_out);
++    av_frame_free(&gpu_out);
++    av_buffer_unref(&upload_ctx);
++    avfilter_graph_free(&cpu_graph);
++    return err;
++}
++
+ /* A first frame whose format differs from the link format must be refused with AVERROR(EINVAL). */
+ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
+ {
+@@ -644,11 +763,13 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
      const AVPixFmtDescriptor *desc;
      int err, refused_err = 0, refused = 0;
  
@@ -383,7 +465,7 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
      if (err < 0)
          goto end;
  
-@@ -674,7 +724,7 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
+@@ -674,7 +795,7 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
              memset(sw_f->data[p] + y * sw_f->linesize[p], 0, FFABS(sw_f->linesize[p]));
      }
  
@@ -392,7 +474,7 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
      av_frame_free(&sw_f);
      if (err < 0)
          goto end;
-@@ -726,11 +776,13 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
+@@ -726,11 +847,13 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
      AVFrame *sw_f = NULL, *gpu_in_vk = NULL, *gpu_out_vk = NULL, *sw_out = NULL;
      int err, bad = 0;
  
@@ -408,7 +490,7 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
      if (err < 0)
          goto end;
  
-@@ -771,7 +823,7 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
+@@ -771,7 +894,7 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
          }
  
          sw_f->pts = n;
@@ -417,7 +499,7 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
          if (err < 0)
              goto end;
  
-@@ -879,7 +931,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
+@@ -879,7 +1002,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
      AVFrame *sw_f = NULL, *cpu_out = NULL, *gpu_out = NULL;
      int err;
  
@@ -427,7 +509,7 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
      if (err < 0)
          goto end;
  
-@@ -887,7 +940,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
+@@ -887,7 +1011,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
      if (err < 0)
          goto end;
  
@@ -437,7 +519,7 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
      if (err < 0)
          goto end;
  
-@@ -931,58 +985,112 @@ end:
+@@ -931,58 +1056,112 @@ end:
      return err;
  }
  
@@ -561,12 +643,12 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
 +#endif
 +}
 +
-+/* Verify GPU reset parity and run Vulkan-specific regression steps when selected;
-+ * exit nonzero on an error or when a compared frame differs. */
++/* Verify GPU reset parity, run the CUDA format change step and the Vulkan-specific
++ * regression steps when selected; exit nonzero on an error or when a compared frame differs. */
  int main(int argc, char **argv)
  {
      ResetTest t = { 0 };
-@@ -993,11 +1101,12 @@ int main(int argc, char **argv)
+@@ -993,11 +1172,12 @@ int main(int argc, char **argv)
      int refused_10 = 0, refused_444 = 0;
  
      if (argc > 2) {
@@ -582,7 +664,12 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
  
      av_log_set_level(AV_LOG_ERROR);
  
-@@ -1019,6 +1128,10 @@ int main(int argc, char **argv)
+@@ -1016,9 +1196,15 @@ int main(int argc, char **argv)
+     }
+ 
+     err = run_first_frame_step(&t, 14, &seed, &first_same);
++    if (err >= 0)
++        err = run_cuda_change_step(&t, 15, &seed);
      if (err < 0)
          goto end;
  
@@ -593,7 +680,7 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
      /* Run yuv420p10 first: an accepted change ends the run before the yuv444p step,
       * which would overflow chroma buffers on a filter that accepts it. */
      err = run_format_step(&t, 12, AV_PIX_FMT_YUV420P10, t.upload_ctxs[3], &refused_10);
-@@ -1029,15 +1142,15 @@ int main(int argc, char **argv)
+@@ -1029,15 +1215,15 @@ int main(int argc, char **argv)
      if (err < 0)
          goto end;
  
@@ -614,7 +701,7 @@ index 50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e..b8dc4d6f78c3413ccbbc37295f5ce0cd
      if (err < 0)
 diff --git a/libavfilter/vf_hqdn3d_cuda.c b/libavfilter/vf_hqdn3d_cuda.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..235720a9cf5c930026d848426d18a290bb239612
+index 0000000000000000000000000000000000000000..11477b45fc9a44a9698c2588fcb77e11aa0026ac
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_cuda.c
 @@ -0,0 +1,805 @@
@@ -951,6 +1038,8 @@ index 0000000000000000000000000000000000000000..235720a9cf5c930026d848426d18a290
 +        return err;
 +
 +    if (in->width != s->width || in->height != s->height || hwfc->sw_format != s->sw_format) {
++        s->hsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_w;
++        s->vsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_h;
 +        if (s->initialized) {
 +            free_buffers(ctx);
 +            err = init_buffers(ctx, in->width, in->height);
@@ -980,8 +1069,6 @@ index 0000000000000000000000000000000000000000..235720a9cf5c930026d848426d18a290
 +        s->sw_format = hwfc->sw_format;
 +        s->width = in->width;
 +        s->height = in->height;
-+        s->hsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_w;
-+        s->vsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_h;
 +    }
 +    return 0;
 +}
