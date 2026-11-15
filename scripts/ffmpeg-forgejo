@@ -1671,12 +1671,12 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     me="$(token_login)" || die "cannot read token login"
     out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read review $2 on #$1"
     check_comment_duplicate "$1" "$4" "$me" <<<"$out"
-    body="$(mktemp)"
-    trap 'rm -f "$body"' EXIT
-    review_reply_body "$2" "$3" "$4" <<<"$out" >"$body"
+    reply_payload="$(mktemp)"
+    trap 'rm -f "$reply_payload"' EXIT
+    review_reply_body "$2" "$3" "$4" <<<"$out" >"$reply_payload"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
-    api POST "/repos/$REPO/pulls/$1/reviews/$2/comments" "$body" >/dev/null
-    rm -f "$body"
+    api POST "/repos/$REPO/pulls/$1/reviews/$2/comments" "$reply_payload" >/dev/null
+    rm -f "$reply_payload"
     out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read back review $2 on #$1"
     require_reply_posted "$2" "$3" "$4" "$me" <<<"$out"
     ;;
@@ -1737,13 +1737,13 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     out="$(api_list "/repos/$REPO/issues/$1/comments?" 200)" || exit 1
     check_comment_duplicate "$1" "$2" "$me" <<<"$out"
     require_own_open_pull "$1" "$me"
-    body="$(mktemp)"
-    trap 'rm -f "$body"' EXIT
-    json_body "body=@$2" >"$body"
-    api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
-    json_body "state=closed" >"$body"
-    api PATCH "/repos/$REPO/pulls/$1" "$body" >/dev/null
-    rm -f "$body"
+    close_payload="$(mktemp)"
+    trap 'rm -f "$close_payload"' EXIT
+    json_body "body=@$2" >"$close_payload"
+    api POST "/repos/$REPO/issues/$1/comments" "$close_payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    json_body "state=closed" >"$close_payload"
+    api PATCH "/repos/$REPO/pulls/$1" "$close_payload" >/dev/null
+    rm -f "$close_payload"
     require_closed "$1"
     ;;
   reviewers)

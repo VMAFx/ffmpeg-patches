@@ -9,6 +9,8 @@ import copy
 import http.server
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess  # nosec B404 - fixed git and helper argv in temporary test repositories.
 import tempfile
@@ -1604,6 +1606,32 @@ class ReplyTest(ForgejoTest):
         self.assertEqual(proc.returncode, 76, proc.stderr)
         self.assertIn("does not match live head", proc.stderr)
         self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_moved_head_exit_removes_the_reply_payload(self) -> None:
+        """A moved head that exits 76 after the payload file exists leaves no tmp file behind."""
+
+        stub = self.stub(heads=[A, B])
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={A}\n", encoding="utf-8")
+        body = str(self.tmp / "body.md")
+        clean_tmp = self.tmp / "reply-tmp"
+        clean_tmp.mkdir()
+        proc = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            A,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            body,
+            env_updates={"TMPDIR": str(clean_tmp)},
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+        self.assertEqual(list(clean_tmp.iterdir()), [], "reply payload tmp file leaked on exit 76")
 
 
 class TestClaimHeadTest(ForgejoTest):
@@ -4428,6 +4456,36 @@ MUTANTS = {
 }
 
 
+def top_level_trap_locals(source: str) -> list[str]:
+    """Return names a top-level EXIT trap expands that some function also declares local."""
+
+    lines = source.splitlines()
+    try:
+        case_start = lines.index('case "$cmd" in')
+        case_end = lines.index("esac", case_start + 1)
+    except ValueError as err:
+        raise ValueError("dispatch case not found") from err
+
+    local_names: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("local "):
+            continue
+        for token in shlex.split(stripped.removeprefix("local "), comments=True):
+            name = token.split("=", 1)[0]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                local_names.add(name)
+
+    top_lines = lines[case_start : case_end + 1] + [
+        line for line in lines if line.startswith("trap ")
+    ]
+    trapped: set[str] = set()
+    for line in top_lines:
+        handlers = " ".join(re.findall(r"\btrap\s+'([^']*)'\s+EXIT\b", line))
+        trapped.update(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", handlers))
+    return sorted(trapped & local_names)
+
+
 @contextlib.contextmanager
 def mutant_case(
     source: str,
@@ -4477,6 +4535,59 @@ def assert_mutant_killed(
     mutated = run_selected(source, old, new, base, test_name)
     check.assertTrue(mutated.failures or mutated.errors, f"{label} survived")
     return mutated
+
+
+class TopLevelTrapTest(unittest.TestCase):
+    """A top-level EXIT trap must not expand a name a function shadows with local."""
+
+    PLANTED = (
+        "f() {\n"
+        "  local x body=1\n"
+        "  exit 76\n"
+        "}\n"
+        'case "$cmd" in\n'
+        "  a)\n"
+        '    body="$(mktemp)"\n'
+        "    trap 'rm -f \"$body\"' EXIT\n"
+        "    f\n"
+        "    ;;\n"
+        "esac\n"
+    )
+
+    def test_helper_traps_name_no_function_local(self) -> None:
+        """The helper's top-level EXIT traps expand no function-local variable names."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        self.assertEqual(
+            top_level_trap_locals(source),
+            [],
+            "top-level EXIT trap expands a function-local name",
+        )
+        self.assertEqual(source.count("trap 'rm -f \"$reply_payload\"' EXIT"), 1)
+        self.assertEqual(source.count("trap 'rm -f \"$close_payload\"' EXIT"), 1)
+
+    def test_planted_shadowed_trap_is_found(self) -> None:
+        """Shadowed top-level EXIT traps in dispatch branches or at column zero are reported."""
+
+        self.assertEqual(top_level_trap_locals(self.PLANTED), ["body"])
+        braced = self.PLANTED.replace('"$body"', '"${body}"')
+        self.assertEqual(top_level_trap_locals(braced), ["body"])
+        column_zero = "trap 'rm -f \"$body\"' EXIT\n" + self.PLANTED.replace(
+            "    trap 'rm -f \"$body\"' EXIT\n", ""
+        )
+        self.assertEqual(top_level_trap_locals(column_zero), ["body"])
+
+    def test_unshadowed_and_missing_case_boundaries(self) -> None:
+        """Unshadowed traps pass, local flags are skipped, and a missing dispatch case fails."""
+
+        unshadowed = self.PLANTED.replace('"$body"', '"$payload"')
+        self.assertEqual(top_level_trap_locals(unshadowed), [])
+        readonly_local = self.PLANTED.replace("local x body=1", "local -r body")
+        self.assertEqual(top_level_trap_locals(readonly_local), ["body"])
+        with self.assertRaises(ValueError):
+            top_level_trap_locals(self.PLANTED.replace('case "$cmd" in\n', ""))
+        with self.assertRaises(ValueError):
+            top_level_trap_locals(self.PLANTED.replace("esac\n", ""))
 
 
 class MutantTest(unittest.TestCase):
@@ -4667,7 +4778,7 @@ class CloseMutantTest(unittest.TestCase):
 
 
 class ReplyMutantTest(unittest.TestCase):
-    """Reply verb mutants that drop the anchor copy are caught."""
+    """Reply verb mutants that drop the anchor copy or shadow the payload trap are caught."""
 
     def test_reply_mutants_are_caught(self) -> None:
         """Each planted anchor-copy defect fails its targeted reply test case."""
@@ -4692,6 +4803,16 @@ class ReplyMutantTest(unittest.TestCase):
             (pos_old, '"old_position": 0,'),
             (ReplyTest, "test_old_side_comment_keeps_its_old_position"),
             "old_position dropped",
+        )
+        reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
+        self.assertEqual(reply_branch.count("reply_payload"), 5, "mutation site missing")
+        self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (reply_branch, reply_branch.replace("reply_payload", "body")),
+            (ReplyTest, "test_moved_head_exit_removes_the_reply_payload"),
+            "reply payload trap shadowed by a function local",
         )
 
 
