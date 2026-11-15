@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
 A = "a" * 40
 B = "b" * 40
+MERGE_BASE = "c" * 40
 LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
@@ -202,6 +203,7 @@ class Stub:
     fail_status: answer the status endpoint with HTTP 500.
     pull_status: answer GET /pulls/1 with this HTTP status instead of a pull.
     paginate_large_comments: paginate comment rows normally even when there are more than 1000.
+    on_pull: optional callback run on GET /pulls/1 before building the reply.
     pull_author: login of the pull author (default: the token login).
     pull_state: state of the pull ("open" by default); a PATCH with state closed
         sets it unless ignore_close.
@@ -221,6 +223,9 @@ class Stub:
         heads = heads or [A]
         polls = polls or {}
         self.heads, self.polls = heads, polls
+        self.merge_base = MERGE_BASE
+        self.pull_body = ""
+        self.on_pull = None
         self.fail_status = bool(kwargs.get("fail_status", False))
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
@@ -278,6 +283,8 @@ class Stub:
         return {
             "number": 1,
             "head": {"sha": self.head()},
+            "merge_base": self.merge_base,
+            "body": self.pull_body,
             "html_url": "stub/pulls/1",
             "user": {"login": self.pull_author},
             "state": self.pull_state,
@@ -404,6 +411,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         if url.path.endswith("/pulls/1"):
             stub.pull_headers.append(dict(self.headers.items()))
+            if stub.on_pull is not None:
+                stub.on_pull()
             if stub.pull_status == 200:
                 self.reply(200, stub.pull())
             else:
@@ -1195,6 +1204,63 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.run_helper(stub, path_first=broken), 75)
         self.assertEqual(self.patches(stub), [])
 
+    def test_edit_body_stale_base_claim_exits_80(self) -> None:
+        """A stale base claim in the new PR body exits 80 without a PATCH."""
+
+        (self.tmp / "body.md").write_text("Base: FFmpeg master 46f23be8b197.\n", encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertIn("46f23be8b197", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_edit_body_current_base_claim_is_patched(self) -> None:
+        """A new PR body naming the live merge base is patched."""
+
+        body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        (self.tmp / "body.md").write_text(body, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        self.assertEqual(self.run_helper(stub), 0)
+        self.assertEqual(self.patches(stub), [body])
+
+    def test_edit_body_patches_the_checked_snapshot(self) -> None:
+        """Rewriting the body file during pull reads cannot alter the patched snapshot."""
+
+        body_path = self.tmp / "body.md"
+        original = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        body_path.write_text(original, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        stub.on_pull = lambda: body_path.write_text(
+            "Base: FFmpeg master 46f23be8b197.\n", encoding="utf-8"
+        )
+        proc = self.run_command(stub, "edit-body", "--no-test-claims", "1", str(body_path))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [original])
+
+    def test_edit_body_base_read_is_the_head_reread(self) -> None:
+        """The Autolabel head re-read performs the base check without a later pull read."""
+
+        stub = Stub([A, A, B], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [BODY])
+        self.assertEqual(stub.head_reads, 2)
+
+    def test_edit_body_head_change_in_base_read_exits_75(self) -> None:
+        """A head change seen by the base-check pull read exits 75 without a PATCH."""
+
+        stub = Stub([A, B], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 75, proc.stderr)
+        self.assertIn("superseded by a new push", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
 
 class CloseTest(ForgejoTest):
     """The close verb comments on and closes only an own open pull request."""
@@ -1814,6 +1880,58 @@ class TestClaimHeadTest(ForgejoTest):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(self.posts(stub), [BODY])
+
+    def test_comment_stale_live_base_exits_80(self) -> None:
+        """A stale base claim in the live PR body exits 80 without posting a comment."""
+
+        stub = Stub([LIVE])
+        stub.pull_body = "Base: FFmpeg master 46f23be8b197.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertIn("live PR body", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_current_live_base_is_posted(self) -> None:
+        """A live PR body naming the current merge base authorizes the comment POST."""
+
+        stub = Stub([LIVE])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_comment_posts_the_checked_snapshot(self) -> None:
+        """Rewriting the comment body file during pull reads cannot alter the posted text."""
+
+        body_path = self.tmp / "body.md"
+        stub = Stub([LIVE])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        stub.on_pull = lambda: body_path.write_text("changed\n", encoding="utf-8")
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_comment_head_change_in_base_read_exits_76(self) -> None:
+        """A head change seen by the base-check pull read exits 76 without posting."""
+
+        stub = Stub([LIVE, LIVE, B])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("base check", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_prefix_head_change_in_base_read_exits_76(self) -> None:
+        """A base-check read of a different head sharing the tested prefix exits 76
+        without posting."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        stub = Stub([LIVE, LIVE, other])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("base check", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
 
     def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
         """Both writes reject a different full head sharing the tested prefix."""
@@ -4030,7 +4148,7 @@ MUTANTS = {
         "test_pending_and_none_are_refused",
     ),
     "head not rechecked": (
-        '[ "$(head_sha "$1")" = "$sha" ] && break',
+        'if require_current_base "$1" 0 "$snapshot" "$sha" "$2"; then break; fi',
         "break",
         "test_a_push_during_the_check_is_not_cleared_by_the_old_head",
     ),
@@ -4065,12 +4183,47 @@ def mutant_case(
     base: type[unittest.TestCase],
     name: str,
 ) -> Iterator[type[unittest.TestCase]]:
-    """Write one mutated helper and yield its temporary test case class."""
+    """Write one mutated helper into a checkout-shaped temp copy and yield its test case class."""
 
     with tempfile.TemporaryDirectory() as tmp:
-        mutant = Path(tmp) / "ffmpeg-forgejo"
+        checkout = Path(tmp) / "checkout"
+        scripts = checkout / "scripts"
+        scripts.mkdir(parents=True)
+        git(checkout, "init", "-q")
+        shutil.copyfile(HELPER.parent / "base_claims.py", scripts / "base_claims.py")
+        shutil.copyfile(HELPER.parent / "variant_sweep.py", scripts / "variant_sweep.py")
+        mutant = scripts / "ffmpeg-forgejo"
         mutant.write_text(source.replace(old, new), encoding="utf-8")
         yield type(name, (base,), {"helper": mutant})
+
+
+def run_selected(
+    source: str, old: str, new: str, base: type[unittest.TestCase], test_name: str
+) -> unittest.TestResult:
+    """Run one selected test against the helper source with old replaced by new."""
+
+    with mutant_case(source, old, new, base, "Selected") as case:
+        result = unittest.TestResult()
+        case(test_name).run(result)
+        return result
+
+
+def assert_mutant_killed(
+    check: unittest.TestCase,
+    source: str,
+    mutation: tuple[str, str],
+    selected: tuple[type[unittest.TestCase], str],
+    label: str,
+) -> unittest.TestResult:
+    """Require the selected test to pass unmutated, then to fail or error with the mutation."""
+
+    old, new = mutation
+    base, test_name = selected
+    clean = run_selected(source, old, old, base, test_name)
+    check.assertTrue(clean.wasSuccessful(), f"{label}: {test_name} fails without the mutation")
+    mutated = run_selected(source, old, new, base, test_name)
+    check.assertTrue(mutated.failures or mutated.errors, f"{label} survived")
+    return mutated
 
 
 class MutantTest(unittest.TestCase):
@@ -4083,10 +4236,7 @@ class MutantTest(unittest.TestCase):
         for name, (old, new, test_name) in MUTANTS.items():
             with self.subTest(mutant=name):
                 self.assertEqual(source.count(old), 1, "mutation site missing")
-                with mutant_case(source, old, new, EditBodyTest, "Mutated") as case:
-                    result = unittest.TestResult()
-                    case(test_name).run(result)
-                    self.assertTrue(result.failures or result.errors, f"{name} survived")
+                assert_mutant_killed(self, source, (old, new), (EditBodyTest, test_name), name)
 
 
 class FairyReviewsMutantTest(unittest.TestCase):
@@ -4100,12 +4250,16 @@ class FairyReviewsMutantTest(unittest.TestCase):
             'key=lambda row: datetime.fromisoformat(row["submitted_at"])',
             'key=lambda row: row["submitted_at"]',
         )
-        with mutant_case(source, old, "", FairyReviewsTest, "NaiveFairyCounter") as case:
-            result = unittest.TestResult()
-            case("test_request_review_is_not_submitted").run(result)
-            self.assertEqual(len(result.failures), 1, "naive Fairy counter survived")
-            self.assertEqual(result.errors, [])
-            self.assertIn("AssertionError: '1\\t1\\tREQUEST_REVIEW", result.failures[0][1])
+        result = assert_mutant_killed(
+            self,
+            source,
+            (old, ""),
+            (FairyReviewsTest, "test_request_review_is_not_submitted"),
+            "naive Fairy counter",
+        )
+        self.assertEqual(len(result.failures), 1, "naive Fairy counter survived")
+        self.assertEqual(result.errors, [])
+        self.assertIn("AssertionError: '1\\t1\\tREQUEST_REVIEW", result.failures[0][1])
 
 
 class PullOverlapMutantTest(unittest.TestCase):
@@ -4137,12 +4291,11 @@ class PullOverlapMutantTest(unittest.TestCase):
         )
         for old, new, cases in mutations:
             self.assertEqual(source.count(old), 1, "mutation site missing")
-            with mutant_case(source, old, new, PullRequestOverlapTest, "MutatedOverlap") as case:
-                for name in cases:
-                    with self.subTest(test=name):
-                        result = unittest.TestResult()
-                        case(name).run(result)
-                        self.assertTrue(result.failures or result.errors, f"{name} survived")
+            for name in cases:
+                with self.subTest(test=name):
+                    assert_mutant_killed(
+                        self, source, (old, new), (PullRequestOverlapTest, name), name
+                    )
 
     def test_overlap_verb_mutants_are_caught(self) -> None:
         """Each planted overlap verb defect fails its targeted test case."""
@@ -4192,12 +4345,45 @@ class PullOverlapMutantTest(unittest.TestCase):
         )
         for old, new, cases in mutations:
             self.assertEqual(source.count(old), 1, "mutation site missing")
-            with mutant_case(source, old, new, OverlapVerbTest, "MutatedOverlapVerb") as case:
-                for name in cases:
-                    with self.subTest(test=name):
-                        result = unittest.TestResult()
-                        case(name).run(result)
-                        self.assertTrue(result.failures or result.errors, f"{name} survived")
+            for name in cases:
+                with self.subTest(test=name):
+                    assert_mutant_killed(self, source, (old, new), (OverlapVerbTest, name), name)
+
+
+class MutantCaseTest(unittest.TestCase):
+    """The mutation harness copy is a runnable repository helper."""
+
+    def test_copy_has_siblings_in_a_checkout(self) -> None:
+        """The temp copy sits at scripts/ffmpeg-forgejo of a Git checkout beside both validators."""
+
+        with mutant_case(HELPER.read_text(encoding="utf-8"), "", "", EditBodyTest, "Probe") as case:
+            self.assertEqual(case.helper.name, "ffmpeg-forgejo")
+            self.assertEqual(case.helper.parent.name, "scripts")
+            self.assertTrue((case.helper.parent / "base_claims.py").is_file())
+            self.assertTrue((case.helper.parent / "variant_sweep.py").is_file())
+            self.assertTrue((case.helper.parent.parent / ".git" / "HEAD").is_file())
+
+    def test_broken_copy_is_reported(self) -> None:
+        """A selected test that fails without the mutation fails the kill check by name."""
+
+        class PlantedFailure(unittest.TestCase):
+            helper = HELPER
+
+            def test_planted(self) -> None:
+                """Fail unconditionally."""
+
+                self.fail("planted")
+
+        old, new, _ = MUTANTS["seq loop"]
+        with self.assertRaises(AssertionError) as raised:
+            assert_mutant_killed(
+                self,
+                HELPER.read_text(encoding="utf-8"),
+                (old, new),
+                (PlantedFailure, "test_planted"),
+                "planted",
+            )
+        self.assertIn("test_planted fails without the mutation", str(raised.exception))
 
 
 class CloseMutantTest(unittest.TestCase):
