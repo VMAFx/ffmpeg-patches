@@ -419,6 +419,161 @@ SCRIPT_DIR = {
         NEWLINE_NAME,
         {"tools/\n": DOLLAR0 + SRC + RUN, "tools/run.sh": "-> \n", "lib.sh": CFG},
     ),
+    "r8-cr-printf-dynamic-dest": Case(
+        "v=${missing:-BASH_ARGV0}\nprintf -v \"$v\" '%s' <case>/other/anchor.sh\n"
+        + DOLLAR0
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-cr-printf-dynamic-dest-cdpwd": Case(
+        "v=${missing:-BASH_ARGV0}\nprintf -v \"$v\" '%s' <case>/other/anchor.sh\n"
+        + CDPWD
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-cr-declare-i-expanded": Case(
+        'p=PA\nq=TH\ndeclare -i n\nn="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-cr-declare-i-expanded-cdpwd": Case(
+        'p=PA\nq=TH\ndeclare -i n\nn="${p}${q}=7"\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r8-arith-expansion-dynamic": Case(
+        "p=PA\nq=TH\n: $((${p}${q}=7))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-arith-command-dynamic": Case(
+        "p=PA\nq=TH\n(( ${p}${q}=7 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-declare-i-value-expanded": Case(
+        'p=PA\nq=TH\ndeclare -i n="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-integer-append-expanded": Case(
+        'p=PA\nq=TH\ndeclare -i n\nn+="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-typeset-ix-expanded": Case(
+        'p=PA\nq=TH\ntypeset -ix n\nn="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-integer-from-env-var": Case("declare -i n\nn=$UNSET_X\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-integer-array-element": Case(
+        'p=PA\nq=TH\ndeclare -ai a\na[0]="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-subscript-arith-dynamic": Case(
+        "p=PA\nq=TH\ndeclare -a a\na[${p}${q}=7]=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-dbracket-eq-dynamic": Case(
+        "p=PA\nq=TH\n[[ ${p}${q}=7 -eq 7 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-read-dynamic-dest": Case(
+        'v=${missing:-BASH_ARGV0}\nread -r "$v" <<< <case>/other/anchor.sh\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-declare-dynamic-name": Case(
+        'v=${missing:-BASH_ARGV0}\ndeclare "$v=<case>/other/anchor.sh"\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-printf-braced-dynamic": Case(
+        "v=${missing:-BASH_ARGV0}\nprintf -v \"${v}\" '%s' <case>/other/anchor.sh\n"
+        + DOLLAR0
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-printf-attached-dynamic": Case(
+        "v=${missing:-BASH_ARGV0}\nprintf -v\"$v\" '%s' <case>/other/anchor.sh\n"
+        + DOLLAR0
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-mapfile-dynamic-dest": Case(
+        'v=${missing:-BASH_ARGV0}\nmapfile -t "$v" <<< <case>/other/anchor.sh\n'
+        + DOLLAR0
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-export-dynamic-name": Case(
+        'v=${missing:-PATH}\nexport "$v=<case>/other"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-mapfile-dynamic-path": Case(
+        'v=${missing:-PATH}\nmapfile -t "$v" <<< <case>/other\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-subscript-read-dynamic": Case(
+        'p=PA\nq=TH\ndeclare -a a\n: "${a[${p}${q}=7]}"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-substring-offset-dynamic": Case(
+        'p=PA\nq=TH\nx=abc\n: "${x:${p}${q}=7}"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-getopts-dynamic-dest": Case(
+        'v=${missing:-BASH_ARGV0}\ngetopts a "$v" -a\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-local-i-in-function": Case(
+        'p=PA\nq=TH\nf() {\n  local -i n\n  n="${p}${q}=7"\n}\nf\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-dbracket-env-operand": Case("[[ $UNSET_X -eq 0 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-indirect-assign-default": Case(
+        'v=${missing:-BASH_ARGV0}\n: "${!v:=<case>/other/anchor.sh}"\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-read-array-dynamic": Case(
+        'v=${missing:-PATH}\nread -r -a "$v" <<< <case>/other\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-wait-p-dynamic": Case(
+        'v=${missing:-BASH_ARGV0}\ntrue &\nwait -p "$v" -n\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-compgen-V-dynamic": Case(
+        'v=${missing:-PATH}\ncompgen -V "$v" -W <case>/other\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-unset-dynamic": Case('v=${missing:-PATH}\nunset "$v"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-printf-subscript-arith": Case(
+        'p=PA\nq=TH\ndeclare -a a\nprintf -v "a[${p}${q}=7]" x\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-dollar-bracket-arith": Case(
+        "p=PA\nq=TH\n: $[${p}${q}=7]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-cfor-dynamic": Case(
+        "p=PA\nq=TH\nfor (( ${p}${q}=7; 0; )); do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-expansion": Case(
+        "x=${missing:-PATH=7}\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-command": Case(
+        "x=${missing:-PATH=7}\n(( x ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-dbracket": Case(
+        "x=${missing:-PATH=7}\n[[ x -eq 7 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-subscript": Case(
+        "x=${missing:-PATH=7}\ndeclare -a a\na[x]=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-integer": Case(
+        "x=${missing:-PATH=7}\ndeclare -i n\nn=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-let": Case("x=${missing:-PATH=7}\nlet y=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-positional-arith": Case(": $(( $1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-integer-literal-sum": Case('declare -i n\nn="1+2"\n' + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-printf-literal-dest": Case("printf -v x '%s' y\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-read-dynamic-prompt": Case('m=hi\nread -r -p "$m" x <<< y\n' + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-integer-number": Case("declare -i n\nn=3\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-arith-read-only": Case("p=1\nq=2\n: $((p+q))\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-array-element": Case("declare -a a\na[0]=x\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-dbracket-literal": Case("[[ 1 -eq 1 ]]\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-dbracket-argc": Case("[[ $# -eq 0 ]]\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-assoc-dynamic-subscript": Case("declare -A m\nm[$PWD]=1\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-arith-status": Case(": $(( $? + 1 ))\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-string-append": Case("n=1\nn+=x\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-literal-int-ref": Case("x=3\n: $((x + 1))\n" + DOLLAR0 + SRC + RUN, 0),
 }
 
 
@@ -466,8 +621,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 159 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 159)
+        """Replay all 211 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 211)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
