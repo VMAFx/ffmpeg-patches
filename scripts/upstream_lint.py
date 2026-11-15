@@ -32,9 +32,11 @@ waives it and prints the reason; when test paths do change, each fix commit must
 be reached by name: a changed test path or one of its added lines must contain,
 as a whole word, the stem of a source file the commit changes (a vf_, af_,
 vsrc_, asrc_, avf_, avsrc_, vsink_, asink_ or f_ prefix also stripped) or a
-function name Git prints in one of its source hunk headers. The same waiver
-covers a fix the changed tests do not name. A test that names the code without
-running the fixed path is not detected.
+function name Git prints in one of its source hunk headers. Quoted,
+tab-terminated and binary test paths count, and the range diff forces the a/
+and b/ prefixes whatever diff.noprefix says. The same waiver covers a fix the
+changed tests do not name. A test that names the code without running the fixed
+path is not detected.
 
 The diagnostic-citation step fails a commit whose message names a compiler
 diagnostic flag (-W...) together with workaround wording (workaround, false
@@ -108,7 +110,15 @@ GIT_ENVIRONMENT_NAMES = (
     "GIT_WORK_TREE",
 )
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
-DIFF_COMMON = ("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames")
+DIFF_COMMON = (
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--no-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 MAX_PATHS = 2000
 RUN_TIMEOUT = 1800
 CLEANUP_TIMEOUT = 30
@@ -116,6 +126,8 @@ REAP_TIMEOUT = 10
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
 CONFIG = ".forgejo/pre-commit/config.yaml"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+GIT_QUOTED_ESCAPE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
+GIT_ESCAPE_BYTES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 REFERENCE = re.compile(r"^[^:\n]+?[:-]\d+[:-](.*)$")
 FUNCTION = re.compile(r"^(?:[A-Za-z_]\w*[ *]+)+[A-Za-z_]\w*\([^();{}]*\)\s*\{")
@@ -1175,6 +1187,31 @@ def is_source_path(name: str) -> bool:
     )
 
 
+def unquote_git_path(text: str) -> str:
+    """Decode a C-style quoted Git path, leaving an unquoted path unchanged."""
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body = text[1:-1]
+    decoded = bytearray()
+    cursor = 0
+    for match in GIT_QUOTED_ESCAPE.finditer(body):
+        decoded.extend(body[cursor : match.start()].encode("utf-8", "surrogateescape"))
+        code = match[1]
+        decoded.append(int(code, 8) if len(code) == 3 else GIT_ESCAPE_BYTES[code])
+        cursor = match.end()
+    decoded.extend(body[cursor:].encode("utf-8", "surrogateescape"))
+    return decoded.decode("utf-8", "surrogateescape")
+
+
+def _header_path(line: str) -> str:
+    """Return the path a --- a/ or +++ b/ file header names, or an empty string."""
+    for marker, prefix in (("--- ", "a/"), ("+++ ", "b/")):
+        if line.startswith(marker):
+            name = unquote_git_path(line[len(marker) :].removesuffix("\t"))
+            return name[len(prefix) :] if name.startswith(prefix) else ""
+    return ""
+
+
 def _patch_files(patch: str) -> list[tuple[str, list[str], list[str]]]:
     """Split a unified diff into per-file paths, hunk headers and added lines."""
     entries: list[tuple[str, list[str], list[str]]] = []
@@ -1189,9 +1226,10 @@ def _patch_files(patch: str) -> list[tuple[str, list[str], list[str]]]:
             in_header = False
             entries[-1][1].append(line)
         elif in_header:
-            if line.startswith(("--- a/", "+++ b/")):
+            path = _header_path(line)
+            if path:
                 _, hunks, added = entries[-1]
-                entries[-1] = (line[6:], hunks, added)
+                entries[-1] = (path, hunks, added)
         elif line.startswith("+"):
             entries[-1][2].append(line[1:])
     return entries
@@ -1222,9 +1260,12 @@ def reach_names(paths: list[str], patch: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def test_words(patch: str) -> frozenset[str]:
+def test_words(patch: str, paths: list[str] | None = None) -> frozenset[str]:
     """Collect word tokens from changed test paths and their added lines."""
     words: set[str] = set()
+    for path in paths or []:
+        if is_test_path(path):
+            words.update(WORD.findall(path))
     for path, _, added in _patch_files(patch):
         if is_test_path(path):
             words.update(WORD.findall(path))
@@ -1289,18 +1330,8 @@ def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
     reason = waiver.strip()
     if not test_paths:
         return _no_test_step(fixes, reason)
-    range_patch = _git(
-        tree,
-        "diff",
-        "-U0",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        base,
-        head,
-    )
-    words = test_words(range_patch)
+    range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
+    words = test_words(range_patch, test_paths)
     unreached = [fix for fix in fixes if not fix[2] & words]
     if not unreached:
         return Step("regression-test", 0, summary)
