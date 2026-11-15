@@ -31,7 +31,7 @@ BODY = "new body\nline two\n"
 NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset(
-    {"comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap"}
+    {"close", "comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap"}
 )
 
 
@@ -204,6 +204,10 @@ class Stub:
     pull_status: answer GET /pulls/1 with this HTTP status instead of a pull.
     paginate_large_comments: paginate comment rows normally even when there are more than 1000.
     on_pull: optional callback run on GET /pulls/1 before building the reply.
+    pull_author: login of the pull author (default: the token login).
+    pull_state: state of the pull ("open" by default); a PATCH with state closed
+        sets it unless ignore_close.
+    ignore_close: acknowledge a close PATCH without changing the state.
     """
 
     def __init__(
@@ -226,6 +230,9 @@ class Stub:
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
         self.login = str(kwargs.get("login", "tester"))
+        self.pull_author = str(kwargs.get("pull_author", self.login))
+        self.pull_state = str(kwargs.get("pull_state", "open"))
+        self.ignore_close = bool(kwargs.get("ignore_close", False))
         self.max_response_items = kwargs.get("max_response_items", 50)
         self.open_pulls: list[dict] = []
         self.pull_files: dict[int, list[ChangedFile]] = {}
@@ -279,6 +286,8 @@ class Stub:
             "merge_base": self.merge_base,
             "body": self.pull_body,
             "html_url": "stub/pulls/1",
+            "user": {"login": self.pull_author},
+            "state": self.pull_state,
             "requested_reviewers": [
                 {"login": login}
                 for login in dict.fromkeys(reviewers + self.requested_users)
@@ -518,10 +527,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(404, {})
 
     def do_PATCH(self) -> None:
-        """Record and acknowledge pull-body edits."""
+        """Record pull edits, apply a close unless the stub ignores it, and acknowledge."""
 
         data = self.rfile.read(int(self.headers["Content-Length"])).decode()
-        self.stub().requests.append(("PATCH", self.path, data))
+        stub = self.stub()
+        stub.requests.append(("PATCH", self.path, data))
+        if (
+            self.path.endswith("/pulls/1")
+            and json.loads(data).get("state") == "closed"
+            and not stub.ignore_close
+        ):
+            stub.pull_state = "closed"
         self.reply(200, {"html_url": "stub/pulls/1"})
 
 
@@ -1244,6 +1260,119 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(proc.returncode, 75, proc.stderr)
         self.assertIn("superseded by a new push", proc.stderr)
         self.assertEqual(self.patches(stub), [])
+
+
+class CloseTest(ForgejoTest):
+    """The close verb comments on and closes only an own open pull request."""
+
+    def writes(self, stub: Stub) -> list[tuple[str, str]]:
+        """Return the method and path of every POST and PATCH the stub received."""
+
+        return [(m, p) for m, p, _ in stub.requests if m in {"POST", "PATCH"}]
+
+    def test_own_open_pull_is_commented_then_closed(self) -> None:
+        """An own open pull is commented on, closed, and verified closed."""
+
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.writes(stub),
+            [
+                ("POST", "/api/v1/repos/FFmpeg/FFmpeg/issues/1/comments"),
+                ("PATCH", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1"),
+            ],
+        )
+        self.assertEqual(self.sent_bodies(stub, "POST"), [BODY])
+        patches = [json.loads(data) for method, _, data in stub.requests if method == "PATCH"]
+        self.assertEqual(patches, [{"state": "closed"}])
+        self.assertIn("closed stub/pulls/1", proc.stdout)
+
+    def test_foreign_pull_is_refused_before_any_write(self) -> None:
+        """A pull authored by another login exits 80 before any write."""
+
+        stub = Stub(pull_author="someone-else")
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertEqual(self.writes(stub), [])
+        self.assertIn("authored by someone-else, not tester", proc.stderr)
+
+    def test_closed_pull_is_refused_before_any_write(self) -> None:
+        """An already-closed pull exits 1 before any write."""
+
+        stub = Stub(pull_state="closed")
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(self.writes(stub), [])
+        self.assertIn("is closed; not closed", proc.stderr)
+
+    def test_missing_comment_file_is_refused_before_any_request(self) -> None:
+        """A missing comment file exits 1 before contacting the API."""
+
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "missing.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+        self.assertIn("no comment file", proc.stderr)
+
+    def test_blank_comment_file_is_refused_before_any_request(self) -> None:
+        """A whitespace-only comment file exits 1 before contacting the API."""
+
+        blank = self.tmp / "blank.md"
+        blank.write_text(" \n\t\n", encoding="utf-8")
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1", str(blank))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+        self.assertIn("empty comment file", proc.stderr)
+
+    def test_duplicate_comment_is_refused_before_any_write(self) -> None:
+        """An own matching comment exits 78 before posting or closing."""
+
+        stub = Stub()
+        stub.comments[1] = [
+            {
+                "id": 7,
+                "html_url": "stub/issues/1#issuecomment-7",
+                "body": BODY,
+                "user": {"login": "tester"},
+            }
+        ]
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertEqual(self.writes(stub), [])
+
+    def test_close_not_read_back_fails(self) -> None:
+        """A close PATCH whose read-back stays open exits 1."""
+
+        stub = Stub(ignore_close=True)
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(
+            self.writes(stub),
+            [
+                ("POST", "/api/v1/repos/FFmpeg/FFmpeg/issues/1/comments"),
+                ("PATCH", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1"),
+            ],
+        )
+        self.assertIn("is still open after the close request", proc.stderr)
+
+    def test_wrong_argument_count_is_a_usage_error(self) -> None:
+        """Missing the comment file argument exits 64 before any request."""
+
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1")
+        self.assertEqual(proc.returncode, 64, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_non_numeric_pull_is_refused(self) -> None:
+        """A non-numeric pull identifier exits 1 before any request."""
+
+        stub = Stub()
+        body = str(self.tmp / "body.md")
+        proc = self.run_command(stub, "close", "x", body)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
 
 
 class TestClaimHeadTest(ForgejoTest):
@@ -4255,6 +4384,33 @@ class MutantCaseTest(unittest.TestCase):
                 "planted",
             )
         self.assertIn("test_planted fails without the mutation", str(raised.exception))
+
+
+class CloseMutantTest(unittest.TestCase):
+    """A close verb without the author check lets the foreign pull test fail."""
+
+    def test_dropped_author_check_is_caught(self) -> None:
+        """The foreign pull test passes on the unmutated helper and fails once
+        the author check is gone."""
+
+        old = "if not isinstance(author, str) or author != me:"
+        new = "if False:"
+        source = HELPER.read_text(encoding="utf-8")
+        self.assertEqual(source.count(old), 1, "mutation site missing")
+        for replacement, expect_pass in ((old, True), (new, False)):
+            with mutant_case(source, old, replacement, CloseTest, "MutatedClose") as case:
+                result = unittest.TestResult()
+                case("test_foreign_pull_is_refused_before_any_write").run(result)
+                if expect_pass:
+                    self.assertTrue(
+                        result.wasSuccessful(),
+                        "test_foreign_pull_is_refused_before_any_write fails without the mutation",
+                    )
+                else:
+                    self.assertTrue(
+                        result.failures or result.errors,
+                        "dropped author check survived",
+                    )
 
 
 if __name__ == "__main__":
