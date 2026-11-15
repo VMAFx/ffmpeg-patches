@@ -19,6 +19,14 @@ from pathlib import Path
 
 GUARD = Path(__file__).resolve().parent.parent / "scripts" / "tmp_leak_guard.py"
 
+# Test module with one passing test.
+_CLEAN_TEST_MODULE = (
+    "import unittest\n"
+    "class CleanCase(unittest.TestCase):\n"
+    "    def test_ok(self) -> None:\n"
+    "        self.assertTrue(True)\n"
+)
+
 
 class TmpLeakGuardTest(unittest.TestCase):
     """Test suite for the tmp_leak_guard CLI runner."""
@@ -267,16 +275,12 @@ class TmpLeakGuardTest(unittest.TestCase):
             (fixture_dir / name).write_text(source, encoding="utf-8")
         return fixture_dir
 
-    def test_parallel_clean_modules_pass(self) -> None:
-        """Two clean test modules run in parallel worker processes exit zero without leaks."""
-        clean_mod = (
-            "import unittest\n"
-            "class CleanCase(unittest.TestCase):\n"
-            "    def test_ok(self) -> None:\n"
-            "        self.assertTrue(True)\n"
-        )
-        fixture_dir = self._parallel_fixture({"test_a.py": clean_mod, "test_b.py": clean_mod})
-        proc = self.run_guard(
+    def _run_parallel_guard(
+        self,
+        fixture_dir: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute the leak guard over unittest_parallel against a fixture directory."""
+        return self.run_guard(
             [],
             [
                 sys.executable,
@@ -294,18 +298,19 @@ class TmpLeakGuardTest(unittest.TestCase):
             ],
             timeout=120.0,
         )
+
+    def test_parallel_clean_modules_pass(self) -> None:
+        """Two clean test modules run in parallel worker processes exit zero without leaks."""
+        fixture_dir = self._parallel_fixture(
+            {"test_a.py": _CLEAN_TEST_MODULE, "test_b.py": _CLEAN_TEST_MODULE}
+        )
+        proc = self._run_parallel_guard(fixture_dir)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("tmp leak guard:", proc.stderr)
         self.assertEqual(list(self.outer_dir.iterdir()), [])
 
     def test_parallel_worker_leak_fails(self) -> None:
         """A file leaked into TMPDIR by a parallel worker triggers exit code one and cleanup."""
-        clean_mod = (
-            "import unittest\n"
-            "class CleanCase(unittest.TestCase):\n"
-            "    def test_ok(self) -> None:\n"
-            "        self.assertTrue(True)\n"
-        )
         leaking_mod = (
             "import pathlib, tempfile, unittest\n"
             "class LeakCase(unittest.TestCase):\n"
@@ -313,25 +318,10 @@ class TmpLeakGuardTest(unittest.TestCase):
             "        leak = pathlib.Path(tempfile.gettempdir()) / 'leak.txt'\n"
             "        leak.write_text('worker leak', encoding='utf-8')\n"
         )
-        fixture_dir = self._parallel_fixture({"test_a.py": clean_mod, "test_b.py": leaking_mod})
-        proc = self.run_guard(
-            [],
-            [
-                sys.executable,
-                "-I",
-                "-m",
-                "unittest_parallel",
-                "-j",
-                "2",
-                "--level",
-                "module",
-                "-s",
-                str(fixture_dir),
-                "-t",
-                str(fixture_dir),
-            ],
-            timeout=120.0,
+        fixture_dir = self._parallel_fixture(
+            {"test_a.py": _CLEAN_TEST_MODULE, "test_b.py": leaking_mod}
         )
+        proc = self._run_parallel_guard(fixture_dir)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("leak.txt", proc.stderr)
         self.assertEqual(list(self.outer_dir.iterdir()), [])
@@ -345,24 +335,7 @@ class TmpLeakGuardTest(unittest.TestCase):
             "        self.assertEqual(1, 2)\n"
         )
         fixture_dir = self._parallel_fixture({"test_fail.py": failing_mod})
-        proc = self.run_guard(
-            [],
-            [
-                sys.executable,
-                "-I",
-                "-m",
-                "unittest_parallel",
-                "-j",
-                "2",
-                "--level",
-                "module",
-                "-s",
-                str(fixture_dir),
-                "-t",
-                str(fixture_dir),
-            ],
-            timeout=120.0,
-        )
+        proc = self._run_parallel_guard(fixture_dir)
         self.assertEqual(proc.returncode, 1)
         self.assertNotIn("tmp leak guard:", proc.stderr)
         self.assertEqual(list(self.outer_dir.iterdir()), [])
