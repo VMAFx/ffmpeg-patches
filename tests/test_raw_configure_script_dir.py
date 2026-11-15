@@ -9,6 +9,7 @@ import subprocess  # nosec B404 - only the fixed guard runs.
 from pathlib import Path
 from typing import NamedTuple
 
+from scripts.raw_configure_body import BASH_VARIABLES
 from tests.raw_configure_support import RawConfigureGuardBase
 
 UNKNOWN_SOURCE = "relative script path after a source the guard cannot read; use an absolute path"
@@ -348,6 +349,47 @@ SCRIPT_DIR = {
     ),
     "declare-quoted-integer-before": Case('declare "-i" n=1\n' + DOLLAR0 + SRC + RUN, 0),
     "export-n-other-before": Case("export -n X\n" + DOLLAR0 + SRC + RUN, 0),
+    "bash-argv0-before": Case(
+        "BASH_ARGV0=<case>/other/anchor.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "bash-cmds-before": Case(
+        "BASH_CMDS[dirname]=<case>/bin/dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "bash-aliases-before": Case("BASH_ALIASES[dirname]=false\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "execignore-before": Case("EXECIGNORE=/usr/bin/dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "read-bash-cmds-before": Case(
+        "read -r 'BASH_CMDS[dirname]' <<< <case>/bin/dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "declare-argv0-before": Case(
+        "declare BASH_ARGV0=<case>/other/anchor.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "arith-argv0-before": Case(": $((BASH_ARGV0=7))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-attached-argv0-before": Case(
+        "printf -vBASH_ARGV0 '%s' <case>/other/anchor.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "lc-all-prefix-before": Case("LC_ALL=C true\n" + DOLLAR0 + SRC + RUN, 0),
+    "undocumented-bash-name-before": Case("BASH_CMDS_X=1\n" + DOLLAR0 + SRC + RUN, 0),
+    "echo-path-assign-before": Case("echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 0),
+    "printf-path-assign-before": Case("printf '%s\\n' 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 0),
+    "builtin-echo-path-assign-before": Case(
+        "builtin echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 0
+    ),
+    "subst-echo-path-before": Case(
+        "x=$(echo 'PATH=7')\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "redirect-echo-path-before": Case("echo 'PATH=7' > f\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "pipe-echo-path-before": Case("echo 'PATH=7' | read -r x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-v-capture-path-before": Case(
+        "printf -v x '%s' 'PATH=7'\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "function-echo-path-before": Case("f() { echo 'PATH=7'; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "eval-echo-path-before": Case("eval \"echo 'PATH=7'\"\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "sourced-echo-capture-before": Case(
+        'x=$(. "<case>/tools/print.sh")\n: $((x))\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+        {"tools/print.sh": "echo 'PATH=7'\n"},
+    ),
     "newline-name-symlink": Case(
         DOLLAR0 + SRC + RUN,
         2,
@@ -391,9 +433,18 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         run_env = {"PATH": os.defpath, "LC_ALL": "C.UTF-8", **(env or {})}
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
+    def test_bash_variables_documented(self) -> None:
+        """Keep the 110 bash 5.3 manual variable names and exclude undocumented names."""
+        self.assertEqual(len(BASH_VARIABLES), 110)
+        self.assertLessEqual(
+            {"_", "PATH", "BASH_ARGV0", "BASH_CMDS", "BASH_ALIASES", "EXECIGNORE", "IFS", "UID"},
+            BASH_VARIABLES,
+        )
+        self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
+
     def test_script_dir_shapes(self) -> None:
-        """Replay all 132 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 132)
+        """Replay all 152 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 152)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

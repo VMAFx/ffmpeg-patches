@@ -59,7 +59,7 @@ NEWLINE_SCRIPT_NAME = (
 )
 REBOUND_SCRIPT_DIR = (
     "script path from an own-directory name assigned after a shell function, alias, enable, "
-    "hash or PATH change that can rebind the commands of the idiom; use an absolute path"
+    "hash or bash variable change that can rebind the commands of the idiom; use an absolute path"
 )
 UNKNOWN_SOURCE_PATH = (
     "relative script path after a source the guard cannot read; use an absolute path"
@@ -83,17 +83,61 @@ SCRIPT_DIR_VALUE = re.compile(
 SCRIPT_DIR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-(.+)\}")
 ASSIGNED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PLAIN_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
-PATH_WORD = re.compile(r"PATH(?:\[[^\]]*\])?(?:\+?=.*)?", re.DOTALL)
-# PATH as a whole identifier in arithmetic let operands.
-PATH_TOKEN = re.compile(r"(?<![A-Za-z0-9_])PATH(?![A-Za-z0-9_])")
-# Writer option cluster with the PATH target name attached (-vPATH, -raPATH, -pPATH, -VPATH).
-ATTACHED_PATH_OPTION = re.compile(r"-[A-Za-z]+PATH(?:\[[^\]]*\])?")
-# Arithmetic assignment, increment or decrement of PATH in literal text.
-PATH_ARITH_WRITE = re.compile(
-    r"(?<![A-Za-z0-9_])PATH\s*(?:\[[^\]]*\])?\s*(?:\*\*|<<|>>|[-+*/%&|^])?=(?!=)"
-    r"|(?:\+\+|--)\s*PATH(?![A-Za-z0-9_])"
-    r"|(?<![A-Za-z0-9_])PATH\s*(?:\+\+|--)"
+# Variables documented in the bash 5.3 manual, section 5.1 Bourne Shell Variables
+# and section 5.2 Bash Variables (110 names).
+BASH_VARIABLES = frozenset(
+    (  # noqa: SIM905 - compact verbatim manual name table.
+        "_ BASH BASH_ALIASES BASH_ARGC BASH_ARGV BASH_ARGV0 BASH_CMDS BASH_COMMAND "
+        "BASH_COMPAT BASH_ENV BASH_EXECUTION_STRING BASH_LINENO BASH_LOADABLES_PATH "
+        "BASH_MONOSECONDS BASHOPTS BASHPID BASH_REMATCH BASH_SOURCE BASH_SUBSHELL "
+        "BASH_TRAPSIG BASH_VERSINFO BASH_VERSION BASH_XTRACEFD CDPATH CHILD_MAX COLUMNS "
+        "COMP_CWORD COMP_KEY COMP_LINE COMP_POINT COMPREPLY COMP_TYPE COMP_WORDBREAKS "
+        "COMP_WORDS COPROC DIRSTACK EMACS ENV EPOCHREALTIME EPOCHSECONDS EUID EXECIGNORE "
+        "FCEDIT FIGNORE FUNCNAME FUNCNEST GLOBIGNORE GLOBSORT GROUPS HISTCMD HISTCONTROL "
+        "HISTFILE HISTFILESIZE HISTIGNORE HISTSIZE HISTTIMEFORMAT HOME HOSTFILE HOSTNAME "
+        "HOSTTYPE IFS IGNOREEOF INPUTRC INSIDE_EMACS LANG LC_ALL LC_COLLATE LC_CTYPE "
+        "LC_MESSAGES LC_NUMERIC LC_TIME LINENO LINES MACHTYPE MAIL MAILCHECK MAILPATH "
+        "MAPFILE OLDPWD OPTARG OPTERR OPTIND OSTYPE PATH PIPESTATUS POSIXLY_CORRECT PPID "
+        "PROMPT_COMMAND PROMPT_DIRTRIM PS0 PS1 PS2 PS3 PS4 PWD RANDOM READLINE_ARGUMENT "
+        "READLINE_LINE READLINE_MARK READLINE_POINT REPLY SECONDS SHELL SHELLOPTS SHLVL "
+        "SRANDOM TIMEFORMAT TMOUT TMPDIR UID"
+    ).split()
 )
+# Identifier operand with an optional subscript and optional assignment or append value.
+VARIABLE_WORD = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?(?:\+?=.*)?", re.DOTALL)
+# Whole shell identifier in arithmetic let operands.
+IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
+# Writer option cluster with its target variable name and optional subscript attached.
+ATTACHED_OPTION = re.compile(r"-([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?")
+# Arithmetic assignment, increment or decrement of an identifier in literal text.
+VARIABLE_ARITH_WRITE = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])"
+    r"\s*(?:\[[^\]]*\]\s*)?(?:\*\*|<<|>>|[-+*/%&|^])?=(?!=)"
+    r"|(?:\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])\s*(?:\+\+|--)"
+)
+# Builtins and utilities whose arguments only print when stdout is not captured.
+PRINT_COMMANDS = frozenset(["echo", "printf"])
+# Syntax wrappers allowed between a printed literal span and its enclosing command.
+PRINT_PARENTS = frozenset(["string", "concatenation"])
+# Ancestors that pass a print command's output unchanged to the script's own stdout.
+TERMINAL_ANCESTORS = frozenset(
+    [
+        "program",
+        "list",
+        "compound_statement",
+        "if_statement",
+        "elif_clause",
+        "else_clause",
+        "while_statement",
+        "for_statement",
+        "case_statement",
+        "case_item",
+        "do_group",
+    ]
+)
+# Maximum ancestor walk depth when proving a print command writes to terminal stdout.
+MAX_PRINT_DEPTH = 64
 # Terminal syntax spans whose literal text can feed arithmetic evaluation.
 LITERAL_TEXT = frozenset(["word", "raw_string", "string_content", "ansi_c_string", "ERROR"])
 # Shell builtins that declare, export, freeze or unset variable bindings.
@@ -277,6 +321,7 @@ class _Scan:
     rebound: bool = False
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
+    top_raw: bytes = b""
 
 
 def bash_parser() -> Any | str:
@@ -766,27 +811,71 @@ def _assignment_hit(node: Any, raw: bytes) -> str | None:
     return None
 
 
+def _names_bash_variable(word: str) -> bool:
+    """Match an assignment or target operand naming a documented bash variable."""
+    match = VARIABLE_WORD.fullmatch(word)
+    return match is not None and match.group(1) in BASH_VARIABLES
+
+
+def _attached_bash_variable(word: str) -> bool:
+    """Match a writer option cluster with a documented bash variable attached."""
+    match = ATTACHED_OPTION.fullmatch(word)
+    if match is None:
+        return False
+    cluster = match.group(1)
+    return any(
+        cluster[:i].isalpha() and cluster[i:] in BASH_VARIABLES for i in range(1, len(cluster))
+    )
+
+
+def _arith_writes_bash_variable(text: str) -> bool:
+    """Match an arithmetic write to a documented bash variable in literal text."""
+    return any(
+        (match.group(1) or match.group(2) or match.group(3)) in BASH_VARIABLES
+        for match in VARIABLE_ARITH_WRITE.finditer(text)
+    )
+
+
 def _declaration_rebinds(name: str, operands: list[str]) -> bool:
-    """Match a PATH operand, or nameref option of declare, typeset or local, after quote removal."""
-    has_path = any(PATH_WORD.fullmatch(w) is not None for w in operands)
+    """Match a bash variable operand, or nameref option of declare, typeset or local."""
+    has_variable = any(_names_bash_variable(w) for w in operands)
     has_nameref = name in NAMEREF_BUILTINS and any(w.startswith("-") and "n" in w for w in operands)
-    return has_path or has_nameref
+    return has_variable or has_nameref
+
+
+def _printf_writes_bash_variable(args: list[str]) -> bool:
+    """Match a printf -v option whose separate or attached target is a bash variable."""
+    take_next = False
+    for arg in args:
+        if take_next:
+            if _names_bash_variable(arg):
+                return True
+            take_next = False
+        elif not arg.startswith("-") or arg in ("-", "--"):
+            break
+        elif arg == "-v":
+            take_next = True
+        elif _attached_bash_variable(arg):
+            return True
+    return False
 
 
 def _writes_path(name: str, args: list[str]) -> bool:
-    """Match a writer builtin, let operand or wrapped declaration that can bind PATH."""
+    """Match a writer builtin, let operand or wrapped declaration binding a bash variable."""
+    if name == "printf":
+        return _printf_writes_bash_variable(args)
     if name in PATH_WRITERS:
+        return any(_names_bash_variable(w) or _attached_bash_variable(w) for w in args)
+    if name == "let":
         return any(
-            PATH_WORD.fullmatch(w) is not None or ATTACHED_PATH_OPTION.fullmatch(w) is not None
+            "$" in w or "`" in w or any(ident in BASH_VARIABLES for ident in IDENTIFIER.findall(w))
             for w in args
         )
-    if name == "let":
-        return any(PATH_TOKEN.search(w) is not None or "$" in w or "`" in w for w in args)
     return name in DECLARATION_BUILTINS and _declaration_rebinds(name, args)
 
 
 def _note_rebinding_command(words: list[str], idx: int, name: str, scan: _Scan) -> None:
-    """Record commands that alias, disable, hash or write PATH before the idiom runs."""
+    """Record commands that alias, disable, hash or write a bash variable before the idiom."""
     args = words[idx + 1 :]
     hash_reset = name == "hash" and all(w == "-r" for w in args)
     rebinds = name in REBINDING_COMMANDS and not hash_reset
@@ -1041,16 +1130,56 @@ def _path_operands(node: Any) -> Iterable[Any]:
     return ()
 
 
+def _print_command(node: Any) -> Any | None:
+    """Return the enclosing command when a literal sits in its non-name argument."""
+    child = node
+    current = node.parent
+    for _ in range(4):
+        if current is None or current.type not in PRINT_PARENTS:
+            break
+        child = current
+        current = current.parent
+    if current is not None and current.type == "command":
+        return current if child != current.child_by_field_name("name") else None
+    return None
+
+
+def _prints_to_terminal(command: Any) -> bool:
+    """Allow only ancestors that leave a print command's stdout on the script's stdout."""
+    current = command.parent
+    for _ in range(MAX_PRINT_DEPTH):
+        if current is None:
+            return True
+        if current.type not in TERMINAL_ANCESTORS:
+            return False
+        current = current.parent
+    return False
+
+
+def _printed_only(node: Any, raw: bytes, scan: _Scan) -> bool:
+    """Allow literal text only as a direct echo or non-assigning printf terminal argument."""
+    if node.type == "ERROR" or raw is not scan.top_raw:
+        return False
+    command = _print_command(node)
+    words, idx, name = _command_info(command, raw, scan.literals)
+    printf_assigns = name == "printf" and any(w.startswith("-v") for w in words[idx + 1 :])
+    return name in PRINT_COMMANDS and not printf_assigns and _prints_to_terminal(command)
+
+
 def _note_path_write(node: Any, raw: bytes, scan: _Scan) -> None:
-    """Record literal arithmetic text, loop variables, arithmetic and expansions binding PATH."""
-    if node.type in LITERAL_TEXT and PATH_ARITH_WRITE.search(_text(node, raw)) is not None:
+    """Record literal arithmetic, loop, arithmetic and expansion writes to bash variables."""
+    if (
+        node.type in LITERAL_TEXT
+        and _arith_writes_bash_variable(_text(node, raw))
+        and not _printed_only(node, raw, scan)
+    ):
         scan.rebound = True
         return
     for operand in _path_operands(node):
         if operand.type not in PATH_OPERANDS:
             continue
         match = ASSIGNED_NAME.match(_text(operand, raw))
-        if match is not None and match.group() == "PATH":
+        if match is not None and match.group() in BASH_VARIABLES:
             scan.rebound = True
             return
 
@@ -1140,7 +1269,7 @@ def _declaration_words(node: Any, raw: bytes) -> list[str]:
 
 
 def _note_path_words(node: Any, raw: bytes, scan: _Scan) -> None:
-    """Record PATH declarations, unsets and nameref flags before own-directory resolution."""
+    """Record bash variable declarations, unsets and namerefs before own-directory resolution."""
     if node.type not in ("declaration_command", "unset_command") or not node.children:
         return
     keyword = _text(node.children[0], raw)
@@ -1149,7 +1278,7 @@ def _note_path_words(node: Any, raw: bytes, scan: _Scan) -> None:
 
 
 def _path_binding_persists(assignment: Any, raw: bytes, scan: _Scan) -> bool:
-    """PATH assignment outside a command, or a prefix of a special builtin."""
+    """Match a bash variable assignment outside a command or before a special builtin."""
     return (
         assignment.parent.type != "command"
         or _command_info(assignment.parent, raw, scan.literals)[2] in SPECIAL_BUILTINS
@@ -1192,14 +1321,15 @@ def _store_script_dir(assignment: Any, name: str, override: str | None, scan: _S
 def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     """Resolve an own-directory name from its top-level assignment on, never before it.
 
-    PATH writes by loops, arithmetic, literal arithmetic text, assign-default expansions,
-    writer builtins, attached writer options, let operands, declarations, wrapped declarations,
-    unsets, namerefs, quoted declaration operands and special-builtin prefixes mark idiom
-    commands rebound; prefixes of other commands do not. A directory path or resolved script
-    file name holding a newline, or an assignment after rebinding, refuses every script path
-    referencing the name. After a directory change or unread source, with its override
-    assigned, or through a top-level declaration, later relative paths refuse; nested in a
-    function, branch or loop, every script path referencing the name refuses.
+    Documented bash variable writes by loops, arithmetic, literal arithmetic text (unless only
+    printed to the script's terminal output by echo or non-assigning printf), assign-default
+    expansions, writer builtins, attached writer options, let operands, declarations, wrapped
+    declarations, unsets, namerefs, quoted declaration operands and special-builtin prefixes
+    mark idiom commands rebound; prefixes of other commands do not. A directory path or
+    resolved script file name holding a newline, or an assignment after rebinding, refuses
+    every script path referencing the name. After a directory change or unread source, with
+    its override assigned, or through a top-level declaration, later relative paths refuse;
+    nested in a function, branch or loop, every script path referencing the name refuses.
     """
     if not scan.script_dirs:
         return
@@ -1207,7 +1337,7 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     for assignment in _assignment_nodes(node):
         match = ASSIGNED_NAME.match(_text(assignment, raw))
         name = match.group() if match is not None else ""
-        if name == "PATH" and _path_binding_persists(assignment, raw, scan):
+        if name in BASH_VARIABLES and _path_binding_persists(assignment, raw, scan):
             scan.rebound = True
             continue
         if name not in scan.script_dirs:
@@ -1293,7 +1423,7 @@ def scan_body(
     if isinstance(parser, str):
         return parser, [], [], []
     raw = body.encode("utf-8", "surrogateescape")
-    scan = _Scan(context, budget, dir_changed=context.directory_changed)
+    scan = _Scan(context, budget, dir_changed=context.directory_changed, top_raw=raw)
     root = parser.parse(raw).root_node
     assignments, scan.assigned = _assignment_texts(root, raw, budget)
     scan.literals = _find_literal_assignments(assignments)
