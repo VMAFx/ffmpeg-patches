@@ -64,7 +64,7 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/allfilters.c                      |    1 +
  libavfilter/hqdn3d_coefs.c                    |   58 +
  libavfilter/hqdn3d_coefs.h                    |   57 +
- libavfilter/tests/hqdn3d_vulkan.c             | 1044 +++++++++++++++++
+ libavfilter/tests/hqdn3d_vulkan.c             | 1047 +++++++++++++++++
  libavfilter/vf_hqdn3d.c                       |   33 +-
  libavfilter/vf_hqdn3d_vulkan.c                |  938 +++++++++++++++
  libavfilter/vulkan/Makefile                   |    2 +
@@ -72,7 +72,7 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  233 ++++
  tests/fate/hw.mak                             |    4 +
  tests/ref/fate/filter-hqdn3d-vulkan           |   21 +
- 14 files changed, 2571 insertions(+), 31 deletions(-)
+ 14 files changed, 2574 insertions(+), 31 deletions(-)
  create mode 100644 libavfilter/hqdn3d_coefs.c
  create mode 100644 libavfilter/hqdn3d_coefs.h
  create mode 100644 libavfilter/tests/hqdn3d_vulkan.c
@@ -313,10 +313,10 @@ index 0000000000000000000000000000000000000000..3399d70ec3d321ab51a61b99f1dabdb5
 +#endif /* AVFILTER_HQDN3D_COEFS_H */
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..0eb373c1c58432ef0c13e5939bc4eb40b274276f
+index 0000000000000000000000000000000000000000..50429313d6426b7d0f2f1d58ee8154eaaaa4ae8e
 --- /dev/null
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
-@@ -0,0 +1,1044 @@
+@@ -0,0 +1,1047 @@
 +/*
 + * Copyright (c) 2026 Lusoris
 + *
@@ -1034,14 +1034,16 @@ index 0000000000000000000000000000000000000000..0eb373c1c58432ef0c13e5939bc4eb40
 +/* Frame 0 has a black first column and frames 1 and 2 are at the p012 maximum.
 + * On this input hqdn3d on yuv420p12le computes 4096 in frames 1 and 2, which
 + * p012 cannot hold. Print the smallest and largest sample and the OR of the
-+ * low 4 bits of each output frame. */
++ * low 4 bits of each output frame, and return AVERROR_BUG unless frame 0
++ * spans 0 to 0xFFF0, frames 1 and 2 are 0xFFF0 throughout and no low bit
++ * is set. */
 +static int run_f4_step(AVBufferRef *vk_device_ref)
 +{
 +    AVBufferRef *frames_ref = NULL;
 +    AVFilterGraph *graph = NULL;
 +    AVFilterContext *gpu_src = NULL, *gpu_sink = NULL;
 +    AVFrame *sw_f = NULL, *gpu_in_vk = NULL, *gpu_out_vk = NULL, *sw_out = NULL;
-+    int err;
++    int err, bad = 0;
 +
 +    err = create_vk_frames_ctx(vk_device_ref, 160, 96, AV_PIX_FMT_P012, &frames_ref);
 +    if (err < 0)
@@ -1134,10 +1136,11 @@ index 0000000000000000000000000000000000000000..0eb373c1c58432ef0c13e5939bc4eb40
 +
 +        printf("p012 %d min %u max %u low %u\n", n, min_val, max_val, low_or);
 +        fflush(stdout);
++        bad |= min_val != (n ? 0xFFF0u : 0) || max_val != 0xFFF0u || low_or;
 +        av_frame_unref(sw_out);
 +    }
 +
-+    err = 0;
++    err = bad ? AVERROR_BUG : 0;
 +
 +end:
 +    av_frame_free(&sw_f);
