@@ -205,6 +205,31 @@ BASH_VARIABLES = frozenset(
         "UID",
     }
 )
+# glibc sysdeps/generic/unsecvars.h UNSECURE_ENVVARS: non-LD_ variables read by libc or ld.so.
+LOADER_VARIABLES = frozenset(
+    [
+        "GCONV_PATH",
+        "GETCONF_DIR",
+        "GLIBC_TUNABLES",
+        "HOSTALIASES",
+        "LOCALDOMAIN",
+        "LOCPATH",
+        "MALLOC_ARENA_MAX",
+        "MALLOC_ARENA_TEST",
+        "MALLOC_MMAP_MAX_",
+        "MALLOC_MMAP_THRESHOLD_",
+        "MALLOC_PERTURB_",
+        "MALLOC_TOP_PAD_",
+        "MALLOC_TRACE",
+        "MALLOC_TRIM_THRESHOLD_",
+        "NIS_PATH",
+        "NLSPATH",
+        "RESOLV_HOST_CONF",
+        "RES_OPTIONS",
+        "TMPDIR",
+        "TZDIR",
+    ]
+)
 SUBSHELLS = frozenset(["command_substitution", "process_substitution", "subshell"])
 IDIOM_COMMANDS = frozenset(["cd", "pwd", "dirname", "readlink", "realpath"])
 BLOCKED_FUNCTIONS = IDIOM_COMMANDS | frozenset(
@@ -214,6 +239,9 @@ SHAPE_DISALLOWED = re.compile(r"[^A-Za-z0-9_.:-]")
 DECLARATION_FLAGS = re.compile(r"-[rgx]+")
 PLAIN_WORD = re.compile(r"[A-Za-z0-9_./:@%+,=~^-]+")
 PLAIN_EXPANSION = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])\}")
+DEFAULT_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?-[A-Za-z0-9_./:@%+,=~^-]*\}")
+# Keep functions whose body prints or assigns a Bash variable (e.g. echo 'PATH=7') disallowed.
+BODY_ASSIGNED_NAME = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=")
 SET_FLAGS = re.compile(r"[-+][eu]+")
 SET_OPTION_CLUSTER = re.compile(r"[-+][eu]*o")
 EXIT_STATUS = re.compile(r"[0-9]+")
@@ -1060,25 +1088,30 @@ def _child_modes(node: Any, data_only: bool) -> list[tuple[Any, bool]]:
     return result
 
 
-def _plain_expansion(node: Any, raw: bytes) -> bool:
-    """Accept a braced variable or special-parameter expansion with no operator."""
-    return not node.has_error and PLAIN_EXPANSION.fullmatch(_text(node, raw)) is not None
+def _plain_expansion(node: Any, raw: bytes, *, defaults: bool = False) -> bool:
+    """Accept a plain braced expansion or an optional read-only default expansion."""
+    if node.has_error:
+        return False
+    text = _text(node, raw)
+    return PLAIN_EXPANSION.fullmatch(text) is not None or (
+        defaults and DEFAULT_EXPANSION.fullmatch(text) is not None
+    )
 
 
-def _plain_string(node: Any, raw: bytes) -> bool:
-    """Accept a double-quoted string built only from literal text and plain expansions."""
+def _plain_string(node: Any, raw: bytes, *, defaults: bool = False) -> bool:
+    """Accept a double-quoted string of literals, plain expansions or optional defaults."""
     for child in node.named_children:
         if child.has_error:
             return False
         if child.type in ("string_content", "simple_expansion"):
             continue
-        if child.type != "expansion" or not _plain_expansion(child, raw):
+        if child.type != "expansion" or not _plain_expansion(child, raw, defaults=defaults):
             return False
     return True
 
 
-def _plain_part(node: Any, raw: bytes) -> bool:
-    """Accept one static or plain-expansion value part outside arrays and substitutions."""
+def _plain_part(node: Any, raw: bytes, *, defaults: bool = False) -> bool:
+    """Accept one static, plain-expansion or optional read-only default value part."""
     if node.has_error:
         return False
     kind = node.type
@@ -1087,12 +1120,12 @@ def _plain_part(node: Any, raw: bytes) -> bool:
     if kind in ("raw_string", "ansi_c_string", "number", "simple_expansion"):
         return True
     if kind == "expansion":
-        return _plain_expansion(node, raw)
-    return kind == "string" and _plain_string(node, raw)
+        return _plain_expansion(node, raw, defaults=defaults)
+    return kind == "string" and _plain_string(node, raw, defaults=defaults)
 
 
-def _plain_value(node: Any, raw: bytes) -> bool:
-    """Accept an absent value, a plain part or a concatenation of plain parts."""
+def _plain_value(node: Any, raw: bytes, *, defaults: bool = False) -> bool:
+    """Accept an absent value, plain part or concatenation with optional default expansions."""
     if node is None:
         return True
     if node.has_error or node.type == "array":
@@ -1102,9 +1135,9 @@ def _plain_value(node: Any, raw: bytes) -> bool:
         return (
             bool(named)
             and len(node.children) == len(named)
-            and all(_plain_part(child, raw) for child in named)
+            and all(_plain_part(child, raw, defaults=defaults) for child in named)
         )
-    return _plain_part(node, raw)
+    return _plain_part(node, raw, defaults=defaults)
 
 
 def _plain_assignment_name(node: Any, raw: bytes) -> bool:
@@ -1119,7 +1152,7 @@ def _plain_assignment_name(node: Any, raw: bytes) -> bool:
 
 
 def _plain_assignment(node: Any, raw: bytes) -> bool:
-    """Accept a command-free scalar assignment with a plain operator and value."""
+    """Accept a command-free scalar assignment with a plain or read-only default value."""
     parent = node.parent
     if node.type != "variable_assignment" or node.has_error or parent is None:
         return False
@@ -1129,7 +1162,7 @@ def _plain_assignment(node: Any, raw: bytes) -> bool:
     if len(children) not in (2, 3) or children[1].type not in ("=", "+="):
         return False
     return _plain_assignment_name(node, raw) and _plain_value(
-        node.child_by_field_name("value"), raw
+        node.child_by_field_name("value"), raw, defaults=True
     )
 
 
@@ -1155,6 +1188,45 @@ def _own_dir_declaration(node: Any, raw: bytes, scan: _Scan) -> bool:
         if flag.type != "word" or DECLARATION_FLAGS.fullmatch(_text(flag, raw)) is None:
             return False
     return _own_dir_assignment(children[-1], raw, scan)
+
+
+def _allowed_export_name(name: str) -> bool:
+    """Accept an exported variable name outside Bash, environment and loader variables."""
+    return (
+        ASSIGNED_NAME.fullmatch(name) is not None
+        and name not in BASH_VARIABLES
+        and name not in os.environ
+        and not name.startswith("LD_")
+        and name not in LOADER_VARIABLES
+    )
+
+
+def _allowed_export_assignment(node: Any, raw: bytes) -> bool:
+    """Accept an export NAME=word assignment with a safe name and plain-word value."""
+    name_node = node.child_by_field_name("name")
+    value = node.child_by_field_name("value")
+    if name_node is None or name_node.type != "variable_name" or value is None:
+        return False
+    if len(node.children) != 3 or node.children[1].type != "=":
+        return False
+    if value.has_error or value.type != "word" or value.named_children:
+        return False
+    return _allowed_export_name(_text(name_node, raw)) and (
+        PLAIN_WORD.fullmatch(_text(value, raw)) is not None
+    )
+
+
+def _allowed_export(node: Any, raw: bytes) -> bool:
+    """Accept top-level export NAME or export NAME=word for safe variable names."""
+    children = node.children
+    if node.has_error or len(children) != 2 or children[0].is_named:
+        return False
+    if children[0].type != "export" or children[1].has_error:
+        return False
+    operand = children[1]
+    if operand.type == "variable_name":
+        return not operand.named_children and _allowed_export_name(_text(operand, raw))
+    return operand.type == "variable_assignment" and _allowed_export_assignment(operand, raw)
 
 
 def _allowed_assignments(node: Any, raw: bytes, scan: _Scan) -> bool:
@@ -1275,8 +1347,16 @@ def _allowed_command(node: Any, raw: bytes) -> bool:
     return _allowed_command_args(name, args, raw)
 
 
+def _function_body_allowed(body_node: Any, raw: bytes) -> bool:
+    """Refuse function bodies naming PATH or a documented Bash variable before =."""
+    return not any(
+        match.group(1) == "PATH" or match.group(1) in BASH_VARIABLES
+        for match in BODY_ASSIGNED_NAME.finditer(_text(body_node, raw))
+    )
+
+
 def _allowed_function(node: Any, raw: bytes) -> bool:
-    """Accept an unredirected plain function definition that shadows no idiom or builtin."""
+    """Accept an unredirected plain function shadowing no builtin and naming no Bash var=."""
     name_node = node.child_by_field_name("name")
     body_node = node.child_by_field_name("body")
     if name_node is None or name_node.type != "word" or body_node is None:
@@ -1287,7 +1367,11 @@ def _allowed_function(node: Any, raw: bytes) -> bool:
     ):
         return False
     name = _text(name_node, raw)
-    return PLAIN_FUNCTION.fullmatch(name) is not None and name not in BLOCKED_FUNCTIONS
+    return (
+        PLAIN_FUNCTION.fullmatch(name) is not None
+        and name not in BLOCKED_FUNCTIONS
+        and _function_body_allowed(body_node, raw)
+    )
 
 
 def _step_list_node(current: Any, raw: bytes, stack: list[Any]) -> bool:
@@ -1316,17 +1400,17 @@ def _allowed_list(node: Any, raw: bytes) -> bool:
 
 
 def _assignment_statement_allowed(node: Any, raw: bytes, scan: _Scan) -> bool:
-    """Accept top-level own-directory or plain assignment statements."""
+    """Accept top-level own-directory, plain assignment or safe export statements."""
     kind = node.type
     if kind == "variable_assignment":
         return _own_dir_assignment(node, raw, scan) or _plain_assignment(node, raw)
     if kind == "declaration_command":
-        return _own_dir_declaration(node, raw, scan)
+        return _own_dir_declaration(node, raw, scan) or _allowed_export(node, raw)
     return kind == "variable_assignments" and _allowed_assignments(node, raw, scan)
 
 
 def _statement_allowed(node: Any, raw: bytes, scan: _Scan) -> bool:
-    """Decide whether a top-level statement belongs to the own-directory allow-list."""
+    """Accept allow-listed top-level assignments, exports, commands, functions and lists."""
     if node.has_error or (node.next_sibling is not None and node.next_sibling.type == "&"):
         return False
     kind = node.type
@@ -1493,13 +1577,15 @@ def _store_script_dir(assignment: Any, name: str, override: str | None, scan: _S
 def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
     """Resolve an own-directory name from its top-level assignment on, never before it.
 
-    A top-level statement outside the own-directory allow-list before the assignment, or
-    BASH_ENV, ENV or an exported BASH_FUNC_ function in the environment, marks idiom commands
-    rebound and refuses top-level resolution. A directory path or resolved script file name
-    holding a newline refuses every script path referencing the name. After a directory change
-    or unread source, with its override assigned, or through a top-level declaration, later
-    relative paths refuse; nested in a function, branch or loop, every script path referencing
-    the name refuses.
+    A top-level statement outside the own-directory allow-list (which includes safe export
+    declarations, read-only default expansions in plain assignments, and functions whose body
+    names no PATH or Bash variable before =) before the assignment, or BASH_ENV, ENV or an
+    exported BASH_FUNC_ function in the environment, marks idiom commands rebound and refuses
+    top-level resolution. A directory path or resolved script file name holding a newline
+    refuses every script path referencing the name. After a directory change or unread source,
+    with its override assigned, or through a top-level declaration, later relative paths
+    refuse; nested in a function, branch or loop, every script path referencing the name
+    refuses.
     """
     if not scan.script_dirs:
         return

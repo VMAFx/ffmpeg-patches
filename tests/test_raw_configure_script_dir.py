@@ -629,7 +629,7 @@ SCRIPT_DIR = {
     "r9-set-x": Case("set -x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "r9-set-a": Case("set -a\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "r9-quoted-set": Case("'set' -e\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
-    "r9-default-expansion-value": Case("X=${Y:-z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-default-expansion-value": Case("X=${Y:-z}\n" + DOLLAR0 + SRC + RUN, 0),
     "r9-command-substitution-value": Case("X=$(true)\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "r9-cdpath-assign": Case("CDPATH=/x\n" + CDPWD + SRC + RUN, 2, REBOUND),
     "r9-env-name-assign": Case("LANE_X=2\n" + DOLLAR0 + SRC + RUN, 2, REBOUND, env={"LANE_X": "1"}),
@@ -639,6 +639,54 @@ SCRIPT_DIR = {
     "r9-array-assign": Case("a=(x)\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "r9-subscript-assign": Case("a[0]=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "r9-function-named-set": Case("set() { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-plain-word": Case("export LANE_R10=squash_merge.sh\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-export-name": Case("LANE_R10=1\nexport LANE_R10\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-landing-squash-shape": Case(
+        "set -euo pipefail\nexport LANE_CALLER=squash_merge.sh\n" + DOLLAR0 + SRC + RUN, 0
+    ),
+    "r10-landing-reland-shape": Case(
+        "set -euo pipefail\nR=a/b; pr=$1; wt=$2\nT=${LANE_ROOT:-/home/x/triage-1}\n"
+        + DOLLAR0
+        + SRC
+        + RUN,
+        0,
+    ),
+    "r10-default-dash": Case("X=${Y-z}\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-default-empty": Case("X=${Y:-}\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-default-concat": Case("X=${Y:-/a}/b\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-default-quoted": Case('X="${Y:-/a}"\n' + DOLLAR0 + SRC + RUN, 0),
+    "r10-default-path-read": Case("X=${PATH:-/bin}\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-function-longer-name-body": Case("f() { MYPATH=x; }\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-function-bare-path-word": Case("f() { echo PATH; }\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-export-bash-variable": Case("export IFS=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-path": Case("export PATH=/x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-bash-name": Case("export BASH_ENV\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-ld-preload": Case("export LD_PRELOAD=/x.so\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-ld-name": Case(
+        "LD_AUDIT=/x.so\nexport LD_AUDIT\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r10-export-loader-name": Case("export GCONV_PATH=/x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-env-name": Case(
+        "export LANE_X=2\n" + DOLLAR0 + SRC + RUN, 2, REBOUND, env={"LANE_X": "1"}
+    ),
+    "r10-export-quoted-value": Case('export LANE_R10="$x"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-substitution": Case("export LANE_R10=$(true)\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-default-value": Case("export LANE_R10=${Y:-z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-two-operands": Case("export A=1 B=2\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-append": Case("export LANE_R10+=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-flag-p": Case("export -p\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-assign-colon": Case("X=${Y:=z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-assign": Case("X=${Y=z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-alternative": Case("X=${Y:+z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-indirect": Case("X=${!Y:-z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-substitution": Case("X=${Y:-$(true)}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-nested": Case("X=${Y:-$Z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-exit-operand": Case("exit ${Y:-1}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-path-target": Case("PATH=${Y:-/x}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-function-ifs-body": Case("f() { IFS=x; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-function-printed-argv0": Case(
+        "f() { printf '%s' 'BASH_ARGV0=/x'; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
 }
 
 
@@ -686,8 +734,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 242 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 242)
+        """Replay all 276 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 276)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
