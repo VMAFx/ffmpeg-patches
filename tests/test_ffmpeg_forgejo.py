@@ -1956,6 +1956,28 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertEqual(proc.returncode, 76, proc.stderr)
         self.assertEqual(self.patches(stub), [])
 
+    def test_edit_body_abbreviated_evidence_rechecks_full_head(self) -> None:
+        """Abbreviated evidence cannot carry a body edit across a push to a same-prefix head."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        stub = Stub([LIVE, LIVE, LIVE, other], {LIVE: [[label("success")]]})
+        proc = self.edit_body(
+            stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE[:7])
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertIn(other, proc.stderr)
+
+    def test_edit_body_abbreviated_evidence_same_head_edits(self) -> None:
+        """Abbreviated evidence still edits when every read returns the same head."""
+
+        stub = Stub([LIVE, LIVE, LIVE, LIVE], {LIVE: [[label("success")]]})
+        proc = self.edit_body(
+            stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE[:7])
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.patches(stub)), 1)
+
     def test_invalid_tested_heads_are_usage_errors(self) -> None:
         """Short and nonhex tested heads are usage errors without writes."""
 
