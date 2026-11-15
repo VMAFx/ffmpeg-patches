@@ -39,6 +39,17 @@ starting `Reproducer:`; diagnostics named without a flag and workarounds
 described in other words are not detected. The two-word phrases match across a
 line break, and a flag suffix may contain `#`, uppercase letters, digits, `+`,
 `_`, `=` and `-`.
+
+The claim-scope step fails a commit whose message makes a blanket verification
+claim (passes all tests, all tests pass, fully tested or verified, thoroughly
+tested, no regressions, completely or 100% safe, verified or tested), never
+waivable, and a commit whose message claims several sites (both, all, every or
+each, followed within two words by loops, callers, call sites, branches, paths,
+cases, functions, uses, instances, places, sites or occurrences) while its diff
+changes exactly one hunk in library or fftools sources; --claim-reason TEXT
+waives only the second rule. Signed-off-by lines are ignored; claims worded
+otherwise, and claims that a multi-hunk diff still does not support, are not
+detected.
 """
 
 from __future__ import annotations
@@ -122,6 +133,19 @@ DIAGNOSTIC_CITATION = re.compile(
     r"|github\.com/llvm/llvm-project/issues/|godbolt\.org/)\S+"
     r"|^Reproducer:[ \t]*\S",
     re.IGNORECASE | re.MULTILINE,
+)
+VERIFICATION_CLAIM = re.compile(
+    r"\b(pass(?:es|ed)?\s+all\s+(?:the\s+)?(?:fate\s+)?tests"
+    r"|all\s+(?:the\s+)?(?:fate\s+)?tests\s+pass(?:es|ed)?"
+    r"|fully\s+(?:tested|verified)|thoroughly\s+tested"
+    r"|no\s+regressions?(?!\s+tests?\b)|(?:completely|100%)\s+(?:safe|verified|tested))\b",
+    re.IGNORECASE,
+)
+SCOPE_CLAIM = re.compile(
+    r"\b(?:both|all|every|each)\s+(?:\w+[ -]){0,2}?"
+    r"(?:loops?|callers?|call[ -]sites?|branches|paths|cases"
+    r"|functions|uses|instances|places|sites|occurrences)\b",
+    re.IGNORECASE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an
 # allow-list: heuristic and newly introduced categories require human review.
@@ -1171,9 +1195,14 @@ def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("regression-test", 1, "\n".join(f"{item}: {suffix}" for item in headed))
 
 
+def _without_signoff(message: str) -> str:
+    """Return a commit message with Signed-off-by trailer lines removed."""
+    return "\n".join(line for line in message.splitlines() if not line.startswith("Signed-off-by:"))
+
+
 def uncited_diagnostic(message: str) -> str | None:
     """Return the first uncited compiler diagnostic flag in a workaround message."""
-    text = "\n".join(line for line in message.splitlines() if not line.startswith("Signed-off-by:"))
+    text = _without_signoff(message)
     flag = DIAGNOSTIC_FLAG.search(text)
     if flag and WORKAROUND_WORDING.search(text) and not DIAGNOSTIC_CITATION.search(text):
         return flag[0]
@@ -1201,6 +1230,87 @@ def _diagnostic_citation(tree: Path, base: str, head: str) -> Step:
     return Step("diagnostic-citation", 0, f"no uncited diagnostic workaround in {count} commits")
 
 
+def unverified_claim(message: str) -> str | None:
+    """Return the first blanket verification claim in a commit message."""
+    match = VERIFICATION_CLAIM.search(_without_signoff(message))
+    return match[0] if match else None
+
+
+def scope_claim(message: str) -> str | None:
+    """Return the first multi-site scope claim in a commit message."""
+    match = SCOPE_CLAIM.search(_without_signoff(message))
+    return match[0] if match else None
+
+
+def source_hunks(patch: str) -> int:
+    """Count unified-diff hunks belonging to library or fftools source files."""
+    count = 0
+    in_source = False
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            in_source = False
+        elif line.startswith("+++ "):
+            in_source = line.startswith("+++ b/") and is_source_path(line.removeprefix("+++ b/"))
+        elif in_source and HUNK.match(line):
+            count += 1
+    return count
+
+
+def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[str | None, str | None]:
+    """Check one commit's message and diff for unverified or single-hunk scope claims."""
+    unverified_finding = None
+    blanket = unverified_claim(message)
+    if blanket is not None:
+        unverified_finding = (
+            f'{commit[:12]}: claims "{blanket}"; '
+            "name the test command and platform that ran instead"
+        )
+    scope_finding = None
+    scoped = scope_claim(message)
+    if scoped is not None:
+        patch = _git(
+            tree,
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "-p",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            commit,
+        )
+        if source_hunks(patch) == 1:
+            scope_finding = (
+                f'{commit[:12]}: claims "{scoped}" but changes 1 source hunk; '
+                "show each site or pass --claim-reason"
+            )
+    return unverified_finding, scope_finding
+
+
+def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Reject blanket verification claims and unwaived single-hunk multi-site claims."""
+    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    records = list(filter(None, log.split("\0")))
+    unverified: list[str] = []
+    scoped: list[str] = []
+    for record in records:
+        commit, _, message = record.partition("\n")
+        rule_a, rule_b = _commit_claim_findings(tree, commit, message)
+        if rule_a is not None:
+            unverified.append(rule_a)
+        if rule_b is not None:
+            scoped.append(rule_b)
+    if not (unverified or scoped):
+        return Step("claim-scope", 0, f"no unsupported claim in {len(records)} commits")
+    reason = waiver.strip()
+    if scoped and reason:
+        lines = [*unverified, f"waived: {reason}", *scoped]
+        return Step("claim-scope", int(bool(unverified)), "\n".join(lines))
+    return Step("claim-scope", 1, "\n".join([*unverified, *scoped]))
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
     try:
         return action()
@@ -1208,7 +1318,9 @@ def _collect(name: str, action: Callable[[], Step]) -> Step:
         return Step(name, 2, str(error))
 
 
-def _checks(tree: Path, base: str, head: str, waiver: str = "") -> list[Step]:
+def _checks(
+    tree: Path, base: str, head: str, waiver: str = "", claim_reason: str = ""
+) -> list[Step]:
     """Collect every independent check even when another check fails."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-upstream-lint-") as directory:
         scratch = Path(directory)
@@ -1220,6 +1332,7 @@ def _checks(tree: Path, base: str, head: str, waiver: str = "") -> list[Step]:
             _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
             _collect("regression-test", lambda: _regression_test(tree, base, head, waiver)),
             _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
+            _collect("claim-scope", lambda: _claim_scope(tree, base, head, claim_reason)),
         ]
 
 
@@ -1235,12 +1348,18 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="why the fix commits in the range carry no test; waives the regression-test step",
     )
+    parser.add_argument(
+        "--claim-reason",
+        default="",
+        help="why a multi-site claim is backed by one source hunk; "
+        "waives that claim-scope rule only",
+    )
     args = parser.parse_args(argv)
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
         base, head = _prepare(tree, base, head)
-        steps = _checks(tree, base, head, args.no_test_reason)
+        steps = _checks(tree, base, head, args.no_test_reason, claim_reason=args.claim_reason)
         _remaining(0)
     except (OSError, RuntimeError, ValueError) as error:
         steps = [Step("preflight", 2, str(error))]
