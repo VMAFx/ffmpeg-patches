@@ -108,6 +108,7 @@ def build_layer(directory: Path) -> Path:
         [
             _compiler(),
             "-std=c17",
+            "-D_GNU_SOURCE",
             "-O1",
             "-Wall",
             "-Wextra",
@@ -259,6 +260,13 @@ class FaultRuleTest(unittest.TestCase):
                 return
         self.assertNotEqual(compiler, "/nonexistent/evil-cc")
         self.assertTrue(Path(compiler).is_absolute(), compiler)
+
+    @unittest.skipUnless(shutil.which("cc"), "no C compiler cc on PATH")
+    def test_build_layer_compiles_without_device(self) -> None:
+        """Compile the Vulkan fault layer shared object without a Vulkan device."""
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = build_layer(Path(tmp)) / "libvk_fault.so"
+            self.assertTrue(lib.is_file())
 
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")

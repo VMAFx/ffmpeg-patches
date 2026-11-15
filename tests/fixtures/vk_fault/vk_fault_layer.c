@@ -6,19 +6,18 @@
  * 127 characters) from begin=N, submit=N, view=N (N in 1..1000) and fence.
  * The layer reads VMAFX_VK_FAULT through secure_getenv, as the Vulkan loader
  * reads its own variables, so a setuid or setgid process sees no fault
- * configuration. On instance creation it writes "vk_fault: active <value|none>"
- * or "vk_fault: bad VMAFX_VK_FAULT value" to stderr; each injected failure
- * writes "vk_fault: injected <function> failure (call <N>)" to stderr and
- * returns VK_ERROR_OUT_OF_DEVICE_MEMORY. tests/test_hqdn3d_vulkan_fault.py
- * builds and loads this layer. The loader-layer negotiation and link-chain
- * interface follows docs/LoaderLayerInterface.md of KhronosGroup/Vulkan-Loader
- * (Apache-2.0).
+ * configuration. Build it with -D_GNU_SOURCE, which declares secure_getenv and
+ * strnlen in glibc. On instance creation it writes "vk_fault: active
+ * <value|none>" or "vk_fault: bad VMAFX_VK_FAULT value" to stderr; each
+ * injected failure writes "vk_fault: injected <function> failure (call <N>)"
+ * to stderr and returns VK_ERROR_OUT_OF_DEVICE_MEMORY.
+ * tests/test_hqdn3d_vulkan_fault.py builds and loads this layer. The
+ * loader-layer negotiation and link-chain interface follows
+ * docs/LoaderLayerInterface.md of KhronosGroup/Vulkan-Loader (Apache-2.0).
  *
  * SPDX-FileCopyrightText: 2026 Lusoris
  * SPDX-License-Identifier: EUPL-1.2
  */
-/* Declare secure_getenv in glibc. */
-#define _GNU_SOURCE /* NOLINT(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) */
 
 #include <errno.h>
 #include <pthread.h>

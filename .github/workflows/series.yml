@@ -186,13 +186,16 @@ jobs:
         # as system headers so that only the generator is judged. The Vulkan
         # loader finds the exported entry point of the fault layer with dlsym;
         # .config/cppcheck/vulkan-layer.cfg names it as an entry point, so
-        # cppcheck knows its caller.
+        # cppcheck knows its caller. The fault layer reads secure_getenv and
+        # strnlen, which glibc declares under _GNU_SOURCE; the flag comes from
+        # the command line because clang-tidy rejects a reserved identifier
+        # defined in the source.
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           clang-tidy --version | head -2
           cppcheck --version
           mapfile -t sources < .config/clang-tidy/sources.txt
-          clang-tidy --quiet "${sources[@]}" -- -std=c17 -isystem ffmpeg -isystem build
+          clang-tidy --quiet "${sources[@]}" -- -std=c17 -D_GNU_SOURCE -isystem ffmpeg -isystem build
           cppcheck --enable=all --std=c17 --check-level=exhaustive --error-exitcode=1 \
             --suppress=missingIncludeSystem --suppress=checkersReport \
             --library=.config/cppcheck/vulkan-layer.cfg "${sources[@]}"
