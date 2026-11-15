@@ -181,6 +181,25 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(upstream_lint._added_lines("@@ -2 +2,2 @@\n+a\n+b\n"), {2, 3})
 
 
+class RegressionTestPathTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of test and source path predicates."""
+
+    def test_is_test_path(self) -> None:
+        """Top-level and nested tests directories match; source directories do not."""
+        self.assertTrue(upstream_lint.is_test_path("tests/fate/x.mak"))
+        self.assertTrue(upstream_lint.is_test_path("libavutil/tests/x.c"))
+        self.assertFalse(upstream_lint.is_test_path("libavfilter/vf_x.c"))
+
+    def test_is_source_path(self) -> None:
+        """Library and fftools sources match while test, doc and compat paths do not."""
+        for path in ("libavfilter/vf_x.c", "fftools/ffmpeg.c", "libavcodec/x86/x.asm"):
+            with self.subTest(path=path):
+                self.assertTrue(upstream_lint.is_source_path(path))
+        for path in ("libavutil/tests/x.c", "doc/filters.texi", "compat/x.c"):
+            with self.subTest(path=path):
+                self.assertFalse(upstream_lint.is_source_path(path))
+
+
 FATE_RED = (
     "FATE_SCALE_REFUSE = fate-filter-scale-ipt-c2-refuse-rgb "
     "fate-filter-scale-ipt-c2-refuse-range\n"
@@ -792,7 +811,7 @@ class FixtureTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
 
-    def commit(self, subject="avfilter/vf_x: fix y"):
+    def commit(self, subject="avfilter/vf_x: update y"):
         """Commit fixture changes; never touch the implementation repository."""
         self.git("add", ".")
         self.git("commit", "-qm", subject)
@@ -836,9 +855,63 @@ class PipelineTest(FixtureTest):
             "patcheck",
             "developer.texi",
             "fate-deps",
+            "regression-test",
             "diagnostic-citation",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_fix_without_test_fails(self) -> None:
+        """A source fix commit with no changed test path in the range fails."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        for name in ("pre-commit", "commit-msg", "patcheck", "developer.texi", "fate-deps"):
+            self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_fix_with_test_passes(self) -> None:
+        """A source fix accompanied by a test file in the same commit passes."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_test_in_later_commit_passes(self) -> None:
+        """A test added in a separate commit within the same range satisfies the check."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.commit("tests/fate: add filter-x")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_waiver_passes(self) -> None:
+        """A non-blank --no-test-reason waives a source fix without a test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check("--no-test-reason", "hardware-only path")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: hardware-only path", output)
+
+    def test_blank_waiver_fails(self) -> None:
+        """Whitespace-only --no-test-reason does not waive a missing regression test."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check("--no-test-reason", "  ")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_fix_outside_sources_passes(self) -> None:
+        """A fix commit touching only documentation does not require a test path."""
+        self.write("doc/x.texi", "fixed wording\n")
+        self.commit("doc/x: fix a typo")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
 
     def test_uncited_diagnostic_workaround_fails(self) -> None:
         """An uncited compiler-diagnostic workaround fails only its own step."""
@@ -1271,7 +1344,7 @@ class RealToolsTest(FixtureTest):
     def test_clean_commit_passes(self):
         """The requested area-prefixed subject and clean C change pass."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
-        self.commit("avfilter/vf_x: fix y")
+        self.commit("avfilter/vf_x: update y")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
 
