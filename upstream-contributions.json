@@ -1,5 +1,5 @@
 {
-  "checked": "2026-11-13",
+  "checked": "2026-11-14",
   "contributions": [
     {
       "number": 24045,
@@ -316,7 +316,7 @@
     {
       "number": 25476,
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25476",
-      "title": "avformat: fix GCC 14 and 16 warnings in mpegts, nspdec and rtsp",
+      "title": "avformat: fix GCC 14 and 16 warnings in nspdec and rtsp",
       "base": "master",
       "state": "open",
       "merged_at": "",
