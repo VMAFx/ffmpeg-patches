@@ -178,6 +178,7 @@ class Stub:
     fail_status: answer the status endpoint with HTTP 500.
     pull_status: answer GET /pulls/1 with this HTTP status instead of a pull.
     paginate_large_comments: paginate comment rows normally even when there are more than 1000.
+    on_pull: optional callback run on GET /pulls/1 before building the reply.
     """
 
     def __init__(
@@ -195,6 +196,7 @@ class Stub:
         self.heads, self.polls = heads, polls
         self.merge_base = MERGE_BASE
         self.pull_body = ""
+        self.on_pull = None
         self.fail_status = bool(kwargs.get("fail_status", False))
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
@@ -375,6 +377,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         if url.path.endswith("/pulls/1"):
             stub.pull_headers.append(dict(self.headers.items()))
+            if stub.on_pull is not None:
+                stub.on_pull()
             if stub.pull_status == 200:
                 self.reply(200, stub.pull())
             else:
@@ -1180,6 +1184,42 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.run_helper(stub), 0)
         self.assertEqual(self.patches(stub), [body])
 
+    def test_edit_body_patches_the_checked_snapshot(self) -> None:
+        """Rewriting the body file during pull reads cannot alter the patched snapshot."""
+
+        body_path = self.tmp / "body.md"
+        original = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        body_path.write_text(original, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        stub.on_pull = lambda: body_path.write_text(
+            "Base: FFmpeg master 46f23be8b197.\n", encoding="utf-8"
+        )
+        proc = self.run_command(stub, "edit-body", "--no-test-claims", "1", str(body_path))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [original])
+
+    def test_edit_body_base_read_is_the_head_reread(self) -> None:
+        """The Autolabel head re-read performs the base check without a later pull read."""
+
+        stub = Stub([A, A, B], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [BODY])
+        self.assertEqual(stub.head_reads, 2)
+
+    def test_edit_body_head_change_in_base_read_exits_75(self) -> None:
+        """A head change seen by the base-check pull read exits 75 without a PATCH."""
+
+        stub = Stub([A, B], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 75, proc.stderr)
+        self.assertIn("superseded by a new push", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
 
 class TestClaimHeadTest(ForgejoTest):
     """Validate evidence before accepting claims about a tested head."""
@@ -1705,6 +1745,27 @@ class TestClaimHeadTest(ForgejoTest):
         proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
+
+    def test_comment_posts_the_checked_snapshot(self) -> None:
+        """Rewriting the comment body file during pull reads cannot alter the posted text."""
+
+        body_path = self.tmp / "body.md"
+        stub = Stub([LIVE])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        stub.on_pull = lambda: body_path.write_text("changed\n", encoding="utf-8")
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_comment_head_change_in_base_read_exits_76(self) -> None:
+        """A head change seen by the base-check pull read exits 76 without posting."""
+
+        stub = Stub([LIVE, LIVE, B])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("base check", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
 
     def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
         """Both writes reject a different full head sharing the tested prefix."""
@@ -3599,7 +3660,7 @@ MUTANTS = {
         "test_pending_and_none_are_refused",
     ),
     "head not rechecked": (
-        '[ "$(head_sha "$1")" = "$sha" ] && break',
+        'if require_current_base "$1" 0 "$snapshot" "$sha" "$2"; then break; fi',
         "break",
         "test_a_push_during_the_check_is_not_cleared_by_the_old_head",
     ),

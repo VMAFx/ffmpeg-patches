@@ -26,6 +26,7 @@
 #                          comment on an issue or PR; test claims must match the live PR head;
 #                          exits 78 when the body equals an own existing comment after whitespace normalization
 #                          with --tested-head, exits 80 when the comment or the live PR body names a base commit other than the live merge base
+#                          the comment posts the body file as read once at start; a head change seen by the base check exits 76
 #   ffmpeg-forgejo edit-body [--wait] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          replace a PR body; test claims must match the live PR head; refuses (exit 75) while the
 #                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
@@ -33,6 +34,7 @@
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
 #                          exits 80 when the new body names a base commit other than the live merge base (scripts/base_claims.py)
+#                          the PATCH sends the body file as read once at start
 # Evidence test claims start with `- test:` or `test:` after optional whitespace.
 # Every such line needs head=<7-40 hex> and tree=<path>; other lines are ignored.
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
@@ -300,10 +302,10 @@ print(sha)' \
   [ -z "$evidence" ] || require_claim_evidence "$evidence" "$live"
 }
 
-# require_current_base NUMBER LIVE BODY-FILE: exit 80 when BODY-FILE (and the live PR body when LIVE is 1) names a base commit other than the live merge base.
+# require_current_base NUMBER LIVE BODY-FILE HEAD LABEL: exit 80 when BODY-FILE (and the live PR body when LIVE is 1) names a base commit other than the live merge base; return 3 when the same pull read shows a head other than HEAD.
 require_current_base() {
-  local number="$1" live="$2" body_file="$3" response status body self rc
-  local -a args=(--pull-json -)
+  local number="$1" live="$2" body_file="$3" head="$4" label="$5" response status body self rc
+  local -a args=(--pull-json - --head "$head" --label "$label")
   if response="$(pull_status "$number")"; then rc=0; else rc=$?; fi
   [ "$rc" -eq 0 ] || die "base check: cannot read pull #$number (curl rc $rc)"
   status="${response%%$'\n'*}"
@@ -317,6 +319,7 @@ require_current_base() {
   else
     rc=$?
   fi
+  [ "$rc" -ne 3 ] || return 3
   [ "$rc" -ne 1 ] || exit 80
   die "base check: helper exited $rc"
 }
@@ -1281,16 +1284,25 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: $1"
     [ -f "$2" ] || die "no body file $2"
+    snapshot="$(mktemp)"
+    chmod 600 "$snapshot"
+    trap 'rm -f "$snapshot"' EXIT
+    cat -- "$2" >"$snapshot" || die "cannot read body file $2"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     me="$(token_login)" || die "cannot read token login"
     discover_page_size
     out="$(api_list "/repos/$REPO/issues/$1/comments?" 200)" || exit 1
-    check_comment_duplicate "$1" "$2" "$me" <<<"$out"
+    check_comment_duplicate "$1" "$snapshot" "$me" <<<"$out"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
-    [ "$claim_mode" != "tested-head" ] || require_current_base "$1" 1 "$2"
+    if [ "$claim_mode" = "tested-head" ] \
+      && ! require_current_base "$1" 1 "$snapshot" "$tested_head" "$2"; then
+      printf 'ffmpeg-forgejo: tested head %s does not match the head read by the base check.\n' \
+        "$tested_head" >&2
+      exit 76
+    fi
     body="$(mktemp)"
-    json_body "body=@$2" >"$body"
+    json_body "body=@$snapshot" >"$body"
     api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
     rm -f "$body"
     ;;
@@ -1303,16 +1315,21 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
     [ -f "$2" ] || die "no body file $2"
+    snapshot="$(mktemp)"
+    chmod 600 "$snapshot"
+    trap 'rm -f "$snapshot"' EXIT
+    cat -- "$2" >"$snapshot" || die "cannot read body file $2"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
-    # The head is read again after the status check: a push in between starts a new Autolabel
-    # run, and the finished statuses of the old head must not clear the edit. Forgejo's PR edit
-    # takes no expected head, so a push landing between this last read and the PATCH still races.
+    # The head re-read after the status check is the base check's pull read: a push in between
+    # starts a new Autolabel run, and the finished statuses of the old head must not clear the
+    # edit. Forgejo's PR edit takes no expected head, so a push landing between this last read
+    # and the PATCH still races.
     for ((i = 1; i <= 80; i++)); do
       sha="$(head_sha "$1")"
       state="$(autolabel_state "$sha")"
       if [ "$state" = "done" ]; then
-        [ "$(head_sha "$1")" = "$sha" ] && break
+        if require_current_base "$1" 0 "$snapshot" "$sha" "$2"; then break; fi
         state="superseded by a new push"
       fi
       if [ "$wait" = 0 ] || [ "$i" = 80 ]; then
@@ -1322,9 +1339,8 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
       sleep "${FFMPEG_FORGEJO_POLL:-15}"
     done
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
-    require_current_base "$1" 0 "$2"
     body="$(mktemp)"
-    json_body "body=@$2" >"$body"
+    json_body "body=@$snapshot" >"$body"
     api PATCH "/repos/$REPO/pulls/$1" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
     rm -f "$body"
     ;;

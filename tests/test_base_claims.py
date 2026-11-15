@@ -151,6 +151,69 @@ class BaseClaimsTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertNotEqual(err, "")
 
+    def test_find_base_claims_commonmark_fences(self) -> None:
+        """CommonMark backtick and tilde fences track marker, length, indent and info strings."""
+        cases = (
+            ("````text\n```\n````\nBase: aaaaaaa.\n", ["aaaaaaa"]),
+            ("~~~\nBase: aaaaaaa.\n~~~\n", []),
+            ("```\nBase: aaaaaaa.\n````  \nBase: bbbbbbb.\n", ["bbbbbbb"]),
+            ("```\n``` text\nBase: aaaaaaa.\n```\n", []),
+            ("~~~\n```\nBase: aaaaaaa.\n~~~\nBase: bbbbbbb.\n", ["bbbbbbb"]),
+            ("    ```\nBase: aaaaaaa.\n", ["aaaaaaa"]),
+            ("``` a`b\nBase: aaaaaaa.\n", ["aaaaaaa"]),
+        )
+        for sample, expected in cases:
+            with self.subTest(sample=sample):
+                self.assertEqual(base_claims.find_base_claims(sample), expected)
+
+    def test_find_base_claims_clause_scoped_history_words(self) -> None:
+        """History markers drop only claims in their own clause and keep later current claims."""
+        compound = "Previous base: ccccccc; current base: aaaaaaa."
+        self.assertEqual(base_claims.find_base_claims(compound), ["aaaaaaa"])
+        self.assertEqual(base_claims.stale_claims(compound, "c" * 40), ["aaaaaaa"])
+        self.assertEqual(
+            base_claims.find_base_claims("Previous base: ccccccc, now base aaaaaaa"),
+            ["aaaaaaa"],
+        )
+        self.assertEqual(
+            base_claims.find_base_claims("rebased from the previous base abc1234"),
+            [],
+        )
+
+    def test_main_head_option(self) -> None:
+        """CLI --head checks pull head.sha before claims and rejects invalid usage or heads."""
+        pull_file = self.write_fixture(
+            "pull.json",
+            json.dumps({"head": {"sha": "a" * 40}, "merge_base": "c" * 40}),
+        )
+        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "aaaaaaa")
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+
+        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "bbbbbbb")
+        self.assertEqual(rc, 3)
+        self.assertIn("pull head", err)
+
+        no_head = self.write_fixture("no_head.json", json.dumps({"merge_base": "c" * 40}))
+        rc, err = self.run_cli("--pull-json", str(no_head), "--head", "aaaaaaa")
+        self.assertEqual(rc, 2)
+        self.assertNotEqual(err, "")
+
+        rc, err = self.run_cli("--merge-base", "c" * 40, "--head", "aaaaaaa")
+        self.assertEqual(rc, 2)
+        self.assertNotEqual(err, "")
+
+        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "xyz")
+        self.assertEqual(rc, 2)
+        self.assertNotEqual(err, "")
+
+    def test_main_label_option(self) -> None:
+        """CLI --label replaces the file path in stale-claim diagnostic messages."""
+        stale_file = self.write_fixture("stale.md", "Base: FFmpeg master 46f23be8b197.\n")
+        rc, err = self.run_cli("--merge-base", MERGE_BASE, "--label", "shown-name", str(stale_file))
+        self.assertEqual(rc, 1)
+        self.assertTrue(err.startswith("shown-name:"), err)
+
 
 if __name__ == "__main__":
     unittest.main()
