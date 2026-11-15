@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
 A = "a" * 40
 B = "b" * 40
+MERGE_BASE = "c" * 40
 LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
@@ -192,6 +193,8 @@ class Stub:
         heads = heads or [A]
         polls = polls or {}
         self.heads, self.polls = heads, polls
+        self.merge_base = MERGE_BASE
+        self.pull_body = ""
         self.fail_status = bool(kwargs.get("fail_status", False))
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
@@ -246,6 +249,8 @@ class Stub:
         return {
             "number": 1,
             "head": {"sha": self.head()},
+            "merge_base": self.merge_base,
+            "body": self.pull_body,
             "html_url": "stub/pulls/1",
             "requested_reviewers": [
                 {"login": login}
@@ -1154,6 +1159,27 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.run_helper(stub, path_first=broken), 75)
         self.assertEqual(self.patches(stub), [])
 
+    def test_edit_body_stale_base_claim_exits_80(self) -> None:
+        """A stale base claim in the new PR body exits 80 without a PATCH."""
+
+        (self.tmp / "body.md").write_text("Base: FFmpeg master 46f23be8b197.\n", encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertIn("46f23be8b197", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_edit_body_current_base_claim_is_patched(self) -> None:
+        """A new PR body naming the live merge base is patched."""
+
+        body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        (self.tmp / "body.md").write_text(body, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        self.assertEqual(self.run_helper(stub), 0)
+        self.assertEqual(self.patches(stub), [body])
+
 
 class TestClaimHeadTest(ForgejoTest):
     """Validate evidence before accepting claims about a tested head."""
@@ -1660,6 +1686,25 @@ class TestClaimHeadTest(ForgejoTest):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(self.posts(stub), [BODY])
+
+    def test_comment_stale_live_base_exits_80(self) -> None:
+        """A stale base claim in the live PR body exits 80 without posting a comment."""
+
+        stub = Stub([LIVE])
+        stub.pull_body = "Base: FFmpeg master 46f23be8b197.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertIn("live PR body", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_current_live_base_is_posted(self) -> None:
+        """A live PR body naming the current merge base authorizes the comment POST."""
+
+        stub = Stub([LIVE])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
 
     def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
         """Both writes reject a different full head sharing the tested prefix."""
