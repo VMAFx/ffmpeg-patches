@@ -19,6 +19,17 @@ from pathlib import Path
 
 GUARD = Path(__file__).resolve().parent.parent / "scripts" / "tmp_leak_guard.py"
 
+# Guard gets this share of outer timeout so its timeout path (tree kill, root cleanup) runs first.
+GUARD_DEADLINE_SHARE = 0.75
+
+# Test module with one passing test.
+_CLEAN_TEST_MODULE = (
+    "import unittest\n"
+    "class CleanCase(unittest.TestCase):\n"
+    "    def test_ok(self) -> None:\n"
+    "        self.assertTrue(True)\n"
+)
+
 
 class TmpLeakGuardTest(unittest.TestCase):
     """Test suite for the tmp_leak_guard CLI runner."""
@@ -35,11 +46,16 @@ class TmpLeakGuardTest(unittest.TestCase):
         cmd_args: list[str],
         timeout: float = 15.0,
     ) -> subprocess.CompletedProcess[str]:
-        """Execute the leak guard subprocess in the test temporary directory."""
+        """Execute the leak guard in outer_dir and set its deadline below the outer timeout."""
         env = os.environ.copy()
         env["TMPDIR"] = str(self.outer_dir)
+        effective_guard_args = (
+            guard_args
+            if "--timeout" in guard_args
+            else ["--timeout", f"{timeout * GUARD_DEADLINE_SHARE:g}", *guard_args]
+        )
         return subprocess.run(  # nosec B603 - fixed guard script invocation with explicit timeout.
-            [sys.executable, "-I", str(GUARD), *guard_args, "--", *cmd_args],
+            [sys.executable, "-I", str(GUARD), *effective_guard_args, "--", *cmd_args],
             capture_output=True,
             text=True,
             env=env,
@@ -256,3 +272,108 @@ class TmpLeakGuardTest(unittest.TestCase):
             guard_mod._kill_command(fake_process)
             mock_kill.assert_called_once_with(fake_process)
             fake_process.kill.assert_not_called()
+
+    def _parallel_fixture(self, modules: dict[str, str]) -> Path:
+        """Write test module sources into a fresh directory outside outer_dir."""
+        fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(fixture.cleanup)
+        fixture_dir = Path(fixture.name)
+        self.assertFalse(fixture_dir.resolve().is_relative_to(self.outer_dir.resolve()))
+        for name, source in modules.items():
+            (fixture_dir / name).write_text(source, encoding="utf-8")
+        return fixture_dir
+
+    def _run_parallel_guard(
+        self,
+        fixture_dir: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute the leak guard over unittest_parallel against a fixture directory."""
+        return self.run_guard(
+            [],
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                "unittest_parallel",
+                "-j",
+                "2",
+                "--level",
+                "module",
+                "-s",
+                str(fixture_dir),
+                "-t",
+                str(fixture_dir),
+            ],
+            timeout=120.0,
+        )
+
+    def test_parallel_clean_modules_pass(self) -> None:
+        """Two clean test modules run in parallel worker processes exit zero without leaks."""
+        fixture_dir = self._parallel_fixture(
+            {"test_a.py": _CLEAN_TEST_MODULE, "test_b.py": _CLEAN_TEST_MODULE}
+        )
+        proc = self._run_parallel_guard(fixture_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("tmp leak guard:", proc.stderr)
+        self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def test_parallel_worker_leak_fails(self) -> None:
+        """A file leaked into TMPDIR by a parallel worker triggers exit code one and cleanup."""
+        leaking_mod = (
+            "import pathlib, tempfile, unittest\n"
+            "class LeakCase(unittest.TestCase):\n"
+            "    def test_leak(self) -> None:\n"
+            "        leak = pathlib.Path(tempfile.gettempdir()) / 'leak.txt'\n"
+            "        leak.write_text('worker leak', encoding='utf-8')\n"
+        )
+        fixture_dir = self._parallel_fixture(
+            {"test_a.py": _CLEAN_TEST_MODULE, "test_b.py": leaking_mod}
+        )
+        proc = self._run_parallel_guard(fixture_dir)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("leak.txt", proc.stderr)
+        self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def test_parallel_failing_test_fails(self) -> None:
+        """A failing test module under unittest-parallel exits non-zero and cleans outer_dir."""
+        failing_mod = (
+            "import unittest\n"
+            "class FailCase(unittest.TestCase):\n"
+            "    def test_fail(self) -> None:\n"
+            "        self.assertEqual(1, 2)\n"
+        )
+        fixture_dir = self._parallel_fixture({"test_fail.py": failing_mod})
+        proc = self._run_parallel_guard(fixture_dir)
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("tmp leak guard:", proc.stderr)
+        self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def test_run_guard_sets_guard_deadline_below_outer(self) -> None:
+        """Default guard invocations set a positive --timeout flag below the outer timeout."""
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with unittest.mock.patch.object(subprocess, "run", return_value=completed) as mock_run:
+            self.run_guard([], [sys.executable, "-I", "-c", "pass"], timeout=120.0)
+        mock_run.assert_called_once()
+        argv = mock_run.call_args.args[0]
+        kwargs = mock_run.call_args.kwargs
+        self.assertEqual(argv.count("--timeout"), 1)
+        timeout_idx = argv.index("--timeout")
+        guard_deadline = float(argv[timeout_idx + 1])
+        self.assertGreater(guard_deadline, 0.0)
+        self.assertLess(guard_deadline, 120.0)
+        self.assertLess(timeout_idx + 1, argv.index("--"))
+        self.assertEqual(kwargs["timeout"], 120.0)
+
+    def test_run_guard_keeps_explicit_guard_deadline(self) -> None:
+        """Explicit --timeout arguments in guard_args are preserved without duplication."""
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with unittest.mock.patch.object(subprocess, "run", return_value=completed) as mock_run:
+            self.run_guard(["--timeout", "1"], [sys.executable, "-I", "-c", "pass"], timeout=15.0)
+        mock_run.assert_called_once()
+        argv = mock_run.call_args.args[0]
+        kwargs = mock_run.call_args.kwargs
+        self.assertEqual(argv.count("--timeout"), 1)
+        timeout_idx = argv.index("--timeout")
+        self.assertEqual(argv[timeout_idx + 1], "1")
+        self.assertLess(timeout_idx + 1, argv.index("--"))
+        self.assertEqual(kwargs["timeout"], 15.0)
