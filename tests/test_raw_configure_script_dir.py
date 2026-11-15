@@ -355,6 +355,16 @@ SCRIPT_DIR = {
     "bash-cmds-before": Case(
         "BASH_CMDS[dirname]=<case>/bin/dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
+    "bash-cmds-cdpwd-before": Case(
+        "BASH_CMDS[dirname]=<case>/bin/dirname\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "bash-cmds-cdpwd-p-before": Case(
+        "BASH_CMDS[realpath]=<case>/bin/realpath\n" + CDPWD_P + SRC + RUN, 2, REBOUND
+    ),
+    "bash-cmds-cdpwd-after-idiom": Case(
+        CDPWD + "BASH_CMDS[dirname]=<case>/bin/dirname\n" + SRC + RUN, 0
+    ),
+    "bash-aliases-cdpwd-before": Case("BASH_ALIASES[cd]=false\n" + CDPWD + SRC + RUN, 2, REBOUND),
     "bash-aliases-before": Case("BASH_ALIASES[dirname]=false\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "execignore-before": Case("EXECIGNORE=/usr/bin/dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "read-bash-cmds-before": Case(
@@ -456,8 +466,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 155 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 155)
+        """Replay all 159 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 159)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
