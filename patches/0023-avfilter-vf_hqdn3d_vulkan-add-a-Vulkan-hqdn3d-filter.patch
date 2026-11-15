@@ -66,13 +66,13 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/hqdn3d_coefs.h                    |   57 +
  libavfilter/tests/hqdn3d_vulkan.c             | 1043 +++++++++++++++++
  libavfilter/vf_hqdn3d.c                       |   33 +-
- libavfilter/vf_hqdn3d_vulkan.c                |  925 +++++++++++++++
+ libavfilter/vf_hqdn3d_vulkan.c                |  933 +++++++++++++++
  libavfilter/vulkan/Makefile                   |    2 +
  .../vulkan/hqdn3d_horizontal.comp.glsl        |  160 +++
  libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  233 ++++
  tests/fate/hw.mak                             |    4 +
  tests/ref/fate/filter-hqdn3d-vulkan           |   21 +
- 14 files changed, 2557 insertions(+), 31 deletions(-)
+ 14 files changed, 2565 insertions(+), 31 deletions(-)
  create mode 100644 libavfilter/hqdn3d_coefs.c
  create mode 100644 libavfilter/hqdn3d_coefs.h
  create mode 100644 libavfilter/tests/hqdn3d_vulkan.c
@@ -1424,10 +1424,10 @@ index 98c05e886c20dea9b4adff6f6075afb4abbfe204..d066a0e75bb927300a19ccddfb80ba21
  static int config_input(AVFilterLink *inlink)
 diff --git a/libavfilter/vf_hqdn3d_vulkan.c b/libavfilter/vf_hqdn3d_vulkan.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..461fe552ff87f6fda2a39b594a5a9233d4968c6c
+index 0000000000000000000000000000000000000000..044708611c203d2f38022604fa8d3662ebfec6b3
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_vulkan.c
-@@ -0,0 +1,925 @@
+@@ -0,0 +1,933 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -2180,37 +2180,43 @@ index 0000000000000000000000000000000000000000..461fe552ff87f6fda2a39b594a5a9233
 +    return 0;
 +}
 +
-+/* Signal the context fence with an empty queue submission after an aborted or failed submit. */
-+static void signal_exec_fence(HQDN3DVulkanContext *s, FFVkExecContext *exec)
++/* Replace the context fence, reset and not pending after a failed start, recording or submit,
++ * with a new signalled fence; when that fails, make the filter error sticky and keep the free
++ * from waiting on the old fence. */
++static void restore_exec_fence(HQDN3DVulkanContext *s, FFVkExecContext *exec)
 +{
 +    FFVulkanContext *vkctx = &s->vkctx;
++    FFVulkanFunctions *vk = &vkctx->vkfn;
++    VkFenceCreateInfo fence_create = {
++        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
++        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
++    };
++    VkFence fence;
 +    VkResult ret;
 +
-+#if FF_API_VULKAN_SYNC_QUEUES
-+FF_DISABLE_DEPRECATION_WARNINGS
-+    vkctx->hwctx->lock_queue(vkctx->device, exec->qf, exec->qi);
-+FF_ENABLE_DEPRECATION_WARNINGS
-+#endif
-+    ret = vkctx->vkfn.QueueSubmit2(exec->queue, 0, NULL, exec->fence);
-+#if FF_API_VULKAN_SYNC_QUEUES
-+FF_DISABLE_DEPRECATION_WARNINGS
-+    vkctx->hwctx->unlock_queue(vkctx->device, exec->qf, exec->qi);
-+FF_ENABLE_DEPRECATION_WARNINGS
-+#endif
-+    if (ret != VK_SUCCESS)
-+        av_log(s, AV_LOG_ERROR, "Unable to signal the execution fence: %s\n",
++    ret = vk->CreateFence(vkctx->hwctx->act_dev, &fence_create, vkctx->hwctx->alloc, &fence);
++    if (ret != VK_SUCCESS) {
++        av_log(s, AV_LOG_ERROR, "Unable to restore the execution fence: %s\n",
 +               ff_vk_ret2str(ret));
++        exec->had_submission = 0;
++        s->init_error = AVERROR_EXTERNAL;
++        return;
++    }
++
++    vk->DestroyFence(vkctx->hwctx->act_dev, exec->fence, vkctx->hwctx->alloc);
++    exec->fence = fence;
 +}
 +
-+/* End an unsubmitted command buffer, discard its dependencies, and signal its fence. */
++/* End an unsubmitted command buffer, discard its dependencies, and restore its fence. */
 +static void abort_recording(HQDN3DVulkanContext *s, FFVkExecContext *exec)
 +{
 +    s->vkctx.vkfn.EndCommandBuffer(exec->buf);
 +    ff_vk_exec_discard_deps(&s->vkctx, exec);
-+    signal_exec_fence(s, exec);
++    restore_exec_fence(s, exec);
 +}
 +
-+/* Record one frame, submit, and wait on host; on error, drop recording and signal its fence. */
++/* Record one frame, submit, and wait on host;
++ * on error, drop the recording and restore its fence. */
 +static int exec_filter(HQDN3DVulkanContext *s, AVFrame *in, AVFrame *out)
 +{
 +    FFVulkanContext *vkctx = &s->vkctx;
@@ -2220,8 +2226,10 @@ index 0000000000000000000000000000000000000000..461fe552ff87f6fda2a39b594a5a9233
 +    int err;
 +
 +    err = ff_vk_exec_start(vkctx, exec);
-+    if (err < 0)
++    if (err < 0) {
++        restore_exec_fence(s, exec);
 +        return err;
++    }
 +
 +    err = setup_views_and_barriers(s, exec, in, out, in_views, out_views);
 +    if (err >= 0)
@@ -2233,7 +2241,7 @@ index 0000000000000000000000000000000000000000..461fe552ff87f6fda2a39b594a5a9233
 +
 +    err = ff_vk_exec_submit(vkctx, exec);
 +    if (err < 0) {
-+        signal_exec_fence(s, exec);
++        restore_exec_fence(s, exec);
 +        return err;
 +    }
 +    ff_vk_exec_wait(vkctx, exec);
@@ -2250,7 +2258,7 @@ index 0000000000000000000000000000000000000000..461fe552ff87f6fda2a39b594a5a9233
 +    AVFrame *out;
 +    int err;
 +
-+    /* A failed initialization or resize is terminal. */
++    /* A failed initialization, resize or fence restore is terminal. */
 +    if (s->init_error < 0) {
 +        av_frame_free(&in);
 +        return s->init_error;
@@ -2290,7 +2298,7 @@ index 0000000000000000000000000000000000000000..461fe552ff87f6fda2a39b594a5a9233
 +}
 +
 +/* Apply a runtime command and recompute the lookup tables if the filter is initialized;
-+ * return the stored error after a failed initialization or resize. */
++ * return the stored error after a failed initialization, resize or fence restore. */
 +static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
 +                           char *res, int res_len, int flags)
 +{

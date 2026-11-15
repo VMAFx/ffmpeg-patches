@@ -182,7 +182,10 @@ jobs:
       - name: Lint the C sources of this repository with clang-tidy and cppcheck
         # The list is the clang_tidy lane of .standards.yaml. The DV5 fixture
         # generator (ADR-0002) compiles against the pinned FFmpeg headers, taken
-        # as system headers so that only the generator is judged.
+        # as system headers so that only the generator is judged. The Vulkan
+        # loader finds the exported entry point of the fault layer with dlsym;
+        # .config/cppcheck/vulkan-layer.cfg names it as an entry point, so
+        # cppcheck knows its caller.
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           clang-tidy --version | head -2
@@ -190,7 +193,8 @@ jobs:
           mapfile -t sources < .config/clang-tidy/sources.txt
           clang-tidy --quiet "${sources[@]}" -- -std=c17 -isystem ffmpeg -isystem build
           cppcheck --enable=all --std=c17 --check-level=exhaustive --error-exitcode=1 \
-            --suppress=missingIncludeSystem --suppress=checkersReport "${sources[@]}"
+            --suppress=missingIncludeSystem --suppress=checkersReport \
+            --library=.config/cppcheck/vulkan-layer.cfg "${sources[@]}"
       - name: Build FFmpeg, its tools and test programs
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         working-directory: build
@@ -210,11 +214,15 @@ jobs:
           fi
           echo "FATE targets: ${#targets[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           make -j"$(nproc)" -k "${targets[@]}" 2>&1 | tee -a build.log
-      - name: Run fate-filter-hqdn3d-vulkan on lavapipe
+      - name: Run fate-filter-hqdn3d-vulkan and the fence fault tests on lavapipe
         # The FATE step above leaves out fate-filter-hqdn3d-vulkan (0023), as
         # libavfilter/tests/hqdn3d_vulkan needs a Vulkan device. The hosted
         # runner has no GPU, so Mesa lavapipe runs it on the CPU. The step runs
         # for every pull request in series scope, not only in GPU parity scope.
+        # It then runs tests.test_hqdn3d_vulkan_fault (0023), which loads
+        # tests/fixtures/vk_fault/vk_fault_layer.c as a Vulkan layer and
+        # requires every injected failure to end FFmpeg within 30 seconds with
+        # a nonzero exit.
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
@@ -233,6 +241,18 @@ jobs:
           fi
           if ! make -C build fate-filter-hqdn3d-vulkan 2>&1 | tee fate-hqdn3d.log; then
             echo "::error::fate-filter-hqdn3d-vulkan failed on lavapipe"
+            exit 1
+          fi
+          export VK_FFMPEG="$PWD/build/ffmpeg" VK_DEVICE=0
+          fault=0
+          python3 -m unittest -v tests.test_hqdn3d_vulkan_fault > fault.log 2>&1 || fault=$?
+          cat fault.log
+          if grep "skipped 'set VK_" fault.log; then
+            echo "::error::a fence fault case was skipped instead of run"
+            exit 1
+          fi
+          if [ "$fault" -ne 0 ]; then
+            echo "::error::tests.test_hqdn3d_vulkan_fault exited $fault"
             exit 1
           fi
       - name: Compare the hqdn3d and tonemap GPU filters with the CPU filters on software devices
