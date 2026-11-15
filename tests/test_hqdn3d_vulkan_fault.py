@@ -9,10 +9,11 @@ vkQueueSubmit2 or vkQueueSubmit2KHR on a filter submission, vkCreateImageView
 after the first dispatch, and vkCreateFence after an earlier injection.
 
 Each injected failure must end FFmpeg within 30 seconds with a nonzero exit
-status and the layer's injection marker on stderr; when `fence` is also active,
-stderr must carry both the vkCreateFence injection marker and `Unable to
-restore the execution fence`. A baseline run with the layer enabled and no
-fault configured must exit 0 with `vk_fault: active none`.
+status, not termination by a signal, and the layer's injection marker on
+stderr; when `fence` is also active, stderr must carry both the vkCreateFence
+injection marker and `Unable to restore the execution fence`. A baseline run
+with the layer enabled and no fault configured must exit 0 with
+`vk_fault: active none`.
 
 The planted wrong case is patch 0023 before this fix, where the injected begin
 and submit failures leave the execution context fence unsignalled and hang
@@ -31,9 +32,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess  # nosec B404 - fixed compiler and FFmpeg argv with bounded timeouts.
 import tempfile
 import unittest
+import unittest.mock
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,8 +67,11 @@ class FaultRun:
 
 
 def _compiler() -> str:
-    """Return the configured C compiler executable from CC or cc."""
-    return os.environ.get("CC", "cc")
+    """Return the absolute path of the C compiler cc found on PATH."""
+    compiler = shutil.which("cc")
+    if compiler is None:
+        raise FileNotFoundError("no C compiler cc on PATH")
+    return str(Path(compiler).absolute())
 
 
 def _required_markers(fault: str) -> tuple[str, ...]:
@@ -83,7 +89,9 @@ def fault_problems(fault: str, run: FaultRun) -> list[str]:
     if run.returncode is None:
         return [f"no exit within {DEADLINE} s"]
     problems: list[str] = []
-    if not fault and run.returncode != 0:
+    if run.returncode < 0:
+        problems.append(f"killed by signal {-run.returncode}")
+    elif not fault and run.returncode != 0:
         problems.append(f"exit status {run.returncode}")
     elif fault and run.returncode == 0:
         problems.append("exit status 0")
@@ -226,6 +234,31 @@ class FaultRuleTest(unittest.TestCase):
             fault_problems("begin=1,fence", FaultRun(1, stderr)),
             [f"missing {RESTORE_FAILED}"],
         )
+
+    def test_fault_run_killed_by_signal_fails(self) -> None:
+        """Reject a fault run terminated by a signal even with injection markers."""
+        stderr = (
+            "vk_fault: active begin=1\nvk_fault: injected vkBeginCommandBuffer failure (call 1)\n"
+        )
+        self.assertEqual(fault_problems("begin=1", FaultRun(-11, stderr)), ["killed by signal 11"])
+
+    def test_baseline_killed_by_signal_fails(self) -> None:
+        """Reject a baseline run terminated by a signal."""
+        self.assertEqual(
+            fault_problems("", FaultRun(-6, "vk_fault: active none\n")),
+            ["killed by signal 6"],
+        )
+
+    def test_compiler_ignores_cc_environment(self) -> None:
+        """Ignore CC in the environment when resolving the C compiler."""
+        with unittest.mock.patch.dict(os.environ, {"CC": "/nonexistent/evil-cc"}):
+            try:
+                compiler = _compiler()
+            except FileNotFoundError as exc:
+                self.assertIn("cc", str(exc))
+                return
+        self.assertNotEqual(compiler, "/nonexistent/evil-cc")
+        self.assertTrue(Path(compiler).is_absolute(), compiler)
 
 
 @unittest.skipUnless(FFMPEG and DEVICE, "set VK_FFMPEG and VK_DEVICE")

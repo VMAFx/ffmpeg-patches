@@ -4,17 +4,21 @@
  *
  * VMAFX_VK_FAULT accepts a comma-separated list of at most 8 items (at most
  * 127 characters) from begin=N, submit=N, view=N (N in 1..1000) and fence.
- * On instance creation it writes "vk_fault: active <value|none>" or
- * "vk_fault: bad VMAFX_VK_FAULT value" to stderr; each injected failure writes
- * "vk_fault: injected <function> failure (call <N>)" to stderr and returns
- * VK_ERROR_OUT_OF_DEVICE_MEMORY. tests/test_hqdn3d_vulkan_fault.py builds and
- * loads this layer. The loader-layer negotiation and link-chain interface
- * follows docs/LoaderLayerInterface.md of KhronosGroup/Vulkan-Loader
+ * The layer reads VMAFX_VK_FAULT through secure_getenv, as the Vulkan loader
+ * reads its own variables, so a setuid or setgid process sees no fault
+ * configuration. On instance creation it writes "vk_fault: active <value|none>"
+ * or "vk_fault: bad VMAFX_VK_FAULT value" to stderr; each injected failure
+ * writes "vk_fault: injected <function> failure (call <N>)" to stderr and
+ * returns VK_ERROR_OUT_OF_DEVICE_MEMORY. tests/test_hqdn3d_vulkan_fault.py
+ * builds and loads this layer. The loader-layer negotiation and link-chain
+ * interface follows docs/LoaderLayerInterface.md of KhronosGroup/Vulkan-Loader
  * (Apache-2.0).
  *
  * SPDX-FileCopyrightText: 2026 Lusoris
  * SPDX-License-Identifier: EUPL-1.2
  */
+/* Declare secure_getenv in glibc. */
+#define _GNU_SOURCE /* NOLINT(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) */
 
 #include <errno.h>
 #include <pthread.h>
@@ -115,16 +119,12 @@ static const void *dispatch_key(const void *handle)
 /* Append src to dst[pos..MSG_BUF_SIZE-2], NUL-terminate and return new pos. */
 static int append_str(char *dst, int pos, const char *src)
 {
-    size_t src_len = strlen(src);
     int out = pos;
 
     if (out < 0 || out >= MSG_BUF_SIZE - 1) {
         return out;
     }
-    for (int i = 0; i < MSG_BUF_SIZE; i++) {
-        if ((size_t)i >= src_len || out >= MSG_BUF_SIZE - 1) {
-            break;
-        }
+    for (int i = 0; out < MSG_BUF_SIZE - 1 && src[i] != '\0'; i++) {
         dst[out] = src[i];
         out++;
     }
@@ -248,15 +248,13 @@ static int parse_item(char *item, struct fault_config *cfg)
 static int parse_fault_env(const char *raw, struct fault_config *cfg)
 {
     char buf[FAULT_BUF_SIZE] = { 0 };
-    size_t len = 0;
     char *cur = NULL;
 
     *cfg = (struct fault_config){ 0 };
     if (raw == NULL || raw[0] == '\0') {
         return 0;
     }
-    len = strlen(raw);
-    if (len > MAX_FAULT_LEN) {
+    if (strnlen(raw, MAX_FAULT_LEN + 1) > MAX_FAULT_LEN) {
         return -1;
     }
     for (int i = 0; i < FAULT_BUF_SIZE; i++) {
@@ -483,7 +481,7 @@ static VkResult VKAPI_CALL fault_CreateInstance(const VkInstanceCreateInfo *pCre
                                                 const VkAllocationCallbacks *pAllocator,
                                                 VkInstance *pInstance)
 {
-    const char *raw = getenv("VMAFX_VK_FAULT");
+    const char *raw = secure_getenv("VMAFX_VK_FAULT");
     const char *label = "none";
     struct fault_config cfg = { 0 };
     struct fault_state *st = fault_state();
