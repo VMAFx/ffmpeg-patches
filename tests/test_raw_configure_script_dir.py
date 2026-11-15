@@ -369,10 +369,12 @@ SCRIPT_DIR = {
     ),
     "lc-all-prefix-before": Case("LC_ALL=C true\n" + DOLLAR0 + SRC + RUN, 0),
     "undocumented-bash-name-before": Case("BASH_CMDS_X=1\n" + DOLLAR0 + SRC + RUN, 0),
-    "echo-path-assign-before": Case("echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 0),
-    "printf-path-assign-before": Case("printf '%s\\n' 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 0),
+    "echo-path-assign-before": Case("echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-path-assign-before": Case(
+        "printf '%s\\n' 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
     "builtin-echo-path-assign-before": Case(
-        "builtin echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 0
+        "builtin echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
     "subst-echo-path-before": Case(
         "x=$(echo 'PATH=7')\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
@@ -389,6 +391,17 @@ SCRIPT_DIR = {
         2,
         REBOUND,
         {"tools/print.sh": "echo 'PATH=7'\n"},
+    ),
+    "devstdout-readback-before": Case(
+        "echo 'PATH=7'\nread -r x < /dev/stdout\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "exec-redirect-readback-before": Case(
+        "exec 3>&1 >f\necho 'PATH=7'\nexec >&3\nread -r x < f\n: $((x))\n" + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "proc-fd-readback-before": Case(
+        "echo 'PATH=7'\nx=$(< /proc/self/fd/1)\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
     ),
     "newline-name-symlink": Case(
         DOLLAR0 + SRC + RUN,
@@ -443,8 +456,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 152 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 152)
+        """Replay all 155 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 155)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
