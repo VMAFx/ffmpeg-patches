@@ -846,6 +846,62 @@ class DiagnosticCitationTest(unittest.TestCase):
         self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
 
 
+class ClaimScopeTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of verification and scope claims."""
+
+    def test_passes_all_fate_tests_claim_detected(self) -> None:
+        """Blanket FATE pass claims return the matched verification phrase."""
+        message = "avcodec/x: update y\n\nPasses all FATE tests.\n"
+        self.assertEqual(upstream_lint.unverified_claim(message), "Passes all FATE tests")
+
+    def test_fully_verified_claim_detected(self) -> None:
+        """Blanket verification claims return the matched phrase."""
+        message = "avcodec/x: update y\n\nFully verified on x86.\n"
+        self.assertEqual(upstream_lint.unverified_claim(message), "Fully verified")
+
+    def test_specific_command_and_platform_passes(self) -> None:
+        """Naming the concrete test command and platform is not flagged."""
+        message = "avcodec/x: update y\n\nTested with make fate on x86-64 Linux.\n"
+        self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_no_regression_test_explanation_passes(self) -> None:
+        """Explaining why there is no regression test is not a no-regressions claim."""
+        message = "avcodec/x: fix y\n\nNo regression test: the path needs hardware.\n"
+        self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_signed_off_by_verification_words_ignored(self) -> None:
+        """Signed-off-by trailers are excluded from verification-claim matching."""
+        message = "avcodec/x: update y\n\nSigned-off-by: Fully Tested <x@invalid>\n"
+        self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_both_loops_scope_claim_detected(self) -> None:
+        """A both-loops commit message returns its multi-site scope phrase."""
+        message = "avcodec/x: silence a warning in both loops\n"
+        self.assertEqual(upstream_lint.scope_claim(message), "both loops")
+
+    def test_all_three_callers_scope_claim_detected(self) -> None:
+        """A quantified callers phrase within two words returns the scope match."""
+        message = "avcodec/x: check all three callers\n"
+        self.assertEqual(upstream_lint.scope_claim(message), "all three callers")
+
+    def test_ordinary_single_site_message_passes(self) -> None:
+        """Messages without multi-site quantifiers return None."""
+        self.assertIsNone(upstream_lint.scope_claim("avcodec/x: rename y\n"))
+
+    def test_source_hunks_counts_only_non_test_source_files(self) -> None:
+        """Source hunks count library sources while ignoring docs, tests and deletions."""
+        two_source = "+++ b/libavcodec/x.c\n@@ -3 +3 @@\n-a\n+b\n@@ -9 +9 @@\n-c\n+d\n"
+        self.assertEqual(upstream_lint.source_hunks(two_source), 2)
+        source_and_doc = (
+            "+++ b/libavcodec/x.c\n@@ -3 +3 @@\n-a\n+b\n+++ b/doc/x.texi\n@@ -3 +3 @@\n-c\n+d\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(source_and_doc), 1)
+        test_and_deleted = (
+            "+++ b/libavcodec/tests/x.c\n@@ -3 +3 @@\n-a\n+b\n+++ /dev/null\n@@ -3 +0,0 @@\n-c\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(test_and_deleted), 0)
+
+
 class FixtureTest(unittest.TestCase):
     """Shared disposable Git fixture; stub the pre-commit subprocess only."""
 
@@ -933,7 +989,7 @@ class PipelineTest(FixtureTest):
     """Run Git and base tools in a throwaway repository; stub pre-commit only."""
 
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
-        """A correctly named clean commit passes all six collected checks."""
+        """A correctly named clean commit passes all eight collected checks."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit()
         rc, output = self.check()
@@ -946,6 +1002,7 @@ class PipelineTest(FixtureTest):
             "fate-deps",
             "regression-test",
             "diagnostic-citation",
+            "claim-scope",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
 
@@ -1077,6 +1134,66 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: diagnostic-citation rc: 0", output)
+
+    def test_verification_claim_fails(self) -> None:
+        """A blanket verification claim fails claim-scope while other steps pass."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update y\n\nPasses all FATE tests.")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        for name in (
+            "pre-commit",
+            "commit-msg",
+            "patcheck",
+            "developer.texi",
+            "fate-deps",
+            "regression-test",
+            "diagnostic-citation",
+        ):
+            self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_verification_claim_is_not_waived(self) -> None:
+        """Passing --claim-reason cannot waive a blanket verification claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update y\n\nPasses all FATE tests.")
+        rc, output = self.check("--claim-reason", "ran fate")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_single_hunk_scope_claim_fails(self) -> None:
+        """A multi-site claim backed by one source hunk fails without a waiver."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in both loops")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_scope_claim_waiver_passes(self) -> None:
+        """A non-blank --claim-reason waives a single-hunk scope claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in both loops")
+        rc, output = self.check("--claim-reason", "the second loop is generated from one macro")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: the second loop is generated from one macro", output)
+
+    def test_blank_scope_waiver_fails(self) -> None:
+        """Whitespace-only --claim-reason does not waive a single-hunk scope claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in both loops")
+        rc, output = self.check("--claim-reason", "  ")
+        self.assertEqual(rc, 1, output)
+
+    def test_two_hunk_scope_claim_passes(self) -> None:
+        """A multi-site claim backed by two source hunks passes without a waiver."""
+        self.write(
+            "libavfilter/vf_x.c",
+            SOURCE.replace("ff_value", "ff_first") + "\nint ff_other(void)\n{\n    return 3;\n}\n",
+        )
+        self.commit("avfilter/vf_x: update both functions")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: claim-scope rc: 0", output)
 
     def test_fate_missing_decoder_fails(self) -> None:
         """A committed lavfi video dependency gap fails without losing other steps."""
