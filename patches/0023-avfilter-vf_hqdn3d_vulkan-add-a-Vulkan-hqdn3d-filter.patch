@@ -40,9 +40,9 @@ records on one execution context, a buffer memory barrier makes the
 previous frame's temporal history writes visible to the compute shaders,
 and the host waits after each submission. A recording that is not
 submitted is ended and its dependencies are discarded with
-ff_vk_exec_discard_deps(); after that, or after a failed submission, an
-empty queue submission signals the context fence, so the next
-ff_vk_exec_start() on the context finds the fence signalled. The filter
+ff_vk_exec_discard_deps(); after that, or after a failed start or
+submission, a new signalled fence replaces the context fence, so the
+next ff_vk_exec_start() on the context finds it signalled. The filter
 declares FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE, defined as 0 where the
 release lacks it, and the Changelog is left alone.
 
