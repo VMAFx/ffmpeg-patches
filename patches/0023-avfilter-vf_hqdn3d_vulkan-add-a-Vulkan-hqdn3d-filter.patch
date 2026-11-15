@@ -64,15 +64,15 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/allfilters.c                      |    1 +
  libavfilter/hqdn3d_coefs.c                    |   58 +
  libavfilter/hqdn3d_coefs.h                    |   57 +
- libavfilter/tests/hqdn3d_vulkan.c             | 1043 +++++++++++++++++
+ libavfilter/tests/hqdn3d_vulkan.c             | 1044 +++++++++++++++++
  libavfilter/vf_hqdn3d.c                       |   33 +-
- libavfilter/vf_hqdn3d_vulkan.c                |  933 +++++++++++++++
+ libavfilter/vf_hqdn3d_vulkan.c                |  938 +++++++++++++++
  libavfilter/vulkan/Makefile                   |    2 +
  .../vulkan/hqdn3d_horizontal.comp.glsl        |  160 +++
  libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  233 ++++
  tests/fate/hw.mak                             |    4 +
  tests/ref/fate/filter-hqdn3d-vulkan           |   21 +
- 14 files changed, 2565 insertions(+), 31 deletions(-)
+ 14 files changed, 2571 insertions(+), 31 deletions(-)
  create mode 100644 libavfilter/hqdn3d_coefs.c
  create mode 100644 libavfilter/hqdn3d_coefs.h
  create mode 100644 libavfilter/tests/hqdn3d_vulkan.c
@@ -313,10 +313,10 @@ index 0000000000000000000000000000000000000000..3399d70ec3d321ab51a61b99f1dabdb5
 +#endif /* AVFILTER_HQDN3D_COEFS_H */
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..8c259b6396453291b26b60b8f7c96cb323bf602f
+index 0000000000000000000000000000000000000000..0eb373c1c58432ef0c13e5939bc4eb40b274276f
 --- /dev/null
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
-@@ -0,0 +1,1043 @@
+@@ -0,0 +1,1044 @@
 +/*
 + * Copyright (c) 2026 Lusoris
 + *
@@ -836,7 +836,8 @@ index 0000000000000000000000000000000000000000..8c259b6396453291b26b60b8f7c96cb3
 +    return "other";
 +}
 +
-+/* Filter must reject in-stream format change with AVERROR(EINVAL); return any other error. */
++/* The filter must refuse this in-stream format change with AVERROR(EINVAL).
++ * An accepted change returns AVERROR_BUG; another refusal error is returned. */
 +static int run_format_step(ResetTest *t, int n, enum AVPixelFormat fmt,
 +                           AVBufferRef *frames_ref, int *refused)
 +{
@@ -902,7 +903,9 @@ index 0000000000000000000000000000000000000000..8c259b6396453291b26b60b8f7c96cb3
 +    else
 +        printf("%d 160 96 %s accepted\n", n, format_name);
 +    fflush(stdout);
-+    return 0;
++    if (!*refused)
++        return AVERROR_BUG;
++    return refused_err == AVERROR(EINVAL) ? 0 : refused_err;
 +}
 +
 +/* Run a first frame larger than the link through fresh CPU/GPU graphs, verifying parity. */
@@ -950,7 +953,7 @@ index 0000000000000000000000000000000000000000..8c259b6396453291b26b60b8f7c96cb3
 +    return err;
 +}
 +
-+/* Test whether a first frame with format mismatch against link format is refused. */
++/* A first frame whose format differs from the link format must be refused with AVERROR(EINVAL). */
 +static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
 +{
 +    AVFilterGraph *graph = NULL;
@@ -1016,7 +1019,8 @@ index 0000000000000000000000000000000000000000..8c259b6396453291b26b60b8f7c96cb3
 +        printf("f1 160 96 yuv444p accepted\n");
 +    fflush(stdout);
 +
-+    err = 0;
++    err = !refused ? AVERROR_BUG :
++          refused_err == AVERROR(EINVAL) ? 0 : refused_err;
 +
 +end:
 +    av_frame_free(&sw_f);
@@ -1331,18 +1335,15 @@ index 0000000000000000000000000000000000000000..8c259b6396453291b26b60b8f7c96cb3
 +    if (err < 0)
 +        goto end;
 +
-+    /* Test yuv420p10 first and abort if accepted, avoiding chroma buffer overflow from yuv444p on unpatched filters. */
++    /* Run yuv420p10 first: an accepted change ends the run before the yuv444p step,
++     * which would overflow chroma buffers on a filter that accepts it. */
 +    err = run_format_step(&t, 12, AV_PIX_FMT_YUV420P10, t.upload_ctxs[3], &refused_10);
 +    if (err < 0)
 +        goto end;
-+    if (!refused_10) {
-+        printf("13 160 96 yuv444p skipped\n");
-+        fflush(stdout);
-+    } else {
-+        err = run_format_step(&t, 13, AV_PIX_FMT_YUV444P, t.upload_ctxs[4], &refused_444);
-+        if (err < 0)
-+            goto end;
-+    }
++
++    err = run_format_step(&t, 13, AV_PIX_FMT_YUV444P, t.upload_ctxs[4], &refused_444);
++    if (err < 0)
++        goto end;
 +
 +    err = run_f1_step(t.vk_device_ref, t.upload_ctxs[4]);
 +    if (err < 0)
@@ -1424,10 +1425,10 @@ index 98c05e886c20dea9b4adff6f6075afb4abbfe204..d066a0e75bb927300a19ccddfb80ba21
  static int config_input(AVFilterLink *inlink)
 diff --git a/libavfilter/vf_hqdn3d_vulkan.c b/libavfilter/vf_hqdn3d_vulkan.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..044708611c203d2f38022604fa8d3662ebfec6b3
+index 0000000000000000000000000000000000000000..85f0c9a056615412aab29f3f4d2b4494bef0a2a0
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_vulkan.c
-@@ -0,0 +1,933 @@
+@@ -0,0 +1,938 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -1461,6 +1462,11 @@ index 0000000000000000000000000000000000000000..044708611c203d2f38022604fa8d3662
 +#include "video.h"
 +#include "vf_hqdn3d.h"
 +#include "hqdn3d_coefs.h"
++
++/* FFmpeg releases without the frame parameter check on filter inputs lack this flag. */
++#ifndef FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE
++#define FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE 0
++#endif
 +
 +extern const unsigned char ff_hqdn3d_horizontal_comp_spv_data[];
 +extern const unsigned int  ff_hqdn3d_horizontal_comp_spv_len;
@@ -2359,7 +2365,7 @@ index 0000000000000000000000000000000000000000..044708611c203d2f38022604fa8d3662
 +    FILTER_INPUTS(hqdn3d_vulkan_inputs),
 +    FILTER_OUTPUTS(hqdn3d_vulkan_outputs),
 +    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VULKAN),
-+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE | FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE,
 +};
 diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
 index f81542dcb9d8e40debcb11dd5eddb8ff34e4fa3e..4434028f839d0495c0c861eed63b581bd38f3a54 100644

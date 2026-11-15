@@ -29,8 +29,8 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/allfilters.c                      |    1 +
  .../metal/vf_hqdn3d_videotoolbox.metal        |  325 +++++
  libavfilter/tests/hqdn3d_vulkan.c             |   23 +-
- libavfilter/vf_hqdn3d_videotoolbox.m          | 1080 +++++++++++++++++
- 7 files changed, 1467 insertions(+), 1 deletion(-)
+ libavfilter/vf_hqdn3d_videotoolbox.m          | 1093 +++++++++++++++++
+ 7 files changed, 1480 insertions(+), 1 deletion(-)
  create mode 100644 libavfilter/metal/vf_hqdn3d_videotoolbox.metal
  create mode 100644 libavfilter/vf_hqdn3d_videotoolbox.m
 
@@ -457,7 +457,7 @@ index 0000000000000000000000000000000000000000..30f3e40acfd806be2a861a553a721ebd
 +    }
 +}
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
-index e3184e8bb5503774515cab7b1f04e70b74de4aaa..dd92340c685f26c31b8362d0c13cc914e3577eeb 100644
+index 97ef3c8218bf5c4b42f884ba23bb5496afa639fc..b64b7d736a729d90401f91361e9c075eee58ca39 100644
 --- a/libavfilter/tests/hqdn3d_vulkan.c
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
 @@ -111,6 +111,10 @@ static enum AVPixelFormat get_gpu_pix_fmt(enum AVHWDeviceType hw_type)
@@ -482,7 +482,7 @@ index e3184e8bb5503774515cab7b1f04e70b74de4aaa..dd92340c685f26c31b8362d0c13cc914
  #endif
      default:
          return NULL;
-@@ -1053,6 +1061,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
+@@ -1057,6 +1065,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
      return AV_HWDEVICE_TYPE_CUDA;
  #elif CONFIG_HQDN3D_OPENCL_FILTER
      return AV_HWDEVICE_TYPE_OPENCL;
@@ -491,7 +491,7 @@ index e3184e8bb5503774515cab7b1f04e70b74de4aaa..dd92340c685f26c31b8362d0c13cc914
  #else
      return AV_HWDEVICE_TYPE_NONE;
  #endif
-@@ -1093,6 +1103,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+@@ -1097,6 +1107,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
  #endif
      }
  
@@ -509,7 +509,7 @@ index e3184e8bb5503774515cab7b1f04e70b74de4aaa..dd92340c685f26c31b8362d0c13cc914
  #if CONFIG_HQDN3D_VULKAN_FILTER
      *hw_type = AV_HWDEVICE_TYPE_VULKAN;
      *dev_idx = strncmp(arg, "vk:", 3) == 0 ? arg + 3 : arg;
-@@ -1115,7 +1136,7 @@ int main(int argc, char **argv)
+@@ -1119,7 +1140,7 @@ int main(int argc, char **argv)
      int refused_10 = 0, refused_444 = 0;
  
      if (argc > 2) {
@@ -520,10 +520,10 @@ index e3184e8bb5503774515cab7b1f04e70b74de4aaa..dd92340c685f26c31b8362d0c13cc914
      err = parse_device_arg(argc >= 2 ? argv[1] : NULL, &t.hw_type, &dev_idx);
 diff --git a/libavfilter/vf_hqdn3d_videotoolbox.m b/libavfilter/vf_hqdn3d_videotoolbox.m
 new file mode 100644
-index 0000000000000000000000000000000000000000..cae4bf5ee195b6203a31d98336b9508fbb7aa678
+index 0000000000000000000000000000000000000000..fb787780283a13e7e1988b2c58effc5062a67a39
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_videotoolbox.m
-@@ -0,0 +1,1080 @@
+@@ -0,0 +1,1093 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -1131,6 +1131,19 @@ index 0000000000000000000000000000000000000000..cae4bf5ee195b6203a31d98336b9508f
 +            if (err < 0)
 +                return err;
 +            s->first_frame = 1;
++        } else {
++            FilterLink *outl = ff_filter_link(ctx->outputs[0]);
++            AVHWFramesContext *out_hwfc = outl->hw_frames_ctx ?
++                (AVHWFramesContext *)outl->hw_frames_ctx->data : NULL;
++
++            /* The first frame may differ from the configured output link. */
++            if (in->width  != ctx->outputs[0]->w ||
++                in->height != ctx->outputs[0]->h ||
++                !out_hwfc || out_hwfc->sw_format != hwfc->sw_format) {
++                err = create_out_frames_ctx(ctx, in);
++                if (err < 0)
++                    return err;
++            }
 +        }
 +        s->sw_format = hwfc->sw_format;
 +        s->width = in->width;

@@ -26,10 +26,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  doc/filters.texi                  |  32 ++
  libavfilter/Makefile              |   5 +
  libavfilter/allfilters.c          |   1 +
- libavfilter/tests/hqdn3d_vulkan.c | 232 ++++++---
- libavfilter/vf_hqdn3d_cuda.c      | 792 ++++++++++++++++++++++++++++++
+ libavfilter/tests/hqdn3d_vulkan.c | 233 ++++++---
+ libavfilter/vf_hqdn3d_cuda.c      | 805 ++++++++++++++++++++++++++++++
  libavfilter/vf_hqdn3d_cuda.cu     | 458 +++++++++++++++++
- 7 files changed, 1462 insertions(+), 60 deletions(-)
+ 7 files changed, 1476 insertions(+), 60 deletions(-)
  create mode 100644 libavfilter/vf_hqdn3d_cuda.c
  create mode 100644 libavfilter/vf_hqdn3d_cuda.cu
 
@@ -125,7 +125,7 @@ index 3211fc02153db11796ab388a28faa82e1c465f53..3cacb97a8fbfc2e5e0880aa1048f2459
  extern const FFFilter ff_vf_hqx;
  extern const FFFilter ff_vf_hstack;
 diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
-index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bbfda09351 100644
+index 0eb373c1c58432ef0c13e5939bc4eb40b274276f..6b5c32d9dcd81bf04ea58a39a0cbd755100689cb 100644
 --- a/libavfilter/tests/hqdn3d_vulkan.c
 +++ b/libavfilter/tests/hqdn3d_vulkan.c
 @@ -22,11 +22,15 @@
@@ -348,7 +348,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      AVBufferRef *upload_ctxs[5];
      AVFilterGraph *cpu_graph, *gpu_graph;
      AVFilterContext *cpu_src, *cpu_sink, *gpu_src, *gpu_sink;
-@@ -554,7 +601,7 @@ static int run_format_step(ResetTest *t, int n, enum AVPixelFormat fmt,
+@@ -555,7 +602,7 @@ static int run_format_step(ResetTest *t, int n, enum AVPixelFormat fmt,
              memset(sw_f->data[p] + y * sw_f->linesize[p], 0, FFABS(sw_f->linesize[p]));
      }
  
@@ -357,7 +357,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      av_frame_free(&sw_f);
      if (err < 0) {
          av_frame_free(&out);
-@@ -601,7 +648,8 @@ static int run_first_frame_step(ResetTest *t, int n, uint32_t *seed, int *is_sam
+@@ -604,7 +651,8 @@ static int run_first_frame_step(ResetTest *t, int n, uint32_t *seed, int *is_sam
      if (err < 0)
          goto end;
  
@@ -367,7 +367,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      if (err < 0)
          goto end;
  
-@@ -641,11 +689,13 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
+@@ -644,11 +692,13 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
      const AVPixFmtDescriptor *desc;
      int err, refused_err = 0, refused = 0;
  
@@ -383,7 +383,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      if (err < 0)
          goto end;
  
-@@ -671,7 +721,7 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
+@@ -674,7 +724,7 @@ static int run_f1_step(AVBufferRef *vk_device_ref, AVBufferRef *upload_ctx_444)
              memset(sw_f->data[p] + y * sw_f->linesize[p], 0, FFABS(sw_f->linesize[p]));
      }
  
@@ -392,7 +392,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      av_frame_free(&sw_f);
      if (err < 0)
          goto end;
-@@ -720,11 +770,13 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
+@@ -724,11 +774,13 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
      AVFrame *sw_f = NULL, *gpu_in_vk = NULL, *gpu_out_vk = NULL, *sw_out = NULL;
      int err;
  
@@ -408,7 +408,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      if (err < 0)
          goto end;
  
-@@ -765,7 +817,7 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
+@@ -769,7 +821,7 @@ static int run_f4_step(AVBufferRef *vk_device_ref)
          }
  
          sw_f->pts = n;
@@ -417,7 +417,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
          if (err < 0)
              goto end;
  
-@@ -872,7 +924,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
+@@ -876,7 +928,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
      AVFrame *sw_f = NULL, *cpu_out = NULL, *gpu_out = NULL;
      int err;
  
@@ -427,7 +427,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      if (err < 0)
          goto end;
  
-@@ -880,7 +933,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
+@@ -884,7 +937,8 @@ static int run_neg_step(AVBufferRef *vk_device_ref, int *diffs)
      if (err < 0)
          goto end;
  
@@ -437,7 +437,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      if (err < 0)
          goto end;
  
-@@ -924,58 +978,112 @@ end:
+@@ -928,58 +982,112 @@ end:
      return err;
  }
  
@@ -566,7 +566,7 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
  int main(int argc, char **argv)
  {
      ResetTest t = { 0 };
-@@ -986,11 +1094,12 @@ int main(int argc, char **argv)
+@@ -990,11 +1098,12 @@ int main(int argc, char **argv)
      int refused_10 = 0, refused_444 = 0;
  
      if (argc > 2) {
@@ -582,19 +582,20 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
  
      av_log_set_level(AV_LOG_ERROR);
  
-@@ -1008,6 +1117,9 @@ int main(int argc, char **argv)
-             goto end;
-     }
+@@ -1016,6 +1125,10 @@ int main(int argc, char **argv)
+     if (err < 0)
+         goto end;
  
++    /* The format, f1, f4 and negative steps build Vulkan-only graphs. */
 +    if (t.hw_type != AV_HWDEVICE_TYPE_VULKAN)
 +        goto end;
 +
-     err = run_first_frame_step(&t, 14, &seed, &first_same);
+     /* Run yuv420p10 first: an accepted change ends the run before the yuv444p step,
+      * which would overflow chroma buffers on a filter that accepts it. */
+     err = run_format_step(&t, 12, AV_PIX_FMT_YUV420P10, t.upload_ctxs[3], &refused_10);
+@@ -1026,15 +1139,15 @@ int main(int argc, char **argv)
      if (err < 0)
          goto end;
-@@ -1025,15 +1137,15 @@ int main(int argc, char **argv)
-             goto end;
-     }
  
 -    err = run_f1_step(t.vk_device_ref, t.upload_ctxs[4]);
 +    err = run_f1_step(t.device_ref, t.upload_ctxs[4]);
@@ -613,10 +614,10 @@ index 8c259b6396453291b26b60b8f7c96cb323bf602f..ecff5faf835edcb47801345f212b53bb
      if (err < 0)
 diff --git a/libavfilter/vf_hqdn3d_cuda.c b/libavfilter/vf_hqdn3d_cuda.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..a80111e8cf3f23a859503f8e054f54c171c094df
+index 0000000000000000000000000000000000000000..235720a9cf5c930026d848426d18a290bb239612
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_cuda.c
-@@ -0,0 +1,792 @@
+@@ -0,0 +1,805 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -962,6 +963,19 @@ index 0000000000000000000000000000000000000000..a80111e8cf3f23a859503f8e054f54c1
 +            if (err < 0)
 +                return err;
 +            s->first_frame = 1;
++        } else {
++            FilterLink *outl = ff_filter_link(ctx->outputs[0]);
++            AVHWFramesContext *out_hwfc = outl->hw_frames_ctx ?
++                (AVHWFramesContext *)outl->hw_frames_ctx->data : NULL;
++
++            /* The first frame may differ from the configured output link. */
++            if (in->width  != ctx->outputs[0]->w ||
++                in->height != ctx->outputs[0]->h ||
++                !out_hwfc || out_hwfc->sw_format != hwfc->sw_format) {
++                err = create_out_frames_ctx(ctx, in);
++                if (err < 0)
++                    return err;
++            }
 +        }
 +        s->sw_format = hwfc->sw_format;
 +        s->width = in->width;
