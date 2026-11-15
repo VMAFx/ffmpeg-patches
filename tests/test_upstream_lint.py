@@ -181,6 +181,25 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(upstream_lint._added_lines("@@ -2 +2,2 @@\n+a\n+b\n"), {2, 3})
 
 
+class RegressionTestPathTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of test and source path predicates."""
+
+    def test_is_test_path(self) -> None:
+        """Top-level and nested tests directories match; source directories do not."""
+        self.assertTrue(upstream_lint.is_test_path("tests/fate/x.mak"))
+        self.assertTrue(upstream_lint.is_test_path("libavutil/tests/x.c"))
+        self.assertFalse(upstream_lint.is_test_path("libavfilter/vf_x.c"))
+
+    def test_is_source_path(self) -> None:
+        """Library and fftools sources match while test, doc and compat paths do not."""
+        for path in ("libavfilter/vf_x.c", "fftools/ffmpeg.c", "libavcodec/x86/x.asm"):
+            with self.subTest(path=path):
+                self.assertTrue(upstream_lint.is_source_path(path))
+        for path in ("libavutil/tests/x.c", "doc/filters.texi", "compat/x.c"):
+            with self.subTest(path=path):
+                self.assertFalse(upstream_lint.is_source_path(path))
+
+
 FATE_RED = (
     "FATE_SCALE_REFUSE = fate-filter-scale-ipt-c2-refuse-rgb "
     "fate-filter-scale-ipt-c2-refuse-range\n"
@@ -649,6 +668,95 @@ class FateDepsTest(unittest.TestCase):
                 )
 
 
+class DiagnosticCitationTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of diagnostic workaround citations."""
+
+    def test_uncited_diagnostic_workaround_returns_flag(self) -> None:
+        """An uncited compiler-diagnostic workaround returns the first named flag."""
+        message = (
+            "avcodec/x: silence -Wmaybe-uninitialized false positive\n\nGCC 14 warns about ctx.\n"
+        )
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
+
+    def test_gcc_bugzilla_url_satisfies_citation(self) -> None:
+        """A GCC Bugzilla URL cites the named compiler diagnostic."""
+        message = (
+            "avcodec/x: silence -Wmaybe-uninitialized false positive\n\n"
+            "GCC 14 warns about ctx.\n"
+            "https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109999\n"
+        )
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_reproducer_line_satisfies_citation(self) -> None:
+        """A Reproducer line with a Compiler Explorer URL cites the diagnostic."""
+        message = (
+            "avcodec/x: silence -Wmaybe-uninitialized false positive\n\n"
+            "GCC 14 warns about ctx.\n"
+            "Reproducer: https://godbolt.org/z/abc123\n"
+        )
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_flag_without_workaround_wording_returns_none(self) -> None:
+        """A compiler flag without workaround wording does not require a citation."""
+        message = "avcodec/x: build with -Wall\n\nNo behaviour change.\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_workaround_wording_without_flag_returns_none(self) -> None:
+        """Workaround wording without a compiler diagnostic flag passes."""
+        message = "avcodec/x: work around a decoder hang\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_signed_off_by_workaround_wording_is_ignored(self) -> None:
+        """Signed-off-by trailers cannot supply workaround wording for a body flag."""
+        message = "avcodec/x: set flags\n\nUse -Wall.\n\nSigned-off-by: Work Around x@invalid\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_empty_reproducer_line_does_not_cite_diagnostic(self) -> None:
+        """A Reproducer prefix with nothing after it on the line does not count."""
+        prefix = (
+            "avcodec/x: silence -Wmaybe-uninitialized false positive\n\nGCC 14 warns about ctx.\n"
+        )
+        for trailer in ("Reproducer:", "Reproducer:\n", "Reproducer: \t\nSee above.\n"):
+            with self.subTest(trailer=trailer):
+                self.assertEqual(
+                    upstream_lint.uncited_diagnostic(prefix + trailer), "-Wmaybe-uninitialized"
+                )
+
+    def test_hash_flag_detected(self) -> None:
+        """Clang flags containing a hash in the suffix are detected."""
+        message = "avutil/x: silence -W#warnings\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-W#warnings")
+
+    def test_uppercase_flag_detected(self) -> None:
+        """Clang flags containing uppercase letters in the suffix are detected."""
+        message = "avutil/x: silence -WCFString-literal\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-WCFString-literal")
+
+    def test_plus_flag_detected_whole(self) -> None:
+        """Flags containing plus signs return the whole flag token."""
+        message = "avcodec/x: silence -Wc++11-compat\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wc++11-compat")
+
+    def test_lowercase_w_not_a_flag(self) -> None:
+        """Lowercase -w is a general compiler option, not a named diagnostic flag."""
+        message = "avcodec/x: silence warnings with -w\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_wrapped_false_positive_detected(self) -> None:
+        """Line-wrapped false positive wording still triggers the citation check."""
+        message = (
+            "avcodec/x: avoid -Wmaybe-uninitialized\n\nGCC reports a false\npositive for ctx.\n"
+        )
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
+
+    def test_wrapped_work_around_detected(self) -> None:
+        """Line-wrapped work around wording still triggers the citation check."""
+        message = (
+            "avcodec/x: init ctx for -Wmaybe-uninitialized\n\nThis is a work\naround for GCC 14.\n"
+        )
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
+
+
 class FixtureTest(unittest.TestCase):
     """Shared disposable Git fixture; stub the pre-commit subprocess only."""
 
@@ -703,7 +811,7 @@ class FixtureTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
 
-    def commit(self, subject="avfilter/vf_x: fix y"):
+    def commit(self, subject="avfilter/vf_x: update y"):
         """Commit fixture changes; never touch the implementation repository."""
         self.git("add", ".")
         self.git("commit", "-qm", subject)
@@ -736,13 +844,95 @@ class PipelineTest(FixtureTest):
     """Run Git and base tools in a throwaway repository; stub pre-commit only."""
 
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
-        """A correctly named clean commit passes all five collected checks."""
+        """A correctly named clean commit passes all six collected checks."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit()
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
+        for name in (
+            "pre-commit",
+            "commit-msg",
+            "patcheck",
+            "developer.texi",
+            "fate-deps",
+            "regression-test",
+            "diagnostic-citation",
+        ):
+            self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_fix_without_test_fails(self) -> None:
+        """A source fix commit with no changed test path in the range fails."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
         for name in ("pre-commit", "commit-msg", "patcheck", "developer.texi", "fate-deps"):
             self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_fix_with_test_passes(self) -> None:
+        """A source fix accompanied by a test file in the same commit passes."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_test_in_later_commit_passes(self) -> None:
+        """A test added in a separate commit within the same range satisfies the check."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.commit("tests/fate: add filter-x")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_waiver_passes(self) -> None:
+        """A non-blank --no-test-reason waives a source fix without a test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check("--no-test-reason", "hardware-only path")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: hardware-only path", output)
+
+    def test_blank_waiver_fails(self) -> None:
+        """Whitespace-only --no-test-reason does not waive a missing regression test."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check("--no-test-reason", "  ")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_fix_outside_sources_passes(self) -> None:
+        """A fix commit touching only documentation does not require a test path."""
+        self.write("doc/x.texi", "fixed wording\n")
+        self.commit("doc/x: fix a typo")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_uncited_diagnostic_workaround_fails(self) -> None:
+        """An uncited compiler-diagnostic workaround fails only its own step."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: silence -Wmaybe-uninitialized false positive")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: diagnostic-citation rc: 1", output)
+        for name in ("pre-commit", "commit-msg", "patcheck", "developer.texi", "fate-deps"):
+            self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_cited_diagnostic_workaround_passes(self) -> None:
+        """A compiler-diagnostic workaround with an upstream bug URL passes."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit(
+            "avfilter/vf_x: silence -Wmaybe-uninitialized false positive\n\n"
+            "https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109999"
+        )
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: diagnostic-citation rc: 0", output)
 
     def test_fate_missing_decoder_fails(self) -> None:
         """A committed lavfi video dependency gap fails without losing other steps."""
@@ -1154,7 +1344,7 @@ class RealToolsTest(FixtureTest):
     def test_clean_commit_passes(self):
         """The requested area-prefixed subject and clean C change pass."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
-        self.commit("avfilter/vf_x: fix y")
+        self.commit("avfilter/vf_x: update y")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
 

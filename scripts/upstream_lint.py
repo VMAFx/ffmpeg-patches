@@ -24,6 +24,21 @@ WRAPPED_AVFRAME_DECODER: lavfi emits wrapped_avframe video packets, so an encode
 alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
+
+The regression-test step fails when a commit whose subject says fix, fixes or
+fixed changes C, header or assembly sources under lib*/ or fftools/ and no path
+under a tests directory changes anywhere in base..head. --no-test-reason TEXT
+waives it and prints the reason; the step does not judge whether a changed test
+covers the fixed path.
+
+The diagnostic-citation step fails a commit whose message names a compiler
+diagnostic flag (-W...) together with workaround wording (workaround, false
+positive, silence, suppress, spurious) unless the message carries a GCC
+Bugzilla, LLVM bug, llvm-project issue or Compiler Explorer URL, or a line
+starting `Reproducer:`; diagnostics named without a flag and workarounds
+described in other words are not detected. The two-word phrases match across a
+line break, and a flag suffix may contain `#`, uppercase letters, digits, `+`,
+`_`, `=` and `-`.
 """
 
 from __future__ import annotations
@@ -41,7 +56,7 @@ import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Ensure repository root is on sys.path for test/tool imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +108,20 @@ C_NONCODE = re.compile(
     r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
     r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
     re.DOTALL | re.MULTILINE,
+)
+FIX_SUBJECT = re.compile(r"\bfix(es|ed)?\b", re.IGNORECASE)
+SOURCE_SUFFIXES = (".c", ".h", ".asm", ".S")
+DIAGNOSTIC_FLAG = re.compile(r"(?<![\w-])-W[A-Za-z0-9#][A-Za-z0-9#+=_-]*")
+WORKAROUND_WORDING = re.compile(
+    r"\b(work(s|ed)?(?:\s+|-)?around|false(?:\s+|-)positives?"
+    r"|silence[sd]?|suppress(es|ed)?|spurious)\b",
+    re.IGNORECASE,
+)
+DIAGNOSTIC_CITATION = re.compile(
+    r"https?://(gcc\.gnu\.org/bugzilla/|bugs\.llvm\.org/"
+    r"|github\.com/llvm/llvm-project/issues/|godbolt\.org/)\S+"
+    r"|^Reproducer:[ \t]*\S",
+    re.IGNORECASE | re.MULTILINE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an
 # allow-list: heuristic and newly introduced categories require human review.
@@ -1098,6 +1127,80 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
     return _fate_summary(report, rc)
 
 
+def is_test_path(name: str) -> bool:
+    """Return whether a repository path has a tests directory component."""
+    return "tests" in PurePosixPath(name).parts
+
+
+def is_source_path(name: str) -> bool:
+    """Return whether a repository path is a non-test library or fftools source."""
+    parts = PurePosixPath(name).parts
+    return (
+        len(parts) > 1
+        and name.endswith(SOURCE_SUFFIXES)
+        and (parts[0].startswith("lib") or parts[0] == "fftools")
+        and not is_test_path(name)
+    )
+
+
+def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Require a changed test path when a fix commit changes library or tool sources."""
+    records = _git(tree, "log", "-z", "--format=%H%n%s", f"{base}..{head}").split("\0")
+    fixes: list[tuple[str, str]] = []
+    for record in filter(None, records):
+        commit, _, rest = record.partition("\n")
+        subject = rest.rstrip("\r\n")
+        if FIX_SUBJECT.search(subject):
+            paths = _git(
+                tree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit
+            ).split("\0")
+            if any(is_source_path(path) for path in paths if path):
+                fixes.append((commit, subject))
+    test_paths = [name for name in _changed_paths(tree, base, head) if is_test_path(name)]
+    if not fixes or test_paths:
+        summary = f"{len(fixes)} fix commit(s), {len(test_paths)} test path(s) changed"
+        return Step("regression-test", 0, summary)
+    headed = [f"{commit[:12]}: {subject}" for commit, subject in fixes]
+    reason = waiver.strip()
+    if reason:
+        return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
+    suffix = (
+        "fixes C or assembly sources and no test path changed in the range; "
+        "add a FATE or unit test, or pass --no-test-reason"
+    )
+    return Step("regression-test", 1, "\n".join(f"{item}: {suffix}" for item in headed))
+
+
+def uncited_diagnostic(message: str) -> str | None:
+    """Return the first uncited compiler diagnostic flag in a workaround message."""
+    text = "\n".join(line for line in message.splitlines() if not line.startswith("Signed-off-by:"))
+    flag = DIAGNOSTIC_FLAG.search(text)
+    if flag and WORKAROUND_WORDING.search(text) and not DIAGNOSTIC_CITATION.search(text):
+        return flag[0]
+    return None
+
+
+def _diagnostic_citation(tree: Path, base: str, head: str) -> Step:
+    """Require a bug report URL or reproducer for compiler-diagnostic workarounds."""
+    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    findings: list[str] = []
+    count = 0
+    for record in log.split("\0"):
+        if not record:
+            continue
+        count += 1
+        commit, _, message = record.partition("\n")
+        flag = uncited_diagnostic(message)
+        if flag is not None:
+            findings.append(
+                f"{commit[:12]}: names {flag} as a workaround "
+                "without a bug report URL or Reproducer: line"
+            )
+    if findings:
+        return Step("diagnostic-citation", 1, "\n".join(findings))
+    return Step("diagnostic-citation", 0, f"no uncited diagnostic workaround in {count} commits")
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
     try:
         return action()
@@ -1105,7 +1208,7 @@ def _collect(name: str, action: Callable[[], Step]) -> Step:
         return Step(name, 2, str(error))
 
 
-def _checks(tree: Path, base: str, head: str) -> list[Step]:
+def _checks(tree: Path, base: str, head: str, waiver: str = "") -> list[Step]:
     """Collect every independent check even when another check fails."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-upstream-lint-") as directory:
         scratch = Path(directory)
@@ -1115,6 +1218,8 @@ def _checks(tree: Path, base: str, head: str) -> list[Step]:
             _collect("patcheck", lambda: _patcheck(tree, base, head, scratch)),
             _collect("developer.texi", lambda: _mechanical(tree, base, head)),
             _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
+            _collect("regression-test", lambda: _regression_test(tree, base, head, waiver)),
+            _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
         ]
 
 
@@ -1125,12 +1230,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--no-test-reason",
+        default="",
+        help="why the fix commits in the range carry no test; waives the regression-test step",
+    )
     args = parser.parse_args(argv)
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
         base, head = _prepare(tree, base, head)
-        steps = _checks(tree, base, head)
+        steps = _checks(tree, base, head, args.no_test_reason)
         _remaining(0)
     except (OSError, RuntimeError, ValueError) as error:
         steps = [Step("preflight", 2, str(error))]
