@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Check pull-request bodies and comments for stale base-commit claims.
 
-With --pull-json, --head HEX verifies that the pull head.sha starts with HEX
-(exiting 3 on mismatch) before checking claims, and --label TEXT overrides the
-display label for FILE arguments in stale-claim diagnostics.
+With --pull-json, --head HEX requires an exact match between pull head.sha and
+full 40-hex HEX (exiting 3 on mismatch) before checking claims, and --label TEXT
+overrides the display label for FILE arguments in stale-claim diagnostics.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ BASE_CLAIM = re.compile(
 CLAUSE_BREAK = re.compile(r"[;,|()]|\.\s")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 HISTORY_WORDS = re.compile(r"\b(previous|prior|earlier|former|old)\b", re.IGNORECASE)
-HEX_PREFIX = re.compile(r"[0-9a-fA-F]{7,40}")
 HEX_SHA = re.compile(r"[0-9a-fA-F]{40}")
 
 
@@ -87,8 +86,8 @@ def _validate_options(args: argparse.Namespace) -> None:
             raise ValueError("--live-body requires --pull-json")
         if args.head is not None:
             raise ValueError("--head requires --pull-json")
-    if args.head is not None and HEX_PREFIX.fullmatch(args.head) is None:
-        raise ValueError(f"invalid --head: {args.head!r}")
+    if args.head is not None and HEX_SHA.fullmatch(args.head) is None:
+        raise ValueError("--head must be a full 40-hex commit id")
 
 
 def _read_pull_payload(path_or_dash: str) -> dict[str, object]:
@@ -111,7 +110,7 @@ def _check_pull_head(payload: dict[str, object], expected_head: str | None) -> s
     if not isinstance(sha, str) or HEX_SHA.fullmatch(sha) is None:
         raise ValueError(f"invalid pull head: {sha!r}")
     actual, wanted = sha.lower(), expected_head.lower()
-    if not actual.startswith(wanted):
+    if actual != wanted:
         return f"pull head {actual} is not {wanted}"
     return None
 
@@ -150,7 +149,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--head",
         metavar="HEX",
-        help="require pull JSON head.sha to start with HEX (7-40 hex; exit 3 on mismatch)",
+        help="require pull JSON head.sha to match full 40-hex HEX exactly (exit 3 on mismatch)",
     )
     parser.add_argument(
         "--live-body",

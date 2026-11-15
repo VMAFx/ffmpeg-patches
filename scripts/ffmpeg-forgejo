@@ -28,6 +28,7 @@
 #                          exits 78 when the body equals an own existing comment after whitespace normalization
 #                          with --tested-head, exits 80 when the comment or the live PR body names a base commit other than the live merge base
 #                          the comment posts the body file as read once at start; a head change seen by the base check exits 76
+#                          the base check compares the full live head read by the last tested-head check
 #   ffmpeg-forgejo edit-body [--wait] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          replace a PR body; test claims must match the live PR head; refuses (exit 75) while the
 #                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
@@ -260,7 +261,7 @@ if not count:
 PY
 }
 
-# require_tested_head NUMBER TESTED [EVIDENCE]: check the live PR head and any evidence.
+# require_tested_head NUMBER TESTED [EVIDENCE]: check the live PR head and any evidence; set tested_live_head to the full live head.
 require_tested_head() {
   local number="$1" tested="$2" evidence="${3:-}" response status body live rc
   if response="$(pull_status "$number")"; then rc=0; else rc=$?; fi
@@ -300,6 +301,7 @@ print(sha)' \
       "$tested" "$live" >&2
     exit 76
   fi
+  tested_live_head="$live"
   [ -z "$evidence" ] || require_claim_evidence "$evidence" "$live"
 }
 
@@ -1476,7 +1478,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     check_comment_duplicate "$1" "$snapshot" "$me" <<<"$out"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     if [ "$claim_mode" = "tested-head" ] \
-      && ! require_current_base "$1" 1 "$snapshot" "$tested_head" "$2"; then
+      && ! require_current_base "$1" 1 "$snapshot" "$tested_live_head" "$2"; then
       printf 'ffmpeg-forgejo: tested head %s does not match the head read by the base check.\n' \
         "$tested_head" >&2
       exit 76

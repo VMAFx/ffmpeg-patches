@@ -181,31 +181,39 @@ class BaseClaimsTest(unittest.TestCase):
         )
 
     def test_main_head_option(self) -> None:
-        """CLI --head checks pull head.sha before claims and rejects invalid usage or heads."""
+        """CLI --head checks exact 40-hex pull head.sha and rejects short or invalid heads."""
         pull_file = self.write_fixture(
             "pull.json",
             json.dumps({"head": {"sha": "a" * 40}, "merge_base": "c" * 40}),
         )
-        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "aaaaaaa")
+        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "a" * 40)
         self.assertEqual(rc, 0)
         self.assertEqual(err, "")
 
-        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "bbbbbbb")
+        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "A" * 40)
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+
+        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "b" * 40)
         self.assertEqual(rc, 3)
         self.assertIn("pull head", err)
 
         no_head = self.write_fixture("no_head.json", json.dumps({"merge_base": "c" * 40}))
-        rc, err = self.run_cli("--pull-json", str(no_head), "--head", "aaaaaaa")
+        rc, err = self.run_cli("--pull-json", str(no_head), "--head", "a" * 40)
         self.assertEqual(rc, 2)
         self.assertNotEqual(err, "")
 
-        rc, err = self.run_cli("--merge-base", "c" * 40, "--head", "aaaaaaa")
+        rc, err = self.run_cli("--merge-base", "c" * 40, "--head", "a" * 40)
         self.assertEqual(rc, 2)
         self.assertNotEqual(err, "")
 
         rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "xyz")
         self.assertEqual(rc, 2)
-        self.assertNotEqual(err, "")
+        self.assertIn("full 40-hex", err)
+
+        rc, err = self.run_cli("--pull-json", str(pull_file), "--head", "aaaaaaa")
+        self.assertEqual(rc, 2)
+        self.assertIn("full 40-hex", err)
 
     def test_main_label_option(self) -> None:
         """CLI --label replaces the file path in stale-claim diagnostic messages."""

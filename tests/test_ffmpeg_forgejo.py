@@ -1792,6 +1792,18 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertIn("base check", proc.stderr)
         self.assertEqual(self.posts(stub), [])
 
+    def test_comment_prefix_head_change_in_base_read_exits_76(self) -> None:
+        """A base-check read of a different head sharing the tested prefix exits 76
+        without posting."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        stub = Stub([LIVE, LIVE, other])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("base check", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
     def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
         """Both writes reject a different full head sharing the tested prefix."""
 
