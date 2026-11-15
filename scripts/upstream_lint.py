@@ -24,6 +24,13 @@ WRAPPED_AVFRAME_DECODER: lavfi emits wrapped_avframe video packets, so an encode
 alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
+
+The diagnostic-citation step fails a commit whose message names a compiler
+diagnostic flag (-W...) together with workaround wording (workaround, false
+positive, silence, suppress, spurious) unless the message carries a GCC
+Bugzilla, LLVM bug, llvm-project issue or Compiler Explorer URL, or a line
+starting `Reproducer:`; diagnostics named without a flag and workarounds
+described in other words are not detected.
 """
 
 from __future__ import annotations
@@ -93,6 +100,17 @@ C_NONCODE = re.compile(
     r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
     r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
     re.DOTALL | re.MULTILINE,
+)
+DIAGNOSTIC_FLAG = re.compile(r"(?<![\w-])-W[a-z0-9][a-z0-9=-]*")
+WORKAROUND_WORDING = re.compile(
+    r"\b(work(s|ed)?[ -]?around|false[ -]positives?|silence[sd]?|suppress(es|ed)?|spurious)\b",
+    re.IGNORECASE,
+)
+DIAGNOSTIC_CITATION = re.compile(
+    r"https?://(gcc\.gnu\.org/bugzilla/|bugs\.llvm\.org/"
+    r"|github\.com/llvm/llvm-project/issues/|godbolt\.org/)\S+"
+    r"|^Reproducer:[ \t]*\S",
+    re.IGNORECASE | re.MULTILINE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an
 # allow-list: heuristic and newly introduced categories require human review.
@@ -1098,6 +1116,36 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
     return _fate_summary(report, rc)
 
 
+def uncited_diagnostic(message: str) -> str | None:
+    """Return the first uncited compiler diagnostic flag in a workaround message."""
+    text = "\n".join(line for line in message.splitlines() if not line.startswith("Signed-off-by:"))
+    flag = DIAGNOSTIC_FLAG.search(text)
+    if flag and WORKAROUND_WORDING.search(text) and not DIAGNOSTIC_CITATION.search(text):
+        return flag[0]
+    return None
+
+
+def _diagnostic_citation(tree: Path, base: str, head: str) -> Step:
+    """Require a bug report URL or reproducer for compiler-diagnostic workarounds."""
+    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    findings: list[str] = []
+    count = 0
+    for record in log.split("\0"):
+        if not record:
+            continue
+        count += 1
+        commit, _, message = record.partition("\n")
+        flag = uncited_diagnostic(message)
+        if flag is not None:
+            findings.append(
+                f"{commit[:12]}: names {flag} as a workaround "
+                "without a bug report URL or Reproducer: line"
+            )
+    if findings:
+        return Step("diagnostic-citation", 1, "\n".join(findings))
+    return Step("diagnostic-citation", 0, f"no uncited diagnostic workaround in {count} commits")
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
     try:
         return action()
@@ -1115,6 +1163,7 @@ def _checks(tree: Path, base: str, head: str) -> list[Step]:
             _collect("patcheck", lambda: _patcheck(tree, base, head, scratch)),
             _collect("developer.texi", lambda: _mechanical(tree, base, head)),
             _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
+            _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
         ]
 
 
