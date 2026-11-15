@@ -32,6 +32,9 @@
 #                          Without Autolabel, edit-body requires at least one terminal status and the newest status to be at least 30 minutes old.
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
+#   ffmpeg-forgejo close   <number> <comment-file>
+#                          comment on an own open PR, then close it; refuses (exit 80) a PR whose author is not the token login,
+#                          exits 78 when the comment equals an own existing comment, 1 unless the PR reads back closed
 # Evidence test claims start with `- test:` or `test:` after optional whitespace.
 # Every such line needs head=<7-40 hex> and tree=<path>; other lines are ignored.
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
@@ -659,6 +662,63 @@ except (OSError, UnicodeError, ValueError) as error:
     print(f"ffmpeg-forgejo: cannot check existing comments on #{number}: {error}", file=sys.stderr)
     raise SystemExit(1)
 ' "$1" "$2" "$3"
+}
+
+# require_own_open_pull NUMBER LOGIN: exit 80 unless pull NUMBER is authored by LOGIN, 1 unless it is open.
+require_own_open_pull() {
+  local out
+  out="$(api GET "/repos/$REPO/pulls/$1")" || die "cannot read pull #$1"
+  python3 -I -c '
+import json
+import sys
+
+number, me = sys.argv[1:]
+try:
+    pull = json.load(sys.stdin)
+    author = pull["user"]["login"]
+    state = pull["state"]
+except (ValueError, KeyError, TypeError) as error:
+    print(f"ffmpeg-forgejo: cannot read pull #{number}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(author, str) or author != me:
+    print(
+        f"ffmpeg-forgejo: pull #{number} is authored by {author}, not {me}; not closed",
+        file=sys.stderr,
+    )
+    raise SystemExit(80)
+if state != "open":
+    print(f"ffmpeg-forgejo: pull #{number} is {state}; not closed", file=sys.stderr)
+    raise SystemExit(1)
+' "$1" "$2" <<<"$out"
+}
+
+# require_closed NUMBER: print the PR URL once pull NUMBER reads back closed; exit 1 otherwise.
+require_closed() {
+  local out
+  out="$(api GET "/repos/$REPO/pulls/$1")" || die "cannot read back pull #$1"
+  python3 -I -c '
+import json
+import sys
+
+number = sys.argv[1]
+try:
+    pull = json.load(sys.stdin)
+    state = pull["state"]
+    url = pull["html_url"] if state == "closed" else ""
+except (ValueError, KeyError, TypeError) as error:
+    print(f"ffmpeg-forgejo: cannot read back pull #{number}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if state != "closed":
+    print(
+        f"ffmpeg-forgejo: pull #{number} is still {state} after the close request",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if not isinstance(url, str) or not url:
+    print(f"ffmpeg-forgejo: cannot read back pull #{number}: missing html_url", file=sys.stderr)
+    raise SystemExit(1)
+print(f"closed {url}")
+' "$1" <<<"$out"
 }
 
 # own_open_pr_numbers: list own open pull numbers using the overlap checks poster filter.
@@ -1482,6 +1542,27 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     json_body "body=@$2" >"$body"
     api PATCH "/repos/$REPO/pulls/$1" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
     rm -f "$body"
+    ;;
+  close)
+    usage='close <number> <comment-file>'
+    [ $# -eq 2 ] || usage_error "$usage"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
+    [ -f "$2" ] || die "no comment file $2"
+    [ -n "$(tr -d '[:space:]' <"$2")" ] || die "empty comment file $2"
+    me="$(token_login)" || die "cannot read token login"
+    require_own_open_pull "$1" "$me"
+    discover_page_size
+    out="$(api_list "/repos/$REPO/issues/$1/comments?" 200)" || exit 1
+    check_comment_duplicate "$1" "$2" "$me" <<<"$out"
+    require_own_open_pull "$1" "$me"
+    body="$(mktemp)"
+    trap 'rm -f "$body"' EXIT
+    json_body "body=@$2" >"$body"
+    api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    json_body "state=closed" >"$body"
+    api PATCH "/repos/$REPO/pulls/$1" "$body" >/dev/null
+    rm -f "$body"
+    require_closed "$1"
     ;;
   reviewers)
     [ $# -ge 1 ] || die "usage: reviewers <number> [<login>...]"
