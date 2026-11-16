@@ -72,6 +72,11 @@ WRITTEN_SCRIPT_DIR = (
     "read, mapfile, unset, a loop, an arithmetic, append or array assignment, or a special "
     "builtin prefix); assign it only with = or use an absolute path"
 )
+PREFIXED_FUNCTION_SCRIPT_DIR = (
+    "script path in a function that the script calls with a prefix assignment of the name "
+    "(NAME=value f), which Bash keeps for the whole call; pass the value as an argument or use "
+    "an absolute path"
+)
 UNKNOWN_SOURCE_PATH = (
     "relative script path after a source the guard cannot read; use an absolute path"
 )
@@ -433,6 +438,9 @@ class _Scan:
     script_literals: set[str] = field(default_factory=set)
     unresolved_dirs: set[str] = field(default_factory=set)
     refused_dirs: dict[str, str] = field(default_factory=dict)
+    prefixed_functions: dict[str, frozenset[str]] = field(default_factory=dict)
+    prefix_spans: list[tuple[bytes, int, int, frozenset[str]]] = field(default_factory=list)
+    span_names: frozenset[str] = frozenset()
     pending: list[tuple[str, bool, bool, frozenset[str]]] = field(default_factory=list)
     moved: bool = False
     rebound: bool = False
@@ -515,7 +523,12 @@ def _referenced(word: str, names: Iterable[str]) -> frozenset[str]:
 
 
 def _reference_refusal(word: str, scan: _Scan) -> str | None:
-    """Name the refusal for a word referencing an ambiguous, unresolved or refused script dir."""
+    """Name the refusal for a word referencing an ambiguous, unresolved or refused script dir.
+
+    A name that a prefix assignment holds in the function body being walked refuses first.
+    """
+    if _referenced(word, scan.span_names):
+        return PREFIXED_FUNCTION_SCRIPT_DIR
     if _referenced(word, scan.ambiguous):
         return AMBIGUOUS_SCRIPT_PATH
     if _referenced(word, scan.unresolved_dirs):
@@ -798,7 +811,7 @@ def _single_reader(node: Any) -> Any:
 
 def _process_reader_hit(node: Any, raw: bytes, scan: _Scan) -> str | None:
     """Inspect a sole file reader supplying shell text through process substitution."""
-    words, idx, name = _command_info(_single_reader(node), raw, scan.literals)
+    words, idx, name = _command_info(_single_reader(node), raw, _live_literals(scan))
     operands = _reader_operands(words, idx)
     if not operands or "-" in operands:
         return "shell reads a process substitution the guard cannot inspect"
@@ -931,7 +944,7 @@ def _assignment_hit(node: Any, raw: bytes) -> str | None:
 
 def _inspect_command(node: Any, raw: bytes, scan: _Scan) -> str | None:
     """Classify command position, wrappers and executable paths without following call cycles."""
-    words, idx, name = _command_info(node, raw, scan.literals)
+    words, idx, name = _command_info(node, raw, _live_literals(scan))
     if idx >= len(words):
         return None
     if name in SHELLS:
@@ -996,7 +1009,7 @@ def _ordinary_command(words: list[str], idx: int, scan: _Scan) -> str | None:
 
 def _literal_pipe(stages: list[Any], raw: bytes, scan: _Scan) -> str | None:
     """Inspect literal producers and bounded file readers piped into a shell."""
-    producers = [_command_info(stage, raw, scan.literals) for stage in stages]
+    producers = [_command_info(stage, raw, _live_literals(scan)) for stage in stages]
     filtered = any(
         name != "cat" or len(_reader_operands(words, idx) or []) != 1
         for words, idx, name in producers[1:]
@@ -1024,7 +1037,7 @@ def _pipeline_hit(node: Any, raw: bytes, scan: _Scan) -> str | None:
     """Inspect shell stdin producers and configure data piped into executable consumers."""
     stages = node.named_children
     for i in range(1, len(stages)):
-        words, idx, name = _command_info(stages[i], raw, scan.literals)
+        words, idx, name = _command_info(stages[i], raw, _live_literals(scan))
         consumer = name in ("xargs", "make", "eval", "source", ".") or INTERPRETERS.fullmatch(name)
         if name in SHELLS:
             target, inline = _shell_argument(words[idx:])
@@ -1088,13 +1101,13 @@ def _heredoc_parts(node: Any, raw: bytes) -> tuple[str, bool, Any, list[Any]]:
 def _heredoc(node: Any, raw: bytes, scan: _Scan) -> tuple[str | None, list[tuple[Any, bool]]]:
     """Inspect executable redirect payloads and expanding substitutions in data payloads."""
     text, quoted, body, statements = _heredoc_parts(node, raw)
-    words, idx, name = _command_info(_redirect_owner(node), raw, scan.literals)
+    words, idx, name = _command_info(_redirect_owner(node), raw, _live_literals(scan))
     target, inline = _shell_argument(words[idx:]) if name in SHELLS else (None, False)
     shell_input = name in SHELLS and not inline and target in (None, "-")
     for i in range(len(statements)):
         stages = statements[i].named_children
         for j in range(len(stages)):
-            _, _, stage_name = _command_info(stages[j], raw, scan.literals)
+            _, _, stage_name = _command_info(stages[j], raw, _live_literals(scan))
             shell_input |= stage_name in SHELLS
     children = [(n, False) for n in node.named_children if n != body]
     if shell_input:
@@ -1502,6 +1515,9 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
     kind = node.type
     if kind not in STRUCTURE | ASSIGNMENTS | DATA | LEAVES | SPECIAL:
         return f"unsupported shell syntax {kind} near line {node.start_point.row + 1}"
+    if kind == "function_definition":
+        _note_prefix_span(node, raw, scan)
+    scan.span_names = _span_names(node, raw, scan)
     if node.parent is not None and node.parent.type == "program":
         _note_statement(node, raw, scan)
     if kind == "ERROR":
@@ -1514,6 +1530,33 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
     hit, children = _visit_semantics(node, raw, data_only, scan)
     _push_visit_children(kind, entry, children, raw, scan)
     return hit
+
+
+def _note_prefix_span(node: Any, raw: bytes, scan: _Scan) -> None:
+    """Mark a function body that the script calls under a prefix assignment of a watched name."""
+    name_node = node.child_by_field_name("name")
+    body = node.child_by_field_name("body")
+    if name_node is None or body is None:
+        return
+    held = scan.prefixed_functions.get(_text(name_node, raw))
+    if held:
+        scan.prefix_spans.append((raw, body.start_byte, body.end_byte, held))
+
+
+def _span_names(node: Any, raw: bytes, scan: _Scan) -> frozenset[str]:
+    """Return the names a prefix assignment holds in every marked function body around a node."""
+    held: frozenset[str] = frozenset()
+    for span_raw, start, end, names in scan.prefix_spans:
+        if span_raw is raw and start <= node.start_byte < end:
+            held |= names
+    return held
+
+
+def _live_literals(scan: _Scan) -> dict[str, str]:
+    """Return the literals to substitute, leaving out the names a prefix holds right here."""
+    if not scan.span_names:
+        return scan.literals
+    return {k: v for k, v in scan.literals.items() if k not in scan.span_names}
 
 
 def _visit_semantics(
@@ -1662,6 +1705,8 @@ class _Names:
     assigned: set[str] = field(default_factory=set)
     starts: set[int] = field(default_factory=set)
     skipped: list[tuple[int, int]] = field(default_factory=list)
+    prefixed: dict[str, set[str]] = field(default_factory=dict)
+    bodies: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _plain_start(node: Any) -> int | None:
@@ -1700,12 +1745,13 @@ def _prefix_command(node: Any, raw: bytes) -> str | None:
 
 
 def _note_prefix(node: Any, raw: bytes, names: _Names) -> None:
-    """Record the name start of an = prefix before a plain command that is no special builtin.
+    """Record the name start and command of an = prefix before a plain non-special command.
 
     Bash keeps such a prefix assignment for that one command and restores the old value after
     it (bash 5.3 manual 4.4: only a special builtin in POSIX mode keeps it), so it writes no
     value for later statements. A prefix before a special builtin, a quoted or computed
-    command name, or no command at all counts as a write.
+    command name, or no command at all counts as a write. The command word is kept, because a
+    function called this way sees the prefix value in its whole body.
     """
     command = _prefix_command(node, raw)
     if command is None or command in SPECIAL_BUILTINS:
@@ -1713,6 +1759,16 @@ def _note_prefix(node: Any, raw: bytes, names: _Names) -> None:
     start = _plain_start(node)
     if start is not None:
         names.starts.add(start)
+        name = _text(node.child_by_field_name("name"), raw)
+        names.prefixed.setdefault(command, set()).add(name)
+
+
+def _note_function(node: Any, raw: bytes, names: _Names) -> None:
+    """Record a function's name and body text for the prefix call closure."""
+    name_node = node.child_by_field_name("name")
+    body = node.child_by_field_name("body")
+    if name_node is not None and body is not None:
+        names.bodies.setdefault(_text(name_node, raw), []).append(_text(body, raw))
 
 
 def _note_heredoc(node: Any, raw: bytes, names: _Names) -> None:
@@ -1739,6 +1795,8 @@ def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> _Names:
             _note_prefix(node, raw, names)
         elif node.type == "variable_assignment":
             _note_assignment(node, raw, names)
+        elif node.type == "function_definition":
+            _note_function(node, raw, names)
         stack.extend(reversed(node.named_children))
     return names
 
@@ -1762,8 +1820,8 @@ def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
     command other than a special builtin is no write. Every other use counts as a write, among
     them printf -v, read, mapfile, unset, an arithmetic, append or array assignment,
     ${NAME:=value}, a for loop variable and any text that names the variable, such
-    as an eval or trap string. Not detected: a name built at run time, alias expansion, and the
-    value a function sees under a prefix assignment, which is resolved with the top-level value.
+    as an eval or trap string. A function called under a prefix assignment is handled by
+    _prefixed_functions. Not detected: a name built at run time and alias expansion.
     """
     code = bytearray(raw)
     for start, end in names.skipped:
@@ -1791,6 +1849,28 @@ def _literal_map(
     return {k: v for k, v in literals.items() if k not in written}, names.assigned | written
 
 
+def _prefixed_functions(names: _Names, watched: set[str]) -> dict[str, frozenset[str]]:
+    """Map each called function to the watched names a prefix assignment holds in its body.
+
+    Bash keeps a prefix assignment before a function call for the whole call, callees included
+    (bash 5.3 manual 3.7.4 and 3.3), so the names pass on to every word a function body holds,
+    a function defined in a sourced file included, over at most one round per function body.
+    Not followed: a prefix call written in a sourced file.
+    """
+    held = {f: set(n) & watched for f, n in names.prefixed.items()}
+    calls = {f: set(PLAIN_FUNCTION.findall(" ".join(texts))) for f, texts in names.bodies.items()}
+    for _ in range(len(calls) + 1):
+        grown = False
+        for caller in sorted(held):
+            for callee in sorted(calls.get(caller, ())):
+                if not held[caller] <= held.setdefault(callee, set()):
+                    held[callee] |= held[caller]
+                    grown = True
+        if not grown:
+            break
+    return {f: frozenset(n) for f, n in held.items() if n}
+
+
 def _prime_names(scan: _Scan, names: _Names, raw: bytes) -> None:
     """Seed literals, assigned and own-directory names; refuse own-directory names it writes."""
     dirs = _script_dir_names(names.assignments) if scan.context.script_dir is not None else {}
@@ -1802,6 +1882,7 @@ def _prime_names(scan: _Scan, names: _Names, raw: bytes) -> None:
     scan.script_dirs = {k: v for k, v in dirs.items() if k not in written}
     for name in sorted(written & set(dirs)):
         scan.refused_dirs[name] = WRITTEN_SCRIPT_DIR
+    scan.prefixed_functions = _prefixed_functions(names, set(dirs) | set(literals))
 
 
 def _merge_source_literals(node: Any, scan: _Scan) -> None:
@@ -1823,6 +1904,7 @@ def _finish(
     scan: _Scan, directory_state: list[bool] | None
 ) -> tuple[str | None, list[tuple[str, bool, bool]], list[str], list[tuple[str, bool, bool]]]:
     """Settle pending references and return the file's verdict and candidates."""
+    scan.span_names = frozenset()
     refusal = _settle_pending(scan)
     if refusal is not None:
         return refusal, [], [], []

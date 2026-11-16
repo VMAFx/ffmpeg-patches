@@ -43,6 +43,7 @@ HASH_DIRNAME = "{ builtin hash -p <case>/bin/dirname dirname; }\n"
 OTHER_DIRNAME = {"bin/dirname": "echo <case>/other\n", "other/lib.sh": CFG}
 ARGV0_OWN = 'BASH_ARGV0=$(dirname "$(readlink -f "$0")")\n'
 ROOT_LIB = {"lib.sh": CFG}
+PREFIXED = "script path in a function that the script calls with a prefix assignment"
 
 
 class Case(NamedTuple):
@@ -849,6 +850,70 @@ SCRIPT_DIR = {
     "r12-keep-landing-prefix": Case(
         DOLLAR0 + 'f() { :; }\nrun() {\n  HERE="$d/missing" MODE=always f\n}\n' + SRC + RUN, 0
     ),
+    "r13-function-prefix-source": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\nHERE=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r13-function-prefix-program": Case(
+        DOLLAR0 + 'f() {\n  "$HERE/next.sh"\n}\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/next.sh": "echo benign\n", "other/next.sh": CFG},
+    ),
+    "r13-function-prefix-callee": Case(
+        DOLLAR0 + 'g() { . "$HERE/lib.sh"; }\nf() { g; }\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r13-function-prefix-callee-later": Case(
+        DOLLAR0 + 'f() { g; }\ng() { . "$HERE/lib.sh"; }\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r13-function-prefix-cdpwd": Case(
+        CDPWD + 'f() { . "$HERE/lib.sh"; }\nHERE=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r13-function-prefix-literal": Case(
+        'X=<case>/tools\nf() { . "$X/lib.sh"; }\nX=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r13-function-prefix-nested-call": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\nrun() {\n  HERE=<case>/other f\n}\nrun\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r13-function-before-dir": Case(
+        'f() { . "$HERE/lib.sh"; }\n' + DOLLAR0 + "HERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r13-function-in-sourced-file": Case(
+        DOLLAR0 + '. "$HERE/fn.sh"\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/fn.sh": 'f() { . "$HERE/lib.sh"; }\n', "other/lib.sh": CFG},
+    ),
+    "r13-keep-other-prefix": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\nMODE=x f\n' + RUN, 0, files=OTHER
+    ),
+    "r13-keep-function-reads-only": Case(
+        DOLLAR0 + 'f() { echo "$HERE"; }\nHERE=<case>/other f\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r13-keep-unrelated-function": Case(
+        DOLLAR0 + 'g() { . "$HERE/lib.sh"; }\nf() { echo hi; }\nHERE=<case>/other f\ng\n' + RUN,
+        0,
+        files=OTHER,
+    ),
+    "r13-keep-landing-judge": Case(
+        DOLLAR0
+        + 'judge() {\n  python3 -B "$HERE/../x.py"\n}\n'
+        + 'run() {\n  HERE="$d/missing" judge\n}\nrun\n'
+        + SRC
+        + RUN,
+        0,
+    ),
 }
 
 
@@ -896,8 +961,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 333 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 333)
+        """Replay all 346 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 346)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
