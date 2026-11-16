@@ -67,6 +67,14 @@ gray or grey, or a colour range comparison while the added docs mention range
 or rangein but never unspecified, unknown or untagged. --doc-reason TEXT waives
 it and prints the reason. Only these two pairs are checked; any other gap
 between what the code does and what the docs say is not detected.
+
+The test-program step fails when base..head adds a C file directly under a
+lib*/tests/ directory and an added line of that library's Makefile names the
+file's stem, which registers a new TESTPROGS program. Upstream reviewers ask
+for the standard FATE structure instead: an input sample run through ffmpeg or
+ffprobe and compared against a tests/ref reference. --test-program-reason TEXT
+waives it and prints the reason. A program registered in another file, and a
+FATE test whose input another custom tool builds, are not detected.
 """
 
 from __future__ import annotations
@@ -221,6 +229,7 @@ class Waivers:
     no_test: str = ""
     claim: str = ""
     doc: str = ""
+    test_program: str = ""
 
 
 @dataclass
@@ -1554,6 +1563,65 @@ def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("doc-terms", 1, "\n".join([*findings, advice]))
 
 
+def is_test_program_path(name: str) -> bool:
+    """Return whether a repository path is a C file directly under a lib*/tests/ directory."""
+    parts = PurePosixPath(name).parts
+    return (
+        len(parts) == 3
+        and parts[0].startswith("lib")
+        and parts[1] == "tests"
+        and parts[2].endswith(".c")
+    )
+
+
+def registered_test_programs(new_paths: list[str], patch: str) -> list[str]:
+    """Return new lib*/tests C files whose stem an added line of their library Makefile names."""
+    makefile_lines: dict[str, list[str]] = {}
+    for path, _, added in _patch_files(patch):
+        makefile_lines.setdefault(path, []).extend(added)
+    programs: list[str] = []
+    for path in new_paths:
+        if not is_test_program_path(path):
+            continue
+        word = re.compile(rf"\b{re.escape(PurePosixPath(path).stem)}\b")
+        library = PurePosixPath(path).parts[0]
+        if any(word.search(line) for line in makefile_lines.get(f"{library}/Makefile", [])):
+            programs.append(path)
+    return programs
+
+
+def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Ask for a FATE sample and reference test instead of a new lib*/tests program."""
+    changed = [
+        name
+        for name in _changed_paths(tree, base, head, "lib*/tests/*.c")
+        if is_test_program_path(name)
+    ]
+    existing: set[str] = set()
+    if changed:
+        listed = _git(tree, "ls-tree", "-z", "--name-only", base, "--", *changed)
+        existing = set(filter(None, listed.split("\0")))
+    patch = _git(tree, *DIFF_COMMON, "-U0", base, head, "--", "lib*/Makefile")
+    new_paths = [name for name in changed if name not in existing]
+    programs = registered_test_programs(new_paths, patch)
+    if not programs:
+        return Step(
+            "test-program",
+            0,
+            f"no new registered program in {len(new_paths)} new lib*/tests file(s)",
+        )
+    findings = [
+        f"{name}: new TESTPROGS program; upstream asks for a FATE test that runs an input "
+        "sample and compares the output with a tests/ref reference"
+        for name in programs
+    ]
+    reason = waiver.strip()
+    if reason:
+        return Step("test-program", 0, "\n".join([f"waived: {reason}", *findings]))
+    advice = "add a FATE sample test with a tests/ref reference, or pass --test-program-reason"
+    return Step("test-program", 1, "\n".join([*findings, advice]))
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
     try:
         return action()
@@ -1577,11 +1645,12 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
             _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
+            _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
         ]
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run all upstream checks, print their statuses, and optionally save a report."""
+def _parser() -> argparse.ArgumentParser:
+    """Build the command line parser with the range options and one waiver per step."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--base", required=True)
@@ -1606,12 +1675,27 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="why the added docs may leave out a case the doc-terms step names; waives that step",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--test-program-reason",
+        default="",
+        help="why a new lib*/tests program cannot be a FATE sample test; waives that step",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run all upstream checks, print their statuses, and optionally save a report."""
+    args = _parser().parse_args(argv)
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
         base, head = _prepare(tree, base, head)
-        waivers = Waivers(no_test=args.no_test_reason, claim=args.claim_reason, doc=args.doc_reason)
+        waivers = Waivers(
+            no_test=args.no_test_reason,
+            claim=args.claim_reason,
+            doc=args.doc_reason,
+            test_program=args.test_program_reason,
+        )
         steps = _checks(tree, base, head, waivers)
         _remaining(0)
     except (OSError, RuntimeError, ValueError) as error:

@@ -1020,6 +1020,58 @@ class DocTermTest(unittest.TestCase):
                 self.assertFalse(upstream_lint.is_doc_path(name))
 
 
+class TestProgramTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of new registered lib*/tests programs."""
+
+    def test_registered_new_program_is_found(self) -> None:
+        """A new lib*/tests C file named by an added line of its Makefile is found."""
+        for line in (
+            "+TESTPROGS-$(CONFIG_ITUT_T35)              += aom_film_grain",
+            "+           aom_film_grain                                             \\",
+        ):
+            with self.subTest(line=line):
+                patch = (
+                    "diff --git a/libavcodec/Makefile b/libavcodec/Makefile\n"
+                    "--- a/libavcodec/Makefile\n"
+                    "+++ b/libavcodec/Makefile\n"
+                    f"@@ -1398,0 +1399 @@\n{line}\n"
+                )
+                found = upstream_lint.registered_test_programs(
+                    ["libavcodec/tests/aom_film_grain.c"], patch
+                )
+                self.assertEqual(found, ["libavcodec/tests/aom_film_grain.c"])
+
+    def test_unregistered_or_other_library_passes(self) -> None:
+        """No finding without a matching whole word in the same library Makefile."""
+        program = ["libavcodec/tests/aom_film_grain.c"]
+        for path, line in (
+            ("libavutil/Makefile", "+TESTPROGS += aom_film_grain"),
+            ("libavcodec/Makefile", "+TESTPROGS += aom_film_grain_sets"),
+            ("libavcodec/x86/Makefile", "+TESTPROGS += aom_film_grain"),
+            ("libavcodec/aom_film_grain.c", "+int aom_film_grain;"),
+        ):
+            with self.subTest(path=path, line=line):
+                patch = (
+                    f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                    f"@@ -1 +1,2 @@\n{line}\n"
+                )
+                self.assertEqual(upstream_lint.registered_test_programs(program, patch), [])
+        self.assertEqual(upstream_lint.registered_test_programs(program, ""), [])
+
+    def test_test_program_path_is_c_under_lib_tests(self) -> None:
+        """Only C files directly below a lib*/tests directory count as test programs."""
+        self.assertTrue(upstream_lint.is_test_program_path("libavcodec/tests/x.c"))
+        for name in (
+            "libavcodec/tests/x.h",
+            "libavcodec/tests/sub/x.c",
+            "tests/api/x.c",
+            "libavcodec/x.c",
+            "tools/tests/x.c",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(upstream_lint.is_test_program_path(name))
+
+
 class FixtureTest(unittest.TestCase):
     """Shared disposable Git fixture; stub the pre-commit subprocess only."""
 
@@ -1122,6 +1174,7 @@ class PipelineTest(FixtureTest):
             "diagnostic-citation",
             "claim-scope",
             "doc-terms",
+            "test-program",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
 
@@ -1380,6 +1433,46 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_test_program_fails(self) -> None:
+        """A new lib*/tests program registered in its Makefile fails the test-program step."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write("libavcodec/Makefile", "TESTPROGS += x_grain\n")
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: test-program rc: 1", output)
+        self.assertIn("libavcodec/tests/x_grain.c: new TESTPROGS program", output)
+
+    def test_test_program_waiver_passes(self) -> None:
+        """A non-blank --test-program-reason waives the test-program step and prints it."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write("libavcodec/Makefile", "TESTPROGS += x_grain\n")
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check("--test-program-reason", "no sample reaches the payload")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: test-program rc: 0\nwaived: no sample reaches the payload", output)
+
+    def test_unregistered_test_file_passes(self) -> None:
+        """A new lib*/tests C file that no added Makefile line names passes."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: test-program rc: 0", output)
+
+    def test_existing_test_program_edit_passes(self) -> None:
+        """Editing a program and Makefile line that exist at base is not a new program."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write("libavcodec/Makefile", "TESTPROGS += x_grain\n")
+        self.commit("avcodec/tests: add x_grain")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 1;\n}\n")
+        self.write("libavcodec/Makefile", "TESTPROGS += golomb x_grain\n")
+        self.commit("avcodec/tests: extend x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: test-program rc: 0", output)
 
     def test_fate_missing_decoder_fails(self) -> None:
         """A committed lavfi video dependency gap fails without losing other steps."""
