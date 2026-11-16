@@ -101,6 +101,15 @@ a TEXI_INLINE command and its brace; block names come from the file's own @end
 lines, so lines in an unlisted block are never checked. --doc-reason TEXT
 waives it and prints the reason.
 
+The doc-reference step fails an added @ref, @xref or @pxref inside a @section
+that follows wording such as described for or in, or same format as, in the
+same sentence across the previous line, when its anchor sits in another
+@section of the same file and the anchored table item names a library of that
+section (a word of its title, or the part of the word before its first -) that
+the citing section does not name. References to nodes or to other files, and
+deferrals worded otherwise, are not detected. --doc-reason TEXT waives it and
+prints the reason.
+
 The test-program step fails when base..head adds a C file directly under a
 lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
 TESTPROGS-$(CONFIG_X) +=) in that library's Makefile at head lists the file's
@@ -1680,6 +1689,17 @@ TEXI_END = re.compile(r"@end\s+([A-Za-z]+)\s*$")
 TEXI_FIRST_WORD = re.compile(r"@[A-Za-z]+\{[^}]*\}\S*|\S+")
 WRAP_MIN_NEIGHBOUR = 50
 SENTENCE_END = re.compile(r"(?:[.:;!?]|@\*)\s*$")
+TEXI_ANCHOR = re.compile(r"@anchor\{([^}]+)\}")
+TEXI_SECTION = re.compile(r"@section\s+(.+?)\s*$")
+TEXI_ITEM = re.compile(r"@itemx?\b")
+TEXI_ITEM_END = re.compile(r"@(?:itemx?|end|section|subsection|chapter|anchor)\b")
+TEXI_REF = re.compile(r"@(?:ref|xref|pxref)\{([^,}]+)")
+DEFER_WORDING = re.compile(
+    r"\b(?:(?:described|documented|defined|specified|explained)\s+(?:for|in|under|by|with)"
+    r"|(?:same|identical)\s+(?:format|syntax)\s+as)\b(?:(?!\.\s)[^;])*$",
+    re.IGNORECASE,
+)
+ANCHOR_ITEM_LIMIT = 400
 
 
 def is_doc_path(name: str) -> bool:
@@ -1791,6 +1811,77 @@ def wrap_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
     return findings
 
 
+def texi_sections(lines: list[str]) -> list[str]:
+    """Return the title of the @section each line belongs to, or an empty string."""
+    current = ""
+    titles: list[str] = []
+    for line in lines:
+        match = TEXI_SECTION.match(line)
+        current = match[1] if match else current
+        titles.append(current)
+    return titles
+
+
+def section_names(title: str) -> frozenset[str]:
+    """Return the names a section title gives: each word and its part before the first -."""
+    words = [word for word in re.split(r"[\s,]+", title) if word]
+    return frozenset(name for word in words for name in (word, word.split("-")[0]) if len(name) > 2)
+
+
+def _anchor_item(lines: list[str], start: int) -> list[str]:
+    """Return the lines of the table item an @anchor opens, up to the next item or section."""
+    index = start + 1
+    for index in range(start + 1, min(len(lines), start + 1 + ANCHOR_ITEM_LIMIT)):
+        if not TEXI_ITEM.match(lines[index]):
+            break
+    body: list[str] = []
+    for line in lines[index : index + ANCHOR_ITEM_LIMIT]:
+        if TEXI_ITEM_END.match(line):
+            break
+        body.append(line)
+    return body
+
+
+def _reference_finding(
+    path: str, lines: list[str], sections: list[str], anchors: dict[str, int], number: int
+) -> list[str]:
+    """Return a finding per reference on one added line that defers to another section's item."""
+    index = number - 1
+    before = lines[index - 1] if index else ""
+    findings: list[str] = []
+    for ref in TEXI_REF.finditer(lines[index]):
+        target = anchors.get(ref[1].strip())
+        if target is None or not sections[index]:
+            continue
+        if not DEFER_WORDING.search(f"{before} {lines[index][: ref.start()]}"):
+            continue
+        body = "\n".join(_anchor_item(lines, target))
+        others = section_names(sections[target]) - section_names(sections[index])
+        named = sorted(
+            name for name in others if re.search(rf"(?<![\w-]){re.escape(name)}\b", body)
+        )
+        if named:
+            findings.append(
+                f"{path}:{number}: the {sections[index]} text defers to @ref{{{ref[1].strip()}}}, "
+                f"whose item in the {sections[target]} section names {', '.join(named)}"
+            )
+    return findings
+
+
+def reference_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
+    """Return a finding per added reference deferring to an item that names another library."""
+    sections = texi_sections(lines)
+    anchors: dict[str, int] = {}
+    for index, line in enumerate(lines):
+        if match := TEXI_ANCHOR.match(line):
+            anchors.setdefault(match[1].strip(), index)
+    findings: list[str] = []
+    for number in sorted(added):
+        if 0 < number <= len(lines):
+            findings.extend(_reference_finding(path, lines, sections, anchors, number))
+    return findings
+
+
 def _doc_files(tree: Path, base: str, head: str) -> list[tuple[str, list[str], set[int]]]:
     """Return each changed doc/*.texi file with its head lines and added line numbers."""
     files: list[tuple[str, list[str], set[int]]] = []
@@ -1810,6 +1901,18 @@ def _doc_wrap(tree: Path, base: str, head: str, waiver: str) -> Step:
         waiver,
         f"no early line break in {len(files)} changed doc file(s)",
         "join each line with the next one, or pass --doc-reason",
+    )
+
+
+def _doc_reference(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Fail added doc references that defer to an item describing another library."""
+    files = _doc_files(tree, base, head)
+    return _waivable_step(
+        "doc-reference",
+        [f for path, lines, added in files for f in reference_findings(path, lines, added)],
+        waiver,
+        f"no deferred reference to another section in {len(files)} changed doc file(s)",
+        "describe the case in this section, or pass --doc-reason",
     )
 
 
@@ -1907,6 +2010,7 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
             _collect("doc-wrap", lambda: _doc_wrap(tree, base, head, waivers.doc)),
+            _collect("doc-reference", lambda: _doc_reference(tree, base, head, waivers.doc)),
             _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
         ]
 
@@ -1935,8 +2039,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--doc-reason",
         default="",
-        help="why the added docs may leave out a case the doc-terms step names or break a "
-        "line early; waives the doc-terms and doc-wrap steps",
+        help="why the added docs may leave out a case the doc-terms step names, break a line "
+        "early or defer to another section; waives the doc-terms, doc-wrap and doc-reference steps",
     )
     parser.add_argument(
         "--test-program-reason",

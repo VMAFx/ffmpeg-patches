@@ -1350,6 +1350,20 @@ WRAP_TEXT = (
     "SVT-AV1 would apply the map to the scaled frame with the full layout.\n"
     "@end table\n"
 )
+REFERENCE_TEXT = (
+    "@section libaom-av1\n"
+    "@table @option\n"
+    "@anchor{libaom-av1-qpfile}\n"
+    "@item qpfile @var{filename}\n"
+    "Read per-frame offsets; libaom reads a missing offset as 0.\n"
+    "@end table\n"
+    "@section libsvtav1\n"
+    "@table @option\n"
+    "@item qpfile @var{filename}\n"
+    "Read per-frame offsets from @var{filename}, in the format described for\n"
+    "the @ref{libaom-av1-qpfile,,libaom-av1 @option{qpfile} option}.\n"
+    "@end table\n"
+)
 
 
 class DocWrapTest(unittest.TestCase):
@@ -1435,6 +1449,84 @@ class DocWrapTest(unittest.TestCase):
         ]
         expected = [False, False, True, False, False, False, False, False, True, False]
         self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
+
+class DocReferenceTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of added references to another section."""
+
+    def findings(self, text: str, added: set[int] | None = None) -> list[str]:
+        """Check the reference lines of one Texinfo text."""
+        lines = text.splitlines()
+        return upstream_lint.reference_findings("doc/encoders.texi", lines, added or {11})
+
+    def test_deferred_reference_is_found(self) -> None:
+        """A reference deferring the format to another library's item is found."""
+        self.assertEqual(
+            self.findings(REFERENCE_TEXT),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom-av1 section names libaom"
+            ],
+        )
+
+    def test_other_defer_wordings_and_commands_are_found(self) -> None:
+        """Same-format wording and @xref or @pxref references are found too."""
+        for old, new in (
+            ("in the format described for", "in the same format as"),
+            ("the @ref{", "the @xref{"),
+            ("the @ref{", "the @pxref{"),
+            ("in the format described for", "in the syntax documented in"),
+        ):
+            with self.subTest(new=new):
+                self.assertEqual(len(self.findings(REFERENCE_TEXT.replace(old, new))), 1)
+
+    def test_reference_without_defer_wording_passes(self) -> None:
+        """A reference not worded as a deferral, or after a sentence end, passes."""
+        for old, new in (
+            ("in the format described for", "and see also"),
+            ("in the format described for", "as described for libaom. See"),
+            ("in the format described for", "as described for libaom; see"),
+        ):
+            with self.subTest(new=new):
+                self.assertEqual(self.findings(REFERENCE_TEXT.replace(old, new)), [])
+
+    def test_same_section_or_missing_anchor_passes(self) -> None:
+        """A reference inside its own section or to an unknown anchor passes."""
+        self.assertEqual(len(self.findings(REFERENCE_TEXT)), 1)
+        same = REFERENCE_TEXT.replace("@section libsvtav1\n", "")
+        self.assertEqual(self.findings(same, {10}), [])
+        missing = REFERENCE_TEXT.replace("@ref{libaom-av1-qpfile", "@ref{other-qpfile")
+        self.assertEqual(self.findings(missing), [])
+
+    def test_item_without_other_library_passes(self) -> None:
+        """An anchored item that names no library of its section passes."""
+        text = REFERENCE_TEXT.replace("libaom reads a missing offset as 0", "a gap reads as 0")
+        self.assertEqual(self.findings(text), [])
+
+    def test_item_ends_at_next_item(self) -> None:
+        """Library names after the next @item are outside the anchored item."""
+        text = REFERENCE_TEXT.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.\n",
+            "Read per-frame offsets.\n@item other\nlibaom reads a missing offset as 0.\n",
+        )
+        self.assertEqual(self.findings(text, {13}), [])
+
+    def test_citing_line_outside_sections_or_unadded_passes(self) -> None:
+        """A citing line before any @section, or one not added, passes."""
+        self.assertEqual(self.findings(REFERENCE_TEXT, {10}), [])
+        lines = REFERENCE_TEXT.splitlines()
+        first = [*lines[9:11], *lines[:6]]
+        self.assertEqual(upstream_lint.reference_findings("doc/x.texi", first, {2}), [])
+
+    def test_section_names(self) -> None:
+        """Section names are the title words and their parts before a dash, over two letters."""
+        self.assertEqual(
+            upstream_lint.section_names("libaom-av1"), frozenset({"libaom-av1", "libaom"})
+        )
+        self.assertEqual(upstream_lint.section_names("qp of x"), frozenset())
+        self.assertEqual(
+            upstream_lint.texi_sections(["a", "@section b c", "d"]), ["", "b c", "b c"]
+        )
 
 
 class TestProgramTest(unittest.TestCase):
@@ -1608,6 +1700,7 @@ class PipelineTest(FixtureTest):
             "claim-scope",
             "doc-terms",
             "doc-wrap",
+            "doc-reference",
             "test-program",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
@@ -2017,6 +2110,36 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: doc-wrap rc: 0", output)
+
+    def test_doc_reference_fails(self) -> None:
+        """An added reference deferring to another library's item fails doc-reference."""
+        self.write("doc/encoders.texi", REFERENCE_TEXT)
+        self.commit("doc/encoders: describe qpfile")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-reference rc: 1", output)
+        self.assertIn("the libsvtav1 text defers to @ref{libaom-av1-qpfile}", output)
+
+    def test_doc_reference_waiver_passes(self) -> None:
+        """A non-blank --doc-reason waives the doc-reference step and prints the reason."""
+        self.write("doc/encoders.texi", REFERENCE_TEXT)
+        self.commit("doc/encoders: describe qpfile")
+        rc, output = self.check("--doc-reason", "both encoders parse the file alike")
+        self.assertEqual(rc, 0, output)
+        self.assertIn(
+            "step: doc-reference rc: 0\nwaived: both encoders parse the file alike", output
+        )
+
+    def test_doc_reference_own_description_passes(self) -> None:
+        """Docs that describe the format in their own section pass doc-reference."""
+        text = REFERENCE_TEXT.replace(
+            "in the format described for\n", "one offset per line; a gap reads as 0, like\n"
+        )
+        self.write("doc/encoders.texi", text)
+        self.commit("doc/encoders: describe qpfile")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-reference rc: 0", output)
 
     def test_test_program_fails(self) -> None:
         """A new lib*/tests program registered in its Makefile fails the test-program step."""
