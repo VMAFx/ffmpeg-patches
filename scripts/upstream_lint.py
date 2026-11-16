@@ -1423,7 +1423,7 @@ def _source_header(line: str, old_source: bool) -> bool:
     """Return whether a +++ header line opens a library or fftools source file."""
     if line == "+++ /dev/null":
         return old_source
-    return line.startswith("+++ b/") and is_source_path(line.removeprefix("+++ b/"))
+    return is_source_path(_header_path(line))
 
 
 def _hunk_body(line: str, old_left: int, new_left: int) -> tuple[int, int] | None:
@@ -1456,7 +1456,7 @@ def source_hunks(patch: str) -> int:
             count += int(in_source)
             left = (int(lengths[1] or "1"), int(lengths[2] or "1"))
         elif line.startswith("--- "):
-            old_source = line.startswith("--- a/") and is_source_path(line.removeprefix("--- a/"))
+            old_source = is_source_path(_header_path(line))
         elif line.startswith("+++ "):
             in_source = _source_header(line, old_source)
     return count

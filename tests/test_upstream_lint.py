@@ -1114,6 +1114,29 @@ class ClaimScopeTest(unittest.TestCase):
         deleted_test = second.replace("libavcodec/y.c", "libavcodec/tests/y.c")
         self.assertEqual(upstream_lint.source_hunks(deleted_test), 1)
 
+    def test_source_hunks_decodes_quoted_headers(self) -> None:
+        """Quoted non-ASCII source headers count for deleted and changed files alike."""
+        deleted = (
+            'diff --git "a/libavcodec/caf\\303\\251.c" "b/libavcodec/caf\\303\\251.c"\n'
+            "deleted file mode 100644\n"
+            '--- "a/libavcodec/caf\\303\\251.c"\n'
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-int ff_old(void) { return 0; }\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(deleted), 1)
+        changed = (
+            'diff --git "a/libavcodec/caf\\303\\251.c" "b/libavcodec/caf\\303\\251.c"\n'
+            '--- "a/libavcodec/caf\\303\\251.c"\n'
+            '+++ "b/libavcodec/caf\\303\\251.c"\n'
+            "@@ -3 +3 @@\n"
+            "-a\n"
+            "+b\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(changed), 1)
+        quoted_test = deleted.replace("libavcodec/caf", "libavcodec/tests/caf")
+        self.assertEqual(upstream_lint.source_hunks(quoted_test), 0)
+
     def test_source_hunks_fftools_added_and_empty(self) -> None:
         """Context-bearing fftools diffs and added files count; empty diffs give 0."""
         fftools = (
@@ -1495,6 +1518,17 @@ class PipelineTest(FixtureTest):
         self.git("mv", "libavfilter/vf_x.c", "libavfilter/vf_y.c")
         self.write("libavfilter/vf_y.c", grown.replace("return 1;", "return 11;"))
         self.commit("avfilter/vf_y: clamp y in both loops")
+        _, output = self.check()
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn("changes 1 source hunk", output)
+
+    def test_quoted_source_deletion_scope_claim_fails(self) -> None:
+        """Deleting a quoted non-ASCII source path in one hunk fails a multi-site claim."""
+        self.write("libavfilter/café.c", "int ff_old(void)\n{\n    return 0;\n}\n")
+        self.commit("avfilter/café: add fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("rm", "-q", "libavfilter/café.c")
+        self.commit("avfilter/café: drop both functions")
         _, output = self.check()
         self.assertIn("step: claim-scope rc: 1", output)
         self.assertIn("changes 1 source hunk", output)
