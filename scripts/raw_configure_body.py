@@ -77,6 +77,11 @@ PREFIXED_FUNCTION_SCRIPT_DIR = (
     "(NAME=value f), which Bash keeps for the whole call; pass the value as an argument or use "
     "an absolute path"
 )
+SOURCED_PREFIX_CALL = (
+    "prefix assignment in a sourced file before a call of a function whose body the guard "
+    "already walked with the old value of the name; pass the value as an argument or use an "
+    "absolute path"
+)
 UNKNOWN_SOURCE_PATH = (
     "relative script path after a source the guard cannot read; use an absolute path"
 )
@@ -439,6 +444,9 @@ class _Scan:
     unresolved_dirs: set[str] = field(default_factory=set)
     refused_dirs: dict[str, str] = field(default_factory=dict)
     prefixed_functions: dict[str, frozenset[str]] = field(default_factory=dict)
+    prefix_calls: dict[str, set[str]] = field(default_factory=dict)
+    function_bodies: dict[str, list[str]] = field(default_factory=dict)
+    walked_functions: set[str] = field(default_factory=set)
     prefix_spans: list[tuple[bytes, int, int, frozenset[str]]] = field(default_factory=list)
     span_names: frozenset[str] = frozenset()
     pending: list[tuple[str, bool, bool, frozenset[str]]] = field(default_factory=list)
@@ -598,7 +606,9 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     root = bash_parser().parse(raw).root_node
     if source:
         watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
-        scan.source_literals[id(root)] = _literal_map(root, raw, scan.budget, watched)
+        names = _assignment_texts(root, raw, scan.budget)
+        scan.source_literals[id(root)] = _literal_map(names, raw, watched)
+        _note_prefix_calls(names, scan)
     scan.stack.append((root, raw, False))
 
 
@@ -1533,23 +1543,31 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
 
 
 def _note_prefix_span(node: Any, raw: bytes, scan: _Scan) -> None:
-    """Mark a function body that the script calls under a prefix assignment of a watched name."""
+    """Note a walked function and mark its body if the script calls it under a prefix assignment."""
     name_node = node.child_by_field_name("name")
     body = node.child_by_field_name("body")
     if name_node is None or body is None:
         return
-    held = scan.prefixed_functions.get(_text(name_node, raw))
+    name = _text(name_node, raw)
+    scan.walked_functions.add(name)
+    held = scan.prefixed_functions.get(name)
     if held:
         scan.prefix_spans.append((raw, body.start_byte, body.end_byte, held))
 
 
 def _span_names(node: Any, raw: bytes, scan: _Scan) -> frozenset[str]:
-    """Return the names a prefix assignment holds in every marked function body around a node."""
+    """Return the trusted names a prefix assignment holds in every marked body around a node.
+
+    Only a trusted literal or an own-directory name counts: the guard substitutes no other
+    name, so the prefix value of any other name changes no path the guard judges.
+    """
     held: frozenset[str] = frozenset()
     for span_raw, start, end, names in scan.prefix_spans:
         if span_raw is raw and start <= node.start_byte < end:
             held |= names
-    return held
+    if not held:
+        return held
+    return held & (set(scan.literals) | set(scan.script_dirs))
 
 
 def _live_literals(scan: _Scan) -> dict[str, str]:
@@ -1821,7 +1839,7 @@ def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
     them printf -v, read, mapfile, unset, an arithmetic, append or array assignment,
     ${NAME:=value}, a for loop variable and any text that names the variable, such
     as an eval or trap string. A function called under a prefix assignment is handled by
-    _prefixed_functions. Not detected: a name built at run time and alias expansion.
+    _hold_closure. Not detected: a name built at run time and alias expansion.
     """
     code = bytearray(raw)
     for start, end in names.skipped:
@@ -1839,26 +1857,23 @@ def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
     return written
 
 
-def _literal_map(
-    root: Any, raw: bytes, budget: BodyBudget, watched: set[str]
-) -> tuple[dict[str, str], set[str]]:
+def _literal_map(names: _Names, raw: bytes, watched: set[str]) -> tuple[dict[str, str], set[str]]:
     """Collect unique literals and assigned names, counting a write of a watched name as one."""
-    names = _assignment_texts(root, raw, budget)
     written = _written_names(raw, names.assigned | watched, names)
     literals = _find_literal_assignments(names.assignments)
     return {k: v for k, v in literals.items() if k not in written}, names.assigned | written
 
 
-def _prefixed_functions(names: _Names, watched: set[str]) -> dict[str, frozenset[str]]:
-    """Map each called function to the watched names a prefix assignment holds in its body.
+def _hold_closure(scan: _Scan) -> dict[str, frozenset[str]]:
+    """Map each called function to the names a prefix assignment holds in its body.
 
     Bash keeps a prefix assignment before a function call for the whole call, callees included
     (bash 5.3 manual 3.7.4 and 3.3), so the names pass on to every word a function body holds,
-    a function defined in a sourced file included, over at most one round per function body.
-    Not followed: a prefix call written in a sourced file.
+    over at most one round per function body. Every name counts, because a sourced file can
+    assign a trusted literal of that name later.
     """
-    held = {f: set(n) & watched for f, n in names.prefixed.items()}
-    calls = {f: set(PLAIN_FUNCTION.findall(" ".join(texts))) for f, texts in names.bodies.items()}
+    held = {f: set(n) for f, n in scan.prefix_calls.items()}
+    calls = {f: set(PLAIN_FUNCTION.findall(" ".join(t))) for f, t in scan.function_bodies.items()}
     for _ in range(len(calls) + 1):
         grown = False
         for caller in sorted(held):
@@ -1869,6 +1884,27 @@ def _prefixed_functions(names: _Names, watched: set[str]) -> dict[str, frozenset
         if not grown:
             break
     return {f: frozenset(n) for f, n in held.items() if n}
+
+
+def _note_prefix_calls(names: _Names, scan: _Scan) -> None:
+    """Add one text's prefix calls and function bodies, then recompute the held names.
+
+    The top script and each sourced file add theirs before the guard walks them. A sourced file
+    can call a function under a prefix assignment after the guard walked that function's body
+    with the old value, so a walked body that references a newly held name refuses.
+    """
+    for command, held in names.prefixed.items():
+        scan.prefix_calls.setdefault(command, set()).update(held)
+    for function, texts in names.bodies.items():
+        scan.function_bodies.setdefault(function, []).extend(texts)
+    before = scan.prefixed_functions
+    scan.prefixed_functions = _hold_closure(scan)
+    trusted = scan.assigned | names.assigned | set(scan.literals) | set(scan.script_dirs)
+    for function in sorted(scan.walked_functions):
+        now = scan.prefixed_functions.get(function, frozenset())
+        gained = (now - before.get(function, frozenset())) & trusted
+        if _referenced(" ".join(scan.function_bodies.get(function, [])), gained):
+            scan.refusal = SOURCED_PREFIX_CALL
 
 
 def _prime_names(scan: _Scan, names: _Names, raw: bytes) -> None:
@@ -1882,7 +1918,7 @@ def _prime_names(scan: _Scan, names: _Names, raw: bytes) -> None:
     scan.script_dirs = {k: v for k, v in dirs.items() if k not in written}
     for name in sorted(written & set(dirs)):
         scan.refused_dirs[name] = WRITTEN_SCRIPT_DIR
-    scan.prefixed_functions = _prefixed_functions(names, set(dirs) | set(literals))
+    _note_prefix_calls(names, scan)
 
 
 def _merge_source_literals(node: Any, scan: _Scan) -> None:

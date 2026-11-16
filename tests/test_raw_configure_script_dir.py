@@ -44,6 +44,7 @@ OTHER_DIRNAME = {"bin/dirname": "echo <case>/other\n", "other/lib.sh": CFG}
 ARGV0_OWN = 'BASH_ARGV0=$(dirname "$(readlink -f "$0")")\n'
 ROOT_LIB = {"lib.sh": CFG}
 PREFIXED = "script path in a function that the script calls with a prefix assignment"
+SOURCED = "prefix assignment in a sourced file before a call of a function"
 
 
 class Case(NamedTuple):
@@ -914,6 +915,48 @@ SCRIPT_DIR = {
         + RUN,
         0,
     ),
+    "r13-sourced-prefix-call": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\n. "$HERE/call.sh"\n' + RUN,
+        2,
+        SOURCED,
+        {"tools/call.sh": "HERE=<case>/other f\n", "other/lib.sh": CFG},
+    ),
+    "r13-sourced-defines-and-calls": Case(
+        DOLLAR0 + '. "$HERE/call.sh"\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/call.sh": 'f() { . "$HERE/lib.sh"; }\nHERE=<case>/other f\n', "other/lib.sh": CFG},
+    ),
+    "r13-sourced-callee-chain": Case(
+        DOLLAR0 + '. "$HERE/fn.sh"\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/fn.sh": 'f() { g; }\ng() { . "$HERE/lib.sh"; }\n', "other/lib.sh": CFG},
+    ),
+    "r13-sourced-literal-prefix": Case(
+        DOLLAR0 + '. "$HERE/fn.sh"\nf() { . "$X/lib.sh"; }\nX=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/fn.sh": "X=<case>/tools\n", "other/lib.sh": CFG},
+    ),
+    "r13-keep-sourced-prefix-command": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\n. "$HERE/call.sh"\nf\n' + RUN,
+        0,
+        files={"tools/call.sh": "HERE=<case>/other true\n", "other/lib.sh": CFG},
+    ),
+    "r13-keep-sourced-prefix-unreferenced": Case(
+        DOLLAR0 + 'f() { echo hi; }\n. "$HERE/call.sh"\n' + SRC + RUN,
+        0,
+        files={"tools/call.sh": "HERE=<case>/other f\n", "other/lib.sh": CFG},
+    ),
+    "r13-keep-untrusted-prefix": Case(
+        DOLLAR0
+        + 'TOOL=${TOOL:-true}\ng() { "$TOOL" ok; }\nf() { g; }\nTOOL=<case>/stub f\n'
+        + SRC
+        + RUN,
+        0,
+        files=OTHER,
+    ),
 }
 
 
@@ -961,8 +1004,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 346 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 346)
+        """Replay all 353 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 353)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
