@@ -4,18 +4,22 @@
 
 Verifies:
 1. The verdict allow-list takes an accept and a parsed refusal, and nothing else (planted negatives:
-   parser unavailable, the guard's inspection-deadline refusal, timeout, crash, wrong exit status,
-   foreign stderr).
+   parser unavailable, the guard's inspection-deadline and parse-error refusals, timeout, crash,
+   wrong exit status, foreign stderr).
 2. A missing parser refuses with exit 3 before any guard runs; the parser check runs in a child
    interpreter with the guard's -I flag and environment (planted negatives).
-3. A guard copy that only reports the parser as unavailable makes the run exit 3 (planted negative).
-4. An empty list exits 3; a list over the bound exits 2 (planted negatives).
+3. A guard copy that only reports the parser as unavailable or raises a parse error makes the run
+   exit 3 (planted negatives).
+4. An empty list exits 3; a list over the bound or naming a missing path or directory exits 2
+   without running guards or writing the TSV (planted negatives).
 5. A missing guard, a guard timeout and a script directory that does not exist are unmeasured.
 6. A measured run exits 0 and counts changed and accepted-to-refused verdicts.
 7. A parser-unavailable refusal after a long script path is classified on the whole line; the TSV
    keeps the first 200 characters (planted negative).
 8. A script path with a space reaches the guard as one shell operand (planted negative).
 9. Relative trees and list entries resolve against the invocation directory (planted negative).
+10. TSV fields escape backslashes, tabs, LF and CR after 200-character diagnostic truncation, and
+    decode_field inverts the encoding (planted negatives).
 """
 
 from __future__ import annotations
@@ -61,6 +65,11 @@ DEADLINE_LINE = (
     "raw configure refused: inspection exceeded the 10 s deadline (stalled filesystem or very "
     "large script); run python3 scripts/ffmpeg_configure.py SRC_DIR BUILD_DIR -- <args>"
 )
+PARSE_ERROR_LINE = (
+    "raw configure refused: parse error (planted); "
+    "run python3 scripts/ffmpeg_configure.py SRC_DIR BUILD_DIR -- <args>"
+)
+PARSE_ERROR = f"import sys\nprint({PARSE_ERROR_LINE!r}, file=sys.stderr)\nsys.exit(2)\n"
 
 
 def _tree(root: Path, name: str, body: str | None) -> Path:
@@ -101,7 +110,9 @@ class MeasuredAllowListTest(unittest.TestCase):
             (2, "raw configure refused: x (WRITTEN_SCRIPT_DIR)", True),
             (2, "raw configure refused: x (shell script parser unavailable: no module)", False),
             (2, DEADLINE_LINE, False),
+            (2, PARSE_ERROR_LINE, False),
             (2, "raw configure refused: x writes past a deadline (WRITTEN_SCRIPT_DIR)", True),
+            (2, "raw configure refused: x mentions parse error (WRITTEN_SCRIPT_DIR)", True),
             (2, "python3: can't open file 'scripts/raw_configure_guard.py'", False),
             (2, "", False),
             (3, "raw configure refused: x", False),
@@ -240,6 +251,60 @@ class VacuousRunTest(unittest.TestCase):
             self.assertEqual(rc, measure.INPUT_ERROR)
             self.assertIn("cannot read", err)
 
+    def test_parse_error_guard_refuses(self) -> None:
+        """A guard copy that reports a parse error makes its verdicts unmeasured and exits 3."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, head = _tree(root, "base", PARSE_ERROR), _tree(root, "head", PARSE_ERROR)
+            out = root / "out.tsv"
+            rc, summary, err = _run([str(base), str(head), str(_list(root, 2)), str(out)])
+            self.assertEqual(rc, measure.VACUOUS)
+            self.assertIn("unmeasured=4", summary)
+            self.assertIn("4 verdicts unmeasured", err)
+            self.assertEqual(len(out.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_missing_listed_script_refuses(self) -> None:
+        """A list naming an absent file under an existing directory exits 2 without writing TSV."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = _tree(root, "tree", ACCEPT)
+            real = root / "real.sh"
+            real.write_text("echo ok\n", encoding="utf-8")
+            missing = root / "existing" / "missing.sh"
+            missing.parent.mkdir()
+            listing = root / "list.txt"
+            listing.write_text(f"{real}\n{missing}\n", encoding="utf-8")
+            out = root / "out.tsv"
+            with unittest.mock.patch.object(measure, "verdict", wraps=measure.verdict) as spy:
+                rc, _, err = _run([str(tree), str(tree), str(listing), str(out)])
+            self.assertEqual(rc, measure.INPUT_ERROR)
+            self.assertIn("1 ", err)
+            self.assertIn(str(missing), err)
+            spy.assert_not_called()
+            self.assertFalse(out.exists())
+
+    def test_directory_in_list_refuses(self) -> None:
+        """A list naming a directory exits 2, counts non-files and names the first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = _tree(root, "tree", ACCEPT)
+            subdir = root / "subdir"
+            subdir.mkdir()
+            out = root / "out.tsv"
+            listing = root / "list.txt"
+            listing.write_text(f"{subdir}\n", encoding="utf-8")
+            rc, _, err = _run([str(tree), str(tree), str(listing), str(out)])
+            self.assertEqual(rc, measure.INPUT_ERROR)
+            self.assertIn(str(subdir), err)
+            self.assertFalse(out.exists())
+            missing = root / "missing.sh"
+            listing.write_text(f"{subdir}\n{missing}\n", encoding="utf-8")
+            rc_two, _, err_two = _run([str(tree), str(tree), str(listing), str(out)])
+            self.assertEqual(rc_two, measure.INPUT_ERROR)
+            self.assertIn("2 ", err_two)
+            self.assertIn(str(subdir), err_two)
+            self.assertNotIn(str(missing), err_two)
+
 
 class VerdictTest(unittest.TestCase):
     def test_timeout_is_unmeasured(self) -> None:
@@ -353,6 +418,64 @@ class MeasuredRunTest(unittest.TestCase):
                 "accepted_to_refused=0 unmeasured=0",
                 summary,
             )
+
+    def test_tab_in_script_path_round_trips(self) -> None:
+        """A tab in a script path is escaped into one TSV field and decoded by decode_field."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = _tree(root, "tree", ACCEPT)
+            script = root / "dir\twith\ttab" / "s.sh"
+            script.parent.mkdir()
+            script.write_text("echo ok\n", encoding="utf-8")
+            listing = root / "list.txt"
+            listing.write_text(f"{script}\n", encoding="utf-8")
+            out = root / "out.tsv"
+            rc, _, _ = _run([str(tree), str(tree), str(listing), str(out)])
+            fields = out.read_text(encoding="utf-8").split("\n")[0].split("\t")
+        expected = str(script).replace("\\", "\\\\").replace("\t", "\\t")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(fields), 6)
+        self.assertEqual(fields[0], expected)
+        self.assertEqual(measure.decode_field(fields[0]), str(script))
+
+    def test_backslash_in_script_path_round_trips(self) -> None:
+        """Backslashes in a script path escape before tabs so \\t stays literal on decode."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = _tree(root, "tree", ACCEPT)
+            script = root / r"dir\twith\backslash" / "s.sh"
+            script.parent.mkdir()
+            script.write_text("echo ok\n", encoding="utf-8")
+            listing = root / "list.txt"
+            listing.write_text(f"{script}\n", encoding="utf-8")
+            out = root / "out.tsv"
+            rc, _, _ = _run([str(tree), str(tree), str(listing), str(out)])
+            fields = out.read_text(encoding="utf-8").split("\n")[0].split("\t")
+        expected = str(script).replace("\\", "\\\\")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(fields), 6)
+        self.assertEqual(fields[0], expected)
+        self.assertEqual(measure.decode_field(fields[0]), str(script))
+
+    def test_diagnostic_cut_before_encoding_keeps_escape_whole(self) -> None:
+        """A tab at character SHOWN is truncated before escaping so no escape is cut in half."""
+        filler = "x" * (measure.SHOWN - len(measure.REFUSED) - 2)
+        prefix = f"{measure.REFUSED} {filler}\t"
+        guard_body = f"import sys\nprint({(prefix + 'tail')!r}, file=sys.stderr)\nsys.exit(2)\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, head = _tree(root, "base", guard_body), _tree(root, "head", ACCEPT)
+            out = root / "out.tsv"
+            rc, _, _ = _run([str(base), str(head), str(_list(root, 1)), str(out)])
+            fields = out.read_text(encoding="utf-8").split("\n")[0].split("\t")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(fields), 6)
+        self.assertTrue(fields[4].endswith("\\t"))
+        self.assertEqual(measure.decode_field(fields[4]), prefix)
+        sample = "a\\b\tc\nd\re\\tf\\"
+        self.assertEqual(measure.decode_field(measure.encode_field(sample)), sample)
+        with self.assertRaises(ValueError):
+            measure.decode_field("cut\\")
 
 
 if __name__ == "__main__":
