@@ -70,7 +70,8 @@ REBOUND_SCRIPT_DIR = (
 WRITTEN_SCRIPT_DIR = (
     "script path from an own-directory name the script also writes another way (printf -v, "
     "read, mapfile, unset, a loop, an arithmetic, append or array assignment, or a special "
-    "builtin prefix); assign it only with = or use an absolute path"
+    "builtin prefix, or a writer or eval that names a variable at run time); assign it only "
+    "with = or use an absolute path"
 )
 PREFIXED_FUNCTION_SCRIPT_DIR = (
     "script path in a function that the script calls with a prefix assignment of the name "
@@ -104,6 +105,58 @@ SCRIPT_DIR_VALUE = re.compile(
 SCRIPT_DIR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-(.+)\}")
 ASSIGNED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PLAIN_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+# Word parts tree-sitter-bash builds a shell word from. Bash keeps the text of the static
+# parts after quote removal (bash 5.3 manual 3.5.9); every other part is expanded at run time.
+STATIC_GROUPS = frozenset(["concatenation", "string", "translated_string"])
+STATIC_LEAVES = frozenset(
+    ["word", "raw_string", "ansi_c_string", "string_content", "variable_name", "number"]
+)
+WORD_PARTS = (
+    STATIC_GROUPS
+    | STATIC_LEAVES
+    | frozenset(
+        [
+            "expansion",
+            "simple_expansion",
+            "command_substitution",
+            "process_substitution",
+            "arithmetic_expansion",
+        ]
+    )
+)
+# An unquoted word with a glob or brace pattern expands at run time (bash 5.3 manual 3.5.1, 3.5.8).
+GLOB_OR_BRACE = re.compile(r"[*?[]|\{[^}]*(?:,|\.\.)")
+WORD_ESCAPE = re.compile(r"\\(.)", re.S)
+STRING_ESCAPE = re.compile(r'\\([$`"\\\n])')
+# ANSI-C quoting escapes (bash 5.3 manual 3.1.2.4); an unknown escape keeps its backslash.
+ANSI_C_ESCAPE = re.compile(
+    r"\\(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|c(.)|(.))",
+    re.S,
+)
+ANSI_C_SIMPLE = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+WRITER_NODES = frozenset(["command", "declaration_command", "unset_command"])
+# Builtins that run their operands as shell text: eval now, trap when the signal arrives.
+EVAL_BUILTINS = frozenset(["eval", "trap"])
+# Words before a command that keep a shell function or eval in reach: time runs a function,
+# and builtin or command can run eval (measured on bash 5.3.20). An external wrapper such as
+# env or timeout, and exec, run a program and never a function of this shell.
+SHELL_WRAPPERS = frozenset(["builtin", "command", "time"])
+# A for loop word list "${!PREFIX@}" binds the loop variable to names that begin with PREFIX.
+PREFIX_NAMES = re.compile(r'"\$\{!([A-Za-z_][A-Za-z0-9_]*)@\}"')
 # Variables documented in the bash 5.3 manual, section 5.1 Bourne Shell Variables
 # and section 5.2 Bash Variables (110 names).
 BASH_VARIABLES = frozenset(
@@ -424,6 +477,43 @@ class _DirState(NamedTuple):
     moved: bool
 
 
+class _Writer(NamedTuple):
+    """A builtin that assigns or unsets the variables it names (bash 5.3 manual 4.2).
+
+    with_argument: option letters that take an argument; naming: option letters whose argument
+    names a variable; operands: which operands name a variable (all, last, second, names for
+    NAME[=value] operands, any for shell text, empty for none); functions: option letters that
+    make the operands function names.
+    """
+
+    with_argument: str
+    naming: str
+    operands: str
+    functions: str = ""
+
+
+DECLARING = _Writer("", "", "names", "fF")
+# wait -p is from bash 5.1 and compgen -V from bash 5.3.
+WRITERS = {
+    "printf": _Writer("v", "v", ""),
+    "read": _Writer("adinNptu", "a", "all"),
+    "mapfile": _Writer("dnOsuCc", "", "last"),
+    "readarray": _Writer("dnOsuCc", "", "last"),
+    "getopts": _Writer("", "", "second"),
+    "wait": _Writer("p", "p", ""),
+    "compgen": _Writer("AGWFCXPSoV", "V", ""),
+    "unset": _Writer("", "", "all", "f"),
+    "declare": DECLARING,
+    "typeset": DECLARING,
+    "local": DECLARING,
+    "export": DECLARING,
+    "readonly": DECLARING,
+    "let": _Writer("", "", "names"),
+    "eval": _Writer("", "", "any"),
+    "trap": _Writer("", "", "any"),
+}
+
+
 @dataclass
 class _Scan:
     """Keep one file's ordered traversal and candidate state."""
@@ -449,6 +539,10 @@ class _Scan:
     walked_functions: set[str] = field(default_factory=set)
     prefix_spans: list[tuple[bytes, int, int, frozenset[str]]] = field(default_factory=list)
     span_names: frozenset[str] = frozenset()
+    span_held: frozenset[str] = frozenset()
+    function_calls: dict[str, set[str]] = field(default_factory=dict)
+    dynamic_callers: set[str] = field(default_factory=set)
+    late_dirs: set[str] = field(default_factory=set)
     pending: list[tuple[str, bool, bool, frozenset[str]]] = field(default_factory=list)
     moved: bool = False
     rebound: bool = False
@@ -603,6 +697,8 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
         return
     scan.budget.inline_bodies += 1
     raw = body.encode("utf-8", "surrogateescape")
+    if scan.span_held:
+        scan.prefix_spans.append((raw, 0, len(raw) + 1, scan.span_held))
     root = bash_parser().parse(raw).root_node
     if source:
         watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
@@ -1559,12 +1655,15 @@ def _span_names(node: Any, raw: bytes, scan: _Scan) -> frozenset[str]:
     """Return the trusted names a prefix assignment holds in every marked body around a node.
 
     Only a trusted literal or an own-directory name counts: the guard substitutes no other
-    name, so the prefix value of any other name changes no path the guard judges.
+    name, so the prefix value of any other name changes no path the guard judges. Every held
+    name stays in span_held, so an inline body queued from this node (eval, trap, bash -c,
+    a sourced file, a here-document or a pipe into a shell) is marked with the same names.
     """
     held: frozenset[str] = frozenset()
     for span_raw, start, end, names in scan.prefix_spans:
         if span_raw is raw and start <= node.start_byte < end:
             held |= names
+    scan.span_held = held
     if not held:
         return held
     return held & (set(scan.literals) | set(scan.script_dirs))
@@ -1705,6 +1804,8 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
         reason = _script_dir_refusal(scan)
         if reason is None and scan.prefix is not None and _top_level(assignment):
             reason = scan.prefix
+        if reason is None and name in scan.late_dirs:
+            reason = WRITTEN_SCRIPT_DIR
         if reason is not None:
             scan.literals.pop(name, None)
             scan.refused_dirs[name] = reason
@@ -1717,6 +1818,10 @@ class _Names:
     """Statement assignments, assigned names, plain-assignment name starts and skipped spans.
 
     Skipped spans are comments and quoted here-document bodies, which Bash never expands.
+    Spelled words are words whose text differs after quote removal; calls holds the words
+    each function body spells that way, and inline the eval and trap texts left to parse.
+    dynamic_write marks a writer that names a variable at run time, and prefix_writes the
+    prefixes such a writer is narrowed to by a "${!PREFIX@}" loop.
     """
 
     assignments: list[str] = field(default_factory=list)
@@ -1725,6 +1830,13 @@ class _Names:
     skipped: list[tuple[int, int]] = field(default_factory=list)
     prefixed: dict[str, set[str]] = field(default_factory=dict)
     bodies: dict[str, list[str]] = field(default_factory=dict)
+    spelled: list[str] = field(default_factory=list)
+    dynamic_write: bool = False
+    prefix_writes: set[str] = field(default_factory=set)
+    calls: dict[str, set[str]] = field(default_factory=dict)
+    dynamic_callers: set[str] = field(default_factory=set)
+    inline: list[str] = field(default_factory=list)
+    parsed: int = 0
 
 
 def _plain_start(node: Any) -> int | None:
@@ -1796,26 +1908,299 @@ def _note_heredoc(node: Any, raw: bytes, names: _Names) -> None:
         names.skipped.append((body.start_byte, body.end_byte))
 
 
+def _kept_escape(match: re.Match[str]) -> str:
+    """Drop the backslash of an escape, and a backslash-newline line continuation whole."""
+    char = match.group(1)
+    return "" if char == "\n" else char
+
+
+def _ansi_c_char(match: re.Match[str]) -> str:
+    """Decode one ANSI-C escape; octal keeps the low eight bits as Bash does."""
+    octal, hex2, hex4, hex8, control, other = match.groups()
+    if octal is not None:
+        return chr(int(octal, 8) & 0xFF)
+    digits = hex2 or hex4 or hex8
+    if digits is not None:
+        return chr(min(int(digits, 16), 0x10FFFF))
+    if control is not None:
+        return chr(ord(control) & 0x1F)
+    return ANSI_C_SIMPLE.get(other, "\\" + other)
+
+
+def _leaf_value(node: Any, raw: bytes) -> tuple[str, bool]:
+    """Return a static word part's text after quote removal and whether it may still expand."""
+    text = _text(node, raw)
+    if node.type == "raw_string":
+        return text[1:-1], False
+    if node.type == "ansi_c_string":
+        # Bash ends an ANSI-C string at a decoded NUL byte.
+        return ANSI_C_ESCAPE.sub(_ansi_c_char, text[2:-1]).split("\x00", 1)[0], False
+    if node.type == "string_content":
+        return STRING_ESCAPE.sub(_kept_escape, text), False
+    expands = node.type == "word" and GLOB_OR_BRACE.search(text) is not None
+    return WORD_ESCAPE.sub(_kept_escape, text), expands
+
+
+def _static_value(nodes: list[Any], raw: bytes) -> tuple[str, int]:
+    """Return a word's text after quote removal and the offset of its first run-time part.
+
+    A run-time part (an expansion, a substitution or any part type outside the allow-list)
+    counts as empty text, and a glob or brace word keeps its text; the offset is -1 when the
+    word has no run-time part.
+    """
+    parts: list[str] = []
+    dynamic = -1
+    stack = list(reversed(nodes))
+    for _ in range(MAX_BODY_NODES):
+        if not stack:
+            break
+        part = stack.pop()
+        if part.type in STATIC_GROUPS:
+            stack.extend(reversed(part.named_children))
+            continue
+        text, expands = _leaf_value(part, raw) if part.type in STATIC_LEAVES else ("", True)
+        if expands and dynamic < 0:
+            dynamic = sum(len(p) for p in parts)
+        parts.append(text)
+    return "".join(parts), dynamic
+
+
+def _word_runs(node: Any) -> list[list[Any]]:
+    """Group a node's adjacent word-part children into the shell words they form.
+
+    tree-sitter-bash splits a declaration operand such as H''ERE=1 into a variable_name and
+    an adjacent concatenation; Bash reads one word.
+    """
+    runs: list[list[Any]] = []
+    end = -1
+    for child in node.named_children:
+        if child.type not in WORD_PARTS:
+            end = -1
+            continue
+        if runs and child.start_byte == end:
+            runs[-1].append(child)
+        else:
+            runs.append([child])
+        end = child.end_byte
+    return runs
+
+
+def _note_runs(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -> None:
+    """Record each word whose text changes in quote removal, and its names for every owner."""
+    for run in _word_runs(node):
+        value, _ = _static_value(run, raw)
+        if value == raw[run[0].start_byte : run[-1].end_byte].decode("utf-8", "surrogateescape"):
+            continue
+        names.spelled.append(value)
+        for owner in owners:
+            names.calls.setdefault(owner, set()).update(PLAIN_FUNCTION.findall(value))
+
+
+def _command_values(node: Any, raw: bytes) -> list[tuple[str, int]]:
+    """Return a command's quote-removed words, its name first, with their run-time offsets."""
+    if node.type != "command":
+        head = (_text(node.children[0], raw), -1)
+    else:
+        name = node.child_by_field_name("name")
+        if name is None:
+            return []
+        head = _static_value(name.named_children, raw)
+    return [head] + [_static_value(run, raw) for run in _word_runs(node)]
+
+
+def _option_letters(
+    spec: _Writer, word: tuple[str, int], following: tuple[str, int] | None
+) -> tuple[list[tuple[str, int]], bool] | None:
+    """Read one option word: the naming arguments and whether it took the next word.
+
+    None means an option made the operands function names.
+    """
+    value, dynamic = word
+    for pos, letter in enumerate(value[1:], 2):
+        if letter in spec.functions:
+            return None
+        if letter not in spec.with_argument:
+            continue
+        argument = (value[pos:], dynamic) if pos < len(value) else following
+        named = [argument] if letter in spec.naming and argument is not None else []
+        return named, pos >= len(value)
+    return [], False
+
+
+def _writer_operands(
+    spec: _Writer, args: list[tuple[str, int]]
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]] | None:
+    """Split a writer builtin's words into operands and naming option arguments.
+
+    Options end at --, at a word without a leading - or +, and at a word that starts with a
+    run-time part. None means an option made the operands function names.
+    """
+    named: list[tuple[str, int]] = []
+    idx = 0
+    for _ in range(len(args) + 1):
+        if idx >= len(args) or args[idx][0] == "--":
+            return args[idx + 1 :], named
+        value, dynamic = args[idx]
+        if len(value) < 2 or value[0] not in "-+" or dynamic == 0:
+            return args[idx:], named
+        following = args[idx + 1] if idx + 1 < len(args) else None
+        read = _option_letters(spec, args[idx], following)
+        if read is None:
+            return None
+        named += read[0]
+        idx += 1 + int(read[1])
+    return [], named
+
+
+def _dynamic_name(value: str, dynamic: int) -> bool:
+    """Tell whether a NAME[=value] operand has a run-time part before its first =."""
+    equals = value.find("=")
+    return dynamic >= 0 and (equals < 0 or dynamic <= equals)
+
+
+def _writer_dynamic(spec: _Writer, args: list[tuple[str, int]]) -> bool:
+    """Tell whether a writer builtin may name a variable through a run-time word."""
+    split = _writer_operands(spec, args)
+    if split is None:
+        return False
+    operands, named = split
+    if spec.operands == "names":
+        return any(_dynamic_name(value, dynamic) for value, dynamic in operands)
+    picks = {"all": operands, "any": operands, "last": operands[-1:], "second": operands[1:2]}
+    return any(dynamic >= 0 for _, dynamic in named + picks.get(spec.operands, []))
+
+
+def _dynamic_call(values: list[tuple[str, int]]) -> bool:
+    """Tell whether a command word built at run time may name a shell function or eval.
+
+    Bash looks a run-time command word up as a function, even one whose name holds a slash
+    (measured on bash 5.3.20). Only the words of SHELL_WRAPPERS and their options keep that
+    lookup in reach; any other first word runs a program or a builtin of its own.
+    """
+    for value, dynamic in values:
+        if dynamic >= 0:
+            return True
+        if value not in SHELL_WRAPPERS and not value.startswith("-"):
+            return False
+    return False
+
+
+def _loop_prefix(node: Any, raw: bytes) -> str | None:
+    """Return PREFIX when a writer is the only command of a for loop over "${!PREFIX@}".
+
+    The quoted list binds the loop variable to whole names that begin with PREFIX (bash 5.3
+    manual 3.5.3), so a writer whose every run-time word is the quoted loop variable names
+    only those. Any other run-time word, or a second command in the loop body, gives None.
+    """
+    group = node.parent
+    loop = group.parent if group is not None and group.type == "do_group" else None
+    if loop is None or loop.type != "for_statement" or len(group.named_children) != 1:
+        return None
+    variable = loop.child_by_field_name("variable")
+    listed = loop.children_by_field_name("value")
+    match = PREFIX_NAMES.fullmatch(_text(listed[0], raw)) if len(listed) == 1 else None
+    if variable is None or match is None:
+        return None
+    name = _text(variable, raw)
+    loop_words = {f'"${name}"', f'"${{{name}}}"'}
+    for run in _word_runs(node):
+        text = raw[run[0].start_byte : run[-1].end_byte].decode("utf-8", "surrogateescape")
+        if _static_value(run, raw)[1] >= 0 and text not in loop_words:
+            return None
+    return match.group(1)
+
+
+def _note_writer(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -> None:
+    """Note a writer builtin that names a variable at run time and a call named at run time.
+
+    The command word is unwrapped from builtin, command and the other known wrappers. An
+    eval or trap text is queued for one more parse, because Bash removes its quotes again.
+    """
+    values = _command_values(node, raw)
+    idx = _unwrap_command([value for value, _ in values], 0)
+    if idx >= len(values):
+        return
+    command, dynamic = values[idx]
+    args = values[idx + 1 :]
+    if _dynamic_call(values) or (command in EVAL_BUILTINS and any(d >= 0 for _, d in args)):
+        names.dynamic_callers.update(owners)
+    if dynamic >= 0:
+        return
+    if command in EVAL_BUILTINS:
+        names.inline.append(" ".join(value for value, _ in args))
+    spec = WRITERS.get(command)
+    if spec is None or not _writer_dynamic(spec, args):
+        return
+    prefix = _loop_prefix(node, raw)
+    if prefix is None:
+        names.dynamic_write = True
+    else:
+        names.prefix_writes.add(prefix)
+
+
+def _note_offsets(node: Any, raw: bytes, names: _Names) -> None:
+    """Record the comments, quoted here-documents, assignments and functions of the top text."""
+    if node.type == "comment":
+        names.skipped.append((node.start_byte, node.end_byte))
+    elif node.type == "heredoc_redirect":
+        _note_heredoc(node, raw, names)
+    elif node.type == "variable_assignment" and node.parent.type == "command":
+        _note_prefix(node, raw, names)
+    elif node.type == "variable_assignment":
+        _note_assignment(node, raw, names)
+    elif node.type == "function_definition":
+        _note_function(node, raw, names)
+
+
+def _note_words(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -> tuple[str, ...]:
+    """Record one node's spelled words and writer builtins; return the owners of its children."""
+    if node.type not in STATIC_GROUPS:
+        _note_runs(node, raw, names, owners)
+    if node.type in WRITER_NODES:
+        _note_writer(node, raw, names, owners)
+    name = node.child_by_field_name("name") if node.type == "function_definition" else None
+    return owners if name is None else (*owners, _text(name, raw))
+
+
+def _inline_roots(
+    names: _Names, owners: tuple[str, ...]
+) -> list[tuple[Any, bytes, tuple[str, ...], bool]]:
+    """Parse the eval and trap texts one node queued, within the inline body bound.
+
+    Past the bound a text counts as unknown: it may write any name and call any function.
+    """
+    roots: list[tuple[Any, bytes, tuple[str, ...], bool]] = []
+    for body in names.inline:
+        if names.parsed >= MAX_INLINE_BODIES:
+            names.dynamic_write = True
+            names.dynamic_callers.update(owners)
+            continue
+        names.parsed += 1
+        data = body.encode("utf-8", "surrogateescape")
+        roots.append((bash_parser().parse(data).root_node, data, owners, True))
+    names.inline.clear()
+    return roots
+
+
 def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> _Names:
-    """Collect assignments, assigned names, plain = starts and skipped spans in one bounded walk."""
-    stack = [root]
+    """Collect assignments, assigned names, plain = starts and skipped spans in one bounded walk.
+
+    The walk also records spelled words, writer builtins that name a variable at run time and
+    the words each function body calls. An eval or trap text is parsed once more and walked
+    for those three only, since its byte offsets are not the top text's.
+    """
+    stack: list[tuple[Any, bytes, tuple[str, ...], bool]] = [(root, raw, (), False)]
     names = _Names()
     for _ in range(MAX_BODY_NODES):
         if not stack or budget.nodes >= MAX_BODY_NODES:
             break
-        node = stack.pop()
+        node, text, owners, inline = stack.pop()
         budget.nodes += 1
-        if node.type == "comment":
-            names.skipped.append((node.start_byte, node.end_byte))
-        elif node.type == "heredoc_redirect":
-            _note_heredoc(node, raw, names)
-        elif node.type == "variable_assignment" and node.parent.type == "command":
-            _note_prefix(node, raw, names)
-        elif node.type == "variable_assignment":
-            _note_assignment(node, raw, names)
-        elif node.type == "function_definition":
-            _note_function(node, raw, names)
-        stack.extend(reversed(node.named_children))
+        if not inline:
+            _note_offsets(node, text, names)
+        inner = _note_words(node, text, names, owners)
+        stack.extend(_inline_roots(names, owners))
+        stack.extend((child, text, inner, inline) for child in reversed(node.named_children))
     return names
 
 
@@ -1838,13 +2223,19 @@ def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
     command other than a special builtin is no write. Every other use counts as a write, among
     them printf -v, read, mapfile, unset, an arithmetic, append or array assignment,
     ${NAME:=value}, a for loop variable and any text that names the variable, such
-    as an eval or trap string. A function called under a prefix assignment is handled by
-    _hold_closure. Not detected: a name built at run time and alias expansion.
+    as an eval or trap string. A word counts with its text after quote removal too, so
+    H''ERE, H\\ERE and $'\\x48ERE' name HERE, and a writer narrowed to a "${!PREFIX@}" loop
+    writes every name that begins with PREFIX. Callers count every name as written when a
+    writer builtin or eval names a variable through any other run-time word (dynamic_write).
+    A function called under a prefix assignment is handled by _hold_closure. Not detected: a
+    writer reached through a command or option word built at run time, a name built by
+    arithmetic evaluation, and alias expansion.
     """
     code = bytearray(raw)
     for start, end in names.skipped:
         code[start:end] = b" " * (end - start)
     text = bytes(code)
+    spelled = "\n".join(names.spelled).encode("utf-8", "surrogateescape")
     written = set()
     for name in sorted(watched):
         word = re.compile(rb"(?<![A-Za-z0-9_])" + re.escape(name.encode()) + rb"(?![A-Za-z0-9_])")
@@ -1852,14 +2243,15 @@ def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
             match.start() not in names.starts
             and _write_occurrence(text, match.start(), match.end())
             for match in word.finditer(text)
-        ):
+        ) or any(_write_occurrence(spelled, m.start(), m.end()) for m in word.finditer(spelled)):
             written.add(name)
-    return written
+    return written | {n for n in watched if any(n.startswith(p) for p in names.prefix_writes)}
 
 
 def _literal_map(names: _Names, raw: bytes, watched: set[str]) -> tuple[dict[str, str], set[str]]:
     """Collect unique literals and assigned names, counting a write of a watched name as one."""
-    written = _written_names(raw, names.assigned | watched, names)
+    every = names.assigned | watched
+    written = every if names.dynamic_write else _written_names(raw, every, names)
     literals = _find_literal_assignments(names.assignments)
     return {k: v for k, v in literals.items() if k not in written}, names.assigned | written
 
@@ -1869,11 +2261,19 @@ def _hold_closure(scan: _Scan) -> dict[str, frozenset[str]]:
 
     Bash keeps a prefix assignment before a function call for the whole call, callees included
     (bash 5.3 manual 3.7.4 and 3.3), so the names pass on to every word a function body holds,
-    over at most one round per function body. Every name counts, because a sourced file can
-    assign a trusted literal of that name later.
+    before and after quote removal, over at most one round per function body. A body that
+    runs a command named at run time, or an eval or trap text built at run time, may call
+    every function. Every name counts, because a sourced file can assign a trusted literal of
+    that name later.
     """
     held = {f: set(n) for f, n in scan.prefix_calls.items()}
-    calls = {f: set(PLAIN_FUNCTION.findall(" ".join(t))) for f, t in scan.function_bodies.items()}
+    bodies = scan.function_bodies
+    calls = {
+        f: set(PLAIN_FUNCTION.findall(" ".join(t))) | scan.function_calls.get(f, set())
+        for f, t in bodies.items()
+    }
+    for caller in sorted(scan.dynamic_callers & set(calls)):
+        calls[caller] = set(bodies)
     for _ in range(len(calls) + 1):
         grown = False
         for caller in sorted(held):
@@ -1897,6 +2297,9 @@ def _note_prefix_calls(names: _Names, scan: _Scan) -> None:
         scan.prefix_calls.setdefault(command, set()).update(held)
     for function, texts in names.bodies.items():
         scan.function_bodies.setdefault(function, []).extend(texts)
+    for function, called in names.calls.items():
+        scan.function_calls.setdefault(function, set()).update(called)
+    scan.dynamic_callers |= names.dynamic_callers
     before = scan.prefixed_functions
     scan.prefixed_functions = _hold_closure(scan)
     trusted = scan.assigned | names.assigned | set(scan.literals) | set(scan.script_dirs)
@@ -1908,14 +2311,23 @@ def _note_prefix_calls(names: _Names, scan: _Scan) -> None:
 
 
 def _prime_names(scan: _Scan, names: _Names, raw: bytes) -> None:
-    """Seed literals, assigned and own-directory names; refuse own-directory names it writes."""
+    """Seed literals, assigned and own-directory names; refuse own-directory names it writes.
+
+    A writer that names a variable at run time leaves no literal trusted and refuses each
+    own-directory name at its assignment, after the refusal of an earlier statement outside
+    the allow-list, which names the line.
+    """
     dirs = _script_dir_names(names.assignments) if scan.context.script_dir is not None else {}
     overrides = {override for override in dirs.values() if override is not None}
-    written = _written_names(raw, names.assigned | overrides, names)
-    scan.assigned = names.assigned | written
+    watched = names.assigned | overrides
+    written = _written_names(raw, watched, names)
+    unsure = watched if names.dynamic_write else written
+    scan.assigned = names.assigned | unsure
     literals = _find_literal_assignments(names.assignments)
-    scan.literals = {k: v for k, v in literals.items() if k not in written}
+    scan.literals = {k: v for k, v in literals.items() if k not in unsure}
     scan.script_dirs = {k: v for k, v in dirs.items() if k not in written}
+    if names.dynamic_write:
+        scan.late_dirs = set(scan.script_dirs)
     for name in sorted(written & set(dirs)):
         scan.refused_dirs[name] = WRITTEN_SCRIPT_DIR
     _note_prefix_calls(names, scan)

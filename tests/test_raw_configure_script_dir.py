@@ -24,6 +24,7 @@ DEFAULT = 'HERE=${LANE_TEST_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
 REALPATH = 'HERE=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")\n'
 CDPWD = 'HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
+GH = 'gh() { . "$HERE/lib.sh"; }\n'
 THERE = 'THERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
 CDPWD_P = 'HERE="$(cd -P -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")" && pwd -P)"\n'
 CD_LINK_DIR = 'HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)\n'
@@ -957,6 +958,120 @@ SCRIPT_DIR = {
         0,
         files=OTHER,
     ),
+    "r14-printf-split-single": Case(
+        DOLLAR0 + "printf -v H''ERE '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-read-split-double": Case(
+        DOLLAR0 + 'read -r H""ERE <<< <case>/other\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-printf-backslash": Case(
+        DOLLAR0 + "printf -v H\\ERE '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-printf-ansi-empty": Case(
+        DOLLAR0 + "printf -v H$''ERE '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-printf-ansi-escape": Case(
+        DOLLAR0 + "printf -v $'\\x48ERE' '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-printf-dynamic-dest": Case(
+        DOLLAR0 + "v=${missing:-HERE}\nprintf -v \"$v\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r14-declare-split": Case(CDPWD + "declare H''ERE=<case>/other\n" + SRC, 2, WRITTEN, OTHER),
+    "r14-keep-printf-other": Case(DOLLAR0 + "printf -v x '%s' y\n" + SRC + RUN, 0, files=OTHER),
+    "r14-keep-read-line": Case(DOLLAR0 + "read -r line <<< hi\n" + SRC + RUN, 0, files=OTHER),
+    "r14-callee-double-quoted": Case(
+        CDPWD + GH + 'f() { g""h; }\nHERE=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-callee-single-quoted": Case(
+        CDPWD + GH + "f() { g''h; }\nHERE=<case>/other f\n" + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-callee-backslash": Case(
+        CDPWD + GH + "f() { g\\h; }\nHERE=<case>/other f\n" + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-callee-dynamic": Case(
+        CDPWD + GH + 'f() { "$1"; }\nHERE=<case>/other f gh\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-eval-dynamic": Case(
+        CDPWD + GH + 'f() { eval "$1"; }\nHERE=<case>/other f gh\n' + RUN, 2, WRITTEN, OTHER
+    ),
+    "r14-eval-quoted-callee": Case(
+        CDPWD + GH + "f() { eval 'g''h'; }\nHERE=<case>/other f\n" + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-eval-inline-body": Case(
+        CDPWD + "f() { eval '. \"$HERE/lib.sh\"'; }\nHERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-sourced-inline-body": Case(
+        CDPWD + "f() { . <case>/tools/mid.sh; }\nHERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        {"tools/mid.sh": SRC, "other/lib.sh": CFG},
+    ),
+    "r14-bash-c-inline-body": Case(
+        CDPWD + "f() { bash -c '. \"$HERE/lib.sh\"'; }\nHERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-keep-eval-unheld": Case(
+        CDPWD + "f() { eval '. \"$HERE/lib.sh\"'; }\nMODE=x f\n" + RUN, 0, files=OTHER
+    ),
+    "r14-keep-run-dollar-at": Case(
+        DOLLAR0 + 'run() { "$@"; }\nrun true\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r14-keep-read-prompt": Case(
+        DOLLAR0 + 'prompt=go\nread -r -p "$prompt" line <<< hi\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r14-keep-prefix-loop-unset": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do unset "$k"; done\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r14-keep-timeout-dynamic": Case(
+        CDPWD + GH + 'f() { timeout 5 "$1"; }\nHERE=<case>/other f gh\n' + RUN, 0, files=OTHER
+    ),
+    "r14-keep-exec-dynamic": Case(
+        CDPWD + GH + 'f() { exec "$1"; }\nHERE=<case>/other f gh\n' + RUN, 0, files=OTHER
+    ),
+    "r14-time-dynamic": Case(
+        CDPWD + GH + 'f() { time "$1"; }\nHERE=<case>/other f gh\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-command-eval": Case(
+        CDPWD + GH + 'f() { command "$1" gh; }\nHERE=<case>/other f eval\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-builtin-eval": Case(
+        CDPWD + GH + 'f() { builtin "$1" gh; }\nHERE=<case>/other f eval\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-slash-callee": Case(
+        CDPWD + 'a/b() { . "$HERE/lib.sh"; }\nf() { "$1"; }\nHERE=<case>/other f a/b\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-prefix-loop-match": Case(
+        DOLLAR0 + 'for k in "${!HER@}"; do printf -v "$k" %s <case>/other; done\n' + SRC + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r14-prefix-loop-extra": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do unset "$k" "$1"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r14-prefix-loop-unquoted": Case(
+        DOLLAR0 + 'for k in ${!GIT_@}; do unset "$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r14-prefix-loop-two": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do echo; unset "$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
 }
 
 
@@ -1004,8 +1119,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 353 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 353)
+        """Replay all 385 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 385)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
