@@ -6,18 +6,22 @@
 A lane judge runs this to show that a guard change turns no accepted script into a refusal.
 A run that measured nothing must not pass as "no change", so three vacuous shapes refuse:
 
-1. Preflight: the running interpreter must import tree_sitter and tree_sitter_bash. The guard
-   needs them, and without them every verdict is the parser-unavailable refusal. Exit 3 before
-   any script runs.
+1. Preflight: a child of the running interpreter, started with the guard's -I flag and
+   environment, must import tree_sitter and tree_sitter_bash. The guard needs them, and without
+   them every verdict is the parser-unavailable refusal. Exit 3 before any script runs.
 2. Empty list: a list file that names no script measures nothing. Exit 3.
 3. Allow-list per verdict: a verdict counts as measured only when the guard exits 0, or exits 2
-   with a first stderr line that starts with "raw configure refused:" and does not name the
-   parser as unavailable. A timeout, a crash, a missing guard or a parser-unavailable refusal
-   on either side is unmeasured, and one unmeasured verdict makes the run exit 3.
+   with a first stderr line that starts with "raw configure refused:", is not the guard's own
+   inspection-deadline refusal and does not name the parser as unavailable. The whole line is
+   classified; the TSV shows its first 200 characters. A timeout, a crash, a missing guard, a
+   deadline refusal or a parser-unavailable refusal on either side is unmeasured, and one
+   unmeasured verdict makes the run exit 3.
 
 Usage: raw_configure_measure.py BASE HEAD LIST OUT
   BASE, HEAD  trees that hold scripts/raw_configure_guard.py (for example git archive output)
   LIST        file with one shell script path per line, at most 5000
+  Relative BASE, HEAD and LIST entries resolve against the invocation directory; the guard
+  receives each script path as one shell-quoted operand.
   OUT         TSV written with one row per script: path, base rc, head rc, same or CHANGED,
               base stderr line, head stderr line
 Run it with the repository venv interpreter; the guard copies run under the same interpreter.
@@ -30,8 +34,8 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import importlib
 import json
+import shlex
 import subprocess  # nosec B404 - guard copies run with a fixed argv, no shell, bounded timeout.
 import sys
 from pathlib import Path
@@ -41,9 +45,12 @@ GUARD_TIMEOUT = 20
 VACUOUS = 3
 INPUT_ERROR = 2
 REFUSED = "raw configure refused:"
+DEADLINE = "raw configure refused: inspection exceeded the 10 s deadline"
 UNAVAILABLE = "shell script parser unavailable"
 GUARD = Path("scripts") / "raw_configure_guard.py"
 GUARD_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "HOME": "/nonexistent"}
+PREFLIGHT = "import tree_sitter, tree_sitter_bash"
+SHOWN = 200
 
 
 @dataclasses.dataclass
@@ -58,20 +65,29 @@ class Tally:
 
 
 def preflight() -> str:
-    """Return why the guard parser does not load under this interpreter, or '' when it loads."""
+    """Return why the parser does not load in the guard's isolated environment, or ''."""
     try:
-        importlib.import_module("tree_sitter")
-        importlib.import_module("tree_sitter_bash")
-    except ImportError as exc:
-        return f"parser does not load under {sys.executable}: {exc}"
+        result = subprocess.run(  # nosec B603 - fixed argv, no shell.
+            [sys.executable, "-I", "-c", PREFLIGHT],
+            text=True,
+            capture_output=True,
+            timeout=GUARD_TIMEOUT,
+            check=False,
+            env=GUARD_ENV,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"parser check did not run under {sys.executable} -I: {exc}"
+    if result.returncode:
+        last = (result.stderr.strip().splitlines() or [""])[-1]
+        return f"parser does not load under {sys.executable} -I: {last}"
     return ""
 
 
 def verdict(guard: Path, script: Path) -> tuple[int, str]:
-    """Run one guard copy on `bash <script>` and return its exit status and first stderr line."""
+    """Run one guard copy on `bash <script>`; return its exit status and whole first stderr line."""
     payload = {
         "tool_name": "Bash",
-        "tool_input": {"command": f"bash {script}"},
+        "tool_input": {"command": f"bash {shlex.quote(str(script))}"},
         "cwd": str(script.parent),
     }
     try:
@@ -89,15 +105,20 @@ def verdict(guard: Path, script: Path) -> tuple[int, str]:
         return 124, "timeout"
     except OSError as exc:
         return 127, f"guard did not start: {exc}"
-    first = (result.stderr.strip().splitlines() or [""])[0][:200]
+    first = (result.stderr.strip().splitlines() or [""])[0]
     return result.returncode, first
 
 
 def measured(rc: int, err: str) -> bool:
-    """Allow-list: the guard accepted, or refused after a parse that ran."""
+    """Allow-list: the guard accepted, or refused after a parse that ran within its deadline."""
     if rc == 0:
         return True
-    return rc == 2 and err.startswith(REFUSED) and UNAVAILABLE not in err
+    return (
+        rc == 2
+        and err.startswith(REFUSED)
+        and not err.startswith(DEADLINE)
+        and UNAVAILABLE not in err
+    )
 
 
 def compare(base: Path, head: Path, scripts: list[Path]) -> tuple[list[str], Tally]:
@@ -116,18 +137,19 @@ def compare(base: Path, head: Path, scripts: list[Path]) -> tuple[list[str], Tal
         tally.accepted_head += int(head_rc == 0)
         tally.accepted_to_refused += int(base_rc == 0 and head_rc != 0)
         state = "same" if same else "CHANGED"
-        rows.append(f"{script}\t{base_rc}\t{head_rc}\t{state}\t{base_err}\t{head_err}")
+        shown = f"{base_err[:SHOWN]}\t{head_err[:SHOWN]}"
+        rows.append(f"{script}\t{base_rc}\t{head_rc}\t{state}\t{shown}")
     return rows, tally
 
 
 def read_list(path: Path) -> list[Path]:
-    """Return the script paths the list file names, one per non-blank line."""
+    """Return the script paths the list file names, one per non-blank line, made absolute."""
     lines = path.read_text(encoding="utf-8").splitlines()
-    return [Path(line) for line in lines if line.strip()]
+    return [Path(line).absolute() for line in lines if line.strip()]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    """Parse the two trees, the list file and the output path."""
+    """Parse the two trees, the list file and the output path; make both trees absolute."""
     parser = argparse.ArgumentParser(
         description="Compare raw configure guard verdicts of two script trees."
     )
@@ -139,7 +161,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("list", type=Path, help="file with one shell script path per line")
     parser.add_argument("out", type=Path, help="TSV written with one row per script")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.base, args.head = args.base.absolute(), args.head.absolute()
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:

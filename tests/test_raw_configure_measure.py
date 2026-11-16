@@ -4,19 +4,28 @@
 
 Verifies:
 1. The verdict allow-list takes an accept and a parsed refusal, and nothing else (planted negatives:
-   parser unavailable, timeout, crash, wrong exit status, foreign stderr).
-2. A missing parser refuses with exit 3 before any guard runs (planted negative).
+   parser unavailable, the guard's inspection-deadline refusal, timeout, crash, wrong exit status,
+   foreign stderr).
+2. A missing parser refuses with exit 3 before any guard runs; the parser check runs in a child
+   interpreter with the guard's -I flag and environment (planted negatives).
 3. A guard copy that only reports the parser as unavailable makes the run exit 3 (planted negative).
 4. An empty list exits 3; a list over the bound exits 2 (planted negatives).
 5. A missing guard, a guard timeout and a script directory that does not exist are unmeasured.
 6. A measured run exits 0 and counts changed and accepted-to-refused verdicts.
+7. A parser-unavailable refusal after a long script path is classified on the whole line; the TSV
+   keeps the first 200 characters (planted negative).
+8. A script path with a space reaches the guard as one shell operand (planted negative).
+9. Relative trees and list entries resolve against the invocation directory (planted negative).
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import json
+import os
 import subprocess  # nosec B404 - TimeoutExpired type for the planted timeout.
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -35,6 +44,22 @@ UNAVAILABLE = (
     'print("raw configure refused: planted '
     '(shell script parser unavailable: planted)", file=sys.stderr)\n'
     "sys.exit(2)\n"
+)
+LONG_UNAVAILABLE = (
+    "import sys\n"
+    'print("raw configure refused: " + "/long" * 60 + '
+    '" (shell script parser unavailable: planted)", file=sys.stderr)\n'
+    "sys.exit(2)\n"
+)
+ECHO_OPERANDS = (
+    "import json, shlex, sys\n"
+    'command = json.load(sys.stdin)["tool_input"]["command"]\n'
+    'print("raw configure refused: " + json.dumps(shlex.split(command)), file=sys.stderr)\n'
+    "sys.exit(2)\n"
+)
+DEADLINE_LINE = (
+    "raw configure refused: inspection exceeded the 10 s deadline (stalled filesystem or very "
+    "large script); run python3 scripts/ffmpeg_configure.py SRC_DIR BUILD_DIR -- <args>"
 )
 
 
@@ -75,6 +100,8 @@ class MeasuredAllowListTest(unittest.TestCase):
             (0, "anything", True),
             (2, "raw configure refused: x (WRITTEN_SCRIPT_DIR)", True),
             (2, "raw configure refused: x (shell script parser unavailable: no module)", False),
+            (2, DEADLINE_LINE, False),
+            (2, "raw configure refused: x writes past a deadline (WRITTEN_SCRIPT_DIR)", True),
             (2, "python3: can't open file 'scripts/raw_configure_guard.py'", False),
             (2, "", False),
             (3, "raw configure refused: x", False),
@@ -87,27 +114,57 @@ class MeasuredAllowListTest(unittest.TestCase):
                 self.assertIs(measure.measured(rc, err), expected)
 
 
+def _child(rc: int, stderr: str = "") -> subprocess.CompletedProcess[str]:
+    """Return a finished parser-check child with the given status and stderr."""
+    return subprocess.CompletedProcess(args=[], returncode=rc, stdout="", stderr=stderr)
+
+
 class PreflightTest(unittest.TestCase):
     def test_missing_parser_refuses_before_any_guard_runs(self) -> None:
-        """An interpreter without tree_sitter_bash exits 3 and runs no guard."""
+        """A parser check child that cannot import tree_sitter_bash exits 3 and runs no guard."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             out = root / "out.tsv"
-            missing = ImportError("No module named 'tree_sitter_bash'")
+            missing = _child(1, "ModuleNotFoundError: No module named 'tree_sitter_bash'\n")
             with (
-                unittest.mock.patch.object(measure.importlib, "import_module", side_effect=missing),
+                unittest.mock.patch.object(measure.subprocess, "run", return_value=missing),
                 unittest.mock.patch.object(measure, "verdict") as verdict,
             ):
                 rc, _, err = _run([str(root), str(root), str(_list(root, 1)), str(out)])
             self.assertEqual(rc, measure.VACUOUS)
             self.assertIn("parser does not load", err)
+            self.assertIn("No module named 'tree_sitter_bash'", err)
             verdict.assert_not_called()
             self.assertFalse(out.exists())
 
     def test_loaded_parser_passes(self) -> None:
-        """The preflight returns no problem when both modules import."""
-        with unittest.mock.patch.object(measure.importlib, "import_module"):
+        """The preflight returns no problem when the parser check child exits 0."""
+        with unittest.mock.patch.object(measure.subprocess, "run", return_value=_child(0)):
             self.assertEqual(measure.preflight(), "")
+
+    def test_check_runs_with_the_guard_flags_and_environment(self) -> None:
+        """The parser check runs `-I` under GUARD_ENV, as each guard copy does."""
+        with unittest.mock.patch.object(measure.subprocess, "run", return_value=_child(0)) as run:
+            measure.preflight()
+        self.assertEqual(run.call_args.args[0], [sys.executable, "-I", "-c", measure.PREFLIGHT])
+        self.assertEqual(run.call_args.kwargs["env"], measure.GUARD_ENV)
+
+    def test_parent_only_module_is_not_seen(self) -> None:
+        """A module only the parent's PYTHONPATH reaches fails the isolated parser check."""
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "planted_parent_only.py").write_text("", encoding="utf-8")
+            with (
+                unittest.mock.patch.dict(os.environ, {"PYTHONPATH": tmp}),
+                unittest.mock.patch.object(measure, "PREFLIGHT", "import planted_parent_only"),
+            ):
+                problem = measure.preflight()
+        self.assertIn("No module named 'planted_parent_only'", problem)
+
+    def test_check_that_does_not_start_refuses(self) -> None:
+        """A parser check that times out is a refusal, not a pass."""
+        expired = subprocess.TimeoutExpired(cmd="check", timeout=measure.GUARD_TIMEOUT)
+        with unittest.mock.patch.object(measure.subprocess, "run", side_effect=expired):
+            self.assertIn("parser check did not run", measure.preflight())
 
 
 class VacuousRunTest(unittest.TestCase):
@@ -193,6 +250,18 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual((rc, err), (124, "timeout"))
         self.assertFalse(measure.measured(rc, err))
 
+    def test_space_in_script_path_is_one_operand(self) -> None:
+        """A script under a directory with a space reaches the guard as one operand."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            guard = _tree(root, "tree", ECHO_OPERANDS) / measure.GUARD
+            script = root / "dir with space" / "s.sh"
+            script.parent.mkdir()
+            script.write_text("echo ok\n", encoding="utf-8")
+            rc, err = measure.verdict(guard, script)
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(err.removeprefix(measure.REFUSED)), ["bash", str(script)])
+
     def test_missing_script_directory_is_unmeasured(self) -> None:
         """A script whose directory does not exist yields an unmeasured verdict."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +296,45 @@ class MeasuredRunTest(unittest.TestCase):
             self.assertEqual(
                 [row[1:4] for row in rows], [["0", "2", "CHANGED"], ["0", "2", "CHANGED"]]
             )
+
+    def test_long_unavailable_line_is_classified_whole(self) -> None:
+        """A parser-unavailable refusal past 200 characters is unmeasured; the TSV truncates it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, head = _tree(root, "base", LONG_UNAVAILABLE), _tree(root, "head", ACCEPT)
+            out = root / "out.tsv"
+            rc, summary, _ = _run([str(base), str(head), str(_list(root, 1)), str(out)])
+            self.assertEqual(rc, measure.VACUOUS)
+            self.assertIn("unmeasured=1", summary)
+            row = out.read_text(encoding="utf-8").splitlines()[0].split("\t")
+            self.assertEqual(len(row[4]), measure.SHOWN)
+
+    def test_relative_paths_resolve_against_invocation_directory(self) -> None:
+        """Relative trees and list entries are measured from the directory main runs in."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _tree(root, "tree", ACCEPT)
+            (root / "sub").mkdir()
+            (root / "sub" / "s.sh").write_text("echo ok\n", encoding="utf-8")
+            (root / "list.txt").write_text("sub/s.sh\n", encoding="utf-8")
+            previous = os.getcwd()
+            os.chdir(root)
+            try:
+                rc, summary, _ = _run(["tree", "tree", "list.txt", "out.tsv"])
+            finally:
+                os.chdir(previous)
+        self.assertEqual(rc, 0)
+        self.assertIn("unmeasured=0", summary)
+
+    def test_absolute_paths_stay_unchanged(self) -> None:
+        """Absolute trees and list entries pass through unchanged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            listing = root / "list.txt"
+            listing.write_text(f"{root / 's.sh'}\n", encoding="utf-8")
+            args = measure.parse_args([str(root), str(root / "h"), str(listing), "out.tsv"])
+            self.assertEqual((args.base, args.head), (root, root / "h"))
+            self.assertEqual(measure.read_list(listing), [root / "s.sh"])
 
     def test_same_verdicts(self) -> None:
         """Identical guards change no verdict."""
