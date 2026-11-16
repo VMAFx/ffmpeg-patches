@@ -10,16 +10,18 @@ Verifies:
    interpreter with the guard's -I flag and environment (planted negatives).
 3. A guard copy that only reports the parser as unavailable or raises a parse error makes the run
    exit 3 (planted negatives).
-4. An empty list exits 3; a list over the bound or naming a missing path or directory exits 2
-   without running guards or writing the TSV (planted negatives).
+4. An empty list exits 3; a list over the bound or naming a missing path, a directory or a path
+   whose is_file check raises OSError exits 2 without running guards or writing the TSV (planted
+   negatives).
 5. A missing guard, a guard timeout and a script directory that does not exist are unmeasured.
 6. A measured run exits 0 and counts changed and accepted-to-refused verdicts.
 7. A parser-unavailable refusal after a long script path is classified on the whole line; the TSV
    keeps the first 200 characters (planted negative).
 8. A script path with a space reaches the guard as one shell operand (planted negative).
 9. Relative trees and list entries resolve against the invocation directory (planted negative).
-10. TSV fields escape backslashes, tabs, LF and CR after 200-character diagnostic truncation, and
-    decode_field inverts the encoding (planted negatives).
+10. TSV rows escape backslashes and tabs after 200-character diagnostic truncation; encode_field
+    escapes backslashes, tabs, LF and CR, and decode_field inverts the encoding and rejects a
+    truncated escape (planted negatives).
 """
 
 from __future__ import annotations
@@ -305,6 +307,39 @@ class VacuousRunTest(unittest.TestCase):
             self.assertIn(str(subdir), err_two)
             self.assertNotIn(str(missing), err_two)
 
+    def test_oserror_on_listed_path_refuses(self) -> None:
+        """A listed path whose is_file check raises OSError exits 2 without writing TSV."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).absolute()
+            tree = _tree(root, "tree", ACCEPT)
+            real = root / "real.sh"
+            real.write_text("echo ok\n", encoding="utf-8")
+            unreadable = root / "unreadable.sh"
+            unreadable.write_text("echo ok\n", encoding="utf-8")
+            listing = root / "list.txt"
+            listing.write_text(f"{real}\n{unreadable}\n", encoding="utf-8")
+            out = root / "out.tsv"
+            real_is_file = Path.is_file
+
+            def _fake_is_file(candidate: Path) -> bool:
+                """Raise OSError on the unreadable path and check other paths normally."""
+                if candidate == unreadable:
+                    raise OSError("planted stat failure")
+                return real_is_file(candidate)
+
+            with (
+                unittest.mock.patch.object(Path, "is_file", _fake_is_file),
+                unittest.mock.patch.object(measure, "verdict", wraps=measure.verdict) as spy,
+            ):
+                rc, _, err = _run([str(tree), str(tree), str(listing), str(out)])
+            self.assertTrue(unreadable.is_file())
+            self.assertEqual(rc, measure.INPUT_ERROR)
+            self.assertIn("1 ", err)
+            self.assertIn(str(unreadable), err)
+            self.assertNotIn(str(real), err)
+            spy.assert_not_called()
+            self.assertFalse(out.exists())
+
 
 class VerdictTest(unittest.TestCase):
     def test_timeout_is_unmeasured(self) -> None:
@@ -476,6 +511,27 @@ class MeasuredRunTest(unittest.TestCase):
         self.assertEqual(measure.decode_field(measure.encode_field(sample)), sample)
         with self.assertRaises(ValueError):
             measure.decode_field("cut\\")
+
+
+class FieldEncodingTest(unittest.TestCase):
+    def test_control_characters_escape_and_round_trip(self) -> None:
+        """Each TSV control character escapes to its backslash pair and round-trips."""
+        cases = [
+            ("backslash", "a\\b", "a\\\\b"),
+            ("tab", "a\tb", "a\\tb"),
+            ("lf", "a\nb", "a\\nb"),
+            ("cr", "a\rb", "a\\rb"),
+            ("crlf", "a\r\nb", "a\\r\\nb"),
+            ("mixed", "a\\b\tc\nd\re\\tf\\ng\\rh\\", "a\\\\b\\tc\\nd\\re\\\\tf\\\\ng\\\\rh\\\\"),
+        ]
+        for label, raw, expected in cases:
+            with self.subTest(label=label):
+                encoded = measure.encode_field(raw)
+                self.assertEqual(encoded, expected)
+                self.assertNotIn("\t", encoded)
+                self.assertNotIn("\n", encoded)
+                self.assertNotIn("\r", encoded)
+                self.assertEqual(measure.decode_field(encoded), raw)
 
 
 if __name__ == "__main__":
