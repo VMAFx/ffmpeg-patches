@@ -67,6 +67,11 @@ REBOUND_SCRIPT_DIR = (
     "script path from an own-directory name with BASH_ENV, ENV or an exported BASH_FUNC_ "
     "function in the environment that can rebind the commands of the idiom; use an absolute path"
 )
+WRITTEN_SCRIPT_DIR = (
+    "script path from an own-directory name the script also writes another way (printf -v, "
+    "read, mapfile, unset, a loop, an arithmetic, append or array assignment, or a special "
+    "builtin prefix); assign it only with = or use an absolute path"
+)
 UNKNOWN_SOURCE_PATH = (
     "relative script path after a source the guard cannot read; use an absolute path"
 )
@@ -246,6 +251,30 @@ PLAIN_EXPANSION = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])\}
 DEFAULT_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?-[A-Za-z0-9_./:@%+,=~^-]*\}")
 # Keep functions whose body prints or assigns a Bash variable (e.g. echo 'PATH=7') disallowed.
 BODY_ASSIGNED_NAME = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=")
+READ_BRACE_TAIL = re.compile(rb"\}|:(?!=)|[-+?#%/^,@]")
+# POSIX special builtins (bash 5.3 manual 4.4); in POSIX mode a prefix assignment stays set.
+SPECIAL_BUILTINS = frozenset(
+    [
+        "break",
+        ":",
+        ".",
+        "source",
+        "continue",
+        "eval",
+        "exec",
+        "exit",
+        "export",
+        "readonly",
+        "return",
+        "set",
+        "shift",
+        "times",
+        "trap",
+        "unset",
+    ]
+)
+BARE_ATTRIBUTE = re.compile(rb"[ \t]*(?:export|readonly)[ \t]+")
+BARE_ENDS = (b"", b"\n", b";", b" ", b"\t")
 SET_FLAGS = re.compile(r"[-+][eu]+")
 SET_OPTION_CLUSTER = re.compile(r"[-+][eu]*o")
 EXIT_STATUS = re.compile(r"[0-9]+")
@@ -555,7 +584,8 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     raw = body.encode("utf-8", "surrogateescape")
     root = bash_parser().parse(raw).root_node
     if source:
-        scan.source_literals[id(root)] = _literal_map(root, raw, scan.budget)
+        watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
+        scan.source_literals[id(root)] = _literal_map(root, raw, scan.budget, watched)
     scan.stack.append((root, raw, False))
 
 
@@ -1621,32 +1651,157 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
         _store_script_dir(assignment, name, override, scan)
 
 
-def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> tuple[list[str], set[str]]:
-    """Collect assignment texts and all assigned names with one bounded syntax walk."""
+@dataclass
+class _Names:
+    """Statement assignments, assigned names, plain-assignment name starts and skipped spans.
+
+    Skipped spans are comments and quoted here-document bodies, which Bash never expands.
+    """
+
+    assignments: list[str] = field(default_factory=list)
+    assigned: set[str] = field(default_factory=set)
+    starts: set[int] = field(default_factory=set)
+    skipped: list[tuple[int, int]] = field(default_factory=list)
+
+
+def _plain_start(node: Any) -> int | None:
+    """Return the name start of a NAME=value assignment; None for +=, an index or other names."""
+    name_node = node.child_by_field_name("name")
+    if name_node is None or name_node.type != "variable_name":
+        return None
+    if len(node.children) < 2 or node.children[1].type != "=":
+        return None
+    return name_node.start_byte
+
+
+def _note_assignment(node: Any, raw: bytes, names: _Names) -> None:
+    """Record a statement assignment, its variable name and, for a plain =, the name's start."""
+    value = node.child_by_field_name("value")
+    if value is not None and value.type == "array":
+        return
+    names.assignments.append(_text(node, raw))
+    name_node = node.child_by_field_name("name")
+    if name_node is None or name_node.type != "variable_name":
+        return
+    names.assigned.add(_text(name_node, raw))
+    start = _plain_start(node)
+    if start is not None:
+        names.starts.add(start)
+
+
+def _prefix_command(node: Any, raw: bytes) -> str | None:
+    """Return the plain word naming the command a prefix assignment runs with, if there is one."""
+    command_name = node.parent.child_by_field_name("name")
+    parts = command_name.named_children if command_name is not None else []
+    if len(parts) != 1 or parts[0].type != "word" or parts[0].named_children:
+        return None
+    word = _text(parts[0], raw)
+    return word if PLAIN_WORD.fullmatch(word) is not None else None
+
+
+def _note_prefix(node: Any, raw: bytes, names: _Names) -> None:
+    """Record the name start of an = prefix before a plain command that is no special builtin.
+
+    Bash keeps such a prefix assignment for that one command and restores the old value after
+    it (bash 5.3 manual 4.4: only a special builtin in POSIX mode keeps it), so it writes no
+    value for later statements. A prefix before a special builtin, a quoted or computed
+    command name, or no command at all counts as a write.
+    """
+    command = _prefix_command(node, raw)
+    if command is None or command in SPECIAL_BUILTINS:
+        return
+    start = _plain_start(node)
+    if start is not None:
+        names.starts.add(start)
+
+
+def _note_heredoc(node: Any, raw: bytes, names: _Names) -> None:
+    """Skip a quoted here-document body, which Bash passes on without any expansion."""
+    _, quoted, body, _ = _heredoc_parts(node, raw)
+    if quoted and body is not None:
+        names.skipped.append((body.start_byte, body.end_byte))
+
+
+def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> _Names:
+    """Collect assignments, assigned names, plain = starts and skipped spans in one bounded walk."""
     stack = [root]
-    assignments = []
-    assigned = set()
+    names = _Names()
     for _ in range(MAX_BODY_NODES):
         if not stack or budget.nodes >= MAX_BODY_NODES:
             break
         node = stack.pop()
         budget.nodes += 1
-        if node.type == "variable_assignment" and node.parent.type != "command":
-            value = node.child_by_field_name("value")
-            if value is None or value.type != "array":
-                assignment = _text(node, raw)
-                assignments.append(assignment)
-                name = assignment.split("=", 1)[0]
-                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-                    assigned.add(name)
+        if node.type == "comment":
+            names.skipped.append((node.start_byte, node.end_byte))
+        elif node.type == "heredoc_redirect":
+            _note_heredoc(node, raw, names)
+        elif node.type == "variable_assignment" and node.parent.type == "command":
+            _note_prefix(node, raw, names)
+        elif node.type == "variable_assignment":
+            _note_assignment(node, raw, names)
         stack.extend(reversed(node.named_children))
-    return assignments, assigned
+    return names
 
 
-def _literal_map(root: Any, raw: bytes, budget: BodyBudget) -> tuple[dict[str, str], set[str]]:
-    """Collect unique literals and all assigned names with one bounded syntax walk."""
-    assignments, assigned = _assignment_texts(root, raw, budget)
-    return _find_literal_assignments(assignments), assigned
+def _write_occurrence(code: bytes, start: int, end: int) -> bool:
+    """Tell a use that may write a name from a read reference, bare export or bare readonly."""
+    if code[max(start - 1, 0) : start] == b"$":
+        return False
+    if code[max(start - 2, 0) : start] == b"${":
+        return READ_BRACE_TAIL.match(code, end) is None
+    if code[max(start - 3, 0) : start] in (b"${#", b"${!"):
+        return code[end : end + 1] != b"}"
+    head = code[code.rfind(b"\n", 0, start) + 1 : start]
+    return BARE_ATTRIBUTE.fullmatch(head) is None or code[end : end + 1] not in BARE_ENDS
+
+
+def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
+    """Return watched names used outside a plain = assignment, a read reference or a bare export.
+
+    Comments and quoted here-document bodies are skipped, and a plain = prefix before a plain
+    command other than a special builtin is no write. Every other use counts as a write, among
+    them printf -v, read, mapfile, unset, an arithmetic, append or array assignment,
+    ${NAME:=value}, a for loop variable and any text that names the variable, such
+    as an eval or trap string. Not detected: a name built at run time, alias expansion, and the
+    value a function sees under a prefix assignment, which is resolved with the top-level value.
+    """
+    code = bytearray(raw)
+    for start, end in names.skipped:
+        code[start:end] = b" " * (end - start)
+    text = bytes(code)
+    written = set()
+    for name in sorted(watched):
+        word = re.compile(rb"(?<![A-Za-z0-9_])" + re.escape(name.encode()) + rb"(?![A-Za-z0-9_])")
+        if any(
+            match.start() not in names.starts
+            and _write_occurrence(text, match.start(), match.end())
+            for match in word.finditer(text)
+        ):
+            written.add(name)
+    return written
+
+
+def _literal_map(
+    root: Any, raw: bytes, budget: BodyBudget, watched: set[str]
+) -> tuple[dict[str, str], set[str]]:
+    """Collect unique literals and assigned names, counting a write of a watched name as one."""
+    names = _assignment_texts(root, raw, budget)
+    written = _written_names(raw, names.assigned | watched, names)
+    literals = _find_literal_assignments(names.assignments)
+    return {k: v for k, v in literals.items() if k not in written}, names.assigned | written
+
+
+def _prime_names(scan: _Scan, names: _Names, raw: bytes) -> None:
+    """Seed literals, assigned and own-directory names; refuse own-directory names it writes."""
+    dirs = _script_dir_names(names.assignments) if scan.context.script_dir is not None else {}
+    overrides = {override for override in dirs.values() if override is not None}
+    written = _written_names(raw, names.assigned | overrides, names)
+    scan.assigned = names.assigned | written
+    literals = _find_literal_assignments(names.assignments)
+    scan.literals = {k: v for k, v in literals.items() if k not in written}
+    scan.script_dirs = {k: v for k, v in dirs.items() if k not in written}
+    for name in sorted(written & set(dirs)):
+        scan.refused_dirs[name] = WRITTEN_SCRIPT_DIR
 
 
 def _merge_source_literals(node: Any, scan: _Scan) -> None:
@@ -1695,10 +1850,8 @@ def scan_body(
     raw = body.encode("utf-8", "surrogateescape")
     scan = _Scan(context, budget, dir_changed=context.directory_changed)
     root = parser.parse(raw).root_node
-    assignments, scan.assigned = _assignment_texts(root, raw, budget)
-    scan.literals = _find_literal_assignments(assignments)
+    _prime_names(scan, _assignment_texts(root, raw, budget), raw)
     if context.script_dir is not None:
-        scan.script_dirs = _script_dir_names(assignments)
         scan.rebound = _environment_rebinds()
     scan.stack.append((root, raw, False))
     for _ in range(MAX_BODY_NODES):

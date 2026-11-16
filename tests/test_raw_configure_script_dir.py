@@ -33,6 +33,10 @@ SRC_THERE = '. "$THERE/lib.sh"\n'
 UNREAD = '. "$UNSET_DIR/x.sh"\n'
 RUN = "bash inner.sh\n"
 CFG = "<cfg>\n"
+WRITTEN = "own-directory name the script also writes another way"
+OTHER = {"other/lib.sh": CFG}
+PRINTF = "printf -v HERE '%s' <case>/other\n"
+POSIX = "set -o posix\n"
 LINK = "-> ../tools/run.sh"
 RUN_NEXT = 'run_next() {\n  "$HERE/next.sh" check\n}\n'
 HASH_DIRNAME = "{ builtin hash -p <case>/bin/dirname dirname; }\n"
@@ -758,6 +762,93 @@ SCRIPT_DIR = {
     "r11-plain-own-dir-name": Case(
         'TOP=$(dirname "$(readlink -f "$0")")\n. "$TOP/lib.sh"\n' + RUN, 0
     ),
+    "r12-printf-v-own-dir": Case(DOLLAR0 + PRINTF + SRC, 2, WRITTEN, OTHER),
+    "r12-printf-v-quoted-name": Case(
+        DOLLAR0 + "printf -v 'HERE' '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-printf-v-cdpwd": Case(CDPWD + PRINTF + SRC, 2, WRITTEN, OTHER),
+    "r12-printf-v-default": Case(DEFAULT + PRINTF + SRC, 2, WRITTEN, OTHER),
+    "r12-read-own-dir": Case(DOLLAR0 + "read -r HERE <<< <case>/other\n" + SRC, 2, WRITTEN, OTHER),
+    "r12-mapfile-own-dir": Case(
+        DOLLAR0 + "mapfile -t HERE <<< <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-arith-own-dir": Case(DOLLAR0 + "echo $((HERE=7))\n" + SRC, 2, WRITTEN, {"7/lib.sh": CFG}),
+    "r12-for-own-dir": Case(
+        DOLLAR0 + "for HERE in <case>/other; do :; done\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-assign-default-colon": Case(DOLLAR0 + ": ${HERE:=x}\n" + SRC, 2, WRITTEN),
+    "r12-assign-default": Case(DOLLAR0 + ": ${HERE=x}\n" + SRC, 2, WRITTEN),
+    "r12-unset-own-dir": Case(DOLLAR0 + "unset HERE\n" + SRC, 2, WRITTEN),
+    "r12-nameref-own-dir": Case(
+        DOLLAR0 + "declare -n R=HERE\nR=<case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-eval-string-own-dir": Case(
+        DOLLAR0 + "eval 'HERE=<case>/other'\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-trap-debug-own-dir": Case(
+        DOLLAR0 + "trap 'HERE=<case>/other' DEBUG\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-colon-prefix-posix": Case(
+        DOLLAR0 + POSIX + "HERE=<case>/other :\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-source-prefix-posix": Case(
+        DOLLAR0 + POSIX + 'HERE=<case>/other . "$HERE/lib.sh"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-eval-prefix-posix": Case(
+        DOLLAR0 + POSIX + "HERE=<case>/other eval :\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-quoted-command-prefix": Case(
+        DOLLAR0 + POSIX + "HERE=<case>/other ':'\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-redirect-only-prefix": Case(
+        DOLLAR0 + "HERE=<case>/other >/dev/null\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-unquoted-heredoc-default": Case(
+        DOLLAR0 + "cat <<EOF\n${HERE:=x}\nEOF\n" + SRC, 2, WRITTEN
+    ),
+    "r12-append-own-dir": Case(DOLLAR0 + "HERE+=/../other\n" + SRC + RUN, 2, UNKNOWN_SOURCE, OTHER),
+    "r12-index-own-dir": Case(
+        DOLLAR0 + "HERE[0]=<case>/other\n" + SRC + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r12-source-file-printf": Case(
+        DOLLAR0 + '. "$HERE/w.sh"\n' + SRC,
+        2,
+        AMBIGUOUS,
+        {"tools/w.sh": "printf -v HERE %s <case>/other\n", "other/lib.sh": CFG},
+    ),
+    "r12-override-append": Case(
+        "LANE_TEST_DIR+=<case>/other\n" + DEFAULT + SRC + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r12-literal-printf-run": Case(
+        "X=<case>/tools\nprintf -v X '%s' <case>/other\n" + '. "$X/lib.sh"\n' + RUN,
+        2,
+        UNKNOWN_SOURCE,
+        OTHER,
+    ),
+    "r12-keep-export-bare": Case(DOLLAR0 + "export HERE\n" + SRC + RUN, 0),
+    "r12-keep-readonly-bare": Case(DOLLAR0 + "readonly HERE\n" + SRC + RUN, 0),
+    "r12-keep-comment": Case(DOLLAR0 + "# printf -v HERE x\n" + SRC + RUN, 0),
+    "r12-keep-braced-reads": Case(
+        DOLLAR0
+        + 'echo "${HERE%/}" "${HERE#/}" "${HERE:-x}" "${HERE:0:2}" "${#HERE}" "${HERE^^}" '
+        + '"${HERE@Q}" "${HERE/a/b}"\n'
+        + SRC
+        + RUN,
+        0,
+    ),
+    "r12-keep-quoted-heredoc": Case(
+        DOLLAR0 + "python3 - <<'PY'\nHERE = 1\nprint(HERE)\nPY\n" + SRC + RUN, 0
+    ),
+    "r12-keep-program-prefix": Case(DOLLAR0 + "HERE=<case>/other env\n" + SRC + RUN, 0),
+    "r12-keep-function-prefix": Case(
+        DOLLAR0 + "g() { echo hi; }\nHERE=<case>/other g\n" + SRC + RUN, 0
+    ),
+    "r12-keep-command-prefix": Case(
+        DOLLAR0 + POSIX + "HERE=<case>/other command :\n" + SRC + RUN, 0
+    ),
+    "r12-keep-landing-prefix": Case(
+        DOLLAR0 + 'f() { :; }\nrun() {\n  HERE="$d/missing" MODE=always f\n}\n' + SRC + RUN, 0
+    ),
 }
 
 
@@ -805,8 +896,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 299 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 299)
+        """Replay all 333 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 333)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
