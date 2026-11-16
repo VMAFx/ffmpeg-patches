@@ -48,15 +48,22 @@ line break, and a flag suffix may contain `#`, uppercase letters, digits, `+`,
 `_`, `=` and `-`.
 
 The claim-scope step fails a commit whose message makes a blanket verification
-claim (passes all tests, all tests pass, fully tested or verified, thoroughly
-tested, no regressions, completely or 100% safe, verified or tested), never
-waivable, and a commit whose message claims several sites (both, all, every or
-each, followed within two words by loops, callers, call sites, branches, paths,
-cases, functions, uses, instances, places, sites or occurrences) while its diff
-changes exactly one hunk in library or fftools sources; --claim-reason TEXT
-waives only the second rule. Signed-off-by lines are ignored; claims worded
-otherwise, and claims that a multi-hunk diff still does not support, are not
-detected.
+claim (passes all tests, all or every test passes, fully or thoroughly tested
+or verified, no regressions or no performance regressions, completely or 100%
+safe, verified or tested), never waivable; a claim directly after not, never,
+cannot, without or an n't contraction, and a safe claim followed by because or
+since, are not claims. It also fails a commit whose message claims several
+sites (both or all followed within two words, line breaks included, by loops,
+callers, call sites, branches, paths, cases, functions, uses, instances,
+places, sites or occurrences; every or each followed the same way by the
+singular or plural of those nouns) while its diff changes exactly one hunk in
+library or fftools sources; renamed files are diffed as renames, a deleted
+source file counts its hunks, and one contiguous hunk counts as one site even
+when it edits two adjacent branches or states an invariant of all callers;
+--claim-reason TEXT waives only the second rule. Signed-off-by lines in any
+letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
+fails with rc 2; claims worded otherwise, and claims that a multi-hunk diff
+still does not support, are not detected.
 """
 
 from __future__ import annotations
@@ -120,12 +127,14 @@ DIFF_COMMON = (
     "--dst-prefix=b/",
 )
 MAX_PATHS = 2000
+MAX_CLAIM_COMMITS = 1000
 RUN_TIMEOUT = 1800
 CLEANUP_TIMEOUT = 30
 REAP_TIMEOUT = 10
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
 CONFIG = ".forgejo/pre-commit/config.yaml"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+HUNK_LENGTHS = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 GIT_QUOTED_ESCAPE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
 GIT_ESCAPE_BYTES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -155,16 +164,24 @@ DIAGNOSTIC_CITATION = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 VERIFICATION_CLAIM = re.compile(
-    r"\b(pass(?:es|ed)?\s+all\s+(?:the\s+)?(?:fate\s+)?tests"
-    r"|all\s+(?:the\s+)?(?:fate\s+)?tests\s+pass(?:es|ed)?"
-    r"|fully\s+(?:tested|verified)|thoroughly\s+tested"
-    r"|no\s+regressions?(?!\s+tests?\b)|(?:completely|100%)\s+(?:safe|verified|tested))\b",
+    r"\b(pass(?:es|ed)?\s+all\s+(?:the\s+)?(?:fate\s+|unit\s+)?tests"
+    r"|(?:all|every)\s+(?:the\s+)?(?:fate\s+|unit\s+)?tests?\s+pass(?:es|ed)?"
+    r"|(?:fully|thoroughly)\s+(?:tested|verified)"
+    r"|no\s+(?:performance\s+)?regressions?(?!\s+test(?:s|ing|ed)?\b)"
+    r"|(?:completely|100%)\s+(?:safe|verified|tested))\b",
     re.IGNORECASE,
 )
+NEGATED_CLAIM = re.compile(
+    r"(?:\bnot|\bnever|\bcannot|n't|\bwithout)\s+(?:been\s+|be\s+)?$", re.IGNORECASE
+)
+SAFETY_REASON = re.compile(r"\s+(?:because|since)\b", re.IGNORECASE)
 SCOPE_CLAIM = re.compile(
-    r"\b(?:both|all|every|each)\s+(?:\w+[ -]){0,2}?"
-    r"(?:loops?|callers?|call[ -]sites?|branches|paths|cases"
-    r"|functions|uses|instances|places|sites|occurrences)\b",
+    r"\b(?:(?:both|all)\s+(?:\w+(?:\s+|-)){0,2}?"
+    r"(?:loops?|callers?|call(?:\s+|-)sites?|branches|paths|cases"
+    r"|functions|uses|instances|places|sites|occurrences)"
+    r"|(?:every|each)\s+(?:\w+(?:\s+|-)){0,2}?"
+    r"(?:branch(?:es)?|(?:loop|caller|call(?:\s+|-)site|path|case"
+    r"|function|use|instance|place|site|occurrence)s?))\b",
     re.IGNORECASE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an
@@ -1348,8 +1365,10 @@ def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
 
 
 def _without_signoff(message: str) -> str:
-    """Return a commit message with Signed-off-by trailer lines removed."""
-    return "\n".join(line for line in message.splitlines() if not line.startswith("Signed-off-by:"))
+    """Return a commit message with Signed-off-by trailer lines removed, in any letter case."""
+    return "\n".join(
+        line for line in message.splitlines() if not line.lower().startswith("signed-off-by:")
+    )
 
 
 def uncited_diagnostic(message: str) -> str | None:
@@ -1383,9 +1402,15 @@ def _diagnostic_citation(tree: Path, base: str, head: str) -> Step:
 
 
 def unverified_claim(message: str) -> str | None:
-    """Return the first blanket verification claim in a commit message."""
-    match = VERIFICATION_CLAIM.search(_without_signoff(message))
-    return match[0] if match else None
+    """Return the first blanket verification claim that is neither negated nor argued."""
+    text = _without_signoff(message)
+    for match in VERIFICATION_CLAIM.finditer(text):
+        if NEGATED_CLAIM.search(text, max(0, match.start() - 24), match.start()):
+            continue
+        if match[0].lower().endswith("safe") and SAFETY_REASON.match(text, match.end()):
+            continue
+        return match[0]
+    return None
 
 
 def scope_claim(message: str) -> str | None:
@@ -1394,22 +1419,53 @@ def scope_claim(message: str) -> str | None:
     return match[0] if match else None
 
 
+def _source_header(line: str, old_source: bool) -> bool:
+    """Return whether a +++ header line opens a library or fftools source file."""
+    if line == "+++ /dev/null":
+        return old_source
+    return is_source_path(_header_path(line))
+
+
+def _hunk_body(line: str, old_left: int, new_left: int) -> tuple[int, int] | None:
+    """Return the hunk line counts left after one body line, or None when the hunk ended."""
+    tag = line[:1]
+    if not (old_left or new_left) or tag not in ("-", "+", " ", "\\"):
+        return None
+    old_used = tag in ("-", " ") and old_left > 0
+    new_used = tag in ("+", " ") and new_left > 0
+    return old_left - int(old_used), new_left - int(new_used)
+
+
 def source_hunks(patch: str) -> int:
-    """Count unified-diff hunks belonging to library or fftools source files."""
+    """Count hunks of library or fftools source files, deletions included,
+    reading headers only outside hunk bodies.
+    """
     count = 0
-    in_source = False
+    in_source = old_source = False
+    left = (0, 0)
     for line in patch.splitlines():
+        body = _hunk_body(line, *left)
+        if body is not None:
+            left = body
+            continue
+        left = (0, 0)
+        lengths = HUNK_LENGTHS.match(line)
         if line.startswith("diff --git "):
-            in_source = False
+            in_source = old_source = False
+        elif lengths:
+            count += int(in_source)
+            left = (int(lengths[1] or "1"), int(lengths[2] or "1"))
+        elif line.startswith("--- "):
+            old_source = is_source_path(_header_path(line))
         elif line.startswith("+++ "):
-            in_source = line.startswith("+++ b/") and is_source_path(line.removeprefix("+++ b/"))
-        elif in_source and HUNK.match(line):
-            count += 1
+            in_source = _source_header(line, old_source)
     return count
 
 
 def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[str | None, str | None]:
-    """Check one commit's message and diff for unverified or single-hunk scope claims."""
+    """Check one commit's message and rename-aware diff for unverified or
+    single-hunk scope claims.
+    """
     unverified_finding = None
     blanket = unverified_claim(message)
     if blanket is not None:
@@ -1430,7 +1486,7 @@ def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[str |
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
-            "--no-renames",
+            "-M",
             commit,
         )
         if source_hunks(patch) == 1:
@@ -1445,6 +1501,8 @@ def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
     """Reject blanket verification claims and unwaived single-hunk multi-site claims."""
     log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
     records = list(filter(None, log.split("\0")))
+    if len(records) > MAX_CLAIM_COMMITS:
+        raise RuntimeError(f"commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(records)}")
     unverified: list[str] = []
     scoped: list[str] = []
     for record in records:
