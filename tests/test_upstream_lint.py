@@ -216,6 +216,28 @@ class FixWordTest(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(upstream_lint.fix_word(message), expected)
 
+    def test_wrapped_defect_phrase_is_found(self) -> None:
+        """A defect phrase split by a line break or by hyphens returns that phrase."""
+        cases = (
+            ("avcodec/x: bound y\n\nThe read goes out of\nbounds.\n", "out of\nbounds"),
+            ("avcodec/x: bound y\n\nAn out-of-\nbounds read of y.\n", "out-of-\nbounds"),
+            ("avcodec/x: bound y\n\nAn out\n-of-bounds read of y.\n", "out\n-of-bounds"),
+            ("avcodec/x: bound y\n\nThe read goes past the\nend of y.\n", "past the\nend"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.fix_word(message), expected)
+
+    def test_split_phrase_words_stay_whole(self) -> None:
+        """Phrase words joined without a separator or with other words between return None."""
+        for message in (
+            "avcodec/x: bound y\n\nThe read stays outof bounds checks.\n",
+            "avcodec/x: bound y\n\nThe read goes out of its\nbounds.\n",
+            "avcodec/x: bound y\n\nThe read goes past\nits end.\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.fix_word(message))
+
     def test_no_defect_word_returns_none(self) -> None:
         """Messages without a whole fix or defect word outside sign-off lines return None."""
         for message in (
@@ -1205,6 +1227,18 @@ class DocTermTest(unittest.TestCase):
                 self.assertTrue(findings[0].startswith("non-RGB input: added code has "))
                 self.assertIn("say non-RGB or name gray", findings[0])
 
+    def test_reversed_operand_non_rgb_code_is_found(self) -> None:
+        """A non-RGB test with the RGB constant as the left operand is found as well."""
+        for code in (
+            "    if (ZIMG_COLOR_RGB != s->src_format.color_family &&",
+            "    if (!(AV_PIX_FMT_FLAG_RGB & desc->flags))",
+        ):
+            with self.subTest(code=code):
+                findings = upstream_lint.doc_term_findings(code, "kept for YUV input only.")
+                self.assertEqual(len(findings), 1)
+                self.assertTrue(findings[0].startswith("non-RGB input: added code has "))
+                self.assertIn("say non-RGB or name gray", findings[0])
+
     def test_range_comparison_without_unspecified_is_found(self) -> None:
         """Added docs naming a range option for a range comparison must say unspecified."""
         code = "        s->src_format.pixel_range != convert_range(in->color_range)))"
@@ -1231,6 +1265,8 @@ class DocTermTest(unittest.TestCase):
             ("    if (!(desc->flags & AV_PIX_FMT_FLAG_RGB))", ""),
             ("    if (in->color_range == AVCOL_RANGE_JPEG)", "kept for every input."),
             ("    if (s->src_format.color_family == ZIMG_COLOR_RGB)", "kept for YUV input."),
+            ("    if (ZIMG_COLOR_RGB == s->src_format.color_family)", "kept for YUV input."),
+            ("    if (AV_PIX_FMT_FLAG_RGB & desc->flags)", "kept for YUV input."),
         ):
             with self.subTest(code=code, docs=docs):
                 self.assertEqual(upstream_lint.doc_term_findings(code, docs), [])
@@ -1459,6 +1495,14 @@ class PipelineTest(FixtureTest):
         """A source commit whose body names a defect fails without a changed test path."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit("avfilter/vf_x: skip absent y\n\nReading y would misalign every field.")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_wrapped_body_defect_phrase_without_test_fails(self) -> None:
+        """A source commit whose body wraps a defect phrase fails without a changed test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: bound y\n\nThe read goes out of\nbounds.")
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: regression-test rc: 1", output)

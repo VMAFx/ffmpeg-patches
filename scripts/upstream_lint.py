@@ -28,7 +28,8 @@ multi-file variables are reported unresolved, and audio PCM decoders are not che
 The regression-test step fails when a commit whose subject or body, outside its
 Signed-off-by lines, says fix, fixes or fixed or names a defect (bug, regression,
 misalignment, crash, overflow, overread, leak, wrong, incorrect, broken,
-truncation, past the end, out of bounds) changes C, header or assembly sources
+truncation, past the end, out of bounds, also when a line break splits the
+phrase) changes C, header or assembly sources
 under lib*/ or fftools/ and no path
 under a tests directory changes anywhere in base..head. --no-test-reason TEXT
 waives it and prints the reason; when test paths do change, each fix commit must
@@ -72,8 +73,9 @@ The doc-terms step fails when base..head adds lines both to library or fftools
 sources and to Texinfo files under doc/, and an added source line shows a
 behaviour whose added description leaves one of its cases out: a test for
 non-RGB input (a comparison against a COLOR_RGB constant, or a negated
-AV_PIX_FMT_FLAG_RGB flag test) while the added docs say YUV but never non-RGB,
-gray or grey, or a colour range comparison while the added docs mention range
+AV_PIX_FMT_FLAG_RGB flag test, in either operand order) while the added
+docs say YUV but never non-RGB, gray or grey, or a colour range comparison
+while the added docs mention range
 or rangein but never unspecified, unknown or untagged. The added source lines
 are read from the head file with comments, string literals and preprocessor
 lines blanked, so a comment that names the behaviour does not count, and
@@ -177,7 +179,7 @@ C_NONCODE = re.compile(
 FIX_MESSAGE = re.compile(
     r"\b(?:fix(?:es|ed)?|bugs?|regressions?|misalign(?:s|ed|ment)?|crash(?:es|ed)?"
     r"|overflow(?:s|ed)?|overreads?|leak(?:s|ed)?|wrong|incorrect(?:ly)?|broken"
-    r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out[ -]of[ -]bounds)\b",
+    r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out(?:\s+|\s*-\s*)of(?:\s+|\s*-\s*)bounds)\b",
     re.IGNORECASE,
 )
 LAVFI_PREFIX = re.compile(r"^(?:vf|af|vsrc|asrc|avf|avsrc|vsink|asink|f)_")
@@ -1584,7 +1586,11 @@ class DocTerm:
 DOC_TERMS = (
     DocTerm(
         "non-RGB input",
-        re.compile(r"!=\s*\w*COLOR_RGB\b|!\s*\(\s*[\w.>-]+flags\s*&\s*AV_PIX_FMT_FLAG_RGB\s*\)"),
+        re.compile(
+            r"!=\s*\w*COLOR_RGB\b|\b\w*COLOR_RGB\s*!="
+            r"|!\s*\(\s*[\w.>-]+flags\s*&\s*AV_PIX_FMT_FLAG_RGB\s*\)"
+            r"|!\s*\(\s*AV_PIX_FMT_FLAG_RGB\s*&\s*[\w.>-]+flags\s*\)"
+        ),
         re.compile(r"\bYUV\b", re.IGNORECASE),
         re.compile(r"\bnon-RGB\b|\bgr[ae]y\b", re.IGNORECASE),
         "the code takes every non-RGB input, gray included; say non-RGB or name gray",
