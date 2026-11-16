@@ -160,8 +160,8 @@ SCOPE_CLAIM = re.compile(
     r"(?:loops?|callers?|call(?:\s+|-)sites?|branches|paths|cases"
     r"|functions|uses|instances|places|sites|occurrences)"
     r"|(?:every|each)\s+(?:\w+(?:\s+|-)){0,2}?"
-    r"(?:loop|caller|call(?:\s+|-)site|branch|path|case"
-    r"|function|use|instance|place|site|occurrence)s?)\b",
+    r"(?:branch(?:es)?|(?:loop|caller|call(?:\s+|-)site|path|case"
+    r"|function|use|instance|place|site|occurrence)s?))\b",
     re.IGNORECASE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an

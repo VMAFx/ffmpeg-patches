@@ -832,6 +832,19 @@ class ClaimScopeTest(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(upstream_lint.scope_claim(message), expected)
 
+    def test_every_and_each_take_plural_branches(self) -> None:
+        """Plural branches after every or each return their scope phrase within two words."""
+        cases = (
+            ("avcodec/x: clamp y in each of the branches\n", "each of the branches"),
+            ("avcodec/x: reset state in each of these branches\n", "each of these branches"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.scope_claim(message), expected)
+        self.assertIsNone(
+            upstream_lint.scope_claim("avcodec/x: reset state in every one of these branches\n")
+        )
+
     def test_scope_claim_two_word_boundary(self) -> None:
         """At most two intervening words separate the quantifier from its noun."""
         hit = "avcodec/x: check all three inner callers\n"
@@ -1183,6 +1196,15 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_single_hunk_each_of_the_branches_claim_fails(self) -> None:
+        """A claim about each of the branches backed by one source hunk fails without a waiver."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in each of the branches")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn("changes 1 source hunk", output)
 
     def test_scope_claim_waiver_passes(self) -> None:
         """A non-blank --claim-reason waives a single-hunk scope claim."""
