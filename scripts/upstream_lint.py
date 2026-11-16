@@ -57,6 +57,16 @@ changes exactly one hunk in library or fftools sources; --claim-reason TEXT
 waives only the second rule. Signed-off-by lines are ignored; claims worded
 otherwise, and claims that a multi-hunk diff still does not support, are not
 detected.
+
+The doc-terms step fails when base..head adds lines both to library or fftools
+sources and to Texinfo files under doc/, and an added source line shows a
+behaviour whose added description leaves one of its cases out: a test for
+non-RGB input (a comparison against a COLOR_RGB constant, or a negated
+AV_PIX_FMT_FLAG_RGB flag test) while the added docs say YUV but never non-RGB,
+gray or grey, or a colour range comparison while the added docs mention range
+or rangein but never unspecified, unknown or untagged. --doc-reason TEXT waives
+it and prints the reason. Only these two pairs are checked; any other gap
+between what the code does and what the docs say is not detected.
 """
 
 from __future__ import annotations
@@ -202,6 +212,15 @@ class RunResult:
     args: tuple[str, ...]
     returncode: int
     stdout: str
+
+
+@dataclass(frozen=True)
+class Waivers:
+    """Reasons that waive single upstream checks; a blank reason waives nothing."""
+
+    no_test: str = ""
+    claim: str = ""
+    doc: str = ""
 
 
 @dataclass
@@ -1463,6 +1482,78 @@ def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("claim-scope", 1, "\n".join([*unverified, *scoped]))
 
 
+@dataclass(frozen=True)
+class DocTerm:
+    """A code behaviour whose added description must name one of its cases."""
+
+    name: str
+    code: re.Pattern[str]
+    wording: re.Pattern[str]
+    required: re.Pattern[str]
+    advice: str
+
+
+DOC_TERMS = (
+    DocTerm(
+        "non-RGB input",
+        re.compile(r"!=\s*\w*COLOR_RGB\b|!\s*\(\s*[\w.>-]+flags\s*&\s*AV_PIX_FMT_FLAG_RGB\s*\)"),
+        re.compile(r"\bYUV\b", re.IGNORECASE),
+        re.compile(r"\bnon-RGB\b|\bgr[ae]y\b", re.IGNORECASE),
+        "the code takes every non-RGB input, gray included; say non-RGB or name gray",
+    ),
+    DocTerm(
+        "unspecified range",
+        re.compile(
+            r"\b(?:color|pixel)_range\s*[!=]=|[!=]=\s*[\w.>-]*\b(?:color|pixel)_range\b"
+            r"|\bAVCOL_RANGE_\w+\s*[!=]=|[!=]=\s*AVCOL_RANGE_\w+"
+        ),
+        re.compile(r"\brange(?:in)?\b", re.IGNORECASE),
+        re.compile(r"\b(?:unspecified|unknown|untagged)\b", re.IGNORECASE),
+        "the code compares a colour range; say how an unspecified range is treated",
+    ),
+)
+
+
+def is_doc_path(name: str) -> bool:
+    """Return whether a repository path is a Texinfo file under doc/."""
+    parts = PurePosixPath(name).parts
+    return len(parts) > 1 and parts[0] == "doc" and name.endswith(".texi")
+
+
+def doc_term_findings(code: str, docs: str) -> list[str]:
+    """Return a finding per doc term the added code shows and the added docs omit."""
+    findings: list[str] = []
+    for term in DOC_TERMS:
+        behaviour = term.code.search(code)
+        wording = term.wording.search(docs)
+        if behaviour and wording and not term.required.search(docs):
+            findings.append(
+                f'{term.name}: added code has "{behaviour[0].strip()}" and added docs say '
+                f'"{wording[0]}"; {term.advice}'
+            )
+    return findings
+
+
+def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Require added docs to name the cases that the added code covers."""
+    range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
+    code: list[str] = []
+    docs: list[str] = []
+    for path, _, added in _patch_files(range_patch):
+        if is_source_path(path):
+            code.extend(added)
+        elif is_doc_path(path):
+            docs.extend(added)
+    findings = doc_term_findings("\n".join(code), "\n".join(docs))
+    if not findings:
+        return Step("doc-terms", 0, f"no omitted doc term in {len(docs)} added doc line(s)")
+    reason = waiver.strip()
+    if reason:
+        return Step("doc-terms", 0, "\n".join([f"waived: {reason}", *findings]))
+    advice = "name the case in the docs, or pass --doc-reason"
+    return Step("doc-terms", 1, "\n".join([*findings, advice]))
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
     try:
         return action()
@@ -1470,9 +1561,7 @@ def _collect(name: str, action: Callable[[], Step]) -> Step:
         return Step(name, 2, str(error))
 
 
-def _checks(
-    tree: Path, base: str, head: str, waiver: str = "", claim_reason: str = ""
-) -> list[Step]:
+def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
     """Collect every independent check even when another check fails."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-upstream-lint-") as directory:
         scratch = Path(directory)
@@ -1482,9 +1571,12 @@ def _checks(
             _collect("patcheck", lambda: _patcheck(tree, base, head, scratch)),
             _collect("developer.texi", lambda: _mechanical(tree, base, head)),
             _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
-            _collect("regression-test", lambda: _regression_test(tree, base, head, waiver)),
+            _collect(
+                "regression-test", lambda: _regression_test(tree, base, head, waivers.no_test)
+            ),
             _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
-            _collect("claim-scope", lambda: _claim_scope(tree, base, head, claim_reason)),
+            _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
+            _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
         ]
 
 
@@ -1509,12 +1601,18 @@ def main(argv: list[str] | None = None) -> int:
         help="why a multi-site claim is backed by one source hunk; "
         "waives that claim-scope rule only",
     )
+    parser.add_argument(
+        "--doc-reason",
+        default="",
+        help="why the added docs may leave out a case the doc-terms step names; waives that step",
+    )
     args = parser.parse_args(argv)
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
         base, head = _prepare(tree, base, head)
-        steps = _checks(tree, base, head, args.no_test_reason, claim_reason=args.claim_reason)
+        waivers = Waivers(no_test=args.no_test_reason, claim=args.claim_reason, doc=args.doc_reason)
+        steps = _checks(tree, base, head, waivers)
         _remaining(0)
     except (OSError, RuntimeError, ValueError) as error:
         steps = [Step("preflight", 2, str(error))]

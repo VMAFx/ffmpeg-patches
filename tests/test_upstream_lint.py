@@ -967,6 +967,59 @@ class ClaimScopeTest(unittest.TestCase):
         self.assertEqual(upstream_lint.source_hunks(test_and_deleted), 0)
 
 
+class DocTermTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of doc terms the added code requires."""
+
+    def test_yuv_wording_for_non_rgb_code_is_found(self) -> None:
+        """Added docs saying YUV for a non-RGB code test name the missing case."""
+        for code in (
+            "    if (s->src_format.color_family != ZIMG_COLOR_RGB &&",
+            "    if (!(desc->flags & AV_PIX_FMT_FLAG_RGB))",
+        ):
+            with self.subTest(code=code):
+                findings = upstream_lint.doc_term_findings(code, "kept for YUV input only.")
+                self.assertEqual(len(findings), 1)
+                self.assertTrue(findings[0].startswith("non-RGB input: added code has "))
+                self.assertIn("say non-RGB or name gray", findings[0])
+
+    def test_range_comparison_without_unspecified_is_found(self) -> None:
+        """Added docs naming a range option for a range comparison must say unspecified."""
+        code = "        s->src_format.pixel_range != convert_range(in->color_range)))"
+        findings = upstream_lint.doc_term_findings(code, "@option{rangein} too,")
+        self.assertEqual(len(findings), 1)
+        self.assertIn('unspecified range: added code has "pixel_range !="', findings[0])
+
+    def test_named_cases_pass(self) -> None:
+        """Docs that say non-RGB, gray or how an unspecified range is treated pass."""
+        code = (
+            "    if (!(desc->flags & AV_PIX_FMT_FLAG_RGB) && in->color_range != AVCOL_RANGE_JPEG)"
+        )
+        for docs in (
+            "kept for non-RGB input. An unspecified\nrange counts as limited.",
+            "kept for YUV and gray input; an unknown range is treated as limited.",
+        ):
+            with self.subTest(docs=docs):
+                self.assertEqual(upstream_lint.doc_term_findings(code, docs), [])
+
+    def test_missing_code_or_wording_passes(self) -> None:
+        """No finding without the code behaviour or without the triggering doc wording."""
+        for code, docs in (
+            ("    return 1;", "kept for YUV input; @option{rangein} too."),
+            ("    if (!(desc->flags & AV_PIX_FMT_FLAG_RGB))", ""),
+            ("    if (in->color_range == AVCOL_RANGE_JPEG)", "kept for every input."),
+            ("    if (s->src_format.color_family == ZIMG_COLOR_RGB)", "kept for YUV input."),
+        ):
+            with self.subTest(code=code, docs=docs):
+                self.assertEqual(upstream_lint.doc_term_findings(code, docs), [])
+
+    def test_doc_path_is_texinfo_under_doc(self) -> None:
+        """Only Texinfo files below the top-level doc directory count as docs."""
+        self.assertTrue(upstream_lint.is_doc_path("doc/filters.texi"))
+        for name in ("filters.texi", "doc/filters.txt", "libavfilter/doc/x.texi"):
+            with self.subTest(name=name):
+                self.assertFalse(upstream_lint.is_doc_path(name))
+
+
 class FixtureTest(unittest.TestCase):
     """Shared disposable Git fixture; stub the pre-commit subprocess only."""
 
@@ -1054,7 +1107,7 @@ class PipelineTest(FixtureTest):
     """Run Git and base tools in a throwaway repository; stub pre-commit only."""
 
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
-        """A correctly named clean commit passes all eight collected checks."""
+        """A correctly named clean commit passes every collected check."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit()
         rc, output = self.check()
@@ -1068,6 +1121,7 @@ class PipelineTest(FixtureTest):
             "regression-test",
             "diagnostic-citation",
             "claim-scope",
+            "doc-terms",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
 
@@ -1290,6 +1344,42 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: claim-scope rc: 0", output)
+
+    def test_doc_terms_omission_fails(self) -> None:
+        """Added docs saying YUV for added non-RGB code fail the doc-terms step."""
+        self.write(
+            "libavfilter/vf_x.c", SOURCE.replace("1", "!(desc->flags & AV_PIX_FMT_FLAG_RGB)")
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for YUV input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn(
+            'non-RGB input: added code has "!(desc->flags & AV_PIX_FMT_FLAG_RGB)"', output
+        )
+
+    def test_doc_terms_waiver_passes(self) -> None:
+        """A non-blank --doc-reason waives the doc-terms step and prints the reason."""
+        self.write(
+            "libavfilter/vf_x.c", SOURCE.replace("1", "!(desc->flags & AV_PIX_FMT_FLAG_RGB)")
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for YUV input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check("--doc-reason", "gray input is rejected earlier")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0\nwaived: gray input is rejected earlier", output)
+
+    def test_doc_terms_named_case_passes(self) -> None:
+        """Added docs that say non-RGB for added non-RGB code pass the doc-terms step."""
+        self.write(
+            "libavfilter/vf_x.c", SOURCE.replace("1", "!(desc->flags & AV_PIX_FMT_FLAG_RGB)")
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for non-RGB input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
 
     def test_fate_missing_decoder_fails(self) -> None:
         """A committed lavfi video dependency gap fails without losing other steps."""
