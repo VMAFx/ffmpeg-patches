@@ -766,6 +766,7 @@ try:
         or not target["path"]
         or type(target["position"]) is not int
         or type(target["original_position"]) is not int
+        or type(target.get("extra_lines_count", 0)) is not int
     ):
         raise ValueError("invalid comment anchor")
     matches = [
@@ -783,12 +784,11 @@ try:
         and row.get("position") == target["position"]
         and type(row.get("original_position")) is int
         and row.get("original_position") == target["original_position"]
+        and type(row.get("extra_lines_count", 0)) is int
+        and row.get("extra_lines_count", 0) == target.get("extra_lines_count", 0)
     ]
     if not matches:
-        print(
-            f"ffmpeg-forgejo: reply to comment {target_id} was not read back in review {review}",
-            file=sys.stderr,
-        )
+        print(f"ffmpeg-forgejo: reply to comment {target_id} was not read back in review {review}", file=sys.stderr)
         raise SystemExit(1)
     url = matches[-1]["html_url"]
     if not isinstance(url, str) or not url:
@@ -1665,20 +1665,23 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [[ "$2" =~ ^[0-9]+$ ]] || die "not a review id: $2"
     [[ "$3" =~ ^[0-9]+$ ]] || die "not a comment id: $3"
     [ -f "$4" ] || die "no body file $4"
-    [ -n "$(tr -d '[:space:]' <"$4")" ] || die "empty body file $4"
+    reply_snapshot="$(mktemp)"
+    reply_payload="$(mktemp)"
+    chmod 600 "$reply_snapshot"
+    trap 'rm -f "$reply_snapshot" "$reply_payload"' EXIT
+    cat -- "$4" >"$reply_snapshot" || die "cannot read body file $4"
+    [ -n "$(tr -d '[:space:]' <"$reply_snapshot")" ] || die "empty body file $4"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     me="$(token_login)" || die "cannot read token login"
     out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read review $2 on #$1"
-    check_comment_duplicate "$1" "$4" "$me" <<<"$out"
-    reply_payload="$(mktemp)"
-    trap 'rm -f "$reply_payload"' EXIT
-    review_reply_body "$2" "$3" "$4" <<<"$out" >"$reply_payload"
+    check_comment_duplicate "$1" "$reply_snapshot" "$me" <<<"$out"
+    review_reply_body "$2" "$3" "$reply_snapshot" <<<"$out" >"$reply_payload"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     api POST "/repos/$REPO/pulls/$1/reviews/$2/comments" "$reply_payload" >/dev/null
     rm -f "$reply_payload"
     out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read back review $2 on #$1"
-    require_reply_posted "$2" "$3" "$4" "$me" <<<"$out"
+    require_reply_posted "$2" "$3" "$reply_snapshot" "$me" <<<"$out"
     ;;
   edit-body)
     wait=0

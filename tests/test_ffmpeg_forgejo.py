@@ -214,6 +214,10 @@ class Stub:
     review_comments: review id -> rows served by GET pulls/1/reviews/<id>/comments;
         a POST there appends a row.
     drop_review_replies: acknowledge a review-comment POST without storing it.
+    review_reply_extra_lines: store and return a review-comment POST with this
+        extra_lines_count instead of the posted one.
+    on_review_listing: optional callback run on GET pulls/1/reviews/<id>/comments
+        before building the reply.
     """
 
     def __init__(
@@ -249,6 +253,8 @@ class Stub:
         self.comments: dict[int, list[dict]] = {}
         self.review_comments: dict[int, list[dict]] = {}
         self.drop_review_replies = bool(kwargs.get("drop_review_replies", False))
+        self.review_reply_extra_lines = kwargs.get("review_reply_extra_lines")
+        self.on_review_listing = None
         self.fail_comments: set[int] = set()
         self.paginate_large_comments = bool(kwargs.get("paginate_large_comments", False))
         self.head_reads = 0
@@ -463,6 +469,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             and parts[-3] == "reviews"
             and parts[-1] == "comments"
         ):
+            if stub.on_review_listing is not None:
+                stub.on_review_listing()
             self.reply(200, stub.review_comments.get(int(parts[-2]), []))
             return True
         return False
@@ -549,6 +557,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "extra_lines_count": payload["extra_lines_count"],
             "html_url": f"stub/pulls/1#issuecomment-{5000 + n}",
         }
+        if stub.review_reply_extra_lines is not None:
+            row["extra_lines_count"] = stub.review_reply_extra_lines
         if not stub.drop_review_replies:
             stub.review_comments.setdefault(review_id, []).append(row)
         self.reply(200, row)
@@ -1549,6 +1559,25 @@ class ReplyTest(ForgejoTest):
         self.assertEqual(len([method for method, _, _ in stub.requests if method == "POST"]), 1)
         self.assertIn("was not read back in review 7", proc.stderr)
 
+    def test_reply_stored_with_another_range_fails_read_back(self) -> None:
+        """A reply stored with another line range than the answered comment fails read-back."""
+
+        stub = self.stub(review_reply_extra_lines=0)
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(len([method for method, _, _ in stub.requests if method == "POST"]), 1)
+        self.assertIn("was not read back in review 7", proc.stderr)
+
+    def test_target_without_range_field_reads_back_with_range_zero(self) -> None:
+        """A target row without extra_lines_count posts and reads back with range zero."""
+
+        stub = self.stub()
+        del stub.review_comments[7][1]["extra_lines_count"]
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.payloads(stub)[0]["extra_lines_count"], 0)
+        self.assertIn("replied stub/pulls/1#issuecomment-5002", proc.stdout)
+
     def test_missing_body_file_is_refused_before_any_request(self) -> None:
         """A missing body file exits 1 before contacting the API."""
 
@@ -1566,6 +1595,40 @@ class ReplyTest(ForgejoTest):
         proc = self.reply(stub, "85995", str(blank))
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertEqual(stub.requests, [])
+
+    def test_body_rewritten_after_listing_posts_the_snapshot(self) -> None:
+        """A body file rewritten after the run starts is neither checked, posted nor read back."""
+
+        stub = self.stub()
+        body = self.tmp / "body.md"
+        stub.review_comments[7].append(
+            {
+                "id": 6000,
+                "body": "changed text",
+                "user": {"login": "tester"},
+                "path": "tests/checkasm/vvc_alf.c",
+                "position": 79,
+                "original_position": 0,
+                "extra_lines_count": 3,
+                "html_url": "stub/pulls/1#issuecomment-6000",
+            }
+        )
+        stub.on_review_listing = lambda: body.write_text("changed text\n", encoding="utf-8")
+        proc = self.reply(stub, "85995", str(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.payloads(stub),
+            [
+                {
+                    "body": BODY,
+                    "path": "tests/checkasm/vvc_alf.c",
+                    "new_position": 79,
+                    "old_position": 0,
+                    "extra_lines_count": 3,
+                }
+            ],
+        )
+        self.assertIn("replied stub/pulls/1#issuecomment-5003", proc.stdout)
 
     def test_wrong_argument_count_is_a_usage_error(self) -> None:
         """Missing the body file argument exits 64 before any request."""
@@ -4563,7 +4626,7 @@ class TopLevelTrapTest(unittest.TestCase):
             [],
             "top-level EXIT trap expands a function-local name",
         )
-        self.assertEqual(source.count("trap 'rm -f \"$reply_payload\"' EXIT"), 1)
+        self.assertEqual(source.count('trap \'rm -f "$reply_snapshot" "$reply_payload"\' EXIT'), 1)
         self.assertEqual(source.count("trap 'rm -f \"$close_payload\"' EXIT"), 1)
 
     def test_planted_shadowed_trap_is_found(self) -> None:
@@ -4778,7 +4841,8 @@ class CloseMutantTest(unittest.TestCase):
 
 
 class ReplyMutantTest(unittest.TestCase):
-    """Reply verb mutants that drop the anchor copy or shadow the payload trap are caught."""
+    """Reply mutants dropping the anchor copy, range read-back or body snapshot,
+    or shadowing the payload trap, are caught."""
 
     def test_reply_mutants_are_caught(self) -> None:
         """Each planted anchor-copy defect fails its targeted reply test case."""
@@ -4813,6 +4877,49 @@ class ReplyMutantTest(unittest.TestCase):
             (reply_branch, reply_branch.replace("reply_payload", "body")),
             (ReplyTest, "test_moved_head_exit_removes_the_reply_payload"),
             "reply payload trap shadowed by a function local",
+        )
+
+    def test_reply_snapshot_and_range_mutants_are_caught(self) -> None:
+        """Each planted snapshot or range defect fails its targeted reply test case."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
+        self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
+        snapshot_mutations = (
+            (
+                'check_comment_duplicate "$1" "$reply_snapshot" "$me"',
+                'check_comment_duplicate "$1" "$4" "$me"',
+            ),
+            (
+                'review_reply_body "$2" "$3" "$reply_snapshot"',
+                'review_reply_body "$2" "$3" "$4"',
+            ),
+            (
+                'require_reply_posted "$2" "$3" "$reply_snapshot" "$me"',
+                'require_reply_posted "$2" "$3" "$4" "$me"',
+            ),
+        )
+        for old, new in snapshot_mutations:
+            self.assertEqual(reply_branch.count(old), 1, "mutation site missing")
+            assert_mutant_killed(
+                self,
+                source,
+                (reply_branch, reply_branch.replace(old, new, 1)),
+                (ReplyTest, "test_body_rewritten_after_listing_posts_the_snapshot"),
+                f"reply body read again after the snapshot: {new}",
+            )
+        posted_fn = source.split("\nrequire_reply_posted() {\n", 1)[1].split("\n}\n", 1)[0]
+        range_old = (
+            '\n        and row.get("extra_lines_count", 0) == target.get("extra_lines_count", 0)'
+        )
+        self.assertEqual(posted_fn.count(range_old), 1, "mutation site missing")
+        self.assertEqual(source.count(posted_fn), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (posted_fn, posted_fn.replace(range_old, "", 1)),
+            (ReplyTest, "test_reply_stored_with_another_range_fails_read_back"),
+            "reply read-back ignores the line range",
         )
 
 
