@@ -1436,6 +1436,53 @@ class DocWrapTest(unittest.TestCase):
         expected = [False, False, True, False, False, False, False, False, True, False]
         self.assertEqual(upstream_lint.texi_prose(lines), expected)
 
+    def test_raw_block_end_of_other_block_is_text(self) -> None:
+        """An @end line of an outer block inside a raw block is literal text."""
+        for opener in ("verbatim", "ignore", "macro foo", "rmacro foo", "linemacro foo"):
+            name = opener.split()[0]
+            lines = [
+                "@table @option",
+                "@item a",
+                "Text one.",
+                f"@{opener}",
+                "@end table",
+                "literal",
+                f"@end {name}",
+                "Text after.",
+                "@end table",
+            ]
+            expected = [False, False, True, False, False, False, False, True, False]
+            with self.subTest(opener=opener):
+                self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
+    def test_raw_block_nesting(self) -> None:
+        """A raw block nests only the openers texi2any counts inside it."""
+        cases = {
+            "same name": ["@verbatim", "@verbatim", "@end verbatim", "a b", "@end verbatim"],
+            "indented opener": ["@ignore", "  @ignore", "@end ignore", "a b", "@end ignore"],
+            "longer name": ["@verbatim", "@verbatimx", "a b", "@end verbatim"],
+            "other raw block": ["@ignore", "@verbatim", "a b", "@end ignore"],
+        }
+        for outer, inner in (("macro", "linemacro"), ("linemacro", "rmacro"), ("rmacro", "macro")):
+            body = [f"@{inner} g", f"@end {outer}", "a b", f"@end {inner}"]
+            cases[f"{inner} in {outer}"] = [f"@{outer} f", *body, f"@end {outer}"]
+        for name, lines in cases.items():
+            with self.subTest(case=name):
+                flags = upstream_lint.texi_prose([*lines, "plain"])
+                self.assertEqual(flags, [False] * len(lines) + [True])
+
+    def test_raw_block_end_line_boundaries(self) -> None:
+        """A raw block ends on @end and its name after leading blanks, before trailing text."""
+        cases = {
+            "leading blanks": (["@verbatim", "x y", "  @end verbatim", "plain"], 3),
+            "trailing text": (["@verbatim", "x y", "@end verbatim @c note", "plain"], 3),
+            "longer name": (["@verbatim", "@end verbatim-x", "x y", "@end verbatim", "p"], 4),
+        }
+        for name, (lines, first_prose) in cases.items():
+            with self.subTest(case=name):
+                expected = [index >= first_prose for index in range(len(lines))]
+                self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
 
 class TestProgramTest(unittest.TestCase):
     """Positive, negative and boundary coverage of new registered lib*/tests programs."""

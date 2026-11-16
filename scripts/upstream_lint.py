@@ -98,8 +98,12 @@ leaves room on it for the first word of the next line (a leading inline
 command counts up to its closing brace). Prose is a non-blank line outside
 every block except the filled ones in TEXI_FILLED that starts with text or with
 a TEXI_INLINE command and its brace; block names come from the file's own @end
-lines, so lines in an unlisted block are never checked. --doc-reason TEXT
-waives it and prints the reason.
+lines, so lines in an unlisted block are never checked. The raw blocks in
+TEXI_RAW (@verbatim, @ignore, @macro, @rmacro, @linemacro) always open, and
+inside one only a nested opener that texi2any counts there and an @end naming
+the innermost raw block change the open blocks, so an @end line shown inside a
+raw block closes no outer block. --doc-reason TEXT waives it and prints the
+reason.
 
 The test-program step fails when base..head adds a C file directly under a
 lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
@@ -1677,6 +1681,19 @@ TEXI_FILLED = frozenset((
 ))  # fmt: skip
 TEXI_COMMAND = re.compile(r"@([A-Za-z]+)")
 TEXI_END = re.compile(r"@end\s+([A-Za-z]+)\s*$")
+# Raw block commands of texi2any 7.3 (Texinfo/Commands.pm, class 'raw'). Inside one,
+# only a nested opener that its pattern matches and an @end naming the innermost raw
+# block count (ParserNonXS.pm _process_raw_block_contents and
+# _process_macro_block_contents); every other line is literal text.
+TEXI_MACROS = re.compile(r"\s*@((?:line|r)?macro)(?:\s|$)")
+TEXI_RAW = {
+    "ignore": re.compile(r"\s*@(ignore)(?:@|\s|$)"),
+    "linemacro": TEXI_MACROS,
+    "macro": TEXI_MACROS,
+    "rmacro": TEXI_MACROS,
+    "verbatim": re.compile(r"\s*@(verbatim)(?:@|\s|$)"),
+}
+TEXI_RAW_END = re.compile(r"\s*@end\s+([A-Za-z][\w-]*)")
 TEXI_FIRST_WORD = re.compile(r"@[A-Za-z]+\{[^}]*\}\S*|\S+")
 WRAP_MIN_NEIGHBOUR = 50
 SENTENCE_END = re.compile(r"(?:[.:;!?]|@\*)\s*$")
@@ -1740,8 +1757,21 @@ def _waivable_step(name: str, findings: list[str], waiver: str, clean: str, advi
     return Step(name, 1, "\n".join([*findings, advice]))
 
 
+def _texi_raw_line(line: str, stack: list[str]) -> None:
+    """Track one line inside the raw block on top of the stack the way texi2any reads it."""
+    nested = TEXI_RAW[stack[-1]].match(line)
+    end = TEXI_RAW_END.match(line)
+    if nested:
+        stack.append(nested[1])
+    elif end and end[1] == stack[-1]:
+        stack.pop()
+
+
 def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
     """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+    if stack and stack[-1] in TEXI_RAW:
+        _texi_raw_line(line, stack)
+        return False
     end = TEXI_END.match(line)
     if end:
         if end[1] in stack:
@@ -1757,8 +1787,13 @@ def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> boo
 
 
 def texi_prose(lines: list[str]) -> list[bool]:
-    """Flag each Texinfo line that is filled prose, outside every block not in TEXI_FILLED."""
-    blocks = frozenset(match[1] for line in lines if (match := TEXI_END.match(line)))
+    """Flag each Texinfo line that is filled prose, outside every block not in TEXI_FILLED.
+
+    A block opens when the file has an @end line naming it; a raw block in TEXI_RAW
+    always opens.
+    """
+    ends = (match[1] for line in lines if (match := TEXI_END.match(line)))
+    blocks = frozenset(TEXI_RAW).union(ends)
     stack: list[str] = []
     return [_texi_prose_line(line, blocks, stack) for line in lines]
 
