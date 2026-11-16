@@ -320,9 +320,12 @@ class MeasuredRunTest(unittest.TestCase):
             previous = os.getcwd()
             os.chdir(root)
             try:
+                entries = measure.read_list(Path("list.txt"))
+                expected = [Path.cwd() / "sub" / "s.sh"]
                 rc, summary, _ = _run(["tree", "tree", "list.txt", "out.tsv"])
             finally:
                 os.chdir(previous)
+        self.assertEqual(entries, expected)
         self.assertEqual(rc, 0)
         self.assertIn("unmeasured=0", summary)
 
