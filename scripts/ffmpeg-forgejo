@@ -29,6 +29,9 @@
 #                          with --tested-head, exits 80 when the comment or the live PR body names a base commit other than the live merge base
 #                          the comment posts the body file as read once at start; a head change seen by the base check exits 76
 #                          the base check compares the full live head read by the last tested-head check
+#   ffmpeg-forgejo reply   (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <review-id> <comment-id> <body-file>
+#                          answer a review comment inside its thread (same path, line and range); test claims must match the live PR head;
+#                          exits 78 when the body equals an own comment in that review, 1 unless the reply reads back at the same anchor
 #   ffmpeg-forgejo edit-body [--wait] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          replace a PR body; test claims must match the live PR head; refuses (exit 75) while the
 #                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
@@ -690,6 +693,111 @@ except (OSError, UnicodeError, ValueError) as error:
     print(f"ffmpeg-forgejo: cannot check existing comments on #{number}: {error}", file=sys.stderr)
     raise SystemExit(1)
 ' "$1" "$2" "$3"
+}
+
+# review_reply_body REVIEW-ID COMMENT-ID BODY-FILE: print the reply payload anchored like comment COMMENT-ID, from review comments JSON on stdin.
+review_reply_body() {
+  python3 -I -c '
+import json
+import sys
+from pathlib import Path
+
+review, target_id, path = sys.argv[1:]
+try:
+    text = Path(path).read_text(encoding="utf-8")
+    comments = json.load(sys.stdin)
+    if not isinstance(comments, list):
+        raise ValueError("review comments listing is not a list")
+    int(target_id)
+    rows = [row for row in comments if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") == int(target_id)]
+    if not rows:
+        print(
+            f"ffmpeg-forgejo: comment {target_id} is not in review {review}; not posted",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    target = rows[0]
+    if not isinstance(target["path"], str) or not target["path"]:
+        raise ValueError("invalid comment path")
+    for field in (target["position"], target["original_position"], target.get("extra_lines_count", 0)):
+        if type(field) is not int or field < 0:
+            raise ValueError("invalid comment anchor")
+    payload = {
+        "body": text,
+        "path": target["path"],
+        "new_position": target["position"],
+        "old_position": target["original_position"],
+        "extra_lines_count": target.get("extra_lines_count", 0),
+    }
+except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
+    print(
+        f"ffmpeg-forgejo: cannot read comment {target_id} in review {review}: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(json.dumps(payload))
+' "$1" "$2" "$3"
+}
+
+# require_reply_posted REVIEW-ID COMMENT-ID BODY-FILE LOGIN: print the reply URL once an own comment with the body sits at the anchor of COMMENT-ID.
+require_reply_posted() {
+  python3 -I -c '
+import json
+import sys
+from pathlib import Path
+
+review, target_id, path, me = sys.argv[1:]
+try:
+    want = " ".join(Path(path).read_text(encoding="utf-8").split())
+    comments = json.load(sys.stdin)
+    if not isinstance(comments, list):
+        raise ValueError("review comments listing is not a list")
+    int(target_id)
+    rows = [row for row in comments if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") == int(target_id)]
+    if not rows:
+        print(
+            f"ffmpeg-forgejo: comment {target_id} is not in review {review}; not posted",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    target = rows[0]
+    if (
+        not isinstance(target["path"], str)
+        or not target["path"]
+        or type(target["position"]) is not int
+        or type(target["original_position"]) is not int
+        or type(target.get("extra_lines_count", 0)) is not int
+    ):
+        raise ValueError("invalid comment anchor")
+    matches = [
+        row
+        for row in comments
+        if isinstance(row, dict)
+        and isinstance(row.get("user"), dict)
+        and row["user"].get("login") == me
+        and isinstance(row.get("body"), str)
+        and " ".join(row["body"].split()) == want
+        and type(row.get("id")) is int
+        and row["id"] != target["id"]
+        and row.get("path") == target["path"]
+        and type(row.get("position")) is int
+        and row.get("position") == target["position"]
+        and type(row.get("original_position")) is int
+        and row.get("original_position") == target["original_position"]
+        and type(row.get("extra_lines_count", 0)) is int
+        and row.get("extra_lines_count", 0) == target.get("extra_lines_count", 0)
+    ]
+    if not matches:
+        print(f"ffmpeg-forgejo: reply to comment {target_id} was not read back in review {review}", file=sys.stderr)
+        raise SystemExit(1)
+    url = matches[-1]["html_url"]
+    if not isinstance(url, str) or not url:
+        raise ValueError("missing html_url")
+except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
+    print(f"ffmpeg-forgejo: cannot read back review {review}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"replied {url}")
+' "$1" "$2" "$3" "$4"
 }
 
 # require_own_open_pull NUMBER LOGIN: exit 80 unless pull NUMBER is authored by LOGIN, 1 unless it is open.
@@ -1548,6 +1656,33 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
     rm -f "$body"
     ;;
+  reply)
+    usage='reply (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <review-id> <comment-id> <body-file>'
+    parse_claim_option "$usage" "$@"
+    shift "$claim_args"
+    [ $# -eq 4 ] || usage_error "$usage"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
+    [[ "$2" =~ ^[0-9]+$ ]] || die "not a review id: $2"
+    [[ "$3" =~ ^[0-9]+$ ]] || die "not a comment id: $3"
+    [ -f "$4" ] || die "no body file $4"
+    reply_snapshot="$(mktemp)"
+    reply_payload="$(mktemp)"
+    chmod 600 "$reply_snapshot"
+    trap 'rm -f "$reply_snapshot" "$reply_payload"' EXIT
+    cat -- "$4" >"$reply_snapshot" || die "cannot read body file $4"
+    [ -n "$(tr -d '[:space:]' <"$reply_snapshot")" ] || die "empty body file $4"
+    [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
+    me="$(token_login)" || die "cannot read token login"
+    out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read review $2 on #$1"
+    check_comment_duplicate "$1" "$reply_snapshot" "$me" <<<"$out"
+    review_reply_body "$2" "$3" "$reply_snapshot" <<<"$out" >"$reply_payload"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
+    api POST "/repos/$REPO/pulls/$1/reviews/$2/comments" "$reply_payload" >/dev/null
+    rm -f "$reply_payload"
+    out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read back review $2 on #$1"
+    require_reply_posted "$2" "$3" "$reply_snapshot" "$me" <<<"$out"
+    ;;
   edit-body)
     wait=0
     if [ "${1:-}" = "--wait" ]; then wait=1; shift; fi
@@ -1605,13 +1740,13 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     out="$(api_list "/repos/$REPO/issues/$1/comments?" 200)" || exit 1
     check_comment_duplicate "$1" "$2" "$me" <<<"$out"
     require_own_open_pull "$1" "$me"
-    body="$(mktemp)"
-    trap 'rm -f "$body"' EXIT
-    json_body "body=@$2" >"$body"
-    api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
-    json_body "state=closed" >"$body"
-    api PATCH "/repos/$REPO/pulls/$1" "$body" >/dev/null
-    rm -f "$body"
+    close_payload="$(mktemp)"
+    trap 'rm -f "$close_payload"' EXIT
+    json_body "body=@$2" >"$close_payload"
+    api POST "/repos/$REPO/issues/$1/comments" "$close_payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    json_body "state=closed" >"$close_payload"
+    api PATCH "/repos/$REPO/pulls/$1" "$close_payload" >/dev/null
+    rm -f "$close_payload"
     require_closed "$1"
     ;;
   reviewers)

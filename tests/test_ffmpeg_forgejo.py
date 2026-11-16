@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import http.server
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess  # nosec B404 - fixed git and helper argv in temporary test repositories.
 import tempfile
@@ -31,7 +34,7 @@ BODY = "new body\nline two\n"
 NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset(
-    {"close", "comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap"}
+    {"close", "comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap", "reply"}
 )
 
 
@@ -208,6 +211,13 @@ class Stub:
     pull_state: state of the pull ("open" by default); a PATCH with state closed
         sets it unless ignore_close.
     ignore_close: acknowledge a close PATCH without changing the state.
+    review_comments: review id -> rows served by GET pulls/1/reviews/<id>/comments;
+        a POST there appends a row.
+    drop_review_replies: acknowledge a review-comment POST without storing it.
+    review_reply_extra_lines: store and return a review-comment POST with this
+        extra_lines_count instead of the posted one.
+    on_review_listing: optional callback run on GET pulls/1/reviews/<id>/comments
+        before building the reply.
     """
 
     def __init__(
@@ -241,6 +251,10 @@ class Stub:
         self.reviews: dict[int, list[dict]] = {}
         self.fail_reviews: set[int] = set()
         self.comments: dict[int, list[dict]] = {}
+        self.review_comments: dict[int, list[dict]] = {}
+        self.drop_review_replies = bool(kwargs.get("drop_review_replies", False))
+        self.review_reply_extra_lines = kwargs.get("review_reply_extra_lines")
+        self.on_review_listing = None
         self.fail_comments: set[int] = set()
         self.paginate_large_comments = bool(kwargs.get("paginate_large_comments", False))
         self.head_reads = 0
@@ -446,6 +460,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         return False
 
+    def _route_review_comments(self, stub: Stub, parts: list[str]) -> bool:
+        """Serve the comments of one pull review."""
+
+        if (
+            len(parts) > 5
+            and parts[-5] == "pulls"
+            and parts[-3] == "reviews"
+            and parts[-1] == "comments"
+        ):
+            if stub.on_review_listing is not None:
+                stub.on_review_listing()
+            self.reply(200, stub.review_comments.get(int(parts[-2]), []))
+            return True
+        return False
+
     def _route_comments(self, stub: Stub, parts: list[str], url: urllib.parse.SplitResult) -> bool:
         """Handle paged issue comment reads."""
 
@@ -487,6 +516,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             lambda: self._route_pull(stub, url),
             lambda: self._route_pull_files(stub, parts, url),
             lambda: self._route_reviews(stub, parts, url),
+            lambda: self._route_review_comments(stub, parts),
             lambda: self._route_comments(stub, parts, url),
             lambda: self._route_branch(stub, parts),
             lambda: self._route_status(stub, parts, url),
@@ -502,6 +532,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parts = url.path.split("/")
         if not self._dispatch_get(stub, url, parts):
             self.reply(404, {})
+
+    def _post_review_comment(self, stub: Stub, data: str) -> bool:
+        """Persist and return a posted pull-review comment when the path matches."""
+
+        parts = urllib.parse.urlsplit(self.path).path.split("/")
+        if not (
+            len(parts) > 5
+            and parts[-5] == "pulls"
+            and parts[-3] == "reviews"
+            and parts[-1] == "comments"
+        ):
+            return False
+        review_id = int(parts[-2])
+        n = len(stub.review_comments.get(review_id, []))
+        payload = json.loads(data)
+        row = {
+            "id": 5000 + n,
+            "body": payload["body"],
+            "user": {"login": stub.login},
+            "path": payload["path"],
+            "position": payload["new_position"],
+            "original_position": payload["old_position"],
+            "extra_lines_count": payload["extra_lines_count"],
+            "html_url": f"stub/pulls/1#issuecomment-{5000 + n}",
+        }
+        if stub.review_reply_extra_lines is not None:
+            row["extra_lines_count"] = stub.review_reply_extra_lines
+        if not stub.drop_review_replies:
+            stub.review_comments.setdefault(review_id, []).append(row)
+        self.reply(200, row)
+        return True
 
     def do_POST(self) -> None:
         """Record writes and persist additive reviewer requests as Forgejo does."""
@@ -523,6 +584,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(stub.request_status, {})
         elif self.path.endswith("/issues/1/comments"):
             self.reply(201, {"html_url": "stub/issues/1#issuecomment-1"})
+        elif self._post_review_comment(self.stub(), data):
+            return
         else:
             self.reply(404, {})
 
@@ -1373,6 +1436,265 @@ class CloseTest(ForgejoTest):
         proc = self.run_command(stub, "close", "x", body)
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertEqual(stub.requests, [])
+
+
+THREAD = [
+    {
+        "id": 85943,
+        "body": "first",
+        "user": {"login": "reviewer"},
+        "path": "other.c",
+        "position": 5,
+        "original_position": 0,
+        "extra_lines_count": 0,
+        "html_url": "stub/pulls/1#issuecomment-85943",
+    },
+    {
+        "id": 85995,
+        "body": "question",
+        "user": {"login": "reviewer"},
+        "path": "tests/checkasm/vvc_alf.c",
+        "position": 79,
+        "original_position": 0,
+        "extra_lines_count": 3,
+        "html_url": "stub/pulls/1#issuecomment-85995",
+    },
+]
+
+
+class ReplyTest(ForgejoTest):
+    """The reply verb answers a review comment inside its thread."""
+
+    def stub(self, *, heads: list[object] | None = None, **kwargs: object) -> Stub:
+        """Return a stub serving the planted thread under review 7."""
+
+        stub = Stub(heads=heads, **kwargs)
+        stub.review_comments[7] = copy.deepcopy(THREAD)
+        return stub
+
+    def reply(self, stub: Stub, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run a reply with no test claims on pull 1, review 7."""
+
+        return self.run_command(stub, "reply", "--no-test-claims", "1", "7", *args)
+
+    def payloads(self, stub: Stub) -> list[dict]:
+        """Return the JSON bodies of every review-comment POST."""
+
+        return [
+            json.loads(data)
+            for method, path, data in stub.requests
+            if method == "POST" and "/reviews/" in path and path.endswith("/comments")
+        ]
+
+    def test_reply_copies_the_anchor_of_the_answered_comment(self) -> None:
+        """Replying to a review comment posts at its file, line, and range."""
+
+        stub = self.stub()
+        body = str(self.tmp / "body.md")
+        proc = self.reply(stub, "85995", body)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.payloads(stub),
+            [
+                {
+                    "body": BODY,
+                    "path": "tests/checkasm/vvc_alf.c",
+                    "new_position": 79,
+                    "old_position": 0,
+                    "extra_lines_count": 3,
+                }
+            ],
+        )
+        posts = [path for method, path, _ in stub.requests if method == "POST"]
+        self.assertEqual(posts, ["/api/v1/repos/FFmpeg/FFmpeg/pulls/1/reviews/7/comments"])
+        self.assertIn("replied stub/pulls/1#issuecomment-5002", proc.stdout)
+
+    def test_old_side_comment_keeps_its_old_position(self) -> None:
+        """An old-side review comment keeps position zero and its original line."""
+
+        stub = self.stub()
+        stub.review_comments[7][1]["position"] = 0
+        stub.review_comments[7][1]["original_position"] = 12
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = self.payloads(stub)[0]
+        self.assertEqual(payload["new_position"], 0)
+        self.assertEqual(payload["old_position"], 12)
+
+    def test_unknown_comment_is_refused_before_any_write(self) -> None:
+        """A comment missing from the named review exits 1 before posting."""
+
+        stub = self.stub()
+        proc = self.reply(stub, "99", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+        self.assertIn("comment 99 is not in review 7", proc.stderr)
+
+    def test_duplicate_reply_is_refused_before_any_write(self) -> None:
+        """An own matching comment in the review exits 78 before posting."""
+
+        stub = self.stub()
+        stub.review_comments[7].append(
+            {
+                "id": 6000,
+                "body": BODY,
+                "user": {"login": "tester"},
+                "path": "tests/checkasm/vvc_alf.c",
+                "position": 79,
+                "original_position": 0,
+                "extra_lines_count": 3,
+                "html_url": "stub/pulls/1#issuecomment-6000",
+            }
+        )
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_reply_not_read_back_fails(self) -> None:
+        """A dropped review-comment POST fails read-back with exit 1."""
+
+        stub = self.stub(drop_review_replies=True)
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(len([method for method, _, _ in stub.requests if method == "POST"]), 1)
+        self.assertIn("was not read back in review 7", proc.stderr)
+
+    def test_reply_stored_with_another_range_fails_read_back(self) -> None:
+        """A reply stored with another line range than the answered comment fails read-back."""
+
+        stub = self.stub(review_reply_extra_lines=0)
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(len([method for method, _, _ in stub.requests if method == "POST"]), 1)
+        self.assertIn("was not read back in review 7", proc.stderr)
+
+    def test_target_without_range_field_reads_back_with_range_zero(self) -> None:
+        """A target row without extra_lines_count posts and reads back with range zero."""
+
+        stub = self.stub()
+        del stub.review_comments[7][1]["extra_lines_count"]
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.payloads(stub)[0]["extra_lines_count"], 0)
+        self.assertIn("replied stub/pulls/1#issuecomment-5002", proc.stdout)
+
+    def test_missing_body_file_is_refused_before_any_request(self) -> None:
+        """A missing body file exits 1 before contacting the API."""
+
+        stub = self.stub()
+        proc = self.reply(stub, "85995", str(self.tmp / "missing.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_blank_body_file_is_refused_before_any_request(self) -> None:
+        """A whitespace-only body file exits 1 before contacting the API."""
+
+        blank = self.tmp / "blank.md"
+        blank.write_text(" \n\t\n", encoding="utf-8")
+        stub = self.stub()
+        proc = self.reply(stub, "85995", str(blank))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_body_rewritten_after_listing_posts_the_snapshot(self) -> None:
+        """A body file rewritten after the run starts is neither checked, posted nor read back."""
+
+        stub = self.stub()
+        body = self.tmp / "body.md"
+        stub.review_comments[7].append(
+            {
+                "id": 6000,
+                "body": "changed text",
+                "user": {"login": "tester"},
+                "path": "tests/checkasm/vvc_alf.c",
+                "position": 79,
+                "original_position": 0,
+                "extra_lines_count": 3,
+                "html_url": "stub/pulls/1#issuecomment-6000",
+            }
+        )
+        stub.on_review_listing = lambda: body.write_text("changed text\n", encoding="utf-8")
+        proc = self.reply(stub, "85995", str(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.payloads(stub),
+            [
+                {
+                    "body": BODY,
+                    "path": "tests/checkasm/vvc_alf.c",
+                    "new_position": 79,
+                    "old_position": 0,
+                    "extra_lines_count": 3,
+                }
+            ],
+        )
+        self.assertIn("replied stub/pulls/1#issuecomment-5003", proc.stdout)
+
+    def test_wrong_argument_count_is_a_usage_error(self) -> None:
+        """Missing the body file argument exits 64 before any request."""
+
+        stub = self.stub()
+        proc = self.run_command(stub, "reply", "--no-test-claims", "1", "7", "85995")
+        self.assertEqual(proc.returncode, 64, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_non_numeric_review_is_refused(self) -> None:
+        """A non-numeric review identifier exits 1 before any request."""
+
+        stub = self.stub()
+        body = str(self.tmp / "body.md")
+        proc = self.run_command(stub, "reply", "--no-test-claims", "1", "x", "85995", body)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_tested_head_is_rechecked_after_review_listing(self) -> None:
+        """A PR head changing during review listing exits 76 without posting."""
+
+        stub = self.stub(heads=[A, B])
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={A}\n", encoding="utf-8")
+        body = str(self.tmp / "body.md")
+        proc = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            A,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            body,
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("does not match live head", proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_moved_head_exit_removes_the_reply_payload(self) -> None:
+        """A moved head that exits 76 after the payload file exists leaves no tmp file behind."""
+
+        stub = self.stub(heads=[A, B])
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={A}\n", encoding="utf-8")
+        body = str(self.tmp / "body.md")
+        clean_tmp = self.tmp / "reply-tmp"
+        clean_tmp.mkdir()
+        proc = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            A,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            body,
+            env_updates={"TMPDIR": str(clean_tmp)},
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+        self.assertEqual(list(clean_tmp.iterdir()), [], "reply payload tmp file leaked on exit 76")
 
 
 class TestClaimHeadTest(ForgejoTest):
@@ -4197,6 +4519,36 @@ MUTANTS = {
 }
 
 
+def top_level_trap_locals(source: str) -> list[str]:
+    """Return names a top-level EXIT trap expands that some function also declares local."""
+
+    lines = source.splitlines()
+    try:
+        case_start = lines.index('case "$cmd" in')
+        case_end = lines.index("esac", case_start + 1)
+    except ValueError as err:
+        raise ValueError("dispatch case not found") from err
+
+    local_names: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("local "):
+            continue
+        for token in shlex.split(stripped.removeprefix("local "), comments=True):
+            name = token.split("=", 1)[0]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                local_names.add(name)
+
+    top_lines = lines[case_start : case_end + 1] + [
+        line for line in lines if line.startswith("trap ")
+    ]
+    trapped: set[str] = set()
+    for line in top_lines:
+        handlers = " ".join(re.findall(r"\btrap\s+'([^']*)'\s+EXIT\b", line))
+        trapped.update(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", handlers))
+    return sorted(trapped & local_names)
+
+
 @contextlib.contextmanager
 def mutant_case(
     source: str,
@@ -4246,6 +4598,59 @@ def assert_mutant_killed(
     mutated = run_selected(source, old, new, base, test_name)
     check.assertTrue(mutated.failures or mutated.errors, f"{label} survived")
     return mutated
+
+
+class TopLevelTrapTest(unittest.TestCase):
+    """A top-level EXIT trap must not expand a name a function shadows with local."""
+
+    PLANTED = (
+        "f() {\n"
+        "  local x body=1\n"
+        "  exit 76\n"
+        "}\n"
+        'case "$cmd" in\n'
+        "  a)\n"
+        '    body="$(mktemp)"\n'
+        "    trap 'rm -f \"$body\"' EXIT\n"
+        "    f\n"
+        "    ;;\n"
+        "esac\n"
+    )
+
+    def test_helper_traps_name_no_function_local(self) -> None:
+        """The helper's top-level EXIT traps expand no function-local variable names."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        self.assertEqual(
+            top_level_trap_locals(source),
+            [],
+            "top-level EXIT trap expands a function-local name",
+        )
+        self.assertEqual(source.count('trap \'rm -f "$reply_snapshot" "$reply_payload"\' EXIT'), 1)
+        self.assertEqual(source.count("trap 'rm -f \"$close_payload\"' EXIT"), 1)
+
+    def test_planted_shadowed_trap_is_found(self) -> None:
+        """Shadowed top-level EXIT traps in dispatch branches or at column zero are reported."""
+
+        self.assertEqual(top_level_trap_locals(self.PLANTED), ["body"])
+        braced = self.PLANTED.replace('"$body"', '"${body}"')
+        self.assertEqual(top_level_trap_locals(braced), ["body"])
+        column_zero = "trap 'rm -f \"$body\"' EXIT\n" + self.PLANTED.replace(
+            "    trap 'rm -f \"$body\"' EXIT\n", ""
+        )
+        self.assertEqual(top_level_trap_locals(column_zero), ["body"])
+
+    def test_unshadowed_and_missing_case_boundaries(self) -> None:
+        """Unshadowed traps pass, local flags are skipped, and a missing dispatch case fails."""
+
+        unshadowed = self.PLANTED.replace('"$body"', '"$payload"')
+        self.assertEqual(top_level_trap_locals(unshadowed), [])
+        readonly_local = self.PLANTED.replace("local x body=1", "local -r body")
+        self.assertEqual(top_level_trap_locals(readonly_local), ["body"])
+        with self.assertRaises(ValueError):
+            top_level_trap_locals(self.PLANTED.replace('case "$cmd" in\n', ""))
+        with self.assertRaises(ValueError):
+            top_level_trap_locals(self.PLANTED.replace("esac\n", ""))
 
 
 class MutantTest(unittest.TestCase):
@@ -4433,6 +4838,89 @@ class CloseMutantTest(unittest.TestCase):
                         result.failures or result.errors,
                         "dropped author check survived",
                     )
+
+
+class ReplyMutantTest(unittest.TestCase):
+    """Reply mutants dropping the anchor copy, range read-back or body snapshot,
+    or shadowing the payload trap, are caught."""
+
+    def test_reply_mutants_are_caught(self) -> None:
+        """Each planted anchor-copy defect fails its targeted reply test case."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        body_fn = source.split("\nreview_reply_body() {\n", 1)[1].split("\n}\n", 1)[0]
+        id_old = 'row.get("id") == int(target_id)]'
+        self.assertEqual(body_fn.count(id_old), 1, "mutation site missing")
+        self.assertEqual(source.count(body_fn), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (body_fn, body_fn.replace(id_old, "True]", 1)),
+            (ReplyTest, "test_reply_copies_the_anchor_of_the_answered_comment"),
+            "target id filter removed",
+        )
+        pos_old = '"old_position": target["original_position"],'
+        self.assertEqual(source.count(pos_old), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (pos_old, '"old_position": 0,'),
+            (ReplyTest, "test_old_side_comment_keeps_its_old_position"),
+            "old_position dropped",
+        )
+        reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
+        self.assertEqual(reply_branch.count("reply_payload"), 5, "mutation site missing")
+        self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (reply_branch, reply_branch.replace("reply_payload", "body")),
+            (ReplyTest, "test_moved_head_exit_removes_the_reply_payload"),
+            "reply payload trap shadowed by a function local",
+        )
+
+    def test_reply_snapshot_and_range_mutants_are_caught(self) -> None:
+        """Each planted snapshot or range defect fails its targeted reply test case."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
+        self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
+        snapshot_mutations = (
+            (
+                'check_comment_duplicate "$1" "$reply_snapshot" "$me"',
+                'check_comment_duplicate "$1" "$4" "$me"',
+            ),
+            (
+                'review_reply_body "$2" "$3" "$reply_snapshot"',
+                'review_reply_body "$2" "$3" "$4"',
+            ),
+            (
+                'require_reply_posted "$2" "$3" "$reply_snapshot" "$me"',
+                'require_reply_posted "$2" "$3" "$4" "$me"',
+            ),
+        )
+        for old, new in snapshot_mutations:
+            self.assertEqual(reply_branch.count(old), 1, "mutation site missing")
+            assert_mutant_killed(
+                self,
+                source,
+                (reply_branch, reply_branch.replace(old, new, 1)),
+                (ReplyTest, "test_body_rewritten_after_listing_posts_the_snapshot"),
+                f"reply body read again after the snapshot: {new}",
+            )
+        posted_fn = source.split("\nrequire_reply_posted() {\n", 1)[1].split("\n}\n", 1)[0]
+        range_old = (
+            '\n        and row.get("extra_lines_count", 0) == target.get("extra_lines_count", 0)'
+        )
+        self.assertEqual(posted_fn.count(range_old), 1, "mutation site missing")
+        self.assertEqual(source.count(posted_fn), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (posted_fn, posted_fn.replace(range_old, "", 1)),
+            (ReplyTest, "test_reply_stored_with_another_range_fails_read_back"),
+            "reply read-back ignores the line range",
+        )
 
 
 if __name__ == "__main__":
