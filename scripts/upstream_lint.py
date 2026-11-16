@@ -67,17 +67,24 @@ behaviour whose added description leaves one of its cases out: a test for
 non-RGB input (a comparison against a COLOR_RGB constant, or a negated
 AV_PIX_FMT_FLAG_RGB flag test) while the added docs say YUV but never non-RGB,
 gray or grey, or a colour range comparison while the added docs mention range
-or rangein but never unspecified, unknown or untagged. --doc-reason TEXT waives
-it and prints the reason. Only these two pairs are checked; any other gap
-between what the code does and what the docs say is not detected.
+or rangein but never unspecified, unknown or untagged. The added source lines
+are read from the head file with comments, string literals and preprocessor
+lines blanked, so a comment that names the behaviour does not count, and
+neither does a macro that tests the flag. --doc-reason TEXT waives it and
+prints the reason. Only these two pairs are checked; any other gap between
+what the code does and what the docs say is not detected.
 
 The test-program step fails when base..head adds a C file directly under a
-lib*/tests/ directory and an added line of that library's Makefile names the
-file's stem, which registers a new TESTPROGS program. Upstream reviewers ask
-for the standard FATE structure instead: an input sample run through ffmpeg or
+lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
+TESTPROGS-$(CONFIG_X) +=) in that library's Makefile at head lists the file's
+stem as a word, which registers a new TESTPROGS program. Continuation
+lines are joined and make comments dropped first, so an OBJS entry or a
+comment that names the stem does not count. Upstream reviewers ask for the
+standard FATE structure instead: an input sample run through ffmpeg or
 ffprobe and compared against a tests/ref reference. --test-program-reason TEXT
-waives it and prints the reason. A program registered in another file, and a
-FATE test whose input another custom tool builds, are not detected.
+waives it and prints the reason. A program registered in another file or
+through another variable, and a FATE test whose input another custom tool
+builds, are not detected.
 """
 
 from __future__ import annotations
@@ -1557,14 +1564,23 @@ def doc_term_findings(code: str, docs: str) -> list[str]:
     return findings
 
 
+def _added_code(tree: Path, head: str, path: str, hunks: list[str]) -> list[str]:
+    """Return the added lines of a head source file with comments and literals blanked."""
+    numbers = _added_lines("\n".join(hunks))
+    if not numbers:
+        return []
+    code = _code_lines(_git(tree, "show", f"{head}:{path}"))
+    return [code[number - 1] for number in sorted(numbers) if number <= len(code)]
+
+
 def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
     """Require added docs to name the cases that the added code covers."""
     range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
     code: list[str] = []
     docs: list[str] = []
-    for path, _, added in _patch_files(range_patch):
+    for path, hunks, added in _patch_files(range_patch):
         if is_source_path(path):
-            code.extend(added)
+            code.extend(_added_code(tree, head, path, hunks))
         elif is_doc_path(path):
             docs.extend(added)
     findings = doc_term_findings("\n".join(code), "\n".join(docs))
@@ -1588,20 +1604,35 @@ def is_test_program_path(name: str) -> bool:
     )
 
 
-def registered_test_programs(new_paths: list[str], patch: str) -> list[str]:
-    """Return new lib*/tests C files whose stem an added line of their library Makefile names."""
-    makefile_lines: dict[str, list[str]] = {}
-    for path, _, added in _patch_files(patch):
-        makefile_lines.setdefault(path, []).extend(added)
+def testprogs_names(makefile: str) -> frozenset[str]:
+    """Return the words that TESTPROGS assignments of a Makefile list."""
+    names: set[str] = set()
+    for line in _fate_lines(makefile):
+        kind, groups = _fate_kind(line)
+        if kind in ("variable", "registration") and groups[0] == "TESTPROGS":
+            names.update(groups[-1].split())
+    return frozenset(names)
+
+
+def registered_test_programs(new_paths: list[str], makefiles: dict[str, str]) -> list[str]:
+    """Return new lib*/tests C files whose stem their library Makefile lists in TESTPROGS."""
     programs: list[str] = []
     for path in new_paths:
         if not is_test_program_path(path):
             continue
-        word = re.compile(rf"\b{re.escape(PurePosixPath(path).stem)}\b")
-        library = PurePosixPath(path).parts[0]
-        if any(word.search(line) for line in makefile_lines.get(f"{library}/Makefile", [])):
+        makefile = makefiles.get(f"{PurePosixPath(path).parts[0]}/Makefile", "")
+        if PurePosixPath(path).stem in testprogs_names(makefile):
             programs.append(path)
     return programs
+
+
+def _head_makefiles(tree: Path, head: str, paths: list[str]) -> dict[str, str]:
+    """Read the head Makefile of each library that owns one of the paths."""
+    names = sorted({f"{PurePosixPath(path).parts[0]}/Makefile" for path in paths})
+    if not names:
+        return {}
+    listed = _git(tree, "ls-tree", "-z", "--name-only", head, "--", *names)
+    return {name: _git(tree, "show", f"{head}:{name}") for name in filter(None, listed.split("\0"))}
 
 
 def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
@@ -1615,9 +1646,8 @@ def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
     if changed:
         listed = _git(tree, "ls-tree", "-z", "--name-only", base, "--", *changed)
         existing = set(filter(None, listed.split("\0")))
-    patch = _git(tree, *DIFF_COMMON, "-U0", base, head, "--", "lib*/Makefile")
     new_paths = [name for name in changed if name not in existing]
-    programs = registered_test_programs(new_paths, patch)
+    programs = registered_test_programs(new_paths, _head_makefiles(tree, head, new_paths))
     if not programs:
         return Step(
             "test-program",

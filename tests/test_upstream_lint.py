@@ -1052,39 +1052,55 @@ class TestProgramTest(unittest.TestCase):
     """Positive, negative and boundary coverage of new registered lib*/tests programs."""
 
     def test_registered_new_program_is_found(self) -> None:
-        """A new lib*/tests C file named by an added line of its Makefile is found."""
-        for line in (
-            "+TESTPROGS-$(CONFIG_ITUT_T35)              += aom_film_grain",
-            "+           aom_film_grain                                             \\",
+        """A new lib*/tests C file listed by a TESTPROGS assignment of its Makefile is found."""
+        for makefile in (
+            "TESTPROGS-$(CONFIG_ITUT_T35)              += aom_film_grain\n",
+            "TESTPROGS = avcodec                                    \\\n"
+            "            aom_film_grain                             \\\n"
+            "            golomb\n",
+            "TESTPROGS += aom_film_grain # needs a sample\n",
+            "TESTPROGS-yes += golomb aom_film_grain\n",
+            "TESTPROGS := golomb aom_film_grain\n",
         ):
-            with self.subTest(line=line):
-                patch = (
-                    "diff --git a/libavcodec/Makefile b/libavcodec/Makefile\n"
-                    "--- a/libavcodec/Makefile\n"
-                    "+++ b/libavcodec/Makefile\n"
-                    f"@@ -1398,0 +1399 @@\n{line}\n"
-                )
+            with self.subTest(makefile=makefile):
                 found = upstream_lint.registered_test_programs(
-                    ["libavcodec/tests/aom_film_grain.c"], patch
+                    ["libavcodec/tests/aom_film_grain.c"], {"libavcodec/Makefile": makefile}
                 )
                 self.assertEqual(found, ["libavcodec/tests/aom_film_grain.c"])
 
     def test_unregistered_or_other_library_passes(self) -> None:
-        """No finding without a matching whole word in the same library Makefile."""
+        """No finding without the stem as a TESTPROGS word in the same library Makefile."""
         program = ["libavcodec/tests/aom_film_grain.c"]
-        for path, line in (
-            ("libavutil/Makefile", "+TESTPROGS += aom_film_grain"),
-            ("libavcodec/Makefile", "+TESTPROGS += aom_film_grain_sets"),
-            ("libavcodec/x86/Makefile", "+TESTPROGS += aom_film_grain"),
-            ("libavcodec/aom_film_grain.c", "+int aom_film_grain;"),
+        for path, makefile in (
+            ("libavutil/Makefile", "TESTPROGS += aom_film_grain\n"),
+            ("libavcodec/Makefile", "TESTPROGS += aom_film_grain_sets\n"),
+            ("libavcodec/x86/Makefile", "TESTPROGS += aom_film_grain\n"),
+            ("libavcodec/Makefile", "OBJS-$(CONFIG_ITUT_T35) += aom_film_grain.o\n"),
+            ("libavcodec/Makefile", "OBJS += aom_film_grain.o\n"),
+            ("libavcodec/Makefile", "# TESTPROGS += aom_film_grain\n"),
+            ("libavcodec/Makefile", "TESTPROGS += golomb # aom_film_grain next\n"),
+            ("libavcodec/Makefile", "TESTPROGS += golomb # see \\\naom_film_grain\n"),
+            ("libavcodec/Makefile", "TOOLS = golomb \\\n    aom_film_grain\n"),
         ):
-            with self.subTest(path=path, line=line):
-                patch = (
-                    f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
-                    f"@@ -1 +1,2 @@\n{line}\n"
-                )
-                self.assertEqual(upstream_lint.registered_test_programs(program, patch), [])
-        self.assertEqual(upstream_lint.registered_test_programs(program, ""), [])
+            with self.subTest(path=path, makefile=makefile):
+                found = upstream_lint.registered_test_programs(program, {path: makefile})
+                self.assertEqual(found, [])
+        self.assertEqual(upstream_lint.registered_test_programs(program, {}), [])
+
+    def test_testprogs_names_reads_only_testprogs_words(self) -> None:
+        """TESTPROGS words come from joined logical lines with make comments dropped."""
+        makefile = (
+            "OBJS += golomb.o\n"
+            "TESTPROGS = avcodec \\\n"
+            "            jpeg2000dwt # utf8 \\\n"
+            "            bitstream_be\n"
+            "TESTPROGSX += x\n"
+            "TESTPROGS-$(CONFIG_GOLOMB) += golomb\n"
+        )
+        self.assertEqual(
+            upstream_lint.testprogs_names(makefile), frozenset({"avcodec", "jpeg2000dwt", "golomb"})
+        )
+        self.assertEqual(upstream_lint.testprogs_names(""), frozenset())
 
     def test_test_program_path_is_c_under_lib_tests(self) -> None:
         """Only C files directly below a lib*/tests directory count as test programs."""
@@ -1495,6 +1511,36 @@ class PipelineTest(FixtureTest):
         self.assertEqual(rc, 0, output)
         self.assertIn("step: doc-terms rc: 0", output)
 
+    def test_doc_terms_comment_only_passes(self) -> None:
+        """An added comment that names the RGB test is not added non-RGB code."""
+        self.write(
+            "libavfilter/vf_x.c",
+            SOURCE.replace(
+                "    return 1;", "    /* was !(desc->flags & AV_PIX_FMT_FLAG_RGB) */\n    return 1;"
+            ),
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for YUV input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_added_line_inside_comment_passes(self) -> None:
+        """An added line inside an existing block comment is read as comment text."""
+        self.write("libavfilter/vf_x.c", "/*\n * Light level.\n */\n" + SOURCE)
+        self.commit("avfilter/vf_x: describe the light level")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write(
+            "libavfilter/vf_x.c",
+            "/*\n * Light level.\n * The old test was !(desc->flags & AV_PIX_FMT_FLAG_RGB).\n */\n"
+            + SOURCE,
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for YUV input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
     def test_test_program_fails(self) -> None:
         """A new lib*/tests program registered in its Makefile fails the test-program step."""
         self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
@@ -1514,8 +1560,32 @@ class PipelineTest(FixtureTest):
         self.assertEqual(rc, 0, output)
         self.assertIn("step: test-program rc: 0\nwaived: no sample reaches the payload", output)
 
+    def test_test_program_continuation_line_fails(self) -> None:
+        """A new program added to a backslash-continued TESTPROGS list fails the step."""
+        self.write("libavcodec/Makefile", "TESTPROGS = golomb \\\n            rangecoder\n")
+        self.commit("avcodec: list test programs")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write(
+            "libavcodec/Makefile",
+            "TESTPROGS = golomb \\\n            x_grain \\\n            rangecoder\n",
+        )
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("libavcodec/tests/x_grain.c: new TESTPROGS program", output)
+
+    def test_test_program_other_makefile_entry_passes(self) -> None:
+        """An OBJS entry or a comment naming the new file's stem is not a registration."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write("libavcodec/Makefile", "OBJS += x_grain.o\n# x_grain needs a sample\n")
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: test-program rc: 0", output)
+
     def test_unregistered_test_file_passes(self) -> None:
-        """A new lib*/tests C file that no added Makefile line names passes."""
+        """A new lib*/tests C file without a head library Makefile passes."""
         self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
         self.commit("avcodec/tests: add x_grain")
         rc, output = self.check()
