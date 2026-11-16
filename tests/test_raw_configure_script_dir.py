@@ -1138,6 +1138,55 @@ SCRIPT_DIR = {
     "r15-keep-eval-defined-unheld": Case(
         CDPWD + JH + "eval 'gh() { jh; }'\nf() { gh; }\nf\n" + RUN, 0, files=OTHER
     ),
+    "r16-printf-leading-option": Case(
+        CDPWD + "opt=-v\ndest=${missing:-H}ERE\nprintf $opt \"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-printf-leading-option-quoted": Case(
+        CDPWD + 'opt=-v\ndest=${missing:-H}ERE\nprintf "$opt" "$dest" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-command-word-dynamic": Case(
+        CDPWD + "c=printf\nn=HE\nm=RE\n$c -v \"$n$m\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-command-word-quoted": Case(
+        CDPWD + 'c=printf\nn=HE\nm=RE\n"$c" -v "$n$m" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-command-word-builtin": Case(
+        CDPWD + 'c=printf\nn=HE\nm=RE\nbuiltin "$c" -v"$n$m" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-command-word-wait": Case(
+        CDPWD + 'c=wait\nn=HE\nm=RE\n"$c" -p "$n$m"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r16-getopts-split-name": Case(
+        CDPWD + 'spec="ab ${missing:-H}ERE"\ngetopts $spec\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r16-keep-printf-literal-format": Case(
+        DOLLAR0 + 'x=a\nprintf "%s\\n" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r16-keep-wait-pid": Case(DOLLAR0 + 'sleep 0 &\np=$!\nwait "$p"\n' + SRC + RUN, 0, files=OTHER),
+    "r16-keep-command-path": Case(
+        DOLLAR0 + 'd=/usr\nx=a\n"$d/bin/true" -v "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r16-keep-command-external-wrapper": Case(
+        DOLLAR0 + 'c=true\nx=a\ntimeout 5 "$c" -v "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r16-keep-command-output-option": Case(
+        DOLLAR0 + 'CC=true\nout=a\n"$CC" -o "$out" "$1"\n' + SRC + RUN, 0, files=OTHER
+    ),
 }
 
 
@@ -1185,8 +1234,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 400 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 400)
+        """Replay all 412 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 412)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

@@ -2062,7 +2062,10 @@ def _writer_operands(
 
     Options end at --, at a word without a leading - or +, at a lone - or +, and at a word
     that starts with a run-time part; a run-time part after the leading - or + keeps the word
-    an option word. None means an option made the operands function names.
+    an option word. Bash expands a word before the builtin reads its options, so a word that
+    starts with a run-time part and has a word after it may spell a naming option (printf
+    $opt NAME with opt=-v) and counts as a naming argument for a writer that has one. None
+    means an option made the operands function names.
     """
     named: list[tuple[str, int]] = []
     idx = 0
@@ -2070,6 +2073,8 @@ def _writer_operands(
         if idx >= len(args) or args[idx][0] == "--":
             return args[idx + 1 :], named
         value, dynamic = args[idx]
+        if dynamic == 0 and spec.naming and idx + 1 < len(args):
+            return args[idx:], [*named, args[idx]]
         if value[:1] not in ("-", "+") or dynamic == 0 or (len(value) < 2 and dynamic < 0):
             return args[idx:], named
         following = args[idx + 1] if idx + 1 < len(args) else None
@@ -2095,8 +2100,37 @@ def _writer_dynamic(spec: _Writer, args: list[tuple[str, int]]) -> bool:
     operands, named = split
     if spec.operands == "names":
         return any(_dynamic_name(value, dynamic) for value, dynamic in operands)
-    picks = {"all": operands, "any": operands, "last": operands[-1:], "second": operands[1:2]}
+    picks = {"all": operands, "any": operands, "last": operands[-1:], "second": operands[:2]}
     return any(dynamic >= 0 for _, dynamic in named + picks.get(spec.operands, []))
+
+
+def _option_named(args: list[tuple[str, int]]) -> bool:
+    """Tell whether a literal naming option of any writer builtin takes a run-time argument."""
+    for idx, word in enumerate(args):
+        if word[1] == 0 or word[0][:1] != "-" or word[0] == "--":
+            continue
+        following = args[idx + 1] if idx + 1 < len(args) else None
+        for spec in WRITERS.values():
+            read = _option_letters(spec, word, following) if spec.naming else None
+            if read is not None and any(dynamic >= 0 for _, dynamic in read[0]):
+                return True
+    return False
+
+
+def _may_write(values: list[tuple[str, int]], idx: int) -> bool:
+    """Tell whether the command at idx may write a variable that a run-time word names.
+
+    A command word built at run time names a builtin only where Bash may still pick one (the
+    first word or a word after builtin, command or time) and only when its literal text has no
+    slash; it then counts as a writer when a literal naming option (printf -v, read -a, wait
+    -p, compgen -V) takes a run-time argument.
+    """
+    command, dynamic = values[idx]
+    args = values[idx + 1 :]
+    if dynamic >= 0:
+        return _dynamic_call(values) and "/" not in command and _option_named(args)
+    spec = WRITERS.get(command)
+    return spec is not None and _writer_dynamic(spec, args)
 
 
 def _dynamic_call(values: list[tuple[str, int]]) -> bool:
@@ -2153,12 +2187,9 @@ def _note_writer(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) 
     args = values[idx + 1 :]
     if _dynamic_call(values) or (command in EVAL_BUILTINS and any(d >= 0 for _, d in args)):
         names.dynamic_callers.update(owners)
-    if dynamic >= 0:
-        return
-    if command in EVAL_BUILTINS:
+    if dynamic < 0 and command in EVAL_BUILTINS:
         names.inline.append(" ".join(value for value, _ in args))
-    spec = WRITERS.get(command)
-    if spec is None or not _writer_dynamic(spec, args):
+    if not _may_write(values, idx):
         return
     prefix = _loop_prefix(node, raw)
     if prefix is None:
@@ -2260,8 +2291,10 @@ def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
     writes every name that begins with PREFIX. Callers count every name as written when a
     writer builtin or eval names a variable through any other run-time word (dynamic_write).
     A function called under a prefix assignment is handled by _hold_closure. Not detected: a
-    writer reached through a command word built at run time or an option word that starts
-    with a run-time part, a name built by arithmetic evaluation, and alias expansion.
+    command word built at run time that names a variable through an operand ($c "$n" with
+    c=read), a last word that starts with a run-time part and spells a naming option with its
+    argument (wait "$p" with p=-pNAME), a name built by arithmetic evaluation, and alias
+    expansion.
     """
     code = bytearray(raw)
     for start, end in names.skipped:
