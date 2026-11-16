@@ -25,6 +25,11 @@ DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
 REALPATH = 'HERE=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")\n'
 CDPWD = 'HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
 GH = 'gh() { . "$HERE/lib.sh"; }\n'
+JH = 'jh() { . "$HERE/lib.sh"; }\n'
+# Unicode escape openers of ANSI-C quoting, spelled in two parts so tools that decode Unicode
+# escapes in text they copy keep the escape.
+ESC_U = "\\" + "u"
+ESC_UU = "\\" + "U"
 THERE = 'THERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
 CDPWD_P = 'HERE="$(cd -P -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")" && pwd -P)"\n'
 CD_LINK_DIR = 'HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)\n'
@@ -1072,6 +1077,67 @@ SCRIPT_DIR = {
     "r14-prefix-loop-two": Case(
         DOLLAR0 + 'for k in "${!GIT_@}"; do echo; unset "$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
     ),
+    "r15-eval-surrogate-write": Case(
+        DOLLAR0 + "eval $'" + ESC_U + "D800\\nHERE=<case>/other'\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r15-printf-past-range-name": Case(
+        DOLLAR0 + "printf -v $'H" + ESC_UU + "80000000ERE' '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r15-printf-locale-name": Case(
+        DOLLAR0 + "printf -v $'H" + ESC_U + "00c9RE' '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r15-printf-option-dynamic": Case(
+        CDPWD + 'opt=v\ndest=${missing:-H}ERE\nprintf -"$opt" "$dest" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r15-printf-attached-dynamic": Case(
+        CDPWD + "dest=${missing:-H}ERE\nprintf -v\"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r15-wait-option-dynamic": Case(
+        DOLLAR0 + 'o=p\ndest=${missing:-H}ERE\nwait -"$o" "$dest"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r15-eval-defined-callee": Case(
+        CDPWD + JH + "eval 'gh() { jh; }'\nf() { gh; }\nHERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r15-eval-defined-double": Case(
+        CDPWD + JH + 'eval "gh() { jh; }"\nf() { gh; }\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r15-eval-defined-direct": Case(
+        CDPWD + JH + "eval 'gh() { jh; }'\nHERE=<case>/other gh\n" + RUN, 2, PREFIXED, OTHER
+    ),
+    "r15-keep-surrogate-colon": Case(
+        DOLLAR0 + ": $'" + ESC_U + "D800'\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r15-keep-surrogate-no-dir": Case(": $'" + ESC_U + "DFFF'\n" + RUN, 0),
+    "r15-keep-wide-colon": Case(
+        DOLLAR0 + ": $'" + ESC_UU + "00110000'\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r15-keep-printf-dash-operand": Case(
+        DOLLAR0 + 'x=a\nprintf "%s\\n" -"$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r15-keep-read-prompt-attached": Case(
+        DOLLAR0 + 'p=go\nread -r -p"$p" line <<< hi\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r15-keep-eval-defined-unheld": Case(
+        CDPWD + JH + "eval 'gh() { jh; }'\nf() { gh; }\nf\n" + RUN, 0, files=OTHER
+    ),
 }
 
 
@@ -1119,8 +1185,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 385 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 385)
+        """Replay all 400 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 400)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

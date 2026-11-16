@@ -1914,14 +1914,34 @@ def _kept_escape(match: re.Match[str]) -> str:
     return "" if char == "\n" else char
 
 
+def _locale_escape(match: re.Match[str]) -> bool:
+    """Tell a Unicode escape whose decoded text depends on the run-time locale.
+
+    Bash 5.3.20 writes a four- or eight-digit Unicode escape of U+0080 to U+7FFFFFFF as UTF-8
+    bytes (generalized past U+10FFFF and for surrogates) in a UTF-8 locale and keeps the
+    escape text in the C and POSIX locales (measured).
+    """
+    digits = match.group(3) or match.group(4)
+    return digits is not None and 0x80 <= int(digits, 16) <= 0x7FFFFFFF
+
+
 def _ansi_c_char(match: re.Match[str]) -> str:
-    """Decode one ANSI-C escape; octal keeps the low eight bits as Bash does."""
+    """Decode one ANSI-C escape as bash 5.3.20 does (measured).
+
+    Octal keeps its low eight bits, and a Unicode escape past U+7FFFFFFF writes nothing. A
+    locale-dependent escape keeps its escape text, as in the C locale, so the decoded word
+    stays encodable; _leaf_value counts such a string as run-time text.
+    """
     octal, hex2, hex4, hex8, control, other = match.groups()
     if octal is not None:
         return chr(int(octal, 8) & 0xFF)
-    digits = hex2 or hex4 or hex8
+    if hex2 is not None:
+        return chr(int(hex2, 16))
+    if _locale_escape(match):
+        return match.group(0)
+    digits = hex4 or hex8
     if digits is not None:
-        return chr(min(int(digits, 16), 0x10FFFF))
+        return chr(int(digits, 16)) if int(digits, 16) < 0x80 else ""
     if control is not None:
         return chr(ord(control) & 0x1F)
     return ANSI_C_SIMPLE.get(other, "\\" + other)
@@ -1933,8 +1953,11 @@ def _leaf_value(node: Any, raw: bytes) -> tuple[str, bool]:
     if node.type == "raw_string":
         return text[1:-1], False
     if node.type == "ansi_c_string":
-        # Bash ends an ANSI-C string at a decoded NUL byte.
-        return ANSI_C_ESCAPE.sub(_ansi_c_char, text[2:-1]).split("\x00", 1)[0], False
+        # Bash ends an ANSI-C string at a decoded NUL byte; a locale-dependent escape makes the
+        # string run-time text.
+        body = text[2:-1]
+        locale = any(_locale_escape(match) for match in ANSI_C_ESCAPE.finditer(body))
+        return ANSI_C_ESCAPE.sub(_ansi_c_char, body).split("\x00", 1)[0], locale
     if node.type == "string_content":
         return STRING_ESCAPE.sub(_kept_escape, text), False
     expands = node.type == "word" and GLOB_OR_BRACE.search(text) is not None
@@ -2013,18 +2036,23 @@ def _option_letters(
 ) -> tuple[list[tuple[str, int]], bool] | None:
     """Read one option word: the naming arguments and whether it took the next word.
 
-    None means an option made the operands function names.
+    None means an option made the operands function names. The letters end at the word's
+    run-time part: a letter that takes an argument takes the rest of the word when any follows,
+    and a run-time part in place of the letters may spell a naming option, so it counts as a
+    run-time naming argument for a writer that has one.
     """
     value, dynamic = word
-    for pos, letter in enumerate(value[1:], 2):
+    letters = value[1:dynamic] if dynamic > 0 else value[1:]
+    for pos, letter in enumerate(letters, 2):
         if letter in spec.functions:
             return None
         if letter not in spec.with_argument:
             continue
-        argument = (value[pos:], dynamic) if pos < len(value) else following
+        attached = pos < len(value) or dynamic >= 0
+        argument = (value[pos:], dynamic) if attached else following
         named = [argument] if letter in spec.naming and argument is not None else []
-        return named, pos >= len(value)
-    return [], False
+        return named, not attached
+    return ([(value, dynamic)] if dynamic > 0 and spec.naming else []), False
 
 
 def _writer_operands(
@@ -2032,8 +2060,9 @@ def _writer_operands(
 ) -> tuple[list[tuple[str, int]], list[tuple[str, int]]] | None:
     """Split a writer builtin's words into operands and naming option arguments.
 
-    Options end at --, at a word without a leading - or +, and at a word that starts with a
-    run-time part. None means an option made the operands function names.
+    Options end at --, at a word without a leading - or +, at a lone - or +, and at a word
+    that starts with a run-time part; a run-time part after the leading - or + keeps the word
+    an option word. None means an option made the operands function names.
     """
     named: list[tuple[str, int]] = []
     idx = 0
@@ -2041,7 +2070,7 @@ def _writer_operands(
         if idx >= len(args) or args[idx][0] == "--":
             return args[idx + 1 :], named
         value, dynamic = args[idx]
-        if len(value) < 2 or value[0] not in "-+" or dynamic == 0:
+        if value[:1] not in ("-", "+") or dynamic == 0 or (len(value) < 2 and dynamic < 0):
             return args[idx:], named
         following = args[idx + 1] if idx + 1 < len(args) else None
         read = _option_letters(spec, args[idx], following)
@@ -2187,7 +2216,8 @@ def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> _Names:
 
     The walk also records spelled words, writer builtins that name a variable at run time and
     the words each function body calls. An eval or trap text is parsed once more and walked
-    for those three only, since its byte offsets are not the top text's.
+    for those three and its function bodies only, since its byte offsets are not the top
+    text's; a function it defines joins the prefix call closure like any other.
     """
     stack: list[tuple[Any, bytes, tuple[str, ...], bool]] = [(root, raw, (), False)]
     names = _Names()
@@ -2198,6 +2228,8 @@ def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> _Names:
         budget.nodes += 1
         if not inline:
             _note_offsets(node, text, names)
+        elif node.type == "function_definition":
+            _note_function(node, text, names)
         inner = _note_words(node, text, names, owners)
         stack.extend(_inline_roots(names, owners))
         stack.extend((child, text, inner, inline) for child in reversed(node.named_children))
@@ -2228,8 +2260,8 @@ def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
     writes every name that begins with PREFIX. Callers count every name as written when a
     writer builtin or eval names a variable through any other run-time word (dynamic_write).
     A function called under a prefix assignment is handled by _hold_closure. Not detected: a
-    writer reached through a command or option word built at run time, a name built by
-    arithmetic evaluation, and alias expansion.
+    writer reached through a command word built at run time or an option word that starts
+    with a run-time part, a name built by arithmetic evaluation, and alias expansion.
     """
     code = bytearray(raw)
     for start, end in names.skipped:
