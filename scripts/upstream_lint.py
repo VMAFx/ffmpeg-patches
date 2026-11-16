@@ -98,12 +98,12 @@ leaves room on it for the first word of the next line (a leading inline
 command counts up to its closing brace). Prose is a non-blank line outside
 every block except the filled ones in TEXI_FILLED that starts with text or with
 a TEXI_INLINE command and its brace; block names come from the file's own @end
-lines, so lines in an unlisted block are never checked. The raw blocks in
-TEXI_RAW (@verbatim, @ignore, @macro, @rmacro, @linemacro) always open, and
-inside one only a nested opener that texi2any counts there and an @end naming
-the innermost raw block change the open blocks, so an @end line shown inside a
-raw block closes no outer block. --doc-reason TEXT waives it and prints the
-reason.
+lines read outside raw blocks, so lines in an unlisted block are never checked.
+The raw blocks in TEXI_RAW (@verbatim, @ignore, @macro, @rmacro, @linemacro)
+always open, and inside one only a nested opener that texi2any counts there and
+an @end naming the innermost raw block change the open blocks, so an @end line
+shown inside a raw block closes no outer block. --doc-reason TEXT waives it and
+prints the reason.
 
 The test-program step fails when base..head adds a C file directly under a
 lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
@@ -1786,14 +1786,27 @@ def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> boo
     return bool(line.strip()) and all(name in TEXI_FILLED for name in stack)
 
 
+def _texi_blocks(lines: list[str]) -> frozenset[str]:
+    """Collect Texinfo block names from TEXI_RAW and @end lines read outside raw blocks."""
+    blocks = set(TEXI_RAW)
+    stack: list[str] = []
+    for line in lines:
+        if stack:
+            _texi_raw_line(line, stack)
+        elif end := TEXI_END.match(line):
+            blocks.add(end[1])
+        elif (command := TEXI_COMMAND.match(line)) and command[1] in TEXI_RAW:
+            stack.append(command[1])
+    return frozenset(blocks)
+
+
 def texi_prose(lines: list[str]) -> list[bool]:
     """Flag each Texinfo line that is filled prose, outside every block not in TEXI_FILLED.
 
-    A block opens when the file has an @end line naming it; a raw block in TEXI_RAW
+    Block names come from @end lines read outside raw blocks; a raw block in TEXI_RAW
     always opens.
     """
-    ends = (match[1] for line in lines if (match := TEXI_END.match(line)))
-    blocks = frozenset(TEXI_RAW).union(ends)
+    blocks = _texi_blocks(lines)
     stack: list[str] = []
     return [_texi_prose_line(line, blocks, stack) for line in lines]
 

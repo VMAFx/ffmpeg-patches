@@ -1483,6 +1483,83 @@ class DocWrapTest(unittest.TestCase):
                 expected = [index >= first_prose for index in range(len(lines))]
                 self.assertEqual(upstream_lint.texi_prose(lines), expected)
 
+    CODE_PARAGRAPH = (
+        "@code{x} starts a prose line that is long enough to count",
+        "Each neighbour in this filled paragraph is sixty-six columns wide,",
+        "short",
+        "and the following prose line is also sixty-six columns wide here.",
+    )
+
+    def test_raw_block_end_adds_no_block_name(self) -> None:
+        """An @end inside a raw block adds no block name; one outside still does."""
+        for opener in ("verbatim", "ignore", "macro foo", "rmacro foo", "linemacro foo"):
+            name = opener.split()[0]
+            lines = [f"@{opener}", "@end code", f"@end {name}", "", *self.CODE_PARAGRAPH]
+            with self.subTest(opener=opener):
+                self.assertEqual(upstream_lint.texi_prose(lines), [False] * 4 + [True] * 4)
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {7})
+                self.assertEqual(len(findings), 1)
+                self.assertIn('"short" ends a filled paragraph line early', findings[0])
+        outside = ["@end code", "", *self.CODE_PARAGRAPH]
+        self.assertEqual(upstream_lint.texi_prose(outside), [False] * 6)
+        self.assertEqual(upstream_lint.wrap_findings("doc/x.texi", outside, {5}), [])
+
+    def test_nested_and_mixed_raw_block_end_names(self) -> None:
+        """Nested raw blocks hide inner @end names unless an outside @end names them."""
+        nested = {
+            "verbatim": [
+                "@verbatim",
+                "@verbatim",
+                "@end code",
+                "@end verbatim",
+                "@end code",
+                "@end verbatim",
+            ],
+            "ignore": [
+                "@ignore",
+                "  @ignore",
+                "@end code",
+                "@end ignore",
+                "@end code",
+                "@end ignore",
+            ],
+            "macro": [
+                "@macro f",
+                "@rmacro g",
+                "@end macro",
+                "@end code",
+                "@end rmacro",
+                "@end code",
+                "@end macro",
+            ],
+        }
+        for case, raw in nested.items():
+            lines = [*raw, "", *self.CODE_PARAGRAPH]
+            short_line = len(raw) + 4
+            with self.subTest(case=case):
+                self.assertEqual(
+                    upstream_lint.texi_prose(lines), [False] * (len(raw) + 1) + [True] * 4
+                )
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {short_line})
+                self.assertEqual(len(findings), 1)
+        mixed = (
+            (
+                "after",
+                ["@verbatim", "@end code", "@end verbatim", "", *self.CODE_PARAGRAPH, "@end code"],
+                7,
+            ),
+            (
+                "before",
+                ["@ignore", "@end code", "@end ignore", "@end code", "", *self.CODE_PARAGRAPH],
+                8,
+            ),
+        )
+        for case, lines, short_line in mixed:
+            with self.subTest(case=case):
+                self.assertEqual(upstream_lint.texi_prose(lines), [False] * len(lines))
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {short_line})
+                self.assertEqual(findings, [])
+
 
 class TestProgramTest(unittest.TestCase):
     """Positive, negative and boundary coverage of new registered lib*/tests programs."""
