@@ -25,8 +25,12 @@ alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
 
-The regression-test step fails when a commit whose subject says fix, fixes or
-fixed changes C, header or assembly sources under lib*/ or fftools/ and no path
+The regression-test step fails when a commit whose subject or body, outside its
+Signed-off-by lines, says fix, fixes or fixed or names a defect (bug, regression,
+misalignment, crash, overflow, overread, leak, wrong, incorrect, broken,
+truncation, past the end, out of bounds, also when a line break splits the
+phrase) changes C, header or assembly sources
+under lib*/ or fftools/ and no path
 under a tests directory changes anywhere in base..head. --no-test-reason TEXT
 waives it and prints the reason; when test paths do change, each fix commit must
 be reached by name: a changed test path or one of its added lines must contain,
@@ -64,6 +68,32 @@ when it edits two adjacent branches or states an invariant of all callers;
 letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
 fails with rc 2; claims worded otherwise, and claims that a multi-hunk diff
 still does not support, are not detected.
+
+The doc-terms step fails when base..head adds lines both to library or fftools
+sources and to Texinfo files under doc/, and an added source line shows a
+behaviour whose added description leaves one of its cases out: a test for
+non-RGB input (a comparison against a COLOR_RGB constant, or a negated
+AV_PIX_FMT_FLAG_RGB flag test, in either operand order) while the added
+docs say YUV but never non-RGB, gray or grey, or a colour range comparison
+while the added docs mention range
+or rangein but never unspecified, unknown or untagged. The added source lines
+are read from the head file with comments, string literals and preprocessor
+lines blanked, so a comment that names the behaviour does not count, and
+neither does a macro that tests the flag. --doc-reason TEXT waives it and
+prints the reason. Only these two pairs are checked; any other gap between
+what the code does and what the docs say is not detected.
+
+The test-program step fails when base..head adds a C file directly under a
+lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
+TESTPROGS-$(CONFIG_X) +=) in that library's Makefile at head lists the file's
+stem as a word, which registers a new TESTPROGS program. Continuation
+lines are joined and make comments dropped first, so an OBJS entry or a
+comment that names the stem does not count. Upstream reviewers ask for the
+standard FATE structure instead: an input sample run through ffmpeg or
+ffprobe and compared against a tests/ref reference. --test-program-reason TEXT
+waives it and prints the reason. A program registered in another file or
+through another variable, and a FATE test whose input another custom tool
+builds, are not detected.
 """
 
 from __future__ import annotations
@@ -146,7 +176,12 @@ C_NONCODE = re.compile(
     r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
     re.DOTALL | re.MULTILINE,
 )
-FIX_SUBJECT = re.compile(r"\bfix(es|ed)?\b", re.IGNORECASE)
+FIX_MESSAGE = re.compile(
+    r"\b(?:fix(?:es|ed)?|bugs?|regressions?|misalign(?:s|ed|ment)?|crash(?:es|ed)?"
+    r"|overflow(?:s|ed)?|overreads?|leak(?:s|ed)?|wrong|incorrect(?:ly)?|broken"
+    r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out(?:\s+|\s*-\s*)of(?:\s+|\s*-\s*)bounds)\b",
+    re.IGNORECASE,
+)
 LAVFI_PREFIX = re.compile(r"^(?:vf|af|vsrc|asrc|avf|avsrc|vsink|asink|f)_")
 FUNCTION_NAME = re.compile(r"([A-Za-z_]\w*)\s*\(")
 WORD = re.compile(r"[A-Za-z0-9_]+")
@@ -219,6 +254,16 @@ class RunResult:
     args: tuple[str, ...]
     returncode: int
     stdout: str
+
+
+@dataclass(frozen=True)
+class Waivers:
+    """Reasons that waive single upstream checks; a blank reason waives nothing."""
+
+    no_test: str = ""
+    claim: str = ""
+    doc: str = ""
+    test_program: str = ""
 
 
 @dataclass
@@ -1291,14 +1336,20 @@ def test_words(patch: str, paths: list[str] | None = None) -> frozenset[str]:
     return frozenset(words)
 
 
+def fix_word(message: str) -> str | None:
+    """Return the first fix or defect word of a commit message outside Signed-off-by lines."""
+    match = FIX_MESSAGE.search(_without_signoff(message))
+    return match[0] if match else None
+
+
 def _fix_commits(tree: Path, base: str, head: str) -> list[tuple[str, str, frozenset[str]]]:
     """Collect source fix commits in base..head with their reachable names."""
-    records = _git(tree, "log", "-z", "--format=%H%n%s", f"{base}..{head}").split("\0")
+    records = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}").split("\0")
     fixes: list[tuple[str, str, frozenset[str]]] = []
     for record in filter(None, records):
-        commit, _, rest = record.partition("\n")
-        subject = rest.rstrip("\r\n")
-        if not FIX_SUBJECT.search(subject):
+        commit, _, message = record.partition("\n")
+        subject = message.partition("\n")[0].rstrip("\r")
+        if not fix_word(message):
             continue
         paths = [
             path
@@ -1521,6 +1572,164 @@ def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("claim-scope", 1, "\n".join([*unverified, *scoped]))
 
 
+@dataclass(frozen=True)
+class DocTerm:
+    """A code behaviour whose added description must name one of its cases."""
+
+    name: str
+    code: re.Pattern[str]
+    wording: re.Pattern[str]
+    required: re.Pattern[str]
+    advice: str
+
+
+DOC_TERMS = (
+    DocTerm(
+        "non-RGB input",
+        re.compile(
+            r"!=\s*\w*COLOR_RGB\b|\b\w*COLOR_RGB\s*!="
+            r"|!\s*\(\s*[\w.>-]+flags\s*&\s*AV_PIX_FMT_FLAG_RGB\s*\)"
+            r"|!\s*\(\s*AV_PIX_FMT_FLAG_RGB\s*&\s*[\w.>-]+flags\s*\)"
+        ),
+        re.compile(r"\bYUV\b", re.IGNORECASE),
+        re.compile(r"\bnon-RGB\b|\bgr[ae]y\b", re.IGNORECASE),
+        "the code takes every non-RGB input, gray included; say non-RGB or name gray",
+    ),
+    DocTerm(
+        "unspecified range",
+        re.compile(
+            r"\b(?:color|pixel)_range\s*[!=]=|[!=]=\s*[\w.>-]*\b(?:color|pixel)_range\b"
+            r"|\bAVCOL_RANGE_\w+\s*[!=]=|[!=]=\s*AVCOL_RANGE_\w+"
+        ),
+        re.compile(r"\brange(?:in)?\b", re.IGNORECASE),
+        re.compile(r"\b(?:unspecified|unknown|untagged)\b", re.IGNORECASE),
+        "the code compares a colour range; say how an unspecified range is treated",
+    ),
+)
+
+
+def is_doc_path(name: str) -> bool:
+    """Return whether a repository path is a Texinfo file under doc/."""
+    parts = PurePosixPath(name).parts
+    return len(parts) > 1 and parts[0] == "doc" and name.endswith(".texi")
+
+
+def doc_term_findings(code: str, docs: str) -> list[str]:
+    """Return a finding per doc term the added code shows and the added docs omit."""
+    findings: list[str] = []
+    for term in DOC_TERMS:
+        behaviour = term.code.search(code)
+        wording = term.wording.search(docs)
+        if behaviour and wording and not term.required.search(docs):
+            findings.append(
+                f'{term.name}: added code has "{behaviour[0].strip()}" and added docs say '
+                f'"{wording[0]}"; {term.advice}'
+            )
+    return findings
+
+
+def _added_code(tree: Path, head: str, path: str, hunks: list[str]) -> list[str]:
+    """Return the added lines of a head source file with comments and literals blanked."""
+    numbers = _added_lines("\n".join(hunks))
+    if not numbers:
+        return []
+    code = _code_lines(_git(tree, "show", f"{head}:{path}"))
+    return [code[number - 1] for number in sorted(numbers) if number <= len(code)]
+
+
+def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Require added docs to name the cases that the added code covers."""
+    range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
+    code: list[str] = []
+    docs: list[str] = []
+    for path, hunks, added in _patch_files(range_patch):
+        if is_source_path(path):
+            code.extend(_added_code(tree, head, path, hunks))
+        elif is_doc_path(path):
+            docs.extend(added)
+    findings = doc_term_findings("\n".join(code), "\n".join(docs))
+    if not findings:
+        return Step("doc-terms", 0, f"no omitted doc term in {len(docs)} added doc line(s)")
+    reason = waiver.strip()
+    if reason:
+        return Step("doc-terms", 0, "\n".join([f"waived: {reason}", *findings]))
+    advice = "name the case in the docs, or pass --doc-reason"
+    return Step("doc-terms", 1, "\n".join([*findings, advice]))
+
+
+def is_test_program_path(name: str) -> bool:
+    """Return whether a repository path is a C file directly under a lib*/tests/ directory."""
+    parts = PurePosixPath(name).parts
+    return (
+        len(parts) == 3
+        and parts[0].startswith("lib")
+        and parts[1] == "tests"
+        and parts[2].endswith(".c")
+    )
+
+
+def testprogs_names(makefile: str) -> frozenset[str]:
+    """Return the words that TESTPROGS assignments of a Makefile list."""
+    names: set[str] = set()
+    for line in _fate_lines(makefile):
+        kind, groups = _fate_kind(line)
+        if kind in ("variable", "registration") and groups[0] == "TESTPROGS":
+            names.update(groups[-1].split())
+    return frozenset(names)
+
+
+def registered_test_programs(new_paths: list[str], makefiles: dict[str, str]) -> list[str]:
+    """Return new lib*/tests C files whose stem their library Makefile lists in TESTPROGS."""
+    programs: list[str] = []
+    for path in new_paths:
+        if not is_test_program_path(path):
+            continue
+        makefile = makefiles.get(f"{PurePosixPath(path).parts[0]}/Makefile", "")
+        if PurePosixPath(path).stem in testprogs_names(makefile):
+            programs.append(path)
+    return programs
+
+
+def _head_makefiles(tree: Path, head: str, paths: list[str]) -> dict[str, str]:
+    """Read the head Makefile of each library that owns one of the paths."""
+    names = sorted({f"{PurePosixPath(path).parts[0]}/Makefile" for path in paths})
+    if not names:
+        return {}
+    listed = _git(tree, "ls-tree", "-z", "--name-only", head, "--", *names)
+    return {name: _git(tree, "show", f"{head}:{name}") for name in filter(None, listed.split("\0"))}
+
+
+def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Ask for a FATE sample and reference test instead of a new lib*/tests program."""
+    changed = [
+        name
+        for name in _changed_paths(tree, base, head, "lib*/tests/*.c")
+        if is_test_program_path(name)
+    ]
+    existing: set[str] = set()
+    if changed:
+        listed = _git(tree, "ls-tree", "-z", "--name-only", base, "--", *changed)
+        existing = set(filter(None, listed.split("\0")))
+    new_paths = [name for name in changed if name not in existing]
+    programs = registered_test_programs(new_paths, _head_makefiles(tree, head, new_paths))
+    if not programs:
+        return Step(
+            "test-program",
+            0,
+            f"no new registered program in {len(new_paths)} new lib*/tests file(s)",
+        )
+    findings = [
+        f"{name}: new TESTPROGS program; upstream asks for a FATE test that runs an input "
+        "sample and compares the output with a tests/ref reference"
+        for name in programs
+    ]
+    reason = waiver.strip()
+    if reason:
+        return Step("test-program", 0, "\n".join([f"waived: {reason}", *findings]))
+    advice = "add a FATE sample test with a tests/ref reference, or pass --test-program-reason"
+    return Step("test-program", 1, "\n".join([*findings, advice]))
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
     try:
         return action()
@@ -1528,9 +1737,7 @@ def _collect(name: str, action: Callable[[], Step]) -> Step:
         return Step(name, 2, str(error))
 
 
-def _checks(
-    tree: Path, base: str, head: str, waiver: str = "", claim_reason: str = ""
-) -> list[Step]:
+def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
     """Collect every independent check even when another check fails."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-upstream-lint-") as directory:
         scratch = Path(directory)
@@ -1540,14 +1747,18 @@ def _checks(
             _collect("patcheck", lambda: _patcheck(tree, base, head, scratch)),
             _collect("developer.texi", lambda: _mechanical(tree, base, head)),
             _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
-            _collect("regression-test", lambda: _regression_test(tree, base, head, waiver)),
+            _collect(
+                "regression-test", lambda: _regression_test(tree, base, head, waivers.no_test)
+            ),
             _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
-            _collect("claim-scope", lambda: _claim_scope(tree, base, head, claim_reason)),
+            _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
+            _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
+            _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
         ]
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run all upstream checks, print their statuses, and optionally save a report."""
+def _parser() -> argparse.ArgumentParser:
+    """Build the command line parser with the range options and one waiver per step."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--base", required=True)
@@ -1567,12 +1778,33 @@ def main(argv: list[str] | None = None) -> int:
         help="why a multi-site claim is backed by one source hunk; "
         "waives that claim-scope rule only",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--doc-reason",
+        default="",
+        help="why the added docs may leave out a case the doc-terms step names; waives that step",
+    )
+    parser.add_argument(
+        "--test-program-reason",
+        default="",
+        help="why a new lib*/tests program cannot be a FATE sample test; waives that step",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run all upstream checks, print their statuses, and optionally save a report."""
+    args = _parser().parse_args(argv)
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
         base, head = _prepare(tree, base, head)
-        steps = _checks(tree, base, head, args.no_test_reason, claim_reason=args.claim_reason)
+        waivers = Waivers(
+            no_test=args.no_test_reason,
+            claim=args.claim_reason,
+            doc=args.doc_reason,
+            test_program=args.test_program_reason,
+        )
+        steps = _checks(tree, base, head, waivers)
         _remaining(0)
     except (OSError, RuntimeError, ValueError) as error:
         steps = [Step("preflight", 2, str(error))]
