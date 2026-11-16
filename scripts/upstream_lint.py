@@ -25,8 +25,11 @@ alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
 
-The regression-test step fails when a commit whose subject says fix, fixes or
-fixed changes C, header or assembly sources under lib*/ or fftools/ and no path
+The regression-test step fails when a commit whose subject or body, outside its
+Signed-off-by lines, says fix, fixes or fixed or names a defect (bug, regression,
+misalignment, crash, overflow, overread, leak, wrong, incorrect, broken,
+truncation, past the end, out of bounds) changes C, header or assembly sources
+under lib*/ or fftools/ and no path
 under a tests directory changes anywhere in base..head. --no-test-reason TEXT
 waives it and prints the reason; when test paths do change, each fix commit must
 be reached by name: a changed test path or one of its added lines must contain,
@@ -155,7 +158,12 @@ C_NONCODE = re.compile(
     r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
     re.DOTALL | re.MULTILINE,
 )
-FIX_SUBJECT = re.compile(r"\bfix(es|ed)?\b", re.IGNORECASE)
+FIX_MESSAGE = re.compile(
+    r"\b(?:fix(?:es|ed)?|bugs?|regressions?|misalign(?:s|ed|ment)?|crash(?:es|ed)?"
+    r"|overflow(?:s|ed)?|overreads?|leak(?:s|ed)?|wrong|incorrect(?:ly)?|broken"
+    r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out[ -]of[ -]bounds)\b",
+    re.IGNORECASE,
+)
 LAVFI_PREFIX = re.compile(r"^(?:vf|af|vsrc|asrc|avf|avsrc|vsink|asink|f)_")
 FUNCTION_NAME = re.compile(r"([A-Za-z_]\w*)\s*\(")
 WORD = re.compile(r"[A-Za-z0-9_]+")
@@ -1302,14 +1310,20 @@ def test_words(patch: str, paths: list[str] | None = None) -> frozenset[str]:
     return frozenset(words)
 
 
+def fix_word(message: str) -> str | None:
+    """Return the first fix or defect word of a commit message outside Signed-off-by lines."""
+    match = FIX_MESSAGE.search(_without_signoff(message))
+    return match[0] if match else None
+
+
 def _fix_commits(tree: Path, base: str, head: str) -> list[tuple[str, str, frozenset[str]]]:
     """Collect source fix commits in base..head with their reachable names."""
-    records = _git(tree, "log", "-z", "--format=%H%n%s", f"{base}..{head}").split("\0")
+    records = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}").split("\0")
     fixes: list[tuple[str, str, frozenset[str]]] = []
     for record in filter(None, records):
-        commit, _, rest = record.partition("\n")
-        subject = rest.rstrip("\r\n")
-        if not FIX_SUBJECT.search(subject):
+        commit, _, message = record.partition("\n")
+        subject = message.partition("\n")[0].rstrip("\r")
+        if not fix_word(message):
             continue
         paths = [
             path

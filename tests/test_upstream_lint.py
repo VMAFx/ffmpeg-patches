@@ -200,6 +200,34 @@ class RegressionTestPathTest(unittest.TestCase):
                 self.assertFalse(upstream_lint.is_source_path(path))
 
 
+class FixWordTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of fix detection in commit messages."""
+
+    def test_subject_and_body_defect_words(self) -> None:
+        """A fix or defect word in the subject or the body returns that word."""
+        cases = (
+            ("avfilter/vf_x: fix y\n", "fix"),
+            ("avformat/dashenc: do not delete y\n\nFix this by skipping y.\n", "Fix"),
+            ("avcodec/x: skip absent y\n\nReading y would misalign every field.\n", "misalign"),
+            ("avcodec/x: bound y\n\nThe next set was read past the end of it.\n", "past the end"),
+            ("avformat/x: enlarge y\n\nGCC reports -Wformat-truncation for y.\n", "truncation"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.fix_word(message), expected)
+
+    def test_no_defect_word_returns_none(self) -> None:
+        """Messages without a whole fix or defect word outside sign-off lines return None."""
+        for message in (
+            "avfilter/vf_x: update y\n",
+            "avfilter/vf_x: update y\n\nRename the helper.\n",
+            "avfilter/vf_x: prefix y\n\nKeep the debug fixture.\n",
+            "avfilter/vf_x: update y\n\nSigned-off-by: Bug Fixer <fixer@invalid>\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+
 class TestReachTest(unittest.TestCase):
     """Positive, negative and boundary coverage of reach_names and test_words."""
 
@@ -1206,6 +1234,39 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
+
+    def test_body_fix_without_test_fails(self) -> None:
+        """A source commit whose body says fix fails without a changed test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: do not delete y\n\nFix this by skipping y.")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        self.assertIn(": avfilter/vf_x: do not delete y: fixes C or assembly sources", output)
+
+    def test_body_defect_word_without_test_fails(self) -> None:
+        """A source commit whose body names a defect fails without a changed test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: skip absent y\n\nReading y would misalign every field.")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_body_without_defect_word_passes(self) -> None:
+        """A source commit whose subject and body name no defect needs no test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update y\n\nRename the helper.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_body_fix_waiver_passes(self) -> None:
+        """A non-blank --no-test-reason waives a source commit whose body says fix."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: do not delete y\n\nFix this by skipping y.")
+        rc, output = self.check("--no-test-reason", "hardware-only path")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: hardware-only path", output)
 
     def test_fix_waiver_passes(self) -> None:
         """A non-blank --no-test-reason waives a source fix without a test path."""
