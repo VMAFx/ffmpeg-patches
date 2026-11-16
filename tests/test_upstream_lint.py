@@ -200,6 +200,160 @@ class RegressionTestPathTest(unittest.TestCase):
                 self.assertFalse(upstream_lint.is_source_path(path))
 
 
+class TestReachTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of reach_names and test_words."""
+
+    def test_lavfi_prefix_stripped(self) -> None:
+        """Source paths contribute both full stems and lavfi-stripped stems."""
+        self.assertEqual(
+            upstream_lint.reach_names(["libavfilter/vf_x.c"], ""),
+            frozenset({"vf_x", "x"}),
+        )
+
+    def test_source_stem_and_hunk_function(self) -> None:
+        """Source stems and hunk-header functions are collected while docs are ignored."""
+        patch = (
+            "diff --git a/libavcodec/aom_film_grain.c b/libavcodec/aom_film_grain.c\n"
+            "--- a/libavcodec/aom_film_grain.c\n"
+            "+++ b/libavcodec/aom_film_grain.c\n"
+            "@@ -4 +4 @@ static int parse_sets(GetBitContext *gb)\n"
+            "-    return x;\n"
+            "+    return x + 1;\n"
+        )
+        self.assertEqual(
+            upstream_lint.reach_names(["libavcodec/aom_film_grain.c", "doc/x.texi"], patch),
+            frozenset({"aom_film_grain", "parse_sets"}),
+        )
+
+    def test_deleted_source_file_keeps_old_path_and_function(self) -> None:
+        """Deleted source diffs retain the --- a/ path for hunk function extraction."""
+        patch = (
+            "diff --git a/libavcodec/old.c b/libavcodec/old.c\n"
+            "deleted file mode 100644\n"
+            "--- a/libavcodec/old.c\n"
+            "+++ /dev/null\n"
+            "@@ -1,3 +0,0 @@ int ff_old(void)\n"
+            "-x\n"
+        )
+        self.assertEqual(
+            upstream_lint.reach_names(["libavcodec/old.c"], patch),
+            frozenset({"old", "ff_old"}),
+        )
+
+    def test_test_path_hunk_header_adds_nothing(self) -> None:
+        """Hunk headers under test paths do not contribute reachable source names."""
+        patch = (
+            "diff --git a/libavcodec/tests/x.c b/libavcodec/tests/x.c\n"
+            "--- a/libavcodec/tests/x.c\n"
+            "+++ b/libavcodec/tests/x.c\n"
+            "@@ -1 +1 @@ int main(void)\n"
+            "+y\n"
+        )
+        self.assertEqual(upstream_lint.reach_names(["libavcodec/tests/x.c"], patch), frozenset())
+
+    def test_test_words_from_path_and_added_lines(self) -> None:
+        """Changed test diffs yield every word from both the path and added lines."""
+        patch = (
+            "diff --git a/tests/ref/fate/filter-x b/tests/ref/fate/filter-x\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/tests/ref/fate/filter-x\n"
+            "@@ -0,0 +1 @@\n"
+            "+0\n"
+        )
+        self.assertEqual(
+            upstream_lint.test_words(patch),
+            frozenset({"tests", "ref", "fate", "filter", "x", "0"}),
+        )
+
+    def test_source_added_lines_add_no_test_words(self) -> None:
+        """Added body lines under source paths do not enter test_words."""
+        patch = (
+            "diff --git a/libavfilter/vf_x.c b/libavfilter/vf_x.c\n"
+            "--- a/libavfilter/vf_x.c\n"
+            "+++ b/libavfilter/vf_x.c\n"
+            "@@ -1 +1 @@\n"
+            "+parse_sets();\n"
+        )
+        self.assertEqual(upstream_lint.test_words(patch), frozenset())
+
+    def test_body_line_resembling_header_is_not_header(self) -> None:
+        """An added source line starting with +++ b/tests/ cannot switch file state."""
+        patch = (
+            "diff --git a/libavfilter/vf_x.c b/libavfilter/vf_x.c\n"
+            "--- a/libavfilter/vf_x.c\n"
+            "+++ b/libavfilter/vf_x.c\n"
+            "@@ -1 +1 @@\n"
+            "+++ b/tests/parse_sets\n"
+        )
+        self.assertEqual(upstream_lint.test_words(patch), frozenset())
+
+    def test_quoted_non_ascii_test_path_words(self) -> None:
+        """Quoted non-ASCII test headers decode so path and added-line words are kept."""
+        patch = (
+            'diff --git "a/tests/caf\\303\\251_x.c" "b/tests/caf\\303\\251_x.c"\n'
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            '+++ "b/tests/caf\\303\\251_x.c"\n'
+            "@@ -0,0 +1 @@\n"
+            "+    return ff_value();\n"
+        )
+        words = upstream_lint.test_words(patch)
+        self.assertIn("ff_value", words)
+        self.assertIn("tests", words)
+
+    def test_unquote_git_path_escapes(self) -> None:
+        """C-style quote, backslash, tab and UTF-8 octal escapes decode to text."""
+        self.assertEqual(
+            upstream_lint.unquote_git_path('"b/tests/a\\"b\\\\c\\td.c"'),
+            'b/tests/a"b\\c\td.c',
+        )
+        self.assertEqual(
+            upstream_lint.unquote_git_path('"b/tests/caf\\303\\251_x.c"'),
+            "b/tests/café_x.c",
+        )
+
+    def test_unquote_git_path_unquoted_and_lone_quote(self) -> None:
+        """Unquoted paths, a lone quote and the empty string return unchanged."""
+        self.assertEqual(upstream_lint.unquote_git_path("b/tests/x.c"), "b/tests/x.c")
+        self.assertEqual(upstream_lint.unquote_git_path('"'), '"')
+        self.assertEqual(upstream_lint.unquote_git_path(""), "")
+
+    def test_space_path_trailing_tab_hunk_names(self) -> None:
+        """Space-containing source headers drop Git's trailing TAB before suffix checks."""
+        patch = (
+            "diff --git a/libavfilter/vf_a b.c b/libavfilter/vf_a b.c\n"
+            "--- a/libavfilter/vf_a b.c\t\n"
+            "+++ b/libavfilter/vf_a b.c\t\n"
+            "@@ -1 +1 @@ int ff_space(void)\n"
+            "-x\n"
+            "+y\n"
+        )
+        self.assertEqual(upstream_lint.reach_names([], patch), frozenset({"ff_space"}))
+
+    def test_binary_test_path_words_from_paths(self) -> None:
+        """Explicit test paths supply path words even when a binary diff has no headers."""
+        self.assertEqual(
+            upstream_lint.test_words("", ["tests/data/filter-x.bin", "libavfilter/vf_x.c"]),
+            frozenset({"tests", "data", "filter", "x", "bin"}),
+        )
+
+    def test_dev_null_header_keeps_path(self) -> None:
+        """A deleted test file retains its --- a/ path across a +++ /dev/null header."""
+        patch = (
+            "diff --git a/tests/ref/fate/filter-x b/tests/ref/fate/filter-x\n"
+            "deleted file mode 100644\n"
+            "--- a/tests/ref/fate/filter-x\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-0\n"
+        )
+        self.assertEqual(
+            upstream_lint.test_words(patch),
+            frozenset({"tests", "ref", "fate", "filter", "x"}),
+        )
+
+
 FATE_RED = (
     "FATE_SCALE_REFUSE = fate-filter-scale-ipt-c2-refuse-rgb "
     "fate-filter-scale-ipt-c2-refuse-range\n"
@@ -1138,6 +1292,92 @@ class PipelineTest(FixtureTest):
         """A fix commit touching only documentation does not require a test path."""
         self.write("doc/x.texi", "fixed wording\n")
         self.commit("doc/x: fix a typo")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_unreaching_test_fails(self) -> None:
+        """A source fix fails when changed tests name neither its file nor function."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("libavutil/tests/film_grain_params.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        self.assertIn("test paths changed but none names ff_value, vf_x, x", output)
+
+    def test_fix_with_test_naming_function_passes(self) -> None:
+        """A source fix passes when an added test line names the changed function."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write(
+            "libavutil/tests/film_grain_params.c",
+            "int main(void)\n{\n    return ff_value();\n}\n",
+        )
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_unreached_fix_waiver_passes(self) -> None:
+        """A non-blank --no-test-reason waives an unreached source fix commit."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("libavutil/tests/film_grain_params.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check(
+            "--no-test-reason",
+            "the parser runs only behind a hardware decoder",
+        )
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: the parser runs only behind a hardware decoder", output)
+
+    def test_unreached_fix_blank_waiver_fails(self) -> None:
+        """Whitespace-only --no-test-reason does not waive an unreached source fix."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("libavutil/tests/film_grain_params.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check("--no-test-reason", "  ")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_one_unreached_fix_of_two_fails(self) -> None:
+        """Each fix commit in the range must be reached by the changed tests."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.write("libavfilter/vf_y.c", SOURCE.replace("ff_value", "ff_other"))
+        self.commit("avfilter/vf_y: fix z")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("avfilter/vf_y: fix z: test paths changed but none names vf_y, y", output)
+        self.assertNotIn("avfilter/vf_x: fix y: test paths changed", output)
+
+    def test_fix_with_binary_test_fixture_passes(self) -> None:
+        """A source fix passes when a binary test fixture path names the fixed stem."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("tests/data/filter-x.bin", "\x00\x01\x02")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_quoted_test_path_passes(self) -> None:
+        """A source fix passes when a non-ASCII quoted test file names the function."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("tests/café_x.c", "int main(void)\n{\n    return ff_value();\n}\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_noprefix_config_passes(self) -> None:
+        """A source fix passes even when repository config sets diff.noprefix=true."""
+        self.git("config", "diff.noprefix", "true")
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write(
+            "libavutil/tests/film_grain_params.c",
+            "int main(void)\n{\n    return ff_value();\n}\n",
+        )
+        self.commit("avfilter/vf_x: fix y")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)

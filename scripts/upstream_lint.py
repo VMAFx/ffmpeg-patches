@@ -28,8 +28,15 @@ multi-file variables are reported unresolved, and audio PCM decoders are not che
 The regression-test step fails when a commit whose subject says fix, fixes or
 fixed changes C, header or assembly sources under lib*/ or fftools/ and no path
 under a tests directory changes anywhere in base..head. --no-test-reason TEXT
-waives it and prints the reason; the step does not judge whether a changed test
-covers the fixed path.
+waives it and prints the reason; when test paths do change, each fix commit must
+be reached by name: a changed test path or one of its added lines must contain,
+as a whole word, the stem of a source file the commit changes (a vf_, af_,
+vsrc_, asrc_, avf_, avsrc_, vsink_, asink_ or f_ prefix also stripped) or a
+function name Git prints in one of its source hunk headers. Quoted,
+tab-terminated and binary test paths count, and the range diff forces the a/
+and b/ prefixes whatever diff.noprefix says. The same waiver covers a fix the
+changed tests do not name. A test that names the code without running the fixed
+path is not detected.
 
 The diagnostic-citation step fails a commit whose message names a compiler
 diagnostic flag (-W...) together with workaround wording (workaround, false
@@ -110,7 +117,15 @@ GIT_ENVIRONMENT_NAMES = (
     "GIT_WORK_TREE",
 )
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
-DIFF_COMMON = ("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames")
+DIFF_COMMON = (
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--no-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 MAX_PATHS = 2000
 MAX_CLAIM_COMMITS = 1000
 RUN_TIMEOUT = 1800
@@ -120,6 +135,8 @@ _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
 CONFIG = ".forgejo/pre-commit/config.yaml"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 HUNK_LENGTHS = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+GIT_QUOTED_ESCAPE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
+GIT_ESCAPE_BYTES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 REFERENCE = re.compile(r"^[^:\n]+?[:-]\d+[:-](.*)$")
 FUNCTION = re.compile(r"^(?:[A-Za-z_]\w*[ *]+)+[A-Za-z_]\w*\([^();{}]*\)\s*\{")
@@ -130,6 +147,9 @@ C_NONCODE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 FIX_SUBJECT = re.compile(r"\bfix(es|ed)?\b", re.IGNORECASE)
+LAVFI_PREFIX = re.compile(r"^(?:vf|af|vsrc|asrc|avf|avsrc|vsink|asink|f)_")
+FUNCTION_NAME = re.compile(r"([A-Za-z_]\w*)\s*\(")
+WORD = re.compile(r"[A-Za-z0-9_]+")
 SOURCE_SUFFIXES = (".c", ".h", ".asm", ".S")
 DIAGNOSTIC_FLAG = re.compile(r"(?<![\w-])-W[A-Za-z0-9#][A-Za-z0-9#+=_-]*")
 WORKAROUND_WORDING = re.compile(
@@ -1184,25 +1204,130 @@ def is_source_path(name: str) -> bool:
     )
 
 
-def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
-    """Require a changed test path when a fix commit changes library or tool sources."""
+def unquote_git_path(text: str) -> str:
+    """Decode a C-style quoted Git path, leaving an unquoted path unchanged."""
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body = text[1:-1]
+    decoded = bytearray()
+    cursor = 0
+    for match in GIT_QUOTED_ESCAPE.finditer(body):
+        decoded.extend(body[cursor : match.start()].encode("utf-8", "surrogateescape"))
+        code = match[1]
+        decoded.append(int(code, 8) if len(code) == 3 else GIT_ESCAPE_BYTES[code])
+        cursor = match.end()
+    decoded.extend(body[cursor:].encode("utf-8", "surrogateescape"))
+    return decoded.decode("utf-8", "surrogateescape")
+
+
+def _header_path(line: str) -> str:
+    """Return the path a --- a/ or +++ b/ file header names, or an empty string."""
+    for marker, prefix in (("--- ", "a/"), ("+++ ", "b/")):
+        if line.startswith(marker):
+            name = unquote_git_path(line[len(marker) :].removesuffix("\t"))
+            return name[len(prefix) :] if name.startswith(prefix) else ""
+    return ""
+
+
+def _patch_files(patch: str) -> list[tuple[str, list[str], list[str]]]:
+    """Split a unified diff into per-file paths, hunk headers and added lines."""
+    entries: list[tuple[str, list[str], list[str]]] = []
+    in_header = False
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            entries.append(("", [], []))
+            in_header = True
+        elif not entries:
+            continue
+        elif HUNK.match(line):
+            in_header = False
+            entries[-1][1].append(line)
+        elif in_header:
+            path = _header_path(line)
+            if path:
+                _, hunks, added = entries[-1]
+                entries[-1] = (path, hunks, added)
+        elif line.startswith("+"):
+            entries[-1][2].append(line[1:])
+    return entries
+
+
+def _hunk_functions(hunks: list[str]) -> list[str]:
+    """Extract the first function name after the second @@ of each hunk header."""
+    found: list[str] = []
+    for line in hunks:
+        parts = line.split("@@", 2)
+        if len(parts) == 3:
+            match = FUNCTION_NAME.search(parts[2])
+            if match:
+                found.append(match[1])
+    return found
+
+
+def reach_names(paths: list[str], patch: str) -> frozenset[str]:
+    """Collect reachable source file stems and hunk-header function names."""
+    names: set[str] = set()
+    for path in paths:
+        if is_source_path(path):
+            stem = PurePosixPath(path).stem
+            names.update((stem, LAVFI_PREFIX.sub("", stem)))
+    for path, hunks, _ in _patch_files(patch):
+        if is_source_path(path):
+            names.update(_hunk_functions(hunks))
+    return frozenset(names)
+
+
+def test_words(patch: str, paths: list[str] | None = None) -> frozenset[str]:
+    """Collect word tokens from changed test paths and their added lines."""
+    words: set[str] = set()
+    for path in paths or []:
+        if is_test_path(path):
+            words.update(WORD.findall(path))
+    for path, _, added in _patch_files(patch):
+        if is_test_path(path):
+            words.update(WORD.findall(path))
+            for line in added:
+                words.update(WORD.findall(line))
+    return frozenset(words)
+
+
+def _fix_commits(tree: Path, base: str, head: str) -> list[tuple[str, str, frozenset[str]]]:
+    """Collect source fix commits in base..head with their reachable names."""
     records = _git(tree, "log", "-z", "--format=%H%n%s", f"{base}..{head}").split("\0")
-    fixes: list[tuple[str, str]] = []
+    fixes: list[tuple[str, str, frozenset[str]]] = []
     for record in filter(None, records):
         commit, _, rest = record.partition("\n")
         subject = rest.rstrip("\r\n")
-        if FIX_SUBJECT.search(subject):
-            paths = _git(
+        if not FIX_SUBJECT.search(subject):
+            continue
+        paths = [
+            path
+            for path in _git(
                 tree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit
             ).split("\0")
-            if any(is_source_path(path) for path in paths if path):
-                fixes.append((commit, subject))
-    test_paths = [name for name in _changed_paths(tree, base, head) if is_test_path(name)]
-    if not fixes or test_paths:
-        summary = f"{len(fixes)} fix commit(s), {len(test_paths)} test path(s) changed"
-        return Step("regression-test", 0, summary)
-    headed = [f"{commit[:12]}: {subject}" for commit, subject in fixes]
-    reason = waiver.strip()
+            if path
+        ]
+        if any(is_source_path(path) for path in paths):
+            patch = _git(
+                tree,
+                "diff-tree",
+                "--no-commit-id",
+                "-r",
+                "-p",
+                "-U0",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                commit,
+            )
+            fixes.append((commit, subject, reach_names(paths, patch)))
+    return fixes
+
+
+def _no_test_step(fixes: list[tuple[str, str, frozenset[str]]], reason: str) -> Step:
+    """Report or waive source fix commits when no test path changed in the range."""
+    headed = [f"{commit[:12]}: {subject}" for commit, subject, _ in fixes]
     if reason:
         return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
     suffix = (
@@ -1210,6 +1335,33 @@ def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
         "add a FATE or unit test, or pass --no-test-reason"
     )
     return Step("regression-test", 1, "\n".join(f"{item}: {suffix}" for item in headed))
+
+
+def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Require changed tests that reach each source fix commit by file or function name."""
+    fixes = _fix_commits(tree, base, head)
+    test_paths = [name for name in _changed_paths(tree, base, head) if is_test_path(name)]
+    summary = f"{len(fixes)} fix commit(s), {len(test_paths)} test path(s) changed"
+    if not fixes:
+        return Step("regression-test", 0, summary)
+    reason = waiver.strip()
+    if not test_paths:
+        return _no_test_step(fixes, reason)
+    range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
+    words = test_words(range_patch, test_paths)
+    unreached = [fix for fix in fixes if not fix[2] & words]
+    if not unreached:
+        return Step("regression-test", 0, summary)
+    if reason:
+        headed = [f"{commit[:12]}: {subject}" for commit, subject, _ in unreached]
+        return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
+    lines = [
+        f"{commit[:12]}: {subject}: test paths changed but none names "
+        f"{', '.join(sorted(names))}; name the fixed file or function in a test, "
+        "or pass --no-test-reason"
+        for commit, subject, names in unreached
+    ]
+    return Step("regression-test", 1, "\n".join(lines))
 
 
 def _without_signoff(message: str) -> str:
@@ -1404,7 +1556,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-test-reason",
         default="",
-        help="why the fix commits in the range carry no test; waives the regression-test step",
+        help=(
+            "why the fix commits in the range carry no test, or why the changed tests "
+            "do not name them; waives the regression-test step"
+        ),
     )
     parser.add_argument(
         "--claim-reason",
