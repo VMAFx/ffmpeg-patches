@@ -25,6 +25,22 @@ alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
 
+The fate-shape step reads added logical lines in tests/fate/*.mak and
+tests/fate-run.sh. It reads the ffmpeg-dependent target variables from
+tests/Makefile and follows plain variable aggregation through tests/Makefile
+and every tests/fate/*.mak file at the checked revision. A registration that
+reaches those targets and runs lib*/tests/ needs the matching FATE_LIB* group.
+It checks CMD values for unquoted pipelines and whole-word grep assertions,
+and helper pipelines starting with test commands or command variables. In CMD
+filter graphs after -lavfi, -vf, -filter_complex or -filter:v, an endian-specific
+format= is checked against its next consumer in the same chain: scale and
+format convert it, other consumers fail, and chain ends pass. Not checked:
+forced formats ending labelled chains feeding native-endian filters in another
+chain, aggregation built with make functions other than plain $(VAR) references
+(for example $(foreach) or $(call)), reference-file and C-test endian pairing,
+missing CONFIG gates, phony alias targets and pipes inside quoted strings.
+--fate-shape-reason TEXT waives findings, never Git or read errors.
+
 The regression-test step fails when a commit whose subject or body, outside its
 Signed-off-by lines, says fix, fixes or fixed or names a defect (bug, regression,
 misalignment, crash, overflow, overread, leak, wrong, incorrect, broken,
@@ -336,6 +352,7 @@ class Waivers:
     doc: str = ""
     test_program: str = ""
     c_rule: str = ""
+    fate_shape: str = ""
 
 
 @dataclass
@@ -418,10 +435,11 @@ def _run(argv: list[str], cwd: Path, data: str | None = None, timeout: float = 6
             return _reap_timeout(process, argv, error.output)
 
 
-def _git(tree: Path, *args: str) -> str:
-    """Return Git output or raise an error with the command's captured result."""
+def _git(tree: Path, *args: str, allow_no_match: bool = False) -> str:
+    """Return Git output, optionally accepting grep's explicit no-match result."""
     result: RunResult = _run(["git", *args], tree)
-    if result.returncode:
+    no_match = allow_no_match and args[:1] == ("grep",) and result.returncode == 1
+    if result.returncode and not no_match:
         raise RuntimeError(f"git {shlex.join(args)}: rc={result.returncode}\n{result.stdout}")
     return result.stdout
 
@@ -1273,7 +1291,42 @@ def _fate_merge(report: FateReport, result: FateReport) -> None:
     report.lines.extend(result.lines)
 
 
-def _fate_deps(tree: Path, base: str, head: str) -> Step:
+def _fate_makefile(tree: Path, head: str, catalogs: dict[str, str | Exception] | None) -> str:
+    """Read each revision's Makefile once, retaining read errors for both FATE steps."""
+    if catalogs is None:
+        catalogs = {}
+    if head not in catalogs:
+        try:
+            catalogs[head] = _git(tree, "show", f"{head}:tests/Makefile")
+        except (OSError, RuntimeError, ValueError) as error:
+            catalogs[head] = error
+    source = catalogs[head]
+    if isinstance(source, Exception):
+        raise source
+    return source
+
+
+def _fate_needs_sources(parsed: FateFile) -> bool:
+    """Identify registrations needing the head revision's filter source catalog."""
+    return bool(parsed.templates) or any(
+        LAVFI_FORMAT.search(entry.command)
+        for variants in parsed.commands.values()
+        for entry in variants
+    )
+
+
+def _fate_previous(
+    tree: Path, base: str, name: str, existing: set[str], macros: frozenset[str] | None
+) -> FateFile | None:
+    """Parse an existing base file with the same macro definitions as its replacement."""
+    if name not in existing:
+        return None
+    return _fate_parse(_git(tree, "show", f"{base}:{name}"), macros or frozenset())
+
+
+def _fate_deps(
+    tree: Path, base: str, head: str, catalogs: dict[str, str | Exception] | None = None
+) -> Step:
     """Check changed FATE files with lazily loaded head filter and macro catalogs."""
     report, sources, macros, rc = FateReport(), None, None, 0
     try:
@@ -1284,25 +1337,342 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
         for name in names:
             patch = _git(tree, *DIFF_COMMON, "-U0", base, head, "--", name)
             source = _git(tree, "show", f"{head}:{name}")
-            old = _git(tree, "show", f"{base}:{name}") if name in existing else None
             parsed = _fate_parse(source, macros or frozenset())
             if macros is None and parsed.needs_macros:
-                macros = _fate_macros(_git(tree, "show", f"{head}:tests/Makefile"))
+                macros = _fate_macros(_fate_makefile(tree, head, catalogs))
                 parsed = _fate_parse(source, macros)
-            needs_sources = parsed.templates or any(
-                LAVFI_FORMAT.search(entry.command)
-                for variants in parsed.commands.values()
-                for entry in variants
-            )
-            if sources is None and needs_sources:
+            if sources is None and _fate_needs_sources(parsed):
                 sources = _fate_sources(_git(tree, "show", f"{head}:libavfilter/allfilters.c"))
             touched = _added_lines(patch) | _deleted_lines(patch)
-            old_parsed = _fate_parse(old, macros or frozenset()) if old is not None else None
+            old_parsed = _fate_previous(tree, base, name, existing, macros)
             _fate_merge(report, _fate_check(name, parsed, touched, sources or {}, old_parsed))
     except (OSError, RuntimeError, ValueError) as error:
         rc = 2
         report.lines.append(str(error))
     return _fate_summary(report, rc)
+
+
+FATE_SHAPE_RULES = ("registration", "pipe", "helper-pipe", "grep", "endian")
+FATE_SHELL_TOKEN = re.compile(
+    r"""\\.|'[^']*'|"(?:\\.|[^"\\])*"|\$\(|\|\||&&|[()|;&]|[^\\'"$()|;&]+|."""
+)
+FATE_GRAPH = re.compile(
+    r"""(?:^|\s)(?:-lavfi|-vf|-filter_complex|-filter:v)\s+("(?:\\.|[^"\\])*"|'[^']*'|\S+)"""
+)
+
+
+@dataclass(frozen=True)
+class FateShapeFinding:
+    """One mechanical rule violation at an added physical source line."""
+
+    rule: str
+    line: int
+    message: str
+
+
+def _fate_shape_added(line: FateLine, added: set[int]) -> int | None:
+    """Choose an added physical line within a logical line, if one exists."""
+    return min(added.intersection(range(line.first, line.last + 1)), default=None)
+
+
+def _fate_shell_operators(command: str) -> list[tuple[int, str]]:
+    """Locate unquoted list and pipe operators outside balanced dollar expansions."""
+    operators, depth = [], 0
+    for match in FATE_SHELL_TOKEN.finditer(command):
+        token = match[0]
+        if token == "$(" or (depth and token == "("):
+            depth += 1
+        elif depth and token == ")":
+            depth -= 1
+        elif not depth and token in {"|", "||", "&&", ";", "&"}:
+            operators.append((match.start(), token))
+    return operators
+
+
+def _fate_shape_pipes(command: str, shell: bool) -> list[str]:
+    """Report test producers while allowing only literal data-generator commands."""
+    messages, start = [], 0
+    for index, operator in _fate_shell_operators(command):
+        words = command[start:index].split()
+        first = words[0].strip("\"'") if words else ""
+        test = first in {"run", "ffmpeg", "ffprobe"} or first.startswith("$")
+        refused = test if shell else bool(first) and first not in {"printf", "echo", "cat"}
+        if operator == "|" and refused:
+            messages.append(f"{first}: pipeline hides producer exit status")
+        start = index + len(operator)
+    return messages
+
+
+def _fate_shape_filter(item: str) -> str:
+    """Remove leading input and trailing output labels from a graph filter."""
+    item = re.sub(r"^(?:\s*\[[^\]]+\])*\s*", "", item).strip()
+    return re.sub(r"(?:\s*\[[^\]]+\])+\s*$", "", item).strip()
+
+
+def _fate_shape_endian_chain(chain: str) -> list[str]:
+    """Report forced endian formats handed to a non-converting next filter."""
+    items = [_fate_shape_filter(item) for item in chain.split(",")]
+    messages = []
+    for item, consumer in zip(items, items[1:], strict=False):
+        formats = re.match(r"format=(?:pix_fmts=)?([^:\[\]]+)", item)
+        if (
+            formats
+            and consumer.split("=", 1)[0] not in {"scale", "format"}
+            and any(name.strip("\"' ").endswith(("le", "be")) for name in formats[1].split("|"))
+        ):
+            messages.append(f"{item}: endian format reaches consumer {consumer}")
+    return messages
+
+
+def _fate_shape_endian(command: str) -> list[str]:
+    """Judge the next consumer of each forced endian format within its chain."""
+    return [
+        message
+        for match in FATE_GRAPH.finditer(command)
+        for chain in match[1].strip("\"'").split(";")
+        for message in _fate_shape_endian_chain(chain)
+    ]
+
+
+def _fate_shape_commands(lines: list[FateLine]) -> list[tuple[str, str, FateLine]]:
+    """Read target-specific and plain CMD assignments through the shared classifier."""
+    commands = []
+    for line in lines:
+        kind, groups = _fate_kind(line)
+        if kind == "command":
+            commands.append((groups[0], groups[1], line))
+        elif kind == "variable" and groups[0] == "CMD":
+            commands.append(("", groups[2], line))
+    return commands
+
+
+def _fate_shape_library(command: str) -> str:
+    """Return the matching library group for a direct run lib*/tests/ command."""
+    words = command.split()
+    if len(words) < 2 or words[0] != "run":
+        return ""
+    executable = words[1]
+    if not executable.startswith("lib") or "/tests/" not in executable:
+        return ""
+    return "FATE_" + executable.split("/", 1)[0].upper()
+
+
+def _fate_shape_registration(line: FateLine) -> tuple[str, list[str]]:
+    """Extract literal append registrations using the existing FATE line kinds."""
+    kind, groups = _fate_kind(line)
+    if kind == "registration":
+        return f"{groups[0]}-{groups[1]}", groups[2].split()
+    if kind == "variable" and groups[1] == "+=":
+        return groups[0], groups[2].split()
+    return "", []
+
+
+def _fate_shape_normalize(name: str) -> str:
+    """Join conditional and enabled spellings of the same make variable."""
+    return re.sub(r"-(?:\$\(.+\)|yes)$", "-yes", name)
+
+
+FATE_SHAPE_REFERENCE = re.compile(r"\$\(([A-Za-z_]\w*(?:-yes|-\$\([^()]*\))?)\)")
+FATE_SHAPE_ASSIGNMENT = re.compile(r"([A-Za-z_]\w*(?:-\$\(.+\)|-yes)?)\s*(\+=|:=|=)\s*(.*)")
+
+
+def _fate_shape_ffmpeg(makefile: str) -> set[str]:
+    """Discover variables whose targets require the ffmpeg executable."""
+    variables = set()
+    for line in _fate_lines(makefile):
+        targets, separator, prerequisites = line.text.partition(":")
+        if (
+            separator
+            and not FATE_SHAPE_ASSIGNMENT.fullmatch(line.text)
+            and "ffmpeg$(PROGSSUF)$(EXESUF)" in prerequisites.split()
+        ):
+            variables.update(
+                _fate_shape_normalize(name) for name in FATE_SHAPE_REFERENCE.findall(targets)
+            )
+    if not variables:
+        raise ValueError("tests/Makefile: no ffmpeg$(PROGSSUF)$(EXESUF) prerequisite rule")
+    return variables
+
+
+def _fate_shape_graph(sources: list[str]) -> dict[str, set[str]]:
+    """Read plain reference edges from logical make assignment lines."""
+    graph: dict[str, set[str]] = {}
+    for source in sources:
+        for line in _fate_lines(source):
+            assignment = FATE_SHAPE_ASSIGNMENT.fullmatch(line.text)
+            if assignment:
+                destination = _fate_shape_normalize(assignment[1])
+                for name in FATE_SHAPE_REFERENCE.findall(assignment[3]):
+                    graph.setdefault(_fate_shape_normalize(name), set()).add(destination)
+    return graph
+
+
+def _fate_shape_chain(variable: str, graph: dict[str, set[str]], ffmpeg: set[str]) -> list[str]:
+    """Walk aggregation iteratively with a visited set and an edge-count bound."""
+    start = _fate_shape_normalize(variable)
+    pending, visited = [[start]], {start}
+    bound = 1 + sum(len(destinations) for destinations in graph.values())
+    for _ in range(bound):
+        if not pending:
+            break
+        chain = pending.pop()
+        if chain[-1] in ffmpeg:
+            return chain
+        for destination in sorted(graph.get(chain[-1], set())):
+            if destination not in visited:
+                visited.add(destination)
+                pending.append([*chain, destination])
+    return []
+
+
+def _fate_shape_registrations(
+    lines: list[FateLine],
+    commands: list[tuple[str, str, FateLine]],
+    added: set[int],
+    graph: dict[str, set[str]],
+    ffmpeg: set[str],
+) -> list[FateShapeFinding]:
+    """Pair added library registrations with their ffmpeg aggregation chains."""
+    libraries = [
+        (target, library)
+        for targets, command, _ in commands
+        if (library := _fate_shape_library(command))
+        for target in targets.split()
+        if target.startswith("fate-")
+    ]
+    findings = []
+    for line in lines:
+        variable, targets = _fate_shape_registration(line)
+        number = _fate_shape_added(line, added)
+        chain = _fate_shape_chain(variable, graph, ffmpeg) if number is not None else []
+        if chain:
+            for target, library in libraries:
+                if target in targets:
+                    message = (
+                        f"{target}: {variable}: {' -> '.join(chain)}: "
+                        f"register it under the matching {library} variable"
+                    )
+                    findings.append(FateShapeFinding("registration", number, message))
+    return findings
+
+
+def _fate_shape_cmd_rules(command: str) -> list[tuple[str, str]]:
+    """Collect the independent CMD pipeline, grep and graph-endian rules."""
+    findings = [("pipe", text) for text in _fate_shape_pipes(command, False)]
+    if re.search(r"\bgrep\b", command):
+        findings.append(("grep", "grep assertion needs a reference comparison"))
+    findings.extend(("endian", text) for text in _fate_shape_endian(command))
+    return findings
+
+
+def _fate_shape_file(
+    path: str,
+    source: str,
+    added: set[int],
+    graph: dict[str, set[str]],
+    ffmpeg: set[str],
+) -> list[FateShapeFinding]:
+    """Check shared logical lines and report only added physical provenance."""
+    lines = _fate_lines(source)
+    if path == "tests/fate-run.sh":
+        return [
+            FateShapeFinding("helper-pipe", number, message)
+            for line in lines
+            if (number := _fate_shape_added(line, added)) is not None
+            for message in _fate_shape_pipes(line.text, True)
+        ]
+    commands = _fate_shape_commands(lines)
+    findings = _fate_shape_registrations(lines, commands, added, graph, ffmpeg)
+    for target, command, line in commands:
+        number = _fate_shape_added(line, added)
+        if number is not None:
+            findings.extend(
+                FateShapeFinding(rule, number, f"{target or 'CMD'}: {message}")
+                for rule, message in _fate_shape_cmd_rules(command)
+            )
+    return findings
+
+
+def _fate_shape_report(
+    files: int, findings: list[tuple[str, FateShapeFinding]], waiver: str
+) -> Step:
+    """Summarize every rule and retain findings when a reason waives rc 1."""
+    counts = ", ".join(
+        f"{rule}={sum(item.rule == rule for _, item in findings)}" for rule in FATE_SHAPE_RULES
+    )
+    summary = f"{files} file(s) checked; {counts}"
+    reports = [
+        f"finding: {path}:{item.line}: {item.rule}: {item.message}" for path, item in findings
+    ]
+    step = _waivable_step(
+        "fate-shape", reports, waiver, summary, "fix FATE shape, or pass --fate-shape-reason"
+    )
+    if findings:
+        step.output += "\n" + summary
+    return step
+
+
+def _fate_shape_revision(
+    tree: Path, head: str, catalogs: dict[str, str | Exception] | None = None
+) -> tuple[dict[str, set[str]], set[str]]:
+    """Combine the shared Makefile catalog with every revision FATE fragment."""
+    makefile = _fate_makefile(tree, head, catalogs)
+    ffmpeg = _fate_shape_ffmpeg(makefile)
+    listing = _git(
+        tree,
+        "grep",
+        "--no-color",
+        "--no-textconv",
+        "--full-name",
+        "--no-line-number",
+        "--no-heading",
+        "--no-break",
+        "-H",
+        "-z",
+        "-e",
+        "^",
+        head,
+        "--",
+        ":(glob)tests/fate/*.mak",
+        allow_no_match=True,
+    )
+    files: dict[str, list[str]] = {}
+    for line in listing.splitlines():
+        name, separator, text = line.partition("\0")
+        if not separator:
+            raise ValueError("FATE aggregation: malformed git grep record")
+        files.setdefault(name, []).append(text)
+    return _fate_shape_graph([makefile, *("\n".join(lines) for lines in files.values())]), ffmpeg
+
+
+def _fate_shape(
+    tree: Path,
+    base: str,
+    head: str,
+    waiver: str,
+    catalogs: dict[str, str | Exception] | None = None,
+) -> Step:
+    """Check added FATE and helper lines from zero-context range diffs."""
+    findings = []
+    try:
+        names = _changed_paths(
+            tree, base, head, "tests/fate/*.mak", "tests/fate-run.sh", added_or_modified=True
+        )
+        if not names:
+            return Step(
+                "fate-shape", 0, "no added or modified FATE file or fate-run.sh in the range"
+            )
+        graph, ffmpeg = _fate_shape_revision(tree, head, catalogs)
+        for name in names:
+            patch = _git(tree, *DIFF_COMMON, "-U0", base, head, "--", name)
+            source = _git(tree, "show", f"{head}:{name}")
+            findings.extend(
+                (name, item)
+                for item in _fate_shape_file(name, source, _added_lines(patch), graph, ffmpeg)
+            )
+    except (OSError, RuntimeError, ValueError) as error:
+        return Step("fate-shape", 2, str(error))
+    return _fate_shape_report(len(names), findings, waiver)
 
 
 def is_test_path(name: str) -> bool:
@@ -2189,12 +2559,16 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
     """Collect every independent check even when another check fails."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-upstream-lint-") as directory:
         scratch = Path(directory)
+        catalogs: dict[str, str | Exception] = {}
         return [
             _collect("pre-commit", lambda: _precommit(tree, base, head, scratch)),
             _collect("commit-msg", lambda: _commit_messages(tree, base, head, scratch)),
             _collect("patcheck", lambda: _patcheck(tree, base, head, scratch)),
             _collect("developer.texi", lambda: _mechanical(tree, base, head)),
-            _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
+            _collect("fate-deps", lambda: _fate_deps(tree, base, head, catalogs)),
+            _collect(
+                "fate-shape", lambda: _fate_shape(tree, base, head, waivers.fate_shape, catalogs)
+            ),
             _collect(
                 "regression-test", lambda: _regression_test(tree, base, head, waivers.no_test)
             ),
@@ -2247,6 +2621,11 @@ def _parser() -> argparse.ArgumentParser:
             "waives findings of the c-rules step"
         ),
     )
+    parser.add_argument(
+        "--fate-shape-reason",
+        default="",
+        help="why a FATE shape finding is acceptable; waives findings, never Git or read errors",
+    )
     return parser
 
 
@@ -2263,6 +2642,7 @@ def main(argv: list[str] | None = None) -> int:
             doc=args.doc_reason,
             test_program=args.test_program_reason,
             c_rule=args.c_rule_reason,
+            fate_shape=args.fate_shape_reason,
         )
         steps = _checks(tree, base, head, waivers)
         _remaining(0)
