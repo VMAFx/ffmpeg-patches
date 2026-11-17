@@ -94,11 +94,23 @@ ffprobe and compared against a tests/ref reference. --test-program-reason TEXT
 waives it and prints the reason. A program registered in another file or
 through another variable, and a FATE test whose input another custom tool
 builds, are not detected.
+
+The c-rules step runs scripts/semgrep_scan.sh with .semgrep-ffmpeg.yml from
+this repository over added or modified library and fftools C and header
+sources in base..head, using the FFmpeg checkout at head as the working
+directory, and skips the run when none changed. Results are read through an
+allow-list: exit status 0 or 1, no semgrep_scan: warning line, and a JSON
+output object whose results and errors lists hold only PartialParsing
+errors. Matches whose line range meets a file's added lines fail with rc 1,
+untouched matches and PartialParsing errors are reported without failing,
+and any other status, warning, error type or JSON failure gives rc 2.
+--c-rule-reason TEXT waives rc 1 findings and prints the reason, never rc 2.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -159,8 +171,11 @@ DIFF_COMMON = (
 MAX_PATHS = 2000
 MAX_CLAIM_COMMITS = 1000
 RUN_TIMEOUT = 1800
+C_RULES_TIMEOUT = 300
 CLEANUP_TIMEOUT = 30
 REAP_TIMEOUT = 10
+SEMGREP_SCAN = REPO_ROOT / "scripts" / "semgrep_scan.sh"
+SEMGREP_FFMPEG_RULES = REPO_ROOT / ".semgrep-ffmpeg.yml"
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
 CONFIG = ".forgejo/pre-commit/config.yaml"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -264,6 +279,7 @@ class Waivers:
     claim: str = ""
     doc: str = ""
     test_program: str = ""
+    c_rule: str = ""
 
 
 @dataclass
@@ -1730,7 +1746,178 @@ def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("test-program", 1, "\n".join([*findings, advice]))
 
 
+@dataclass(frozen=True, slots=True)
+class SemgrepMatch:
+    """One validated Semgrep finding with its inclusive physical line span."""
+
+    path: str
+    start_line: int
+    end_line: int
+    check_id: str
+    message_line: str
+
+
+def is_c_source_path(name: str) -> bool:
+    """Return whether a repository path is a non-test library or fftools C or header source."""
+    return name.endswith((".c", ".h")) and is_source_path(name)
+
+
+def _semgrep_span(item: dict[str, object]) -> tuple[int, int] | None:
+    """Extract a positive inclusive (start_line, end_line) pair from a Semgrep result."""
+    start, end = item.get("start"), item.get("end")
+    if not (isinstance(start, dict) and isinstance(end, dict)):
+        return None
+    first, last = start.get("line"), end.get("line")
+    if (
+        isinstance(first, int)
+        and not isinstance(first, bool)
+        and isinstance(last, int)
+        and not isinstance(last, bool)
+        and 1 <= first <= last
+    ):
+        return first, last
+    return None
+
+
+def _parse_semgrep_match(item: object) -> SemgrepMatch | None:
+    """Validate one Semgrep JSON result entry against the allow-listed schema."""
+    if not isinstance(item, dict):
+        return None
+    path, check_id, extra = item.get("path"), item.get("check_id"), item.get("extra")
+    span = _semgrep_span(item)
+    message = extra.get("message") if isinstance(extra, dict) else None
+    if (
+        span is None
+        or not (isinstance(path, str) and path)
+        or not (isinstance(check_id, str) and check_id)
+        or not isinstance(message, str)
+    ):
+        return None
+    # Semgrep prefixes check_id with the dotted rules path; rule ids carry no dot.
+    return SemgrepMatch(
+        path, span[0], span[1], check_id.rpartition(".")[2], message.partition("\n")[0]
+    )
+
+
+def _partial_parsing_path(error: object) -> str | None:
+    """Return the file path of a PartialParsing error, or None for any other error."""
+    if not isinstance(error, dict):
+        return None
+    error_type = error.get("type")
+    is_partial = error_type == "PartialParsing" or (
+        isinstance(error_type, list) and bool(error_type) and error_type[0] == "PartialParsing"
+    )
+    path = error.get("path")
+    if is_partial and isinstance(path, str) and path:
+        return path
+    return None
+
+
+def _read_semgrep_lists(
+    raw_results: list[object], raw_errors: list[object]
+) -> tuple[list[SemgrepMatch], list[str]] | None:
+    """Validate every result and PartialParsing error in Semgrep's JSON lists."""
+    matches: list[SemgrepMatch] = []
+    for raw in raw_results:
+        match = _parse_semgrep_match(raw)
+        if match is None:
+            return None
+        matches.append(match)
+    partial_paths: list[str] = []
+    for raw in raw_errors:
+        path = _partial_parsing_path(raw)
+        if path is None:
+            return None
+        partial_paths.append(path)
+    return matches, partial_paths
+
+
+def _read_semgrep_json(json_path: Path) -> tuple[list[SemgrepMatch], list[str]] | None:
+    """Read and allow-list a Semgrep JSON output file."""
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_results, raw_errors = payload.get("results"), payload.get("errors")
+    if not (isinstance(raw_results, list) and isinstance(raw_errors, list)):
+        return None
+    return _read_semgrep_lists(raw_results, raw_errors)
+
+
+def _c_rules_error(result: RunResult) -> Step:
+    """Format an unrecognised semgrep_scan result as a non-waivable rc 2 step."""
+    header = f"command rc: {result.returncode}"
+    output = f"{header}\n{result.stdout}" if result.stdout else header
+    return Step("c-rules", 2, output)
+
+
+def _c_rules_report(
+    matches: list[SemgrepMatch],
+    partial_paths: list[str],
+    added_by_path: dict[str, set[int]],
+    source_count: int,
+    waiver: str,
+) -> Step:
+    """Classify allow-listed Semgrep matches against added lines and apply any waiver."""
+    findings: list[str] = []
+    notes: list[str] = []
+    for match in matches:
+        added = added_by_path.get(match.path, set())
+        touched = any(match.start_line <= line <= match.end_line for line in added)
+        detail = f"{match.path}:{match.start_line}: {match.check_id}: {match.message_line}"
+        if touched:
+            findings.append(f"finding: {detail}")
+        else:
+            notes.append(f"pre-existing (untouched): {detail}")
+    notes.extend(f"informational: {path}: PartialParsing" for path in partial_paths)
+    if not findings:
+        summary = f"0 finding(s) in {source_count} changed C/header source(s)"
+        return Step("c-rules", 0, "\n".join([*notes, summary]))
+    reason = waiver.strip()
+    if reason:
+        return Step("c-rules", 0, "\n".join([f"waived: {reason}", *findings, *notes]))
+    advice = "fix the flagged path, or pass --c-rule-reason"
+    return Step("c-rules", 1, "\n".join([*findings, *notes, advice]))
+
+
+def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Scan changed library and fftools C and header sources with .semgrep-ffmpeg.yml."""
+    paths = [
+        name
+        for name in _changed_paths(tree, base, head, "*.c", "*.h", added_or_modified=True)
+        if is_c_source_path(name)
+    ]
+    if not paths:
+        return Step("c-rules", 0, "no added or modified C or header source in the range")
+    added_by_path = {
+        name: _added_lines(_git(tree, *DIFF_COMMON, "-U0", base, head, "--", name))
+        for name in paths
+    }
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
+        json_path = Path(directory) / "semgrep.json"
+        argv = [
+            "bash",
+            str(SEMGREP_SCAN),
+            f"--rules={SEMGREP_FFMPEG_RULES}",
+            f"--json-output={json_path}",
+            *paths,
+        ]
+        result = _run(argv, tree, timeout=C_RULES_TIMEOUT)
+        has_warning = any(line.startswith("semgrep_scan:") for line in result.stdout.splitlines())
+        parsed = (
+            _read_semgrep_json(json_path)
+            if result.returncode in (0, 1) and not has_warning
+            else None
+        )
+    if parsed is None:
+        return _c_rules_error(result)
+    return _c_rules_report(parsed[0], parsed[1], added_by_path, len(paths), waiver)
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
+    """Run one check and capture unexpected tool or I/O errors as rc 2."""
     try:
         return action()
     except (OSError, RuntimeError, ValueError) as error:
@@ -1754,6 +1941,7 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
             _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
+            _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule)),
         ]
 
 
@@ -1788,6 +1976,14 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help="why a new lib*/tests program cannot be a FATE sample test; waives that step",
     )
+    parser.add_argument(
+        "--c-rule-reason",
+        default="",
+        help=(
+            "why a finding in .semgrep-ffmpeg.yml does not apply to the touched path; "
+            "waives findings of the c-rules step"
+        ),
+    )
     return parser
 
 
@@ -1803,6 +1999,7 @@ def main(argv: list[str] | None = None) -> int:
             claim=args.claim_reason,
             doc=args.doc_reason,
             test_program=args.test_program_reason,
+            c_rule=args.c_rule_reason,
         )
         steps = _checks(tree, base, head, waivers)
         _remaining(0)

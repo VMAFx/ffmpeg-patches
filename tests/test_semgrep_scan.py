@@ -113,6 +113,36 @@ class SemgrepScanTest(unittest.TestCase):
         _run_scan(self.scratch, RULE_WARNING, 0)
         self.assertEqual(sorted(p.name for p in self.scratch.glob("tmp.*")), [])
 
+    def test_rules_operand_replaces_default_config(self) -> None:
+        """A leading --rules=PATH operand replaces .semgrep.yml without reaching semgrep."""
+        custom = self.scratch / "custom-rules.yml"
+        proc, argv = _run_scan(
+            self.scratch,
+            "0 findings.\n",
+            0,
+            (f"--rules={custom}", "--json-output=out.json"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        expected = [
+            "scan",
+            "--config",
+            str(custom),
+            "--error",
+            "--metrics",
+            "off",
+            "--disable-version-check",
+            "--json-output=out.json",
+        ]
+        self.assertEqual(argv, expected)
+        self.assertNotIn(f"--rules={custom}", argv)
+        self.assertNotIn(".semgrep.yml", argv)
+
+    def test_no_operand_keeps_default_config(self) -> None:
+        """Running with no operand keeps .semgrep.yml as the semgrep config."""
+        proc, argv = _run_scan(self.scratch, "0 findings.\n", 0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(argv, SCAN_ARGS)
+
 
 if __name__ == "__main__":
     unittest.main()
