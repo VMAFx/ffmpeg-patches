@@ -63,8 +63,9 @@ performance or throughput) without an end-to-end figure anywhere in the
 message: an fps or frames/s number, ffmpeg -benchmark, a bench: utime= line,
 speed= followed by a number, or hyperfine. A benchmark of one helper does not
 show that; a claim after not, never, cannot, without, no or an n't contraction
-earlier in its sentence is no claim, and speed words other than these, such as
-time or a bare encoding speed, are not detected. It also fails a commit whose
+earlier in its sentence (a decimal point inside a number is not a sentence end)
+is no claim, and speed words other than these, such as time or a bare encoding
+speed, are not detected. It also fails a commit whose
 message claims several sites (both or all followed within two words, line
 breaks included, by loops, callers, call sites, branches, paths, cases,
 functions, uses, instances, places, sites or occurrences; every or each
@@ -252,7 +253,8 @@ SPEED_CLAIM = re.compile(
     re.IGNORECASE,
 )
 SPEED_NEGATION = re.compile(
-    r"(?:\bnot|\bnever|\bcannot|\bwithout|\bno|n't)\b[^.;!?]*$", re.IGNORECASE
+    r"(?:\bnot|\bnever|\bcannot|\bwithout|\bno|n't)\b(?:[^.;!?]|(?<=\d)\.(?=\d))*$",
+    re.IGNORECASE,
 )
 END_TO_END_MEASURE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:fps|frames/s)\b|(?<![\w-])-benchmark\b|\bbench:\s*utime="

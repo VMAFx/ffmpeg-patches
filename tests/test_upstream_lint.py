@@ -1160,6 +1160,53 @@ class ClaimScopeTest(unittest.TestCase):
         message = "avcodec/x: cache maps\n\nThe old path did not cache. Encoding is faster.\n"
         self.assertEqual(upstream_lint.speed_claim(message), "Encoding is faster")
 
+    def test_speed_claim_decimal_in_negation_passes(self) -> None:
+        """Decimal points inside numbers do not end the negation window of speed claims."""
+        for message in (
+            "No 1.5x encoding speedup is claimed.",
+            "Not 2.0x faster encoding here.",
+            "It does not claim 3.25% encoding speedup.",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.speed_claim(message))
+
+    def test_speed_claim_sentence_end_after_negation_detected(self) -> None:
+        """Non-decimal full stops and other sentence marks still end the negation window."""
+        cases = (
+            ("No change. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2.3. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Encoding speedup of 1.5x.", "Encoding speedup"),
+            ("No .5x encoding speedup is claimed.", "encoding speedup"),
+            ("Not here.2x faster encoding.", "faster encoding"),
+            ("No 1..5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1;5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1!5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1?5x encoding speedup is claimed.", "encoding speedup"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.speed_claim(message), expected)
+
+    def test_speed_claim_decimal_negation_boundaries(self) -> None:
+        """Window-boundary decimals and multi-dot numbers do not end speed negation."""
+        dot_at_start = "Version 1.5 of this encoder patch does not claim any new encoding speedup."
+        window_start = dot_at_start.index("encoding speedup") - 48
+        self.assertEqual(dot_at_start[window_start - 1 : window_start + 2], "1.5")
+        self.assertIsNone(upstream_lint.speed_claim(dot_at_start))
+        digit_at_start = (
+            "Version 1.5 of this encoder patch does not claim any real encoding speedup."
+        )
+        after_dot = digit_at_start.index("encoding speedup") - 48
+        self.assertEqual(digit_at_start[after_dot - 2 : after_dot + 1], "1.5")
+        self.assertIsNone(upstream_lint.speed_claim(digit_at_start))
+        for message in (
+            "No 1.2.3 encoding speedup is claimed.",
+            "Not in 1.2.3 is faster encoding claimed.",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.speed_claim(message))
+
     def test_speed_claim_finding_names_the_fix(self) -> None:
         """The claim-scope finding for a speed claim asks for an end-to-end figure."""
         findings = upstream_lint._unverified_findings(
