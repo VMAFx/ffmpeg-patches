@@ -151,7 +151,7 @@ class ReviewClassesTest(unittest.TestCase):
 
     def test_invalid_hits(self) -> None:
         """Refuse nonrecurring counts and values that only coerce to integers."""
-        for value in (None, True, "2", 2.0, 1, 0, -1):
+        for value in (None, True, False, "2", 2.0, 1, 0, -1):
             with self.subTest(value=value):
                 self.invalid_item("hits", value, "hits")
 
@@ -163,7 +163,7 @@ class ReviewClassesTest(unittest.TestCase):
 
     def test_invalid_pull_request_number(self) -> None:
         """Refuse zero, negative, noninteger, and boolean pull request numbers."""
-        for value in (None, True, "1", 1.0, 0, -1):
+        for value in (None, True, False, "1", 1.0, 0, -1):
             with self.subTest(value=value):
                 self.invalid_item("pull_requests", [value], "pull request number")
 

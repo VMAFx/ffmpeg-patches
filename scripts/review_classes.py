@@ -39,11 +39,16 @@ def plain_text(value: object) -> bool:
     )
 
 
+def _is_integer(value: object) -> bool:
+    """Accept integers while refusing boolean values."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _validate_pull_requests(requests: object, label: str) -> None:
     """Require nonempty, unique, strictly ascending positive pull request numbers."""
     if not isinstance(requests, list) or not requests:
         raise ValueError(f"{label}: missing or invalid pull_requests")
-    if any(type(number) is not int or number < 1 for number in requests):
+    if any(not _is_integer(number) or number < 1 for number in requests):
         raise ValueError(f"{label}: invalid pull request number")
     if len(requests) != len(set(requests)):
         raise ValueError(f"{label}: duplicate pull request number")
@@ -58,7 +63,7 @@ def validate_item(item: object, path: Path) -> dict:
     if not isinstance(item["id"], str) or not CLASS_ID.fullmatch(item["id"]):
         raise ValueError(f"{path}: invalid class id")
     label = f"{path}: {item['id']}"
-    if type(item["hits"]) is not int or item["hits"] < 2:
+    if not _is_integer(item["hits"]) or item["hits"] < 2:
         raise ValueError(f"{label}: hits must be an integer >= 2")
     _validate_pull_requests(item["pull_requests"], label)
     for field in ("definition", "question"):
