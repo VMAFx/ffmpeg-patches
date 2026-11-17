@@ -1715,6 +1715,39 @@ TEXI_CHAPTER = re.compile(
 )
 TEXI_ITEM = re.compile(r"@itemx?\b")
 TEXI_ITEM_END = re.compile(r"@(?:itemx?|end|section|subsection|chapter|anchor)\b")
+TEXI_ITEM_BLOCKS = (
+    "example",
+    "smallexample",
+    "verbatim",
+    "display",
+    "format",
+    "quotation",
+    "cartouche",
+    "itemize",
+    "enumerate",
+    "table",
+    "ftable",
+    "vtable",
+    "multitable",
+)
+SECTION_DESCRIPTION_WORDS = (
+    "and",
+    "encoder",
+    "encoders",
+    "decoder",
+    "decoders",
+    "muxer",
+    "muxers",
+    "demuxer",
+    "demuxers",
+    "filter",
+    "filters",
+    "device",
+    "devices",
+    "codec",
+    "codecs",
+    "options",
+)
 TEXI_REF = re.compile(r"@(?:ref|xref|pxref)\{")
 DEFER_WORDING = re.compile(
     r"\b(?:(?:described|documented|defined|specified|explained)\s+(?:for|in|under|by|with)"
@@ -1722,6 +1755,7 @@ DEFER_WORDING = re.compile(
     re.IGNORECASE,
 )
 ANCHOR_ITEM_LIMIT = 400
+REFERENCE_CONTEXT_LINES = 6
 
 
 def is_doc_path(name: str) -> bool:
@@ -1879,23 +1913,40 @@ def texi_sections(lines: list[str]) -> list[str]:
 
 
 def section_names(title: str) -> frozenset[str]:
-    """Return the names a section title gives: each word and its part before the first -."""
+    """Return library tokens over two letters and dash prefixes, omitting descriptive words."""
     words = [word for word in re.split(r"[\s,]+", title) if word]
-    return frozenset(name for word in words for name in (word, word.split("-")[0]) if len(name) > 2)
+    return frozenset(
+        name
+        for word in words
+        for name in (word, word.split("-")[0])
+        if len(name) > 2 and name.lower() not in SECTION_DESCRIPTION_WORDS
+    )
+
+
+def _anchor_body(lines: list[str]) -> list[str]:
+    """Collect a bounded item body through matching nested Texinfo block ends."""
+    body: list[str] = []
+    stack: list[str] = []
+    for line in lines[:ANCHOR_ITEM_LIMIT]:
+        command = TEXI_COMMAND.match(line)
+        end = TEXI_END.match(line)
+        if command and command[1] in TEXI_ITEM_BLOCKS:
+            stack.append(command[1])
+        elif end and stack and end[1] == stack[-1]:
+            stack.pop()
+        elif not stack and TEXI_ITEM_END.match(line):
+            break
+        body.append(line)
+    return body
 
 
 def _anchor_item(lines: list[str], start: int) -> list[str]:
-    """Return the lines of the table item an @anchor opens, up to the next item or section."""
+    """Return an anchored table item's bounded body, including its nested blocks."""
     index = start + 1
     for index in range(start + 1, min(len(lines), start + 1 + ANCHOR_ITEM_LIMIT)):
         if not TEXI_ITEM.match(lines[index]):
             break
-    body: list[str] = []
-    for line in lines[index : index + ANCHOR_ITEM_LIMIT]:
-        if TEXI_ITEM_END.match(line):
-            break
-        body.append(line)
-    return body
+    return _anchor_body(lines[index : index + ANCHOR_ITEM_LIMIT])
 
 
 def _texi_ref_arguments(text: str) -> list[str]:
@@ -1920,12 +1971,26 @@ def _texi_ref_arguments(text: str) -> list[str]:
     return []
 
 
+def _reference_context(lines: list[str], index: int) -> str:
+    """Join bounded preceding prose without crossing a paragraph or block command."""
+    before: list[str] = []
+    for at in range(index - 1, max(-1, index - 1 - REFERENCE_CONTEXT_LINES), -1):
+        line = lines[at].strip()
+        if not line:
+            break
+        command = TEXI_COMMAND.match(line)
+        if command and not (command[1] in TEXI_INLINE and line[command.end() :].startswith("{")):
+            break
+        before.append(line)
+    return " ".join(reversed(before))
+
+
 def _reference_finding(
     path: str, lines: list[str], sections: list[str], anchors: dict[str, int], number: int
 ) -> list[str]:
     """Return a finding per reference on one added line that defers to another section's item."""
     index = number - 1
-    before = lines[index - 1] if index else ""
+    before = _reference_context(lines, index)
     findings: list[str] = []
     for ref in TEXI_REF.finditer(lines[index]):
         text = lines[index][ref.end() :]

@@ -1697,6 +1697,36 @@ class DocReferenceTest(unittest.TestCase):
                 text = REFERENCE_TEXT.replace("in the format described for", wording)
                 self.assertEqual(len(self.findings(text)), 1)
 
+    def test_defer_wording_two_lines_before_reference_is_found(self) -> None:
+        """Deferral wording survives an earlier continuation of the same sentence."""
+        text = REFERENCE_TEXT.replace("the @ref{", "the corresponding option in\nthe @ref{")
+        self.assertEqual(len(self.findings(text, {12})), 1)
+
+    def test_defer_context_stops_at_paragraph_sentence_or_command(self) -> None:
+        """Paragraphs, sentence endings and block commands end deferral context."""
+        for boundary in (
+            "",
+            "   ",
+            "the option ends here. See",
+            "the option ends here; see",
+            "@item next",
+            "@end table",
+            "@section libsvtav1",
+            "@example",
+            "@table @option",
+            "@anchor{next}",
+        ):
+            with self.subTest(boundary=boundary):
+                text = REFERENCE_TEXT.replace("the @ref{", f"{boundary}\nthe @ref{{")
+                self.assertEqual(self.findings(text, {12}), [])
+
+    def test_defer_context_allows_inline_commands_and_is_bounded(self) -> None:
+        """Inline commands preserve context only within six preceding lines."""
+        for count, expected in ((5, 1), (6, 0)):
+            with self.subTest(count=count):
+                text = REFERENCE_TEXT.replace("the @ref{", "@code{option}\n" * count + "the @ref{")
+                self.assertEqual(len(self.findings(text, {11 + count})), expected)
+
     def test_reference_after_chapter_heading_passes(self) -> None:
         """Chapter-level and higher headings clear the earlier section's ownership."""
         for heading in (
@@ -1790,6 +1820,64 @@ class DocReferenceTest(unittest.TestCase):
         )
         self.assertEqual(self.findings(text, {13}), [])
 
+    def test_item_library_after_example_is_found(self) -> None:
+        """Library prose after a closed example remains inside the anchored item."""
+        text = REFERENCE_TEXT.replace(
+            "Read per-frame offsets;", "@example\n0 1\n@end example\nRead per-frame offsets;"
+        )
+        self.assertEqual(len(self.findings(text, {14})), 1)
+
+    def test_item_library_after_nested_itemize_is_found(self) -> None:
+        """Nested list and table items do not end the enclosing anchored item."""
+        for block in ("itemize", "enumerate", "table", "ftable", "vtable", "multitable"):
+            with self.subTest(block=block):
+                text = REFERENCE_TEXT.replace(
+                    "Read per-frame offsets;",
+                    f"@{block}\n@item nested\n@itemize\n@item deeper\n@end itemize\n"
+                    f"@end {block}\nRead per-frame offsets;",
+                )
+                self.assertEqual(len(self.findings(text, {17})), 1)
+
+    def test_item_block_ends_remain_in_body(self) -> None:
+        """Matching nested ends stay in the body before a peer item or heading."""
+        for block in (
+            "example",
+            "smallexample",
+            "verbatim",
+            "display",
+            "format",
+            "quotation",
+            "cartouche",
+        ):
+            for boundary in (
+                "@item next",
+                "@itemx next",
+                "@end table",
+                "@section next",
+                "@subsection next",
+                "@chapter next",
+                "@anchor{next}",
+            ):
+                with self.subTest(block=block, boundary=boundary):
+                    body = [f"@{block}", "@end other", f"@end {block}", "prose"]
+                    lines = ["@anchor{option}", "@item option", *body, boundary, "libaom"]
+                    self.assertEqual(upstream_lint._anchor_item(lines, 0), body)
+
+    def test_item_descriptive_heading_word_passes(self) -> None:
+        """Descriptive heading labels cannot stand in for library names."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom-av1 encoder")
+        text = text.replace(
+            "libaom reads a missing offset as 0", "the encoder reads a missing offset as 0"
+        )
+        self.assertEqual(self.findings(text), [])
+
+    def test_item_library_under_descriptive_heading_is_found(self) -> None:
+        """A descriptive heading preserves findings naming only the actual library."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom-av1 encoder")
+        text = text.replace("libaom reads", "the encoder libaom reads")
+        self.assertEqual(len(self.findings(text)), 1)
+        self.assertTrue(self.findings(text)[0].endswith("section names libaom"))
+
     def test_citing_line_outside_sections_or_unadded_passes(self) -> None:
         """A citing line before any @section, or one not added, passes."""
         self.assertEqual(self.findings(REFERENCE_TEXT, {10}), [])
@@ -1798,10 +1886,23 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(upstream_lint.reference_findings("doc/x.texi", first, {2}), [])
 
     def test_section_names(self) -> None:
-        """Section names are the title words and their parts before a dash, over two letters."""
+        """Library names omit descriptive words and retain long prefixes before a dash."""
         self.assertEqual(
             upstream_lint.section_names("libaom-av1"), frozenset({"libaom-av1", "libaom"})
         )
+        for title, expected in (
+            ("libaom-av1 encoder", {"libaom-av1", "libaom"}),
+            ("ac3 and ac3_fixed", {"ac3", "ac3_fixed"}),
+            ("VAAPI encoders", {"VAAPI"}),
+            ("libaom Decoders", {"libaom"}),
+            (
+                "and encoder encoders decoder decoders muxer muxers demuxer demuxers "
+                "filter filters device devices codec codecs options",
+                set(),
+            ),
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(upstream_lint.section_names(title), frozenset(expected))
         self.assertEqual(upstream_lint.section_names("qp of x"), frozenset())
         self.assertEqual(
             upstream_lint.texi_sections(["a", "@section b c", "d"]), ["", "b c", "b c"]
