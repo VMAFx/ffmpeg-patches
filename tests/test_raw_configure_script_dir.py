@@ -51,6 +51,12 @@ ARGV0_OWN = 'BASH_ARGV0=$(dirname "$(readlink -f "$0")")\n'
 ROOT_LIB = {"lib.sh": CFG}
 PREFIXED = "script path in a function that the script calls with a prefix assignment"
 SOURCED = "prefix assignment in a sourced file before a call of a function"
+# Round r23: the command word $c with the two halves of the name HERE, read from a here-string.
+NAME_HERE = "n=HE\nm=RE\n"
+CALL_C = '"$c" "$n$m" <<< <case>/other\n'
+X16 = "".join(f"c=x{idx:02d}\n" for idx in range(16))
+CALL_ARRAY = '"${arr[@]}" "$n$m" <<< <case>/other\n'
+READ_RUN = "bash tools/run.sh read"
 
 
 class Case(NamedTuple):
@@ -1468,6 +1474,104 @@ SCRIPT_DIR = {
         UNKNOWN_SOURCE,
         {"tools/lib$.sh": CFG},
     ),
+    "r23-positional-fallback-command": Case(
+        CDPWD + "c=${1:-true}\n" + NAME_HERE + CALL_C + SRC, 2, WRITTEN, OTHER, command=READ_RUN
+    ),
+    "r23-cap-sixteen-then-read": Case(
+        CDPWD + X16 + "c=read\n" + NAME_HERE + CALL_C + SRC, 2, WRITTEN, OTHER
+    ),
+    "r23-unresolved-assignment-keeps-true": Case(
+        CDPWD + 'c=true\nc="$1"\n' + NAME_HERE + CALL_C + SRC, 2, WRITTEN, OTHER, command=READ_RUN
+    ),
+    "r23-keep-positional-fallback-data": Case(CDPWD + 'c=${1:-true}\necho "$c"\n' + SRC, 0),
+    "r23-keep-sixteen-harmless": Case(CDPWD + X16 + NAME_HERE + CALL_C + SRC, 0),
+    "r23-keep-two-resolved": Case(CDPWD + "c=true\nc=false\n" + NAME_HERE + CALL_C + SRC, 0),
+    **{
+        f"r23-unknown-fallback-{param}": Case(
+            CDPWD + NAME_HERE + '"${' + param + ':-true}" "$n$m" <<< <case>/other\n' + SRC,
+            2,
+            WRITTEN,
+            OTHER,
+        )
+        for param in (
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "10",
+            "@",
+            "*",
+            "#",
+            "?",
+            "-",
+            "$",
+            "!",
+        )
+    },
+    "r23-concat-cap-read": Case(
+        CDPWD
+        + "a=x0\na=x1\na=x2\na=x3\na=rea\nb=y0\nb=y1\nb=y2\nb=y3\nb=d\n"
+        + NAME_HERE
+        + '"$a$b" "$n$m" <<< <case>/other\n'
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r23-fallback-cap-read": Case(
+        CDPWD + X16 + NAME_HERE + '"${c:-read}" "$n$m" <<< <case>/other\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r23-keep-fallback-sixteen": Case(
+        CDPWD + X16 + NAME_HERE + '"${c:-x00}" "$n$m" <<< <case>/other\n' + SRC, 0
+    ),
+    "r23-array-join-cap-read": Case(
+        CDPWD
+        + "a=x0\na=x1\na=x2\na=x3\na=read\nb=y0\nb=y1\nb=y2\nb=y3\nb=-r\n"
+        + 'arr=("$a" "$b")\n'
+        + NAME_HERE
+        + CALL_ARRAY
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r23-array-bucket-cap-read": Case(
+        CDPWD
+        + "".join(f"arr=(p{idx} q{jdx})\n" for idx in range(4) for jdx in range(4))
+        + "arr=(read -r)\n"
+        + NAME_HERE
+        + CALL_ARRAY
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r23-array-index-cap-read": Case(
+        CDPWD
+        + "c=("
+        + " ".join(f"x{idx:02d}" for idx in range(16))
+        + " read)\n"
+        + NAME_HERE
+        + '"${c[16]}" "$n$m" <<< <case>/other\n'
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r23-keep-array-index-sixteen": Case(
+        CDPWD
+        + "c=("
+        + " ".join(f"x{idx:02d}" for idx in range(16))
+        + ")\n"
+        + NAME_HERE
+        + '"${c[15]}" "$n$m" <<< <case>/other\n'
+        + SRC,
+        0,
+    ),
 }
 
 
@@ -1515,8 +1619,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 476 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 476)
+        """Replay all 505 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 505)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

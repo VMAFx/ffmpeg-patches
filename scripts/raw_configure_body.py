@@ -157,7 +157,12 @@ BRACE_CHOICES = re.compile(r"\{([A-Za-z0-9_.-]+(?:,[A-Za-z0-9_.-]*)+)\}")
 PLAIN_BRACE_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]+\])?)\}")
 ARRAY_ALL_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}")
 CASE_BRACE_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(\^\^?|,,?)\}")
-FALLBACK_BRACE_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*|[0-9]+)(:?[-+=])(.*)\}", re.S)
+FALLBACK_BRACE_VAR = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(:?[-+=])(.*)\}", re.S
+)
+# Positional and special parameters: the script's own arguments and shell state, known only at
+# run time unless the guard has established their values.
+UNKNOWN_PARAM = re.compile(r"[1-9][0-9]*|[@*#?$!-]")
 INDEXED_TARGET = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\[([0-9]+)\]")
 # Words before a command that keep a shell function or eval in reach: time runs a function,
 # and builtin or command can run eval (measured on bash 5.3.20). An external wrapper such as
@@ -1982,6 +1987,7 @@ class _Names:
     static_bindings: list[tuple[str, str, str]] = field(default_factory=list)
     array_bindings: list[tuple[str, list[Any], bytes]] = field(default_factory=list)
     writer_nodes: list[tuple[Any, bytes, tuple[str, ...]]] = field(default_factory=list)
+    unknown_names: set[str] = field(default_factory=set)
     var_scope: _VarScope = field(default_factory=_VarScope)
     parsed: int = 0
 
@@ -2316,8 +2322,20 @@ def _lookup_var(name: str, scope: _VarScope) -> tuple[str, ...]:
         return scope.values[name]
     if name in os.environ:
         return (os.environ[name][:64],)
+    if _unknown_param(name, scope):
+        return ()
     base = name.split("[", 1)[0]
     return () if base in scope.assigned else ("",)
+
+
+def _unknown_param(name: str, scope: _VarScope) -> bool:
+    """Tell whether name is a positional or special parameter the guard has not established."""
+    return UNKNOWN_PARAM.fullmatch(name) is not None and name not in scope.values
+
+
+def _mark_unknown(loc_vars: set[str], key: str) -> None:
+    """Record that a variable may also hold text known only at run time."""
+    loc_vars.update((key, key.split("[", 1)[0]))
 
 
 def _apply_case(value: str, op: str) -> str:
@@ -2343,7 +2361,7 @@ def _fallback_values(
 ) -> tuple[tuple[str, ...] | None, list[Any], bool]:
     """Resolve a ${name:-word}, ${name:=word} or ${name:+word} expansion."""
     var, op, tail = match.groups()
-    loc = var in scope.locale_vars
+    loc = var in scope.locale_vars or _unknown_param(var, scope)
     rest = part.named_children[1:]
     has_var = var in scope.values or var in os.environ
     known = _lookup_var(var, scope) if has_var else ()
@@ -2356,7 +2374,8 @@ def _fallback_values(
         extra_vals = (extra[:64],) if dyn < 0 else ()
     else:
         extra_vals = _plain_tail_values(tail)
-    return tuple(dict.fromkeys((*known, *extra_vals)))[:16], [], loc
+    merged = tuple(dict.fromkeys((*known, *extra_vals)))
+    return merged[:16], [], loc or len(merged) > 16
 
 
 def _brace_values(
@@ -2386,11 +2405,12 @@ def _brace_values(
     return (), [], False
 
 
-def _append_choices(acc: tuple[str, ...], choices: tuple[str, ...]) -> tuple[str, ...]:
-    """Concatenate candidate prefixes and next-segment choices within a 16-word cap."""
+def _append_choices(acc: tuple[str, ...], choices: tuple[str, ...]) -> tuple[tuple[str, ...], bool]:
+    """Concatenate prefixes and choices within a 16-word cap and report a dropped candidate."""
     if not acc or not choices:
-        return ()
-    return tuple(dict.fromkeys((a + c)[:64] for a in acc for c in choices))[:16]
+        return (), False
+    joined = tuple(dict.fromkeys((a + c)[:64] for a in acc for c in choices))
+    return joined[:16], len(joined) > 16
 
 
 def _part_choices(part: Any, raw: bytes, scope: _VarScope) -> tuple[tuple[str, ...], bool]:
@@ -2415,7 +2435,7 @@ def _step_expansion_part(
     part: Any, quoted: bool, raw: bytes, scope: _VarScope
 ) -> tuple[tuple[str, ...] | None, list[Any], bool, bool]:
     """Evaluate one braced or simple word part to choices, pushed nodes, locale and split."""
-    if part.type == "expansion":
+    if part.type in ("expansion", "ERROR"):
         split = not quoted or ARRAY_ALL_VAR.fullmatch(_text(part, raw)) is not None
         vals, rest, loc = _brace_values(part, raw, scope)
         return vals, rest, loc, split
@@ -2448,7 +2468,8 @@ def _word_candidates(
             if vals is None:
                 stack.extend((child, quoted) for child in reversed(rest))
             else:
-                acc = _append_choices(acc, vals)
+                acc, dropped = _append_choices(acc, vals)
+                locale |= dropped
     return acc, locale, split
 
 
@@ -2482,6 +2503,8 @@ def _record_binding(node: Any, raw: bytes, names: _Names) -> None:
             names.array_bindings.append((target, items[:8], raw))
         for idx, item in enumerate(items[:16]):
             names.raw_bindings.append((f"{target}[{idx}]", "=", [item], raw))
+        if len(items) > 16:
+            names.unknown_names.add(target)
     elif value.type != "array":
         names.raw_bindings.append((target, op, [value], raw))
         if target.endswith("[0]"):
@@ -2517,15 +2540,21 @@ def _record_node_bindings(node: Any, raw: bytes, names: _Names) -> None:
 
 def _add_resolved(
     store: dict[str, list[str]], key: str, op: str, items: Iterable[str], live: _VarScope
-) -> None:
-    """Merge new or appended candidate strings into a variable bucket within a 16-item cap."""
+) -> bool:
+    """Merge candidate strings into a 16-item bucket and report whether the cap dropped one."""
     prefixes = (live.values.get(key) or ("",)) if op == "+=" else ("",)
     bucket = store.setdefault(key, [])
+    dropped = False
     for prefix in prefixes:
         for item in items:
             merged = (prefix + item)[:64]
-            if merged not in bucket and len(bucket) < 16:
+            if merged in bucket:
+                continue
+            if len(bucket) < 16:
                 bucket.append(merged)
+            else:
+                dropped = True
+    return dropped
 
 
 def _array_element_strings(
@@ -2540,7 +2569,9 @@ def _array_element_strings(
         if not vals:
             break
         sep = " " if parts != ("",) else ""
-        parts = tuple(dict.fromkeys(f"{p}{sep}{v}"[:64] for p in parts for v in vals))[:16]
+        joined = tuple(dict.fromkeys(f"{p}{sep}{v}"[:64] for p in parts for v in vals))
+        parts = joined[:16]
+        locale |= len(joined) > 16
     return parts, locale
 
 
@@ -2555,8 +2586,12 @@ def _resolve_arrays(
             loc_vars.add(target)
         bucket = arrays.setdefault(target, [])
         for part in parts:
-            if part and part not in bucket and len(bucket) < 16:
+            if not part or part in bucket:
+                continue
+            if len(bucket) < 16:
                 bucket.append(part)
+            else:
+                loc_vars.add(target)
     return {k: tuple(v) for k, v in arrays.items() if v}
 
 
@@ -2566,14 +2601,16 @@ def _step_binding_pass(
     """Run one forward sweep over static and syntax-node variable bindings."""
     store: dict[str, list[str]] = {k: list(v) for k, v in base.values.items()}
     for key, op, rhs in names.static_bindings:
-        _add_resolved(store, key, op, (rhs,), live)
+        if _add_resolved(store, key, op, (rhs,), live):
+            _mark_unknown(loc_vars, key)
         live.values[key] = tuple(store[key])
     for key, op, nodes, raw in names.raw_bindings:
         vals, loc, _ = _word_candidates(nodes, raw, live)
-        if loc:
-            loc_vars.update((key, key.split("[", 1)[0]))
+        if loc or not vals:
+            _mark_unknown(loc_vars, key)
         if vals:
-            _add_resolved(store, key, op, vals, live)
+            if _add_resolved(store, key, op, vals, live):
+                _mark_unknown(loc_vars, key)
             live.values[key] = tuple(store[key])
     return {k: tuple(v) for k, v in store.items() if v}
 
@@ -2589,7 +2626,7 @@ def _resolve_bindings(names: _Names, seed: _VarScope | None = None) -> _VarScope
     )
     current: dict[str, tuple[str, ...]] = dict(base.values)
     arrays: dict[str, tuple[str, ...]] = dict(base.arrays)
-    loc_vars: set[str] = set(base.locale_vars)
+    loc_vars: set[str] = set(base.locale_vars) | names.unknown_names
     for _ in range(6):
         prev_loc = frozenset(loc_vars)
         live = _VarScope(dict(current), arrays, assigned, prev_loc)
