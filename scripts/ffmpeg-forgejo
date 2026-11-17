@@ -43,6 +43,7 @@
 #   ffmpeg-forgejo close   <number> <comment-file>
 #                          comment on an own open PR, then close it; refuses (exit 80) a PR whose author is not the token login,
 #                          exits 78 when the comment equals an own existing comment, 1 unless the PR reads back closed
+# pr, issue, comment, reply, edit-body and close refuse filler phrases in body files (exit 81).
 # Evidence test claims start with `- test:` or `test:` after optional whitespace.
 # Every such line needs head=<7-40 hex> and tree=<path>; other lines are ignored.
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
@@ -331,6 +332,20 @@ require_current_base() {
   [ "$rc" -ne 3 ] || return 3
   [ "$rc" -ne 1 ] || exit 80
   die "base check: helper exited $rc"
+}
+
+# require_forge_text BODY-FILE: exit 81 for filler, or fail closed on helper errors.
+require_forge_text() {
+  local body_file="$1" self rc
+  self="$(python3 -I -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${BASH_SOURCE[0]}")" \
+    || die "forge text check: cannot resolve helper path: ${BASH_SOURCE[0]}"
+  if python3 -I "${self%/*}/forge_text.py" "$body_file"; then
+    return 0
+  else
+    rc=$?
+  fi
+  [ "$rc" -ne 1 ] || exit 81
+  die "forge text check: helper exited $rc"
 }
 
 # autolabel_state SHA: classify Autolabel contexts or an aged, settled head without one.
@@ -1567,8 +1582,9 @@ for i in json.load(sys.stdin):
     done
     [ $# -eq 3 ] || usage_error "$usage"
     require_sweep "$sweep" "$1"
-    require_clean_merge "$SWEPT_SHA"
     [ -f "$3" ] || die "no body file $3"
+    require_forge_text "$3"
+    require_clean_merge "$SWEPT_SHA"
     is_login "$BOT_REVIEWER" || die "not a login: $BOT_REVIEWER"
     me="$(login)"
     if check_pr_overlap "$1" "$me" "$overlap_ok" first; then rc=0; else rc=$?; fi
@@ -1622,6 +1638,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
   issue)
     [ $# -eq 2 ] || die "usage: issue <title> <body-file>"
     [ -f "$2" ] || die "no body file $2"
+    require_forge_text "$2"
     body="$(mktemp)"
     json_body "title=$1" "body=@$2" >"$body"
     api POST "/repos/$REPO/issues" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
@@ -1638,6 +1655,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     chmod 600 "$snapshot"
     trap 'rm -f "$snapshot"' EXIT
     cat -- "$2" >"$snapshot" || die "cannot read body file $2"
+    require_forge_text "$snapshot"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     me="$(token_login)" || die "cannot read token login"
@@ -1671,6 +1689,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     trap 'rm -f "$reply_snapshot" "$reply_payload"' EXIT
     cat -- "$4" >"$reply_snapshot" || die "cannot read body file $4"
     [ -n "$(tr -d '[:space:]' <"$reply_snapshot")" ] || die "empty body file $4"
+    require_forge_text "$reply_snapshot"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     me="$(token_login)" || die "cannot read token login"
@@ -1696,6 +1715,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     chmod 600 "$snapshot"
     trap 'rm -f "$snapshot"' EXIT
     cat -- "$2" >"$snapshot" || die "cannot read body file $2"
+    require_forge_text "$snapshot"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     # The head re-read after the status check is the base check's pull read: a push in between
@@ -1734,6 +1754,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
     [ -f "$2" ] || die "no comment file $2"
     [ -n "$(tr -d '[:space:]' <"$2")" ] || die "empty comment file $2"
+    require_forge_text "$2"
     me="$(token_login)" || die "cannot read token login"
     require_own_open_pull "$1" "$me"
     discover_page_size
