@@ -83,16 +83,20 @@ filter-deps:
 
 # HISS-04 function-length gate on the applied series. It needs the series
 # applied to an FFmpeg checkout (base..HEAD, one commit per patch), so it is
-# not in the default local gate; CI runs it unconditionally. Run it directly:
+# not in the default local gate. CI runs it on every push to main and every
+# release run; on a non-draft pull request only when scripts/series.py scope
+# selects ffmpeg work. Draft or out-of-scope pull requests skip it. Run directly:
 #   make lengths FFMPEG_TREE=/path/to/applied-ffmpeg
 lengths:
 	@test -n "$(FFMPEG_TREE)" || { echo 'set FFMPEG_TREE to an FFmpeg checkout with the series applied' >&2; exit 1; }
 	@sh .config/lefthook/python.sh scripts/series.py lengths "$(FFMPEG_TREE)"
 
 # verify-all hook for the applied-tree length gate: run it when FFMPEG_TREE
-# names an applied checkout, otherwise skip loudly (never a silent pass) so a
-# tree-less local run says plainly that only CI will catch an over-length
-# function. `make verify-all FFMPEG_TREE=<applied tree>` runs the full gate.
+# names an applied checkout, otherwise skip loudly (never a silent pass).
+# CI runs it on every push to main and every release run; on a non-draft pull
+# request only when scripts/series.py scope selects ffmpeg work. Draft or
+# out-of-scope pull requests skip it; a tree-less local run cannot catch it.
+# `make verify-all FFMPEG_TREE=<applied tree>` runs the full gate.
 lengths-local:
 	@if [ -n "$(FFMPEG_TREE)" ]; then \
 		sh .config/lefthook/python.sh scripts/series.py lengths "$(FFMPEG_TREE)"; \
@@ -102,8 +106,10 @@ lengths-local:
 		  echo '  The HISS-04 applied-tree function-length gate needs the series'; \
 		  echo '  applied to an FFmpeg checkout. Before pushing a patch change run:'; \
 		  echo '    make verify-all FFMPEG_TREE=<applied FFmpeg tree>'; \
-		  echo '  (see "Apply the series" in README.md). CI enforces this gate'; \
-		  echo '  unconditionally, so a tree-less local run cannot catch it.'; \
+		  echo '  (see "Apply the series" in README.md). CI runs this gate on every'; \
+		  echo '  push to main and every release run; on a non-draft pull request only'; \
+		  echo '  when scripts/series.py scope selects ffmpeg work. Draft or out-of-scope'; \
+		  echo '  pull requests skip it; a tree-less local run cannot catch it.'; \
 		} >&2; \
 	fi
 
