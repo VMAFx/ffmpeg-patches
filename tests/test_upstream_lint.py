@@ -484,12 +484,12 @@ class FateShapeTest(unittest.TestCase):
         self,
         source: str,
         added: set[int] | None = None,
-        shell: bool = False,
+        shell_grammar: bool = False,
         graph: dict[str, set[str]] | None = None,
         ffmpeg: set[str] | None = None,
     ):
         """Run per-file rules with explicit aggregation and executable dependencies."""
-        path = "tests/fate-run.sh" if shell else "tests/fate/shape.mak"
+        path = "tests/fate-run.sh" if shell_grammar else "tests/fate/shape.mak"
         if added is None:
             added = set(range(1, len(source.splitlines()) + 1))
         if graph is None:
@@ -498,7 +498,9 @@ class FateShapeTest(unittest.TestCase):
             path, source, added, graph, {"FATE_FFMPEG"} if ffmpeg is None else ffmpeg
         )
 
-    def fixture(self, source: str = "", shell: bool = False, makefile: str | None = "default"):
+    def fixture(
+        self, source: str = "", shell_grammar: bool = False, makefile: str | None = "default"
+    ):
         """Commit one FATE change in the existing isolated disposable Git fixture."""
         fixture = FixtureTest()
         fixture.setUp()
@@ -507,7 +509,7 @@ class FateShapeTest(unittest.TestCase):
             rule = "$(FATE_FFMPEG): ffmpeg$(PROGSSUF)$(EXESUF)\n"
             fixture.write("tests/Makefile", rule if makefile == "default" else makefile)
         if source:
-            path = "tests/fate-run.sh" if shell else "tests/fate/shape.mak"
+            path = "tests/fate-run.sh" if shell_grammar else "tests/fate/shape.mak"
             fixture.write(path, source)
             fixture.commit()
         return fixture
@@ -717,7 +719,7 @@ class FateShapeTest(unittest.TestCase):
         """Shell helpers catch test commands and command variables on the left."""
         for command in ("run x", "ffmpeg x", "ffprobe x", "$showfiltfmts x", '"$@"'):
             with self.subTest(command=command):
-                findings = self.findings(f"    {command} | sort\n", shell=True)
+                findings = self.findings(f"    {command} | sort\n", shell_grammar=True)
                 self.assertEqual([f.rule for f in findings], ["helper-pipe"])
 
     def test_control_word_helper_pipelines_fail(self) -> None:
@@ -729,12 +731,13 @@ class FateShapeTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertEqual(
-                    [f.rule for f in self.findings(command, shell=True)], ["helper-pipe"]
+                    [f.rule for f in self.findings(command, shell_grammar=True)],
+                    ["helper-pipe"],
                 )
 
     def test_control_word_generators_pass(self) -> None:
         """Control words preserve exemptions for literal data generators."""
-        self.assertEqual(self.findings("if printf x | sort; then :; fi", shell=True), [])
+        self.assertEqual(self.findings("if printf x | sort; then :; fi", shell_grammar=True), [])
         for producer in ("printf", "echo", "cat"):
             with self.subTest(producer=producer):
                 self.assertEqual(self.findings(f"CMD = if {producer} x | sort\n"), [])
@@ -743,14 +746,14 @@ class FateShapeTest(unittest.TestCase):
         """Only whole leading control words are skipped in either pipe rule."""
         for prefix in ("if", "then", "elif", "else", "while", "until", "do", "!", "{", "("):
             with self.subTest(prefix=prefix):
-                findings = self.findings(f"{prefix} run x | sort", shell=True)
+                findings = self.findings(f"{prefix} run x | sort", shell_grammar=True)
                 self.assertEqual([f.rule for f in findings], ["helper-pipe"])
                 self.assertEqual(self.findings(f"CMD = {prefix} printf x | sort\n"), [])
         self.assertEqual(
-            [f.rule for f in self.findings("if then ! { ( run x | sort", shell=True)],
+            [f.rule for f in self.findings("if then ! { ( run x | sort", shell_grammar=True)],
             ["helper-pipe"],
         )
-        self.assertEqual(self.findings("ifconfig ffmpeg x | sort", shell=True), [])
+        self.assertEqual(self.findings("ifconfig ffmpeg x | sort", shell_grammar=True), [])
         self.assertEqual(
             [f.rule for f in self.findings("CMD = ifconfig printf x | sort\n")], ["pipe"]
         )
@@ -766,7 +769,7 @@ class FateShapeTest(unittest.TestCase):
             "x=$(ffmpeg x | sort)",
         ):
             with self.subTest(line=line):
-                self.assertEqual(self.findings(line, shell=True), [])
+                self.assertEqual(self.findings(line, shell_grammar=True), [])
 
     def test_shell_quoted_hash_pipelines_fail(self) -> None:
         """Quoted hashes retain helper pipelines for producer status checking."""
@@ -776,7 +779,8 @@ class FateShapeTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertEqual(
-                    [f.rule for f in self.findings(command, shell=True)], ["helper-pipe"]
+                    [f.rule for f in self.findings(command, shell_grammar=True)],
+                    ["helper-pipe"],
                 )
 
     def test_shell_comment_word_boundaries(self) -> None:
@@ -785,7 +789,8 @@ class FateShapeTest(unittest.TestCase):
             with self.subTest(argument=argument):
                 command = f"run x {argument} | sort"
                 self.assertEqual(
-                    [f.rule for f in self.findings(command, shell=True)], ["helper-pipe"]
+                    [f.rule for f in self.findings(command, shell_grammar=True)],
+                    ["helper-pipe"],
                 )
 
     def test_shell_real_comments_and_generators_pass(self) -> None:
@@ -797,7 +802,7 @@ class FateShapeTest(unittest.TestCase):
             "printf '%s\\n' \"#\" | sort",
         ):
             with self.subTest(command=command):
-                self.assertEqual(self.findings(command, shell=True), [])
+                self.assertEqual(self.findings(command, shell_grammar=True), [])
         self.assertEqual(self.findings("CMD = run x # | sort\n"), [])
         self.assertEqual(self.findings("CMD = run x '#' | sort\n"), [])
         makefile = "$(FATE_X): # ffmpeg$(PROGSSUF)$(EXESUF)\n"
@@ -809,11 +814,11 @@ class FateShapeTest(unittest.TestCase):
         source = "ffmpeg -metadata title='#' \\\n    -i input | sort\n"
         for added in ({1}, {2}):
             with self.subTest(added=added):
-                findings = self.findings(source, added, shell=True)
+                findings = self.findings(source, added, shell_grammar=True)
                 self.assertEqual([f.rule for f in findings], ["helper-pipe"])
                 self.assertEqual([f.line for f in findings], list(added))
-        self.assertEqual(self.findings(source, {3}, shell=True), [])
-        self.assertEqual(self.findings("ffmpeg x # comment \\\n | sort\n", shell=True), [])
+        self.assertEqual(self.findings(source, {3}, shell_grammar=True), [])
+        self.assertEqual(self.findings("ffmpeg x # comment \\\n | sort\n", shell_grammar=True), [])
 
     def test_endian_graph_fails(self) -> None:
         """Explicit endian format filters fail for each supported graph option."""
@@ -908,7 +913,7 @@ class FateShapeTest(unittest.TestCase):
         self.assertEqual(self.findings(source, {4}), [])
         self.assertEqual(self.findings("# " + source.splitlines()[0]), [])
         self.assertEqual(self.findings("CMD = run x # | sed s/x/y/\n"), [])
-        self.assertEqual(self.findings("ffmpeg x | sort\n", set(), shell=True), [])
+        self.assertEqual(self.findings("ffmpeg x | sort\n", set(), shell_grammar=True), [])
 
     def test_continuations_report_added_physical_line(self) -> None:
         """Joined commands and registrations report the added continuation line."""
@@ -977,7 +982,7 @@ class FateShapeTest(unittest.TestCase):
 
     def test_range_shell_file_is_checked(self) -> None:
         """The range driver includes added fate-run.sh helper lines."""
-        fixture = self.fixture("ffmpeg x | sort\n", shell=True)
+        fixture = self.fixture("ffmpeg x | sort\n", shell_grammar=True)
         step = upstream_lint._fate_shape(fixture.root, fixture.base, "HEAD", "")
         self.assertEqual(step.rc, 1, step.output)
         self.assertIn("tests/fate-run.sh:1:", step.output)

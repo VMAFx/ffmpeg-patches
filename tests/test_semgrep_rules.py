@@ -130,6 +130,63 @@ def case_not_flagged_oserror_print_err():
         return 1
 """
 
+SHELL_KEYWORD_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
+\"\"\"Fixture functions for shell-keyword-outside-subprocess rule testing.\"\"\"
+
+import subprocess
+
+
+def case_flagged_true():
+    \"\"\"Flagged: plain call passing shell=True.\"\"\"
+    select_grammar(shell=True)
+
+
+def case_flagged_comparison(path):
+    \"\"\"Flagged: plain call passing a comparison as shell.\"\"\"
+    select_grammar(shell=path == "tests/fate-run.sh")
+
+
+def case_flagged_method(selector):
+    \"\"\"Flagged: method call passing shell=True.\"\"\"
+    selector.select_grammar(shell=True)
+
+
+def case_flagged_false_variable():
+    \"\"\"Flagged: a variable holding False is not the literal False.\"\"\"
+    value = False
+    select_grammar(shell=value)
+
+
+def case_flagged_zero():
+    \"\"\"Flagged: zero is not the literal False.\"\"\"
+    select_grammar(shell=0)
+
+
+def case_not_flagged_false():
+    \"\"\"Not flagged: plain call passing the literal False.\"\"\"
+    select_grammar(shell=False)
+
+
+def case_not_flagged_subprocess_false():
+    \"\"\"Not flagged: subprocess call passing shell=False.\"\"\"
+    subprocess.run(["tool"], shell=False)
+
+
+def case_not_flagged_subprocess_true():
+    \"\"\"Not flagged: subprocess calls belong to subprocess-shell-true.\"\"\"
+    subprocess.run("tool", shell=True)
+
+
+def case_not_flagged_shell_grammar():
+    \"\"\"Not flagged: the parameter names the selected grammar.\"\"\"
+    select_grammar(shell_grammar=True)
+
+
+def case_not_flagged_positional():
+    \"\"\"Not flagged: True is passed positionally.\"\"\"
+    select_grammar(True)
+"""
+
 POPEN_PIPE_WAIT_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
 \"\"\"Fixture functions for popen-pipe-wait semgrep rule testing.\"\"\"
 
@@ -721,6 +778,13 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertEqual(
             _flagged_in_fixture(SUBTEST_CLEANUP_FIXTURE, "subtest-cleanup-outside-finally"),
             _expected_flagged(SUBTEST_CLEANUP_FIXTURE),
+        )
+
+    def test_shell_keyword_outside_subprocess_rule(self) -> None:
+        """Rule mirrors B604 for shell keywords except literal False and subprocess calls."""
+        self.assertEqual(
+            _flagged_in_fixture(SHELL_KEYWORD_FIXTURE, "shell-keyword-outside-subprocess"),
+            _expected_flagged(SHELL_KEYWORD_FIXTURE),
         )
 
 

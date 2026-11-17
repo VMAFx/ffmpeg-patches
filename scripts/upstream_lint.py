@@ -759,9 +759,9 @@ def _fate_shell_uncomment(text: str) -> str:
     return text
 
 
-def _fate_lines(source: str, *, shell: bool = False) -> list[FateLine]:
+def _fate_lines(source: str, *, shell_grammar: bool = False) -> list[FateLine]:
     """Join continuations with syntax-specific comments and physical endpoints."""
-    uncomment = _fate_shell_uncomment if shell else _fate_uncomment
+    uncomment = _fate_shell_uncomment if shell_grammar else _fate_uncomment
     lines, parts, first = [], [], 1
     for number, text in enumerate(source.splitlines(), 1):
         if not parts:
@@ -1423,13 +1423,13 @@ def _fate_shape_producer(segment: str) -> str:
     return ""
 
 
-def _fate_shape_pipes(command: str, shell: bool) -> list[str]:
+def _fate_shape_pipes(command: str, shell_grammar: bool) -> list[str]:
     """Report test producers while allowing only literal data-generator commands."""
     messages, start = [], 0
     for index, operator in _fate_shell_operators(command):
         first = _fate_shape_producer(command[start:index])
         test = first in {"run", "ffmpeg", "ffprobe"} or first.startswith("$")
-        refused = test if shell else bool(first) and first not in {"printf", "echo", "cat"}
+        refused = test if shell_grammar else bool(first) and first not in {"printf", "echo", "cat"}
         if operator == "|" and refused:
             messages.append(f"{first}: pipeline hides producer exit status")
         start = index + len(operator)
@@ -1631,7 +1631,7 @@ def _fate_shape_file(
     ffmpeg: set[str],
 ) -> list[FateShapeFinding]:
     """Check shared logical lines and report only added physical provenance."""
-    lines = _fate_lines(source, shell=path == "tests/fate-run.sh")
+    lines = _fate_lines(source, shell_grammar=path == "tests/fate-run.sh")
     if path == "tests/fate-run.sh":
         return [
             FateShapeFinding("helper-pipe", number, message)
