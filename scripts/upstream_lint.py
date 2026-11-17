@@ -1928,8 +1928,13 @@ def _reference_finding(
     before = lines[index - 1] if index else ""
     findings: list[str] = []
     for ref in TEXI_REF.finditer(lines[index]):
-        args = _texi_ref_arguments(lines[index][ref.end() :])
-        if not args or (len(args) > 3 and args[3]):
+        text = lines[index][ref.end() :]
+        args = _texi_ref_arguments(text)
+        if not args:
+            args = _texi_ref_arguments(" ".join([text, *lines[index + 1 : index + 4]]))
+        if not args:
+            args = [re.split(r"[,}]", text, maxsplit=1)[0].strip()]
+        if len(args) > 3 and args[3]:
             continue
         target = anchors.get(args[0])
         if target is None or not sections[index]:

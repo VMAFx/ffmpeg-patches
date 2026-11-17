@@ -1747,6 +1747,36 @@ class DocReferenceTest(unittest.TestCase):
                     lines[10] = f"the @{command}{{libaom-av1-qpfile{arguments}}} for details."
                     self.assertEqual(len(self.findings("\n".join(lines))), 1)
 
+    def test_wrapped_local_reference_is_found(self) -> None:
+        """A closing brace on the next line preserves local reference findings."""
+        for command in ("ref", "xref", "pxref"):
+            for arguments in ("\n", ",,\nTitle", ",,\nTitle,"):
+                with self.subTest(command=command, arguments=arguments):
+                    lines = REFERENCE_TEXT.splitlines()
+                    lines[10] = f"the @{command}{{libaom-av1-qpfile{arguments}}} for details."
+                    self.assertEqual(self.findings("\n".join(lines)), self.findings(REFERENCE_TEXT))
+
+    def test_wrapped_reference_to_external_manual_passes(self) -> None:
+        """An external manual on any of the three following lines suppresses findings."""
+        for command in ("ref", "xref", "pxref"):
+            for arguments in (
+                ",,,\nothermanual",
+                ",,Title,\nothermanual, Printed Manual",
+                ",,\nTitle,\n\nothermanual",
+            ):
+                with self.subTest(command=command, arguments=arguments):
+                    lines = REFERENCE_TEXT.splitlines()
+                    lines[10] = f"the @{command}{{libaom-av1-qpfile{arguments}}} for details."
+                    self.assertEqual(self.findings("\n".join(lines)), [])
+
+    def test_reference_unclosed_within_bound_is_found(self) -> None:
+        """Missing braces or a close beyond three following lines keep references local."""
+        for suffix in ("", ",,\nTitle,\nothermanual", ",,\nTitle,\n\n\nothermanual}"):
+            with self.subTest(suffix=suffix):
+                lines = REFERENCE_TEXT.splitlines()[:11]
+                lines[10] = f"the @ref{{libaom-av1-qpfile{suffix}"
+                self.assertEqual(self.findings("\n".join(lines)), self.findings(REFERENCE_TEXT))
+
     def test_item_without_other_library_passes(self) -> None:
         """An anchored item that names no library of its section passes."""
         text = REFERENCE_TEXT.replace("libaom reads a missing offset as 0", "a gap reads as 0")
