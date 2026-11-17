@@ -1187,6 +1187,287 @@ SCRIPT_DIR = {
     "r16-keep-command-output-option": Case(
         DOLLAR0 + 'CC=true\nout=a\n"$CC" -o "$out" "$1"\n' + SRC + RUN, 0, files=OTHER
     ),
+    "r18-translated-printf-dest": Case(
+        CDPWD + "printf -v $\"OTHER\" '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r18-translated-callee": Case(
+        CDPWD + GH + 'f() { $"jx"; }\nHERE=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r18-translated-concat-read": Case(
+        DOLLAR0 + 'read -r H$"OTHER" <<< <case>/other\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r18-translated-source-path": Case(
+        DOLLAR0 + '. $"HERE/lib.sh"\n' + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r18-keep-translated-echo": Case(
+        DOLLAR0 + 'msg=$"hello"\necho $"world" "$msg"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-escaped-dollar-printf": Case(
+        DOLLAR0 + 'printf "%s\\n" \\$"OTHER"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-prefix-command-eval": Case(
+        CDPWD + "HERE=<case>/other command eval '. \"$HERE/lib.sh\"'\n" + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-prefix-builtin-source": Case(
+        DOLLAR0 + 'HERE=<case>/other builtin source "$HERE/lib.sh"\n' + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-prefix-wrapper-chain-dot": Case(
+        CDPWD + 'HERE=<case>/other builtin command -p -- . "$HERE/lib.sh"\n' + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-prefix-command-trap": Case(
+        DOLLAR0 + "HERE=<case>/other command trap '. \"$HERE/lib.sh\"' EXIT\n" + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-keep-prefix-command-true": Case(
+        DOLLAR0 + "HERE=<case>/other command -p true\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-prefix-command-describe": Case(
+        DOLLAR0 + "HERE=<case>/other command -v eval\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-command-word-read": Case(
+        CDPWD + 'c=read\nn=HE\nm=RE\n"$c" "$n$m" <<< <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-parts": Case(
+        CDPWD + 'a=re\nb=ad\nn=HE\nm=RE\n"$a$b" -r "$n$m" <<< <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-declare": Case(
+        DOLLAR0 + 'a=dec\nn=HE\nm=RE\n"${a}"lare "$n$m=<case>/other"\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-printf-opt": Case(
+        CDPWD + 'c=printf\nopt=-v\nn=HE\nm=RE\n"$c" "$opt" "$n$m" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-eval": Case(
+        CDPWD + 'c=eval\nn=HE\nm=RE\n"$c" "$n$m=<case>/other"\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-trap": Case(
+        CDPWD + 'c=trap\nn=HE\nm=RE\n"$c" "$n$m=<case>/other" DEBUG\n:\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-source": Case(
+        CDPWD + 'a=sou\nb=rce\nc="$a$b"\n"$c" <case>/tools/w.sh\n' + SRC,
+        2,
+        WRITTEN,
+        {"tools/w.sh": "HERE=<case>/other\n", "other/lib.sh": CFG},
+    ),
+    "r18-command-word-dot": Case(
+        DOLLAR0 + 'c=${missing:-.}\n"$c" <case>/tools/w.sh\n' + SRC,
+        2,
+        WRITTEN,
+        {"tools/w.sh": "HERE=<case>/other\n", "other/lib.sh": CFG},
+    ),
+    "r18-keep-command-word-echo": Case(
+        DOLLAR0 + 'c=echo\nx=hi\n"$c" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-command-word-parts-true": Case(
+        DOLLAR0 + 'a=tr\nb=ue\nx=hi\n"$a$b" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-command-word-printf-plain": Case(
+        DOLLAR0 + 'c=printf\nx=hi\n"$c" "%s\\n" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-command-word-default-prog": Case(
+        DOLLAR0 + 'TOOL=${TOOL:-true}\nx=hi\n"$TOOL" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r19-command-word-source-written": Case(
+        DOLLAR0
+        + "HERE=<case>/other command eval ':'\n"
+        + 'c=source\n"$c" <case>/tools/w.sh\n'
+        + SRC,
+        2,
+        WRITTEN,
+        {"tools/w.sh": "HERE=<case>/other\n", "other/lib.sh": CFG},
+    ),
+    "r19-keep-translated-slash": Case(
+        DOLLAR0 + 'bash $"OTHER/inner.sh"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-translated-unset-dest": Case(DOLLAR0 + 'unset $"OTHER"\n' + SRC, 2, WRITTEN, OTHER),
+    "r20-translated-declare-dest": Case(
+        CDPWD + 'declare $"OTHER=<case>/other"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-translated-concat-source": Case(
+        DOLLAR0 + '. "$HERE/lib"$".sh"\n' + RUN,
+        2,
+        UNKNOWN_SOURCE,
+        {"tools/lib": "X=1\n", "tools/lib.sh": CFG},
+    ),
+    "r20-translated-quoted-source": Case(
+        DOLLAR0 + ". '<case>/tools/lib.sh'$\"x\"\n" + SRC + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r20-keep-translated-quoted-prog": Case(
+        DOLLAR0 + "'<case>/other/lib.sh'$\"x\"\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-translated-long-opt-compress": Case(
+        DOLLAR0 + 'sort --compress-program=$"configure" data.txt\n' + SRC + RUN, 2, "configure"
+    ),
+    "r20-translated-brace-source": Case(
+        DOLLAR0 + '. {}$"x"\n' + SRC + RUN, 2, UNKNOWN_SOURCE, {"{}": "X=1\n", **OTHER}
+    ),
+    "r20-translated-expanded-source": Case(
+        DOLLAR0 + '. $"$HERE/lib.sh"\n' + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r20-translated-expanded-assign-before": Case(
+        'a=1\nX=$"$a"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r20-printf-attached-translated-dest": Case(
+        CDPWD + "printf -v$\"OTHER\" '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-printf-prefixed-translated-dest": Case(
+        CDPWD + "printf -vH$\"OTHER\" '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-compgen-attached-translated-dest": Case(
+        CDPWD + 'compgen -W <case>/other -VH$"OTHER"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-wait-attached-translated-dest": Case(
+        CDPWD + 'wait -pH$"OTHER"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-prefix-command-translated-opt": Case(
+        DOLLAR0 + "HERE=<case>/other command -$\"p\" eval ':'\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-prefix-bash-translated-opt": Case(
+        DOLLAR0 + 'HERE=<case>/other bash -$"c" \'. "$HERE/lib.sh"\'\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-keep-pid-before-quoted": Case(
+        DOLLAR0 + 'printf "%s\\n" $$"OTHER"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-translated-leading-printf-opt": Case(
+        CDPWD + "dest=${missing:-H}ERE\nprintf $\"-v\"'' \"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-translated-leading-bash-opt": Case(
+        CDPWD + "HERE=<case>/other bash $\"-c\"'' '. \"$HERE/lib.sh\"'\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-translated-concat-printf-opt": Case(
+        CDPWD + "dest=${missing:-H}ERE\nprintf ''$\"-v\" \"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-translated-expanded-printf-opt": Case(
+        CDPWD + "o=v\ndest=${missing:-H}ERE\nprintf ''$\"-$o\" \"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-declare-var-translated-suffix": Case(CDPWD + 'declare H$"x"=1\n' + SRC, 2, WRITTEN, OTHER),
+    "r20-keep-declare-split-translated-rhs": Case(
+        DOLLAR0 + 'declare x"="$"y"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-prefix-loop-translated-list": Case(
+        DOLLAR0 + 'for k in $"${!GIT_@}"; do unset "$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r20-prefix-loop-translated-var": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do unset $"$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r20-keep-translated-escaped-name": Case(
+        DOLLAR0 + 'echo $"H\\\nERE"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-keep-prefix-command-glob-fn": Case(
+        DOLLAR0 + 'f*x() { . "$HERE/lib.sh"; }\nHERE=<case>/other command true\n' + SRC + RUN,
+        0,
+        files=OTHER,
+    ),
+    "r20-keep-prefix-command-braced-fn": Case(
+        DOLLAR0 + 'f[x]() { . "$HERE/lib.sh"; }\nHERE=<case>/other command -p :\n' + SRC + RUN,
+        0,
+        files=OTHER,
+    ),
+    "r20-sourced-uses-caller-command-var": Case(
+        CDPWD + 'c=read\n. "$HERE/w.sh"\n' + SRC,
+        2,
+        AMBIGUOUS,
+        {"tools/w.sh": 'n=HE\nm=RE\n"$c" "$n$m" <<< <case>/other\n', "other/lib.sh": CFG},
+    ),
+    "r20-caller-uses-sourced-command-var": Case(
+        DOLLAR0 + '. "$HERE/def.sh"\n"$c" <case>/other/lib.sh\n',
+        2,
+        "tree/configure",
+        {"tools/def.sh": 'a=ba\nb=sh\nc="$a$b"\n', "other/lib.sh": CFG},
+    ),
+    "r20-keep-sourced-command-var-true": Case(
+        DOLLAR0 + '. "$HERE/def.sh"\nx=hi\n"$c" "$x"\n' + SRC + RUN,
+        0,
+        files={"tools/def.sh": 'a=tr\nb=ue\nc="$a$b"\n', **OTHER},
+    ),
+    "r20-command-word-bash-script": Case(
+        DOLLAR0 + 'a=ba\nb=sh\nc="$a$b"\n"$c" "$HERE/lib.sh"\n',
+        2,
+        "tree/configure",
+        {"tools/lib.sh": CFG},
+    ),
+    "r20-inline-uses-top-command-var": Case(
+        DOLLAR0 + 'a=ba\nb=sh\nc="$a$b"\nbash -c \'"$c" <case>/other/lib.sh\'\n',
+        2,
+        "tree/configure",
+        OTHER,
+    ),
+    "r20-glob-defined-fn-prefix": Case(
+        CDPWD + 'f*x() { . "$HERE/lib.sh"; }\nHERE=<case>/other gh\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r20-sourced-prefix-glob-fn": Case(
+        DOLLAR0 + 'f*x() { . "$HERE/lib.sh"; }\n. "$HERE/call.sh"\n' + RUN,
+        2,
+        SOURCED,
+        {"tools/call.sh": "HERE=<case>/other gh\n", "other/lib.sh": CFG},
+    ),
+    "r21-wait-concat-translated-dest": Case(
+        CDPWD + "wait ''-pH$\"OTHER\"\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r21-prefix-loop-read-translated-var": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do read -r $"$k" <<< <case>/other; done\n' + SRC + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r21-translated-source-option": Case(
+        DOLLAR0 + '. -$"p" <case>/tools/lib.sh\n' + SRC + RUN,
+        2,
+        "source option the guard does not follow",
+        OTHER,
+    ),
+    "r21-escaped-dollar-quoted-source": Case(
+        DOLLAR0 + ". '<case>/tools/lib'\\$\".sh\"\n" + RUN,
+        2,
+        UNKNOWN_SOURCE,
+        {"tools/lib$.sh": CFG},
+    ),
 }
 
 
@@ -1234,8 +1515,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 412 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 412)
+        """Replay all 476 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 476)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

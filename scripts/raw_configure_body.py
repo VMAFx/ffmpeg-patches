@@ -126,6 +126,7 @@ WORD_PARTS = (
 )
 # An unquoted word with a glob or brace pattern expands at run time (bash 5.3 manual 3.5.1, 3.5.8).
 GLOB_OR_BRACE = re.compile(r"[*?[]|\{[^}]*(?:,|\.\.)")
+TRANSLATED_SPAN = re.compile(r'\$"(?:\\.|[^"\\])*"', re.S)
 WORD_ESCAPE = re.compile(r"\\(.)", re.S)
 STRING_ESCAPE = re.compile(r'\\([$`"\\\n])')
 # ANSI-C quoting escapes (bash 5.3 manual 3.1.2.4); an unknown escape keeps its backslash.
@@ -151,6 +152,13 @@ ANSI_C_SIMPLE = {
 WRITER_NODES = frozenset(["command", "declaration_command", "unset_command"])
 # Builtins that run their operands as shell text: eval now, trap when the signal arrives.
 EVAL_BUILTINS = frozenset(["eval", "trap"])
+SHELL_TEXT_BUILTINS = EVAL_BUILTINS | frozenset([".", "source"])
+BRACE_CHOICES = re.compile(r"\{([A-Za-z0-9_.-]+(?:,[A-Za-z0-9_.-]*)+)\}")
+PLAIN_BRACE_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]+\])?)\}")
+ARRAY_ALL_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}")
+CASE_BRACE_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(\^\^?|,,?)\}")
+FALLBACK_BRACE_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*|[0-9]+)(:?[-+=])(.*)\}", re.S)
+INDEXED_TARGET = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\[([0-9]+)\]")
 # Words before a command that keep a shell function or eval in reach: time runs a function,
 # and builtin or command can run eval (measured on bash 5.3.20). An external wrapper such as
 # env or timeout, and exec, run a program and never a function of this shell.
@@ -514,6 +522,16 @@ WRITERS = {
 }
 
 
+@dataclass(frozen=True)
+class _VarScope:
+    """Hold resolved variable and array values, locale names and assigned names."""
+
+    values: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    arrays: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    assigned: frozenset[str] = frozenset()
+    locale_vars: frozenset[str] = frozenset()
+
+
 @dataclass
 class _Scan:
     """Keep one file's ordered traversal and candidate state."""
@@ -544,6 +562,7 @@ class _Scan:
     dynamic_callers: set[str] = field(default_factory=set)
     late_dirs: set[str] = field(default_factory=set)
     pending: list[tuple[str, bool, bool, frozenset[str]]] = field(default_factory=list)
+    var_scope: _VarScope = field(default_factory=_VarScope)
     moved: bool = False
     rebound: bool = False
     prefix: str | None = None
@@ -576,8 +595,9 @@ def _text(node: Any, raw: bytes) -> str:
 
 def _configure_reference(word: str) -> bool:
     """Recognize configure references while leaving unrelated dynamic data undecided."""
+    masked = TRANSLATED_SPAN.sub("$", word).translate(STRIP_CHARS)
+    decidable = DECIDABLE_NAME.fullmatch(os.path.basename(masked))
     literal = word.translate(STRIP_CHARS)
-    decidable = DECIDABLE_NAME.fullmatch(os.path.basename(literal))
     return _is_configure_word(word) and bool(decidable or CONFIGURE_WORD.search(literal))
 
 
@@ -625,19 +645,16 @@ def _referenced(word: str, names: Iterable[str]) -> frozenset[str]:
 
 
 def _reference_refusal(word: str, scan: _Scan) -> str | None:
-    """Name the refusal for a word referencing an ambiguous, unresolved or refused script dir.
-
-    A name that a prefix assignment holds in the function body being walked refuses first.
-    """
+    """Name the refusal for a prefix-held, unresolved, refused or ambiguous reference."""
     if _referenced(word, scan.span_names):
         return PREFIXED_FUNCTION_SCRIPT_DIR
-    if _referenced(word, scan.ambiguous):
-        return AMBIGUOUS_SCRIPT_PATH
     if _referenced(word, scan.unresolved_dirs):
         return UNRESOLVED_SCRIPT_DIR
     refused = _referenced(word, scan.refused_dirs)
     if refused:
         return scan.refused_dirs[min(refused)]
+    if _referenced(word, scan.ambiguous):
+        return AMBIGUOUS_SCRIPT_PATH
     return None
 
 
@@ -702,7 +719,8 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     root = bash_parser().parse(raw).root_node
     if source:
         watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
-        names = _assignment_texts(root, raw, scan.budget)
+        names = _assignment_texts(root, raw, scan.budget, scan.var_scope)
+        scan.var_scope = _merge_scopes(scan.var_scope, names.var_scope)
         scan.source_literals[id(root)] = _literal_map(names, raw, watched)
         _note_prefix_calls(names, scan)
     scan.stack.append((root, raw, False))
@@ -718,35 +736,125 @@ def _file_target(target: str | None, scan: _Scan) -> str | None:
     return None
 
 
+def _translated_string(node: Any, raw: bytes) -> bool:
+    """Identify a locale-translated $"..." node in either tree-sitter-bash shape."""
+    if node.type == "translated_string":
+        return True
+    prev = node.prev_sibling if node.type == "string" else None
+    return prev is not None and (_anonymous_dollar(prev) or _dollar_prefix(prev, raw))
+
+
+def _dollar_prefix(node: Any, raw: bytes) -> bool:
+    """Identify a multi-byte $ token immediately preceding a translated string."""
+    span = raw[node.start_byte : node.end_byte]
+    is_prefix = (
+        not node.is_named
+        and node.type == "$"
+        and len(span) > 1
+        and not span.endswith((b"\\$", b"$$"))
+    )
+    nxt = node.next_sibling if is_prefix else None
+    return nxt is not None and nxt.type == "string" and node.end_byte == nxt.start_byte
+
+
+def _anonymous_dollar(node: Any) -> bool:
+    """Identify a one-byte anonymous $ token immediately preceding a string node."""
+    nxt = node.next_sibling
+    return (
+        not node.is_named
+        and node.type == "$"
+        and node.end_byte - node.start_byte == 1
+        and nxt is not None
+        and nxt.type == "string"
+        and node.end_byte == nxt.start_byte
+    )
+
+
+def _part_start(node: Any, raw: bytes) -> int:
+    """Return a word part's start byte, including any leading anonymous $ token."""
+    if node.type == "string" and _translated_string(node, raw) and not node.prev_sibling.is_named:
+        return node.prev_sibling.start_byte
+    return node.start_byte
+
+
+def _translated_spans(node: Any, raw: bytes) -> list[tuple[int, int]]:
+    """Collect byte spans of locale-translated $"..." strings within a command."""
+    spans: list[tuple[int, int]] = []
+    stack = [node]
+    for _ in range(MAX_BODY_NODES):
+        if not stack:
+            break
+        cur = stack.pop()
+        if _translated_string(cur, raw):
+            start = cur.prev_sibling.start_byte if cur.type == "string" else cur.start_byte
+            spans.append((start, cur.end_byte))
+        elif cur.type not in SUBSHELLS:
+            stack.extend(reversed(cur.named_children))
+    return sorted(spans)
+
+
+def _tokenize_span(
+    raw: bytes, start: int, end: int, translated: list[tuple[int, int]]
+) -> list[str]:
+    """Tokenize a non-assignment command span while keeping $"..." segments intact."""
+    local = [(s, e) for s, e in translated if start <= s and e <= end]
+    if not local:
+        text = raw[start:end].decode("utf-8", "surrogateescape")
+        tokens = _tokens(text)
+        return tokens if tokens is not None else [text.translate(STRIP_CHARS)]
+    parts: list[bytes] = []
+    reps: list[tuple[str, str]] = []
+    cursor = start
+    for idx, (s, e) in enumerate(local):
+        tag = f"__RCG_TR_{idx}__"
+        parts.extend((raw[cursor:s], tag.encode("ascii")))
+        reps.append((tag, raw[s:e].decode("utf-8", "surrogateescape")))
+        cursor = e
+    parts.append(raw[cursor:end])
+    rewritten = b"".join(parts).decode("utf-8", "surrogateescape")
+    tokens = _tokens(rewritten)
+    out = tokens if tokens is not None else [rewritten.translate(STRIP_CHARS)]
+    for tag, orig in reps:
+        out = [tok.replace(tag, orig) for tok in out]
+    return out
+
+
+def _ignored_command_child(node: Any, idx: int, child: Any, raw: bytes) -> bool:
+    """Tell whether a command child is punctuation, a redirect or an anonymous $ prefix."""
+    if _anonymous_dollar(child):
+        return True
+    field_name = node.field_name_for_child(idx)
+    if child.type != "variable_assignment" and field_name not in ("name", "argument"):
+        return True
+    value = _text(child, raw)
+    return bool(re.fullmatch(r"\{[A-Za-z_][A-Za-z_0-9]*\}", value)) and raw[
+        child.end_byte : child.end_byte + 1
+    ] in (b"<", b">")
+
+
 def _command_spans(node: Any, raw: bytes) -> list[tuple[int, int, bool]]:
     """Collect adjacent command fields while keeping assignments in their own spans."""
     spans: list[tuple[int, int, bool]] = []
-    children = node.children
-    for i in range(len(children)):
-        child = children[i]
-        field_name = node.field_name_for_child(i)
-        if child.type != "variable_assignment" and field_name not in ("name", "argument"):
-            continue
-        value = _text(child, raw)
-        if re.fullmatch(r"\{[A-Za-z_][A-Za-z_0-9]*\}", value) and raw[
-            child.end_byte : child.end_byte + 1
-        ] in (b"<", b">"):
+    for i, child in enumerate(node.children):
+        if _ignored_command_child(node, i, child, raw):
             continue
         assignment = child.type == "variable_assignment"
         if spans and not assignment and not spans[-1][2] and spans[-1][1] == child.start_byte:
             spans[-1] = (spans[-1][0], child.end_byte, False)
         else:
-            spans.append((child.start_byte, child.end_byte, assignment))
+            spans.append((_part_start(child, raw), child.end_byte, assignment))
     return spans
 
 
 def _command_words(node: Any, raw: bytes) -> list[str]:
     """Tokenize command fields while preserving each assignment as a single word."""
     words: list[str] = []
+    translated = _translated_spans(node, raw)
     for start, end, assignment in _command_spans(node, raw):
-        text = raw[start:end].decode("utf-8", "surrogateescape")
-        tokens = [text] if assignment else _tokens(text)
-        words.extend(tokens if tokens is not None else [text.translate(STRIP_CHARS)])
+        if assignment:
+            words.append(raw[start:end].decode("utf-8", "surrogateescape"))
+        else:
+            words.extend(_tokenize_span(raw, start, end, translated))
     return [word for word in words if word not in ("(", ")")]
 
 
@@ -1048,21 +1156,54 @@ def _assignment_hit(node: Any, raw: bytes) -> str | None:
     return None
 
 
+def _dispatch_command(
+    node: Any, raw: bytes, tail: list[str], scan: _Scan
+) -> tuple[bool, str | None]:
+    """Dispatch shell, source, eval, trap or direct configure words for a command head."""
+    name = os.path.basename(tail[0])
+    if name in SHELLS:
+        return True, _shell_command(node, raw, tail, scan)
+    if name in ("source", "."):
+        return True, _shell_command(node, raw, tail, scan, source=True)
+    if name in EVAL_BUILTINS:
+        if name == "eval":
+            _queue_inline(" ".join(tail[1:]), scan)
+        else:
+            _trap_program(tail[1:], scan)
+        return True, None
+    if "$" not in tail[0] and "`" not in tail[0] and _is_configure_word(tail[0]):
+        return True, tail[0]
+    return False, None
+
+
+def _inspect_resolved_command(
+    node: Any, raw: bytes, words: list[str], idx: int, scan: _Scan
+) -> tuple[bool, str | None]:
+    """Dispatch candidate invocations resolved from a run-time or clustered command head."""
+    base_idx, calls, _ = _resolved_invocations(node, raw, scan.var_scope)
+    any_handled = False
+    for head, extra, pos in calls:
+        tail = [head, *extra, *words[idx + max(pos - base_idx, 1) :]]
+        sub_handled, sub_hit = _dispatch_command(node, raw, tail, scan)
+        if sub_hit is not None or scan.refusal is not None:
+            return True, sub_hit
+        any_handled |= sub_handled
+    return any_handled, None
+
+
 def _inspect_command(node: Any, raw: bytes, scan: _Scan) -> str | None:
     """Classify command position, wrappers and executable paths without following call cycles."""
-    words, idx, name = _command_info(node, raw, _live_literals(scan))
+    words, idx, _ = _command_info(node, raw, _live_literals(scan))
     if idx >= len(words):
         return None
-    if name in SHELLS:
-        return _shell_command(node, raw, words[idx:], scan)
-    if name in ("source", "."):
-        return _shell_command(node, raw, words[idx:], scan, source=True)
-    if name == "eval":
-        _queue_inline(" ".join(words[idx + 1 :]), scan)
-        return None
-    if name == "trap":
-        _trap_program(words[idx + 1 :], scan)
-        return None
+    handled, hit = _dispatch_command(node, raw, words[idx:], scan)
+    if handled:
+        return hit
+    clustered = idx > 0 and words[idx - 1] in ("command", "builtin") and words[idx].startswith("-")
+    if "$" in words[idx] or clustered:
+        res_handled, res_hit = _inspect_resolved_command(node, raw, words, idx, scan)
+        if res_handled:
+            return res_hit
     return _ordinary_command(words, idx, scan)
 
 
@@ -1638,13 +1779,21 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
     return hit
 
 
+def _function_key(node: Any, raw: bytes) -> str | None:
+    """Return a function's quote-removed name, or $-prefixed text when dynamic."""
+    name_node = node.child_by_field_name("name")
+    if name_node is None:
+        return None
+    value, dynamic = _static_value([name_node], raw)
+    return f"${_text(name_node, raw)}" if dynamic >= 0 else value
+
+
 def _note_prefix_span(node: Any, raw: bytes, scan: _Scan) -> None:
     """Note a walked function and mark its body if the script calls it under a prefix assignment."""
-    name_node = node.child_by_field_name("name")
+    name = _function_key(node, raw)
     body = node.child_by_field_name("body")
-    if name_node is None or body is None:
+    if name is None or body is None:
         return
-    name = _text(name_node, raw)
     scan.walked_functions.add(name)
     held = scan.prefixed_functions.get(name)
     if held:
@@ -1815,14 +1964,7 @@ def _settle_script_dir(node: Any, raw: bytes, scan: _Scan) -> None:
 
 @dataclass
 class _Names:
-    """Statement assignments, assigned names, plain-assignment name starts and skipped spans.
-
-    Skipped spans are comments and quoted here-document bodies, which Bash never expands.
-    Spelled words are words whose text differs after quote removal; calls holds the words
-    each function body spells that way, and inline the eval and trap texts left to parse.
-    dynamic_write marks a writer that names a variable at run time, and prefix_writes the
-    prefixes such a writer is narrowed to by a "${!PREFIX@}" loop.
-    """
+    """Statement assignments, assigned names, plain-assignment name starts and skipped spans."""
 
     assignments: list[str] = field(default_factory=list)
     assigned: set[str] = field(default_factory=set)
@@ -1836,7 +1978,28 @@ class _Names:
     calls: dict[str, set[str]] = field(default_factory=dict)
     dynamic_callers: set[str] = field(default_factory=set)
     inline: list[str] = field(default_factory=list)
+    raw_bindings: list[tuple[str, str, list[Any], bytes]] = field(default_factory=list)
+    static_bindings: list[tuple[str, str, str]] = field(default_factory=list)
+    array_bindings: list[tuple[str, list[Any], bytes]] = field(default_factory=list)
+    writer_nodes: list[tuple[Any, bytes, tuple[str, ...]]] = field(default_factory=list)
+    var_scope: _VarScope = field(default_factory=_VarScope)
     parsed: int = 0
+
+
+def _merge_scopes(left: _VarScope, right: _VarScope) -> _VarScope:
+    """Combine variable scopes from a caller and an inlined sourced script."""
+    values = dict(left.values)
+    for key, items in right.values.items():
+        values[key] = tuple(dict.fromkeys((*values.get(key, ()), *items)))[:16]
+    arrays = dict(left.arrays)
+    for key, items in right.arrays.items():
+        arrays[key] = tuple(dict.fromkeys((*arrays.get(key, ()), *items)))[:16]
+    return _VarScope(
+        values,
+        arrays,
+        left.assigned | right.assigned,
+        left.locale_vars | right.locale_vars,
+    )
 
 
 def _plain_start(node: Any) -> int | None:
@@ -1864,8 +2027,8 @@ def _note_assignment(node: Any, raw: bytes, names: _Names) -> None:
         names.starts.add(start)
 
 
-def _prefix_command(node: Any, raw: bytes) -> str | None:
-    """Return the plain word naming the command a prefix assignment runs with, if there is one."""
+def _prefix_head(node: Any, raw: bytes) -> str | None:
+    """Return the unquoted plain first word of a prefixed command, if there is one."""
     command_name = node.parent.child_by_field_name("name")
     parts = command_name.named_children if command_name is not None else []
     if len(parts) != 1 or parts[0].type != "word" or parts[0].named_children:
@@ -1874,31 +2037,135 @@ def _prefix_command(node: Any, raw: bytes) -> str | None:
     return word if PLAIN_WORD.fullmatch(word) is not None else None
 
 
-def _note_prefix(node: Any, raw: bytes, names: _Names) -> None:
-    """Record the name start and command of an = prefix before a plain non-special command.
+def _dynamic_shell_flag(value: str, dynamic: int, has_more: bool) -> bool:
+    """Tell whether an option-position shell argument can supply a -c flag at run time."""
+    if dynamic < 0:
+        return False
+    return value.startswith("-") or (dynamic == 0 and has_more)
 
-    Bash keeps such a prefix assignment for that one command and restores the old value after
-    it (bash 5.3 manual 4.4: only a special builtin in POSIX mode keeps it), so it writes no
-    value for later statements. A prefix before a special builtin, a quoted or computed
-    command name, or no command at all counts as a write. The command word is kept, because a
-    function called this way sees the prefix value in its whole body.
-    """
+
+def _runs_shell_text(target: str, args: list[tuple[str, int]]) -> bool:
+    """Tell whether a prefixed target command can execute inline or sourced shell text."""
+    if target in SHELL_TEXT_BUILTINS:
+        return True
+    if os.path.basename(target) not in SHELLS:
+        return False
+    for pos, (value, dynamic) in enumerate(args):
+        if dynamic < 0 and value in ("--", "-"):
+            break
+        if _dynamic_shell_flag(value, dynamic, pos + 1 < len(args)):
+            return True
+        if not value.startswith(("-", "+")):
+            break
+    operand, inline = _shell_argument([target, *(value for value, _ in args)])
+    return inline or operand in (None, "-")
+
+
+def _classify_wrapper_opt(wrapper: str, opt: str, dynamic: int) -> str:
+    """Classify one option word after a command or builtin wrapper."""
+    if opt == "--" and dynamic < 0:
+        return "dashdash"
+    if dynamic >= 0:
+        return "dynamic"
+    if not opt.startswith("-") or opt == "-":
+        return "operand"
+    if wrapper == "builtin" or any(ch not in "pVv" for ch in opt[1:]):
+        return "invalid"
+    return "describe" if ("v" in opt[1:] or "V" in opt[1:]) else "keep"
+
+
+def _step_prefix_wrapper(wrapper: str, values: list[tuple[str, int]], idx: int) -> int | None:
+    """Advance past one command or builtin wrapper's options; None marks a run-time option."""
+    describe = False
+    end = len(values)
+    for pos in range(idx, end):
+        kind = _classify_wrapper_opt(wrapper, values[pos][0], values[pos][1])
+        if kind == "dynamic":
+            return None
+        if kind == "invalid":
+            return end
+        if kind in ("dashdash", "operand"):
+            if describe:
+                return end
+            return pos + int(kind == "dashdash")
+        describe |= kind == "describe"
+    return end
+
+
+def _unwrap_prefix_chain(values: list[tuple[str, int]]) -> tuple[int, bool] | None:
+    """Unwrap a leading chain of command and builtin wrappers and track command presence."""
+    idx = 0
+    saw_command = False
+    for _ in range(len(values)):
+        if idx >= len(values) or values[idx][1] >= 0:
+            break
+        wrapper = values[idx][0]
+        if wrapper not in ("command", "builtin"):
+            break
+        saw_command |= wrapper == "command"
+        stepped = _step_prefix_wrapper(wrapper, values, idx + 1)
+        if stepped is None:
+            return None
+        idx = stepped
+    return idx, saw_command
+
+
+def _prefix_unwrapped_shell(values: list[tuple[str, int]], start: int) -> bool:
+    """Tell whether wrappers starting at start unwrap to an inline or stdin shell."""
+    idx = _unwrap_command([value for value, _ in values], start)
+    if idx <= start or idx >= len(values):
+        return False
+    target, dynamic = values[idx]
+    if dynamic >= 0 or os.path.basename(target) not in SHELLS:
+        return False
+    return _runs_shell_text(target, values[idx + 1 :])
+
+
+def _prefix_command(node: Any, raw: bytes) -> str | None:
+    """Return the safe command name for a prefix assignment, or None when it may write."""
+    head = _prefix_head(node, raw)
+    if head is None:
+        return None
+    values = _command_values(node.parent, raw)
+    if head not in ("command", "builtin"):
+        bad = (
+            head in SPECIAL_BUILTINS
+            or _runs_shell_text(head, values[1:])
+            or _prefix_unwrapped_shell(values, 0)
+        )
+        return None if bad else head
+    chain = _unwrap_prefix_chain(values)
+    if chain is None:
+        return None
+    idx, saw_command = chain
+    if idx >= len(values):
+        return ""
+    target, dynamic = values[idx]
+    special = not saw_command and target in SPECIAL_BUILTINS
+    if dynamic >= 0 or special or _runs_shell_text(target, values[idx + 1 :]):
+        return None
+    return None if _prefix_unwrapped_shell(values, idx) else ""
+
+
+def _note_prefix(node: Any, raw: bytes, names: _Names) -> None:
+    """Record the name start and callee of a prefix assignment that cannot write or eval."""
     command = _prefix_command(node, raw)
     if command is None or command in SPECIAL_BUILTINS:
         return
     start = _plain_start(node)
     if start is not None:
         names.starts.add(start)
-        name = _text(node.child_by_field_name("name"), raw)
-        names.prefixed.setdefault(command, set()).add(name)
+        if command:
+            name = _text(node.child_by_field_name("name"), raw)
+            names.prefixed.setdefault(command, set()).add(name)
 
 
 def _note_function(node: Any, raw: bytes, names: _Names) -> None:
     """Record a function's name and body text for the prefix call closure."""
-    name_node = node.child_by_field_name("name")
+    name = _function_key(node, raw)
     body = node.child_by_field_name("body")
-    if name_node is not None and body is not None:
-        names.bodies.setdefault(_text(name_node, raw), []).append(_text(body, raw))
+    if name is not None and body is not None:
+        names.bodies.setdefault(name, []).append(_text(body, raw))
 
 
 def _note_heredoc(node: Any, raw: bytes, names: _Names) -> None:
@@ -1964,13 +2231,18 @@ def _leaf_value(node: Any, raw: bytes) -> tuple[str, bool]:
     return WORD_ESCAPE.sub(_kept_escape, text), expands
 
 
-def _static_value(nodes: list[Any], raw: bytes) -> tuple[str, int]:
-    """Return a word's text after quote removal and the offset of its first run-time part.
+def _part_static_leaf(part: Any, raw: bytes) -> tuple[str, bool]:
+    """Evaluate one non-group word part to its static text and run-time expansion flag."""
+    if _dollar_prefix(part, raw):
+        prefix = _text(part, raw)[:-1]
+        return WORD_ESCAPE.sub(_kept_escape, prefix), GLOB_OR_BRACE.search(prefix) is not None
+    if part.type in STATIC_LEAVES:
+        return _leaf_value(part, raw)
+    return "", True
 
-    A run-time part (an expansion, a substitution or any part type outside the allow-list)
-    counts as empty text, and a glob or brace word keeps its text; the offset is -1 when the
-    word has no run-time part.
-    """
+
+def _static_value(nodes: list[Any], raw: bytes) -> tuple[str, int]:
+    """Return a word's text after quote removal and the offset of its first run-time part."""
     parts: list[str] = []
     dynamic = -1
     stack = list(reversed(nodes))
@@ -1978,26 +2250,25 @@ def _static_value(nodes: list[Any], raw: bytes) -> tuple[str, int]:
         if not stack:
             break
         part = stack.pop()
-        if part.type in STATIC_GROUPS:
-            stack.extend(reversed(part.named_children))
+        if part.type in STATIC_GROUPS and not _translated_string(part, raw):
+            children = part.children if part.type == "concatenation" else part.named_children
+            stack.extend(reversed(children))
             continue
-        text, expands = _leaf_value(part, raw) if part.type in STATIC_LEAVES else ("", True)
+        text, expands = _part_static_leaf(part, raw)
         if expands and dynamic < 0:
             dynamic = sum(len(p) for p in parts)
         parts.append(text)
     return "".join(parts), dynamic
 
 
-def _word_runs(node: Any) -> list[list[Any]]:
-    """Group a node's adjacent word-part children into the shell words they form.
-
-    tree-sitter-bash splits a declaration operand such as H''ERE=1 into a variable_name and
-    an adjacent concatenation; Bash reads one word.
-    """
+def _word_runs(node: Any, raw: bytes) -> list[list[Any]]:
+    """Group a node's adjacent word-part children into the shell words they form."""
     runs: list[list[Any]] = []
     end = -1
-    for child in node.named_children:
-        if child.type not in WORD_PARTS:
+    for child in node.children:
+        if not child.is_named and not _dollar_prefix(child, raw):
+            continue
+        if child.type not in WORD_PARTS and not _dollar_prefix(child, raw):
             end = -1
             continue
         if runs and child.start_byte == end:
@@ -2010,7 +2281,7 @@ def _word_runs(node: Any) -> list[list[Any]]:
 
 def _note_runs(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -> None:
     """Record each word whose text changes in quote removal, and its names for every owner."""
-    for run in _word_runs(node):
+    for run in _word_runs(node, raw):
         value, _ = _static_value(run, raw)
         if value == raw[run[0].start_byte : run[-1].end_byte].decode("utf-8", "surrogateescape"):
             continue
@@ -2019,28 +2290,323 @@ def _note_runs(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) ->
             names.calls.setdefault(owner, set()).update(PLAIN_FUNCTION.findall(value))
 
 
+def _command_runs(node: Any, raw: bytes) -> list[list[Any]]:
+    """Return a writer node's word-part runs, starting with its command or keyword head."""
+    if node.type != "command":
+        return [[node.children[0]], *_word_runs(node, raw)]
+    name = node.child_by_field_name("name")
+    if name is None:
+        return []
+    return [name.named_children, *_word_runs(node, raw)]
+
+
 def _command_values(node: Any, raw: bytes) -> list[tuple[str, int]]:
     """Return a command's quote-removed words, its name first, with their run-time offsets."""
     if node.type != "command":
-        head = (_text(node.children[0], raw), -1)
+        return [
+            (_text(node.children[0], raw), -1),
+            *(_static_value(run, raw) for run in _word_runs(node, raw)),
+        ]
+    return [_static_value(run, raw) for run in _command_runs(node, raw)]
+
+
+def _lookup_var(name: str, scope: _VarScope) -> tuple[str, ...]:
+    """Return resolved values for a variable, environment entry or unassigned empty name."""
+    if name in scope.values:
+        return scope.values[name]
+    if name in os.environ:
+        return (os.environ[name][:64],)
+    base = name.split("[", 1)[0]
+    return () if base in scope.assigned else ("",)
+
+
+def _apply_case(value: str, op: str) -> str:
+    """Apply Bash ^, ^^, , or ,, case-modification operators to a string."""
+    if op == "^^":
+        return value.upper()
+    if op == ",,":
+        return value.lower()
+    if op == "^":
+        return value[:1].upper() + value[1:]
+    return value[:1].lower() + value[1:]
+
+
+def _plain_tail_values(tail: str) -> tuple[str, ...]:
+    """Return a single literal fallback string when it carries no shell expansion."""
+    if not tail:
+        return ("",)
+    return (tail[:64],) if "$" not in tail and "`" not in tail else ()
+
+
+def _fallback_values(
+    part: Any, match: re.Match[str], raw: bytes, scope: _VarScope
+) -> tuple[tuple[str, ...] | None, list[Any], bool]:
+    """Resolve a ${name:-word}, ${name:=word} or ${name:+word} expansion."""
+    var, op, tail = match.groups()
+    loc = var in scope.locale_vars
+    rest = part.named_children[1:]
+    has_var = var in scope.values or var in os.environ
+    known = _lookup_var(var, scope) if has_var else ()
+    if op.endswith("+") or not known:
+        if tail and rest:
+            return None, rest, loc
+        return _plain_tail_values(tail), [], loc
+    if rest:
+        extra, dyn = _static_value(rest, raw)
+        extra_vals = (extra[:64],) if dyn < 0 else ()
     else:
-        name = node.child_by_field_name("name")
-        if name is None:
-            return []
-        head = _static_value(name.named_children, raw)
-    return [head] + [_static_value(run, raw) for run in _word_runs(node)]
+        extra_vals = _plain_tail_values(tail)
+    return tuple(dict.fromkeys((*known, *extra_vals)))[:16], [], loc
+
+
+def _brace_values(
+    part: Any, raw: bytes, scope: _VarScope
+) -> tuple[tuple[str, ...] | None, list[Any], bool]:
+    """Resolve a braced parameter expansion or return fallback child nodes to push."""
+    expr = _text(part, raw)
+    all_arr = ARRAY_ALL_VAR.fullmatch(expr)
+    if all_arr is not None:
+        name = all_arr.group(1)
+        return scope.arrays.get(name) or _lookup_var(name, scope), [], name in scope.locale_vars
+    plain = PLAIN_BRACE_VAR.fullmatch(expr)
+    if plain is not None:
+        key = plain.group(1)
+        loc = key in scope.locale_vars or key.split("[", 1)[0] in scope.locale_vars
+        if key.endswith("[0]") and key not in scope.values:
+            key = key[:-3]
+        return _lookup_var(key, scope), [], loc
+    cased = CASE_BRACE_VAR.fullmatch(expr)
+    if cased is not None:
+        name, op = cased.groups()
+        vals = tuple(_apply_case(v, op) for v in _lookup_var(name, scope))
+        return vals, [], name in scope.locale_vars
+    fallback = FALLBACK_BRACE_VAR.fullmatch(expr)
+    if fallback is not None:
+        return _fallback_values(part, fallback, raw, scope)
+    return (), [], False
+
+
+def _append_choices(acc: tuple[str, ...], choices: tuple[str, ...]) -> tuple[str, ...]:
+    """Concatenate candidate prefixes and next-segment choices within a 16-word cap."""
+    if not acc or not choices:
+        return ()
+    return tuple(dict.fromkeys((a + c)[:64] for a in acc for c in choices))[:16]
+
+
+def _part_choices(part: Any, raw: bytes, scope: _VarScope) -> tuple[tuple[str, ...], bool]:
+    """Evaluate one leaf, brace or simple expansion part and report locale dependence."""
+    if part.type in STATIC_LEAVES:
+        text, expands = _leaf_value(part, raw)
+        if part.type == "ansi_c_string" and expands:
+            return (), True
+        return (() if expands else (text,)), False
+    if part.type == "brace_expression":
+        match = BRACE_CHOICES.fullmatch(_text(part, raw))
+        return (tuple(match.group(1).split(","))[:16] if match else ()), False
+    if part.type == "simple_expansion":
+        children = part.named_children
+        if children and children[0].type == "variable_name":
+            var = _text(children[0], raw)
+            return _lookup_var(var, scope), var in scope.locale_vars
+    return (), False
+
+
+def _step_expansion_part(
+    part: Any, quoted: bool, raw: bytes, scope: _VarScope
+) -> tuple[tuple[str, ...] | None, list[Any], bool, bool]:
+    """Evaluate one braced or simple word part to choices, pushed nodes, locale and split."""
+    if part.type == "expansion":
+        split = not quoted or ARRAY_ALL_VAR.fullmatch(_text(part, raw)) is not None
+        vals, rest, loc = _brace_values(part, raw, scope)
+        return vals, rest, loc, split
+    split = part.type == "simple_expansion" and not quoted
+    vals, loc = _part_choices(part, raw, scope)
+    return vals, [], loc, split
+
+
+def _word_candidates(
+    nodes: list[Any], raw: bytes, scope: _VarScope
+) -> tuple[tuple[str, ...], bool, bool]:
+    """Return bounded candidate strings, locale flag and word-splitting flag for a word."""
+    acc: tuple[str, ...] = ("",)
+    locale = split = False
+    stack: list[tuple[Any, bool]] = [(node, False) for node in reversed(nodes)]
+    for _ in range(MAX_BODY_NODES):
+        if not stack:
+            break
+        part, quoted = stack.pop()
+        if _translated_string(part, raw) or _dollar_prefix(part, raw):
+            locale = True
+            acc = ()
+        elif part.type in STATIC_GROUPS:
+            inner_q = quoted or part.type == "string"
+            stack.extend((child, inner_q) for child in reversed(part.named_children))
+        else:
+            vals, rest, loc, part_split = _step_expansion_part(part, quoted, raw, scope)
+            locale |= loc
+            split |= part_split
+            if vals is None:
+                stack.extend((child, quoted) for child in reversed(rest))
+            else:
+                acc = _append_choices(acc, vals)
+    return acc, locale, split
+
+
+def _binding_target(name_node: Any, raw: bytes) -> str | None:
+    """Extract a plain variable or literal numeric subscript target name."""
+    if name_node is None:
+        return None
+    text = _text(name_node, raw)
+    if name_node.type == "variable_name" and ASSIGNED_NAME.fullmatch(text) is not None:
+        return text
+    if name_node.type == "subscript":
+        match = INDEXED_TARGET.fullmatch(text)
+        if match is not None:
+            return f"{match.group(1)}[{int(match.group(2))}]"
+    return None
+
+
+def _record_binding(node: Any, raw: bytes, names: _Names) -> None:
+    """Record a variable or array assignment's target, operator and RHS syntax nodes."""
+    target = _binding_target(node.child_by_field_name("name"), raw)
+    if target is None or len(node.children) < 2 or node.children[1].type not in ("=", "+="):
+        return
+    op = node.children[1].type
+    value = node.child_by_field_name("value")
+    if value is None:
+        names.static_bindings.append((target, op, ""))
+    elif value.type == "array" and "[" not in target:
+        items = value.named_children
+        if items:
+            names.raw_bindings.append((target, "=", [items[0]], raw))
+            names.array_bindings.append((target, items[:8], raw))
+        for idx, item in enumerate(items[:16]):
+            names.raw_bindings.append((f"{target}[{idx}]", "=", [item], raw))
+    elif value.type != "array":
+        names.raw_bindings.append((target, op, [value], raw))
+        if target.endswith("[0]"):
+            names.raw_bindings.append((target[:-3], op, [value], raw))
+
+
+def _record_extra_bindings(node: Any, raw: bytes, names: _Names) -> None:
+    """Record variable bindings from quoted declarations and for-loop word lists."""
+    if node.type == "declaration_command":
+        for run in _word_runs(node, raw):
+            val, dyn = _static_value(run, raw)
+            if dyn < 0 and "=" in val:
+                lhs, _, rhs = val.partition("=")
+                op = "+=" if lhs.endswith("+") else "="
+                var = lhs[:-1] if op == "+=" else lhs
+                if ASSIGNED_NAME.fullmatch(var):
+                    names.static_bindings.append((var, op, rhs))
+    elif node.type == "for_statement":
+        var_node = node.child_by_field_name("variable")
+        if var_node is not None:
+            var = _text(var_node, raw)
+            for item in node.children_by_field_name("value"):
+                names.raw_bindings.append((var, "=", [item], raw))
+
+
+def _record_node_bindings(node: Any, raw: bytes, names: _Names) -> None:
+    """Collect variable, array, declaration and for-loop bindings from one syntax node."""
+    if node.type == "variable_assignment":
+        _record_binding(node, raw, names)
+    elif node.type in ("declaration_command", "for_statement"):
+        _record_extra_bindings(node, raw, names)
+
+
+def _add_resolved(
+    store: dict[str, list[str]], key: str, op: str, items: Iterable[str], live: _VarScope
+) -> None:
+    """Merge new or appended candidate strings into a variable bucket within a 16-item cap."""
+    prefixes = (live.values.get(key) or ("",)) if op == "+=" else ("",)
+    bucket = store.setdefault(key, [])
+    for prefix in prefixes:
+        for item in items:
+            merged = (prefix + item)[:64]
+            if merged not in bucket and len(bucket) < 16:
+                bucket.append(merged)
+
+
+def _array_element_strings(
+    items: list[Any], raw: bytes, scope: _VarScope
+) -> tuple[tuple[str, ...], bool]:
+    """Join leading resolved elements of one array literal and report locale dependence."""
+    parts: tuple[str, ...] = ("",)
+    locale = False
+    for item in items:
+        vals, loc, _ = _word_candidates([item], raw, scope)
+        locale |= loc
+        if not vals:
+            break
+        sep = " " if parts != ("",) else ""
+        parts = tuple(dict.fromkeys(f"{p}{sep}{v}"[:64] for p in parts for v in vals))[:16]
+    return parts, locale
+
+
+def _resolve_arrays(
+    names: _Names, scope: _VarScope, loc_vars: set[str]
+) -> dict[str, tuple[str, ...]]:
+    """Join leading resolved elements of array assignments for ${arr[@]} expansion."""
+    arrays: dict[str, list[str]] = {k: list(v) for k, v in scope.arrays.items()}
+    for target, items, raw in names.array_bindings:
+        parts, loc = _array_element_strings(items, raw, scope)
+        if loc:
+            loc_vars.add(target)
+        bucket = arrays.setdefault(target, [])
+        for part in parts:
+            if part and part not in bucket and len(bucket) < 16:
+                bucket.append(part)
+    return {k: tuple(v) for k, v in arrays.items() if v}
+
+
+def _step_binding_pass(
+    names: _Names, base: _VarScope, live: _VarScope, loc_vars: set[str]
+) -> dict[str, tuple[str, ...]]:
+    """Run one forward sweep over static and syntax-node variable bindings."""
+    store: dict[str, list[str]] = {k: list(v) for k, v in base.values.items()}
+    for key, op, rhs in names.static_bindings:
+        _add_resolved(store, key, op, (rhs,), live)
+        live.values[key] = tuple(store[key])
+    for key, op, nodes, raw in names.raw_bindings:
+        vals, loc, _ = _word_candidates(nodes, raw, live)
+        if loc:
+            loc_vars.update((key, key.split("[", 1)[0]))
+        if vals:
+            _add_resolved(store, key, op, vals, live)
+            live.values[key] = tuple(store[key])
+    return {k: tuple(v) for k, v in store.items() if v}
+
+
+def _resolve_bindings(names: _Names, seed: _VarScope | None = None) -> _VarScope:
+    """Compute bounded fixed-point candidate values for variables assigned in a script."""
+    base = seed if seed is not None else _VarScope()
+    assigned = frozenset(
+        set(base.assigned)
+        | names.assigned
+        | {k.split("[", 1)[0] for k, _, _ in names.static_bindings}
+        | {k.split("[", 1)[0] for k, _, _, _ in names.raw_bindings}
+    )
+    current: dict[str, tuple[str, ...]] = dict(base.values)
+    arrays: dict[str, tuple[str, ...]] = dict(base.arrays)
+    loc_vars: set[str] = set(base.locale_vars)
+    for _ in range(6):
+        prev_loc = frozenset(loc_vars)
+        live = _VarScope(dict(current), arrays, assigned, prev_loc)
+        nxt = _step_binding_pass(names, base, live, loc_vars)
+        nxt_arrays = _resolve_arrays(
+            names, _VarScope(nxt, arrays, assigned, frozenset(loc_vars)), loc_vars
+        )
+        if nxt == current and nxt_arrays == arrays and frozenset(loc_vars) == prev_loc:
+            break
+        current, arrays = nxt, nxt_arrays
+    return _VarScope(current, arrays, assigned, frozenset(loc_vars))
 
 
 def _option_letters(
     spec: _Writer, word: tuple[str, int], following: tuple[str, int] | None
 ) -> tuple[list[tuple[str, int]], bool] | None:
-    """Read one option word: the naming arguments and whether it took the next word.
-
-    None means an option made the operands function names. The letters end at the word's
-    run-time part: a letter that takes an argument takes the rest of the word when any follows,
-    and a run-time part in place of the letters may spell a naming option, so it counts as a
-    run-time naming argument for a writer that has one.
-    """
+    """Read one option word: the naming arguments and whether it took the next word."""
     value, dynamic = word
     letters = value[1:dynamic] if dynamic > 0 else value[1:]
     for pos, letter in enumerate(letters, 2):
@@ -2058,15 +2624,7 @@ def _option_letters(
 def _writer_operands(
     spec: _Writer, args: list[tuple[str, int]]
 ) -> tuple[list[tuple[str, int]], list[tuple[str, int]]] | None:
-    """Split a writer builtin's words into operands and naming option arguments.
-
-    Options end at --, at a word without a leading - or +, at a lone - or +, and at a word
-    that starts with a run-time part; a run-time part after the leading - or + keeps the word
-    an option word. Bash expands a word before the builtin reads its options, so a word that
-    starts with a run-time part and has a word after it may spell a naming option (printf
-    $opt NAME with opt=-v) and counts as a naming argument for a writer that has one. None
-    means an option made the operands function names.
-    """
+    """Split a writer builtin's words into operands and naming option arguments."""
     named: list[tuple[str, int]] = []
     idx = 0
     for _ in range(len(args) + 1):
@@ -2117,29 +2675,124 @@ def _option_named(args: list[tuple[str, int]]) -> bool:
     return False
 
 
-def _may_write(values: list[tuple[str, int]], idx: int) -> bool:
-    """Tell whether the command at idx may write a variable that a run-time word names.
+def _step_wrapper_word(
+    wrapper: str, prefix: list[str], pos: int
+) -> tuple[list[str], int, str] | None:
+    """Step one resolved word under an active command, builtin or time wrapper."""
+    head, tail = prefix[0], prefix[1:]
+    if head == "--":
+        return tail, pos, ""
+    if head.startswith("-") and head != "-":
+        if wrapper in ("command", "time") and set(head[1:]) <= {"p"}:
+            return tail, pos, wrapper
+        return None
+    return prefix, pos, ""
 
-    A command word built at run time names a builtin only where Bash may still pick one (the
-    first word or a word after builtin, command or time) and only when its literal text has no
-    slash; it then counts as a writer when a literal naming option (printf -v, read -a, wait
-    -p, compgen -V) takes a run-time argument.
-    """
-    command, dynamic = values[idx]
-    args = values[idx + 1 :]
-    if dynamic >= 0:
-        return _dynamic_call(values) and "/" not in command and _option_named(args)
-    spec = WRITERS.get(command)
+
+def _expand_run_state(
+    pos: int, runs: list[list[Any]], values: list[tuple[str, int]], raw: bytes, scope: _VarScope
+) -> tuple[list[tuple[list[str], int]], bool]:
+    """Expand one command-position run into queued word lists and report locale writes."""
+    if pos >= len(runs):
+        return [], False
+    text, dyn = values[pos]
+    if dyn < 0:
+        return [([text], pos + 1)], False
+    cands, locale, split = _word_candidates(runs[pos], raw, scope)
+    states: list[tuple[list[str], int]] = []
+    for cand in cands:
+        parts = cand.split() if split else [cand]
+        if parts and parts[0]:
+            states.append((parts, pos + 1))
+    can_write = locale and "/" not in text and (split or pos + 1 < len(values))
+    return states, can_write
+
+
+def _step_invocation(
+    state: tuple[list[str], int, str],
+    queue: list[tuple[list[str], int, str]],
+    calls: list[tuple[str, list[str], int]],
+) -> None:
+    """Advance one non-empty invocation prefix through wrappers or into resolved calls."""
+    prefix, pos, wrapper = state
+    if wrapper:
+        stepped = _step_wrapper_word(wrapper, prefix, pos)
+        if stepped is not None:
+            queue.append(stepped)
+    elif prefix[0] in SHELL_WRAPPERS:
+        queue.append((prefix[1:], pos, prefix[0]))
+    else:
+        calls.append((prefix[0], prefix[1:], pos))
+
+
+def _resolved_invocations(
+    node: Any, raw: bytes, scope: _VarScope
+) -> tuple[int, list[tuple[str, list[str], int]], bool]:
+    """Resolve unwrapped command words to (head, extra_args, next_pos) and locale status."""
+    runs = _command_runs(node, raw)
+    values = [_static_value(run, raw) for run in runs]
+    base_idx = _unwrap_command([value for value, _ in values], 0)
+    backed = (
+        0 < base_idx < len(values)
+        and values[base_idx - 1][0] in ("command", "builtin")
+        and values[base_idx][0].startswith("-")
+    )
+    queue: list[tuple[list[str], int, str]] = [([], base_idx - int(backed), "")]
+    calls: list[tuple[str, list[str], int]] = []
+    locale_hit = False
+    for _ in range(48):
+        if not queue:
+            break
+        prefix, pos, wrapper = queue.pop()
+        if not prefix:
+            states, loc = _expand_run_state(pos, runs, values, raw, scope)
+            queue.extend((parts, nxt_pos, wrapper) for parts, nxt_pos in states)
+            locale_hit |= loc
+        else:
+            _step_invocation((prefix, pos, wrapper), queue, calls)
+    return base_idx, calls, locale_hit
+
+
+def _invocation_writes(head: str, args: list[tuple[str, int]]) -> bool:
+    """Tell whether a resolved command name and remaining arguments may write a variable."""
+    if "/" in head:
+        return False
+    if head in SHELL_TEXT_BUILTINS:
+        return bool(args)
+    spec = WRITERS.get(head)
     return spec is not None and _writer_dynamic(spec, args)
 
 
-def _dynamic_call(values: list[tuple[str, int]]) -> bool:
-    """Tell whether a command word built at run time may name a shell function or eval.
+def _shell_reachable(values: list[tuple[str, int]], idx: int) -> bool:
+    """Check that only shell wrappers and options precede the command word at idx."""
+    return all(d >= 0 or v in SHELL_WRAPPERS or v.startswith("-") for v, d in values[:idx])
 
-    Bash looks a run-time command word up as a function, even one whose name holds a slash
-    (measured on bash 5.3.20). Only the words of SHELL_WRAPPERS and their options keep that
-    lookup in reach; any other first word runs a program or a builtin of its own.
-    """
+
+def _may_write_node(node: Any, raw: bytes, scope: _VarScope) -> bool:
+    """Tell whether a writer syntax node may write a variable named at run time."""
+    values = _command_values(node, raw)
+    idx = _unwrap_command([value for value, _ in values], 0)
+    if idx >= len(values):
+        return False
+    command, dynamic = values[idx]
+    args = values[idx + 1 :]
+    clustered = idx > 0 and values[idx - 1][0] in ("command", "builtin") and command.startswith("-")
+    if dynamic < 0 and not clustered:
+        spec = WRITERS.get(command)
+        return spec is not None and _writer_dynamic(spec, args)
+    if not _shell_reachable(values, idx) or "/" in command:
+        return False
+    if dynamic >= 0 and _option_named(args):
+        return True
+    _, calls, locale_hit = _resolved_invocations(node, raw, scope)
+    return locale_hit or any(
+        _invocation_writes(head, [*((w, -1) for w in extra), *values[pos:]])
+        for head, extra, pos in calls
+    )
+
+
+def _dynamic_call(values: list[tuple[str, int]]) -> bool:
+    """Tell whether a command word built at run time may name a shell function or eval."""
     for value, dynamic in values:
         if dynamic >= 0:
             return True
@@ -2149,12 +2802,7 @@ def _dynamic_call(values: list[tuple[str, int]]) -> bool:
 
 
 def _loop_prefix(node: Any, raw: bytes) -> str | None:
-    """Return PREFIX when a writer is the only command of a for loop over "${!PREFIX@}".
-
-    The quoted list binds the loop variable to whole names that begin with PREFIX (bash 5.3
-    manual 3.5.3), so a writer whose every run-time word is the quoted loop variable names
-    only those. Any other run-time word, or a second command in the loop body, gives None.
-    """
+    """Return PREFIX when a writer is the only command of a for loop over "${!PREFIX@}"."""
     group = node.parent
     loop = group.parent if group is not None and group.type == "do_group" else None
     if loop is None or loop.type != "for_statement" or len(group.named_children) != 1:
@@ -2166,19 +2814,15 @@ def _loop_prefix(node: Any, raw: bytes) -> str | None:
         return None
     name = _text(variable, raw)
     loop_words = {f'"${name}"', f'"${{{name}}}"'}
-    for run in _word_runs(node):
-        text = raw[run[0].start_byte : run[-1].end_byte].decode("utf-8", "surrogateescape")
+    for run in _word_runs(node, raw):
+        text = raw[_part_start(run[0], raw) : run[-1].end_byte].decode("utf-8", "surrogateescape")
         if _static_value(run, raw)[1] >= 0 and text not in loop_words:
             return None
     return match.group(1)
 
 
-def _note_writer(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -> None:
-    """Note a writer builtin that names a variable at run time and a call named at run time.
-
-    The command word is unwrapped from builtin, command and the other known wrappers. An
-    eval or trap text is queued for one more parse, because Bash removes its quotes again.
-    """
+def _stage_writer(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -> None:
+    """Queue static eval or trap texts immediately and stage writer nodes for resolution."""
     values = _command_values(node, raw)
     idx = _unwrap_command([value for value, _ in values], 0)
     if idx >= len(values):
@@ -2189,13 +2833,7 @@ def _note_writer(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) 
         names.dynamic_callers.update(owners)
     if dynamic < 0 and command in EVAL_BUILTINS:
         names.inline.append(" ".join(value for value, _ in args))
-    if not _may_write(values, idx):
-        return
-    prefix = _loop_prefix(node, raw)
-    if prefix is None:
-        names.dynamic_write = True
-    else:
-        names.prefix_writes.add(prefix)
+    names.writer_nodes.append((node, raw, owners))
 
 
 def _note_offsets(node: Any, raw: bytes, names: _Names) -> None:
@@ -2213,22 +2851,19 @@ def _note_offsets(node: Any, raw: bytes, names: _Names) -> None:
 
 
 def _note_words(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -> tuple[str, ...]:
-    """Record one node's spelled words and writer builtins; return the owners of its children."""
+    """Record one node's spelled words and writer nodes; return the owners of its children."""
     if node.type not in STATIC_GROUPS:
         _note_runs(node, raw, names, owners)
     if node.type in WRITER_NODES:
-        _note_writer(node, raw, names, owners)
-    name = node.child_by_field_name("name") if node.type == "function_definition" else None
-    return owners if name is None else (*owners, _text(name, raw))
+        _stage_writer(node, raw, names, owners)
+    name = _function_key(node, raw) if node.type == "function_definition" else None
+    return owners if name is None else (*owners, name)
 
 
 def _inline_roots(
     names: _Names, owners: tuple[str, ...]
 ) -> list[tuple[Any, bytes, tuple[str, ...], bool]]:
-    """Parse the eval and trap texts one node queued, within the inline body bound.
-
-    Past the bound a text counts as unknown: it may write any name and call any function.
-    """
+    """Parse the eval and trap texts one node queued, within the inline body bound."""
     roots: list[tuple[Any, bytes, tuple[str, ...], bool]] = []
     for body in names.inline:
         if names.parsed >= MAX_INLINE_BODIES:
@@ -2242,16 +2877,11 @@ def _inline_roots(
     return roots
 
 
-def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> _Names:
-    """Collect assignments, assigned names, plain = starts and skipped spans in one bounded walk.
-
-    The walk also records spelled words, writer builtins that name a variable at run time and
-    the words each function body calls. An eval or trap text is parsed once more and walked
-    for those three and its function bodies only, since its byte offsets are not the top
-    text's; a function it defines joins the prefix call closure like any other.
-    """
-    stack: list[tuple[Any, bytes, tuple[str, ...], bool]] = [(root, raw, (), False)]
-    names = _Names()
+def _walk_roots(
+    roots: list[tuple[Any, bytes, tuple[str, ...], bool]], names: _Names, budget: BodyBudget
+) -> None:
+    """Walk syntax roots and static eval or trap inline bodies within the shared node bound."""
+    stack = list(roots)
     for _ in range(MAX_BODY_NODES):
         if not stack or budget.nodes >= MAX_BODY_NODES:
             break
@@ -2261,9 +2891,56 @@ def _assignment_texts(root: Any, raw: bytes, budget: BodyBudget) -> _Names:
             _note_offsets(node, text, names)
         elif node.type == "function_definition":
             _note_function(node, text, names)
+        _record_node_bindings(node, text, names)
         inner = _note_words(node, text, names, owners)
         stack.extend(_inline_roots(names, owners))
         stack.extend((child, text, inner, inline) for child in reversed(node.named_children))
+
+
+def _resolved_inline_roots(
+    names: _Names, scope: _VarScope
+) -> list[tuple[Any, bytes, tuple[str, ...], bool]]:
+    """Parse static eval or trap bodies reached through resolved run-time command words."""
+    roots: list[tuple[Any, bytes, tuple[str, ...], bool]] = []
+    for node, raw, owners in list(names.writer_nodes):
+        values = _command_values(node, raw)
+        idx = _unwrap_command([value for value, _ in values], 0)
+        if idx >= len(values) or values[idx][1] < 0 or not _shell_reachable(values, idx):
+            continue
+        _, calls, _ = _resolved_invocations(node, raw, scope)
+        for head, extra, pos in calls:
+            rem = [*((w, -1) for w in extra), *values[pos:]]
+            if head in EVAL_BUILTINS and rem and all(d < 0 for _, d in rem):
+                names.inline.append(" ".join(v for v, _ in rem))
+                roots.extend(_inline_roots(names, owners))
+    return roots
+
+
+def _finish_writers(names: _Names, scope: _VarScope) -> None:
+    """Evaluate staged writer nodes against the resolved variable scope."""
+    for node, raw, _ in names.writer_nodes:
+        if not _may_write_node(node, raw, scope):
+            continue
+        prefix = _loop_prefix(node, raw)
+        if prefix is None:
+            names.dynamic_write = True
+        else:
+            names.prefix_writes.add(prefix)
+
+
+def _assignment_texts(
+    root: Any, raw: bytes, budget: BodyBudget, seed: _VarScope | None = None
+) -> _Names:
+    """Collect assignments, spelled words, resolved scopes and dynamic writers."""
+    names = _Names()
+    _walk_roots([(root, raw, (), False)], names, budget)
+    scope = _resolve_bindings(names, seed)
+    extra = _resolved_inline_roots(names, scope)
+    if extra:
+        _walk_roots(extra, names, budget)
+        scope = _resolve_bindings(names, seed)
+    names.var_scope = scope
+    _finish_writers(names, scope)
     return names
 
 
@@ -2280,22 +2957,7 @@ def _write_occurrence(code: bytes, start: int, end: int) -> bool:
 
 
 def _written_names(raw: bytes, watched: set[str], names: _Names) -> set[str]:
-    """Return watched names used outside a plain = assignment, a read reference or a bare export.
-
-    Comments and quoted here-document bodies are skipped, and a plain = prefix before a plain
-    command other than a special builtin is no write. Every other use counts as a write, among
-    them printf -v, read, mapfile, unset, an arithmetic, append or array assignment,
-    ${NAME:=value}, a for loop variable and any text that names the variable, such
-    as an eval or trap string. A word counts with its text after quote removal too, so
-    H''ERE, H\\ERE and $'\\x48ERE' name HERE, and a writer narrowed to a "${!PREFIX@}" loop
-    writes every name that begins with PREFIX. Callers count every name as written when a
-    writer builtin or eval names a variable through any other run-time word (dynamic_write).
-    A function called under a prefix assignment is handled by _hold_closure. Not detected: a
-    command word built at run time that names a variable through an operand ($c "$n" with
-    c=read), a last word that starts with a run-time part and spells a naming option with its
-    argument (wait "$p" with p=-pNAME), a name built by arithmetic evaluation, and alias
-    expansion.
-    """
+    """Return watched names used outside a plain = assignment, a read reference or a bare export."""
     code = bytearray(raw)
     for start, end in names.skipped:
         code[start:end] = b" " * (end - start)
@@ -2322,15 +2984,7 @@ def _literal_map(names: _Names, raw: bytes, watched: set[str]) -> tuple[dict[str
 
 
 def _hold_closure(scan: _Scan) -> dict[str, frozenset[str]]:
-    """Map each called function to the names a prefix assignment holds in its body.
-
-    Bash keeps a prefix assignment before a function call for the whole call, callees included
-    (bash 5.3 manual 3.7.4 and 3.3), so the names pass on to every word a function body holds,
-    before and after quote removal, over at most one round per function body. A body that
-    runs a command named at run time, or an eval or trap text built at run time, may call
-    every function. Every name counts, because a sourced file can assign a trusted literal of
-    that name later.
-    """
+    """Map each called function to the names a prefix assignment holds in its body."""
     held = {f: set(n) for f, n in scan.prefix_calls.items()}
     bodies = scan.function_bodies
     calls = {
@@ -2351,13 +3005,18 @@ def _hold_closure(scan: _Scan) -> dict[str, frozenset[str]]:
     return {f: frozenset(n) for f, n in held.items() if n}
 
 
-def _note_prefix_calls(names: _Names, scan: _Scan) -> None:
-    """Add one text's prefix calls and function bodies, then recompute the held names.
+def _seed_dynamic_functions(scan: _Scan) -> None:
+    """Propagate all prefix-held names into functions whose defined name is run-time text."""
+    if not scan.prefix_calls:
+        return
+    every = set().union(*scan.prefix_calls.values())
+    for function in scan.function_bodies:
+        if function.startswith("$"):
+            scan.prefix_calls.setdefault(function, set()).update(every)
 
-    The top script and each sourced file add theirs before the guard walks them. A sourced file
-    can call a function under a prefix assignment after the guard walked that function's body
-    with the old value, so a walked body that references a newly held name refuses.
-    """
+
+def _note_prefix_calls(names: _Names, scan: _Scan) -> None:
+    """Add one text's prefix calls and function bodies, then recompute the held names."""
     for command, held in names.prefixed.items():
         scan.prefix_calls.setdefault(command, set()).update(held)
     for function, texts in names.bodies.items():
@@ -2365,6 +3024,7 @@ def _note_prefix_calls(names: _Names, scan: _Scan) -> None:
     for function, called in names.calls.items():
         scan.function_calls.setdefault(function, set()).update(called)
     scan.dynamic_callers |= names.dynamic_callers
+    _seed_dynamic_functions(scan)
     before = scan.prefixed_functions
     scan.prefixed_functions = _hold_closure(scan)
     trusted = scan.assigned | names.assigned | set(scan.literals) | set(scan.script_dirs)
@@ -2376,12 +3036,8 @@ def _note_prefix_calls(names: _Names, scan: _Scan) -> None:
 
 
 def _prime_names(scan: _Scan, names: _Names, raw: bytes) -> None:
-    """Seed literals, assigned and own-directory names; refuse own-directory names it writes.
-
-    A writer that names a variable at run time leaves no literal trusted and refuses each
-    own-directory name at its assignment, after the refusal of an earlier statement outside
-    the allow-list, which names the line.
-    """
+    """Seed literals, assigned and own-directory names; refuse own-directory names it writes."""
+    scan.var_scope = names.var_scope
     dirs = _script_dir_names(names.assignments) if scan.context.script_dir is not None else {}
     overrides = {override for override in dirs.values() if override is not None}
     watched = names.assigned | overrides
