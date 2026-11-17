@@ -10,6 +10,8 @@
 # REUSE.toml or LICENSES/ was present at adoption: the reuse-lint job runs
 # reuse lint at the release line fsfe/reuse-action@v6 runs in CI.
 # It skips where reuse is not installed and fails on another reuse major.
+# A failing pre-push job (push-guard first) stops the hook, so a refused push
+# never runs the gate.
 ---
 agent-checkpoint-tool:
   commands:
@@ -57,6 +59,7 @@ post-commit:
 
 pre-push:
   parallel: false
+  piped: true
   jobs:
     - name: push-guard
       script: push-guard.sh

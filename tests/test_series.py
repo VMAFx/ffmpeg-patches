@@ -2291,12 +2291,65 @@ class MakeTargetsTest(unittest.TestCase):
         self.assertIn("set FFMPEG_TREE", result.stderr)
 
     def test_lengths_local_skips_loudly_without_a_tree(self) -> None:
-        # verify-all must stay green without an FFmpeg checkout, but the skip is
-        # announced (never a silent pass) and names that CI still enforces it.
+        """Verify a missing applied tree produces a successful, explicit skip."""
         result = self.run_make("lengths-local")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SKIPPED", result.stderr)
-        self.assertIn("CI enforces this gate", result.stderr)
+
+    def test_lengths_local_working_tree_names_ci_scope(self) -> None:
+        """Verify the working-tree skip message describes conditional CI coverage."""
+        env = {k: v for k, v in os.environ.items() if k not in self._LEAKY_MAKE_VARS}
+        result = subprocess.run(  # nosec B603 - make path and arguments are controlled test inputs.
+            [self.make, "-s", "-C", str(series.ROOT), "lengths-local"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SKIPPED", result.stderr)
+        self.assertIn("series.py scope", result.stderr)
+        self.assertNotIn("unconditionally", result.stderr)
+
+    def test_lengths_ci_text_matches_workflow_scope(self) -> None:
+        """Keep local length-gate claims consistent with the workflow scope condition."""
+        workflow = (series.ROOT / ".github/workflows/series.yml").read_text(encoding="utf-8")
+        condition = ""
+        length_conditions = []
+        for line in workflow.splitlines():
+            if line.startswith("      - "):
+                condition = ""
+            if line.strip().startswith("if:"):
+                condition = line.strip()
+            if line.strip().startswith("run: python3 scripts/series.py lengths "):
+                length_conditions.append(condition)
+        self.assertEqual(len(length_conditions), 1, "Expected one CI lengths step")
+        self.assertIn(
+            "IN_SCOPE",
+            length_conditions[0],
+            "CI lengths condition changed; update the three texts in Makefile and README.md",
+        )
+        readme = (series.ROOT / "README.md").read_text(encoding="utf-8")
+        paragraphs = [
+            paragraph.split("\n\n", 1)[0]
+            for paragraph in readme.split("\n- ")
+            if paragraph.startswith("a function-length gate (HISS-04):")
+        ]
+        self.assertEqual(len(paragraphs), 1, "Expected the applied-tree length-gate paragraph")
+        self.assertIn("make lengths FFMPEG_TREE=<applied tree>", paragraphs[0])
+        texts = {
+            "Makefile": (series.ROOT / "Makefile").read_text(encoding="utf-8"),
+            "README.md length-gate paragraph": paragraphs[0],
+        }
+        for path, text in texts.items():
+            with self.subTest(path=path):
+                normalized = " ".join(text.split())
+                for claim in ("unconditionally", "on every pull request"):
+                    self.assertFalse(
+                        claim in normalized,
+                        f"{path}: scoped CI length gate must not claim {claim!r}",
+                    )
 
     def test_lengths_local_runs_the_gate_when_a_tree_is_given(self) -> None:
         # A tree that is not the applied series makes the gate fail rather than
