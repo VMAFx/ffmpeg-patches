@@ -354,6 +354,29 @@ class FixWordTest(unittest.TestCase):
                 message = f"avformat/rtsp: check write\n\n{trailer}\n"
                 self.assertIsNone(upstream_lint.fix_word(message))
 
+    def test_hyphenated_uninitialised_and_warning_flags(self) -> None:
+        """Sanitizer hyphenated forms match while warning flag prefixes return None."""
+        for token, expected in (
+            ("use-of-uninitialized-value", "uninitialized"),
+            ("use-of-uninitialised-value", "uninitialised"),
+        ):
+            with self.subTest(token=token):
+                message = f"avformat/rtsp: check write\n\nHandle {token} in reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), expected)
+        for flag in (
+            "-Wmaybe-uninitialized",
+            "-Wmaybe-uninitialised",
+            "maybe-uninitialized",
+            "maybe-uninitialised",
+            "-Wsometimes-uninitialized",
+            "-Wsometimes-uninitialised",
+            "sometimes-uninitialized",
+            "sometimes-uninitialised",
+        ):
+            with self.subTest(flag=flag):
+                message = f"avformat/rtsp: check write\n\nHandle {flag} in reply.\n"
+                self.assertIsNone(upstream_lint.fix_word(message))
+
 
 class TestReachTest(unittest.TestCase):
     """Positive, negative and boundary coverage of reach_names and test_words."""
@@ -1619,6 +1642,22 @@ class PipelineTest(FixtureTest):
         self.assertIn("step: regression-test rc: 0", output)
         self.assertIn("waived: needs a live RTSP server", output)
         self.git("commit", "--amend", "-qm", f"{subject}\n\nRename the reply helper.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_hyphenated_uninitialized_subject_requires_test_or_waiver(self) -> None:
+        """A use-of-uninitialized-value subject fails without a test unless waived."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avformat/x: use-of-uninitialized-value in keybuffer")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        rc, output = self.check("--no-test-reason", "reproducer requires MemorySanitizer")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("waived: reproducer requires MemorySanitizer", output)
+        self.git("commit", "--amend", "-qm", "avformat/x: clear keybuffer")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)

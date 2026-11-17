@@ -183,7 +183,7 @@ FIX_MESSAGE = re.compile(
     r"\b(?:fix(?:es|ed)?|bugs?|regressions?|misalign(?:s|ed|ment)?|crash(?:es|ed)?"
     r"|overflow(?:s|ed)?|overreads?|leak(?:s|ed)?|wrong|incorrect(?:ly)?|broken"
     r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out(?:\s+|\s*-\s*)of(?:\s+|\s*-\s*)bounds"
-    r"|(?<!-)uninitiali[sz]ed|use(?:\s+|\s*-\s*)after(?:\s+|\s*-\s*)free"
+    r"|(?<!maybe-)(?<!sometimes-)uninitiali[sz]ed|use(?:\s+|\s*-\s*)after(?:\s+|\s*-\s*)free"
     r"|double(?:\s+|\s*-\s*)free|null\s+dereferences?|null\s+pointer\s+dereferences?"
     r"|(?:division|divide)\s+by\s+zero|undefined\s+behaviou?r|deadlock(?:s|ed)?"
     r"|segfault(?:s|ed)?|segmentation\s+faults?|(?:memory|heap|stack)\s+corruption|oob)\b",
