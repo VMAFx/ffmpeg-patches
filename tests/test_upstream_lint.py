@@ -1124,6 +1124,35 @@ class FateDepsTest(unittest.TestCase):
             step.output,
         )
 
+    def test_target_provenance_deletion_with_different_base_command_fails(self) -> None:
+        """A reassigned mixed-root CMD differs from its target's existing base CMD."""
+        command = "$(T): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        tail = command + "fate-x: CMD = true\n"
+        base = "T = fate-x\nT = fate-z\n" + tail
+        head = "T = fate-x\n" + tail
+        step = self.check_diff(base, head)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_comment_deletion_with_different_base_command_passes(self) -> None:
+        """Deleting a comment preserves a mixed-root CMD despite another base CMD."""
+        command = "$(T): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        tail = command + "fate-x: CMD = true\n"
+        base = "T = fate-x\n# note\n" + tail
+        head = "T = fate-x\n" + tail
+        step = self.check_diff(base, head)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertNotIn("finding:", step.output)
+        self.assertIn(
+            "pre-existing (untouched): tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
     def test_unrelated_deletion_after_target_assignment_passes(self) -> None:
         """Deleting unrelated text after an assignment leaves its mixed-root CMD untouched."""
         assignment = "TARGETS = fate-x\n"
