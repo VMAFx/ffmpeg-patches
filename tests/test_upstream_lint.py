@@ -1010,6 +1010,69 @@ class FateDepsTest(unittest.TestCase):
                     step.output,
                 )
 
+    def test_distinct_tests_data_name_continuations_pass(self) -> None:
+        """Distinct tests/data names sharing a prefix before + pass in both root orders."""
+        for command in (
+            "cat tests/data/x/log $(TARGET_PATH)/tests/data/x+extra/out",
+            "cat tests/data/x+extra/log $(TARGET_PATH)/tests/data/x/out",
+        ):
+            with self.subTest(command=command):
+                step = self.check_source(f"FATE_X-yes += fate-x\nfate-x: CMD = {command}\n")
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertNotIn("finding:", step.output)
+
+    def test_tests_data_boundary_allowlist(self) -> None:
+        """Each allow-listed boundary after tests/data/x still flags mixed-root access."""
+        cases = (
+            ("/", "cat tests/data/x/log $(TARGET_PATH)/tests/data/x/out"),
+            (" ", "cat tests/data/x $(TARGET_PATH)/tests/data/x end"),
+            ("\t", "cat tests/data/x\t$(TARGET_PATH)/tests/data/x\tend"),
+            ('"', 'cat "tests/data/x" "$(TARGET_PATH)/tests/data/x"'),
+            ("'", "cat 'tests/data/x' '$(TARGET_PATH)/tests/data/x'"),
+            (";", "echo tests/data/x; echo $(TARGET_PATH)/tests/data/x; true"),
+            ("|", "echo tests/data/x| cat $(TARGET_PATH)/tests/data/x| cat"),
+            (")", "(echo tests/data/x) (echo $(TARGET_PATH)/tests/data/x)"),
+            ("<", "cat tests/data/x<in $(TARGET_PATH)/tests/data/x<in"),
+            (">", "cat tests/data/x>out $(TARGET_PATH)/tests/data/x>out"),
+            ("end-rooted", "cat tests/data/x/log $(TARGET_PATH)/tests/data/x"),
+            ("end-relative", "cat $(TARGET_PATH)/tests/data/x/out tests/data/x"),
+        )
+        for boundary, command in cases:
+            with self.subTest(boundary=boundary):
+                step = self.check_source(f"FATE_X-yes += fate-x\nfate-x: CMD = {command}\n")
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("tests/data/x named with and without $(TARGET_PATH)/", step.output)
+
+    def test_tests_data_refused_continuations_pass(self) -> None:
+        """Non-boundary characters right after x yield no directory match in either form."""
+        for char in ("+", "$", ",", ":", "@", "\\"):
+            for command in (
+                f"cat tests/data/x/log $(TARGET_PATH)/tests/data/x{char}extra/out",
+                f"cat tests/data/x{char}extra/log $(TARGET_PATH)/tests/data/x/out",
+            ):
+                with self.subTest(char=char, command=command):
+                    step = self.check_source(f"FATE_X-yes += fate-x\nfate-x: CMD = {command}\n")
+                    self.assertEqual(step.rc, 0, step.output)
+                    self.assertNotIn("finding:", step.output)
+
+    def test_tests_data_patterns_enforce_name_boundary(self) -> None:
+        """Both tests/data patterns match whole directory names and never truncate prefixes."""
+        for sample in (
+            "$(TARGET_PATH)/tests/data/x+extra/out",
+            " tests/data/x+extra/out",
+            "$(TARGET_PATH)/tests/data/dir_x+extra/out",
+            " tests/data/dir_x+extra/out",
+            "$(TARGET_PATH)/tests/data/x\n",
+            " tests/data/x\n",
+        ):
+            with self.subTest(sample=sample):
+                self.assertEqual(upstream_lint.FATE_ROOTED_DATA.findall(sample), [])
+                self.assertEqual(upstream_lint.FATE_RELATIVE_DATA.findall(sample), [])
+        self.assertEqual(
+            upstream_lint.FATE_ROOTED_DATA.findall("$(TARGET_PATH)/tests/data/x/out"), ["x"]
+        )
+        self.assertEqual(upstream_lint.FATE_RELATIVE_DATA.findall(" tests/data/x/out"), ["x"])
+
 
 class DiagnosticCitationTest(unittest.TestCase):
     """Positive, negative and boundary coverage of diagnostic workaround citations."""

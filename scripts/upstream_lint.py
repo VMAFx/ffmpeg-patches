@@ -552,8 +552,12 @@ LAVFI_FORMAT = re.compile(r"(?:^|\s)-f\s+lavfi(?=\s|$)")
 LAVFI_OPTION = re.compile(r"^-[\w:]+$")
 LAVFI_NAME = re.compile(r"""^["']?([a-z0-9_]+)(?=[=,;\s"']|$)""")
 FATE_REQUIRED = ("LAVFI_INDEV", "WRAPPED_AVFRAME_DECODER")
-FATE_ROOTED_DATA = re.compile(r"\$\(TARGET_PATH\)/tests/data/([A-Za-z0-9_.-]+)")
-FATE_RELATIVE_DATA = re.compile(r"""(?:^|[ \t=<>"'])tests/data/([A-Za-z0-9_.-]+)""")
+FATE_ROOTED_DATA = re.compile(
+    r"""\$\(TARGET_PATH\)/tests/data/([A-Za-z0-9_.-]+)(?=[/ \t"';|)<>]|\Z)"""
+)
+FATE_RELATIVE_DATA = re.compile(
+    r"""(?:^|[ \t=<>"'])tests/data/([A-Za-z0-9_.-]+)(?=[/ \t"';|)<>]|\Z)"""
+)
 
 
 @dataclass(frozen=True)
