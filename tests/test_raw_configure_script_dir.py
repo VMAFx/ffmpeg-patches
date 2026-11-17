@@ -40,6 +40,7 @@ UNREAD = '. "$UNSET_DIR/x.sh"\n'
 RUN = "bash inner.sh\n"
 CFG = "<cfg>\n"
 WRITTEN = "own-directory name the script also writes another way"
+BRACE_WORD = "{a,b,"
 OTHER = {"other/lib.sh": CFG}
 PRINTF = "printf -v HERE '%s' <case>/other\n"
 POSIX = "set -o posix\n"
@@ -1626,6 +1627,43 @@ SCRIPT_DIR = {
         + SRC,
         0,
     ),
+    "r25-operand-read-bash-source": Case(
+        'HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"\n'
+        + "c=read\n"
+        + NAME_HERE
+        + CALL_C
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r25-brace-loop-command": Case(
+        'HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"\n'
+        + "for c in {a,b,read}; do :; done\n"
+        + NAME_HERE
+        + CALL_C
+        + SRC,
+        2,
+        BRACE_WORD,
+        OTHER,
+    ),
+    "r25-brace-loop-body": Case(
+        CDPWD + 'for c in {a,b,read}; do "$c" HERE <<< <case>/other; done\n' + SRC,
+        2,
+        BRACE_WORD,
+        OTHER,
+    ),
+    "r25-plain-loop-command": Case(
+        CDPWD + "for c in a b read; do :; done\n" + NAME_HERE + CALL_C + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r25-brace-loop-harmless": Case(
+        CDPWD + "for c in {a,b,true}; do :; done\n" + NAME_HERE + CALL_C + SRC,
+        2,
+        BRACE_WORD,
+    ),
 }
 
 
@@ -1673,8 +1711,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 522 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 522)
+        """Replay all 527 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 527)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
