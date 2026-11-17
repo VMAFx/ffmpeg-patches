@@ -1063,6 +1063,13 @@ class FairyReviewsTest(ForgejoTest):
 class EditBodyTest(ForgejoTest):
     """Exercise body-edit decisions against scripted commit statuses."""
 
+    def test_edit_body_filler_is_refused_before_any_request(self) -> None:
+        """A filler body exits 81 before any head, status or token request."""
+        (self.tmp / "body.md").write_text("Would you like me to add a test?\n", encoding="utf-8")
+        stub = Stub()
+        self.assertEqual(self.run_helper(stub), 81)
+        self.assertEqual(stub.requests, [])
+
     def run_helper(
         self,
         stub: Stub,
@@ -1345,6 +1352,15 @@ class EditBodyTest(ForgejoTest):
 class CloseTest(ForgejoTest):
     """The close verb comments on and closes only an own open pull request."""
 
+    def test_close_filler_is_refused_before_any_request(self) -> None:
+        """A filler closing comment exits 81 before any token or pull request."""
+        body = self.tmp / "body.md"
+        body.write_text("Would you like me to add a test?\n", encoding="utf-8")
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1", str(body))
+        self.assertEqual(proc.returncode, 81, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
     def writes(self, stub: Stub) -> list[tuple[str, str]]:
         """Return the method and path of every POST and PATCH the stub received."""
 
@@ -1481,6 +1497,15 @@ THREAD = [
 
 class ReplyTest(ForgejoTest):
     """The reply verb answers a review comment inside its thread."""
+
+    def test_reply_filler_is_refused_before_any_request(self) -> None:
+        """A filler reply exits 81 before any token or review-comment request."""
+        body = self.tmp / "body.md"
+        body.write_text("Would you like me to add a test?\n", encoding="utf-8")
+        stub = self.stub()
+        proc = self.reply(stub, "85995", str(body))
+        self.assertEqual(proc.returncode, 81, proc.stderr)
+        self.assertEqual(stub.requests, [])
 
     def stub(self, *, heads: list[object] | None = None, **kwargs: object) -> Stub:
         """Return a stub serving the planted thread under review 7."""
@@ -1716,6 +1741,23 @@ class ReplyTest(ForgejoTest):
 
 class TestClaimHeadTest(ForgejoTest):
     """Validate evidence before accepting claims about a tested head."""
+
+    def test_comment_filler_is_refused_before_any_request(self) -> None:
+        """A filler comment exits 81 before any token, head or comment request."""
+        (self.tmp / "body.md").write_text("Would you like me to add a test?\n", encoding="utf-8")
+        stub = Stub()
+        proc = self.comment(stub, "--no-test-claims")
+        self.assertEqual(proc.returncode, 81, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_issue_filler_is_refused_before_any_request(self) -> None:
+        """A filler issue body exits 81 before any token or issue request."""
+        body = self.tmp / "body.md"
+        body.write_text("Would you like me to add a test?\n", encoding="utf-8")
+        stub = Stub()
+        proc = self.run_command(stub, "issue", "title", str(body))
+        self.assertEqual(proc.returncode, 81, proc.stderr)
+        self.assertEqual(stub.requests, [])
 
     def evidence(self, head: str = A, content: str | None = None) -> str:
         """Write evidence for a tested head."""
@@ -2479,6 +2521,14 @@ class FairyRequestTestBase(unittest.TestCase):
 
 
 class PullRequestReviewerTest(FairyRequestTestBase):
+    def test_pr_filler_is_refused_before_any_request(self) -> None:
+        """A filler PR body exits 81 before any fetch, token or API request."""
+        (self.tmp / "body.md").write_text("Would you like me to add a test?\n", encoding="utf-8")
+        stub = Stub(reviewers=[["alice"]])
+        proc = self.pr(stub)
+        self.assertEqual(proc.returncode, 81, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
     def test_pr_refuses_unswept_fork_head(self) -> None:
         """A different fork head cannot create a pull for a validated local commit."""
 
@@ -4607,6 +4657,7 @@ def mutant_case(
         scripts.mkdir(parents=True)
         git(checkout, "init", "-q")
         shutil.copyfile(HELPER.parent / "base_claims.py", scripts / "base_claims.py")
+        shutil.copyfile(HELPER.parent / "forge_text.py", scripts / "forge_text.py")
         copy_sweep_validator(scripts)
         mutant = scripts / "ffmpeg-forgejo"
         mutant.write_text(source.replace(old, new), encoding="utf-8")
@@ -4823,12 +4874,13 @@ class MutantCaseTest(unittest.TestCase):
     """The mutation harness copy is a runnable repository helper."""
 
     def test_copy_has_siblings_in_a_checkout(self) -> None:
-        """The temp copy sits at scripts/ffmpeg-forgejo of a Git checkout beside both validators."""
+        """The temp copy sits at scripts/ffmpeg-forgejo beside every required validator."""
 
         with mutant_case(HELPER.read_text(encoding="utf-8"), "", "", EditBodyTest, "Probe") as case:
             self.assertEqual(case.helper.name, "ffmpeg-forgejo")
             self.assertEqual(case.helper.parent.name, "scripts")
             self.assertTrue((case.helper.parent / "base_claims.py").is_file())
+            self.assertTrue((case.helper.parent / "forge_text.py").is_file())
             self.assertTrue((case.helper.parent / "variant_sweep.py").is_file())
             self.assertTrue((case.helper.parent.parent / ".git" / "HEAD").is_file())
 
