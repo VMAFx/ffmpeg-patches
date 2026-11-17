@@ -52,7 +52,7 @@ class ReviewClassesTest(unittest.TestCase):
             review_classes.load_classes(self.path)
 
     def test_real_classes_and_check_references(self) -> None:
-        """Load all 39 unique classes and resolve every declared automated check."""
+        """Load 39 unique classes, confirm question endings, and resolve declared checks."""
         classes = review_classes.load_classes()
         self.assertEqual(len(classes), 39)
         self.assertEqual(len({item["id"] for item in classes}), 39)
@@ -67,6 +67,7 @@ class ReviewClassesTest(unittest.TestCase):
             and isinstance(node.args[0], ast.Constant)
         }
         for item in classes:
+            self.assertTrue(item["question"].endswith("?"), item["id"])
             if "check" not in item:
                 continue
             kind, target = item["check"].split(":", 1)
@@ -170,6 +171,14 @@ class ReviewClassesTest(unittest.TestCase):
         """Refuse duplicate pull request evidence within one class."""
         self.invalid_item("pull_requests", [1, 1], "duplicate pull request")
 
+    def test_descending_pull_requests(self) -> None:
+        """Refuse descending pull requests with the file path and ordering problem."""
+        self.invalid_item("pull_requests", [2, 1], rf"{self.path}:.*strictly ascending")
+
+    def test_unsorted_three_pull_requests(self) -> None:
+        """Refuse a three-number list that starts ascending but ends out of order."""
+        self.invalid_item("pull_requests", [1, 3, 2], rf"{self.path}:.*strictly ascending")
+
     def test_invalid_definition(self) -> None:
         """Refuse empty, nontext, non-ASCII, or table-breaking definitions."""
         for value in (None, "", " padded ", "line\nbreak", "bad|cell", "\u00e9", "bad\tcell"):
@@ -177,8 +186,17 @@ class ReviewClassesTest(unittest.TestCase):
                 self.invalid_item("definition", value, "definition")
 
     def test_invalid_question(self) -> None:
-        """Refuse questions that cannot be represented exactly in a table cell."""
-        for value in (None, "", " padded ", "line\nbreak", "bad|cell", "\u00e9", "bad\rcell"):
+        """Refuse questions missing a final ? or unable to fit exactly in a table cell."""
+        for value in (
+            None,
+            "",
+            " padded ",
+            "line\nbreak",
+            "bad|cell",
+            "\u00e9",
+            "bad\rcell",
+            "Missing question mark",
+        ):
             with self.subTest(value=value):
                 self.invalid_item("question", value, "question")
 

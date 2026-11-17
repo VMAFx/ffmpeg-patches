@@ -1,6 +1,15 @@
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-# Recurring upstream review classes; every sweep must answer each question.
+# Read by load_classes in scripts/review_classes.py; scripts/variant_sweep.py uses it
+# to build the review-classes section of a full sweep report in sweep_all and to
+# refuse reports leaving a class unanswered in validate_full_report, reached by
+# the push gate require_sweep in scripts/ffmpeg-forgejo.
+# id: Unique lower-case kebab-case class name.
+# definition: One-line description of the class.
+# hits: Number of review items in the class, at least 2.
+# pull_requests: Own upstream pull request numbers where raised, ascending, no repeats.
+# question: One self-review sentence ending in ?, no |; copied into every sweep row.
+# check: Optional covering step: upstream-lint:STEP, variant-sweep:CLASS, or script:PATH.
 classes:
 - id: commit-claim-overstates-code
   hits: 17

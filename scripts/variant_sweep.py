@@ -735,8 +735,8 @@ def load_review_classes(path: Path = CLASS_FILE) -> list[dict]:
 
 
 def render_review_classes(sha: str, class_file: Path = CLASS_FILE) -> str:
-    """Build the required review section with one unanswered row per configured class."""
-    lines = [f"class: review-classes\nhead: {sha}", REVIEW_TABLE, REVIEW_SEPARATOR]
+    """Build a blank-line-separated review table with one unanswered row per class."""
+    lines = [f"class: review-classes\nhead: {sha}", "", REVIEW_TABLE, REVIEW_SEPARATOR]
     lines.extend(
         f"| {item['id']} | {item['question']} | TODO |" for item in load_review_classes(class_file)
     )

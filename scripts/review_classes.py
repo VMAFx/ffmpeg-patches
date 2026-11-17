@@ -39,8 +39,20 @@ def plain_text(value: object) -> bool:
     )
 
 
+def _validate_pull_requests(requests: object, label: str) -> None:
+    """Require nonempty, unique, strictly ascending positive pull request numbers."""
+    if not isinstance(requests, list) or not requests:
+        raise ValueError(f"{label}: missing or invalid pull_requests")
+    if any(type(number) is not int or number < 1 for number in requests):
+        raise ValueError(f"{label}: invalid pull request number")
+    if len(requests) != len(set(requests)):
+        raise ValueError(f"{label}: duplicate pull request number")
+    if requests != sorted(requests):
+        raise ValueError(f"{label}: pull_requests must be strictly ascending")
+
+
 def validate_item(item: object, path: Path) -> dict:
-    """Validate one class against the field and value allow-lists."""
+    """Validate class fields, ascending pull requests, and a table-safe question ending in ?."""
     if not isinstance(item, dict) or not FIELDS - {"check"} <= item.keys() <= FIELDS:
         raise ValueError(f"{path}: invalid class fields")
     if not isinstance(item["id"], str) or not CLASS_ID.fullmatch(item["id"]):
@@ -48,16 +60,12 @@ def validate_item(item: object, path: Path) -> dict:
     label = f"{path}: {item['id']}"
     if type(item["hits"]) is not int or item["hits"] < 2:
         raise ValueError(f"{label}: hits must be an integer >= 2")
-    requests = item["pull_requests"]
-    if not isinstance(requests, list) or not requests:
-        raise ValueError(f"{label}: missing or invalid pull_requests")
-    if any(type(number) is not int or number < 1 for number in requests):
-        raise ValueError(f"{label}: invalid pull request number")
-    if len(requests) != len(set(requests)):
-        raise ValueError(f"{label}: duplicate pull request number")
+    _validate_pull_requests(item["pull_requests"], label)
     for field in ("definition", "question"):
         if not plain_text(item[field]):
             raise ValueError(f"{label}: invalid {field}")
+    if not item["question"].endswith("?"):
+        raise ValueError(f"{label}: question must end in ?")
     if "check" in item and (
         not isinstance(item["check"], str) or not CHECK.fullmatch(item["check"])
     ):

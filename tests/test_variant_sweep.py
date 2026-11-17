@@ -806,7 +806,7 @@ class ReviewClassSectionTest(unittest.TestCase):
 
     def test_no_hits(self) -> None:
         """Refuse a no-hits marker in place of mandatory individual class answers."""
-        section = f"class: review-classes\nhead: {self.sha}\n"
+        section = f"class: review-classes\nhead: {self.sha}\n\n"
         section += (
             variant_sweep.REVIEW_TABLE + "\n" + variant_sweep.REVIEW_SEPARATOR + "\nno hits\n"
         )
@@ -857,19 +857,20 @@ class ReviewClassSectionTest(unittest.TestCase):
         self.assertEqual(str(actual.exception), str(expected.exception))
 
     def test_generated_section_has_all_todos(self) -> None:
-        """Generate every canonical class question with an unanswered TODO cell."""
+        """Generate a blank line before the table and every canonical unanswered class."""
         section = variant_sweep.render_review_classes(self.sha, self.class_file)
         self.assertEqual(
-            section.splitlines()[:4],
+            section.splitlines()[:5],
             [
                 "class: review-classes",
                 f"head: {self.sha}",
+                "",
                 "| class | question | disposition |",
                 "| --- | --- | --- |",
             ],
         )
         self.assertEqual(
-            section.splitlines()[4:],
+            section.splitlines()[5:],
             [
                 "| first-class | Have you checked first-class? | TODO |",
                 "| second-class | Have you checked second-class? | TODO |",

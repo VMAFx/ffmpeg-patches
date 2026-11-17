@@ -142,7 +142,7 @@ def full_sweep_report(sha: str) -> str:
         "| --- | --- | --- | --- | --- | --- |\n"
         "no hits\n"
     ) + (
-        f"\nclass: review-classes\nhead: {sha}\n"
+        f"\nclass: review-classes\nhead: {sha}\n\n"
         "| class | question | disposition |\n| --- | --- | --- |\n" + rows
     )
 
