@@ -1572,6 +1572,60 @@ SCRIPT_DIR = {
         + SRC,
         0,
     ),
+    **{
+        f"r24-keep-{form}-{position}": Case(idiom + tail, 0)
+        for form, idiom in (
+            ("cd-pwd", CDPWD),
+            ("bash-source", 'HERE=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")\n'),
+        )
+        for position, tail in (
+            ("source-first", SRC + 'c="$HERE/x.sh"\n"$c" a\n'),
+            ("source-between", 'c="$HERE/x.sh"\n' + SRC + '"$c" a\n'),
+            ("source-last", 'c="$HERE/x.sh"\n"$c" a\n' + SRC),
+        )
+    },
+    "r24-keep-default-command": Case(DEFAULT + 'c="$HERE/x.sh"\n"$c" a\n' + SRC, 0),
+    "r24-keep-or-list-command": Case(CDPWD + 'c="$HERE/x.sh"\nfoo a || { "$c" a; }\n' + SRC, 0),
+    "r24-keep-if-command": Case(CDPWD + 'c="$HERE/x.sh"\nif true; then "$c" a; fi\n' + SRC, 0),
+    "r24-keep-or-list-env-command": Case(
+        CDPWD + 'c="$HERE/x.sh"\nfoo env A=1 git || { "$c" a; }\n' + SRC, 0
+    ),
+    "r24-keep-command-without-source": Case(CDPWD + 'c="$HERE/x.sh"\n"$c" a\n', 0),
+    "r24-keep-direct-command": Case(CDPWD + '"$HERE/x.sh" a\n' + SRC, 0),
+    "r24-keep-unquoted-data": Case(CDPWD + 'c=$HERE/x.sh\necho "$c"\n' + SRC, 0),
+    "r24-unresolved-after-own-directory": Case(
+        CDPWD + 'c="$HERE/x.sh"\nc="$1"\n' + NAME_HERE + CALL_C + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+        command=READ_RUN,
+    ),
+    "r24-unresolved-with-own-directory": Case(
+        CDPWD + 'c="$HERE$1"\n' + NAME_HERE + CALL_C + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+        command=READ_RUN,
+    ),
+    "r24-static-cap-sixteen-then-read": Case(
+        CDPWD
+        + "".join(f'declare "c=x{idx:02d}"\n' for idx in range(16))
+        + 'declare "c=read"\n'
+        + NAME_HERE
+        + CALL_C
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r24-keep-static-sixteen-harmless": Case(
+        CDPWD
+        + "".join(f'declare "c=x{idx:02d}"\n' for idx in range(16))
+        + NAME_HERE
+        + CALL_C
+        + SRC,
+        0,
+    ),
 }
 
 
@@ -1619,8 +1673,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 505 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 505)
+        """Replay all 522 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 522)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

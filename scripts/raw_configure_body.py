@@ -2595,6 +2595,22 @@ def _resolve_arrays(
     return {k: tuple(v) for k, v in arrays.items() if v}
 
 
+def _binding_candidates(
+    nodes: list[Any], raw: bytes, live: _VarScope, names: _Names
+) -> tuple[tuple[str, ...], bool]:
+    """Keep unresolved bindings unknown unless their own-directory form establishes them."""
+    vals, loc, _ = _word_candidates(nodes, raw, live)
+    if vals or loc:
+        return vals, loc
+    if len(nodes) == 1 and _script_dir_value(_text(nodes[0], raw))[0]:
+        return vals, False
+    # Directory placeholders establish the form only; never store them as real candidates.
+    dirs = {name: ("/",) for name in _script_dir_names(names.assignments)}
+    known = _VarScope({**live.values, **dirs}, live.arrays, live.assigned, live.locale_vars)
+    established, unknown, _ = _word_candidates(nodes, raw, known)
+    return vals, unknown or not established
+
+
 def _step_binding_pass(
     names: _Names, base: _VarScope, live: _VarScope, loc_vars: set[str]
 ) -> dict[str, tuple[str, ...]]:
@@ -2605,8 +2621,8 @@ def _step_binding_pass(
             _mark_unknown(loc_vars, key)
         live.values[key] = tuple(store[key])
     for key, op, nodes, raw in names.raw_bindings:
-        vals, loc, _ = _word_candidates(nodes, raw, live)
-        if loc or not vals:
+        vals, loc = _binding_candidates(nodes, raw, live, names)
+        if loc:
             _mark_unknown(loc_vars, key)
         if vals:
             if _add_resolved(store, key, op, vals, live):
