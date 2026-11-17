@@ -14,7 +14,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from scripts import sweep_doc_claims, sweep_state_advance, variant_sweep
+from scripts import review_classes, sweep_doc_claims, sweep_state_advance, variant_sweep
 from tests import test_variant_sweep as fixtures
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "variant_sweep.py"
@@ -351,6 +351,12 @@ class SweepClassesTest(unittest.TestCase):
         result = self.sweep(self.base, "all")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(encoding="utf-8").count("no hits"), 3)
+        with self.assertRaisesRegex(RuntimeError, "review-classes:"):
+            variant_sweep.validate_full_report(self.output, self.base)
+        self.output.write_text(
+            self.output.read_text(encoding="utf-8").replace("| TODO |", "| no-variant: fixture |"),
+            encoding="utf-8",
+        )
         self.assertTrue(variant_sweep.validate_full_report(self.output, self.base))
 
 
@@ -591,7 +597,7 @@ class FullReportTest(unittest.TestCase):
             "| --- | --- | --- | --- | --- | --- |\n"
             "| doc/a.texi:3 | 64x64 | libfoo | 1.2.0 | 2.0.0 | "
             "checked: libfoo 1.2.0 2.0.0 upstream/file.c:7; upstream/other.c:9 |\n"
-        )
+        ) + variant_sweep.render_review_classes(sha).replace("| TODO |", "| no-variant: fixture |")
 
     def valid(self, report: str) -> bool:
         """Validate supplied text using the exact-head full-report API."""
@@ -678,7 +684,14 @@ class FullReportTest(unittest.TestCase):
         """The full validator loads under isolated Python without sibling sweep modules."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            shutil.copyfile(SCRIPT, root / "variant_sweep.py")
+            scripts = root / "scripts"
+            scripts.mkdir()
+            for name in ("variant_sweep.py", "review_classes.py", "lane_brief.py"):
+                shutil.copyfile(SCRIPT.parent / name, scripts / name)
+            (root / ".config").mkdir()
+            shutil.copyfile(
+                review_classes.CLASS_FILE, root / ".config" / review_classes.CLASS_FILE.name
+            )
             (root / "report.md").write_text(self.reviewed_report(), encoding="utf-8")
             code = (
                 "import importlib.util,pathlib,sys; "
@@ -694,7 +707,7 @@ class FullReportTest(unittest.TestCase):
                     "-B",
                     "-c",
                     code,
-                    str(root / "variant_sweep.py"),
+                    str(scripts / "variant_sweep.py"),
                     str(root / "report.md"),
                 ],
                 capture_output=True,
