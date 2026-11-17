@@ -1,0 +1,339 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+# Recurring upstream review classes; every sweep must answer each question.
+classes:
+- id: commit-claim-overstates-code
+  hits: 17
+  pull_requests:
+  - 25110
+  - 25475
+  - 25476
+  - 25619
+  - 25664
+  - 25719
+  - 25725
+  - 25726
+  - 25765
+  - 25802
+  - 25875
+  - 25885
+  - 25893
+  definition: Commit message, PR prose, or refusal diagnostic claims a broader execution scope, stronger guarantee, or lower operation count than the code implements.
+  question: Do the commit message, PR prose, and refusal diagnostics match the implemented scope, guarantees, and operation counts?
+  check: upstream-lint:claim-scope
+- id: doc-omits-code-case-or-constraint
+  hits: 15
+  pull_requests:
+  - 24993
+  - 25220
+  - 25613
+  - 25619
+  - 25867
+  - 25875
+  - 25879
+  - 25885
+  definition: Added or modified Texinfo documentation describes a feature or example while omitting a branch case, clamp, prerequisite, or failure mode implemented in C.
+  question: Does the Texinfo documentation cover every implemented branch case, clamp, prerequisite, and failure mode?
+  check: upstream-lint:doc-terms
+- id: incomplete-error-rollback-or-cleanup
+  hits: 11
+  pull_requests:
+  - 25475
+  - 25619
+  - 25714
+  definition: An error or interrupt path exits mid-operation after mutating state or before teardown, publishing truncated output, discarding valid packets, or leaking temporary files.
+  question: Do error and interrupt paths roll back state, preserve valid packets, and finish teardown without truncated output or temporary file leaks?
+- id: stale-pr-metadata
+  hits: 10
+  pull_requests:
+  - 25470
+  - 25476
+  - 25477
+  - 25481
+  - 25534
+  - 25620
+  - 25719
+  - 25761
+  - 25765
+  - 25875
+  definition: Pull request title or body retains outdated base commit hashes, dropped subsystem names, or descriptions of superseded behavior after branch revisions.
+  question: Do the PR title and body describe the current base, subsystems, and behavior after branch revisions?
+  check: script:scripts/base_claims.py
+- id: weak-or-unexercised-regression-test
+  hits: 9
+  pull_requests:
+  - 25475
+  - 25631
+  - 25713
+  - 25714
+  - 25725
+  - 25749
+  - 25875
+  definition: A regression test is present, but its inputs or printed observations leave a changed code branch, boundary value, or side effect unexercised.
+  question: Do regression inputs and observations exercise every changed branch, boundary value, and side effect?
+- id: stopped-stream-timeline-and-duration-drift
+  hits: 8
+  pull_requests:
+  - 25619
+  - 25875
+  definition: Continuing muxing or encoding after a single-stream or single-frame failure miscomputes presentation duration, segment timestamps, bitrate, or frame-index alignment.
+  question: After a stream or frame failure, do duration, segment timestamps, bitrate, and frame indices stay correct?
+- id: fixup-as-separate-commit
+  hits: 7
+  pull_requests:
+  - 25612
+  - 25664
+  - 25714
+  - 25719
+  - 25724
+  - 25893
+  definition: An earlier commit in a multi-commit pull request introduces a bug, nonportable test, or missing guard that a later commit in the same range repairs.
+  question: Does each commit stand alone without a later commit repairing its bug, nonportable test, or missing guard?
+- id: avoidable-hot-path-slowdown
+  hits: 6
+  pull_requests:
+  - 25477
+  - 25480
+  - 25875
+  - 25885
+  - 25893
+  definition: Change introduces an avoidable CPU throughput regression in a pixel, block, or slice hot path via unguarded clamping, lost `restrict`, extra dispatch, or repeated searches.
+  question: Have pixel, block, and slice hot paths been checked for avoidable clamping, lost restrict, extra dispatch, and repeated searches?
+- id: ignored-or-overwritten-error-status
+  hits: 6
+  pull_requests:
+  - 25053
+  - 25475
+  - 25713
+  - 25714
+  - 25879
+  definition: C code discards the return status of a fallible call or overwrites an earlier negative `ret` variable with a subsequent call's status before checking it.
+  question: Is every fallible return status checked before it is discarded or overwritten by another call?
+  check: variant-sweep:unchecked-return
+- id: incomplete-encoder-wrapper-mode-guard
+  hits: 6
+  pull_requests:
+  - 24993
+  - 25875
+  definition: Codec wrapper in `libavcodec/` guards or applies a feature for one flag or SEI kind while missing an equivalent library mode (`fake-interlaced`, `-params`, bitrate RC, scaling, or caption SEI).
+  question: Do codec wrapper guards cover equivalent flags, library modes, and SEI kinds?
+- id: oversized-test-scaffolding
+  hits: 5
+  pull_requests:
+  - 25480
+  - 25664
+  - 25713
+  - 25749
+  - 25867
+  definition: Added test code, shell normalization machinery, or expanded test macros substantially outweigh the production change they cover.
+  question: Is the test scaffolding proportionate to the production change it covers?
+- id: stale-or-contradictory-comment-and-commit-text
+  hits: 5
+  pull_requests:
+  - 24993
+  - 25053
+  - 25480
+  - 25724
+  definition: Code comment, commit message, or PR note retains text from an earlier draft, credits an ancestor commit's fix, lists an absent test variant, or contradicts a sibling number.
+  question: Are comments, commit messages, and PR notes current and consistent with test variants, ancestor fixes, and sibling numbers?
+- id: custom-test-or-compiled-expectations
+  hits: 5
+  pull_requests:
+  - 25719
+  - 25879
+  - 25885
+  definition: Patch adds a custom C test runner or `tools/` binary and/or hardcodes expected output/error verdicts in C source instead of comparing stdout against `tests/ref/fate/*`.
+  question: Do tests compare stdout with FATE references instead of adding custom runners or compiling expected verdicts into C?
+  check: upstream-lint:test-program
+- id: doc-contradicts-code-scale-enum-or-bound
+  hits: 5
+  pull_requests:
+  - 25220
+  - 25765
+  - 25875
+  definition: Texinfo documentation states a numeric range, default type, enum integer mapping, scaling factor, or strict upper bound that disagrees with the C implementation.
+  question: Do documented ranges, default types, enum mappings, scaling factors, and upper bounds agree with C?
+- id: overcomplex-or-hardcoded-driver-workaround
+  hits: 5
+  pull_requests:
+  - 24993
+  - 24994
+  - 25110
+  definition: Patch works around an external GPU driver bug with heavy bitstream rewriting, hardcoded guessed driver limits, or unconditional host sync instead of minimal/configurable guards or upstream fixes.
+  question: Does the driver workaround use minimal or configurable guards rather than guessed limits, heavy rewriting, or unconditional host sync?
+- id: unbounded-or-excessive-memory-retention
+  hits: 5
+  pull_requests:
+  - 25476
+  - 25765
+  - 25875
+  definition: Code retains per-frame or per-segment allocations across an entire stream without freeing or evicting consumed records, or enlarges stack arrays well beyond worst-case bounds.
+  question: Are consumed frame and segment records released and stack arrays bounded by demonstrated worst cases?
+- id: missing-regression-test
+  hits: 4
+  pull_requests:
+  - 25612
+  - 25618
+  - 25664
+  - 25875
+  definition: Pull request adds or fixes parser, protocol, or filter logic without automated FATE coverage.
+  question: Does changed parser, protocol, or filter logic have automated FATE regression coverage?
+  check: upstream-lint:regression-test
+- id: dangling-resource-or-leak-on-reinit-and-teardown
+  hits: 4
+  pull_requests:
+  - 25053
+  - 25714
+  - 25879
+  definition: Reinitialization, resize, or teardown frees/closes a resource before dependent calls finish or before clearing cached pointers/descriptors, causing use-after-free, `POLLNVAL` spins, or leaks.
+  question: Do reinitialization, resize, and teardown finish dependent calls and clear cached handles before releasing resources?
+- id: fate-makefile-dependency-mismatch
+  hits: 4
+  pull_requests:
+  - 25724
+  - 25867
+  - 25879
+  definition: FATE Makefile rule places a standalone library test under `FATE_FILTER`/`ffmpeg`, omits required filter `CONFIG_*` gates, bypasses its gate on a phony alias, or adds an unused protocol dependency.
+  question: Do FATE rules use the correct test target and CONFIG gates without bypassing aliases or unused protocol dependencies?
+  check: upstream-lint:fate-deps
+- id: invalid-spec-test-fixture
+  hits: 4
+  pull_requests:
+  - 25664
+  - 25719
+  - 25867
+  definition: Synthetic bitstream or frame side-data payload constructed in a test violates media specification invariants (ICC 128-byte header, AFGS1 4:2:0 chroma symmetry, or distinct set indices).
+  question: Do synthetic bitstreams and side-data fixtures satisfy media specification invariants?
+- id: workaround-rationale-omits-existing-invariant
+  hits: 4
+  pull_requests:
+  - 25470
+  - 25478
+  - 25479
+  definition: Commit message or comment for a compiler-warning workaround omits explaining that upstream callers, bit widths, or `configure` flags already enforce the bound.
+  question: Does each compiler-warning workaround explain bounds already enforced by callers, bit widths, or configure flags?
+- id: overstrict-or-inconsistent-input-validation
+  hits: 4
+  pull_requests:
+  - 25475
+  - 25875
+  definition: Parser or muxer validation rejects valid boundary inputs (19-character three-digit-hour durations, clearing-only files, sparse frame indices, whitespace lines) or mishandles `NUL`/`CR`.
+  question: Does input validation accept valid boundary inputs and consistently handle whitespace, NUL, and CR?
+- id: texinfo-layout-and-range-formatting
+  hits: 4
+  pull_requests:
+  - 25220
+  - 25875
+  definition: Added Texinfo documentation places library version requirements or codec notes mid-paragraph, inserts spurious blank lines, or formats range endpoints asymmetrically.
+  question: Are Texinfo version requirements, codec notes, blank lines, and range endpoints laid out consistently?
+- id: stopped-stream-stalls-playlist-publication
+  hits: 4
+  pull_requests:
+  - 25619
+  definition: A stopped or delayed HLS/DASH representation stalls manifest readiness counters, delays LHLS master publication, or leaves a stopped playlist missing `#EXT-X-ENDLIST`.
+  question: Can stopped or delayed representations finish readiness accounting and playlist publication with required ENDLIST markers?
+- id: bundled-independent-changes
+  hits: 3
+  pull_requests:
+  - 25475
+  - 25476
+  - 25619
+  definition: A single commit bundles an independent functional or error-propagation change together with a refactoring, buffer resize, or separate bugfix.
+  question: Are independent functional changes, refactorings, buffer resizes, and bugfixes separated into coherent commits?
+- id: checkasm-heap-allocation-lifecycle
+  hits: 3
+  pull_requests:
+  - 25480
+  - 25481
+  definition: Modified `tests/checkasm/*.c` code omits `fail()` on heap allocation failure, computes derived pointers before null checks, or frees local heap buffers after `call_new()` crash-recovery points.
+  question: Do checkasm allocations call fail on failure, check before pointer derivation, and release buffers safely around crash recovery?
+- id: fate-shell-pipeline-or-grep-hides-status
+  hits: 3
+  pull_requests:
+  - 25749
+  - 25885
+  definition: FATE Makefile rule or `fate-run.sh` helper pipes a test command into another filter, drops failed stdout under `GEN=1`, or asserts with `! grep -q` instead of reference comparison.
+  question: Do FATE shell rules preserve test exit status and failed stdout and compare references instead of grep verdicts?
+- id: redundant-branch-for-compiler-invariant
+  hits: 3
+  pull_requests:
+  - 25534
+  - 25535
+  definition: Patch silences a false-positive compiler warning on an already-enforced bound by adding a runtime `if` branch or loop condition instead of `av_assume()` or `av_assert1()`.
+  question: Can an already-enforced compiler invariant use av_assume or av_assert1 instead of an extra runtime branch?
+- id: stale-color-or-hdr-side-data
+  hits: 3
+  pull_requests:
+  - 25867
+  - 25885
+  definition: Video filter transforms colour space, transfer function, `npl` luminance scale, or integer clipping while leaving invalidated ICC or HDR light-level side data on the output frame.
+  question: Do colour, transfer, luminance, and clipping transforms remove or update invalidated ICC and HDR side data?
+- id: unclamped-sample-or-unproven-asm-bound
+  hits: 3
+  pull_requests:
+  - 25879
+  - 25893
+  definition: Filter shader or SIMD assembly omits output sample clamping for negative or >10-bit values, or leaves unclamped SIMD accumulators without a complete bound proof.
+  question: Are shader and SIMD samples clamped to their valid range or supported by a complete accumulator bound proof?
+- id: vulkan-shader-feature-gate-mismatch
+  hits: 3
+  pull_requests:
+  - 25879
+  definition: Vulkan filter requires `VkPhysicalDevice*Features` unused by its shaders, or compiles shaders using `Int16` or dynamic storage-image array indexing without checking device support.
+  question: Do Vulkan feature gates exactly cover shader requirements including Int16 and dynamic storage-image array indexing?
+- id: duplicated-helper-or-predicate
+  hits: 2
+  pull_requests:
+  - 25619
+  - 25719
+  definition: Patch duplicates an existing static helper function or repeats the same multi-clause boolean policy across many call sites in one file.
+  question: Does the patch reuse existing helpers and centralize repeated multi-clause predicates?
+- id: format-or-surface-validation-gap
+  hits: 2
+  pull_requests:
+  - 25109
+  - 25879
+  definition: Frame format guard or hardware surface descriptor lookup omits an initialization state or component bit-depth check, accepting mismatched formats or mapping `P012` to `P010`.
+  question: Do frame format guards and surface lookups check initialization and component bit depth before accepting mappings?
+- id: misleading-ffmpeg-error-code
+  hits: 2
+  pull_requests:
+  - 25618
+  - 25761
+  definition: Error path returns literal `-1` (`EPERM`) or `AVERROR_EOF` where FFmpeg callers expect a negative `AVERROR_*` failure code (`AVERROR_INVALIDDATA` or `AVERROR(EPIPE)`).
+  question: Do error paths return the specific negative AVERROR code expected by callers?
+- id: nonportable-endian-in-fate-test
+  hits: 2
+  pull_requests:
+  - 25879
+  - 25893
+  definition: FATE filtergraph or reference file hardcodes a little-endian `*le` pixel format where the filter or C test uses native-endian `AV_PIX_FMT_*`, failing on big-endian architectures.
+  question: Do FATE pixel formats and references match the native or explicit endianness used by the filter and C test?
+- id: test-static-vs-heap-storage-choice
+  hits: 2
+  pull_requests:
+  - 25470
+  - 25480
+  definition: Large test buffers use static `.bss` in multi-suite `checkasm` (retaining MiBs permanently) or dynamic heap plumbing in standalone singleton `lib*/tests/*.c` binaries.
+  question: Does test buffer storage avoid permanent checkasm retention and unnecessary heap plumbing in standalone tests?
+- id: texinfo-unanchored-cross-reference
+  hits: 2
+  pull_requests:
+  - 25220
+  - 25875
+  definition: Added Texinfo documentation redirects readers in plain prose to another section or option entry without a full option specification or `@anchor`/`@ref` link.
+  question: Do Texinfo redirects provide complete option specifications or anchor and ref links?
+- id: uncited-external-workaround
+  hits: 2
+  pull_requests:
+  - 25110
+  - 25479
+  definition: Commit works around an external compiler or GPU driver defect without citing an upstream bug report URL or inline reproducer.
+  question: Does every external compiler or driver workaround cite an upstream bug report or include an inline reproducer?
+  check: upstream-lint:diagnostic-citation
+- id: encoder-palette-ordering-or-span-quantization
+  hits: 2
+  pull_requests:
+  - 25875
+  definition: AV1 encoder wrapper constructs its 8-segment delta-q palette from value span instead of distinct-value count, or omits the downward-search ordering needed by older SVT-AV1.
+  question: Does the AV1 delta-q palette use distinct-value counts and preserve downward-search ordering for older SVT-AV1?

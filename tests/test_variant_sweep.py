@@ -15,7 +15,9 @@ import unittest.mock
 from functools import partial
 from pathlib import Path
 
-from scripts import variant_sweep
+import yaml
+
+from scripts import review_classes, variant_sweep
 from tests.helpers import run_git as fixture_git
 
 run_git = partial(fixture_git, preserve_config=True)
@@ -726,6 +728,154 @@ class ValidateReportTest(unittest.TestCase):
     def test_one_character_reason_is_enough(self) -> None:
         """A single non-whitespace character satisfies the no-variant reason requirement."""
         self.assertTrue(self.valid("no-variant: x"))
+
+
+class ReviewClassSectionTest(unittest.TestCase):
+    """Require every recurring class exactly once with its canonical question."""
+
+    def setUp(self) -> None:
+        """Create a two-class file and a complete reviewed report at one fixed head."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "report.md"
+        self.class_file = self.path.with_suffix(".yaml")
+        self.sha = "a" * 40
+        classes = [
+            {
+                "id": name,
+                "hits": 2,
+                "pull_requests": [1],
+                "definition": f"Recurring {name} issue.",
+                "question": f"Have you checked {name}?",
+            }
+            for name in ("first-class", "second-class")
+        ]
+        self.class_file.write_text(yaml.safe_dump({"classes": classes}), encoding="utf-8")
+        self.prefix = "".join(
+            f"class: {name}\nhead: {self.sha}\n{table}\n"
+            + "| "
+            + " | ".join(["---"] * (table.count("|") - 1))
+            + " |\nno hits\n"
+            for name, table in variant_sweep.REPORT_TABLES.items()
+        )
+        self.section = variant_sweep.render_review_classes(self.sha, self.class_file).replace(
+            "| TODO |", "| no-variant: fixture |"
+        )
+        self.report = self.prefix + self.section
+
+    def validate(self, report: str) -> bool:
+        """Validate temporary text against the two-class file without repository state."""
+        self.path.write_text(report, encoding="utf-8")
+        return variant_sweep.validate_full_report(self.path, self.sha, self.class_file)
+
+    def assert_refused(self, report: str, message: str) -> None:
+        """Require the class-specific refusal and the offending class or row text."""
+        with self.assertRaisesRegex(RuntimeError, f"^review-classes:.*{message}"):
+            self.validate(report)
+
+    def test_all_answered(self) -> None:
+        """Accept all three allowed disposition forms for complete class answers."""
+        for disposition in ("fold", "follow-up: separate fix", "no-variant: checked"):
+            with self.subTest(disposition=disposition):
+                self.assertTrue(
+                    self.validate(self.report.replace("no-variant: fixture", disposition))
+                )
+
+    def test_missing_class_row(self) -> None:
+        """Refuse an otherwise complete report missing one required class row."""
+        row = "| first-class | Have you checked first-class? | no-variant: fixture |\n"
+        self.assert_refused(self.report.replace(row, ""), "first-class")
+
+    def test_todo_disposition(self) -> None:
+        """Refuse an unanswered class even when every required row is present."""
+        self.assert_refused(self.report.replace("no-variant: fixture", "TODO", 1), "first-class")
+
+    def test_duplicate_row(self) -> None:
+        """Refuse a repeated class id even when the row is otherwise reviewed."""
+        self.assert_refused(self.report + self.section.splitlines()[-1] + "\n", "second-class")
+
+    def test_unknown_id(self) -> None:
+        """Refuse ids outside the configured list and identify the unknown class."""
+        self.assert_refused(self.report + "| unknown-class | Unknown? | fold |\n", "unknown-class")
+
+    def test_changed_question(self) -> None:
+        """Refuse a reviewed answer whose question differs from the canonical file."""
+        self.assert_refused(
+            self.report.replace("Have you checked first-class?", "Changed?"), "first-class"
+        )
+
+    def test_no_hits(self) -> None:
+        """Refuse a no-hits marker in place of mandatory individual class answers."""
+        section = f"class: review-classes\nhead: {self.sha}\n"
+        section += (
+            variant_sweep.REVIEW_TABLE + "\n" + variant_sweep.REVIEW_SEPARATOR + "\nno hits\n"
+        )
+        self.assert_refused(self.prefix + section, "first-class.*second-class")
+
+    def test_no_hits_alongside_answers(self) -> None:
+        """Refuse a no-hits marker even when complete reviewed rows accompany it."""
+        self.assert_refused(self.report + "no hits\n", "no hits")
+
+    def test_missing_section(self) -> None:
+        """Refuse a report with only the original three sweep sections."""
+        self.assert_refused(self.prefix, "first-class.*second-class")
+
+    def test_duplicate_section(self) -> None:
+        """Refuse a second review-classes section for the same head."""
+        self.assertFalse(self.validate(self.report + self.section))
+
+    def test_wrong_review_head(self) -> None:
+        """Refuse a review section tied to a head other than the swept commit."""
+        wrong = self.section.replace(self.sha, "b" * 40)
+        self.assertFalse(self.validate(self.prefix + wrong))
+
+    def test_multiple_offending_classes(self) -> None:
+        """Name missing, duplicate, unknown, and unanswered classes in one refusal."""
+        first = "| first-class | Have you checked first-class? | TODO |\n"
+        section = self.section.split("| first-class |", 1)[0]
+        self.assert_refused(
+            self.prefix + section + first * 2 + "| unknown-class | Unknown? | fold |\n",
+            "first-class.*second-class.*unknown-class",
+        )
+
+    def test_changed_or_duplicate_header(self) -> None:
+        """Refuse a changed table schema or a repeated header."""
+        for report in (
+            self.report.replace("| class | question | disposition |", "| id | prompt | answer |"),
+            self.report + variant_sweep.REVIEW_TABLE + "\n",
+        ):
+            with self.subTest(report=report):
+                self.assert_refused(report, "table header")
+
+    def test_invalid_class_file(self) -> None:
+        """Convert class loader ValueError to RuntimeError with the same diagnostic."""
+        self.class_file.write_text("classes: [", encoding="utf-8")
+        with self.assertRaises(ValueError) as expected:
+            review_classes.load_classes(self.class_file)
+        with self.assertRaises(RuntimeError) as actual:
+            self.validate(self.report)
+        self.assertEqual(str(actual.exception), str(expected.exception))
+
+    def test_generated_section_has_all_todos(self) -> None:
+        """Generate every canonical class question with an unanswered TODO cell."""
+        section = variant_sweep.render_review_classes(self.sha, self.class_file)
+        self.assertEqual(
+            section.splitlines()[:4],
+            [
+                "class: review-classes",
+                f"head: {self.sha}",
+                "| class | question | disposition |",
+                "| --- | --- | --- |",
+            ],
+        )
+        self.assertEqual(
+            section.splitlines()[4:],
+            [
+                "| first-class | Have you checked first-class? | TODO |",
+                "| second-class | Have you checked second-class? | TODO |",
+            ],
+        )
+        self.assert_refused(self.prefix + section, "first-class.*second-class")
 
 
 if __name__ == "__main__":

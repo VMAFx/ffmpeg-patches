@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""List unchecked-return variants around changed C functions and checked calls."""
+"""List unchecked-return variants around changed C functions and checked calls.
+
+Full reports contain unchecked-return, state-advance, and doc-claims tables,
+followed by a review-classes section for the same head. Its class, question,
+and disposition table must answer every question from
+.config/upstream-review-classes.yaml with fold, follow-up: TEXT, or
+no-variant: TEXT; generated TODO cells must be reviewed before push or PR.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +41,9 @@ REPORT_TABLES = {
     "state-advance": "| file:line | expression | first earlier error return line | disposition |",
     "doc-claims": "| file:line | claim text | library | oldest | newest | disposition |",
 }
+REVIEW_TABLE = "| class | question | disposition |"
+REVIEW_SEPARATOR = "| --- | --- | --- |"
+CLASS_FILE = Path(__file__).resolve().parents[1] / ".config" / "upstream-review-classes.yaml"
 VERSION = r"(?:[A-Z][A-Z0-9_]* (?:>=|<) \d+|(?!TODO\b)[^\s,;|]+)"
 DOC_DISPOSITION = re.compile(
     rf"no-claim: \S(?:.*\S)?|checked: [\w.-]+ {VERSION}(?:, {VERSION})* {VERSION} "
@@ -716,8 +726,59 @@ def validate_section(lines: list[str], bug_class: str, sha: str) -> bool:
     return (rows > 0 and empty == 0) or (rows == 0 and empty == 1)
 
 
-def validate_full_report(path: Path, sha: str) -> bool:
-    """Require exactly three distinct reviewed sections, each for the requested head."""
+def load_review_classes(path: Path = CLASS_FILE) -> list[dict]:
+    """Load the trusted sibling class reader and report invalid class files as refusals."""
+    try:
+        return sibling_module("review_classes").load_classes(path)
+    except (ValueError, OSError) as error:
+        raise RuntimeError(str(error)) from error
+
+
+def render_review_classes(sha: str, class_file: Path = CLASS_FILE) -> str:
+    """Build the required review section with one unanswered row per configured class."""
+    lines = [f"class: review-classes\nhead: {sha}", REVIEW_TABLE, REVIEW_SEPARATOR]
+    lines.extend(
+        f"| {item['id']} | {item['question']} | TODO |" for item in load_review_classes(class_file)
+    )
+    return "\n".join(lines) + "\n"
+
+
+def review_class_issues(lines: list[str], expected: dict[str, str]) -> set[str]:
+    """Collect every missing, repeated, unknown, changed, or unanswered class id."""
+    seen = set()
+    issues = set()
+    for line in lines:
+        if not line.strip() or line in {REVIEW_TABLE, REVIEW_SEPARATOR}:
+            continue
+        if line.startswith("head: "):
+            continue
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if not line.startswith("|") or not line.endswith("|") or len(cells) != 3:
+            issues.add(f"invalid row {line!r}")
+            continue
+        name, question, disposition = cells
+        if name in seen or expected.get(name) != question:
+            issues.add(name)
+        if not DISPOSITION.fullmatch(disposition):
+            issues.add(name)
+        seen.add(name)
+    return issues | (expected.keys() - seen)
+
+
+def validate_review_classes(lines: list[str], sha: str, classes: list[dict]) -> bool:
+    """Require exact class questions and reviewed dispositions at the requested head."""
+    if [line[6:] for line in lines if line.startswith("head:")] != [sha]:
+        return False
+    if lines.count(REVIEW_TABLE) != 1 or lines.count(REVIEW_SEPARATOR) != 1:
+        raise RuntimeError("review-classes: missing or duplicate table header")
+    issues = review_class_issues(lines, {item["id"]: item["question"] for item in classes})
+    if issues:
+        raise RuntimeError("review-classes: " + ", ".join(sorted(issues)))
+    return True
+
+
+def validate_full_report(path: Path, sha: str, class_file: Path = CLASS_FILE) -> bool:
+    """Require the three reviewed sweep tables plus all recurring review class answers."""
     with path.open("rb") as stream:
         data = stream.read(MAX_REPORT_BYTES + 1)
     check_limit("report size", len(data), MAX_REPORT_BYTES)
@@ -726,7 +787,7 @@ def validate_full_report(path: Path, sha: str) -> bool:
     for line in data.decode("utf-8").splitlines():
         if line.startswith("class:"):
             current = line.removeprefix("class: ")
-            if current not in REPORT_TABLES or current in sections:
+            if current not in {*REPORT_TABLES, "review-classes"} or current in sections:
                 return False
             sections[current] = []
         elif current is None:
@@ -734,24 +795,36 @@ def validate_full_report(path: Path, sha: str) -> bool:
                 return False
         else:
             sections[current].append(line)
-    return sections.keys() == REPORT_TABLES.keys() and all(
-        validate_section(lines, name, sha) for name, lines in sections.items()
-    )
+    if not REPORT_TABLES.keys() <= sections.keys() or not all(
+        validate_section(sections[name], name, sha) for name in REPORT_TABLES
+    ):
+        return False
+    classes = load_review_classes(class_file)
+    if "review-classes" not in sections:
+        raise RuntimeError(
+            "review-classes: missing section: " + ", ".join(c["id"] for c in classes)
+        )
+    return validate_review_classes(sections["review-classes"], sha, classes)
 
 
-def sweep_class(name: str, directory: str, base: str, head: str, deadline: float) -> str:
-    """Load an additional sweep by sibling file path only when all classes are run."""
-    path = Path(__file__).with_name(f"sweep_{name}.py")
+def sibling_module(name: str):
+    """Load a helper only from the resolved directory containing this validator."""
+    path = Path(__file__).resolve().with_name(f"{name}.py")
     spec = importlib.util.spec_from_file_location(f"_ffmpeg_sweep_{name}", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load sweep: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.sweep(directory, base, head, deadline)
+    return module
+
+
+def sweep_class(name: str, directory: str, base: str, head: str, deadline: float) -> str:
+    """Load an additional sweep by sibling file path only when all classes are run."""
+    return sibling_module(f"sweep_{name}").sweep(directory, base, head, deadline)
 
 
 def sweep_all(directory: str, base: str, head: str) -> str:
-    """Run all three class sweeps within one aggregate wall-clock budget."""
+    """Run the three sweeps and append required review questions within the shared budget."""
     deadline = time.monotonic() + MAX_SWEEP_SECONDS
     report = sweep(directory, base, head, deadline=deadline)
     metadata = report.splitlines()
@@ -760,6 +833,9 @@ def sweep_all(directory: str, base: str, head: str) -> str:
     for name in ("state_advance", "doc_claims"):
         report += "\n" + sweep_class(name, directory, base, head, deadline)
         check_limit("report size", len(report.encode("utf-8")), MAX_REPORT_BYTES)
+    report += "\n" + render_review_classes(head)
+    check_deadline(deadline)
+    check_limit("report size", len(report.encode("utf-8")), MAX_REPORT_BYTES)
     return report
 
 
