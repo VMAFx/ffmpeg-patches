@@ -96,12 +96,13 @@ through another variable, and a FATE test whose input another custom tool
 builds, are not detected.
 
 The c-rules step runs scripts/semgrep_scan.sh with .semgrep-ffmpeg.yml from
-this repository over added or modified library and fftools C and header
-sources in base..head, using the FFmpeg checkout at head as the working
+this repository over added, modified or renamed library and fftools C and
+header sources in base..head, using the FFmpeg checkout at head as the working
 directory, and skips the run when none changed. Results are read through an
 allow-list: exit status 0 or 1, no semgrep_scan: warning line, and a JSON
-output object whose results and errors lists hold only PartialParsing
-errors. Matches whose line range meets a file's added lines fail with rc 1,
+output object whose results name scanned paths with non-empty rule ids and
+whose errors list holds only PartialParsing errors. Matches whose line range
+meets a file's rename-aware added lines or deletion positions fail with rc 1,
 untouched matches and PartialParsing errors are reported without failing,
 and any other status, warning, error type or JSON failure gives rc 2.
 --c-rule-reason TEXT waives rc 1 findings and prints the reason, never rc 2.
@@ -165,6 +166,16 @@ DIFF_COMMON = (
     "--no-textconv",
     "--no-color",
     "--no-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
+C_RULES_DIFF = (
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--find-renames",
+    "--diff-filter=AMR",
     "--src-prefix=a/",
     "--dst-prefix=b/",
 )
@@ -475,6 +486,16 @@ def _added_lines(patch: str) -> set[int]:
             start, count = int(match[1]), int(match[2] or "1")
             added.update(range(start, start + count))
     return added
+
+
+def _deleted_lines(patch: str) -> set[int]:
+    """Map deletion-only hunks to their preceding new-file line, or 1 at top of file."""
+    deleted = set()
+    for line in patch.splitlines():
+        match = HUNK.match(line)
+        if match and match[2] == "0":
+            deleted.add(max(1, int(match[1])))
+    return deleted
 
 
 def _code_lines(source: str) -> list[str]:
@@ -1197,16 +1218,6 @@ def _fate_macros(source: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def _fate_deleted_lines(patch: str) -> set[int]:
-    """Map deletion-only hunks to their new-file position, including continuations."""
-    deleted = set()
-    for line in patch.splitlines():
-        match = HUNK.match(line)
-        if match and match[2] == "0":
-            deleted.add(max(1, int(match[1])))
-    return deleted
-
-
 def _fate_merge(report: FateReport, result: FateReport) -> None:
     """Accumulate one file's independent diagnostics and all classification totals."""
     report.checked += result.checked
@@ -1240,7 +1251,7 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
             )
             if sources is None and needs_sources:
                 sources = _fate_sources(_git(tree, "show", f"{head}:libavfilter/allfilters.c"))
-            touched = _added_lines(patch) | _fate_deleted_lines(patch)
+            touched = _added_lines(patch) | _deleted_lines(patch)
             old_parsed = _fate_parse(old, macros or frozenset()) if old is not None else None
             _fate_merge(report, _fate_check(name, parsed, touched, sources or {}, old_parsed))
     except (OSError, RuntimeError, ValueError) as error:
@@ -1785,18 +1796,17 @@ def _parse_semgrep_match(item: object) -> SemgrepMatch | None:
         return None
     path, check_id, extra = item.get("path"), item.get("check_id"), item.get("extra")
     span = _semgrep_span(item)
+    # Semgrep prefixes check_id with the dotted rules path; rule ids carry no dot.
+    rule_id = check_id.rpartition(".")[2] if isinstance(check_id, str) else ""
     message = extra.get("message") if isinstance(extra, dict) else None
     if (
         span is None
         or not (isinstance(path, str) and path)
-        or not (isinstance(check_id, str) and check_id)
+        or not rule_id
         or not isinstance(message, str)
     ):
         return None
-    # Semgrep prefixes check_id with the dotted rules path; rule ids carry no dot.
-    return SemgrepMatch(
-        path, span[0], span[1], check_id.rpartition(".")[2], message.partition("\n")[0]
-    )
+    return SemgrepMatch(path, span[0], span[1], rule_id, message.partition("\n")[0])
 
 
 def _partial_parsing_path(error: object) -> str | None:
@@ -1814,13 +1824,15 @@ def _partial_parsing_path(error: object) -> str | None:
 
 
 def _read_semgrep_lists(
-    raw_results: list[object], raw_errors: list[object]
+    raw_results: list[object],
+    raw_errors: list[object],
+    scanned_paths: frozenset[str] | None = None,
 ) -> tuple[list[SemgrepMatch], list[str]] | None:
     """Validate every result and PartialParsing error in Semgrep's JSON lists."""
     matches: list[SemgrepMatch] = []
     for raw in raw_results:
         match = _parse_semgrep_match(raw)
-        if match is None:
+        if match is None or (scanned_paths is not None and match.path not in scanned_paths):
             return None
         matches.append(match)
     partial_paths: list[str] = []
@@ -1832,7 +1844,9 @@ def _read_semgrep_lists(
     return matches, partial_paths
 
 
-def _read_semgrep_json(json_path: Path) -> tuple[list[SemgrepMatch], list[str]] | None:
+def _read_semgrep_json(
+    json_path: Path, scanned_paths: frozenset[str] | None = None
+) -> tuple[list[SemgrepMatch], list[str]] | None:
     """Read and allow-list a Semgrep JSON output file."""
     try:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
@@ -1843,7 +1857,7 @@ def _read_semgrep_json(json_path: Path) -> tuple[list[SemgrepMatch], list[str]] 
     raw_results, raw_errors = payload.get("results"), payload.get("errors")
     if not (isinstance(raw_results, list) and isinstance(raw_errors, list)):
         return None
-    return _read_semgrep_lists(raw_results, raw_errors)
+    return _read_semgrep_lists(raw_results, raw_errors, scanned_paths)
 
 
 def _c_rules_error(result: RunResult) -> Step:
@@ -1853,19 +1867,60 @@ def _c_rules_error(result: RunResult) -> Step:
     return Step("c-rules", 2, output)
 
 
+def _diff_sections(patch: str) -> list[str]:
+    """Split a unified diff into one section string per diff --git file header."""
+    sections: list[list[str]] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            sections.append([line])
+        elif sections:
+            sections[-1].append(line)
+    return ["\n".join(lines) for lines in sections]
+
+
+def _c_rules_touched(tree: Path, base: str, head: str) -> dict[str, set[int]]:
+    """Pair changed C and header sources with rename-aware added and deletion lines."""
+    raw_names = list(
+        filter(
+            None,
+            _git(tree, *C_RULES_DIFF, "--name-only", "-z", base, head, "--", "*.c", "*.h").split(
+                "\0"
+            ),
+        )
+    )
+    if len(raw_names) > MAX_PATHS:
+        raise RuntimeError(f"changed paths exceed MAX_PATHS={MAX_PATHS}: {len(raw_names)}")
+    paths = [name for name in raw_names if is_c_source_path(name)]
+    if not paths:
+        return {}
+    sections = _diff_sections(_git(tree, *C_RULES_DIFF, "-U0", base, head, "--", "*.c", "*.h"))
+    if len(raw_names) != len(sections):
+        raise RuntimeError(
+            f"git diff path/patch mismatch: {len(raw_names)} paths, {len(sections)} patches"
+        )
+    wanted = frozenset(paths)
+    return {
+        name: _added_lines(section) | _deleted_lines(section)
+        for name, section in zip(raw_names, sections, strict=True)
+        if name in wanted
+    }
+
+
 def _c_rules_report(
     matches: list[SemgrepMatch],
     partial_paths: list[str],
-    added_by_path: dict[str, set[int]],
+    touched_by_path: dict[str, set[int]],
     source_count: int,
     waiver: str,
 ) -> Step:
-    """Classify allow-listed Semgrep matches against added lines and apply any waiver."""
+    """Classify allow-listed Semgrep matches against touched lines and apply any waiver."""
     findings: list[str] = []
     notes: list[str] = []
     for match in matches:
-        added = added_by_path.get(match.path, set())
-        touched = any(match.start_line <= line <= match.end_line for line in added)
+        if match.path not in touched_by_path:
+            raise ValueError(f"unscanned result path: {match.path}")
+        touched_lines = touched_by_path[match.path]
+        touched = any(match.start_line <= line <= match.end_line for line in touched_lines)
         detail = f"{match.path}:{match.start_line}: {match.check_id}: {match.message_line}"
         if touched:
             findings.append(f"finding: {detail}")
@@ -1884,17 +1939,10 @@ def _c_rules_report(
 
 def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
     """Scan changed library and fftools C and header sources with .semgrep-ffmpeg.yml."""
-    paths = [
-        name
-        for name in _changed_paths(tree, base, head, "*.c", "*.h", added_or_modified=True)
-        if is_c_source_path(name)
-    ]
-    if not paths:
+    touched_by_path = _c_rules_touched(tree, base, head)
+    if not touched_by_path:
         return Step("c-rules", 0, "no added or modified C or header source in the range")
-    added_by_path = {
-        name: _added_lines(_git(tree, *DIFF_COMMON, "-U0", base, head, "--", name))
-        for name in paths
-    }
+    paths = list(touched_by_path)
     with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
         json_path = Path(directory) / "semgrep.json"
         argv = [
@@ -1907,13 +1955,13 @@ def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
         result = _run(argv, tree, timeout=C_RULES_TIMEOUT)
         has_warning = any(line.startswith("semgrep_scan:") for line in result.stdout.splitlines())
         parsed = (
-            _read_semgrep_json(json_path)
+            _read_semgrep_json(json_path, frozenset(paths))
             if result.returncode in (0, 1) and not has_warning
             else None
         )
     if parsed is None:
         return _c_rules_error(result)
-    return _c_rules_report(parsed[0], parsed[1], added_by_path, len(paths), waiver)
+    return _c_rules_report(parsed[0], parsed[1], touched_by_path, len(paths), waiver)
 
 
 def _collect(name: str, action: Callable[[], Step]) -> Step:

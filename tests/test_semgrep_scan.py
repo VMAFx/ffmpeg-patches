@@ -143,6 +143,35 @@ class SemgrepScanTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(argv, SCAN_ARGS)
 
+    def test_rules_operand_with_space_reports_rule_warning_path(self) -> None:
+        """A --rules=PATH holding spaces passes one config path and names it on warning."""
+        spaced_dir = self.scratch / "rules dir"
+        spaced_dir.mkdir()
+        custom = spaced_dir / "ffmpeg rules.yml"
+        proc, argv = _run_scan(
+            self.scratch,
+            RULE_WARNING,
+            0,
+            (f"--rules={custom}", "--json-output=out.json"),
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(argv[0:3], ["scan", "--config", str(custom)])
+        self.assertIn(
+            f"semgrep_scan: a rule in {custom} draws the warning above; fix the rule",
+            proc.stderr,
+        )
+
+    def test_non_leading_rules_argument_is_passed_through(self) -> None:
+        """A non-leading --rules=PATH operand stays in semgrep's arguments unchanged."""
+        proc, argv = _run_scan(
+            self.scratch,
+            "0 findings.\n",
+            0,
+            ("--json-output=out.json", "--rules=other.yml"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(argv, [*SCAN_ARGS, "--json-output=out.json", "--rules=other.yml"])
+
 
 if __name__ == "__main__":
     unittest.main()
