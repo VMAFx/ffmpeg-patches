@@ -21,7 +21,7 @@ import unittest.mock
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
-from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
+from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment, run_git
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402
@@ -433,7 +433,29 @@ FILTER_DECLARATIONS = (
 
 
 class FateDepsTest(unittest.TestCase):
-    """Exercise lavfi dependency parsing without Git or external commands."""
+    """Exercise fate-deps dependency and mixed-root path checks."""
+
+    def check_diff(
+        self, base_source: str, head_source: str, path: str = "tests/fate/x.mak"
+    ) -> upstream_lint.Step:
+        """Run _fate_deps across committed base and head FATE trees."""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "tree"
+            template = Path(directory) / "template"
+            tree.mkdir()
+            template.mkdir()
+            run_git(tree, "init", "-q", f"--template={template}")
+            target = tree / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(base_source, encoding="utf-8")
+            run_git(tree, "add", path)
+            run_git(tree, "commit", "-q", "-m", "tests/fate: add base")
+            base = run_git(tree, "rev-parse", "HEAD")
+            target.write_text(head_source, encoding="utf-8")
+            run_git(tree, "add", path)
+            run_git(tree, "commit", "-q", "-m", "tests/fate: update head")
+            head = run_git(tree, "rev-parse", "HEAD")
+            return upstream_lint._fate_deps(tree, base, head)
 
     def check_source(
         self,
@@ -1072,6 +1094,54 @@ class FateDepsTest(unittest.TestCase):
             upstream_lint.FATE_ROOTED_DATA.findall("$(TARGET_PATH)/tests/data/x/out"), ["x"]
         )
         self.assertEqual(upstream_lint.FATE_RELATIVE_DATA.findall(" tests/data/x/out"), ["x"])
+
+    def test_unrelated_deletion_after_mixed_target_path_passes(self) -> None:
+        """Deleting an unrelated line after an unchanged mixed-root CMD stays pre-existing."""
+        unchanged = (
+            "FATE_X-yes += fate-x\n"
+            "fate-x: CMD = mkdir -p tests/data/x && "
+            "run $(FFMPEG) -i $(SAMPLES)/x.raw $(TARGET_PATH)/tests/data/x/out.nut\n"
+        )
+        step = self.check_diff(unchanged + "# unrelated line\n", unchanged)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertNotIn("finding:", step.output)
+        self.assertIn(
+            "pre-existing (untouched): tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_continuation_deletion_inside_mixed_target_path_fails(self) -> None:
+        """Deleting a middle continuation line inside a mixed-root CMD fails."""
+        first = (
+            "FATE_X-yes += fate-x\n"
+            "fate-x: CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x && \\\n"
+        )
+        middle = "    echo middle && \\\n"
+        last = "    true\n"
+        step = self.check_diff(first + middle + last, first + last)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_added_line_inside_mixed_target_path_fails(self) -> None:
+        """Changing one physical line of a mixed-root CMD fails."""
+        first = (
+            "FATE_X-yes += fate-x\n"
+            "fate-x: CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x && \\\n"
+        )
+        base = first + "    echo before && \\\n    true\n"
+        head = first + "    echo after && \\\n    true\n"
+        step = self.check_diff(base, head)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
 
 
 class DiagnosticCitationTest(unittest.TestCase):

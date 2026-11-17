@@ -1158,11 +1158,17 @@ def _fate_mixed_data(command: str) -> list[str]:
 
 
 def _fate_paths(
-    path: str, variants: list[FateEntry], touched: set[int], report: FateReport
+    path: str,
+    variants: list[FateEntry],
+    added: set[int],
+    deleted: set[int] | frozenset[int],
+    report: FateReport,
 ) -> None:
-    """Report tests/data directories that any command variant accesses through two roots."""
+    """Report mixed-root tests/data commands touched by added lines or interior deletions."""
     for command in variants:
-        changed = _fate_touched(command, touched)
+        changed = _fate_touched(command, added) or bool(
+            deleted.intersection(range(command.line.first, command.line.last))
+        )
         label = "finding" if changed else "pre-existing (untouched)"
         for directory in _fate_mixed_data(command.command):
             report.findings += int(changed)
@@ -1176,15 +1182,17 @@ def _fate_paths(
 def _fate_check(
     path: str,
     parsed: FateFile,
-    added: set[int],
+    changes: tuple[set[int], set[int] | frozenset[int]],
     sources: dict[str, str],
     base: FateFile | None = None,
 ) -> FateReport:
-    """Check command paths and each registration against all video variants."""
+    """Check command paths and video registrations from split added and deletion lines."""
+    added, deleted = changes
+    touched = added | deleted
     report = FateReport()
-    _fate_diagnostics(path, parsed, added, report)
+    _fate_diagnostics(path, parsed, touched, report)
     for name, variants in parsed.commands.items():
-        _fate_paths(path, variants, added, report)
+        _fate_paths(path, variants, added, deleted, report)
         if "$(" in name:
             continue
         video = [
@@ -1198,10 +1206,12 @@ def _fate_check(
         old_video = base is not None and any(
             "video" in _fate_kinds(entry, sources) for entry in base.commands.get(name, [])
         )
-        newly_video = not old_video and any(_fate_touched(entry, added) for entry in video)
+        newly_video = not old_video and any(_fate_touched(entry, touched) for entry in video)
         registrations = parsed.registrations.get(name, [])
-        touched = added | ({entry.line.first for entry in registrations} if newly_video else set())
-        _fate_video(path, video[0], registrations, touched, report)
+        video_touched = touched | (
+            {entry.line.first for entry in registrations} if newly_video else set()
+        )
+        _fate_video(path, video[0], registrations, video_touched, report)
     return report
 
 
@@ -1212,11 +1222,11 @@ def _fate_file(
     sources: dict[str, str],
     context: FateContext | None = None,
 ) -> FateReport:
-    """Expose pure head/base parsing, injected catalogs and deletion-aware checking."""
+    """Expose pure head/base parsing, injected catalogs and split added/deletion sets."""
     context = context or FateContext()
     base = _fate_parse(context.base, context.macros) if context.base is not None else None
     return _fate_check(
-        path, _fate_parse(source, context.macros), added | context.deleted, sources, base
+        path, _fate_parse(source, context.macros), (added, context.deleted), sources, base
     )
 
 
@@ -1280,7 +1290,7 @@ def _fate_merge(report: FateReport, result: FateReport) -> None:
 
 
 def _fate_deps(tree: Path, base: str, head: str) -> Step:
-    """Check changed FATE files with lazily loaded head filter and macro catalogs."""
+    """Check changed FATE files from split diff line sets and lazy head catalogs."""
     report, sources, macros, rc = FateReport(), None, None, 0
     try:
         names = _changed_paths(tree, base, head, "tests/fate/*.mak", added_or_modified=True)
@@ -1302,9 +1312,9 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
             )
             if sources is None and needs_sources:
                 sources = _fate_sources(_git(tree, "show", f"{head}:libavfilter/allfilters.c"))
-            touched = _added_lines(patch) | _fate_deleted_lines(patch)
+            changes = (_added_lines(patch), _fate_deleted_lines(patch))
             old_parsed = _fate_parse(old, macros or frozenset()) if old is not None else None
-            _fate_merge(report, _fate_check(name, parsed, touched, sources or {}, old_parsed))
+            _fate_merge(report, _fate_check(name, parsed, changes, sources or {}, old_parsed))
     except (OSError, RuntimeError, ValueError) as error:
         rc = 2
         report.lines.append(str(error))
