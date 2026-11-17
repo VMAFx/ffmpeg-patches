@@ -647,7 +647,7 @@ def _mechanical(tree: Path, base: str, head: str) -> Step:
 FATE_PATTERNS = (
     ("variable", re.compile(r"^([A-Z][A-Z0-9_]*)\s*(\+=|:=|=)\s*(.*)$")),
     ("registration", re.compile(r"^([A-Z][A-Z0-9_]*)-(\$\(.+?|yes)\s*\+=\s*(.*)$")),
-    ("command", re.compile(r"^(.+?)\s*:\s*CMD\s*=\s*(.*)$")),
+    ("command", re.compile(r"^(.+?)\s*:\s*CMD\s*:?=\s*(.*)$")),
     ("open", re.compile(r"^(?:ifeq|ifneq|ifdef|ifndef)\b.*$")),
     ("else", re.compile(r"^else\b.*$")),
     ("close", re.compile(r"^endif\s*(?:#.*)?$")),
@@ -1380,7 +1380,8 @@ def _fate_deps(
 
 FATE_SHAPE_RULES = ("registration", "pipe", "helper-pipe", "grep", "endian")
 FATE_SHELL_TOKEN = re.compile(
-    r"""\\.|'[^']*'|"(?:\\.|[^"\\])*"|\$\(|\|\||&&|[()|;&]|[^\\'"$()|;&]+|."""
+    r"""\\.|'[^']*'|"(?:\\.|[^"\\])*"|\$\(|[0-9]*[<>]&(?:[0-9]+|-)|&>>?|>>?|<|"""
+    r"""\|\||&&|[()|;&]|[^\\'"$()|;&<>]+|."""
 )
 FATE_GRAPH = re.compile(
     r"""(?:^|\s)(?:-lavfi|-vf|-filter_complex|-filter:v)\s+("(?:\\.|[^"\\])*"|'[^']*'|\S+)"""
@@ -1552,16 +1553,45 @@ def _fate_shape_references(text: str) -> list[str]:
     return names
 
 
+def _fate_shape_source_references(source: str) -> dict[str, set[str]]:
+    """Track per-source references, replacing only unconditional non-self assignments."""
+    references: dict[str, set[str]] = {}
+    depth, defines = 0, 0
+    for line in _fate_lines(source):
+        kind, _ = _fate_kind(line)
+        if kind == "define":
+            defines += 1
+        elif kind == "endef":
+            defines = max(0, defines - 1)
+        elif not defines:
+            if kind == "open":
+                depth += 1
+            elif kind == "close":
+                depth = max(0, depth - 1)
+        assignment = FATE_SHAPE_ASSIGNMENT.fullmatch(line.text)
+        if not assignment:
+            continue
+        destination = _fate_shape_normalize(assignment[1])
+        if (
+            assignment[2] != "+="
+            and not depth
+            and not defines
+            and assignment[1].split("-", 1)[0] not in assignment[3]
+        ):
+            references[destination] = set()
+        references.setdefault(destination, set()).update(
+            _fate_shape_normalize(name) for name in _fate_shape_references(assignment[3])
+        )
+    return references
+
+
 def _fate_shape_graph(sources: list[str]) -> dict[str, set[str]]:
-    """Read plain reference edges from logical make assignment lines."""
+    """Union per-source edges after depth-zero replacements outside defines without self names."""
     graph: dict[str, set[str]] = {}
     for source in sources:
-        for line in _fate_lines(source):
-            assignment = FATE_SHAPE_ASSIGNMENT.fullmatch(line.text)
-            if assignment:
-                destination = _fate_shape_normalize(assignment[1])
-                for name in _fate_shape_references(assignment[3]):
-                    graph.setdefault(_fate_shape_normalize(name), set()).add(destination)
+        for destination, references in _fate_shape_source_references(source).items():
+            for name in references:
+                graph.setdefault(name, set()).add(destination)
     return graph
 
 

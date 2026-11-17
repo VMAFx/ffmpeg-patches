@@ -594,6 +594,122 @@ class FateShapeTest(unittest.TestCase):
         )
         self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
 
+    def test_graph_unconditional_replacements_drop_edges(self) -> None:
+        """Unconditional replacements remove earlier edges from the same source."""
+        for operator in ("=", ":="):
+            with self.subTest(operator=operator):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    f"FATE_FFMPEG {operator} fate-real\n"
+                )
+                graph = upstream_lint._fate_shape_graph([source])
+                self.assertNotIn("FATE_FFMPEG", graph.get("FATE_LIBAVUTIL", set()))
+                self.assertEqual(self.findings(source, graph=graph), [])
+
+    def test_graph_append_order_keeps_registration(self) -> None:
+        """Appends retain earlier references and references after replacements."""
+        for aggregation in (
+            "FATE_FFMPEG += $(FATE_LIBAVUTIL)\nFATE_FFMPEG += fate-real\n",
+            "FATE_FFMPEG = fate-real\nFATE_FFMPEG += $(FATE_LIBAVUTIL)\n",
+        ):
+            with self.subTest(aggregation=aggregation):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n" + aggregation
+                )
+                self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_graph_conditional_replacements_keep_registration(self) -> None:
+        """Conditional replacements conservatively retain references in every branch."""
+        for opening in ("ifeq (x,y)", "ifneq (x,y)", "ifdef CONFIG_X", "ifndef CONFIG_X"):
+            for branch in ("", "else\n", "ifdef CONFIG_Y\nendif\nelse\n"):
+                with self.subTest(opening=opening, branch=branch):
+                    source = (
+                        "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                        "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                        f"{opening}\n{branch}FATE_FFMPEG := fate-real\nendif\n"
+                    )
+                    self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_graph_closed_conditionals_replace_edges(self) -> None:
+        """Closed and unmatched condition endings leave replacements at depth zero."""
+        for conditions in ("ifdef CONFIG_X\nendif\n", "endif\nifdef CONFIG_X\nendif\n"):
+            with self.subTest(conditions=conditions):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    f"{conditions}FATE_FFMPEG := fate-real\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_graph_self_replacements_keep_registration(self) -> None:
+        """Self names inside functions, substitutions and suffixes retain old edges."""
+        for destination, value in (
+            ("FATE_FFMPEG", "$(if $(CONFIG_X), $(FATE_FFMPEG))"),
+            ("FATE_FFMPEG", "$(FATE_FFMPEG:%=fate-%)"),
+            ("FATE_FFMPEG-yes", "$(FATE_FFMPEG:%=fate-%)"),
+            ("FATE_FFMPEG-$(CONFIG_X)", "$(if $(CONFIG_X), $(FATE_FFMPEG-yes))"),
+            ("FATE_FFMPEG", "prefix_FATE_FFMPEG_suffix"),
+        ):
+            with self.subTest(destination=destination, value=value):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                    f"{destination} = $(FATE_LIBAVUTIL)\n{destination} := {value}\n"
+                )
+                graph = upstream_lint._fate_shape_graph([source])
+                ffmpeg = {upstream_lint._fate_shape_normalize(destination)}
+                self.assertEqual(
+                    [f.rule for f in self.findings(source, graph=graph, ffmpeg=ffmpeg)],
+                    ["registration"],
+                )
+
+    def test_graph_define_replacements_keep_registration(self) -> None:
+        """Replacements in define bodies preserve earlier aggregation references."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+            "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+            "define RESET\nFATE_FFMPEG := fate-real\nendef\n"
+        )
+        self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_graph_replacements_after_define_drop_edges(self) -> None:
+        """Define bodies cannot leak their conditional or nested define depth."""
+        for body in ("ifdef CONFIG_X\n", "define INNER\nFATE_FFMPEG = fate-inner\nendef\n"):
+            with self.subTest(body=body):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    f"define RESET\n{body}endef\nFATE_FFMPEG = fate-real\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_graph_separate_source_replacements_keep_registration(self) -> None:
+        """A replacement in another source cannot erase existing reference edges."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+            "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+        )
+        replacement = "FATE_FFMPEG := fate-real\n"
+        for sources in ([source, replacement], [replacement, source]):
+            with self.subTest(sources=sources):
+                graph = upstream_lint._fate_shape_graph(sources)
+                self.assertEqual(graph["FATE_LIBAVUTIL"], {"FATE_FFMPEG"})
+                self.assertEqual(
+                    [f.rule for f in self.findings(source, graph=graph)], ["registration"]
+                )
+
+    def test_graph_replacements_add_new_references(self) -> None:
+        """Replacement references survive while unrelated destinations keep edges."""
+        for operator in ("=", ":="):
+            with self.subTest(operator=operator):
+                graph = upstream_lint._fate_shape_graph(
+                    [
+                        f"FATE_FFMPEG = $(OLD)\nOTHER += $(OLD)\nFATE_FFMPEG {operator} $(NEW)\n",
+                        "FATE_FFMPEG += $(OLD)\n",
+                    ]
+                )
+                self.assertEqual(graph, {"OLD": {"OTHER", "FATE_FFMPEG"}, "NEW": {"FATE_FFMPEG"}})
+
     def test_aggregation_cycle_is_bounded(self) -> None:
         """A visited set terminates cycles and still finds an outgoing dependency."""
         source = "FATE_X += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
@@ -721,6 +837,77 @@ class FateShapeTest(unittest.TestCase):
             with self.subTest(command=command):
                 findings = self.findings(f"    {command} | sort\n", shell_grammar=True)
                 self.assertEqual([f.rule for f in findings], ["helper-pipe"])
+
+    def test_helper_redirection_pipelines_fail(self) -> None:
+        """Descriptor and combined redirections cannot hide helper test producers."""
+        for command in (
+            "ffmpeg x 2>&1 | sort",
+            "run x >&2 | sort",
+            "ffprobe x 2>&- | sort",
+            "ffmpeg x &>log | sort",
+            "run x <&0 | sort",
+            "ffmpeg x &>>log | sort",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)],
+                    ["helper-pipe"],
+                )
+
+    def test_make_redirection_pipeline_fails(self) -> None:
+        """Make CMD pipelines retain findings after descriptor redirection."""
+        self.assertEqual([f.rule for f in self.findings("CMD = run x 2>&1 | sort\n")], ["pipe"])
+
+    def test_redirection_list_boundaries(self) -> None:
+        """Standalone ampersands split commands while redirections leave lists intact."""
+        for command, rules in (
+            ("printf x & ffmpeg y | sort", ["helper-pipe"]),
+            ("ffmpeg x & printf y | sort", []),
+            ("ffmpeg x 2>&1 || return", []),
+            ("ffmpeg x >out 2>&1", []),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)], rules
+                )
+
+    def test_shell_redirection_tokens(self) -> None:
+        """Redirections remain whole non-operator tokens before shell list operators."""
+        for token in ("2>&1", ">&2", "<&0", "2>&-", "12>&345", "&>", "&>>", "<", ">", ">>"):
+            with self.subTest(token=token):
+                self.assertEqual(
+                    [m[0] for m in upstream_lint.FATE_SHELL_TOKEN.finditer(token)], [token]
+                )
+                command = f"run x {token}out | sort"
+                self.assertEqual(
+                    upstream_lint._fate_shell_operators(command), [(command.index("|"), "|")]
+                )
+
+    def test_target_specific_command_assignment_pipes(self) -> None:
+        """Target-specific recursive and simple CMD assignments both check pipelines."""
+        for operator in ("=", ":="):
+            with self.subTest(operator=operator):
+                source = f"fate-x: CMD {operator} run x | sort\n"
+                self.assertEqual([f.rule for f in self.findings(source)], ["pipe"])
+
+    def test_target_specific_command_assignment_registrations(self) -> None:
+        """Both target-specific CMD operators expose library registration mismatches."""
+        for operator in ("=", ":="):
+            with self.subTest(operator=operator):
+                source = (
+                    "FATE_FFMPEG += fate-formats\n"
+                    f"fate-formats: CMD {operator} run libavutil/tests/formats\n"
+                )
+                self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_target_specific_command_assignment_classifier(self) -> None:
+        """The shared command classifier keeps two groups and rejects other names or operators."""
+        line = upstream_lint.FateLine("fate-x: CMD := run x", 1, 1)
+        self.assertEqual(upstream_lint._fate_kind(line), ("command", ("fate-x", "run x")))
+        for assignment in ("CMDX :=", "CMD +=", "CMD ?="):
+            with self.subTest(assignment=assignment):
+                line = upstream_lint.FateLine(f"fate-x: {assignment} run x", 1, 1)
+                self.assertNotEqual(upstream_lint._fate_kind(line)[0], "command")
 
     def test_control_word_helper_pipelines_fail(self) -> None:
         """Control words do not hide helper test producers before a pipe."""
