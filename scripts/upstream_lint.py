@@ -120,11 +120,25 @@ ffprobe and compared against a tests/ref reference. --test-program-reason TEXT
 waives it and prints the reason. A program registered in another file or
 through another variable, and a FATE test whose input another custom tool
 builds, are not detected.
+
+The c-rules step runs scripts/semgrep_scan.sh with .semgrep-ffmpeg.yml from
+this repository over added, modified or renamed library and fftools C and
+header sources in base..head, using the FFmpeg checkout at head as the working
+directory, and skips the run when none changed. Results are read through an
+allow-list: exit status 0 or 1, no semgrep_scan: warning line, and a JSON
+output object whose paths.scanned list contains every requested path, whose
+results name requested paths with non-empty rule ids, and whose errors list
+holds only PartialParsing errors. Matches whose line range
+meets a file's rename-aware added lines or deletion positions fail with rc 1,
+untouched matches and PartialParsing errors are reported without failing,
+and any other status, warning, error type or JSON failure gives rc 2.
+--c-rule-reason TEXT waives rc 1 findings and prints the reason, never rc 2.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -175,6 +189,7 @@ GIT_ENVIRONMENT_NAMES = (
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 DIFF_COMMON = (
     "diff",
+    "--inter-hunk-context=0",
     "--no-ext-diff",
     "--no-textconv",
     "--no-color",
@@ -182,11 +197,25 @@ DIFF_COMMON = (
     "--src-prefix=a/",
     "--dst-prefix=b/",
 )
+C_RULES_DIFF = (
+    "diff",
+    "--inter-hunk-context=0",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--find-renames",
+    "--diff-filter=AMR",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 MAX_PATHS = 2000
 MAX_CLAIM_COMMITS = 1000
 RUN_TIMEOUT = 1800
+C_RULES_TIMEOUT = 300
 CLEANUP_TIMEOUT = 30
 REAP_TIMEOUT = 10
+SEMGREP_SCAN = REPO_ROOT / "scripts" / "semgrep_scan.sh"
+SEMGREP_FFMPEG_RULES = REPO_ROOT / ".semgrep-ffmpeg.yml"
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
 CONFIG = ".forgejo/pre-commit/config.yaml"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -313,6 +342,7 @@ class Waivers:
     claim: str = ""
     doc: str = ""
     test_program: str = ""
+    c_rule: str = ""
 
 
 @dataclass
@@ -508,6 +538,16 @@ def _added_lines(patch: str) -> set[int]:
             start, count = int(match[1]), int(match[2] or "1")
             added.update(range(start, start + count))
     return added
+
+
+def _deleted_lines(patch: str) -> set[int]:
+    """Map deletion-only hunks to their preceding new-file line, or 1 at top of file."""
+    deleted = set()
+    for line in patch.splitlines():
+        match = HUNK.match(line)
+        if match and match[2] == "0":
+            deleted.add(max(1, int(match[1])))
+    return deleted
 
 
 def _code_lines(source: str) -> list[str]:
@@ -1230,16 +1270,6 @@ def _fate_macros(source: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def _fate_deleted_lines(patch: str) -> set[int]:
-    """Map deletion-only hunks to their new-file position, including continuations."""
-    deleted = set()
-    for line in patch.splitlines():
-        match = HUNK.match(line)
-        if match and match[2] == "0":
-            deleted.add(max(1, int(match[1])))
-    return deleted
-
-
 def _fate_merge(report: FateReport, result: FateReport) -> None:
     """Accumulate one file's independent diagnostics and all classification totals."""
     report.checked += result.checked
@@ -1273,7 +1303,7 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
             )
             if sources is None and needs_sources:
                 sources = _fate_sources(_git(tree, "show", f"{head}:libavfilter/allfilters.c"))
-            touched = _added_lines(patch) | _fate_deleted_lines(patch)
+            touched = _added_lines(patch) | _deleted_lines(patch)
             old_parsed = _fate_parse(old, macros or frozenset()) if old is not None else None
             _fate_merge(report, _fate_check(name, parsed, touched, sources or {}, old_parsed))
     except (OSError, RuntimeError, ValueError) as error:
@@ -1940,7 +1970,222 @@ def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
     return _waivable_step("test-program", findings, waiver, "", advice)
 
 
+@dataclass(frozen=True, slots=True)
+class SemgrepMatch:
+    """One validated Semgrep finding with its inclusive physical line span."""
+
+    path: str
+    start_line: int
+    end_line: int
+    check_id: str
+    message_line: str
+
+
+def is_c_source_path(name: str) -> bool:
+    """Return whether a repository path is a non-test library or fftools C or header source."""
+    return name.endswith((".c", ".h")) and is_source_path(name)
+
+
+def _semgrep_span(item: dict[str, object]) -> tuple[int, int] | None:
+    """Extract a positive inclusive (start_line, end_line) pair from a Semgrep result."""
+    start, end = item.get("start"), item.get("end")
+    if not (isinstance(start, dict) and isinstance(end, dict)):
+        return None
+    first, last = start.get("line"), end.get("line")
+    if (
+        isinstance(first, int)
+        and not isinstance(first, bool)
+        and isinstance(last, int)
+        and not isinstance(last, bool)
+        and 1 <= first <= last
+    ):
+        return first, last
+    return None
+
+
+def _parse_semgrep_match(item: object) -> SemgrepMatch | None:
+    """Validate one Semgrep JSON result entry against the allow-listed schema."""
+    if not isinstance(item, dict):
+        return None
+    path, check_id, extra = item.get("path"), item.get("check_id"), item.get("extra")
+    span = _semgrep_span(item)
+    # Semgrep prefixes check_id with the dotted rules path; rule ids carry no dot.
+    rule_id = check_id.rpartition(".")[2] if isinstance(check_id, str) else ""
+    message = extra.get("message") if isinstance(extra, dict) else None
+    if (
+        span is None
+        or not (isinstance(path, str) and path)
+        or not rule_id
+        or not isinstance(message, str)
+    ):
+        return None
+    return SemgrepMatch(path, span[0], span[1], rule_id, message.partition("\n")[0])
+
+
+def _partial_parsing_path(error: object) -> str | None:
+    """Return the file path of a PartialParsing error, or None for any other error."""
+    if not isinstance(error, dict):
+        return None
+    error_type = error.get("type")
+    is_partial = error_type == "PartialParsing" or (
+        isinstance(error_type, list) and bool(error_type) and error_type[0] == "PartialParsing"
+    )
+    path = error.get("path")
+    if is_partial and isinstance(path, str) and path:
+        return path
+    return None
+
+
+def _read_semgrep_lists(
+    raw_results: object,
+    raw_errors: object,
+    scanned_paths: frozenset[str] | None = None,
+) -> tuple[list[SemgrepMatch], list[str]] | None:
+    """Validate every result and PartialParsing error in Semgrep's JSON lists."""
+    if not (isinstance(raw_results, list) and isinstance(raw_errors, list)):
+        return None
+    matches: list[SemgrepMatch] = []
+    for raw in raw_results:
+        match = _parse_semgrep_match(raw)
+        if match is None or (scanned_paths is not None and match.path not in scanned_paths):
+            return None
+        matches.append(match)
+    partial_paths: list[str] = []
+    for raw in raw_errors:
+        path = _partial_parsing_path(raw)
+        if path is None:
+            return None
+        partial_paths.append(path)
+    return matches, partial_paths
+
+
+def _read_semgrep_json(
+    json_path: Path, scanned_paths: frozenset[str] | None = None
+) -> tuple[list[SemgrepMatch], list[str]] | None:
+    """Allow-list Semgrep JSON and require paths.scanned to cover every requested path."""
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    paths = payload.get("paths")
+    scanned = paths.get("scanned") if isinstance(paths, dict) else None
+    if not isinstance(scanned, list) or not all(isinstance(path, str) for path in scanned):
+        return None
+    if scanned_paths is not None and not scanned_paths.issubset(scanned):
+        return None
+    raw_results, raw_errors = payload.get("results"), payload.get("errors")
+    return _read_semgrep_lists(raw_results, raw_errors, scanned_paths)
+
+
+def _c_rules_error(result: RunResult) -> Step:
+    """Format an unrecognised semgrep_scan result as a non-waivable rc 2 step."""
+    header = f"command rc: {result.returncode}"
+    output = f"{header}\n{result.stdout}" if result.stdout else header
+    return Step("c-rules", 2, output)
+
+
+def _diff_sections(patch: str) -> list[str]:
+    """Split a unified diff into one section string per diff --git file header."""
+    sections: list[list[str]] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            sections.append([line])
+        elif sections:
+            sections[-1].append(line)
+    return ["\n".join(lines) for lines in sections]
+
+
+def _c_rules_touched(tree: Path, base: str, head: str) -> dict[str, set[int]]:
+    """Pair changed C and header sources with rename-aware added and deletion lines."""
+    raw_names = list(
+        filter(
+            None,
+            _git(tree, *C_RULES_DIFF, "--name-only", "-z", base, head, "--", "*.c", "*.h").split(
+                "\0"
+            ),
+        )
+    )
+    if len(raw_names) > MAX_PATHS:
+        raise RuntimeError(f"changed paths exceed MAX_PATHS={MAX_PATHS}: {len(raw_names)}")
+    paths = [name for name in raw_names if is_c_source_path(name)]
+    if not paths:
+        return {}
+    sections = _diff_sections(_git(tree, *C_RULES_DIFF, "-U0", base, head, "--", "*.c", "*.h"))
+    if len(raw_names) != len(sections):
+        raise RuntimeError(
+            f"git diff path/patch mismatch: {len(raw_names)} paths, {len(sections)} patches"
+        )
+    wanted = frozenset(paths)
+    return {
+        name: _added_lines(section) | _deleted_lines(section)
+        for name, section in zip(raw_names, sections, strict=True)
+        if name in wanted
+    }
+
+
+def _c_rules_report(
+    matches: list[SemgrepMatch],
+    partial_paths: list[str],
+    touched_by_path: dict[str, set[int]],
+    source_count: int,
+    waiver: str,
+) -> Step:
+    """Classify allow-listed Semgrep matches against touched lines and apply any waiver."""
+    findings: list[str] = []
+    notes: list[str] = []
+    for match in matches:
+        if match.path not in touched_by_path:
+            raise ValueError(f"unscanned result path: {match.path}")
+        touched_lines = touched_by_path[match.path]
+        touched = any(match.start_line <= line <= match.end_line for line in touched_lines)
+        detail = f"{match.path}:{match.start_line}: {match.check_id}: {match.message_line}"
+        if touched:
+            findings.append(f"finding: {detail}")
+        else:
+            notes.append(f"pre-existing (untouched): {detail}")
+    notes.extend(f"informational: {path}: PartialParsing" for path in partial_paths)
+    if not findings:
+        summary = f"0 finding(s) in {source_count} changed C/header source(s)"
+        return Step("c-rules", 0, "\n".join([*notes, summary]))
+    reason = waiver.strip()
+    if reason:
+        return Step("c-rules", 0, "\n".join([f"waived: {reason}", *findings, *notes]))
+    advice = "fix the flagged path, or pass --c-rule-reason"
+    return Step("c-rules", 1, "\n".join([*findings, *notes, advice]))
+
+
+def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Scan changed C/header sources and fail closed unless every requested path was scanned."""
+    touched_by_path = _c_rules_touched(tree, base, head)
+    if not touched_by_path:
+        return Step("c-rules", 0, "no added or modified C or header source in the range")
+    paths = list(touched_by_path)
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
+        json_path = Path(directory) / "semgrep.json"
+        argv = [
+            "bash",
+            str(SEMGREP_SCAN),
+            f"--rules={SEMGREP_FFMPEG_RULES}",
+            f"--json-output={json_path}",
+            "--max-target-bytes=0",
+            *paths,
+        ]
+        result = _run(argv, tree, timeout=C_RULES_TIMEOUT)
+        has_warning = any(line.startswith("semgrep_scan:") for line in result.stdout.splitlines())
+        parsed = (
+            _read_semgrep_json(json_path, frozenset(paths))
+            if result.returncode in (0, 1) and not has_warning
+            else None
+        )
+    if parsed is None:
+        return _c_rules_error(result)
+    return _c_rules_report(parsed[0], parsed[1], touched_by_path, len(paths), waiver)
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
+    """Run one check and capture unexpected tool or I/O errors as rc 2."""
     try:
         return action()
     except (OSError, RuntimeError, ValueError) as error:
@@ -1965,6 +2210,7 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
             _collect("doc-wrap", lambda: _doc_wrap(tree, base, head, waivers.doc)),
             _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
+            _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule)),
         ]
 
 
@@ -2000,6 +2246,14 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help="why a new lib*/tests program cannot be a FATE sample test; waives that step",
     )
+    parser.add_argument(
+        "--c-rule-reason",
+        default="",
+        help=(
+            "why a finding in .semgrep-ffmpeg.yml does not apply to the touched path; "
+            "waives findings of the c-rules step"
+        ),
+    )
     return parser
 
 
@@ -2015,6 +2269,7 @@ def main(argv: list[str] | None = None) -> int:
             claim=args.claim_reason,
             doc=args.doc_reason,
             test_program=args.test_program_reason,
+            c_rule=args.c_rule_reason,
         )
         steps = _checks(tree, base, head, waivers)
         _remaining(0)

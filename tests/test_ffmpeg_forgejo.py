@@ -21,6 +21,7 @@ import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 
+from scripts import review_classes
 from tests.helpers import isolated_git_environment
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -118,8 +119,12 @@ def git_output(repo: Path, *args: str) -> str:
 
 
 def full_sweep_report(sha: str) -> str:
-    """Build a reviewed empty report for all three sweep classes at one head."""
+    """Build reviewed sweep tables and all recurring class answers at one head."""
 
+    rows = "".join(
+        f"| {item['id']} | {item['question']} | no-variant: fixture |\n"
+        for item in review_classes.load_classes()
+    )
     return (
         "class: unchecked-return\n"
         f"head: {sha}\n\n"
@@ -136,7 +141,19 @@ def full_sweep_report(sha: str) -> str:
         "| file:line | claim text | library | oldest | newest | disposition |\n"
         "| --- | --- | --- | --- | --- | --- |\n"
         "no hits\n"
+    ) + (
+        f"\nclass: review-classes\nhead: {sha}\n\n"
+        "| class | question | disposition |\n| --- | --- | --- |\n" + rows
     )
+
+
+def copy_sweep_validator(scripts: Path) -> None:
+    """Copy the validator, class reader, YAML reader, and canonical class data together."""
+    for name in ("variant_sweep.py", "review_classes.py", "lane_brief.py"):
+        shutil.copyfile(HELPER.parent / name, scripts / name)
+    config = scripts.parent / ".config"
+    config.mkdir(exist_ok=True)
+    shutil.copyfile(review_classes.CLASS_FILE, config / review_classes.CLASS_FILE.name)
 
 
 def advance_upstream(tmp: Path, upstream: Path, path: str, text: str) -> str:
@@ -3448,7 +3465,7 @@ class SweepTest(ForgejoTest):
         helper = scripts / "ffmpeg-forgejo"
         shutil.copyfile(HELPER, helper)
         if validator:
-            shutil.copyfile(HELPER.parent / "variant_sweep.py", scripts / "variant_sweep.py")
+            copy_sweep_validator(scripts)
         return helper
 
     def test_sweep_names_missing_module(self) -> None:
@@ -3510,7 +3527,7 @@ class SweepTest(ForgejoTest):
 
         self.helper = self.bin_dir / "ffmpeg-forgejo"
         shutil.copyfile(HELPER, self.helper)
-        shutil.copyfile(HELPER.parent / "variant_sweep.py", self.bin_dir / "variant_sweep.py")
+        copy_sweep_validator(self.bin_dir)
         self.assert_guard_refused()
 
     def test_sweep_refuses_scripts_copy_outside_checkout(self) -> None:
@@ -4371,6 +4388,31 @@ class SweepTest(ForgejoTest):
         )
         self.assert_sweep_refused("--sweep", str(self.sweep))
 
+    def test_push_refuses_missing_review_class(self) -> None:
+        """Push refuses an omitted recurring class and names the missing id."""
+        item = review_classes.load_classes()[0]
+        row = f"| {item['id']} | {item['question']} | no-variant: fixture |\n"
+        self.sweep.write_text(
+            self.sweep.read_text(encoding="utf-8").replace(row, ""), encoding="utf-8"
+        )
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("review-classes:", result.stderr)
+        self.assertIn(item["id"], result.stderr)
+        self.assertNotIn("stub push", result.stdout)
+
+    def test_push_refuses_review_class_todo(self) -> None:
+        """Push refuses an unanswered recurring class disposition."""
+        self.sweep.write_text(
+            self.sweep.read_text(encoding="utf-8").replace("no-variant: fixture", "TODO", 1),
+            encoding="utf-8",
+        )
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("review-classes:", result.stderr)
+        self.assertIn(review_classes.load_classes()[0]["id"], result.stderr)
+        self.assertNotIn("stub push", result.stdout)
+
     def test_sweep_todo(self) -> None:
         """An unresolved table disposition blocks outbound operations."""
 
@@ -4565,7 +4607,7 @@ def mutant_case(
         scripts.mkdir(parents=True)
         git(checkout, "init", "-q")
         shutil.copyfile(HELPER.parent / "base_claims.py", scripts / "base_claims.py")
-        shutil.copyfile(HELPER.parent / "variant_sweep.py", scripts / "variant_sweep.py")
+        copy_sweep_validator(scripts)
         mutant = scripts / "ffmpeg-forgejo"
         mutant.write_text(source.replace(old, new), encoding="utf-8")
         yield type(name, (base,), {"helper": mutant})
