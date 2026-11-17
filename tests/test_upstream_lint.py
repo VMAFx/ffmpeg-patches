@@ -181,6 +181,229 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(upstream_lint._added_lines("@@ -2 +2,2 @@\n+a\n+b\n"), {2, 3})
 
 
+class RegressionTestPathTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of test and source path predicates."""
+
+    def test_is_test_path(self) -> None:
+        """Top-level and nested tests directories match; source directories do not."""
+        self.assertTrue(upstream_lint.is_test_path("tests/fate/x.mak"))
+        self.assertTrue(upstream_lint.is_test_path("libavutil/tests/x.c"))
+        self.assertFalse(upstream_lint.is_test_path("libavfilter/vf_x.c"))
+
+    def test_is_source_path(self) -> None:
+        """Library and fftools sources match while test, doc and compat paths do not."""
+        for path in ("libavfilter/vf_x.c", "fftools/ffmpeg.c", "libavcodec/x86/x.asm"):
+            with self.subTest(path=path):
+                self.assertTrue(upstream_lint.is_source_path(path))
+        for path in ("libavutil/tests/x.c", "doc/filters.texi", "compat/x.c"):
+            with self.subTest(path=path):
+                self.assertFalse(upstream_lint.is_source_path(path))
+
+
+class FixWordTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of fix detection in commit messages."""
+
+    def test_subject_and_body_defect_words(self) -> None:
+        """A fix or defect word in the subject or the body returns that word."""
+        cases = (
+            ("avfilter/vf_x: fix y\n", "fix"),
+            ("avformat/dashenc: do not delete y\n\nFix this by skipping y.\n", "Fix"),
+            ("avcodec/x: skip absent y\n\nReading y would misalign every field.\n", "misalign"),
+            ("avcodec/x: bound y\n\nThe next set was read past the end of it.\n", "past the end"),
+            ("avformat/x: enlarge y\n\nGCC reports -Wformat-truncation for y.\n", "truncation"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.fix_word(message), expected)
+
+    def test_wrapped_defect_phrase_is_found(self) -> None:
+        """A defect phrase split by a line break or by hyphens returns that phrase."""
+        cases = (
+            ("avcodec/x: bound y\n\nThe read goes out of\nbounds.\n", "out of\nbounds"),
+            ("avcodec/x: bound y\n\nAn out-of-\nbounds read of y.\n", "out-of-\nbounds"),
+            ("avcodec/x: bound y\n\nAn out\n-of-bounds read of y.\n", "out\n-of-bounds"),
+            ("avcodec/x: bound y\n\nThe read goes past the\nend of y.\n", "past the\nend"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.fix_word(message), expected)
+
+    def test_split_phrase_words_stay_whole(self) -> None:
+        """Phrase words joined without a separator or with other words between return None."""
+        for message in (
+            "avcodec/x: bound y\n\nThe read stays outof bounds checks.\n",
+            "avcodec/x: bound y\n\nThe read goes out of its\nbounds.\n",
+            "avcodec/x: bound y\n\nThe read goes past\nits end.\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_no_defect_word_returns_none(self) -> None:
+        """Messages without a whole fix or defect word outside sign-off lines return None."""
+        for message in (
+            "avfilter/vf_x: update y\n",
+            "avfilter/vf_x: update y\n\nRename the helper.\n",
+            "avfilter/vf_x: prefix y\n\nKeep the debug fixture.\n",
+            "avfilter/vf_x: update y\n\nSigned-off-by: Bug Fixer <fixer@invalid>\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+
+class TestReachTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of reach_names and test_words."""
+
+    def test_lavfi_prefix_stripped(self) -> None:
+        """Source paths contribute both full stems and lavfi-stripped stems."""
+        self.assertEqual(
+            upstream_lint.reach_names(["libavfilter/vf_x.c"], ""),
+            frozenset({"vf_x", "x"}),
+        )
+
+    def test_source_stem_and_hunk_function(self) -> None:
+        """Source stems and hunk-header functions are collected while docs are ignored."""
+        patch = (
+            "diff --git a/libavcodec/aom_film_grain.c b/libavcodec/aom_film_grain.c\n"
+            "--- a/libavcodec/aom_film_grain.c\n"
+            "+++ b/libavcodec/aom_film_grain.c\n"
+            "@@ -4 +4 @@ static int parse_sets(GetBitContext *gb)\n"
+            "-    return x;\n"
+            "+    return x + 1;\n"
+        )
+        self.assertEqual(
+            upstream_lint.reach_names(["libavcodec/aom_film_grain.c", "doc/x.texi"], patch),
+            frozenset({"aom_film_grain", "parse_sets"}),
+        )
+
+    def test_deleted_source_file_keeps_old_path_and_function(self) -> None:
+        """Deleted source diffs retain the --- a/ path for hunk function extraction."""
+        patch = (
+            "diff --git a/libavcodec/old.c b/libavcodec/old.c\n"
+            "deleted file mode 100644\n"
+            "--- a/libavcodec/old.c\n"
+            "+++ /dev/null\n"
+            "@@ -1,3 +0,0 @@ int ff_old(void)\n"
+            "-x\n"
+        )
+        self.assertEqual(
+            upstream_lint.reach_names(["libavcodec/old.c"], patch),
+            frozenset({"old", "ff_old"}),
+        )
+
+    def test_test_path_hunk_header_adds_nothing(self) -> None:
+        """Hunk headers under test paths do not contribute reachable source names."""
+        patch = (
+            "diff --git a/libavcodec/tests/x.c b/libavcodec/tests/x.c\n"
+            "--- a/libavcodec/tests/x.c\n"
+            "+++ b/libavcodec/tests/x.c\n"
+            "@@ -1 +1 @@ int main(void)\n"
+            "+y\n"
+        )
+        self.assertEqual(upstream_lint.reach_names(["libavcodec/tests/x.c"], patch), frozenset())
+
+    def test_test_words_from_path_and_added_lines(self) -> None:
+        """Changed test diffs yield every word from both the path and added lines."""
+        patch = (
+            "diff --git a/tests/ref/fate/filter-x b/tests/ref/fate/filter-x\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/tests/ref/fate/filter-x\n"
+            "@@ -0,0 +1 @@\n"
+            "+0\n"
+        )
+        self.assertEqual(
+            upstream_lint.test_words(patch),
+            frozenset({"tests", "ref", "fate", "filter", "x", "0"}),
+        )
+
+    def test_source_added_lines_add_no_test_words(self) -> None:
+        """Added body lines under source paths do not enter test_words."""
+        patch = (
+            "diff --git a/libavfilter/vf_x.c b/libavfilter/vf_x.c\n"
+            "--- a/libavfilter/vf_x.c\n"
+            "+++ b/libavfilter/vf_x.c\n"
+            "@@ -1 +1 @@\n"
+            "+parse_sets();\n"
+        )
+        self.assertEqual(upstream_lint.test_words(patch), frozenset())
+
+    def test_body_line_resembling_header_is_not_header(self) -> None:
+        """An added source line starting with +++ b/tests/ cannot switch file state."""
+        patch = (
+            "diff --git a/libavfilter/vf_x.c b/libavfilter/vf_x.c\n"
+            "--- a/libavfilter/vf_x.c\n"
+            "+++ b/libavfilter/vf_x.c\n"
+            "@@ -1 +1 @@\n"
+            "+++ b/tests/parse_sets\n"
+        )
+        self.assertEqual(upstream_lint.test_words(patch), frozenset())
+
+    def test_quoted_non_ascii_test_path_words(self) -> None:
+        """Quoted non-ASCII test headers decode so path and added-line words are kept."""
+        patch = (
+            'diff --git "a/tests/caf\\303\\251_x.c" "b/tests/caf\\303\\251_x.c"\n'
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            '+++ "b/tests/caf\\303\\251_x.c"\n'
+            "@@ -0,0 +1 @@\n"
+            "+    return ff_value();\n"
+        )
+        words = upstream_lint.test_words(patch)
+        self.assertIn("ff_value", words)
+        self.assertIn("tests", words)
+
+    def test_unquote_git_path_escapes(self) -> None:
+        """C-style quote, backslash, tab and UTF-8 octal escapes decode to text."""
+        self.assertEqual(
+            upstream_lint.unquote_git_path('"b/tests/a\\"b\\\\c\\td.c"'),
+            'b/tests/a"b\\c\td.c',
+        )
+        self.assertEqual(
+            upstream_lint.unquote_git_path('"b/tests/caf\\303\\251_x.c"'),
+            "b/tests/café_x.c",
+        )
+
+    def test_unquote_git_path_unquoted_and_lone_quote(self) -> None:
+        """Unquoted paths, a lone quote and the empty string return unchanged."""
+        self.assertEqual(upstream_lint.unquote_git_path("b/tests/x.c"), "b/tests/x.c")
+        self.assertEqual(upstream_lint.unquote_git_path('"'), '"')
+        self.assertEqual(upstream_lint.unquote_git_path(""), "")
+
+    def test_space_path_trailing_tab_hunk_names(self) -> None:
+        """Space-containing source headers drop Git's trailing TAB before suffix checks."""
+        patch = (
+            "diff --git a/libavfilter/vf_a b.c b/libavfilter/vf_a b.c\n"
+            "--- a/libavfilter/vf_a b.c\t\n"
+            "+++ b/libavfilter/vf_a b.c\t\n"
+            "@@ -1 +1 @@ int ff_space(void)\n"
+            "-x\n"
+            "+y\n"
+        )
+        self.assertEqual(upstream_lint.reach_names([], patch), frozenset({"ff_space"}))
+
+    def test_binary_test_path_words_from_paths(self) -> None:
+        """Explicit test paths supply path words even when a binary diff has no headers."""
+        self.assertEqual(
+            upstream_lint.test_words("", ["tests/data/filter-x.bin", "libavfilter/vf_x.c"]),
+            frozenset({"tests", "data", "filter", "x", "bin"}),
+        )
+
+    def test_dev_null_header_keeps_path(self) -> None:
+        """A deleted test file retains its --- a/ path across a +++ /dev/null header."""
+        patch = (
+            "diff --git a/tests/ref/fate/filter-x b/tests/ref/fate/filter-x\n"
+            "deleted file mode 100644\n"
+            "--- a/tests/ref/fate/filter-x\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-0\n"
+        )
+        self.assertEqual(
+            upstream_lint.test_words(patch),
+            frozenset({"tests", "ref", "fate", "filter", "x"}),
+        )
+
+
 FATE_RED = (
     "FATE_SCALE_REFUSE = fate-filter-scale-ipt-c2-refuse-rgb "
     "fate-filter-scale-ipt-c2-refuse-range\n"
@@ -649,6 +872,817 @@ class FateDepsTest(unittest.TestCase):
                 )
 
 
+class DiagnosticCitationTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of diagnostic workaround citations."""
+
+    def test_uncited_diagnostic_workaround_returns_flag(self) -> None:
+        """An uncited compiler-diagnostic workaround returns the first named flag."""
+        message = (
+            "avcodec/x: silence -Wmaybe-uninitialized false positive\n\nGCC 14 warns about ctx.\n"
+        )
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
+
+    def test_gcc_bugzilla_url_satisfies_citation(self) -> None:
+        """A GCC Bugzilla URL cites the named compiler diagnostic."""
+        message = (
+            "avcodec/x: silence -Wmaybe-uninitialized false positive\n\n"
+            "GCC 14 warns about ctx.\n"
+            "https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109999\n"
+        )
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_reproducer_line_satisfies_citation(self) -> None:
+        """A Reproducer line with a Compiler Explorer URL cites the diagnostic."""
+        message = (
+            "avcodec/x: silence -Wmaybe-uninitialized false positive\n\n"
+            "GCC 14 warns about ctx.\n"
+            "Reproducer: https://godbolt.org/z/abc123\n"
+        )
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_flag_without_workaround_wording_returns_none(self) -> None:
+        """A compiler flag without workaround wording does not require a citation."""
+        message = "avcodec/x: build with -Wall\n\nNo behaviour change.\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_workaround_wording_without_flag_returns_none(self) -> None:
+        """Workaround wording without a compiler diagnostic flag passes."""
+        message = "avcodec/x: work around a decoder hang\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_signed_off_by_workaround_wording_is_ignored(self) -> None:
+        """Signed-off-by trailers cannot supply workaround wording for a body flag."""
+        message = "avcodec/x: set flags\n\nUse -Wall.\n\nSigned-off-by: Work Around x@invalid\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_empty_reproducer_line_does_not_cite_diagnostic(self) -> None:
+        """A Reproducer prefix with nothing after it on the line does not count."""
+        prefix = (
+            "avcodec/x: silence -Wmaybe-uninitialized false positive\n\nGCC 14 warns about ctx.\n"
+        )
+        for trailer in ("Reproducer:", "Reproducer:\n", "Reproducer: \t\nSee above.\n"):
+            with self.subTest(trailer=trailer):
+                self.assertEqual(
+                    upstream_lint.uncited_diagnostic(prefix + trailer), "-Wmaybe-uninitialized"
+                )
+
+    def test_hash_flag_detected(self) -> None:
+        """Clang flags containing a hash in the suffix are detected."""
+        message = "avutil/x: silence -W#warnings\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-W#warnings")
+
+    def test_uppercase_flag_detected(self) -> None:
+        """Clang flags containing uppercase letters in the suffix are detected."""
+        message = "avutil/x: silence -WCFString-literal\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-WCFString-literal")
+
+    def test_plus_flag_detected_whole(self) -> None:
+        """Flags containing plus signs return the whole flag token."""
+        message = "avcodec/x: silence -Wc++11-compat\n"
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wc++11-compat")
+
+    def test_lowercase_w_not_a_flag(self) -> None:
+        """Lowercase -w is a general compiler option, not a named diagnostic flag."""
+        message = "avcodec/x: silence warnings with -w\n"
+        self.assertIsNone(upstream_lint.uncited_diagnostic(message))
+
+    def test_wrapped_false_positive_detected(self) -> None:
+        """Line-wrapped false positive wording still triggers the citation check."""
+        message = (
+            "avcodec/x: avoid -Wmaybe-uninitialized\n\nGCC reports a false\npositive for ctx.\n"
+        )
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
+
+    def test_wrapped_work_around_detected(self) -> None:
+        """Line-wrapped work around wording still triggers the citation check."""
+        message = (
+            "avcodec/x: init ctx for -Wmaybe-uninitialized\n\nThis is a work\naround for GCC 14.\n"
+        )
+        self.assertEqual(upstream_lint.uncited_diagnostic(message), "-Wmaybe-uninitialized")
+
+
+class ClaimScopeTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of verification and scope claims."""
+
+    def test_passes_all_fate_tests_claim_detected(self) -> None:
+        """Blanket FATE pass claims return the matched verification phrase."""
+        message = "avcodec/x: update y\n\nPasses all FATE tests.\n"
+        self.assertEqual(upstream_lint.unverified_claim(message), "Passes all FATE tests")
+
+    def test_fully_verified_claim_detected(self) -> None:
+        """Blanket verification claims return the matched phrase."""
+        message = "avcodec/x: update y\n\nFully verified on x86.\n"
+        self.assertEqual(upstream_lint.unverified_claim(message), "Fully verified")
+
+    def test_specific_command_and_platform_passes(self) -> None:
+        """Naming the concrete test command and platform is not flagged."""
+        message = "avcodec/x: update y\n\nTested with make fate on x86-64 Linux.\n"
+        self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_no_regression_test_explanation_passes(self) -> None:
+        """Explaining why there is no regression test is not a no-regressions claim."""
+        message = "avcodec/x: fix y\n\nNo regression test: the path needs hardware.\n"
+        self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_signed_off_by_verification_words_ignored(self) -> None:
+        """Signed-off-by trailers are excluded from verification-claim matching."""
+        message = "avcodec/x: update y\n\nSigned-off-by: Fully Tested <x@invalid>\n"
+        self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_both_loops_scope_claim_detected(self) -> None:
+        """A both-loops commit message returns its multi-site scope phrase."""
+        message = "avcodec/x: silence a warning in both loops\n"
+        self.assertEqual(upstream_lint.scope_claim(message), "both loops")
+
+    def test_all_three_callers_scope_claim_detected(self) -> None:
+        """A quantified callers phrase within two words returns the scope match."""
+        message = "avcodec/x: check all three callers\n"
+        self.assertEqual(upstream_lint.scope_claim(message), "all three callers")
+
+    def test_ordinary_single_site_message_passes(self) -> None:
+        """Messages without multi-site quantifiers return None."""
+        self.assertIsNone(upstream_lint.scope_claim("avcodec/x: rename y\n"))
+
+    def test_source_hunks_counts_only_non_test_source_files(self) -> None:
+        """Source hunks count library sources while ignoring docs, tests and a
+        deletion without its old path.
+        """
+        two_source = "+++ b/libavcodec/x.c\n@@ -3 +3 @@\n-a\n+b\n@@ -9 +9 @@\n-c\n+d\n"
+        self.assertEqual(upstream_lint.source_hunks(two_source), 2)
+        source_and_doc = (
+            "+++ b/libavcodec/x.c\n@@ -3 +3 @@\n-a\n+b\n+++ b/doc/x.texi\n@@ -3 +3 @@\n-c\n+d\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(source_and_doc), 1)
+        test_and_deleted = (
+            "+++ b/libavcodec/tests/x.c\n@@ -3 +3 @@\n-a\n+b\n+++ /dev/null\n@@ -3 +0,0 @@\n-c\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(test_and_deleted), 0)
+
+    def test_scope_claim_matches_across_line_breaks(self) -> None:
+        """Line-wrapped quantified site phrases still match across newlines."""
+        first = "avcodec/x: update y\n\nCheck all three\ncallers before returning.\n"
+        self.assertEqual(upstream_lint.scope_claim(first), "all three\ncallers")
+        second = "avcodec/x: update y\n\nUpdate both call\nsites in the decoder.\n"
+        self.assertEqual(upstream_lint.scope_claim(second), "both call\nsites")
+
+    def test_every_and_each_take_singular_site_nouns(self) -> None:
+        """Singular site nouns after every or each return their scope phrase."""
+        cases = (
+            ("avcodec/x: clamp y in each branch\n", "each branch"),
+            ("avcodec/x: free frame on every error path\n", "every error path"),
+            ("avcodec/x: check return value at each site\n", "each site"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.scope_claim(message), expected)
+
+    def test_every_and_each_take_plural_branches(self) -> None:
+        """Plural branches after every or each return their scope phrase within two words."""
+        cases = (
+            ("avcodec/x: clamp y in each of the branches\n", "each of the branches"),
+            ("avcodec/x: reset state in each of these branches\n", "each of these branches"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.scope_claim(message), expected)
+        self.assertIsNone(
+            upstream_lint.scope_claim("avcodec/x: reset state in every one of these branches\n")
+        )
+
+    def test_scope_claim_two_word_boundary(self) -> None:
+        """At most two intervening words separate the quantifier from its noun."""
+        hit = "avcodec/x: check all three inner callers\n"
+        self.assertEqual(upstream_lint.scope_claim(hit), "all three inner callers")
+        too_far = "avcodec/x: check all of the three callers\n"
+        self.assertIsNone(upstream_lint.scope_claim(too_far))
+        non_site = "avcodec/x: both decoders use the same table\n"
+        self.assertIsNone(upstream_lint.scope_claim(non_site))
+
+    def test_scope_claim_ignores_signoff_in_any_case(self) -> None:
+        """Signed-off-by lines in any letter case are excluded from scope matching."""
+        for prefix in ("Signed-off-by", "signed-off-by"):
+            with self.subTest(prefix=prefix):
+                message = f"avcodec/x: update y\n\n{prefix}: Both Loops <x@invalid>\n"
+                self.assertIsNone(upstream_lint.scope_claim(message))
+
+    def test_lowercase_signoff_verification_words_ignored(self) -> None:
+        """Lowercase signed-off-by trailers cannot trigger verification claims."""
+        message = "avcodec/x: update y\n\nsigned-off-by: Fully Tested <x@invalid>\n"
+        self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_negated_and_argued_claims_pass(self) -> None:
+        """Negated verification phrases and argued safety statements pass."""
+        messages = (
+            "avcodec/x: fix y\n\nNo regression testing is possible without hardware.\n",
+            "avcodec/x: free buffer\n\nFreeing here is completely safe because p is NULL.\n",
+            "avcodec/x: fix y\n\nThis fallback path was never fully tested by FATE.\n",
+            "avcodec/x: fix y\n\nThis path has not been fully tested.\n",
+            "avcodec/x: fix y\n\nThis path cannot be fully tested without hardware.\n",
+            "avcodec/x: fix y\n\nIt is 100% safe since p is NULL.\n",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.unverified_claim(message))
+
+    def test_negation_must_precede_the_claim(self) -> None:
+        """An earlier negation or test note does not excuse a blanket claim."""
+        first = "avcodec/x: fix y\n\nThis is not slow and fully tested.\n"
+        self.assertEqual(upstream_lint.unverified_claim(first), "fully tested")
+        second = "avcodec/x: fix y\n\nNo regression testing; all FATE tests pass.\n"
+        self.assertEqual(upstream_lint.unverified_claim(second), "all FATE tests pass")
+
+    def test_more_blanket_claims_detected(self) -> None:
+        """Expanded blanket test, verification and regression phrases fail."""
+        cases = (
+            ("avcodec/x: update y\n\nEvery test passed.\n", "Every test passed"),
+            ("avcodec/x: update y\n\nAll unit tests pass.\n", "All unit tests pass"),
+            ("avcodec/x: update y\n\nThoroughly verified.\n", "Thoroughly verified"),
+            (
+                "avcodec/x: optimize loop\n\nRuns 2x faster with no performance regressions.\n",
+                "no performance regressions",
+            ),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.unverified_claim(message), expected)
+
+    def test_no_regressions_and_100_percent_safe_detected(self) -> None:
+        """Unargued no-regressions and 100%-safe claims return their phrase."""
+        first = "avcodec/x: fix y\n\nNo regressions.\n"
+        self.assertEqual(upstream_lint.unverified_claim(first), "No regressions")
+        second = "avcodec/x: fix y\n\n100% safe.\n"
+        self.assertEqual(upstream_lint.unverified_claim(second), "100% safe")
+
+    def test_speed_claim_detected(self) -> None:
+        """An encode or decode speed claim without an end-to-end figure returns its phrase."""
+        cases = (
+            (
+                "avcodec/x: paint maps once\n\nThe map painter benchmark ran seven rounds, "
+                "so encoding is 10x faster.\n",
+                "encoding is 10x faster",
+            ),
+            ("avcodec/x: cache maps\n\nThis gives faster encoding.\n", "faster encoding"),
+            ("avcodec/x: cache maps\n\nThis speeds up the encoder.\n", "speeds up the encoder"),
+            ("avcodec/x: cache maps\n\nAn end-to-end speedup of 4%.\n", "end-to-end speedup"),
+            ("avcodec/x: cache maps\n\nDecoding speed-up for 4K.\n", "Decoding speed-up"),
+            ("avcodec/x: cache maps\n\nThe decoder is faster.\n", "decoder is faster"),
+        )
+        for message, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(upstream_lint.speed_claim(message), expected)
+
+    def test_speed_claim_with_end_to_end_figure_passes(self) -> None:
+        """A speed claim next to an fps, -benchmark, speed= or hyperfine figure passes."""
+        claim = "avcodec/x: cache maps\n\nEncoding is faster: {}.\n"
+        for figure in (
+            "120 fps instead of 100 fps",
+            "ffmpeg -benchmark reports bench: utime=4.1s",
+            "speed=1.5x instead of speed=1.2x",
+            "hyperfine shows 4.1 s against 4.5 s",
+            "118.5 frames/s",
+        ):
+            with self.subTest(figure=figure):
+                self.assertIsNone(upstream_lint.speed_claim(claim.format(figure)))
+
+    def test_speed_claim_negated_or_off_topic_passes(self) -> None:
+        """Negated speed wording and speed words without an encode or decode word pass."""
+        for message in (
+            "avcodec/x: cache maps\n\nThis does not make encoding faster.\n",
+            "avcodec/x: cache maps\n\nThe helper runs without an end-to-end speedup.\n",
+            "avcodec/x: paint maps 10x faster\n\nThe map painter is quicker.\n",
+            "avcodec/x: cache maps\n\nNothing here changes.\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.speed_claim(message))
+
+    def test_speed_negation_must_share_the_sentence(self) -> None:
+        """A negation in an earlier sentence does not excuse a later speed claim."""
+        message = "avcodec/x: cache maps\n\nThe old path did not cache. Encoding is faster.\n"
+        self.assertEqual(upstream_lint.speed_claim(message), "Encoding is faster")
+
+    def test_speed_claim_decimal_in_negation_passes(self) -> None:
+        """Decimal points inside numbers do not end the negation window of speed claims."""
+        for message in (
+            "No 1.5x encoding speedup is claimed.",
+            "Not 2.0x faster encoding here.",
+            "It does not claim 3.25% encoding speedup.",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.speed_claim(message))
+
+    def test_speed_claim_sentence_end_after_negation_detected(self) -> None:
+        """Non-decimal full stops and other sentence marks still end the negation window."""
+        cases = (
+            ("No change. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2.3. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2.Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not 2.Faster encoding now.", "Faster encoding"),
+            ("No change in 3._x. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2.This gives faster encoding.", "faster encoding"),
+            ("Not 2.This gives faster encoding.", "faster encoding"),
+            ("No change in 3._x, encoding speedup of 2x.", "encoding speedup"),
+            ("Not in x_.2x faster encoding.", "faster encoding"),
+            ("Encoding speedup of 1.5x.", "Encoding speedup"),
+            ("No .5x encoding speedup is claimed.", "encoding speedup"),
+            ("Not here.2x faster encoding.", "faster encoding"),
+            ("No 1..5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1;5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1!5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1?5x encoding speedup is claimed.", "encoding speedup"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.speed_claim(message), expected)
+
+    def test_speed_claim_decimal_negation_boundaries(self) -> None:
+        """Window-boundary decimals and multi-dot numbers do not end speed negation."""
+        dot_at_start = "Version 1.5 of this encoder patch does not claim any new encoding speedup."
+        window_start = dot_at_start.index("encoding speedup") - 48
+        self.assertEqual(dot_at_start[window_start - 1 : window_start + 2], "1.5")
+        self.assertIsNone(upstream_lint.speed_claim(dot_at_start))
+        digit_at_start = (
+            "Version 1.5 of this encoder patch does not claim any real encoding speedup."
+        )
+        after_dot = digit_at_start.index("encoding speedup") - 48
+        self.assertEqual(digit_at_start[after_dot - 2 : after_dot + 1], "1.5")
+        self.assertIsNone(upstream_lint.speed_claim(digit_at_start))
+        for message in (
+            "No 1.2.3 encoding speedup is claimed.",
+            "Not in 1.2.3 is faster encoding claimed.",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.speed_claim(message))
+
+    def test_speed_claim_finding_names_the_fix(self) -> None:
+        """The claim-scope finding for a speed claim asks for an end-to-end figure."""
+        findings = upstream_lint._unverified_findings(
+            "0123456789abcdef", "avcodec/x: cache maps\n\nEncoding is faster.\n"
+        )
+        self.assertEqual(
+            findings,
+            [
+                '0123456789ab: claims "Encoding is faster" without an end-to-end measurement; '
+                "name an ffmpeg -benchmark or fps result, or drop the claim"
+            ],
+        )
+
+    def test_source_hunks_reads_headers_outside_hunk_bodies(self) -> None:
+        """Added +++ and removed --- C lines inside a hunk do not reset headers."""
+        added_plus = (
+            "diff --git a/libavcodec/x.c b/libavcodec/x.c\n"
+            "--- a/libavcodec/x.c\n"
+            "+++ b/libavcodec/x.c\n"
+            "@@ -3 +3 @@\n"
+            "-a\n"
+            "+++ ptr;\n"
+            "@@ -9 +9 @@\n"
+            "-c\n"
+            "+d\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(added_plus), 2)
+        removed_minus = added_plus.replace("-a\n+++ ptr;\n", "--- ptr;\n+a\n")
+        self.assertEqual(upstream_lint.source_hunks(removed_minus), 2)
+
+    def test_source_hunks_counts_deleted_source_files(self) -> None:
+        """Deleted library sources count their hunks while deleted tests do not."""
+        deleted_and_modified = (
+            "diff --git a/libavcodec/old.c b/libavcodec/old.c\n"
+            "deleted file mode 100644\n"
+            "--- a/libavcodec/old.c\n"
+            "+++ /dev/null\n"
+            "@@ -1,4 +0,0 @@\n"
+            "-int ff_old(void) { return 0; }\n"
+            "diff --git a/libavcodec/new.c b/libavcodec/new.c\n"
+            "--- a/libavcodec/new.c\n"
+            "+++ b/libavcodec/new.c\n"
+            "@@ -3 +3 @@\n"
+            "-return 1;\n"
+            "+return 2;\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(deleted_and_modified), 2)
+        second = (
+            "diff --git a/libavcodec/x.c b/libavcodec/x.c\n"
+            "--- a/libavcodec/x.c\n"
+            "+++ b/libavcodec/x.c\n"
+            "@@ -3 +3 @@\n"
+            "-a\n"
+            "+b\n"
+            "diff --git a/libavcodec/y.c b/libavcodec/y.c\n"
+            "--- a/libavcodec/y.c\n"
+            "+++ /dev/null\n"
+            "@@ -3 +0,0 @@\n"
+            "-c\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(second), 2)
+        deleted_test = second.replace("libavcodec/y.c", "libavcodec/tests/y.c")
+        self.assertEqual(upstream_lint.source_hunks(deleted_test), 1)
+
+    def test_source_hunks_decodes_quoted_headers(self) -> None:
+        """Quoted non-ASCII source headers count for deleted and changed files alike."""
+        deleted = (
+            'diff --git "a/libavcodec/caf\\303\\251.c" "b/libavcodec/caf\\303\\251.c"\n'
+            "deleted file mode 100644\n"
+            '--- "a/libavcodec/caf\\303\\251.c"\n'
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-int ff_old(void) { return 0; }\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(deleted), 1)
+        changed = (
+            'diff --git "a/libavcodec/caf\\303\\251.c" "b/libavcodec/caf\\303\\251.c"\n'
+            '--- "a/libavcodec/caf\\303\\251.c"\n'
+            '+++ "b/libavcodec/caf\\303\\251.c"\n'
+            "@@ -3 +3 @@\n"
+            "-a\n"
+            "+b\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(changed), 1)
+        quoted_test = deleted.replace("libavcodec/caf", "libavcodec/tests/caf")
+        self.assertEqual(upstream_lint.source_hunks(quoted_test), 0)
+
+    def test_source_hunks_fftools_added_and_empty(self) -> None:
+        """Context-bearing fftools diffs and added files count; empty diffs give 0."""
+        fftools = (
+            "diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c\n"
+            "--- a/fftools/ffmpeg.c\n"
+            "+++ b/fftools/ffmpeg.c\n"
+            "@@ -3,2 +3,2 @@\n"
+            " a\n"
+            "-b\n"
+            "+c\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(fftools), 1)
+        added_file = (
+            "diff --git a/libavcodec/n.c b/libavcodec/n.c\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/libavcodec/n.c\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+a\n"
+            "+b\n"
+        )
+        self.assertEqual(upstream_lint.source_hunks(added_file), 1)
+        self.assertEqual(upstream_lint.source_hunks(""), 0)
+
+
+class DocTermTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of doc terms the added code requires."""
+
+    def test_yuv_wording_for_non_rgb_code_is_found(self) -> None:
+        """Added docs saying YUV for a non-RGB code test name the missing case."""
+        for code in (
+            "    if (s->src_format.color_family != ZIMG_COLOR_RGB &&",
+            "    if (!(desc->flags & AV_PIX_FMT_FLAG_RGB))",
+        ):
+            with self.subTest(code=code):
+                findings = upstream_lint.doc_term_findings(code, "kept for YUV input only.")
+                self.assertEqual(len(findings), 1)
+                self.assertTrue(findings[0].startswith("non-RGB input: added code has "))
+                self.assertIn("say non-RGB or name gray", findings[0])
+
+    def test_reversed_operand_non_rgb_code_is_found(self) -> None:
+        """A non-RGB test with the RGB constant as the left operand is found as well."""
+        for code in (
+            "    if (ZIMG_COLOR_RGB != s->src_format.color_family &&",
+            "    if (!(AV_PIX_FMT_FLAG_RGB & desc->flags))",
+        ):
+            with self.subTest(code=code):
+                findings = upstream_lint.doc_term_findings(code, "kept for YUV input only.")
+                self.assertEqual(len(findings), 1)
+                self.assertTrue(findings[0].startswith("non-RGB input: added code has "))
+                self.assertIn("say non-RGB or name gray", findings[0])
+
+    def test_range_comparison_without_unspecified_is_found(self) -> None:
+        """Added docs naming a range option for a range comparison must say unspecified."""
+        code = "        s->src_format.pixel_range != convert_range(in->color_range)))"
+        findings = upstream_lint.doc_term_findings(code, "@option{rangein} too,")
+        self.assertEqual(len(findings), 1)
+        self.assertIn('unspecified range: added code has "pixel_range !="', findings[0])
+
+    def test_named_cases_pass(self) -> None:
+        """Docs that say non-RGB, gray or how an unspecified range is treated pass."""
+        code = (
+            "    if (!(desc->flags & AV_PIX_FMT_FLAG_RGB) && in->color_range != AVCOL_RANGE_JPEG)"
+        )
+        for docs in (
+            "kept for non-RGB input. An unspecified\nrange counts as limited.",
+            "kept for YUV and gray input; an unknown range is treated as limited.",
+        ):
+            with self.subTest(docs=docs):
+                self.assertEqual(upstream_lint.doc_term_findings(code, docs), [])
+
+    def test_missing_code_or_wording_passes(self) -> None:
+        """No finding without the code behaviour or without the triggering doc wording."""
+        for code, docs in (
+            ("    return 1;", "kept for YUV input; @option{rangein} too."),
+            ("    if (!(desc->flags & AV_PIX_FMT_FLAG_RGB))", ""),
+            ("    if (in->color_range == AVCOL_RANGE_JPEG)", "kept for every input."),
+            ("    if (s->src_format.color_family == ZIMG_COLOR_RGB)", "kept for YUV input."),
+            ("    if (ZIMG_COLOR_RGB == s->src_format.color_family)", "kept for YUV input."),
+            ("    if (AV_PIX_FMT_FLAG_RGB & desc->flags)", "kept for YUV input."),
+        ):
+            with self.subTest(code=code, docs=docs):
+                self.assertEqual(upstream_lint.doc_term_findings(code, docs), [])
+
+    def test_doc_path_is_texinfo_under_doc(self) -> None:
+        """Only Texinfo files below the top-level doc directory count as docs."""
+        self.assertTrue(upstream_lint.is_doc_path("doc/filters.texi"))
+        for name in ("filters.texi", "doc/filters.txt", "libavfilter/doc/x.texi"):
+            with self.subTest(name=name):
+                self.assertFalse(upstream_lint.is_doc_path(name))
+
+
+WRAP_TEXT = (
+    "@section libsvtav1\n"
+    "@table @option\n"
+    "@item qpfile @var{filename}\n"
+    "SVT-AV1 applies the maps only with CRF or constant-QP rate control, so\n"
+    "the option is refused unless the effective rate-control mode is 0, and\n"
+    "both. Internal\n"
+    "scaling, a @samp{superres-mode} other than 0, is refused too, because\n"
+    "SVT-AV1 would apply the map to the scaled frame with the full layout.\n"
+    "@end table\n"
+)
+
+
+class DocWrapTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of early line breaks in added docs."""
+
+    def wrap(self, before: str, line: str, after: str) -> list[str]:
+        """Check the middle line of a three-line filled paragraph."""
+        return upstream_lint.wrap_findings("doc/x.texi", [before, line, after], {2})
+
+    def test_early_break_is_found(self) -> None:
+        """An added line ending a filled paragraph line early names the line and widths."""
+        lines = WRAP_TEXT.splitlines()
+        findings = upstream_lint.wrap_findings("doc/encoders.texi", lines, {6})
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(
+            findings[0].startswith(
+                'doc/encoders.texi:6: "both. Internal" ends a filled paragraph line early (14 of '
+            ),
+            findings[0],
+        )
+
+    def test_unadded_or_full_lines_pass(self) -> None:
+        """A short line that was not added and full added lines pass."""
+        lines = WRAP_TEXT.splitlines()
+        for added in (set(), {4, 5, 7, 8}, {1, 9}, {0, 10}):
+            with self.subTest(added=added):
+                self.assertEqual(upstream_lint.wrap_findings("doc/x.texi", lines, added), [])
+
+    def test_sentence_end_passes(self) -> None:
+        """A short line ending a sentence or forcing a break passes; a comma does not."""
+        after = "y " + "z" * 58
+        for end in (".", ":", ";", "!", "?", "@*"):
+            with self.subTest(end=end):
+                self.assertEqual(self.wrap("x" * 60, "a" * 20 + end, after), [])
+        self.assertEqual(len(self.wrap("x" * 60, "a" * 20 + ",", after)), 1)
+
+    def test_half_width_boundary(self) -> None:
+        """A line under half its neighbours' width fails; exactly half passes."""
+        after = "y " + "z" * 58
+        self.assertEqual(len(self.wrap("x" * 60, "a" * 29, after)), 1)
+        self.assertEqual(self.wrap("x" * 60, "a" * 30, after), [])
+
+    def test_neighbour_width_boundary(self) -> None:
+        """Neighbours of WRAP_MIN_NEIGHBOUR columns are checked; one column less is not."""
+        width = upstream_lint.WRAP_MIN_NEIGHBOUR
+        after = "y " + "z" * (width - 2)
+        self.assertEqual(len(self.wrap("x" * width, "a" * 20, after)), 1)
+        self.assertEqual(self.wrap("x" * (width - 1), "a" * 20, after), [])
+
+    def test_next_word_fit_boundary(self) -> None:
+        """The break fails only when the next word fits on the line before."""
+        self.assertEqual(len(self.wrap("x" * 60, "a" * 20, "y" * 39 + " " + "z" * 50)), 1)
+        self.assertEqual(self.wrap("x" * 60, "a" * 20, "y" * 40 + " " + "z" * 50), [])
+
+    def test_inline_command_counts_as_one_word(self) -> None:
+        """A next line opening with an inline command counts up to its closing brace."""
+        after = "@option{svtav1-params}, is refused too, because SVT-AV1 would apply"
+        self.assertEqual(len(self.wrap("x" * 60, "a" * 20, after)), 1)
+        self.assertEqual(self.wrap("x" * 60, "a" * 37, after), [])
+
+    def test_unlisted_block_passes(self) -> None:
+        """Lines inside a block missing from TEXI_FILLED are not filled prose."""
+        body = ["x" * 60, "a" * 20, "y " + "z" * 58]
+        for block, expected in (("example", 0), ("verbatim", 0), ("itemize", 1), ("table", 1)):
+            with self.subTest(block=block):
+                lines = [f"@{block}", *body, f"@end {block}"]
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {3})
+                self.assertEqual(len(findings), expected)
+
+    def test_texi_prose_flags(self) -> None:
+        """Command lines and lines inside unlisted blocks are not prose; inline starts are."""
+        lines = [
+            "@table @option",
+            "@item a",
+            "@code{a} sets b",
+            "@c note",
+            "",
+            "@example",
+            "a b",
+            "@end example",
+            "plain",
+            "@end table",
+        ]
+        expected = [False, False, True, False, False, False, False, False, True, False]
+        self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
+    def test_raw_block_end_of_other_block_is_text(self) -> None:
+        """An @end line of an outer block inside a raw block is literal text."""
+        for opener in ("verbatim", "ignore", "macro foo", "rmacro foo", "linemacro foo"):
+            name = opener.split()[0]
+            lines = [
+                "@table @option",
+                "@item a",
+                "Text one.",
+                f"@{opener}",
+                "@end table",
+                "literal",
+                f"@end {name}",
+                "Text after.",
+                "@end table",
+            ]
+            expected = [False, False, True, False, False, False, False, True, False]
+            with self.subTest(opener=opener):
+                self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
+    def test_raw_block_nesting(self) -> None:
+        """A raw block nests only the openers texi2any counts inside it."""
+        cases = {
+            "same name": ["@verbatim", "@verbatim", "@end verbatim", "a b", "@end verbatim"],
+            "indented opener": ["@ignore", "  @ignore", "@end ignore", "a b", "@end ignore"],
+            "longer name": ["@verbatim", "@verbatimx", "a b", "@end verbatim"],
+            "other raw block": ["@ignore", "@verbatim", "a b", "@end ignore"],
+        }
+        for outer, inner in (("macro", "linemacro"), ("linemacro", "rmacro"), ("rmacro", "macro")):
+            body = [f"@{inner} g", f"@end {outer}", "a b", f"@end {inner}"]
+            cases[f"{inner} in {outer}"] = [f"@{outer} f", *body, f"@end {outer}"]
+        for name, lines in cases.items():
+            with self.subTest(case=name):
+                flags = upstream_lint.texi_prose([*lines, "plain"])
+                self.assertEqual(flags, [False] * len(lines) + [True])
+
+    def test_raw_block_end_line_boundaries(self) -> None:
+        """A raw block ends on @end and its name after leading blanks, before trailing text."""
+        cases = {
+            "leading blanks": (["@verbatim", "x y", "  @end verbatim", "plain"], 3),
+            "trailing text": (["@verbatim", "x y", "@end verbatim @c note", "plain"], 3),
+            "longer name": (["@verbatim", "@end verbatim-x", "x y", "@end verbatim", "p"], 4),
+        }
+        for name, (lines, first_prose) in cases.items():
+            with self.subTest(case=name):
+                expected = [index >= first_prose for index in range(len(lines))]
+                self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
+    CODE_PARAGRAPH = (
+        "@code{x} starts a prose line that is long enough to count",
+        "Each neighbour in this filled paragraph is sixty-six columns wide,",
+        "short",
+        "and the following prose line is also sixty-six columns wide here.",
+    )
+
+    def test_raw_block_end_adds_no_block_name(self) -> None:
+        """An @end inside a raw block adds no block name; one outside still does."""
+        for opener in ("verbatim", "ignore", "macro foo", "rmacro foo", "linemacro foo"):
+            name = opener.split()[0]
+            lines = [f"@{opener}", "@end code", f"@end {name}", "", *self.CODE_PARAGRAPH]
+            with self.subTest(opener=opener):
+                self.assertEqual(upstream_lint.texi_prose(lines), [False] * 4 + [True] * 4)
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {7})
+                self.assertEqual(len(findings), 1)
+                self.assertIn('"short" ends a filled paragraph line early', findings[0])
+        outside = ["@end code", "", *self.CODE_PARAGRAPH]
+        self.assertEqual(upstream_lint.texi_prose(outside), [False] * 6)
+        self.assertEqual(upstream_lint.wrap_findings("doc/x.texi", outside, {5}), [])
+
+    def test_nested_and_mixed_raw_block_end_names(self) -> None:
+        """Nested raw blocks hide inner @end names unless an outside @end names them."""
+        nested = {
+            "verbatim": [
+                "@verbatim",
+                "@verbatim",
+                "@end code",
+                "@end verbatim",
+                "@end code",
+                "@end verbatim",
+            ],
+            "ignore": [
+                "@ignore",
+                "  @ignore",
+                "@end code",
+                "@end ignore",
+                "@end code",
+                "@end ignore",
+            ],
+            "macro": [
+                "@macro f",
+                "@rmacro g",
+                "@end macro",
+                "@end code",
+                "@end rmacro",
+                "@end code",
+                "@end macro",
+            ],
+        }
+        for case, raw in nested.items():
+            lines = [*raw, "", *self.CODE_PARAGRAPH]
+            short_line = len(raw) + 4
+            with self.subTest(case=case):
+                self.assertEqual(
+                    upstream_lint.texi_prose(lines), [False] * (len(raw) + 1) + [True] * 4
+                )
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {short_line})
+                self.assertEqual(len(findings), 1)
+        mixed = (
+            (
+                "after",
+                ["@verbatim", "@end code", "@end verbatim", "", *self.CODE_PARAGRAPH, "@end code"],
+                7,
+            ),
+            (
+                "before",
+                ["@ignore", "@end code", "@end ignore", "@end code", "", *self.CODE_PARAGRAPH],
+                8,
+            ),
+        )
+        for case, lines, short_line in mixed:
+            with self.subTest(case=case):
+                self.assertEqual(upstream_lint.texi_prose(lines), [False] * len(lines))
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {short_line})
+                self.assertEqual(findings, [])
+
+
+class TestProgramTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of new registered lib*/tests programs."""
+
+    def test_registered_new_program_is_found(self) -> None:
+        """A new lib*/tests C file listed by a TESTPROGS assignment of its Makefile is found."""
+        for makefile in (
+            "TESTPROGS-$(CONFIG_ITUT_T35)              += aom_film_grain\n",
+            "TESTPROGS = avcodec                                    \\\n"
+            "            aom_film_grain                             \\\n"
+            "            golomb\n",
+            "TESTPROGS += aom_film_grain # needs a sample\n",
+            "TESTPROGS-yes += golomb aom_film_grain\n",
+            "TESTPROGS := golomb aom_film_grain\n",
+        ):
+            with self.subTest(makefile=makefile):
+                found = upstream_lint.registered_test_programs(
+                    ["libavcodec/tests/aom_film_grain.c"], {"libavcodec/Makefile": makefile}
+                )
+                self.assertEqual(found, ["libavcodec/tests/aom_film_grain.c"])
+
+    def test_unregistered_or_other_library_passes(self) -> None:
+        """No finding without the stem as a TESTPROGS word in the same library Makefile."""
+        program = ["libavcodec/tests/aom_film_grain.c"]
+        for path, makefile in (
+            ("libavutil/Makefile", "TESTPROGS += aom_film_grain\n"),
+            ("libavcodec/Makefile", "TESTPROGS += aom_film_grain_sets\n"),
+            ("libavcodec/x86/Makefile", "TESTPROGS += aom_film_grain\n"),
+            ("libavcodec/Makefile", "OBJS-$(CONFIG_ITUT_T35) += aom_film_grain.o\n"),
+            ("libavcodec/Makefile", "OBJS += aom_film_grain.o\n"),
+            ("libavcodec/Makefile", "# TESTPROGS += aom_film_grain\n"),
+            ("libavcodec/Makefile", "TESTPROGS += golomb # aom_film_grain next\n"),
+            ("libavcodec/Makefile", "TESTPROGS += golomb # see \\\naom_film_grain\n"),
+            ("libavcodec/Makefile", "TOOLS = golomb \\\n    aom_film_grain\n"),
+        ):
+            with self.subTest(path=path, makefile=makefile):
+                found = upstream_lint.registered_test_programs(program, {path: makefile})
+                self.assertEqual(found, [])
+        self.assertEqual(upstream_lint.registered_test_programs(program, {}), [])
+
+    def test_testprogs_names_reads_only_testprogs_words(self) -> None:
+        """TESTPROGS words come from joined logical lines with make comments dropped."""
+        makefile = (
+            "OBJS += golomb.o\n"
+            "TESTPROGS = avcodec \\\n"
+            "            jpeg2000dwt # utf8 \\\n"
+            "            bitstream_be\n"
+            "TESTPROGSX += x\n"
+            "TESTPROGS-$(CONFIG_GOLOMB) += golomb\n"
+        )
+        self.assertEqual(
+            upstream_lint.testprogs_names(makefile), frozenset({"avcodec", "jpeg2000dwt", "golomb"})
+        )
+        self.assertEqual(upstream_lint.testprogs_names(""), frozenset())
+
+    def test_test_program_path_is_c_under_lib_tests(self) -> None:
+        """Only C files directly below a lib*/tests directory count as test programs."""
+        self.assertTrue(upstream_lint.is_test_program_path("libavcodec/tests/x.c"))
+        for name in (
+            "libavcodec/tests/x.h",
+            "libavcodec/tests/sub/x.c",
+            "tests/api/x.c",
+            "libavcodec/x.c",
+            "tools/tests/x.c",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(upstream_lint.is_test_program_path(name))
+
+
 class FixtureTest(unittest.TestCase):
     """Shared disposable Git fixture; stub the pre-commit subprocess only."""
 
@@ -703,7 +1737,7 @@ class FixtureTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
 
-    def commit(self, subject="avfilter/vf_x: fix y"):
+    def commit(self, subject="avfilter/vf_x: update y"):
         """Commit fixture changes; never touch the implementation repository."""
         self.git("add", ".")
         self.git("commit", "-qm", subject)
@@ -736,13 +1770,553 @@ class PipelineTest(FixtureTest):
     """Run Git and base tools in a throwaway repository; stub pre-commit only."""
 
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
-        """A correctly named clean commit passes all five collected checks."""
+        """A correctly named clean commit passes every collected check."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit()
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
+        for name in (
+            "pre-commit",
+            "commit-msg",
+            "patcheck",
+            "developer.texi",
+            "fate-deps",
+            "regression-test",
+            "diagnostic-citation",
+            "claim-scope",
+            "doc-terms",
+            "doc-wrap",
+            "test-program",
+        ):
+            self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_fix_without_test_fails(self) -> None:
+        """A source fix commit with no changed test path in the range fails."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
         for name in ("pre-commit", "commit-msg", "patcheck", "developer.texi", "fate-deps"):
             self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_fix_with_test_passes(self) -> None:
+        """A source fix accompanied by a test file in the same commit passes."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_test_in_later_commit_passes(self) -> None:
+        """A test added in a separate commit within the same range satisfies the check."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.commit("tests/fate: add filter-x")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_body_fix_without_test_fails(self) -> None:
+        """A source commit whose body says fix fails without a changed test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: do not delete y\n\nFix this by skipping y.")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        self.assertIn(": avfilter/vf_x: do not delete y: fixes C or assembly sources", output)
+
+    def test_body_defect_word_without_test_fails(self) -> None:
+        """A source commit whose body names a defect fails without a changed test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: skip absent y\n\nReading y would misalign every field.")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_wrapped_body_defect_phrase_without_test_fails(self) -> None:
+        """A source commit whose body wraps a defect phrase fails without a changed test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: bound y\n\nThe read goes out of\nbounds.")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_body_without_defect_word_passes(self) -> None:
+        """A source commit whose subject and body name no defect needs no test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update y\n\nRename the helper.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_body_fix_waiver_passes(self) -> None:
+        """A non-blank --no-test-reason waives a source commit whose body says fix."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: do not delete y\n\nFix this by skipping y.")
+        rc, output = self.check("--no-test-reason", "hardware-only path")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: hardware-only path", output)
+
+    def test_fix_waiver_passes(self) -> None:
+        """A non-blank --no-test-reason waives a source fix without a test path."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check("--no-test-reason", "hardware-only path")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: hardware-only path", output)
+
+    def test_blank_waiver_fails(self) -> None:
+        """Whitespace-only --no-test-reason does not waive a missing regression test."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check("--no-test-reason", "  ")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_fix_outside_sources_passes(self) -> None:
+        """A fix commit touching only documentation does not require a test path."""
+        self.write("doc/x.texi", "fixed wording\n")
+        self.commit("doc/x: fix a typo")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_unreaching_test_fails(self) -> None:
+        """A source fix fails when changed tests name neither its file nor function."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("libavutil/tests/film_grain_params.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        self.assertIn("test paths changed but none names ff_value, vf_x, x", output)
+
+    def test_fix_with_test_naming_function_passes(self) -> None:
+        """A source fix passes when an added test line names the changed function."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write(
+            "libavutil/tests/film_grain_params.c",
+            "int main(void)\n{\n    return ff_value();\n}\n",
+        )
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_unreached_fix_waiver_passes(self) -> None:
+        """A non-blank --no-test-reason waives an unreached source fix commit."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("libavutil/tests/film_grain_params.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check(
+            "--no-test-reason",
+            "the parser runs only behind a hardware decoder",
+        )
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: the parser runs only behind a hardware decoder", output)
+
+    def test_unreached_fix_blank_waiver_fails(self) -> None:
+        """Whitespace-only --no-test-reason does not waive an unreached source fix."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("libavutil/tests/film_grain_params.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check("--no-test-reason", "  ")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+
+    def test_one_unreached_fix_of_two_fails(self) -> None:
+        """Each fix commit in the range must be reached by the changed tests."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix y")
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.write("libavfilter/vf_y.c", SOURCE.replace("ff_value", "ff_other"))
+        self.commit("avfilter/vf_y: fix z")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("avfilter/vf_y: fix z: test paths changed but none names vf_y, y", output)
+        self.assertNotIn("avfilter/vf_x: fix y: test paths changed", output)
+
+    def test_fix_with_binary_test_fixture_passes(self) -> None:
+        """A source fix passes when a binary test fixture path names the fixed stem."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("tests/data/filter-x.bin", "\x00\x01\x02")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_quoted_test_path_passes(self) -> None:
+        """A source fix passes when a non-ASCII quoted test file names the function."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write("tests/café_x.c", "int main(void)\n{\n    return ff_value();\n}\n")
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_fix_with_noprefix_config_passes(self) -> None:
+        """A source fix passes even when repository config sets diff.noprefix=true."""
+        self.git("config", "diff.noprefix", "true")
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.write(
+            "libavutil/tests/film_grain_params.c",
+            "int main(void)\n{\n    return ff_value();\n}\n",
+        )
+        self.commit("avfilter/vf_x: fix y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_uncited_diagnostic_workaround_fails(self) -> None:
+        """An uncited compiler-diagnostic workaround fails only its own step."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: silence -Wmaybe-uninitialized false positive")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: diagnostic-citation rc: 1", output)
+        for name in ("pre-commit", "commit-msg", "patcheck", "developer.texi", "fate-deps"):
+            self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_cited_diagnostic_workaround_passes(self) -> None:
+        """A compiler-diagnostic workaround with an upstream bug URL passes."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit(
+            "avfilter/vf_x: silence -Wmaybe-uninitialized false positive\n\n"
+            "https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109999"
+        )
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: diagnostic-citation rc: 0", output)
+
+    def test_verification_claim_fails(self) -> None:
+        """A blanket verification claim fails claim-scope while other steps pass."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update y\n\nPasses all FATE tests.")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        for name in (
+            "pre-commit",
+            "commit-msg",
+            "patcheck",
+            "developer.texi",
+            "fate-deps",
+            "regression-test",
+            "diagnostic-citation",
+        ):
+            self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_verification_claim_is_not_waived(self) -> None:
+        """Passing --claim-reason cannot waive a blanket verification claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update y\n\nPasses all FATE tests.")
+        rc, output = self.check("--claim-reason", "ran fate")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_single_hunk_scope_claim_fails(self) -> None:
+        """A multi-site claim backed by one source hunk fails without a waiver."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in both loops")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_single_hunk_each_of_the_branches_claim_fails(self) -> None:
+        """A claim about each of the branches backed by one source hunk fails without a waiver."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in each of the branches")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn("changes 1 source hunk", output)
+
+    def test_scope_claim_waiver_passes(self) -> None:
+        """A non-blank --claim-reason waives a single-hunk scope claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in both loops")
+        rc, output = self.check("--claim-reason", "the second loop is generated from one macro")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: the second loop is generated from one macro", output)
+
+    def test_blank_scope_waiver_fails(self) -> None:
+        """Whitespace-only --claim-reason does not waive a single-hunk scope claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in both loops")
+        rc, output = self.check("--claim-reason", "  ")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_two_hunk_scope_claim_passes(self) -> None:
+        """A multi-site claim backed by two source hunks passes without a waiver."""
+        self.write(
+            "libavfilter/vf_x.c",
+            SOURCE.replace("ff_value", "ff_first") + "\nint ff_other(void)\n{\n    return 3;\n}\n",
+        )
+        self.commit("avfilter/vf_x: update both functions")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: claim-scope rc: 0", output)
+
+    def test_doc_terms_omission_fails(self) -> None:
+        """Added docs saying YUV for added non-RGB code fail the doc-terms step."""
+        self.write(
+            "libavfilter/vf_x.c", SOURCE.replace("1", "!(desc->flags & AV_PIX_FMT_FLAG_RGB)")
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for YUV input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn(
+            'non-RGB input: added code has "!(desc->flags & AV_PIX_FMT_FLAG_RGB)"', output
+        )
+
+    def test_doc_terms_waiver_passes(self) -> None:
+        """A non-blank --doc-reason waives the doc-terms step and prints the reason."""
+        self.write(
+            "libavfilter/vf_x.c", SOURCE.replace("1", "!(desc->flags & AV_PIX_FMT_FLAG_RGB)")
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for YUV input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check("--doc-reason", "gray input is rejected earlier")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0\nwaived: gray input is rejected earlier", output)
+
+    def test_doc_terms_named_case_passes(self) -> None:
+        """Added docs that say non-RGB for added non-RGB code pass the doc-terms step."""
+        self.write(
+            "libavfilter/vf_x.c", SOURCE.replace("1", "!(desc->flags & AV_PIX_FMT_FLAG_RGB)")
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for non-RGB input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_comment_only_passes(self) -> None:
+        """An added comment that names the RGB test is not added non-RGB code."""
+        self.write(
+            "libavfilter/vf_x.c",
+            SOURCE.replace(
+                "    return 1;", "    /* was !(desc->flags & AV_PIX_FMT_FLAG_RGB) */\n    return 1;"
+            ),
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for YUV input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_added_line_inside_comment_passes(self) -> None:
+        """An added line inside an existing block comment is read as comment text."""
+        self.write("libavfilter/vf_x.c", "/*\n * Light level.\n */\n" + SOURCE)
+        self.commit("avfilter/vf_x: describe the light level")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write(
+            "libavfilter/vf_x.c",
+            "/*\n * Light level.\n * The old test was !(desc->flags & AV_PIX_FMT_FLAG_RGB).\n */\n"
+            + SOURCE,
+        )
+        self.write("doc/filters.texi", "@item keep\nKeep the light level for YUV input.\n")
+        self.commit("avfilter/vf_x: keep the light level")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_speed_claim_fails(self) -> None:
+        """An encode speed claim without an end-to-end figure fails claim-scope."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit(
+            "avfilter/vf_x: paint maps once\n\n"
+            "The map painter benchmark ran seven rounds, so encoding is faster."
+        )
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn('claims "encoding is faster" without an end-to-end measurement', output)
+
+    def test_speed_claim_is_not_waived(self) -> None:
+        """Passing --claim-reason cannot waive an encode speed claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: paint maps once\n\nEncoding is faster.")
+        rc, output = self.check("--claim-reason", "helper benchmark")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_speed_claim_with_fps_passes(self) -> None:
+        """An encode speed claim with an fps figure passes claim-scope."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: paint maps once\n\nEncoding runs at 120 fps, not 100 fps.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: claim-scope rc: 0", output)
+
+    def test_doc_wrap_fails(self) -> None:
+        """An added doc line that ends a filled paragraph line early fails doc-wrap."""
+        self.write("doc/encoders.texi", WRAP_TEXT)
+        self.commit("doc/encoders: describe qpfile")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-wrap rc: 1", output)
+        self.assertIn('doc/encoders.texi:6: "both. Internal" ends a filled paragraph', output)
+
+    def test_doc_wrap_waiver_passes(self) -> None:
+        """A non-blank --doc-reason waives the doc-wrap step and prints the reason."""
+        self.write("doc/encoders.texi", WRAP_TEXT)
+        self.commit("doc/encoders: describe qpfile")
+        rc, output = self.check("--doc-reason", "the break keeps a table aligned")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-wrap rc: 0\nwaived: the break keeps a table aligned", output)
+
+    def test_doc_wrap_blank_waiver_fails(self) -> None:
+        """A whitespace-only --doc-reason does not waive the doc-wrap step."""
+        self.write("doc/encoders.texi", WRAP_TEXT)
+        self.commit("doc/encoders: describe qpfile")
+        rc, output = self.check("--doc-reason", "  ")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-wrap rc: 1", output)
+
+    def test_doc_wrap_filled_or_unchanged_passes(self) -> None:
+        """A filled paragraph passes, and so does an early break the range did not add."""
+        self.write("doc/encoders.texi", WRAP_TEXT.replace("both. Internal\n", "both.\n"))
+        self.commit("doc/encoders: describe qpfile")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-wrap rc: 0", output)
+        self.write("doc/encoders.texi", WRAP_TEXT)
+        self.commit("doc/encoders: describe qpfile scaling")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("doc/encoders.texi", WRAP_TEXT.replace("full layout", "full-size layout"))
+        self.commit("doc/encoders: name the layout")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-wrap rc: 0", output)
+
+    def test_test_program_fails(self) -> None:
+        """A new lib*/tests program registered in its Makefile fails the test-program step."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write("libavcodec/Makefile", "TESTPROGS += x_grain\n")
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: test-program rc: 1", output)
+        self.assertIn("libavcodec/tests/x_grain.c: new TESTPROGS program", output)
+
+    def test_test_program_waiver_passes(self) -> None:
+        """A non-blank --test-program-reason waives the test-program step and prints it."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write("libavcodec/Makefile", "TESTPROGS += x_grain\n")
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check("--test-program-reason", "no sample reaches the payload")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: test-program rc: 0\nwaived: no sample reaches the payload", output)
+
+    def test_test_program_continuation_line_fails(self) -> None:
+        """A new program added to a backslash-continued TESTPROGS list fails the step."""
+        self.write("libavcodec/Makefile", "TESTPROGS = golomb \\\n            rangecoder\n")
+        self.commit("avcodec: list test programs")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write(
+            "libavcodec/Makefile",
+            "TESTPROGS = golomb \\\n            x_grain \\\n            rangecoder\n",
+        )
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("libavcodec/tests/x_grain.c: new TESTPROGS program", output)
+
+    def test_test_program_other_makefile_entry_passes(self) -> None:
+        """An OBJS entry or a comment naming the new file's stem is not a registration."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write("libavcodec/Makefile", "OBJS += x_grain.o\n# x_grain needs a sample\n")
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: test-program rc: 0", output)
+
+    def test_unregistered_test_file_passes(self) -> None:
+        """A new lib*/tests C file without a head library Makefile passes."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.commit("avcodec/tests: add x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: test-program rc: 0", output)
+
+    def test_existing_test_program_edit_passes(self) -> None:
+        """Editing a program and Makefile line that exist at base is not a new program."""
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 0;\n}\n")
+        self.write("libavcodec/Makefile", "TESTPROGS += x_grain\n")
+        self.commit("avcodec/tests: add x_grain")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavcodec/tests/x_grain.c", "int main(void)\n{\n    return 1;\n}\n")
+        self.write("libavcodec/Makefile", "TESTPROGS += golomb x_grain\n")
+        self.commit("avcodec/tests: extend x_grain")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: test-program rc: 0", output)
+
+    def test_renamed_two_hunk_scope_claim_passes(self) -> None:
+        """A renamed file with two source hunks satisfies a multi-site scope claim."""
+        grown = "".join(f"int ff_f{i}(void)\n{{\n    return {i};\n}}\n\n" for i in range(8))
+        self.write("libavfilter/vf_x.c", grown)
+        self.commit("avfilter/vf_x: grow fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("mv", "libavfilter/vf_x.c", "libavfilter/vf_y.c")
+        updated = grown.replace("return 1;", "return 11;").replace("return 6;", "return 66;")
+        self.write("libavfilter/vf_y.c", updated)
+        self.commit("avfilter/vf_y: update both functions")
+        _, output = self.check()
+        self.assertIn("step: claim-scope rc: 0", output)
+
+    def test_renamed_single_hunk_scope_claim_fails(self) -> None:
+        """A renamed file with one source hunk still fails a multi-site scope claim."""
+        grown = "".join(f"int ff_f{i}(void)\n{{\n    return {i};\n}}\n\n" for i in range(8))
+        self.write("libavfilter/vf_x.c", grown)
+        self.commit("avfilter/vf_x: grow fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("mv", "libavfilter/vf_x.c", "libavfilter/vf_y.c")
+        self.write("libavfilter/vf_y.c", grown.replace("return 1;", "return 11;"))
+        self.commit("avfilter/vf_y: clamp y in both loops")
+        _, output = self.check()
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn("changes 1 source hunk", output)
+
+    def test_quoted_source_deletion_scope_claim_fails(self) -> None:
+        """Deleting a quoted non-ASCII source path in one hunk fails a multi-site claim."""
+        self.write("libavfilter/café.c", "int ff_old(void)\n{\n    return 0;\n}\n")
+        self.commit("avfilter/café: add fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("rm", "-q", "libavfilter/café.c")
+        self.commit("avfilter/café: drop both functions")
+        _, output = self.check()
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn("changes 1 source hunk", output)
+
+    def test_unverified_claim_with_waived_scope_claim_fails(self) -> None:
+        """Waiving a scope claim still fails when the commit makes a blanket claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: clamp y in both loops\n\nPasses all FATE tests.")
+        rc, output = self.check("--claim-reason", "one macro")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn('claims "Passes all FATE tests"', output)
+        self.assertIn("waived: one macro", output)
+
+    def test_claim_scope_commit_cap(self) -> None:
+        """Exceeding MAX_CLAIM_COMMITS fails the claim-scope step with rc 2."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: first update")
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 3"))
+        self.commit("avfilter/vf_x: second update")
+        with unittest.mock.patch.object(upstream_lint, "MAX_CLAIM_COMMITS", 1):
+            _, output = self.check()
+        self.assertIn("step: claim-scope rc: 2", output)
+        self.assertIn("MAX_CLAIM_COMMITS=1: 2", output)
 
     def test_fate_missing_decoder_fails(self) -> None:
         """A committed lavfi video dependency gap fails without losing other steps."""
@@ -1154,7 +2728,7 @@ class RealToolsTest(FixtureTest):
     def test_clean_commit_passes(self):
         """The requested area-prefixed subject and clean C change pass."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
-        self.commit("avfilter/vf_x: fix y")
+        self.commit("avfilter/vf_x: update y")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
 

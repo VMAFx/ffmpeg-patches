@@ -18,6 +18,7 @@
 #                          (exit 77); --overlap-ok permits exactly that PR;
 #                          exits 3 when Fairy is missing or no human reviewer is requested
 #                          pr/push require a sweep for the local head; every row must be fold, follow-up: <reproducer path> or no-variant: <reason>
+#                          pr/push refuse (exit 73) a swept head that does not merge cleanly into the live $FFMPEG_FORGEJO_BASE fetched from FFMPEG_FORGEJO_GIT
 #                          pr/push run only as scripts/ffmpeg-forgejo of a Git checkout, directly or through a symlink (exit 74 otherwise)
 #   ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>
 #                          lists every own open pull sharing a file with the branch diff against the fetched base; exit 77 when any, 0 when none, 1 when not proven
@@ -25,12 +26,23 @@
 #   ffmpeg-forgejo comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head;
 #                          exits 78 when the body equals an own existing comment after whitespace normalization
+#                          with --tested-head, exits 80 when the comment or the live PR body names a base commit other than the live merge base
+#                          the comment posts the body file as read once at start; a head change seen by the base check exits 76
+#                          the base check compares the full live head read by the last tested-head check
+#   ffmpeg-forgejo reply   (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <review-id> <comment-id> <body-file>
+#                          answer a review comment inside its thread (same path, line and range); test claims must match the live PR head;
+#                          exits 78 when the body equals an own comment in that review, 1 unless the reply reads back at the same anchor
 #   ffmpeg-forgejo edit-body [--wait] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          replace a PR body; test claims must match the live PR head; refuses (exit 75) while the
 #                          Autolabel run for the PR head has not finished, --wait polls up to 20 min.
 #                          Without Autolabel, edit-body requires at least one terminal status and the newest status to be at least 30 minutes old.
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
+#                          exits 80 when the new body names a base commit other than the live merge base (scripts/base_claims.py)
+#                          the PATCH sends the body file as read once at start
+#   ffmpeg-forgejo close   <number> <comment-file>
+#                          comment on an own open PR, then close it; refuses (exit 80) a PR whose author is not the token login,
+#                          exits 78 when the comment equals an own existing comment, 1 unless the PR reads back closed
 # Evidence test claims start with `- test:` or `test:` after optional whitespace.
 # Every such line needs head=<7-40 hex> and tree=<path>; other lines are ignored.
 #   ffmpeg-forgejo reviewers <number> [<login>...]    list requested reviewers, or request these
@@ -255,7 +267,7 @@ if not count:
 PY
 }
 
-# require_tested_head NUMBER TESTED [EVIDENCE]: check the live PR head and any evidence.
+# require_tested_head NUMBER TESTED [EVIDENCE]: check the live PR head and any evidence; set tested_live_head to the full live head.
 require_tested_head() {
   local number="$1" tested="$2" evidence="${3:-}" response status body live rc
   if response="$(pull_status "$number")"; then rc=0; else rc=$?; fi
@@ -295,7 +307,30 @@ print(sha)' \
       "$tested" "$live" >&2
     exit 76
   fi
+  tested_live_head="$live"
   [ -z "$evidence" ] || require_claim_evidence "$evidence" "$live"
+}
+
+# require_current_base NUMBER LIVE BODY-FILE HEAD LABEL: exit 80 when BODY-FILE (and the live PR body when LIVE is 1) names a base commit other than the live merge base; return 3 when the same pull read shows a head other than HEAD.
+require_current_base() {
+  local number="$1" live="$2" body_file="$3" head="$4" label="$5" response status body self rc
+  local -a args=(--pull-json - --head "$head" --label "$label")
+  if response="$(pull_status "$number")"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || die "base check: cannot read pull #$number (curl rc $rc)"
+  status="${response%%$'\n'*}"
+  [ "$status" = 200 ] || die "base check: cannot read pull #$number (HTTP $status)"
+  if [[ "$response" == *$'\n'* ]]; then body="${response#*$'\n'}"; else body=""; fi
+  self="$(python3 -I -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${BASH_SOURCE[0]}")" \
+    || die "base check: cannot resolve helper path: ${BASH_SOURCE[0]}"
+  [ "$live" != 1 ] || args+=(--live-body)
+  if python3 -I "${self%/*}/base_claims.py" "${args[@]}" "$body_file" <<<"$body"; then
+    return 0
+  else
+    rc=$?
+  fi
+  [ "$rc" -ne 3 ] || return 3
+  [ "$rc" -ne 1 ] || exit 80
+  die "base check: helper exited $rc"
 }
 
 # autolabel_state SHA: classify Autolabel contexts or an aged, settled head without one.
@@ -488,12 +523,18 @@ report_overlap_all() {
   return 77
 }
 
+# fetch_base_ref REF: fetch the configured upstream base branch into REF.
+fetch_base_ref() {
+  local ref="$1"
+  timeout 120 git fetch --quiet --no-tags --no-write-fetch-head "$GIT_URL" "+refs/heads/$BASE:$ref"
+}
+
 # prepare_overlap_candidates BRANCH: fetch base into private ref and diff candidate files.
 prepare_overlap_candidates() {
   local branch="$1"
   OVERLAP_REF="refs/ffmpeg-forgejo/overlap-base-$$"
   trap overlap_cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
-  if ! timeout 120 git fetch --quiet --no-tags --no-write-fetch-head "$GIT_URL" "+refs/heads/$BASE:$OVERLAP_REF"; then
+  if ! fetch_base_ref "$OVERLAP_REF"; then
     printf 'ffmpeg-forgejo: cannot fetch %s from %s; overlap not proven absent.\n' "$BASE" "$GIT_URL" >&2
     overlap_cleanup
     return 1
@@ -652,6 +693,168 @@ except (OSError, UnicodeError, ValueError) as error:
     print(f"ffmpeg-forgejo: cannot check existing comments on #{number}: {error}", file=sys.stderr)
     raise SystemExit(1)
 ' "$1" "$2" "$3"
+}
+
+# review_reply_body REVIEW-ID COMMENT-ID BODY-FILE: print the reply payload anchored like comment COMMENT-ID, from review comments JSON on stdin.
+review_reply_body() {
+  python3 -I -c '
+import json
+import sys
+from pathlib import Path
+
+review, target_id, path = sys.argv[1:]
+try:
+    text = Path(path).read_text(encoding="utf-8")
+    comments = json.load(sys.stdin)
+    if not isinstance(comments, list):
+        raise ValueError("review comments listing is not a list")
+    int(target_id)
+    rows = [row for row in comments if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") == int(target_id)]
+    if not rows:
+        print(
+            f"ffmpeg-forgejo: comment {target_id} is not in review {review}; not posted",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    target = rows[0]
+    if not isinstance(target["path"], str) or not target["path"]:
+        raise ValueError("invalid comment path")
+    for field in (target["position"], target["original_position"], target.get("extra_lines_count", 0)):
+        if type(field) is not int or field < 0:
+            raise ValueError("invalid comment anchor")
+    payload = {
+        "body": text,
+        "path": target["path"],
+        "new_position": target["position"],
+        "old_position": target["original_position"],
+        "extra_lines_count": target.get("extra_lines_count", 0),
+    }
+except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
+    print(
+        f"ffmpeg-forgejo: cannot read comment {target_id} in review {review}: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(json.dumps(payload))
+' "$1" "$2" "$3"
+}
+
+# require_reply_posted REVIEW-ID COMMENT-ID BODY-FILE LOGIN: print the reply URL once an own comment with the body sits at the anchor of COMMENT-ID.
+require_reply_posted() {
+  python3 -I -c '
+import json
+import sys
+from pathlib import Path
+
+review, target_id, path, me = sys.argv[1:]
+try:
+    want = " ".join(Path(path).read_text(encoding="utf-8").split())
+    comments = json.load(sys.stdin)
+    if not isinstance(comments, list):
+        raise ValueError("review comments listing is not a list")
+    int(target_id)
+    rows = [row for row in comments if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") == int(target_id)]
+    if not rows:
+        print(
+            f"ffmpeg-forgejo: comment {target_id} is not in review {review}; not posted",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    target = rows[0]
+    if (
+        not isinstance(target["path"], str)
+        or not target["path"]
+        or type(target["position"]) is not int
+        or type(target["original_position"]) is not int
+        or type(target.get("extra_lines_count", 0)) is not int
+    ):
+        raise ValueError("invalid comment anchor")
+    matches = [
+        row
+        for row in comments
+        if isinstance(row, dict)
+        and isinstance(row.get("user"), dict)
+        and row["user"].get("login") == me
+        and isinstance(row.get("body"), str)
+        and " ".join(row["body"].split()) == want
+        and type(row.get("id")) is int
+        and row["id"] != target["id"]
+        and row.get("path") == target["path"]
+        and type(row.get("position")) is int
+        and row.get("position") == target["position"]
+        and type(row.get("original_position")) is int
+        and row.get("original_position") == target["original_position"]
+        and type(row.get("extra_lines_count", 0)) is int
+        and row.get("extra_lines_count", 0) == target.get("extra_lines_count", 0)
+    ]
+    if not matches:
+        print(f"ffmpeg-forgejo: reply to comment {target_id} was not read back in review {review}", file=sys.stderr)
+        raise SystemExit(1)
+    url = matches[-1]["html_url"]
+    if not isinstance(url, str) or not url:
+        raise ValueError("missing html_url")
+except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
+    print(f"ffmpeg-forgejo: cannot read back review {review}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"replied {url}")
+' "$1" "$2" "$3" "$4"
+}
+
+# require_own_open_pull NUMBER LOGIN: exit 80 unless pull NUMBER is authored by LOGIN, 1 unless it is open.
+require_own_open_pull() {
+  local out
+  out="$(api GET "/repos/$REPO/pulls/$1")" || die "cannot read pull #$1"
+  python3 -I -c '
+import json
+import sys
+
+number, me = sys.argv[1:]
+try:
+    pull = json.load(sys.stdin)
+    author = pull["user"]["login"]
+    state = pull["state"]
+except (ValueError, KeyError, TypeError) as error:
+    print(f"ffmpeg-forgejo: cannot read pull #{number}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(author, str) or author != me:
+    print(
+        f"ffmpeg-forgejo: pull #{number} is authored by {author}, not {me}; not closed",
+        file=sys.stderr,
+    )
+    raise SystemExit(80)
+if state != "open":
+    print(f"ffmpeg-forgejo: pull #{number} is {state}; not closed", file=sys.stderr)
+    raise SystemExit(1)
+' "$1" "$2" <<<"$out"
+}
+
+# require_closed NUMBER: print the PR URL once pull NUMBER reads back closed; exit 1 otherwise.
+require_closed() {
+  local out
+  out="$(api GET "/repos/$REPO/pulls/$1")" || die "cannot read back pull #$1"
+  python3 -I -c '
+import json
+import sys
+
+number = sys.argv[1]
+try:
+    pull = json.load(sys.stdin)
+    state = pull["state"]
+    url = pull["html_url"] if state == "closed" else ""
+except (ValueError, KeyError, TypeError) as error:
+    print(f"ffmpeg-forgejo: cannot read back pull #{number}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if state != "closed":
+    print(
+        f"ffmpeg-forgejo: pull #{number} is still {state} after the close request",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if not isinstance(url, str) or not url:
+    print(f"ffmpeg-forgejo: cannot read back pull #{number}: missing html_url", file=sys.stderr)
+    raise SystemExit(1)
+print(f"closed {url}")
+' "$1" <<<"$out"
 }
 
 # own_open_pr_numbers: list own open pull numbers using the overlap checks poster filter.
@@ -883,6 +1086,177 @@ except (AttributeError, ImportError, OSError, UnicodeError, RuntimeError) as err
 sys.exit(0 if valid else 1)
 PY
   SWEPT_SHA="$sha"
+}
+
+MERGE_BASE_REF=""
+MERGE_TREE_OUT=""
+MERGE_TREE_MAX_BYTES=1048576
+
+# merge_base_cleanup: remove merge-tree output file and delete live merge-base ref without altering exit status.
+merge_base_cleanup() {
+  local save_status=$?
+  if [ -n "$MERGE_TREE_OUT" ]; then
+    rm -f "$MERGE_TREE_OUT"
+    MERGE_TREE_OUT=""
+  fi
+  if [ -n "$MERGE_BASE_REF" ]; then
+    if git rev-parse --quiet --verify "$MERGE_BASE_REF" >/dev/null; then
+      if ! git update-ref -d "$MERGE_BASE_REF"; then
+        printf 'ffmpeg-forgejo: cannot delete %s.\n' "$MERGE_BASE_REF" >&2
+      fi
+    fi
+    MERGE_BASE_REF=""
+  fi
+  return "$save_status"
+}
+
+# merge_info_attributes_neutral: verify repository info/attributes sets no attributes.
+merge_info_attributes_neutral() {
+  local attr_path rc
+  if ! attr_path="$(git rev-parse --git-path info/attributes)" || [ -z "$attr_path" ]; then
+    printf 'ffmpeg-forgejo: cannot resolve info/attributes path; merge with the live base not proven.\n' >&2
+    return 1
+  fi
+  if [ ! -e "$attr_path" ] && [ ! -L "$attr_path" ]; then
+    return 0
+  fi
+  if [ ! -f "$attr_path" ] || [ ! -r "$attr_path" ]; then
+    printf 'ffmpeg-forgejo: cannot read %s; merge with the live base not proven.\n' "$attr_path" >&2
+    return 1
+  fi
+  if LC_ALL=C grep -Eqv '^[[:blank:]]*(#|$)' -- "$attr_path"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 1 ]; then
+    return 0
+  fi
+  if [ "$rc" -eq 0 ]; then
+    printf 'ffmpeg-forgejo: %s sets attributes; merge with the live base not proven.\n' \
+      "$attr_path" >&2
+    return 1
+  fi
+  printf 'ffmpeg-forgejo: cannot read %s; merge with the live base not proven.\n' "$attr_path" >&2
+  return 1
+}
+
+# merge_settings_neutral: verify local merge config and info/attributes cannot alter merge-tree.
+merge_settings_neutral() {
+  local out rc key
+  local -a keys=()
+  if out="$(git config --name-only --get-regexp '^merge\.')"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+    printf 'ffmpeg-forgejo: git config failed with status %s; merge with the live base not proven.\n' \
+      "$rc" >&2
+    return 1
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+    mapfile -t keys <<<"$out"
+    for key in "${keys[@]}"; do
+      case "$(LC_ALL=C; printf '%s' "${key,,}")" in
+        merge.conflictstyle|merge.log|merge.branchdesc|merge.stat|merge.ff|merge.verbosity|\
+        merge.tool|merge.guitool|merge.autostash|merge.defaulttoupstream|merge.suppressdest|\
+        merge.verifysignatures) ;;
+        *)
+          printf 'ffmpeg-forgejo: merge setting %s may change the merge result; merge with the live base not proven.\n' \
+            "$key" >&2
+          return 1
+          ;;
+      esac
+    done
+  fi
+  merge_info_attributes_neutral
+}
+
+# neutral_merge_tree REF SHA: run merge-tree into MERGE_TREE_OUT with a byte cap, ignoring local attributes, rename settings, replace refs and grafts.
+neutral_merge_tree() {
+  local ref="$1" sha="$2" empty size
+  local -a pipe_status=()
+  if ! empty="$(git hash-object -t tree --stdin </dev/null)" || [ -z "$empty" ]; then
+    merge_base_cleanup
+    printf 'ffmpeg-forgejo: cannot compute empty tree id; merge with the live base not proven.\n' >&2
+    exit 1
+  fi
+  if ! MERGE_TREE_OUT="$(mktemp)"; then
+    merge_base_cleanup
+    printf 'ffmpeg-forgejo: cannot create temporary file; merge with the live base not proven.\n' >&2
+    exit 1
+  fi
+  # Pin rename detection to git's documented defaults so a local diff.renames or diff.renameLimit cannot change the result.
+  # System gitattributes, replace refs and grafts are host-local state the forge never applies, so the check ignores them.
+  if GIT_ATTR_NOSYSTEM=1 GIT_GRAFT_FILE=/dev/null timeout 120 git -c core.attributesFile=/dev/null -c merge.renames=true -c merge.renameLimit=7000 \
+    --no-replace-objects --attr-source="$empty" merge-tree --write-tree --name-only --no-messages "$ref" "$sha" \
+    | head -c "$((MERGE_TREE_MAX_BYTES + 1))" >"$MERGE_TREE_OUT"; then
+    pipe_status=(0 0)
+  else
+    pipe_status=("${PIPESTATUS[@]}")
+  fi
+  if ! size="$(wc -c <"$MERGE_TREE_OUT")"; then
+    merge_base_cleanup
+    printf 'ffmpeg-forgejo: cannot measure merge-tree output; merge with the live base not proven.\n' >&2
+    exit 1
+  fi
+  size="${size//[[:space:]]/}"
+  if [ "$size" -gt "$MERGE_TREE_MAX_BYTES" ]; then
+    merge_base_cleanup
+    printf 'ffmpeg-forgejo: merge-tree output exceeds %s bytes; merge with the live base not proven.\n' \
+      "$MERGE_TREE_MAX_BYTES" >&2
+    exit 1
+  fi
+  if [ "${pipe_status[1]:-1}" -ne 0 ]; then
+    merge_base_cleanup
+    printf 'ffmpeg-forgejo: merge-tree output capture failed with status %s; merge with the live base not proven.\n' \
+      "${pipe_status[1]:-1}" >&2
+    exit 1
+  fi
+  return "${pipe_status[0]}"
+}
+
+# require_clean_merge SHA: refuse outbound push or PR when SHA conflicts with the live base.
+require_clean_merge() {
+  local sha="$1" ref rc base_sha paths
+  ref="refs/ffmpeg-forgejo/merge-base-$$"
+  MERGE_BASE_REF="$ref"
+  trap merge_base_cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  if ! fetch_base_ref "$ref"; then
+    printf 'ffmpeg-forgejo: cannot fetch %s from %s; merge with the live base not proven.\n' \
+      "$BASE" "$GIT_URL" >&2
+    merge_base_cleanup
+    exit 1
+  fi
+  if ! merge_settings_neutral; then
+    merge_base_cleanup
+    exit 1
+  fi
+  if neutral_merge_tree "$ref" "$sha"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    merge_base_cleanup
+    trap - EXIT
+    return 0
+  fi
+  if [ "$rc" -eq 1 ]; then
+    base_sha="$(timeout 120 git rev-parse --verify "$ref")" || { merge_base_cleanup; exit 1; }
+    paths="$(python3 -I -c \
+      'import sys; print(" ".join(dict.fromkeys(filter(None, sys.stdin.read().split("\n")[1:]))))' \
+      <"$MERGE_TREE_OUT")" || { merge_base_cleanup; exit 1; }
+    merge_base_cleanup
+    printf 'ffmpeg-forgejo: %s does not merge cleanly into live %s at %s; conflicting files: %s; rebase onto the live base and sweep again.\n' \
+      "${sha:0:12}" "$BASE" "${base_sha:0:12}" "$paths" >&2
+    exit 73
+  fi
+  merge_base_cleanup
+  printf 'ffmpeg-forgejo: merge-tree failed with status %s; merge with the live base not proven.\n' \
+    "$rc" >&2
+  exit 1
 }
 
 # select_promise_pull BRANCH LOGIN: reject malformed rows before selecting an own PR.
@@ -1164,6 +1538,7 @@ for i in json.load(sys.stdin):
     done
     [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: $usage"
     require_sweep "$sweep" "$1"
+    require_clean_merge "$SWEPT_SHA"
     me="$(login)"
     rb="${2:-$1}"
     require_promises "$rb" "$promises" "$me"
@@ -1192,6 +1567,7 @@ for i in json.load(sys.stdin):
     done
     [ $# -eq 3 ] || usage_error "$usage"
     require_sweep "$sweep" "$1"
+    require_clean_merge "$SWEPT_SHA"
     [ -f "$3" ] || die "no body file $3"
     is_login "$BOT_REVIEWER" || die "not a login: $BOT_REVIEWER"
     me="$(login)"
@@ -1258,17 +1634,54 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: $1"
     [ -f "$2" ] || die "no body file $2"
+    snapshot="$(mktemp)"
+    chmod 600 "$snapshot"
+    trap 'rm -f "$snapshot"' EXIT
+    cat -- "$2" >"$snapshot" || die "cannot read body file $2"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     me="$(token_login)" || die "cannot read token login"
     discover_page_size
     out="$(api_list "/repos/$REPO/issues/$1/comments?" 200)" || exit 1
-    check_comment_duplicate "$1" "$2" "$me" <<<"$out"
+    check_comment_duplicate "$1" "$snapshot" "$me" <<<"$out"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
+    if [ "$claim_mode" = "tested-head" ] \
+      && ! require_current_base "$1" 1 "$snapshot" "$tested_live_head" "$2"; then
+      printf 'ffmpeg-forgejo: tested head %s does not match the head read by the base check.\n' \
+        "$tested_head" >&2
+      exit 76
+    fi
     body="$(mktemp)"
-    json_body "body=@$2" >"$body"
+    json_body "body=@$snapshot" >"$body"
     api POST "/repos/$REPO/issues/$1/comments" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
     rm -f "$body"
+    ;;
+  reply)
+    usage='reply (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <review-id> <comment-id> <body-file>'
+    parse_claim_option "$usage" "$@"
+    shift "$claim_args"
+    [ $# -eq 4 ] || usage_error "$usage"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
+    [[ "$2" =~ ^[0-9]+$ ]] || die "not a review id: $2"
+    [[ "$3" =~ ^[0-9]+$ ]] || die "not a comment id: $3"
+    [ -f "$4" ] || die "no body file $4"
+    reply_snapshot="$(mktemp)"
+    reply_payload="$(mktemp)"
+    chmod 600 "$reply_snapshot"
+    trap 'rm -f "$reply_snapshot" "$reply_payload"' EXIT
+    cat -- "$4" >"$reply_snapshot" || die "cannot read body file $4"
+    [ -n "$(tr -d '[:space:]' <"$reply_snapshot")" ] || die "empty body file $4"
+    [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
+    me="$(token_login)" || die "cannot read token login"
+    out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read review $2 on #$1"
+    check_comment_duplicate "$1" "$reply_snapshot" "$me" <<<"$out"
+    review_reply_body "$2" "$3" "$reply_snapshot" <<<"$out" >"$reply_payload"
+    [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
+    api POST "/repos/$REPO/pulls/$1/reviews/$2/comments" "$reply_payload" >/dev/null
+    rm -f "$reply_payload"
+    out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read back review $2 on #$1"
+    require_reply_posted "$2" "$3" "$reply_snapshot" "$me" <<<"$out"
     ;;
   edit-body)
     wait=0
@@ -1279,16 +1692,21 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
     [ -f "$2" ] || die "no body file $2"
+    snapshot="$(mktemp)"
+    chmod 600 "$snapshot"
+    trap 'rm -f "$snapshot"' EXIT
+    cat -- "$2" >"$snapshot" || die "cannot read body file $2"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
-    # The head is read again after the status check: a push in between starts a new Autolabel
-    # run, and the finished statuses of the old head must not clear the edit. Forgejo's PR edit
-    # takes no expected head, so a push landing between this last read and the PATCH still races.
+    # The head re-read after the status check is the base check's pull read: a push in between
+    # starts a new Autolabel run, and the finished statuses of the old head must not clear the
+    # edit. Forgejo's PR edit takes no expected head, so a push landing between this last read
+    # and the PATCH still races.
     for ((i = 1; i <= 80; i++)); do
       sha="$(head_sha "$1")"
       state="$(autolabel_state "$sha")"
       if [ "$state" = "done" ]; then
-        [ "$(head_sha "$1")" = "$sha" ] && break
+        if require_current_base "$1" 0 "$snapshot" "$sha" "$2"; then break; fi
         state="superseded by a new push"
       fi
       if [ "$wait" = 0 ] || [ "$i" = 80 ]; then
@@ -1298,10 +1716,38 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
       sleep "${FFMPEG_FORGEJO_POLL:-15}"
     done
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
+    # The final read must name the same full head as the checked loop head, since
+    # evidence and the tested head may be abbreviated prefixes.
+    if [ "$claim_mode" = "tested-head" ] && [ "$tested_live_head" != "${sha,,}" ]; then
+      printf 'ffmpeg-forgejo: live head %s differs from head %s the Autolabel and base checks used; retry the edit.\n' \
+        "$tested_live_head" "$sha" >&2
+      exit 76
+    fi
     body="$(mktemp)"
-    json_body "body=@$2" >"$body"
+    json_body "body=@$snapshot" >"$body"
     api PATCH "/repos/$REPO/pulls/$1" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
     rm -f "$body"
+    ;;
+  close)
+    usage='close <number> <comment-file>'
+    [ $# -eq 2 ] || usage_error "$usage"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
+    [ -f "$2" ] || die "no comment file $2"
+    [ -n "$(tr -d '[:space:]' <"$2")" ] || die "empty comment file $2"
+    me="$(token_login)" || die "cannot read token login"
+    require_own_open_pull "$1" "$me"
+    discover_page_size
+    out="$(api_list "/repos/$REPO/issues/$1/comments?" 200)" || exit 1
+    check_comment_duplicate "$1" "$2" "$me" <<<"$out"
+    require_own_open_pull "$1" "$me"
+    close_payload="$(mktemp)"
+    trap 'rm -f "$close_payload"' EXIT
+    json_body "body=@$2" >"$close_payload"
+    api POST "/repos/$REPO/issues/$1/comments" "$close_payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
+    json_body "state=closed" >"$close_payload"
+    api PATCH "/repos/$REPO/pulls/$1" "$close_payload" >/dev/null
+    rm -f "$close_payload"
+    require_closed "$1"
     ;;
   reviewers)
     [ $# -ge 1 ] || die "usage: reviewers <number> [<login>...]"

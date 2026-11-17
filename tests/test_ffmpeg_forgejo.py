@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import http.server
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess  # nosec B404 - fixed git and helper argv in temporary test repositories.
 import tempfile
@@ -24,13 +27,14 @@ ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
 A = "a" * 40
 B = "b" * 40
+MERGE_BASE = "c" * 40
 LIVE = "77c2f4b1c12b" + "0" * 28
 STALE = "c1f8e9c2a0"
 BODY = "new body\nline two\n"
 NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset(
-    {"comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap"}
+    {"close", "comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap", "reply"}
 )
 
 
@@ -135,6 +139,31 @@ def full_sweep_report(sha: str) -> str:
     )
 
 
+def advance_upstream(tmp: Path, upstream: Path, path: str, text: str) -> str:
+    """Clone upstream under tmp, commit text at path on master, and push."""
+
+    work = Path(tempfile.mkdtemp(prefix="upstream-work-", dir=tmp))
+    git(tmp, "clone", "-q", str(upstream), str(work))
+    target = work / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    git(work, "add", path)
+    git(
+        work,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgSign=false",
+        "commit",
+        "-qm",
+        "advance upstream",
+    )
+    git(work, "push", "-q", "origin", "master")
+    return git_output(work, "rev-parse", "HEAD")
+
+
 OTHER = other_status("pending", "2026-11-06T08:00:00Z")
 ChangedFile = str | dict[str, str]
 
@@ -177,6 +206,18 @@ class Stub:
     fail_status: answer the status endpoint with HTTP 500.
     pull_status: answer GET /pulls/1 with this HTTP status instead of a pull.
     paginate_large_comments: paginate comment rows normally even when there are more than 1000.
+    on_pull: optional callback run on GET /pulls/1 before building the reply.
+    pull_author: login of the pull author (default: the token login).
+    pull_state: state of the pull ("open" by default); a PATCH with state closed
+        sets it unless ignore_close.
+    ignore_close: acknowledge a close PATCH without changing the state.
+    review_comments: review id -> rows served by GET pulls/1/reviews/<id>/comments;
+        a POST there appends a row.
+    drop_review_replies: acknowledge a review-comment POST without storing it.
+    review_reply_extra_lines: store and return a review-comment POST with this
+        extra_lines_count instead of the posted one.
+    on_review_listing: optional callback run on GET pulls/1/reviews/<id>/comments
+        before building the reply.
     """
 
     def __init__(
@@ -192,10 +233,16 @@ class Stub:
         heads = heads or [A]
         polls = polls or {}
         self.heads, self.polls = heads, polls
+        self.merge_base = MERGE_BASE
+        self.pull_body = ""
+        self.on_pull = None
         self.fail_status = bool(kwargs.get("fail_status", False))
         self.pull_status = pull_status
         self.reviewers = reviewers or [[]]
         self.login = str(kwargs.get("login", "tester"))
+        self.pull_author = str(kwargs.get("pull_author", self.login))
+        self.pull_state = str(kwargs.get("pull_state", "open"))
+        self.ignore_close = bool(kwargs.get("ignore_close", False))
         self.max_response_items = kwargs.get("max_response_items", 50)
         self.open_pulls: list[dict] = []
         self.pull_files: dict[int, list[ChangedFile]] = {}
@@ -204,6 +251,10 @@ class Stub:
         self.reviews: dict[int, list[dict]] = {}
         self.fail_reviews: set[int] = set()
         self.comments: dict[int, list[dict]] = {}
+        self.review_comments: dict[int, list[dict]] = {}
+        self.drop_review_replies = bool(kwargs.get("drop_review_replies", False))
+        self.review_reply_extra_lines = kwargs.get("review_reply_extra_lines")
+        self.on_review_listing = None
         self.fail_comments: set[int] = set()
         self.paginate_large_comments = bool(kwargs.get("paginate_large_comments", False))
         self.head_reads = 0
@@ -246,7 +297,11 @@ class Stub:
         return {
             "number": 1,
             "head": {"sha": self.head()},
+            "merge_base": self.merge_base,
+            "body": self.pull_body,
             "html_url": "stub/pulls/1",
+            "user": {"login": self.pull_author},
+            "state": self.pull_state,
             "requested_reviewers": [
                 {"login": login}
                 for login in dict.fromkeys(reviewers + self.requested_users)
@@ -370,6 +425,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         if url.path.endswith("/pulls/1"):
             stub.pull_headers.append(dict(self.headers.items()))
+            if stub.on_pull is not None:
+                stub.on_pull()
             if stub.pull_status == 200:
                 self.reply(200, stub.pull())
             else:
@@ -400,6 +457,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(500, {"message": "reviews failed"})
             else:
                 self.reply(200, stub.review_page(number, urllib.parse.parse_qs(url.query)))
+            return True
+        return False
+
+    def _route_review_comments(self, stub: Stub, parts: list[str]) -> bool:
+        """Serve the comments of one pull review."""
+
+        if (
+            len(parts) > 5
+            and parts[-5] == "pulls"
+            and parts[-3] == "reviews"
+            and parts[-1] == "comments"
+        ):
+            if stub.on_review_listing is not None:
+                stub.on_review_listing()
+            self.reply(200, stub.review_comments.get(int(parts[-2]), []))
             return True
         return False
 
@@ -444,6 +516,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             lambda: self._route_pull(stub, url),
             lambda: self._route_pull_files(stub, parts, url),
             lambda: self._route_reviews(stub, parts, url),
+            lambda: self._route_review_comments(stub, parts),
             lambda: self._route_comments(stub, parts, url),
             lambda: self._route_branch(stub, parts),
             lambda: self._route_status(stub, parts, url),
@@ -459,6 +532,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parts = url.path.split("/")
         if not self._dispatch_get(stub, url, parts):
             self.reply(404, {})
+
+    def _post_review_comment(self, stub: Stub, data: str) -> bool:
+        """Persist and return a posted pull-review comment when the path matches."""
+
+        parts = urllib.parse.urlsplit(self.path).path.split("/")
+        if not (
+            len(parts) > 5
+            and parts[-5] == "pulls"
+            and parts[-3] == "reviews"
+            and parts[-1] == "comments"
+        ):
+            return False
+        review_id = int(parts[-2])
+        n = len(stub.review_comments.get(review_id, []))
+        payload = json.loads(data)
+        row = {
+            "id": 5000 + n,
+            "body": payload["body"],
+            "user": {"login": stub.login},
+            "path": payload["path"],
+            "position": payload["new_position"],
+            "original_position": payload["old_position"],
+            "extra_lines_count": payload["extra_lines_count"],
+            "html_url": f"stub/pulls/1#issuecomment-{5000 + n}",
+        }
+        if stub.review_reply_extra_lines is not None:
+            row["extra_lines_count"] = stub.review_reply_extra_lines
+        if not stub.drop_review_replies:
+            stub.review_comments.setdefault(review_id, []).append(row)
+        self.reply(200, row)
+        return True
 
     def do_POST(self) -> None:
         """Record writes and persist additive reviewer requests as Forgejo does."""
@@ -480,14 +584,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(stub.request_status, {})
         elif self.path.endswith("/issues/1/comments"):
             self.reply(201, {"html_url": "stub/issues/1#issuecomment-1"})
+        elif self._post_review_comment(self.stub(), data):
+            return
         else:
             self.reply(404, {})
 
     def do_PATCH(self) -> None:
-        """Record and acknowledge pull-body edits."""
+        """Record pull edits, apply a close unless the stub ignores it, and acknowledge."""
 
         data = self.rfile.read(int(self.headers["Content-Length"])).decode()
-        self.stub().requests.append(("PATCH", self.path, data))
+        stub = self.stub()
+        stub.requests.append(("PATCH", self.path, data))
+        if (
+            self.path.endswith("/pulls/1")
+            and json.loads(data).get("state") == "closed"
+            and not stub.ignore_close
+        ):
+            stub.pull_state = "closed"
         self.reply(200, {"html_url": "stub/pulls/1"})
 
 
@@ -1154,6 +1267,435 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.run_helper(stub, path_first=broken), 75)
         self.assertEqual(self.patches(stub), [])
 
+    def test_edit_body_stale_base_claim_exits_80(self) -> None:
+        """A stale base claim in the new PR body exits 80 without a PATCH."""
+
+        (self.tmp / "body.md").write_text("Base: FFmpeg master 46f23be8b197.\n", encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertIn("46f23be8b197", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_edit_body_current_base_claim_is_patched(self) -> None:
+        """A new PR body naming the live merge base is patched."""
+
+        body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        (self.tmp / "body.md").write_text(body, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        self.assertEqual(self.run_helper(stub), 0)
+        self.assertEqual(self.patches(stub), [body])
+
+    def test_edit_body_patches_the_checked_snapshot(self) -> None:
+        """Rewriting the body file during pull reads cannot alter the patched snapshot."""
+
+        body_path = self.tmp / "body.md"
+        original = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        body_path.write_text(original, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        stub.on_pull = lambda: body_path.write_text(
+            "Base: FFmpeg master 46f23be8b197.\n", encoding="utf-8"
+        )
+        proc = self.run_command(stub, "edit-body", "--no-test-claims", "1", str(body_path))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [original])
+
+    def test_edit_body_base_read_is_the_head_reread(self) -> None:
+        """The Autolabel head re-read performs the base check without a later pull read."""
+
+        stub = Stub([A, A, B], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [BODY])
+        self.assertEqual(stub.head_reads, 2)
+
+    def test_edit_body_head_change_in_base_read_exits_75(self) -> None:
+        """A head change seen by the base-check pull read exits 75 without a PATCH."""
+
+        stub = Stub([A, B], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 75, proc.stderr)
+        self.assertIn("superseded by a new push", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+
+class CloseTest(ForgejoTest):
+    """The close verb comments on and closes only an own open pull request."""
+
+    def writes(self, stub: Stub) -> list[tuple[str, str]]:
+        """Return the method and path of every POST and PATCH the stub received."""
+
+        return [(m, p) for m, p, _ in stub.requests if m in {"POST", "PATCH"}]
+
+    def test_own_open_pull_is_commented_then_closed(self) -> None:
+        """An own open pull is commented on, closed, and verified closed."""
+
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.writes(stub),
+            [
+                ("POST", "/api/v1/repos/FFmpeg/FFmpeg/issues/1/comments"),
+                ("PATCH", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1"),
+            ],
+        )
+        self.assertEqual(self.sent_bodies(stub, "POST"), [BODY])
+        patches = [json.loads(data) for method, _, data in stub.requests if method == "PATCH"]
+        self.assertEqual(patches, [{"state": "closed"}])
+        self.assertIn("closed stub/pulls/1", proc.stdout)
+
+    def test_foreign_pull_is_refused_before_any_write(self) -> None:
+        """A pull authored by another login exits 80 before any write."""
+
+        stub = Stub(pull_author="someone-else")
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertEqual(self.writes(stub), [])
+        self.assertIn("authored by someone-else, not tester", proc.stderr)
+
+    def test_closed_pull_is_refused_before_any_write(self) -> None:
+        """An already-closed pull exits 1 before any write."""
+
+        stub = Stub(pull_state="closed")
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(self.writes(stub), [])
+        self.assertIn("is closed; not closed", proc.stderr)
+
+    def test_missing_comment_file_is_refused_before_any_request(self) -> None:
+        """A missing comment file exits 1 before contacting the API."""
+
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "missing.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+        self.assertIn("no comment file", proc.stderr)
+
+    def test_blank_comment_file_is_refused_before_any_request(self) -> None:
+        """A whitespace-only comment file exits 1 before contacting the API."""
+
+        blank = self.tmp / "blank.md"
+        blank.write_text(" \n\t\n", encoding="utf-8")
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1", str(blank))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+        self.assertIn("empty comment file", proc.stderr)
+
+    def test_duplicate_comment_is_refused_before_any_write(self) -> None:
+        """An own matching comment exits 78 before posting or closing."""
+
+        stub = Stub()
+        stub.comments[1] = [
+            {
+                "id": 7,
+                "html_url": "stub/issues/1#issuecomment-7",
+                "body": BODY,
+                "user": {"login": "tester"},
+            }
+        ]
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertEqual(self.writes(stub), [])
+
+    def test_close_not_read_back_fails(self) -> None:
+        """A close PATCH whose read-back stays open exits 1."""
+
+        stub = Stub(ignore_close=True)
+        proc = self.run_command(stub, "close", "1", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(
+            self.writes(stub),
+            [
+                ("POST", "/api/v1/repos/FFmpeg/FFmpeg/issues/1/comments"),
+                ("PATCH", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1"),
+            ],
+        )
+        self.assertIn("is still open after the close request", proc.stderr)
+
+    def test_wrong_argument_count_is_a_usage_error(self) -> None:
+        """Missing the comment file argument exits 64 before any request."""
+
+        stub = Stub()
+        proc = self.run_command(stub, "close", "1")
+        self.assertEqual(proc.returncode, 64, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_non_numeric_pull_is_refused(self) -> None:
+        """A non-numeric pull identifier exits 1 before any request."""
+
+        stub = Stub()
+        body = str(self.tmp / "body.md")
+        proc = self.run_command(stub, "close", "x", body)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+
+THREAD = [
+    {
+        "id": 85943,
+        "body": "first",
+        "user": {"login": "reviewer"},
+        "path": "other.c",
+        "position": 5,
+        "original_position": 0,
+        "extra_lines_count": 0,
+        "html_url": "stub/pulls/1#issuecomment-85943",
+    },
+    {
+        "id": 85995,
+        "body": "question",
+        "user": {"login": "reviewer"},
+        "path": "tests/checkasm/vvc_alf.c",
+        "position": 79,
+        "original_position": 0,
+        "extra_lines_count": 3,
+        "html_url": "stub/pulls/1#issuecomment-85995",
+    },
+]
+
+
+class ReplyTest(ForgejoTest):
+    """The reply verb answers a review comment inside its thread."""
+
+    def stub(self, *, heads: list[object] | None = None, **kwargs: object) -> Stub:
+        """Return a stub serving the planted thread under review 7."""
+
+        stub = Stub(heads=heads, **kwargs)
+        stub.review_comments[7] = copy.deepcopy(THREAD)
+        return stub
+
+    def reply(self, stub: Stub, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run a reply with no test claims on pull 1, review 7."""
+
+        return self.run_command(stub, "reply", "--no-test-claims", "1", "7", *args)
+
+    def payloads(self, stub: Stub) -> list[dict]:
+        """Return the JSON bodies of every review-comment POST."""
+
+        return [
+            json.loads(data)
+            for method, path, data in stub.requests
+            if method == "POST" and "/reviews/" in path and path.endswith("/comments")
+        ]
+
+    def test_reply_copies_the_anchor_of_the_answered_comment(self) -> None:
+        """Replying to a review comment posts at its file, line, and range."""
+
+        stub = self.stub()
+        body = str(self.tmp / "body.md")
+        proc = self.reply(stub, "85995", body)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.payloads(stub),
+            [
+                {
+                    "body": BODY,
+                    "path": "tests/checkasm/vvc_alf.c",
+                    "new_position": 79,
+                    "old_position": 0,
+                    "extra_lines_count": 3,
+                }
+            ],
+        )
+        posts = [path for method, path, _ in stub.requests if method == "POST"]
+        self.assertEqual(posts, ["/api/v1/repos/FFmpeg/FFmpeg/pulls/1/reviews/7/comments"])
+        self.assertIn("replied stub/pulls/1#issuecomment-5002", proc.stdout)
+
+    def test_old_side_comment_keeps_its_old_position(self) -> None:
+        """An old-side review comment keeps position zero and its original line."""
+
+        stub = self.stub()
+        stub.review_comments[7][1]["position"] = 0
+        stub.review_comments[7][1]["original_position"] = 12
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = self.payloads(stub)[0]
+        self.assertEqual(payload["new_position"], 0)
+        self.assertEqual(payload["old_position"], 12)
+
+    def test_unknown_comment_is_refused_before_any_write(self) -> None:
+        """A comment missing from the named review exits 1 before posting."""
+
+        stub = self.stub()
+        proc = self.reply(stub, "99", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+        self.assertIn("comment 99 is not in review 7", proc.stderr)
+
+    def test_duplicate_reply_is_refused_before_any_write(self) -> None:
+        """An own matching comment in the review exits 78 before posting."""
+
+        stub = self.stub()
+        stub.review_comments[7].append(
+            {
+                "id": 6000,
+                "body": BODY,
+                "user": {"login": "tester"},
+                "path": "tests/checkasm/vvc_alf.c",
+                "position": 79,
+                "original_position": 0,
+                "extra_lines_count": 3,
+                "html_url": "stub/pulls/1#issuecomment-6000",
+            }
+        )
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 78, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_reply_not_read_back_fails(self) -> None:
+        """A dropped review-comment POST fails read-back with exit 1."""
+
+        stub = self.stub(drop_review_replies=True)
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(len([method for method, _, _ in stub.requests if method == "POST"]), 1)
+        self.assertIn("was not read back in review 7", proc.stderr)
+
+    def test_reply_stored_with_another_range_fails_read_back(self) -> None:
+        """A reply stored with another line range than the answered comment fails read-back."""
+
+        stub = self.stub(review_reply_extra_lines=0)
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(len([method for method, _, _ in stub.requests if method == "POST"]), 1)
+        self.assertIn("was not read back in review 7", proc.stderr)
+
+    def test_target_without_range_field_reads_back_with_range_zero(self) -> None:
+        """A target row without extra_lines_count posts and reads back with range zero."""
+
+        stub = self.stub()
+        del stub.review_comments[7][1]["extra_lines_count"]
+        proc = self.reply(stub, "85995", str(self.tmp / "body.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.payloads(stub)[0]["extra_lines_count"], 0)
+        self.assertIn("replied stub/pulls/1#issuecomment-5002", proc.stdout)
+
+    def test_missing_body_file_is_refused_before_any_request(self) -> None:
+        """A missing body file exits 1 before contacting the API."""
+
+        stub = self.stub()
+        proc = self.reply(stub, "85995", str(self.tmp / "missing.md"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_blank_body_file_is_refused_before_any_request(self) -> None:
+        """A whitespace-only body file exits 1 before contacting the API."""
+
+        blank = self.tmp / "blank.md"
+        blank.write_text(" \n\t\n", encoding="utf-8")
+        stub = self.stub()
+        proc = self.reply(stub, "85995", str(blank))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_body_rewritten_after_listing_posts_the_snapshot(self) -> None:
+        """A body file rewritten after the run starts is neither checked, posted nor read back."""
+
+        stub = self.stub()
+        body = self.tmp / "body.md"
+        stub.review_comments[7].append(
+            {
+                "id": 6000,
+                "body": "changed text",
+                "user": {"login": "tester"},
+                "path": "tests/checkasm/vvc_alf.c",
+                "position": 79,
+                "original_position": 0,
+                "extra_lines_count": 3,
+                "html_url": "stub/pulls/1#issuecomment-6000",
+            }
+        )
+        stub.on_review_listing = lambda: body.write_text("changed text\n", encoding="utf-8")
+        proc = self.reply(stub, "85995", str(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.payloads(stub),
+            [
+                {
+                    "body": BODY,
+                    "path": "tests/checkasm/vvc_alf.c",
+                    "new_position": 79,
+                    "old_position": 0,
+                    "extra_lines_count": 3,
+                }
+            ],
+        )
+        self.assertIn("replied stub/pulls/1#issuecomment-5003", proc.stdout)
+
+    def test_wrong_argument_count_is_a_usage_error(self) -> None:
+        """Missing the body file argument exits 64 before any request."""
+
+        stub = self.stub()
+        proc = self.run_command(stub, "reply", "--no-test-claims", "1", "7", "85995")
+        self.assertEqual(proc.returncode, 64, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_non_numeric_review_is_refused(self) -> None:
+        """A non-numeric review identifier exits 1 before any request."""
+
+        stub = self.stub()
+        body = str(self.tmp / "body.md")
+        proc = self.run_command(stub, "reply", "--no-test-claims", "1", "x", "85995", body)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(stub.requests, [])
+
+    def test_tested_head_is_rechecked_after_review_listing(self) -> None:
+        """A PR head changing during review listing exits 76 without posting."""
+
+        stub = self.stub(heads=[A, B])
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={A}\n", encoding="utf-8")
+        body = str(self.tmp / "body.md")
+        proc = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            A,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            body,
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("does not match live head", proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+
+    def test_moved_head_exit_removes_the_reply_payload(self) -> None:
+        """A moved head that exits 76 after the payload file exists leaves no tmp file behind."""
+
+        stub = self.stub(heads=[A, B])
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={A}\n", encoding="utf-8")
+        body = str(self.tmp / "body.md")
+        clean_tmp = self.tmp / "reply-tmp"
+        clean_tmp.mkdir()
+        proc = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            A,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            body,
+            env_updates={"TMPDIR": str(clean_tmp)},
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in stub.requests))
+        self.assertEqual(list(clean_tmp.iterdir()), [], "reply payload tmp file leaked on exit 76")
+
 
 class TestClaimHeadTest(ForgejoTest):
     """Validate evidence before accepting claims about a tested head."""
@@ -1661,6 +2203,58 @@ class TestClaimHeadTest(ForgejoTest):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(self.posts(stub), [BODY])
 
+    def test_comment_stale_live_base_exits_80(self) -> None:
+        """A stale base claim in the live PR body exits 80 without posting a comment."""
+
+        stub = Stub([LIVE])
+        stub.pull_body = "Base: FFmpeg master 46f23be8b197.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertIn("live PR body", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_current_live_base_is_posted(self) -> None:
+        """A live PR body naming the current merge base authorizes the comment POST."""
+
+        stub = Stub([LIVE])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_comment_posts_the_checked_snapshot(self) -> None:
+        """Rewriting the comment body file during pull reads cannot alter the posted text."""
+
+        body_path = self.tmp / "body.md"
+        stub = Stub([LIVE])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        stub.on_pull = lambda: body_path.write_text("changed\n", encoding="utf-8")
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_comment_head_change_in_base_read_exits_76(self) -> None:
+        """A head change seen by the base-check pull read exits 76 without posting."""
+
+        stub = Stub([LIVE, LIVE, B])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("base check", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_comment_prefix_head_change_in_base_read_exits_76(self) -> None:
+        """A base-check read of a different head sharing the tested prefix exits 76
+        without posting."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        stub = Stub([LIVE, LIVE, other])
+        stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
+        proc = self.comment(stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn("base check", proc.stderr)
+        self.assertEqual(self.posts(stub), [])
+
     def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
         """Both writes reject a different full head sharing the tested prefix."""
 
@@ -1683,6 +2277,28 @@ class TestClaimHeadTest(ForgejoTest):
         proc = self.edit_body(stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE))
         self.assertEqual(proc.returncode, 76, proc.stderr)
         self.assertEqual(self.patches(stub), [])
+
+    def test_edit_body_abbreviated_evidence_rechecks_full_head(self) -> None:
+        """Abbreviated evidence cannot carry a body edit across a push to a same-prefix head."""
+
+        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        stub = Stub([LIVE, LIVE, LIVE, other], {LIVE: [[label("success")]]})
+        proc = self.edit_body(
+            stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE[:7])
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertIn(other, proc.stderr)
+
+    def test_edit_body_abbreviated_evidence_same_head_edits(self) -> None:
+        """Abbreviated evidence still edits when every read returns the same head."""
+
+        stub = Stub([LIVE, LIVE, LIVE, LIVE], {LIVE: [[label("success")]]})
+        proc = self.edit_body(
+            stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE[:7])
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.patches(stub)), 1)
 
     def test_invalid_tested_heads_are_usage_errors(self) -> None:
         """Short and nonhex tested heads are usage errors without writes."""
@@ -1792,7 +2408,14 @@ class FairyRequestTestBase(unittest.TestCase):
             "secret-tool": "printf 'fixture-token\\n'",
             "git": (
                 'case "$1" in fetch|diff) exit 0;; '
-                f"rev-parse) echo {FAIRY_FIXTURE_HEAD};; *) exit 97;; esac"
+                "config) exit 1;; "
+                "hash-object) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904;; "
+                "merge-tree) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; "
+                '-c) case " $* " in *" merge-tree "*)'
+                " echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; esac; exit 97;; "
+                "update-ref) exit 0;; "
+                'rev-parse) if [ "$2" = --git-path ]; then echo "$PWD/fixture-git-dir/$3"; '
+                f"else echo {FAIRY_FIXTURE_HEAD}; fi;; *) exit 97;; esac"
             ),
         }.items():
             tool = self.bin_dir / name
@@ -2296,7 +2919,10 @@ class PullRequestOverlapTest(ForgejoTest):
             env_updates={"FFMPEG_FORGEJO_GIT": missing},
         )
         self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn(f"cannot fetch master from {missing}; overlap not proven absent", proc.stderr)
+        self.assertIn(
+            f"cannot fetch master from {missing}; merge with the live base not proven",
+            proc.stderr,
+        )
         self.assertEqual(self.pull_posts(stub), [])
 
     def test_other_login_overlap_allows_creation(self) -> None:
@@ -2757,6 +3383,23 @@ class OverlapVerbTest(ForgejoTest):
         self.assertEqual(pr_proc.returncode, 1, pr_proc.stderr)
         self.assertIn("no pull request opened", pr_proc.stderr)
 
+    def test_overlap_unreachable_upstream_fails_closed(self) -> None:
+        """The overlap verb fails closed when the live base cannot be fetched."""
+
+        missing = self.tmp / "missing.git"
+        proc = self.run_command(
+            overlap_stub(),
+            "overlap",
+            "topic",
+            env_updates={"FFMPEG_FORGEJO_GIT": str(missing)},
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(
+            f"cannot fetch master from {missing}; overlap not proven absent",
+            proc.stderr,
+        )
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
 
 class SweepTest(ForgejoTest):
     """Require a reviewed sweep before either outbound operation."""
@@ -2958,7 +3601,11 @@ class SweepTest(ForgejoTest):
         self.assertIn("report size limit", result.stderr)
 
     def sweep_command(
-        self, command: str, *options: str, stub: Stub | None = None
+        self,
+        command: str,
+        *options: str,
+        stub: Stub | None = None,
+        env_updates: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Attempt an outbound operation with API and Git push stubbed."""
 
@@ -2970,6 +3617,25 @@ class SweepTest(ForgejoTest):
             "#!/usr/bin/env python3\nimport json, os, sys\n"
             f"with open({str(self.tmp / 'git-calls.jsonl')!r}, 'a', encoding='utf-8') as calls:\n"
             "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            'if "merge-tree" in sys.argv:\n'
+            f"    with open({str(self.tmp / 'merge-tree-env.jsonl')!r}, 'a',"
+            " encoding='utf-8') as env_log:\n"
+            '        env_log.write(json.dumps({"GIT_ATTR_NOSYSTEM":'
+            ' os.environ.get("GIT_ATTR_NOSYSTEM"), "GIT_GRAFT_FILE":'
+            ' os.environ.get("GIT_GRAFT_FILE")}) + "\\n")\n'
+            '    mode = os.environ.get("STUB_MERGE_TREE")\n'
+            '    if mode == "fail":\n'
+            "        sys.exit(128)\n"
+            '    if mode == "flood":\n'
+            '        buf = memoryview(b"a" * (2 * 1024 * 1024))\n'
+            "        try:\n"
+            "            for _ in range(2 * 1024 * 1024):\n"
+            "                if not buf:\n"
+            "                    break\n"
+            "                buf = buf[os.write(1, buf):]\n"
+            "        except BrokenPipeError:\n"
+            "            pass\n"
+            "        sys.exit(0)\n"
             'if "push" in sys.argv:\n'
             f"    with open({str(self.tmp / 'push-argv.json')!r}, 'w') as record:\n"
             "        json.dump(sys.argv[1:], record)\n"
@@ -2982,9 +3648,281 @@ class SweepTest(ForgejoTest):
         positional = ["topic"]
         if command == "pr":
             positional += ["title", str(self.tmp / "body.md")]
-        result = self.run_command(stub, command, *options, *positional)
+        result = self.run_command(stub, command, *options, *positional, env_updates=env_updates)
         self.sweep_requests = stub.requests
         return result
+
+    def test_push_refuses_head_conflicting_with_live_base(self) -> None:
+        """Refuse push when the swept head conflicts with the live upstream base."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_pr_refuses_head_conflicting_with_live_base(self) -> None:
+        """Refuse PR creation when the swept head conflicts with the live upstream base."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        result = self.sweep_command("pr", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.sweep_requests))
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_accepts_live_base_advanced_without_conflict(self) -> None:
+        """Allow push when the live upstream base advanced without conflicting."""
+
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_unfetchable_live_base(self) -> None:
+        """Refuse push when the live upstream base cannot be fetched."""
+
+        result = self.sweep_command(
+            "push",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"FFMPEG_FORGEJO_GIT": str(self.tmp / "missing.git")},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("merge with the live base not proven", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_failed_merge_tree(self) -> None:
+        """Refuse push when git merge-tree fails with an unexpected status."""
+
+        result = self.sweep_command(
+            "push",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"STUB_MERGE_TREE": "fail"},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("merge-tree failed with status 128", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_oversized_merge_tree_output(self) -> None:
+        """Refuse push when git merge-tree output exceeds the byte cap."""
+
+        result = self.sweep_command(
+            "push",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"STUB_MERGE_TREE": "flood"},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("merge-tree output exceeds 1048576 bytes", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_merge_driver_setting(self) -> None:
+        """Refuse push when local Git config defines a custom merge driver."""
+
+        git(self.repo, "config", "merge.fixture.driver", "true")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(
+            "merge setting merge.fixture.driver may change the merge result",
+            result.stderr,
+        )
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_accepts_neutral_merge_setting(self) -> None:
+        """Allow push when local Git config sets an allow-listed merge option."""
+
+        git(self.repo, "config", "merge.conflictStyle", "diff3")
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_local_info_attributes(self) -> None:
+        """Refuse push when the repository info/attributes file defines attributes."""
+
+        attr_path = self.repo / git_output(self.repo, "rev-parse", "--git-path", "info/attributes")
+        attr_path.parent.mkdir(parents=True, exist_ok=True)
+        attr_path.write_text("* merge=union\n", encoding="utf-8")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("sets attributes", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_conflict_ignores_worktree_union_attribute(self) -> None:
+        """Ignore worktree .gitattributes union rules when checking live-base conflicts."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        (self.repo / ".gitattributes").write_text(f"{OVERLAP_FILE} merge=union\n", encoding="utf-8")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_conflict_ignores_local_replace_ref(self) -> None:
+        """Ignore local replace refs when checking live-base conflicts."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        new_blob = git_output(self.upstream, "rev-parse", f"{base_sha}:{OVERLAP_FILE}")
+        old_blob = git_output(self.upstream, "rev-parse", f"{base_sha}~1:{OVERLAP_FILE}")
+        git(self.repo, "update-ref", f"refs/replace/{new_blob}", old_blob)
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_conflict_ignores_info_grafts(self) -> None:
+        """Ignore repository info/grafts parent overrides when checking live-base conflicts."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        topic_head = git_output(self.repo, "rev-parse", "topic")
+        graft_path = self.repo / git_output(self.repo, "rev-parse", "--git-path", "info/grafts")
+        graft_path.parent.mkdir(parents=True, exist_ok=True)
+        graft_path.write_text(f"{topic_head} {base_sha}\n", encoding="utf-8")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_conflict_ignores_graft_file_env(self) -> None:
+        """Ignore GIT_GRAFT_FILE overrides when checking live-base conflicts."""
+
+        base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        topic_head = git_output(self.repo, "rev-parse", "topic")
+        graft_path = self.tmp / "grafts"
+        graft_path.write_text(f"{topic_head} {base_sha}\n", encoding="utf-8")
+        result = self.sweep_command(
+            "push",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"GIT_GRAFT_FILE": str(graft_path)},
+        )
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("does not merge cleanly into live master", result.stderr)
+        self.assertIn(base_sha[:12], result.stderr)
+        self.assertIn(OVERLAP_FILE, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_merge_tree_ignores_system_attributes(self) -> None:
+        """System attributes are root-owned, so the test checks the merge-tree environment."""
+
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        lines = (self.tmp / "merge-tree-env.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(lines), 1)
+        for line in lines:
+            self.assertEqual(
+                json.loads(line),
+                {"GIT_ATTR_NOSYSTEM": "1", "GIT_GRAFT_FILE": "/dev/null"},
+            )
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_pr_accepts_live_base_advanced_without_conflict(self) -> None:
+        """Allow PR creation when the live upstream base advanced without conflicting."""
+
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        stub = Stub(reviewers=[["alice"]])
+        result = self.sweep_command("pr", "--sweep", str(self.sweep), stub=stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pulls_posts = [
+            (method, path, body)
+            for method, path, body in self.sweep_requests
+            if method == "POST" and path.endswith("/pulls")
+        ]
+        self.assertEqual(len(pulls_posts), 1)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_accepts_rename_when_diff_renames_disabled(self) -> None:
+        """Allow push when topic renames a file edited on live base and diff.renames is false."""
+
+        lines = [f"line {number}\n" for number in range(1, 201)]
+        self._prepare_topic_renames([("rename_src.txt", "rename_dst.txt", lines, None)])
+        edited = list(lines)
+        edited[99] = "upstream line 100\n"
+        advance_upstream(self.tmp, self.upstream, "rename_src.txt", "".join(edited))
+        git(self.repo, "config", "diff.renames", "false")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_accepts_inexact_renames_with_low_diff_rename_limit(self) -> None:
+        """Allow push across two inexact renames when local diff.renameLimit is 1."""
+
+        lines_1 = [f"a1 line {number}\n" for number in range(1, 201)]
+        lines_2 = [f"a2 line {number}\n" for number in range(1, 201)]
+        self._prepare_topic_renames(
+            [
+                ("a1.txt", "b1.txt", lines_1, "a1 topic line 1\n"),
+                ("a2.txt", "b2.txt", lines_2, "a2 topic line 1\n"),
+            ]
+        )
+        edited_1 = list(lines_1)
+        edited_1[99] = "a1 upstream line 100\n"
+        edited_2 = list(lines_2)
+        edited_2[99] = "a2 upstream line 100\n"
+        advance_upstream(self.tmp, self.upstream, "a1.txt", "".join(edited_1))
+        advance_upstream(self.tmp, self.upstream, "a2.txt", "".join(edited_2))
+        git(self.repo, "config", "diff.renameLimit", "1")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub push", result.stdout)
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def _prepare_topic_renames(self, renames: list[tuple[str, str, list[str], str | None]]) -> None:
+        """Seed upstream files, rename them on topic, and refresh the sweep report."""
+
+        for src, _, base_lines, _ in renames:
+            advance_upstream(self.tmp, self.upstream, src, "".join(base_lines))
+        git(self.repo, "fetch", "-q", str(self.upstream), "+refs/heads/master:refs/heads/master")
+        git(self.repo, "reset", "--hard", "master")
+        for src, dst, _, topic_first_line in renames:
+            git(self.repo, "mv", src, dst)
+            if topic_first_line is not None:
+                target = self.repo / dst
+                lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+                lines[0] = topic_first_line
+                target.write_text("".join(lines), encoding="utf-8")
+                git(self.repo, "add", dst)
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "rename on topic",
+        )
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
 
     def test_push_refuses_unrecorded_own_next_push_promise(self) -> None:
         """An own next-push promise blocks a push without a promise file."""
@@ -3554,7 +4492,7 @@ MUTANTS = {
         "test_pending_and_none_are_refused",
     ),
     "head not rechecked": (
-        '[ "$(head_sha "$1")" = "$sha" ] && break',
+        'if require_current_base "$1" 0 "$snapshot" "$sha" "$2"; then break; fi',
         "break",
         "test_a_push_during_the_check_is_not_cleared_by_the_old_head",
     ),
@@ -3581,6 +4519,36 @@ MUTANTS = {
 }
 
 
+def top_level_trap_locals(source: str) -> list[str]:
+    """Return names a top-level EXIT trap expands that some function also declares local."""
+
+    lines = source.splitlines()
+    try:
+        case_start = lines.index('case "$cmd" in')
+        case_end = lines.index("esac", case_start + 1)
+    except ValueError as err:
+        raise ValueError("dispatch case not found") from err
+
+    local_names: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("local "):
+            continue
+        for token in shlex.split(stripped.removeprefix("local "), comments=True):
+            name = token.split("=", 1)[0]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                local_names.add(name)
+
+    top_lines = lines[case_start : case_end + 1] + [
+        line for line in lines if line.startswith("trap ")
+    ]
+    trapped: set[str] = set()
+    for line in top_lines:
+        handlers = " ".join(re.findall(r"\btrap\s+'([^']*)'\s+EXIT\b", line))
+        trapped.update(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", handlers))
+    return sorted(trapped & local_names)
+
+
 @contextlib.contextmanager
 def mutant_case(
     source: str,
@@ -3589,12 +4557,100 @@ def mutant_case(
     base: type[unittest.TestCase],
     name: str,
 ) -> Iterator[type[unittest.TestCase]]:
-    """Write one mutated helper and yield its temporary test case class."""
+    """Write one mutated helper into a checkout-shaped temp copy and yield its test case class."""
 
     with tempfile.TemporaryDirectory() as tmp:
-        mutant = Path(tmp) / "ffmpeg-forgejo"
+        checkout = Path(tmp) / "checkout"
+        scripts = checkout / "scripts"
+        scripts.mkdir(parents=True)
+        git(checkout, "init", "-q")
+        shutil.copyfile(HELPER.parent / "base_claims.py", scripts / "base_claims.py")
+        shutil.copyfile(HELPER.parent / "variant_sweep.py", scripts / "variant_sweep.py")
+        mutant = scripts / "ffmpeg-forgejo"
         mutant.write_text(source.replace(old, new), encoding="utf-8")
         yield type(name, (base,), {"helper": mutant})
+
+
+def run_selected(
+    source: str, old: str, new: str, base: type[unittest.TestCase], test_name: str
+) -> unittest.TestResult:
+    """Run one selected test against the helper source with old replaced by new."""
+
+    with mutant_case(source, old, new, base, "Selected") as case:
+        result = unittest.TestResult()
+        case(test_name).run(result)
+        return result
+
+
+def assert_mutant_killed(
+    check: unittest.TestCase,
+    source: str,
+    mutation: tuple[str, str],
+    selected: tuple[type[unittest.TestCase], str],
+    label: str,
+) -> unittest.TestResult:
+    """Require the selected test to pass unmutated, then to fail or error with the mutation."""
+
+    old, new = mutation
+    base, test_name = selected
+    clean = run_selected(source, old, old, base, test_name)
+    check.assertTrue(clean.wasSuccessful(), f"{label}: {test_name} fails without the mutation")
+    mutated = run_selected(source, old, new, base, test_name)
+    check.assertTrue(mutated.failures or mutated.errors, f"{label} survived")
+    return mutated
+
+
+class TopLevelTrapTest(unittest.TestCase):
+    """A top-level EXIT trap must not expand a name a function shadows with local."""
+
+    PLANTED = (
+        "f() {\n"
+        "  local x body=1\n"
+        "  exit 76\n"
+        "}\n"
+        'case "$cmd" in\n'
+        "  a)\n"
+        '    body="$(mktemp)"\n'
+        "    trap 'rm -f \"$body\"' EXIT\n"
+        "    f\n"
+        "    ;;\n"
+        "esac\n"
+    )
+
+    def test_helper_traps_name_no_function_local(self) -> None:
+        """The helper's top-level EXIT traps expand no function-local variable names."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        self.assertEqual(
+            top_level_trap_locals(source),
+            [],
+            "top-level EXIT trap expands a function-local name",
+        )
+        self.assertEqual(source.count('trap \'rm -f "$reply_snapshot" "$reply_payload"\' EXIT'), 1)
+        self.assertEqual(source.count("trap 'rm -f \"$close_payload\"' EXIT"), 1)
+
+    def test_planted_shadowed_trap_is_found(self) -> None:
+        """Shadowed top-level EXIT traps in dispatch branches or at column zero are reported."""
+
+        self.assertEqual(top_level_trap_locals(self.PLANTED), ["body"])
+        braced = self.PLANTED.replace('"$body"', '"${body}"')
+        self.assertEqual(top_level_trap_locals(braced), ["body"])
+        column_zero = "trap 'rm -f \"$body\"' EXIT\n" + self.PLANTED.replace(
+            "    trap 'rm -f \"$body\"' EXIT\n", ""
+        )
+        self.assertEqual(top_level_trap_locals(column_zero), ["body"])
+
+    def test_unshadowed_and_missing_case_boundaries(self) -> None:
+        """Unshadowed traps pass, local flags are skipped, and a missing dispatch case fails."""
+
+        unshadowed = self.PLANTED.replace('"$body"', '"$payload"')
+        self.assertEqual(top_level_trap_locals(unshadowed), [])
+        readonly_local = self.PLANTED.replace("local x body=1", "local -r body")
+        self.assertEqual(top_level_trap_locals(readonly_local), ["body"])
+        with self.assertRaises(ValueError):
+            top_level_trap_locals(self.PLANTED.replace('case "$cmd" in\n', ""))
+        with self.assertRaises(ValueError):
+            top_level_trap_locals(self.PLANTED.replace("esac\n", ""))
 
 
 class MutantTest(unittest.TestCase):
@@ -3607,10 +4663,7 @@ class MutantTest(unittest.TestCase):
         for name, (old, new, test_name) in MUTANTS.items():
             with self.subTest(mutant=name):
                 self.assertEqual(source.count(old), 1, "mutation site missing")
-                with mutant_case(source, old, new, EditBodyTest, "Mutated") as case:
-                    result = unittest.TestResult()
-                    case(test_name).run(result)
-                    self.assertTrue(result.failures or result.errors, f"{name} survived")
+                assert_mutant_killed(self, source, (old, new), (EditBodyTest, test_name), name)
 
 
 class FairyReviewsMutantTest(unittest.TestCase):
@@ -3624,12 +4677,16 @@ class FairyReviewsMutantTest(unittest.TestCase):
             'key=lambda row: datetime.fromisoformat(row["submitted_at"])',
             'key=lambda row: row["submitted_at"]',
         )
-        with mutant_case(source, old, "", FairyReviewsTest, "NaiveFairyCounter") as case:
-            result = unittest.TestResult()
-            case("test_request_review_is_not_submitted").run(result)
-            self.assertEqual(len(result.failures), 1, "naive Fairy counter survived")
-            self.assertEqual(result.errors, [])
-            self.assertIn("AssertionError: '1\\t1\\tREQUEST_REVIEW", result.failures[0][1])
+        result = assert_mutant_killed(
+            self,
+            source,
+            (old, ""),
+            (FairyReviewsTest, "test_request_review_is_not_submitted"),
+            "naive Fairy counter",
+        )
+        self.assertEqual(len(result.failures), 1, "naive Fairy counter survived")
+        self.assertEqual(result.errors, [])
+        self.assertIn("AssertionError: '1\\t1\\tREQUEST_REVIEW", result.failures[0][1])
 
 
 class PullOverlapMutantTest(unittest.TestCase):
@@ -3661,12 +4718,11 @@ class PullOverlapMutantTest(unittest.TestCase):
         )
         for old, new, cases in mutations:
             self.assertEqual(source.count(old), 1, "mutation site missing")
-            with mutant_case(source, old, new, PullRequestOverlapTest, "MutatedOverlap") as case:
-                for name in cases:
-                    with self.subTest(test=name):
-                        result = unittest.TestResult()
-                        case(name).run(result)
-                        self.assertTrue(result.failures or result.errors, f"{name} survived")
+            for name in cases:
+                with self.subTest(test=name):
+                    assert_mutant_killed(
+                        self, source, (old, new), (PullRequestOverlapTest, name), name
+                    )
 
     def test_overlap_verb_mutants_are_caught(self) -> None:
         """Each planted overlap verb defect fails its targeted test case."""
@@ -3716,12 +4772,155 @@ class PullOverlapMutantTest(unittest.TestCase):
         )
         for old, new, cases in mutations:
             self.assertEqual(source.count(old), 1, "mutation site missing")
-            with mutant_case(source, old, new, OverlapVerbTest, "MutatedOverlapVerb") as case:
-                for name in cases:
-                    with self.subTest(test=name):
-                        result = unittest.TestResult()
-                        case(name).run(result)
-                        self.assertTrue(result.failures or result.errors, f"{name} survived")
+            for name in cases:
+                with self.subTest(test=name):
+                    assert_mutant_killed(self, source, (old, new), (OverlapVerbTest, name), name)
+
+
+class MutantCaseTest(unittest.TestCase):
+    """The mutation harness copy is a runnable repository helper."""
+
+    def test_copy_has_siblings_in_a_checkout(self) -> None:
+        """The temp copy sits at scripts/ffmpeg-forgejo of a Git checkout beside both validators."""
+
+        with mutant_case(HELPER.read_text(encoding="utf-8"), "", "", EditBodyTest, "Probe") as case:
+            self.assertEqual(case.helper.name, "ffmpeg-forgejo")
+            self.assertEqual(case.helper.parent.name, "scripts")
+            self.assertTrue((case.helper.parent / "base_claims.py").is_file())
+            self.assertTrue((case.helper.parent / "variant_sweep.py").is_file())
+            self.assertTrue((case.helper.parent.parent / ".git" / "HEAD").is_file())
+
+    def test_broken_copy_is_reported(self) -> None:
+        """A selected test that fails without the mutation fails the kill check by name."""
+
+        class PlantedFailure(unittest.TestCase):
+            helper = HELPER
+
+            def test_planted(self) -> None:
+                """Fail unconditionally."""
+
+                self.fail("planted")
+
+        old, new, _ = MUTANTS["seq loop"]
+        with self.assertRaises(AssertionError) as raised:
+            assert_mutant_killed(
+                self,
+                HELPER.read_text(encoding="utf-8"),
+                (old, new),
+                (PlantedFailure, "test_planted"),
+                "planted",
+            )
+        self.assertIn("test_planted fails without the mutation", str(raised.exception))
+
+
+class CloseMutantTest(unittest.TestCase):
+    """A close verb without the author check lets the foreign pull test fail."""
+
+    def test_dropped_author_check_is_caught(self) -> None:
+        """The foreign pull test passes on the unmutated helper and fails once
+        the author check is gone."""
+
+        old = "if not isinstance(author, str) or author != me:"
+        new = "if False:"
+        source = HELPER.read_text(encoding="utf-8")
+        self.assertEqual(source.count(old), 1, "mutation site missing")
+        for replacement, expect_pass in ((old, True), (new, False)):
+            with mutant_case(source, old, replacement, CloseTest, "MutatedClose") as case:
+                result = unittest.TestResult()
+                case("test_foreign_pull_is_refused_before_any_write").run(result)
+                if expect_pass:
+                    self.assertTrue(
+                        result.wasSuccessful(),
+                        "test_foreign_pull_is_refused_before_any_write fails without the mutation",
+                    )
+                else:
+                    self.assertTrue(
+                        result.failures or result.errors,
+                        "dropped author check survived",
+                    )
+
+
+class ReplyMutantTest(unittest.TestCase):
+    """Reply mutants dropping the anchor copy, range read-back or body snapshot,
+    or shadowing the payload trap, are caught."""
+
+    def test_reply_mutants_are_caught(self) -> None:
+        """Each planted anchor-copy defect fails its targeted reply test case."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        body_fn = source.split("\nreview_reply_body() {\n", 1)[1].split("\n}\n", 1)[0]
+        id_old = 'row.get("id") == int(target_id)]'
+        self.assertEqual(body_fn.count(id_old), 1, "mutation site missing")
+        self.assertEqual(source.count(body_fn), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (body_fn, body_fn.replace(id_old, "True]", 1)),
+            (ReplyTest, "test_reply_copies_the_anchor_of_the_answered_comment"),
+            "target id filter removed",
+        )
+        pos_old = '"old_position": target["original_position"],'
+        self.assertEqual(source.count(pos_old), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (pos_old, '"old_position": 0,'),
+            (ReplyTest, "test_old_side_comment_keeps_its_old_position"),
+            "old_position dropped",
+        )
+        reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
+        self.assertEqual(reply_branch.count("reply_payload"), 5, "mutation site missing")
+        self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (reply_branch, reply_branch.replace("reply_payload", "body")),
+            (ReplyTest, "test_moved_head_exit_removes_the_reply_payload"),
+            "reply payload trap shadowed by a function local",
+        )
+
+    def test_reply_snapshot_and_range_mutants_are_caught(self) -> None:
+        """Each planted snapshot or range defect fails its targeted reply test case."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
+        self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
+        snapshot_mutations = (
+            (
+                'check_comment_duplicate "$1" "$reply_snapshot" "$me"',
+                'check_comment_duplicate "$1" "$4" "$me"',
+            ),
+            (
+                'review_reply_body "$2" "$3" "$reply_snapshot"',
+                'review_reply_body "$2" "$3" "$4"',
+            ),
+            (
+                'require_reply_posted "$2" "$3" "$reply_snapshot" "$me"',
+                'require_reply_posted "$2" "$3" "$4" "$me"',
+            ),
+        )
+        for old, new in snapshot_mutations:
+            self.assertEqual(reply_branch.count(old), 1, "mutation site missing")
+            assert_mutant_killed(
+                self,
+                source,
+                (reply_branch, reply_branch.replace(old, new, 1)),
+                (ReplyTest, "test_body_rewritten_after_listing_posts_the_snapshot"),
+                f"reply body read again after the snapshot: {new}",
+            )
+        posted_fn = source.split("\nrequire_reply_posted() {\n", 1)[1].split("\n}\n", 1)[0]
+        range_old = (
+            '\n        and row.get("extra_lines_count", 0) == target.get("extra_lines_count", 0)'
+        )
+        self.assertEqual(posted_fn.count(range_old), 1, "mutation site missing")
+        self.assertEqual(source.count(posted_fn), 1, "mutation site missing")
+        assert_mutant_killed(
+            self,
+            source,
+            (posted_fn, posted_fn.replace(range_old, "", 1)),
+            (ReplyTest, "test_reply_stored_with_another_range_fails_read_back"),
+            "reply read-back ignores the line range",
+        )
 
 
 if __name__ == "__main__":

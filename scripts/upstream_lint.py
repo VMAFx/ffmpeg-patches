@@ -24,6 +24,99 @@ WRAPPED_AVFRAME_DECODER: lavfi emits wrapped_avframe video packets, so an encode
 alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
+
+The regression-test step fails when a commit whose subject or body, outside its
+Signed-off-by lines, says fix, fixes or fixed or names a defect (bug, regression,
+misalignment, crash, overflow, overread, leak, wrong, incorrect, broken,
+truncation, past the end, out of bounds, also when a line break splits the
+phrase) changes C, header or assembly sources
+under lib*/ or fftools/ and no path
+under a tests directory changes anywhere in base..head. --no-test-reason TEXT
+waives it and prints the reason; when test paths do change, each fix commit must
+be reached by name: a changed test path or one of its added lines must contain,
+as a whole word, the stem of a source file the commit changes (a vf_, af_,
+vsrc_, asrc_, avf_, avsrc_, vsink_, asink_ or f_ prefix also stripped) or a
+function name Git prints in one of its source hunk headers. Quoted,
+tab-terminated and binary test paths count, and the range diff forces the a/
+and b/ prefixes whatever diff.noprefix says. The same waiver covers a fix the
+changed tests do not name. A test that names the code without running the fixed
+path is not detected.
+
+The diagnostic-citation step fails a commit whose message names a compiler
+diagnostic flag (-W...) together with workaround wording (workaround, false
+positive, silence, suppress, spurious) unless the message carries a GCC
+Bugzilla, LLVM bug, llvm-project issue or Compiler Explorer URL, or a line
+starting `Reproducer:`; diagnostics named without a flag and workarounds
+described in other words are not detected. The two-word phrases match across a
+line break, and a flag suffix may contain `#`, uppercase letters, digits, `+`,
+`_`, `=` and `-`.
+
+The claim-scope step fails a commit whose message makes a blanket verification
+claim (passes all tests, all or every test passes, fully or thoroughly tested
+or verified, no regressions or no performance regressions, completely or 100%
+safe, verified or tested), never waivable; a claim directly after not, never,
+cannot, without or an n't contraction, and a safe claim followed by because or
+since, are not claims. It also fails, never waivable, a commit whose message
+claims faster encoding, decoding or transcoding (encoding is faster, faster
+decoding, an encoder speedup, speeds up the encoder, an end-to-end speedup,
+performance or throughput) without an end-to-end figure anywhere in the
+message: an fps or frames/s number, ffmpeg -benchmark, a bench: utime= line,
+speed= followed by a number, or hyperfine. A benchmark of one helper does not
+show that; a claim after not, never, cannot, without, no or an n't contraction
+earlier in its sentence (a decimal point inside a number is not a sentence end)
+is no claim, and speed words other than these, such as time or a bare encoding
+speed, are not detected. It also fails a commit whose message claims several
+sites (both or all followed within two words, line breaks included, by loops,
+callers, call sites, branches, paths, cases, functions, uses, instances,
+places, sites or occurrences; every or each followed the same way by the
+singular or plural of those nouns) while its diff changes exactly one hunk in
+library or fftools sources; renamed files are diffed as renames, a deleted
+source file counts its hunks, and one contiguous hunk counts as one site even
+when it edits two adjacent branches or states an invariant of all callers;
+--claim-reason TEXT waives only that several-sites rule. Signed-off-by lines in
+any letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
+fails with rc 2; claims worded otherwise, and claims that a multi-hunk diff
+still does not support, are not detected.
+
+The doc-terms step fails when base..head adds lines both to library or fftools
+sources and to Texinfo files under doc/, and an added source line shows a
+behaviour whose added description leaves one of its cases out: a test for
+non-RGB input (a comparison against a COLOR_RGB constant, or a negated
+AV_PIX_FMT_FLAG_RGB flag test, in either operand order) while the added
+docs say YUV but never non-RGB, gray or grey, or a colour range comparison
+while the added docs mention range
+or rangein but never unspecified, unknown or untagged. The added source lines
+are read from the head file with comments, string literals and preprocessor
+lines blanked, so a comment that names the behaviour does not count, and
+neither does a macro that tests the flag. --doc-reason TEXT waives it and
+prints the reason. Only these two pairs are checked; any other gap between
+what the code does and what the docs say is not detected.
+
+The doc-wrap step fails an added line of filled prose in a changed doc/*.texi
+file that is shorter than half of both neighbouring prose lines, each at least
+WRAP_MIN_NEIGHBOUR characters, does not end with a sentence mark or @*, and
+leaves room on it for the first word of the next line (a leading inline
+command counts up to its closing brace). Prose is a non-blank line outside
+every block except the filled ones in TEXI_FILLED that starts with text or with
+a TEXI_INLINE command and its brace; block names come from the file's own @end
+lines read outside raw blocks, so lines in an unlisted block are never checked.
+The raw blocks in TEXI_RAW (@verbatim, @ignore, @macro, @rmacro, @linemacro)
+always open, and inside one only a nested opener that texi2any counts there and
+an @end naming the innermost raw block change the open blocks, so an @end line
+shown inside a raw block closes no outer block. --doc-reason TEXT waives it and
+prints the reason.
+
+The test-program step fails when base..head adds a C file directly under a
+lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
+TESTPROGS-$(CONFIG_X) +=) in that library's Makefile at head lists the file's
+stem as a word, which registers a new TESTPROGS program. Continuation
+lines are joined and make comments dropped first, so an OBJS entry or a
+comment that names the stem does not count. Upstream reviewers ask for the
+standard FATE structure instead: an input sample run through ffmpeg or
+ffprobe and compared against a tests/ref reference. --test-program-reason TEXT
+waives it and prints the reason. A program registered in another file or
+through another variable, and a FATE test whose input another custom tool
+builds, are not detected.
 """
 
 from __future__ import annotations
@@ -41,7 +134,7 @@ import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Ensure repository root is on sys.path for test/tool imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -77,14 +170,26 @@ GIT_ENVIRONMENT_NAMES = (
     "GIT_WORK_TREE",
 )
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
-DIFF_COMMON = ("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames")
+DIFF_COMMON = (
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--no-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 MAX_PATHS = 2000
+MAX_CLAIM_COMMITS = 1000
 RUN_TIMEOUT = 1800
 CLEANUP_TIMEOUT = 30
 REAP_TIMEOUT = 10
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
 CONFIG = ".forgejo/pre-commit/config.yaml"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+HUNK_LENGTHS = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+GIT_QUOTED_ESCAPE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
+GIT_ESCAPE_BYTES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 REFERENCE = re.compile(r"^[^:\n]+?[:-]\d+[:-](.*)$")
 FUNCTION = re.compile(r"^(?:[A-Za-z_]\w*[ *]+)+[A-Za-z_]\w*\([^();{}]*\)\s*\{")
@@ -93,6 +198,68 @@ C_NONCODE = re.compile(
     r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
     r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
     re.DOTALL | re.MULTILINE,
+)
+FIX_MESSAGE = re.compile(
+    r"\b(?:fix(?:es|ed)?|bugs?|regressions?|misalign(?:s|ed|ment)?|crash(?:es|ed)?"
+    r"|overflow(?:s|ed)?|overreads?|leak(?:s|ed)?|wrong|incorrect(?:ly)?|broken"
+    r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out(?:\s+|\s*-\s*)of(?:\s+|\s*-\s*)bounds)\b",
+    re.IGNORECASE,
+)
+LAVFI_PREFIX = re.compile(r"^(?:vf|af|vsrc|asrc|avf|avsrc|vsink|asink|f)_")
+FUNCTION_NAME = re.compile(r"([A-Za-z_]\w*)\s*\(")
+WORD = re.compile(r"[A-Za-z0-9_]+")
+SOURCE_SUFFIXES = (".c", ".h", ".asm", ".S")
+DIAGNOSTIC_FLAG = re.compile(r"(?<![\w-])-W[A-Za-z0-9#][A-Za-z0-9#+=_-]*")
+WORKAROUND_WORDING = re.compile(
+    r"\b(work(s|ed)?(?:\s+|-)?around|false(?:\s+|-)positives?"
+    r"|silence[sd]?|suppress(es|ed)?|spurious)\b",
+    re.IGNORECASE,
+)
+DIAGNOSTIC_CITATION = re.compile(
+    r"https?://(gcc\.gnu\.org/bugzilla/|bugs\.llvm\.org/"
+    r"|github\.com/llvm/llvm-project/issues/|godbolt\.org/)\S+"
+    r"|^Reproducer:[ \t]*\S",
+    re.IGNORECASE | re.MULTILINE,
+)
+VERIFICATION_CLAIM = re.compile(
+    r"\b(pass(?:es|ed)?\s+all\s+(?:the\s+)?(?:fate\s+|unit\s+)?tests"
+    r"|(?:all|every)\s+(?:the\s+)?(?:fate\s+|unit\s+)?tests?\s+pass(?:es|ed)?"
+    r"|(?:fully|thoroughly)\s+(?:tested|verified)"
+    r"|no\s+(?:performance\s+)?regressions?(?!\s+test(?:s|ing|ed)?\b)"
+    r"|(?:completely|100%)\s+(?:safe|verified|tested))\b",
+    re.IGNORECASE,
+)
+NEGATED_CLAIM = re.compile(
+    r"(?:\bnot|\bnever|\bcannot|n't|\bwithout)\s+(?:been\s+|be\s+)?$", re.IGNORECASE
+)
+SAFETY_REASON = re.compile(r"\s+(?:because|since)\b", re.IGNORECASE)
+SCOPE_CLAIM = re.compile(
+    r"\b(?:(?:both|all)\s+(?:\w+(?:\s+|-)){0,2}?"
+    r"(?:loops?|callers?|call(?:\s+|-)sites?|branches|paths|cases"
+    r"|functions|uses|instances|places|sites|occurrences)"
+    r"|(?:every|each)\s+(?:\w+(?:\s+|-)){0,2}?"
+    r"(?:branch(?:es)?|(?:loop|caller|call(?:\s+|-)site|path|case"
+    r"|function|use|instance|place|site|occurrence)s?))\b",
+    re.IGNORECASE,
+)
+CODING = r"(?:encod|decod|transcod)\w*"
+SPEED_CLAIM = re.compile(
+    rf"\b(?:{CODING}\s+(?:is\s+|runs\s+|gets\s+|becomes\s+)?"
+    r"(?:\d+(?:\.\d+)?\s*(?:x|%|times)\s+)?(?:faster|quicker)"
+    rf"|(?:faster|quicker)\s+{CODING}"
+    rf"|{CODING}\s+speed-?ups?"
+    rf"|speeds?\s+up\s+(?:the\s+)?{CODING}"
+    rf"|end-to-end\s+(?:{CODING}\s+)?(?:speed(?:-?ups?)?|performance|throughput))\b",
+    re.IGNORECASE,
+)
+SPEED_NEGATION = re.compile(
+    r"(?:\bnot|\bnever|\bcannot|\bwithout|\bno|n't)\b(?:[^.;!?]|(?<=\d)\.(?=\d))*$",
+    re.IGNORECASE,
+)
+END_TO_END_MEASURE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:fps|frames/s)\b|(?<![\w-])-benchmark\b|\bbench:\s*utime="
+    r"|\bspeed=\s*\d|\bhyperfine\b",
+    re.IGNORECASE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an
 # allow-list: heuristic and newly introduced categories require human review.
@@ -129,6 +296,16 @@ class RunResult:
     args: tuple[str, ...]
     returncode: int
     stdout: str
+
+
+@dataclass(frozen=True)
+class Waivers:
+    """Reasons that waive single upstream checks; a blank reason waives nothing."""
+
+    no_test: str = ""
+    claim: str = ""
+    doc: str = ""
+    test_program: str = ""
 
 
 @dataclass
@@ -191,8 +368,6 @@ def _run(argv: list[str], cwd: Path, data: str | None = None, timeout: float = 6
     }
     environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
     with subprocess.Popen(  # nosec B603 - _validate_executable enforces the tool allow-list.
-        # semgrep-reason (expires 2026-11-14): allow-listed argv[0], verified refs, no shell
-        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args  # noqa: E501
         argv,
         cwd=cwd,
         env=environment,
@@ -1100,6 +1275,664 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
     return _fate_summary(report, rc)
 
 
+def is_test_path(name: str) -> bool:
+    """Return whether a repository path has a tests directory component."""
+    return "tests" in PurePosixPath(name).parts
+
+
+def is_source_path(name: str) -> bool:
+    """Return whether a repository path is a non-test library or fftools source."""
+    parts = PurePosixPath(name).parts
+    return (
+        len(parts) > 1
+        and name.endswith(SOURCE_SUFFIXES)
+        and (parts[0].startswith("lib") or parts[0] == "fftools")
+        and not is_test_path(name)
+    )
+
+
+def unquote_git_path(text: str) -> str:
+    """Decode a C-style quoted Git path, leaving an unquoted path unchanged."""
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body = text[1:-1]
+    decoded = bytearray()
+    cursor = 0
+    for match in GIT_QUOTED_ESCAPE.finditer(body):
+        decoded.extend(body[cursor : match.start()].encode("utf-8", "surrogateescape"))
+        code = match[1]
+        decoded.append(int(code, 8) if len(code) == 3 else GIT_ESCAPE_BYTES[code])
+        cursor = match.end()
+    decoded.extend(body[cursor:].encode("utf-8", "surrogateescape"))
+    return decoded.decode("utf-8", "surrogateescape")
+
+
+def _header_path(line: str) -> str:
+    """Return the path a --- a/ or +++ b/ file header names, or an empty string."""
+    for marker, prefix in (("--- ", "a/"), ("+++ ", "b/")):
+        if line.startswith(marker):
+            name = unquote_git_path(line[len(marker) :].removesuffix("\t"))
+            return name[len(prefix) :] if name.startswith(prefix) else ""
+    return ""
+
+
+def _patch_files(patch: str) -> list[tuple[str, list[str], list[str]]]:
+    """Split a unified diff into per-file paths, hunk headers and added lines."""
+    entries: list[tuple[str, list[str], list[str]]] = []
+    in_header = False
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            entries.append(("", [], []))
+            in_header = True
+        elif not entries:
+            continue
+        elif HUNK.match(line):
+            in_header = False
+            entries[-1][1].append(line)
+        elif in_header:
+            path = _header_path(line)
+            if path:
+                _, hunks, added = entries[-1]
+                entries[-1] = (path, hunks, added)
+        elif line.startswith("+"):
+            entries[-1][2].append(line[1:])
+    return entries
+
+
+def _hunk_functions(hunks: list[str]) -> list[str]:
+    """Extract the first function name after the second @@ of each hunk header."""
+    found: list[str] = []
+    for line in hunks:
+        parts = line.split("@@", 2)
+        if len(parts) == 3:
+            match = FUNCTION_NAME.search(parts[2])
+            if match:
+                found.append(match[1])
+    return found
+
+
+def reach_names(paths: list[str], patch: str) -> frozenset[str]:
+    """Collect reachable source file stems and hunk-header function names."""
+    names: set[str] = set()
+    for path in paths:
+        if is_source_path(path):
+            stem = PurePosixPath(path).stem
+            names.update((stem, LAVFI_PREFIX.sub("", stem)))
+    for path, hunks, _ in _patch_files(patch):
+        if is_source_path(path):
+            names.update(_hunk_functions(hunks))
+    return frozenset(names)
+
+
+def test_words(patch: str, paths: list[str] | None = None) -> frozenset[str]:
+    """Collect word tokens from changed test paths and their added lines."""
+    words: set[str] = set()
+    for path in paths or []:
+        if is_test_path(path):
+            words.update(WORD.findall(path))
+    for path, _, added in _patch_files(patch):
+        if is_test_path(path):
+            words.update(WORD.findall(path))
+            for line in added:
+                words.update(WORD.findall(line))
+    return frozenset(words)
+
+
+def fix_word(message: str) -> str | None:
+    """Return the first fix or defect word of a commit message outside Signed-off-by lines."""
+    match = FIX_MESSAGE.search(_without_signoff(message))
+    return match[0] if match else None
+
+
+def _fix_commits(tree: Path, base: str, head: str) -> list[tuple[str, str, frozenset[str]]]:
+    """Collect source fix commits in base..head with their reachable names."""
+    records = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}").split("\0")
+    fixes: list[tuple[str, str, frozenset[str]]] = []
+    for record in filter(None, records):
+        commit, _, message = record.partition("\n")
+        subject = message.partition("\n")[0].rstrip("\r")
+        if not fix_word(message):
+            continue
+        paths = [
+            path
+            for path in _git(
+                tree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit
+            ).split("\0")
+            if path
+        ]
+        if any(is_source_path(path) for path in paths):
+            patch = _git(
+                tree,
+                "diff-tree",
+                "--no-commit-id",
+                "-r",
+                "-p",
+                "-U0",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                commit,
+            )
+            fixes.append((commit, subject, reach_names(paths, patch)))
+    return fixes
+
+
+def _no_test_step(fixes: list[tuple[str, str, frozenset[str]]], reason: str) -> Step:
+    """Report or waive source fix commits when no test path changed in the range."""
+    headed = [f"{commit[:12]}: {subject}" for commit, subject, _ in fixes]
+    if reason:
+        return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
+    suffix = (
+        "fixes C or assembly sources and no test path changed in the range; "
+        "add a FATE or unit test, or pass --no-test-reason"
+    )
+    return Step("regression-test", 1, "\n".join(f"{item}: {suffix}" for item in headed))
+
+
+def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Require changed tests that reach each source fix commit by file or function name."""
+    fixes = _fix_commits(tree, base, head)
+    test_paths = [name for name in _changed_paths(tree, base, head) if is_test_path(name)]
+    summary = f"{len(fixes)} fix commit(s), {len(test_paths)} test path(s) changed"
+    if not fixes:
+        return Step("regression-test", 0, summary)
+    reason = waiver.strip()
+    if not test_paths:
+        return _no_test_step(fixes, reason)
+    range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
+    words = test_words(range_patch, test_paths)
+    unreached = [fix for fix in fixes if not fix[2] & words]
+    if not unreached:
+        return Step("regression-test", 0, summary)
+    if reason:
+        headed = [f"{commit[:12]}: {subject}" for commit, subject, _ in unreached]
+        return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
+    lines = [
+        f"{commit[:12]}: {subject}: test paths changed but none names "
+        f"{', '.join(sorted(names))}; name the fixed file or function in a test, "
+        "or pass --no-test-reason"
+        for commit, subject, names in unreached
+    ]
+    return Step("regression-test", 1, "\n".join(lines))
+
+
+def _without_signoff(message: str) -> str:
+    """Return a commit message with Signed-off-by trailer lines removed, in any letter case."""
+    return "\n".join(
+        line for line in message.splitlines() if not line.lower().startswith("signed-off-by:")
+    )
+
+
+def uncited_diagnostic(message: str) -> str | None:
+    """Return the first uncited compiler diagnostic flag in a workaround message."""
+    text = _without_signoff(message)
+    flag = DIAGNOSTIC_FLAG.search(text)
+    if flag and WORKAROUND_WORDING.search(text) and not DIAGNOSTIC_CITATION.search(text):
+        return flag[0]
+    return None
+
+
+def _diagnostic_citation(tree: Path, base: str, head: str) -> Step:
+    """Require a bug report URL or reproducer for compiler-diagnostic workarounds."""
+    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    findings: list[str] = []
+    count = 0
+    for record in log.split("\0"):
+        if not record:
+            continue
+        count += 1
+        commit, _, message = record.partition("\n")
+        flag = uncited_diagnostic(message)
+        if flag is not None:
+            findings.append(
+                f"{commit[:12]}: names {flag} as a workaround "
+                "without a bug report URL or Reproducer: line"
+            )
+    if findings:
+        return Step("diagnostic-citation", 1, "\n".join(findings))
+    return Step("diagnostic-citation", 0, f"no uncited diagnostic workaround in {count} commits")
+
+
+def unverified_claim(message: str) -> str | None:
+    """Return the first blanket verification claim that is neither negated nor argued."""
+    text = _without_signoff(message)
+    for match in VERIFICATION_CLAIM.finditer(text):
+        if NEGATED_CLAIM.search(text, max(0, match.start() - 24), match.start()):
+            continue
+        if match[0].lower().endswith("safe") and SAFETY_REASON.match(text, match.end()):
+            continue
+        return match[0]
+    return None
+
+
+def scope_claim(message: str) -> str | None:
+    """Return the first multi-site scope claim in a commit message."""
+    match = SCOPE_CLAIM.search(_without_signoff(message))
+    return match[0] if match else None
+
+
+def speed_claim(message: str) -> str | None:
+    """Return the first encode or decode speed claim in a message without an end-to-end figure."""
+    text = _without_signoff(message)
+    if END_TO_END_MEASURE.search(text):
+        return None
+    for match in SPEED_CLAIM.finditer(text):
+        if not SPEED_NEGATION.search(text, max(0, match.start() - 48), match.start()):
+            return match[0]
+    return None
+
+
+def _unverified_findings(commit: str, message: str) -> list[str]:
+    """Return the never-waivable claim findings of one commit message."""
+    findings: list[str] = []
+    blanket = unverified_claim(message)
+    if blanket is not None:
+        findings.append(
+            f'{commit[:12]}: claims "{blanket}"; '
+            "name the test command and platform that ran instead"
+        )
+    speed = speed_claim(message)
+    if speed is not None:
+        findings.append(
+            f'{commit[:12]}: claims "{speed}" without an end-to-end measurement; '
+            "name an ffmpeg -benchmark or fps result, or drop the claim"
+        )
+    return findings
+
+
+def _source_header(line: str, old_source: bool) -> bool:
+    """Return whether a +++ header line opens a library or fftools source file."""
+    if line == "+++ /dev/null":
+        return old_source
+    return is_source_path(_header_path(line))
+
+
+def _hunk_body(line: str, old_left: int, new_left: int) -> tuple[int, int] | None:
+    """Return the hunk line counts left after one body line, or None when the hunk ended."""
+    tag = line[:1]
+    if not (old_left or new_left) or tag not in ("-", "+", " ", "\\"):
+        return None
+    old_used = tag in ("-", " ") and old_left > 0
+    new_used = tag in ("+", " ") and new_left > 0
+    return old_left - int(old_used), new_left - int(new_used)
+
+
+def source_hunks(patch: str) -> int:
+    """Count hunks of library or fftools source files, deletions included,
+    reading headers only outside hunk bodies.
+    """
+    count = 0
+    in_source = old_source = False
+    left = (0, 0)
+    for line in patch.splitlines():
+        body = _hunk_body(line, *left)
+        if body is not None:
+            left = body
+            continue
+        left = (0, 0)
+        lengths = HUNK_LENGTHS.match(line)
+        if line.startswith("diff --git "):
+            in_source = old_source = False
+        elif lengths:
+            count += int(in_source)
+            left = (int(lengths[1] or "1"), int(lengths[2] or "1"))
+        elif line.startswith("--- "):
+            old_source = is_source_path(_header_path(line))
+        elif line.startswith("+++ "):
+            in_source = _source_header(line, old_source)
+    return count
+
+
+def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[list[str], str | None]:
+    """Check one commit's message and rename-aware diff for unverified or
+    single-hunk scope claims.
+    """
+    unverified_findings = _unverified_findings(commit, message)
+    scope_finding = None
+    scoped = scope_claim(message)
+    if scoped is not None:
+        patch = _git(
+            tree,
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "-p",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-M",
+            commit,
+        )
+        if source_hunks(patch) == 1:
+            scope_finding = (
+                f'{commit[:12]}: claims "{scoped}" but changes 1 source hunk; '
+                "show each site or pass --claim-reason"
+            )
+    return unverified_findings, scope_finding
+
+
+def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Reject blanket verification claims and unwaived single-hunk multi-site claims."""
+    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    records = list(filter(None, log.split("\0")))
+    if len(records) > MAX_CLAIM_COMMITS:
+        raise RuntimeError(f"commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(records)}")
+    unverified: list[str] = []
+    scoped: list[str] = []
+    for record in records:
+        commit, _, message = record.partition("\n")
+        rule_a, rule_b = _commit_claim_findings(tree, commit, message)
+        unverified.extend(rule_a)
+        if rule_b is not None:
+            scoped.append(rule_b)
+    if not (unverified or scoped):
+        return Step("claim-scope", 0, f"no unsupported claim in {len(records)} commits")
+    reason = waiver.strip()
+    if scoped and reason:
+        lines = [*unverified, f"waived: {reason}", *scoped]
+        return Step("claim-scope", int(bool(unverified)), "\n".join(lines))
+    return Step("claim-scope", 1, "\n".join([*unverified, *scoped]))
+
+
+@dataclass(frozen=True)
+class DocTerm:
+    """A code behaviour whose added description must name one of its cases."""
+
+    name: str
+    code: re.Pattern[str]
+    wording: re.Pattern[str]
+    required: re.Pattern[str]
+    advice: str
+
+
+DOC_TERMS = (
+    DocTerm(
+        "non-RGB input",
+        re.compile(
+            r"!=\s*\w*COLOR_RGB\b|\b\w*COLOR_RGB\s*!="
+            r"|!\s*\(\s*[\w.>-]+flags\s*&\s*AV_PIX_FMT_FLAG_RGB\s*\)"
+            r"|!\s*\(\s*AV_PIX_FMT_FLAG_RGB\s*&\s*[\w.>-]+flags\s*\)"
+        ),
+        re.compile(r"\bYUV\b", re.IGNORECASE),
+        re.compile(r"\bnon-RGB\b|\bgr[ae]y\b", re.IGNORECASE),
+        "the code takes every non-RGB input, gray included; say non-RGB or name gray",
+    ),
+    DocTerm(
+        "unspecified range",
+        re.compile(
+            r"\b(?:color|pixel)_range\s*[!=]=|[!=]=\s*[\w.>-]*\b(?:color|pixel)_range\b"
+            r"|\bAVCOL_RANGE_\w+\s*[!=]=|[!=]=\s*AVCOL_RANGE_\w+"
+        ),
+        re.compile(r"\brange(?:in)?\b", re.IGNORECASE),
+        re.compile(r"\b(?:unspecified|unknown|untagged)\b", re.IGNORECASE),
+        "the code compares a colour range; say how an unspecified range is treated",
+    ),
+)
+
+
+TEXI_INLINE = frozenset((
+    "abbr", "acronym", "b", "code", "command", "dfn", "dots", "email", "emph", "env",
+    "file", "i", "kbd", "key", "math", "option", "pxref", "r", "ref", "samp", "sc",
+    "strong", "t", "tie", "uref", "url", "var", "verb", "w", "xref",
+))  # fmt: skip
+TEXI_FILLED = frozenset((
+    "enumerate", "ftable", "ifclear", "ifhtml", "ifinfo", "ifnothtml", "ifnotinfo",
+    "ifnottex", "ifset", "iftex", "itemize", "quotation", "table", "vtable",
+))  # fmt: skip
+TEXI_COMMAND = re.compile(r"@([A-Za-z]+)")
+TEXI_END = re.compile(r"@end\s+([A-Za-z]+)\s*$")
+# Raw block commands of texi2any 7.3 (Texinfo/Commands.pm, class 'raw'). Inside one,
+# only a nested opener that its pattern matches and an @end naming the innermost raw
+# block count (ParserNonXS.pm _process_raw_block_contents and
+# _process_macro_block_contents); every other line is literal text.
+TEXI_MACROS = re.compile(r"\s*@((?:line|r)?macro)(?:\s|$)")
+TEXI_RAW = {
+    "ignore": re.compile(r"\s*@(ignore)(?:@|\s|$)"),
+    "linemacro": TEXI_MACROS,
+    "macro": TEXI_MACROS,
+    "rmacro": TEXI_MACROS,
+    "verbatim": re.compile(r"\s*@(verbatim)(?:@|\s|$)"),
+}
+TEXI_RAW_END = re.compile(r"\s*@end\s+([A-Za-z][\w-]*)")
+TEXI_FIRST_WORD = re.compile(r"@[A-Za-z]+\{[^}]*\}\S*|\S+")
+WRAP_MIN_NEIGHBOUR = 50
+SENTENCE_END = re.compile(r"(?:[.:;!?]|@\*)\s*$")
+
+
+def is_doc_path(name: str) -> bool:
+    """Return whether a repository path is a Texinfo file under doc/."""
+    parts = PurePosixPath(name).parts
+    return len(parts) > 1 and parts[0] == "doc" and name.endswith(".texi")
+
+
+def doc_term_findings(code: str, docs: str) -> list[str]:
+    """Return a finding per doc term the added code shows and the added docs omit."""
+    findings: list[str] = []
+    for term in DOC_TERMS:
+        behaviour = term.code.search(code)
+        wording = term.wording.search(docs)
+        if behaviour and wording and not term.required.search(docs):
+            findings.append(
+                f'{term.name}: added code has "{behaviour[0].strip()}" and added docs say '
+                f'"{wording[0]}"; {term.advice}'
+            )
+    return findings
+
+
+def _added_code(tree: Path, head: str, path: str, hunks: list[str]) -> list[str]:
+    """Return the added lines of a head source file with comments and literals blanked."""
+    numbers = _added_lines("\n".join(hunks))
+    if not numbers:
+        return []
+    code = _code_lines(_git(tree, "show", f"{head}:{path}"))
+    return [code[number - 1] for number in sorted(numbers) if number <= len(code)]
+
+
+def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Require added docs to name the cases that the added code covers."""
+    range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
+    code: list[str] = []
+    docs: list[str] = []
+    for path, hunks, added in _patch_files(range_patch):
+        if is_source_path(path):
+            code.extend(_added_code(tree, head, path, hunks))
+        elif is_doc_path(path):
+            docs.extend(added)
+    return _waivable_step(
+        "doc-terms",
+        doc_term_findings("\n".join(code), "\n".join(docs)),
+        waiver,
+        f"no omitted doc term in {len(docs)} added doc line(s)",
+        "name the case in the docs, or pass --doc-reason",
+    )
+
+
+def _waivable_step(name: str, findings: list[str], waiver: str, clean: str, advice: str) -> Step:
+    """Pass without findings, pass and list them under a non-blank waiver, else fail with advice."""
+    if not findings:
+        return Step(name, 0, clean)
+    reason = waiver.strip()
+    if reason:
+        return Step(name, 0, "\n".join([f"waived: {reason}", *findings]))
+    return Step(name, 1, "\n".join([*findings, advice]))
+
+
+def _texi_raw_line(line: str, stack: list[str]) -> None:
+    """Track one line inside the raw block on top of the stack the way texi2any reads it."""
+    nested = TEXI_RAW[stack[-1]].match(line)
+    end = TEXI_RAW_END.match(line)
+    if nested:
+        stack.append(nested[1])
+    elif end and end[1] == stack[-1]:
+        stack.pop()
+
+
+def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
+    """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+    if stack and stack[-1] in TEXI_RAW:
+        _texi_raw_line(line, stack)
+        return False
+    end = TEXI_END.match(line)
+    if end:
+        if end[1] in stack:
+            del stack[len(stack) - 1 - stack[::-1].index(end[1]) :]
+        return False
+    command = TEXI_COMMAND.match(line)
+    if command and command[1] in blocks:
+        stack.append(command[1])
+        return False
+    if command and not (command[1] in TEXI_INLINE and line[command.end() :].startswith("{")):
+        return False
+    return bool(line.strip()) and all(name in TEXI_FILLED for name in stack)
+
+
+def _texi_blocks(lines: list[str]) -> frozenset[str]:
+    """Collect Texinfo block names from TEXI_RAW and @end lines read outside raw blocks."""
+    blocks = set(TEXI_RAW)
+    stack: list[str] = []
+    for line in lines:
+        if stack:
+            _texi_raw_line(line, stack)
+        elif end := TEXI_END.match(line):
+            blocks.add(end[1])
+        elif (command := TEXI_COMMAND.match(line)) and command[1] in TEXI_RAW:
+            stack.append(command[1])
+    return frozenset(blocks)
+
+
+def texi_prose(lines: list[str]) -> list[bool]:
+    """Flag each Texinfo line that is filled prose, outside every block not in TEXI_FILLED.
+
+    Block names come from @end lines read outside raw blocks; a raw block in TEXI_RAW
+    always opens.
+    """
+    blocks = _texi_blocks(lines)
+    stack: list[str] = []
+    return [_texi_prose_line(line, blocks, stack) for line in lines]
+
+
+def _unfilled(before: str, line: str, after: str) -> bool:
+    """Return whether a prose line ends under half its neighbours' width with room for a word."""
+    column = min(len(before), len(after))
+    return (
+        column >= WRAP_MIN_NEIGHBOUR
+        and not SENTENCE_END.search(line)
+        and 2 * len(line) < column
+        and len(line) + 1 + len(TEXI_FIRST_WORD.findall(after)[0]) <= len(before)
+    )
+
+
+def wrap_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
+    """Return a finding per added prose line that breaks a filled paragraph early."""
+    prose = texi_prose(lines)
+    findings: list[str] = []
+    for number in sorted(added):
+        index = number - 1
+        if not (0 < index < len(lines) - 1 and all(prose[index - 1 : index + 2])):
+            continue
+        before, line, after = (lines[at].rstrip() for at in (index - 1, index, index + 1))
+        if _unfilled(before, line, after):
+            findings.append(
+                f'{path}:{number}: "{line.strip()}" ends a filled paragraph line early '
+                f"({len(line)} of {len(before)} columns) and the next word fits on it"
+            )
+    return findings
+
+
+def _doc_files(tree: Path, base: str, head: str) -> list[tuple[str, list[str], set[int]]]:
+    """Return each changed doc/*.texi file with its head lines and added line numbers."""
+    files: list[tuple[str, list[str], set[int]]] = []
+    for path, hunks, _ in _patch_files(_git(tree, *DIFF_COMMON, "-U0", base, head)):
+        added = _added_lines("\n".join(hunks))
+        if is_doc_path(path) and added:
+            files.append((path, _git(tree, "show", f"{head}:{path}").splitlines(), added))
+    return files
+
+
+def _doc_wrap(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Fail added doc prose lines that end early inside a filled paragraph."""
+    files = _doc_files(tree, base, head)
+    return _waivable_step(
+        "doc-wrap",
+        [finding for path, lines, added in files for finding in wrap_findings(path, lines, added)],
+        waiver,
+        f"no early line break in {len(files)} changed doc file(s)",
+        "join each line with the next one, or pass --doc-reason",
+    )
+
+
+def is_test_program_path(name: str) -> bool:
+    """Return whether a repository path is a C file directly under a lib*/tests/ directory."""
+    parts = PurePosixPath(name).parts
+    return (
+        len(parts) == 3
+        and parts[0].startswith("lib")
+        and parts[1] == "tests"
+        and parts[2].endswith(".c")
+    )
+
+
+def testprogs_names(makefile: str) -> frozenset[str]:
+    """Return the words that TESTPROGS assignments of a Makefile list."""
+    names: set[str] = set()
+    for line in _fate_lines(makefile):
+        kind, groups = _fate_kind(line)
+        if kind in ("variable", "registration") and groups[0] == "TESTPROGS":
+            names.update(groups[-1].split())
+    return frozenset(names)
+
+
+def registered_test_programs(new_paths: list[str], makefiles: dict[str, str]) -> list[str]:
+    """Return new lib*/tests C files whose stem their library Makefile lists in TESTPROGS."""
+    programs: list[str] = []
+    for path in new_paths:
+        if not is_test_program_path(path):
+            continue
+        makefile = makefiles.get(f"{PurePosixPath(path).parts[0]}/Makefile", "")
+        if PurePosixPath(path).stem in testprogs_names(makefile):
+            programs.append(path)
+    return programs
+
+
+def _head_makefiles(tree: Path, head: str, paths: list[str]) -> dict[str, str]:
+    """Read the head Makefile of each library that owns one of the paths."""
+    names = sorted({f"{PurePosixPath(path).parts[0]}/Makefile" for path in paths})
+    if not names:
+        return {}
+    listed = _git(tree, "ls-tree", "-z", "--name-only", head, "--", *names)
+    return {name: _git(tree, "show", f"{head}:{name}") for name in filter(None, listed.split("\0"))}
+
+
+def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Ask for a FATE sample and reference test instead of a new lib*/tests program."""
+    changed = [
+        name
+        for name in _changed_paths(tree, base, head, "lib*/tests/*.c")
+        if is_test_program_path(name)
+    ]
+    existing: set[str] = set()
+    if changed:
+        listed = _git(tree, "ls-tree", "-z", "--name-only", base, "--", *changed)
+        existing = set(filter(None, listed.split("\0")))
+    new_paths = [name for name in changed if name not in existing]
+    programs = registered_test_programs(new_paths, _head_makefiles(tree, head, new_paths))
+    if not programs:
+        return Step(
+            "test-program",
+            0,
+            f"no new registered program in {len(new_paths)} new lib*/tests file(s)",
+        )
+    findings = [
+        f"{name}: new TESTPROGS program; upstream asks for a FATE test that runs an input "
+        "sample and compares the output with a tests/ref reference"
+        for name in programs
+    ]
+    advice = "add a FATE sample test with a tests/ref reference, or pass --test-program-reason"
+    return _waivable_step("test-program", findings, waiver, "", advice)
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
     try:
         return action()
@@ -1107,7 +1940,7 @@ def _collect(name: str, action: Callable[[], Step]) -> Step:
         return Step(name, 2, str(error))
 
 
-def _checks(tree: Path, base: str, head: str) -> list[Step]:
+def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
     """Collect every independent check even when another check fails."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-upstream-lint-") as directory:
         scratch = Path(directory)
@@ -1117,22 +1950,66 @@ def _checks(tree: Path, base: str, head: str) -> list[Step]:
             _collect("patcheck", lambda: _patcheck(tree, base, head, scratch)),
             _collect("developer.texi", lambda: _mechanical(tree, base, head)),
             _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
+            _collect(
+                "regression-test", lambda: _regression_test(tree, base, head, waivers.no_test)
+            ),
+            _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
+            _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
+            _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
+            _collect("doc-wrap", lambda: _doc_wrap(tree, base, head, waivers.doc)),
+            _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
         ]
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run all upstream checks, print their statuses, and optionally save a report."""
+def _parser() -> argparse.ArgumentParser:
+    """Build the command line parser with the range options and one waiver per step."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--report", type=Path)
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--no-test-reason",
+        default="",
+        help=(
+            "why the fix commits in the range carry no test, or why the changed tests "
+            "do not name them; waives the regression-test step"
+        ),
+    )
+    parser.add_argument(
+        "--claim-reason",
+        default="",
+        help="why a multi-site claim is backed by one source hunk; "
+        "waives that claim-scope rule only",
+    )
+    parser.add_argument(
+        "--doc-reason",
+        default="",
+        help="why the added docs may leave out a case the doc-terms step names or break a "
+        "line early; waives the doc-terms and doc-wrap steps",
+    )
+    parser.add_argument(
+        "--test-program-reason",
+        default="",
+        help="why a new lib*/tests program cannot be a FATE sample test; waives that step",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run all upstream checks, print their statuses, and optionally save a report."""
+    args = _parser().parse_args(argv)
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
         base, head = _prepare(tree, base, head)
-        steps = _checks(tree, base, head)
+        waivers = Waivers(
+            no_test=args.no_test_reason,
+            claim=args.claim_reason,
+            doc=args.doc_reason,
+            test_program=args.test_program_reason,
+        )
+        steps = _checks(tree, base, head, waivers)
         _remaining(0)
     except (OSError, RuntimeError, ValueError) as error:
         steps = [Step("preflight", 2, str(error))]
