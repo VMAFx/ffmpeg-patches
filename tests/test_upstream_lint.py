@@ -1111,6 +1111,60 @@ class FateDepsTest(unittest.TestCase):
             step.output,
         )
 
+    def test_target_provenance_deletion_mixed_target_path_fails(self) -> None:
+        """Deleting a target override makes its reassigned mixed-root CMD a finding."""
+        command = "$(TARGETS): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        base = "TARGETS = fate-x\nTARGETS = fate-y\n" + command
+        head = "TARGETS = fate-x\n" + command
+        step = self.check_diff(base, head)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_unrelated_deletion_after_target_assignment_passes(self) -> None:
+        """Deleting unrelated text after an assignment leaves its mixed-root CMD untouched."""
+        assignment = "TARGETS = fate-x\n"
+        command = "$(TARGETS): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        for unrelated in ("# unrelated comment\n", "\n", "UNRELATED = value\n"):
+            with self.subTest(unrelated=unrelated):
+                step = self.check_diff(assignment + unrelated + command, assignment + command)
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertNotIn("finding:", step.output)
+                self.assertIn(
+                    "pre-existing (untouched): tests/fate/x.mak:2: fate-x: "
+                    "tests/data/x named with and without $(TARGET_PATH)/",
+                    step.output,
+                )
+
+    def test_target_assignment_rename_mixed_target_path_fails(self) -> None:
+        """Editing a target assignment makes its renamed mixed-root CMD a finding."""
+        command = "$(TARGETS): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        step = self.check_diff("TARGETS = fate-y\n" + command, "TARGETS = fate-x\n" + command)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_shifted_unchanged_mixed_target_path_passes(self) -> None:
+        """Adding an unrelated comment shifts lines without touching the mixed-root CMD."""
+        unchanged = (
+            "TARGETS = fate-x\n"
+            "$(TARGETS): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        )
+        step = self.check_diff(unchanged, "# unrelated comment\n" + unchanged)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertNotIn("finding:", step.output)
+        self.assertIn(
+            "pre-existing (untouched): tests/fate/x.mak:3: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
     def test_continuation_deletion_inside_mixed_target_path_fails(self) -> None:
         """Deleting a middle continuation line inside a mixed-root CMD fails."""
         first = (

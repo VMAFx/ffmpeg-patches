@@ -1160,14 +1160,23 @@ def _fate_mixed_data(command: str) -> list[str]:
 def _fate_paths(
     path: str,
     variants: list[FateEntry],
-    added: set[int],
-    deleted: set[int] | frozenset[int],
+    changes: tuple[set[int], set[int] | frozenset[int]],
     report: FateReport,
+    base: FateFile | None,
 ) -> None:
-    """Report mixed-root tests/data commands touched by added lines or interior deletions."""
+    """Report mixed-root commands changed in lines, target ownership or command text."""
+    added, deleted = changes
     for command in variants:
-        changed = _fate_touched(command, added) or bool(
-            deleted.intersection(range(command.line.first, command.line.last))
+        changed = (
+            _fate_touched(command, added)
+            or bool(deleted.intersection(range(command.line.first, command.line.last)))
+            or (
+                base is not None
+                and not any(
+                    entry.command == command.command
+                    for entry in base.commands.get(command.target.text, [])
+                )
+            )
         )
         label = "finding" if changed else "pre-existing (untouched)"
         for directory in _fate_mixed_data(command.command):
@@ -1186,13 +1195,13 @@ def _fate_check(
     sources: dict[str, str],
     base: FateFile | None = None,
 ) -> FateReport:
-    """Check command paths and video registrations from split added and deletion lines."""
+    """Check paths against base commands and video registrations against changed lines."""
     added, deleted = changes
     touched = added | deleted
     report = FateReport()
     _fate_diagnostics(path, parsed, touched, report)
     for name, variants in parsed.commands.items():
-        _fate_paths(path, variants, added, deleted, report)
+        _fate_paths(path, variants, changes, report, base)
         if "$(" in name:
             continue
         video = [
