@@ -212,7 +212,9 @@ The checks cover:
   so upstream changes are not counted as the series' own
 - a function-length gate (HISS-04): no patch makes a C function longer than
   60 lines without a live exception in that patch's `.toml` sidecar. CI runs
-  it on every pull request. It needs the series applied to an FFmpeg checkout,
+  it on every push to main and every release run; on a non-draft pull request
+  only when `scripts/series.py scope` selects ffmpeg work. Draft or out-of-scope
+  pull requests skip it. It needs the series applied to an FFmpeg checkout,
   so `make verify-all` runs it only when `FFMPEG_TREE` names one and otherwise
   skips it with a notice. Run it before pushing a patch change, with
   `make verify-all FFMPEG_TREE=<applied tree>` or the gate on its own,
