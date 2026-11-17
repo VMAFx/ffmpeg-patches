@@ -1379,13 +1379,13 @@ def _fate_shell_operators(command: str) -> list[tuple[int, str]]:
     """Locate unquoted list and pipe operators outside balanced dollar expansions."""
     operators, depth = [], 0
     for match in FATE_SHELL_TOKEN.finditer(command):
-        token = match[0]
-        if token == "$(" or (depth and token == "("):
+        lexeme = match[0]
+        if lexeme == "$(" or (depth and lexeme == "("):
             depth += 1
-        elif depth and token == ")":
+        elif depth and lexeme == ")":
             depth -= 1
-        elif not depth and token in {"|", "||", "&&", ";", "&"}:
-            operators.append((match.start(), token))
+        elif not depth and lexeme in {"|", "||", "&&", ";", "&"}:
+            operators.append((match.start(), lexeme))
     return operators
 
 
