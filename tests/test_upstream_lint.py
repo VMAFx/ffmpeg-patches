@@ -1414,7 +1414,7 @@ class FixtureTest(unittest.TestCase):
         self.hook_calls = []
         self.c_rules_rc = 0
         self.c_rules_stdout = ""
-        self.c_rules_json: str | None = '{"results": [], "errors": []}'
+        self.c_rules_json: str | None = ""
         self.c_rules_calls: list[tuple[list[str], Path, float]] = []
 
     def git(self, *args: str) -> str:
@@ -1455,7 +1455,7 @@ class FixtureTest(unittest.TestCase):
     def command(
         self, argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60
     ) -> upstream_lint.RunResult:
-        """Intercept pre-commit and semgrep_scan; execute the real bounded runner otherwise."""
+        """Stub hooks and scans with complete default path coverage; bound other commands."""
         if Path(argv[0]).name == upstream_lint.PRE_COMMIT:
             self.hook_calls.append((argv, Path(argv[3]).read_text(encoding="utf-8")))
             self.hook_effect(Path(cwd))
@@ -1465,7 +1465,9 @@ class FixtureTest(unittest.TestCase):
             if self.c_rules_json is not None:
                 json_arg = next(item for item in argv if item.startswith("--json-output="))
                 Path(json_arg.removeprefix("--json-output=")).write_text(
-                    self.c_rules_json, encoding="utf-8"
+                    self.c_rules_json
+                    or json.dumps({"paths": {"scanned": argv[5:]}, "results": [], "errors": []}),
+                    encoding="utf-8",
                 )
             return upstream_lint.RunResult(tuple(argv), self.c_rules_rc, self.c_rules_stdout)
         return self.real_run(argv, cwd, data, timeout)
@@ -1515,6 +1517,7 @@ class PipelineTest(FixtureTest):
         self.c_rules_rc = 1
         self.c_rules_json = json.dumps(
             {
+                "paths": {"scanned": ["libavfilter/vf_x.c"]},
                 "results": [
                     {
                         "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -1546,6 +1549,7 @@ class PipelineTest(FixtureTest):
         self.c_rules_rc = 1
         self.c_rules_json = json.dumps(
             {
+                "paths": {"scanned": ["libavfilter/vf_x.c"]},
                 "results": [
                     {
                         "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -1570,6 +1574,7 @@ class PipelineTest(FixtureTest):
         self.c_rules_rc = 1
         self.c_rules_json = json.dumps(
             {
+                "paths": {"scanned": ["libavformat/rtsp_new.c"]},
                 "results": [
                     {
                         "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -1586,7 +1591,7 @@ class PipelineTest(FixtureTest):
         self.commit("avformat/rtsp: rename mux helper")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
-        self.assertEqual(self.c_rules_calls[0][0][4:], ["libavformat/rtsp_new.c"])
+        self.assertEqual(self.c_rules_calls[0][0][5:], ["libavformat/rtsp_new.c"])
         self.assertIn("pre-existing (untouched): libavformat/rtsp_new.c:8:", output)
 
         self.git("reset", "--hard", self.base)
@@ -1601,7 +1606,7 @@ class PipelineTest(FixtureTest):
         self.commit("avformat/rtsp: rename and adjust return")
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
-        self.assertEqual(self.c_rules_calls[0][0][4:], ["libavformat/rtsp_new.c"])
+        self.assertEqual(self.c_rules_calls[0][0][5:], ["libavformat/rtsp_new.c"])
         self.assertIn("step: c-rules rc: 1", output)
         self.assertIn("finding: libavformat/rtsp_new.c:8:", output)
 
@@ -1610,6 +1615,7 @@ class PipelineTest(FixtureTest):
         self.c_rules_rc = 1
         self.c_rules_json = json.dumps(
             {
+                "paths": {"scanned": ["libavformat/rtsp.c"]},
                 "results": [
                     {
                         "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -2779,7 +2785,9 @@ class CRulesTest(unittest.TestCase):
         self.patches = {"libavformat/rtspenc.c": "@@ -10,0 +11,2 @@\n+a\n+b\n"}
         self.stub_rc = 0
         self.stub_stdout = ""
-        self.stub_json: str | None = '{"results": [], "errors": []}'
+        self.stub_json: str | None = json.dumps(
+            {"paths": {"scanned": ["libavformat/rtspenc.c"]}, "results": [], "errors": []}
+        )
         self.calls: list[tuple[list[str], Path, float]] = []
 
     def fake_git(self, tree: Path, *args: str) -> str:
@@ -2818,6 +2826,90 @@ class CRulesTest(unittest.TestCase):
                 lambda: upstream_lint._c_rules(self.tree, "base", "head", waiver),
             )
 
+    def inter_hunk_fixture(self) -> FixtureTest:
+        """Create real Git hunks around an unchanged defect with context fusion enabled."""
+        fixture = FixtureTest()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        fixture.git("config", "diff.interHunkContext", "2")
+        source = (
+            "int ff_value(void)\n{\n    ff_first();\n    ff_second();\n"
+            "    ff_third();\n    ff_fourth();\n    ff_before(1);\n"
+            "\tff_old();\n    ff_between();\n    return 1;\n}\n"
+        )
+        fixture.write("libavfilter/vf_x.c", source)
+        fixture.commit("avfilter/vf_x: add inherited defect")
+        fixture.base = fixture.git("rev-parse", "HEAD").strip()
+        fixture.write(
+            "libavfilter/vf_x.c",
+            source.replace("ff_before(1)", "ff_before(2)").replace("return 1", "return 2"),
+        )
+        fixture.commit()
+        return fixture
+
+    def test_inter_hunk_context_keeps_c_rule_match_untouched(self) -> None:
+        """Configured context fusion cannot turn an unchanged Semgrep match into a finding."""
+        fixture = self.inter_hunk_fixture()
+        fixture.c_rules_rc = 1
+        fixture.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavfilter/vf_x.c"]},
+                "results": [
+                    {
+                        "check_id": "inherited-defect",
+                        "path": "libavfilter/vf_x.c",
+                        "start": {"line": 8},
+                        "end": {"line": 8},
+                        "extra": {"message": "inherited match"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fixture.command):
+            step = upstream_lint._c_rules(fixture.root, fixture.base, "HEAD", "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("pre-existing (untouched): libavfilter/vf_x.c:8:", step.output)
+
+    def test_inter_hunk_context_keeps_line_rule_defect_untouched(self) -> None:
+        """Configured context fusion cannot mark an unchanged TAB line as added."""
+        fixture = self.inter_hunk_fixture()
+        step = upstream_lint._mechanical(fixture.root, fixture.base, "HEAD")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("pre-existing (untouched): libavfilter/vf_x.c:8: TAB character", step.output)
+
+    def test_requested_path_missing_from_scanned_is_unwaivable(self) -> None:
+        """Every requested path must be scanned even when a waiver is supplied."""
+        self.diff_names += "libavformat/rtsp.h\0"
+        self.patches["libavformat/rtsp.h"] = "@@ -1,0 +2 @@\n+x\n"
+        self.stub_json = json.dumps(
+            {"paths": {"scanned": ["libavformat/rtspenc.c"]}, "results": [], "errors": []}
+        )
+        for waiver in ("", "caller closes network"):
+            with self.subTest(waiver=waiver):
+                step = self.run_c_rules(waiver)
+                self.assertEqual(step.rc, 2, step.output)
+                self.assertNotIn("waived:", step.output)
+
+    def test_invalid_scanned_paths_is_unwaivable(self) -> None:
+        """Missing or malformed scan coverage gives rc 2 with or without a waiver."""
+        for coverage in (
+            {},
+            {"paths": None},
+            {"paths": []},
+            {"paths": {}},
+            {"paths": {"scanned": None}},
+            {"paths": {"scanned": "libavformat/rtspenc.c"}},
+            {"paths": {"scanned": {"libavformat/rtspenc.c": True}}},
+            {"paths": {"scanned": ["libavformat/rtspenc.c", 7]}},
+        ):
+            self.stub_json = json.dumps({"results": [], "errors": [], **coverage})
+            for waiver in ("", "caller closes network"):
+                with self.subTest(coverage=coverage, waiver=waiver):
+                    step = self.run_c_rules(waiver)
+                    self.assertEqual(step.rc, 2, step.output)
+                    self.assertNotIn("waived:", step.output)
+
     def test_no_changed_source_makes_no_run_call(self) -> None:
         """No changed library or fftools C or header source returns rc 0 without _run."""
         for names in ("", "doc/x.texi\0libavcodec/tests/x.c\0libavcodec/x86/x.asm\0"):
@@ -2829,9 +2921,16 @@ class CRulesTest(unittest.TestCase):
                 self.assertEqual(self.calls, [])
 
     def test_argv_working_directory_and_timeout(self) -> None:
-        """Changed sources run semgrep_scan.sh from the FFmpeg tree with C_RULES_TIMEOUT."""
+        """Scan argv disables the target size limit and preserves tree and timeout settings."""
         self.diff_names = "libavformat/rtspenc.c\0libavformat/rtsp.h\0"
         self.patches["libavformat/rtsp.h"] = "@@ -1,0 +2,1 @@\n+x\n"
+        self.stub_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtspenc.c", "libavformat/rtsp.h"]},
+                "results": [],
+                "errors": [],
+            }
+        )
         step = self.run_c_rules()
         self.assertEqual(step.rc, 0, step.output)
         self.assertEqual(len(self.calls), 1)
@@ -2849,7 +2948,8 @@ class CRulesTest(unittest.TestCase):
         )
         self.assertTrue(argv[3].startswith("--json-output="))
         self.assertFalse(Path(argv[3].removeprefix("--json-output=")).parent.exists())
-        self.assertEqual(argv[4:], ["libavformat/rtspenc.c", "libavformat/rtsp.h"])
+        self.assertEqual(argv[4], "--max-target-bytes=0")
+        self.assertEqual(argv[5:], ["libavformat/rtspenc.c", "libavformat/rtsp.h"])
 
     def test_exit_zero_empty_results_passes(self) -> None:
         """Exit status 0 with empty results and errors lists returns step rc 0."""
@@ -2862,6 +2962,7 @@ class CRulesTest(unittest.TestCase):
         self.stub_rc = 1
         self.stub_json = json.dumps(
             {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
                 "results": [
                     {
                         "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -2890,6 +2991,7 @@ class CRulesTest(unittest.TestCase):
         self.stub_rc = 1
         self.stub_json = json.dumps(
             {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
                 "results": [
                     {
                         "check_id": f"home.user.checkout.{rule}",
@@ -2914,6 +3016,7 @@ class CRulesTest(unittest.TestCase):
         self.stub_rc = 1
         self.stub_json = json.dumps(
             {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
                 "results": [
                     {
                         "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -2941,6 +3044,7 @@ class CRulesTest(unittest.TestCase):
             with self.subTest(error_type=error_type):
                 self.stub_json = json.dumps(
                     {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
                         "results": [],
                         "errors": [{"type": error_type, "path": "libavformat/rtsp.c"}],
                     }
@@ -2953,7 +3057,11 @@ class CRulesTest(unittest.TestCase):
         """Any error type other than PartialParsing gives step rc 2 with status and output."""
         self.stub_stdout = "rule parse error\n"
         self.stub_json = json.dumps(
-            {"results": [], "errors": [{"type": "Syntax error", "path": "libavformat/rtsp.c"}]}
+            {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                "results": [],
+                "errors": [{"type": "Syntax error", "path": "libavformat/rtsp.c"}],
+            }
         )
         step = self.run_c_rules()
         self.assertEqual(step.rc, 2, step.output)
@@ -2998,7 +3106,14 @@ class CRulesTest(unittest.TestCase):
     def test_unparseable_json_gives_rc_two(self) -> None:
         """Unparseable or structurally invalid JSON payloads give step rc 2."""
         self.stub_stdout = "scan finished\n"
-        for payload in ("{not-json", "[]", '{"results": []}', '{"results": [{}], "errors": []}'):
+        for payload in (
+            "{not-json",
+            "[]",
+            json.dumps({"paths": {"scanned": ["libavformat/rtspenc.c"]}, "results": []}),
+            json.dumps(
+                {"paths": {"scanned": ["libavformat/rtspenc.c"]}, "results": [{}], "errors": []}
+            ),
+        ):
             with self.subTest(payload=payload):
                 self.stub_json = payload
                 step = self.run_c_rules()
@@ -3010,6 +3125,7 @@ class CRulesTest(unittest.TestCase):
         self.stub_rc = 1
         self.stub_json = json.dumps(
             {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
                 "results": [
                     {
                         "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -3046,6 +3162,7 @@ class CRulesTest(unittest.TestCase):
             with self.subTest(check_id=check_id):
                 self.stub_json = json.dumps(
                     {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
                         "results": [
                             {
                                 "check_id": check_id,
@@ -3076,6 +3193,7 @@ class CRulesTest(unittest.TestCase):
             with self.subTest(result_path=result_path):
                 self.stub_json = json.dumps(
                     {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
                         "results": [
                             {
                                 "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -3101,6 +3219,7 @@ class CRulesTest(unittest.TestCase):
             with self.subTest(start=start_line, end=end_line):
                 self.stub_json = json.dumps(
                     {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
                         "results": [
                             {
                                 "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
@@ -3126,7 +3245,13 @@ class CRulesTest(unittest.TestCase):
             "PartialParsing",
         ):
             with self.subTest(error=error_entry):
-                self.stub_json = json.dumps({"results": [], "errors": [error_entry]})
+                self.stub_json = json.dumps(
+                    {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                        "results": [],
+                        "errors": [error_entry],
+                    }
+                )
                 step = self.run_c_rules()
                 self.assertEqual(step.rc, 2, step.output)
 

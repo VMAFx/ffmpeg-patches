@@ -100,8 +100,9 @@ this repository over added, modified or renamed library and fftools C and
 header sources in base..head, using the FFmpeg checkout at head as the working
 directory, and skips the run when none changed. Results are read through an
 allow-list: exit status 0 or 1, no semgrep_scan: warning line, and a JSON
-output object whose results name scanned paths with non-empty rule ids and
-whose errors list holds only PartialParsing errors. Matches whose line range
+output object whose paths.scanned list contains every requested path, whose
+results name requested paths with non-empty rule ids, and whose errors list
+holds only PartialParsing errors. Matches whose line range
 meets a file's rename-aware added lines or deletion positions fail with rc 1,
 untouched matches and PartialParsing errors are reported without failing,
 and any other status, warning, error type or JSON failure gives rc 2.
@@ -162,6 +163,7 @@ GIT_ENVIRONMENT_NAMES = (
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 DIFF_COMMON = (
     "diff",
+    "--inter-hunk-context=0",
     "--no-ext-diff",
     "--no-textconv",
     "--no-color",
@@ -171,6 +173,7 @@ DIFF_COMMON = (
 )
 C_RULES_DIFF = (
     "diff",
+    "--inter-hunk-context=0",
     "--no-ext-diff",
     "--no-textconv",
     "--no-color",
@@ -1824,11 +1827,13 @@ def _partial_parsing_path(error: object) -> str | None:
 
 
 def _read_semgrep_lists(
-    raw_results: list[object],
-    raw_errors: list[object],
+    raw_results: object,
+    raw_errors: object,
     scanned_paths: frozenset[str] | None = None,
 ) -> tuple[list[SemgrepMatch], list[str]] | None:
     """Validate every result and PartialParsing error in Semgrep's JSON lists."""
+    if not (isinstance(raw_results, list) and isinstance(raw_errors, list)):
+        return None
     matches: list[SemgrepMatch] = []
     for raw in raw_results:
         match = _parse_semgrep_match(raw)
@@ -1847,16 +1852,20 @@ def _read_semgrep_lists(
 def _read_semgrep_json(
     json_path: Path, scanned_paths: frozenset[str] | None = None
 ) -> tuple[list[SemgrepMatch], list[str]] | None:
-    """Read and allow-list a Semgrep JSON output file."""
+    """Allow-list Semgrep JSON and require paths.scanned to cover every requested path."""
     try:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
-    raw_results, raw_errors = payload.get("results"), payload.get("errors")
-    if not (isinstance(raw_results, list) and isinstance(raw_errors, list)):
+    paths = payload.get("paths")
+    scanned = paths.get("scanned") if isinstance(paths, dict) else None
+    if not isinstance(scanned, list) or not all(isinstance(path, str) for path in scanned):
         return None
+    if scanned_paths is not None and not scanned_paths.issubset(scanned):
+        return None
+    raw_results, raw_errors = payload.get("results"), payload.get("errors")
     return _read_semgrep_lists(raw_results, raw_errors, scanned_paths)
 
 
@@ -1938,7 +1947,7 @@ def _c_rules_report(
 
 
 def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
-    """Scan changed library and fftools C and header sources with .semgrep-ffmpeg.yml."""
+    """Scan changed C/header sources and fail closed unless every requested path was scanned."""
     touched_by_path = _c_rules_touched(tree, base, head)
     if not touched_by_path:
         return Step("c-rules", 0, "no added or modified C or header source in the range")
@@ -1950,6 +1959,7 @@ def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
             str(SEMGREP_SCAN),
             f"--rules={SEMGREP_FFMPEG_RULES}",
             f"--json-output={json_path}",
+            "--max-target-bytes=0",
             *paths,
         ]
         result = _run(argv, tree, timeout=C_RULES_TIMEOUT)
