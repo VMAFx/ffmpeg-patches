@@ -1800,12 +1800,42 @@ class DocReferenceTest(unittest.TestCase):
                     self.assertEqual(self.findings("\n".join(lines)), [])
 
     def test_reference_unclosed_within_bound_is_found(self) -> None:
-        """Missing braces or a close beyond three following lines keep references local."""
-        for suffix in ("", ",,\nTitle,\nothermanual", ",,\nTitle,\n\n\nothermanual}"):
+        """Unclosed references without a known external manual keep local findings."""
+        for suffix in ("", ",,\nTitle,\n", ",,\nTitle,\n\n\nothermanual}"):
             with self.subTest(suffix=suffix):
                 lines = REFERENCE_TEXT.splitlines()[:11]
                 lines[10] = f"the @ref{{libaom-av1-qpfile{suffix}"
                 self.assertEqual(self.findings("\n".join(lines)), self.findings(REFERENCE_TEXT))
+
+    def test_reference_unclosed_external_manual_with_comma_passes(self) -> None:
+        """An external fourth argument before a comma survives a close beyond lookahead."""
+        lines = REFERENCE_TEXT.splitlines()[:11]
+        lines[10] = "the @ref{libaom-av1-qpfile,,,othermanual,"
+        lines.extend(["Printed", "Manual", "Title", "} for details."])
+        self.assertEqual(self.findings("\n".join(lines)), [])
+
+    def test_reference_unclosed_external_manual_last_argument_passes(self) -> None:
+        """An external fourth argument needs no trailing comma before lookahead ends."""
+        lines = REFERENCE_TEXT.splitlines()[:11]
+        lines[10] = "the @ref{libaom-av1-qpfile,,,othermanual"
+        lines.extend(["", "", "", "} for details."])
+        self.assertEqual(self.findings("\n".join(lines)), [])
+
+    def test_reference_unclosed_empty_manual_is_found(self) -> None:
+        """An empty or whitespace-only fourth argument keeps an unclosed reference local."""
+        for manual in ("", " "):
+            with self.subTest(manual=manual):
+                lines = REFERENCE_TEXT.splitlines()[:11]
+                lines[10] = f"the @ref{{libaom-av1-qpfile,,,{manual},"
+                lines.extend(["Printed", "Manual", "Title", "} for details."])
+                self.assertEqual(self.findings("\n".join(lines)), self.findings(REFERENCE_TEXT))
+
+    def test_reference_unclosed_first_argument_is_found(self) -> None:
+        """A lone first argument keeps local lookup when its close exceeds lookahead."""
+        lines = REFERENCE_TEXT.splitlines()[:11]
+        lines[10] = "the @ref{libaom-av1-qpfile"
+        lines.extend(["continued", "across", "lines", "} for details."])
+        self.assertEqual(self.findings("\n".join(lines)), self.findings(REFERENCE_TEXT))
 
     def test_item_without_other_library_passes(self) -> None:
         """An anchored item that names no library of its section passes."""

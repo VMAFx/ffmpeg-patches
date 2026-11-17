@@ -1949,8 +1949,8 @@ def _anchor_item(lines: list[str], start: int) -> list[str]:
     return _anchor_body(lines[index : index + ANCHOR_ITEM_LIMIT])
 
 
-def _texi_ref_arguments(text: str) -> list[str]:
-    """Split reference arguments at top-level commas through the matching closing brace."""
+def _texi_ref_arguments(text: str) -> tuple[list[str], bool]:
+    """Split complete or started reference arguments and report a matching closing brace."""
     parts: list[str] = []
     start, depth, escaped = 0, 0, False
     for index, char in enumerate(text):
@@ -1964,11 +1964,11 @@ def _texi_ref_arguments(text: str) -> list[str]:
         elif char == "}" and depth:
             depth -= 1
         elif char == "}":
-            return [*parts, text[start:index].strip()]
+            return [*parts, text[start:index].strip()], True
         elif char == "," and depth == 0:
             parts.append(text[start:index].strip())
             start = index + 1
-    return []
+    return [*parts, text[start:].strip()], False
 
 
 def _reference_context(lines: list[str], index: int) -> str:
@@ -1988,19 +1988,19 @@ def _reference_context(lines: list[str], index: int) -> str:
 def _reference_finding(
     path: str, lines: list[str], sections: list[str], anchors: dict[str, int], number: int
 ) -> list[str]:
-    """Return a finding per reference on one added line that defers to another section's item."""
+    """Find deferred local references, skipping known external manuals even when unclosed."""
     index = number - 1
     before = _reference_context(lines, index)
     findings: list[str] = []
     for ref in TEXI_REF.finditer(lines[index]):
         text = lines[index][ref.end() :]
-        args = _texi_ref_arguments(text)
-        if not args:
-            args = _texi_ref_arguments(" ".join([text, *lines[index + 1 : index + 4]]))
-        if not args:
-            args = [re.split(r"[,}]", text, maxsplit=1)[0].strip()]
+        args, closed = _texi_ref_arguments(text)
+        if not closed:
+            args, closed = _texi_ref_arguments(" ".join([text, *lines[index + 1 : index + 4]]))
         if len(args) > 3 and args[3]:
             continue
+        if not closed:
+            args[0] = re.split(r"[,}]", text, maxsplit=1)[0].strip()
         target = anchors.get(args[0])
         if target is None or not sections[index]:
             continue
