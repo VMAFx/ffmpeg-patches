@@ -1160,6 +1160,60 @@ class ClaimScopeTest(unittest.TestCase):
         message = "avcodec/x: cache maps\n\nThe old path did not cache. Encoding is faster.\n"
         self.assertEqual(upstream_lint.speed_claim(message), "Encoding is faster")
 
+    def test_speed_claim_decimal_in_negation_passes(self) -> None:
+        """Decimal points inside numbers do not end the negation window of speed claims."""
+        for message in (
+            "No 1.5x encoding speedup is claimed.",
+            "Not 2.0x faster encoding here.",
+            "It does not claim 3.25% encoding speedup.",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.speed_claim(message))
+
+    def test_speed_claim_sentence_end_after_negation_detected(self) -> None:
+        """Non-decimal full stops and other sentence marks still end the negation window."""
+        cases = (
+            ("No change. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2.3. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2.Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not 2.Faster encoding now.", "Faster encoding"),
+            ("No change in 3._x. Encoding speedup of 2x.", "Encoding speedup"),
+            ("Not in 1.2.This gives faster encoding.", "faster encoding"),
+            ("Not 2.This gives faster encoding.", "faster encoding"),
+            ("No change in 3._x, encoding speedup of 2x.", "encoding speedup"),
+            ("Not in x_.2x faster encoding.", "faster encoding"),
+            ("Encoding speedup of 1.5x.", "Encoding speedup"),
+            ("No .5x encoding speedup is claimed.", "encoding speedup"),
+            ("Not here.2x faster encoding.", "faster encoding"),
+            ("No 1..5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1;5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1!5x encoding speedup is claimed.", "encoding speedup"),
+            ("No 1?5x encoding speedup is claimed.", "encoding speedup"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.speed_claim(message), expected)
+
+    def test_speed_claim_decimal_negation_boundaries(self) -> None:
+        """Window-boundary decimals and multi-dot numbers do not end speed negation."""
+        dot_at_start = "Version 1.5 of this encoder patch does not claim any new encoding speedup."
+        window_start = dot_at_start.index("encoding speedup") - 48
+        self.assertEqual(dot_at_start[window_start - 1 : window_start + 2], "1.5")
+        self.assertIsNone(upstream_lint.speed_claim(dot_at_start))
+        digit_at_start = (
+            "Version 1.5 of this encoder patch does not claim any real encoding speedup."
+        )
+        after_dot = digit_at_start.index("encoding speedup") - 48
+        self.assertEqual(digit_at_start[after_dot - 2 : after_dot + 1], "1.5")
+        self.assertIsNone(upstream_lint.speed_claim(digit_at_start))
+        for message in (
+            "No 1.2.3 encoding speedup is claimed.",
+            "Not in 1.2.3 is faster encoding claimed.",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.speed_claim(message))
+
     def test_speed_claim_finding_names_the_fix(self) -> None:
         """The claim-scope finding for a speed claim asks for an end-to-end figure."""
         findings = upstream_lint._unverified_findings(
@@ -1449,6 +1503,130 @@ class DocWrapTest(unittest.TestCase):
         ]
         expected = [False, False, True, False, False, False, False, False, True, False]
         self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
+    def test_raw_block_end_of_other_block_is_text(self) -> None:
+        """An @end line of an outer block inside a raw block is literal text."""
+        for opener in ("verbatim", "ignore", "macro foo", "rmacro foo", "linemacro foo"):
+            name = opener.split()[0]
+            lines = [
+                "@table @option",
+                "@item a",
+                "Text one.",
+                f"@{opener}",
+                "@end table",
+                "literal",
+                f"@end {name}",
+                "Text after.",
+                "@end table",
+            ]
+            expected = [False, False, True, False, False, False, False, True, False]
+            with self.subTest(opener=opener):
+                self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
+    def test_raw_block_nesting(self) -> None:
+        """A raw block nests only the openers texi2any counts inside it."""
+        cases = {
+            "same name": ["@verbatim", "@verbatim", "@end verbatim", "a b", "@end verbatim"],
+            "indented opener": ["@ignore", "  @ignore", "@end ignore", "a b", "@end ignore"],
+            "longer name": ["@verbatim", "@verbatimx", "a b", "@end verbatim"],
+            "other raw block": ["@ignore", "@verbatim", "a b", "@end ignore"],
+        }
+        for outer, inner in (("macro", "linemacro"), ("linemacro", "rmacro"), ("rmacro", "macro")):
+            body = [f"@{inner} g", f"@end {outer}", "a b", f"@end {inner}"]
+            cases[f"{inner} in {outer}"] = [f"@{outer} f", *body, f"@end {outer}"]
+        for name, lines in cases.items():
+            with self.subTest(case=name):
+                flags = upstream_lint.texi_prose([*lines, "plain"])
+                self.assertEqual(flags, [False] * len(lines) + [True])
+
+    def test_raw_block_end_line_boundaries(self) -> None:
+        """A raw block ends on @end and its name after leading blanks, before trailing text."""
+        cases = {
+            "leading blanks": (["@verbatim", "x y", "  @end verbatim", "plain"], 3),
+            "trailing text": (["@verbatim", "x y", "@end verbatim @c note", "plain"], 3),
+            "longer name": (["@verbatim", "@end verbatim-x", "x y", "@end verbatim", "p"], 4),
+        }
+        for name, (lines, first_prose) in cases.items():
+            with self.subTest(case=name):
+                expected = [index >= first_prose for index in range(len(lines))]
+                self.assertEqual(upstream_lint.texi_prose(lines), expected)
+
+    CODE_PARAGRAPH = (
+        "@code{x} starts a prose line that is long enough to count",
+        "Each neighbour in this filled paragraph is sixty-six columns wide,",
+        "short",
+        "and the following prose line is also sixty-six columns wide here.",
+    )
+
+    def test_raw_block_end_adds_no_block_name(self) -> None:
+        """An @end inside a raw block adds no block name; one outside still does."""
+        for opener in ("verbatim", "ignore", "macro foo", "rmacro foo", "linemacro foo"):
+            name = opener.split()[0]
+            lines = [f"@{opener}", "@end code", f"@end {name}", "", *self.CODE_PARAGRAPH]
+            with self.subTest(opener=opener):
+                self.assertEqual(upstream_lint.texi_prose(lines), [False] * 4 + [True] * 4)
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {7})
+                self.assertEqual(len(findings), 1)
+                self.assertIn('"short" ends a filled paragraph line early', findings[0])
+        outside = ["@end code", "", *self.CODE_PARAGRAPH]
+        self.assertEqual(upstream_lint.texi_prose(outside), [False] * 6)
+        self.assertEqual(upstream_lint.wrap_findings("doc/x.texi", outside, {5}), [])
+
+    def test_nested_and_mixed_raw_block_end_names(self) -> None:
+        """Nested raw blocks hide inner @end names unless an outside @end names them."""
+        nested = {
+            "verbatim": [
+                "@verbatim",
+                "@verbatim",
+                "@end code",
+                "@end verbatim",
+                "@end code",
+                "@end verbatim",
+            ],
+            "ignore": [
+                "@ignore",
+                "  @ignore",
+                "@end code",
+                "@end ignore",
+                "@end code",
+                "@end ignore",
+            ],
+            "macro": [
+                "@macro f",
+                "@rmacro g",
+                "@end macro",
+                "@end code",
+                "@end rmacro",
+                "@end code",
+                "@end macro",
+            ],
+        }
+        for case, raw in nested.items():
+            lines = [*raw, "", *self.CODE_PARAGRAPH]
+            short_line = len(raw) + 4
+            with self.subTest(case=case):
+                self.assertEqual(
+                    upstream_lint.texi_prose(lines), [False] * (len(raw) + 1) + [True] * 4
+                )
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {short_line})
+                self.assertEqual(len(findings), 1)
+        mixed = (
+            (
+                "after",
+                ["@verbatim", "@end code", "@end verbatim", "", *self.CODE_PARAGRAPH, "@end code"],
+                7,
+            ),
+            (
+                "before",
+                ["@ignore", "@end code", "@end ignore", "@end code", "", *self.CODE_PARAGRAPH],
+                8,
+            ),
+        )
+        for case, lines, short_line in mixed:
+            with self.subTest(case=case):
+                self.assertEqual(upstream_lint.texi_prose(lines), [False] * len(lines))
+                findings = upstream_lint.wrap_findings("doc/x.texi", lines, {short_line})
+                self.assertEqual(findings, [])
 
 
 class DocReferenceTest(unittest.TestCase):

@@ -63,19 +63,20 @@ performance or throughput) without an end-to-end figure anywhere in the
 message: an fps or frames/s number, ffmpeg -benchmark, a bench: utime= line,
 speed= followed by a number, or hyperfine. A benchmark of one helper does not
 show that; a claim after not, never, cannot, without, no or an n't contraction
-earlier in its sentence is no claim, and speed words other than these, such as
-time or a bare encoding speed, are not detected. It also fails a commit whose
-message claims several sites (both or all followed within two words, line
-breaks included, by loops, callers, call sites, branches, paths, cases,
-functions, uses, instances, places, sites or occurrences; every or each
-followed the same way by the singular or plural of those nouns) while its diff
-changes exactly one hunk in library or fftools sources; renamed files are
-diffed as renames, a deleted source file counts its hunks, and one contiguous
-hunk counts as one site even when it edits two adjacent branches or states an
-invariant of all callers; --claim-reason TEXT waives only that several-sites
-rule. Signed-off-by lines in any letter case are ignored, and a range of more
-than MAX_CLAIM_COMMITS commits fails with rc 2; claims worded otherwise, and
-claims that a multi-hunk diff still does not support, are not detected.
+earlier in its sentence (a decimal point inside a number is not a sentence end)
+is no claim, and speed words other than these, such as time or a bare encoding
+speed, are not detected. It also fails a commit whose message claims several
+sites (both or all followed within two words, line breaks included, by loops,
+callers, call sites, branches, paths, cases, functions, uses, instances,
+places, sites or occurrences; every or each followed the same way by the
+singular or plural of those nouns) while its diff changes exactly one hunk in
+library or fftools sources; renamed files are diffed as renames, a deleted
+source file counts its hunks, and one contiguous hunk counts as one site even
+when it edits two adjacent branches or states an invariant of all callers;
+--claim-reason TEXT waives only that several-sites rule. Signed-off-by lines in
+any letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
+fails with rc 2; claims worded otherwise, and claims that a multi-hunk diff
+still does not support, are not detected.
 
 The doc-terms step fails when base..head adds lines both to library or fftools
 sources and to Texinfo files under doc/, and an added source line shows a
@@ -98,8 +99,12 @@ leaves room on it for the first word of the next line (a leading inline
 command counts up to its closing brace). Prose is a non-blank line outside
 every block except the filled ones in TEXI_FILLED that starts with text or with
 a TEXI_INLINE command and its brace; block names come from the file's own @end
-lines, so lines in an unlisted block are never checked. --doc-reason TEXT
-waives it and prints the reason.
+lines read outside raw blocks, so lines in an unlisted block are never checked.
+The raw blocks in TEXI_RAW (@verbatim, @ignore, @macro, @rmacro, @linemacro)
+always open, and inside one only a nested opener that texi2any counts there and
+an @end naming the innermost raw block change the open blocks, so an @end line
+shown inside a raw block closes no outer block. --doc-reason TEXT waives it and
+prints the reason.
 
 The doc-reference step fails an added @ref, @xref or @pxref inside a @section
 that follows wording such as described for or in, or same format as, in the
@@ -257,7 +262,8 @@ SPEED_CLAIM = re.compile(
     re.IGNORECASE,
 )
 SPEED_NEGATION = re.compile(
-    r"(?:\bnot|\bnever|\bcannot|\bwithout|\bno|n't)\b[^.;!?]*$", re.IGNORECASE
+    r"(?:\bnot|\bnever|\bcannot|\bwithout|\bno|n't)\b(?:[^.;!?]|(?<=\d)\.(?=\d))*$",
+    re.IGNORECASE,
 )
 END_TO_END_MEASURE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:fps|frames/s)\b|(?<![\w-])-benchmark\b|\bbench:\s*utime="
@@ -1686,6 +1692,19 @@ TEXI_FILLED = frozenset((
 ))  # fmt: skip
 TEXI_COMMAND = re.compile(r"@([A-Za-z]+)")
 TEXI_END = re.compile(r"@end\s+([A-Za-z]+)\s*$")
+# Raw block commands of texi2any 7.3 (Texinfo/Commands.pm, class 'raw'). Inside one,
+# only a nested opener that its pattern matches and an @end naming the innermost raw
+# block count (ParserNonXS.pm _process_raw_block_contents and
+# _process_macro_block_contents); every other line is literal text.
+TEXI_MACROS = re.compile(r"\s*@((?:line|r)?macro)(?:\s|$)")
+TEXI_RAW = {
+    "ignore": re.compile(r"\s*@(ignore)(?:@|\s|$)"),
+    "linemacro": TEXI_MACROS,
+    "macro": TEXI_MACROS,
+    "rmacro": TEXI_MACROS,
+    "verbatim": re.compile(r"\s*@(verbatim)(?:@|\s|$)"),
+}
+TEXI_RAW_END = re.compile(r"\s*@end\s+([A-Za-z][\w-]*)")
 TEXI_FIRST_WORD = re.compile(r"@[A-Za-z]+\{[^}]*\}\S*|\S+")
 WRAP_MIN_NEIGHBOUR = 50
 SENTENCE_END = re.compile(r"(?:[.:;!?]|@\*)\s*$")
@@ -1760,8 +1779,21 @@ def _waivable_step(name: str, findings: list[str], waiver: str, clean: str, advi
     return Step(name, 1, "\n".join([*findings, advice]))
 
 
+def _texi_raw_line(line: str, stack: list[str]) -> None:
+    """Track one line inside the raw block on top of the stack the way texi2any reads it."""
+    nested = TEXI_RAW[stack[-1]].match(line)
+    end = TEXI_RAW_END.match(line)
+    if nested:
+        stack.append(nested[1])
+    elif end and end[1] == stack[-1]:
+        stack.pop()
+
+
 def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
     """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+    if stack and stack[-1] in TEXI_RAW:
+        _texi_raw_line(line, stack)
+        return False
     end = TEXI_END.match(line)
     if end:
         if end[1] in stack:
@@ -1776,9 +1808,27 @@ def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> boo
     return bool(line.strip()) and all(name in TEXI_FILLED for name in stack)
 
 
+def _texi_blocks(lines: list[str]) -> frozenset[str]:
+    """Collect Texinfo block names from TEXI_RAW and @end lines read outside raw blocks."""
+    blocks = set(TEXI_RAW)
+    stack: list[str] = []
+    for line in lines:
+        if stack:
+            _texi_raw_line(line, stack)
+        elif end := TEXI_END.match(line):
+            blocks.add(end[1])
+        elif (command := TEXI_COMMAND.match(line)) and command[1] in TEXI_RAW:
+            stack.append(command[1])
+    return frozenset(blocks)
+
+
 def texi_prose(lines: list[str]) -> list[bool]:
-    """Flag each Texinfo line that is filled prose, outside every block not in TEXI_FILLED."""
-    blocks = frozenset(match[1] for line in lines if (match := TEXI_END.match(line)))
+    """Flag each Texinfo line that is filled prose, outside every block not in TEXI_FILLED.
+
+    Block names come from @end lines read outside raw blocks; a raw block in TEXI_RAW
+    always opens.
+    """
+    blocks = _texi_blocks(lines)
     stack: list[str] = []
     return [_texi_prose_line(line, blocks, stack) for line in lines]
 
