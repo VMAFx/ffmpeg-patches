@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-import subprocess
+import subprocess  # nosec B404 - fixed Git commands in disposable fixture repositories.
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,7 +47,7 @@ class DocstringsEngineTest(unittest.TestCase):
 
     def git(self, *args: str) -> str:
         """Run bounded Git commands with isolated environment and disabled signing."""
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 B607 - fixed Git, fixture-only arguments.
             [
                 "git",
                 "-c",
