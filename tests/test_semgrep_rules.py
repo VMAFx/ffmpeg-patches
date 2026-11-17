@@ -750,6 +750,102 @@ FFMPEG_PLANTED_WRITE_HEADER = (
     + "}\n"
 )
 
+FFMPEG_ALLOCATION_DECLARATIONS = """\
+#define NULL ((void *)0)
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+void *av_malloc(unsigned long size);
+void *av_mallocz(unsigned long size);
+void *av_malloc_array(unsigned long count, unsigned long size);
+enum { DST_RECT_BUF_SIZE = 128, DST_RECT_OFFSET = 16 };
+
+"""
+
+FFMPEG_PLANTED_ALLOCATION_TERNARY_DECLARATIONS = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int reviewed(void)
+{
+    uint16_t *dst0_buf = av_malloc_array(DST_RECT_BUF_SIZE, sizeof(*dst0_buf));
+    uint8_t *dst0 = dst0_buf ? (uint8_t *)(dst0_buf + DST_RECT_OFFSET) : NULL;
+    uint16_t *dst1_buf = av_malloc_array(DST_RECT_BUF_SIZE, sizeof(*dst1_buf));
+    uint8_t *dst1 = dst1_buf ? (uint8_t *)(dst1_buf + DST_RECT_OFFSET) : NULL;
+    if (!dst0_buf || !dst1_buf)
+        return -1;
+    return 0;
+}
+"""
+)
+
+FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int assigned(void)
+{
+    uint8_t *buffer, *dst;
+    buffer = av_mallocz(DST_RECT_BUF_SIZE);
+    dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+)
+
+FFMPEG_CHECKED_ALLOCATION = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int accepted(void)
+{
+    uint8_t *dst0, *dst1;
+    uint16_t *dst0_buf = av_malloc_array(DST_RECT_BUF_SIZE, sizeof(*dst0_buf));
+    uint16_t *dst1_buf = av_malloc_array(DST_RECT_BUF_SIZE, sizeof(*dst1_buf));
+    if (!dst0_buf || !dst1_buf)
+        return -1;
+    dst0 = (uint8_t *)(dst0_buf + DST_RECT_OFFSET);
+    dst1 = (uint8_t *)(dst1_buf + DST_RECT_OFFSET);
+    return 0;
+}
+"""
+)
+
+FFMPEG_PARAMETER_NULL_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static void optional_buffer(uint8_t *buffer)
+{
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+}
+"""
+)
+
+FFMPEG_ALLOCATION_OTHER_ELSE = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static void fallback_buffer(uint8_t *other)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : other;
+}
+"""
+)
+
+FFMPEG_ALLOCATION_SEPARATE_FUNCTION = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static uint8_t *allocate_buffer(void)
+{
+    uint8_t *buffer = av_mallocz(DST_RECT_BUF_SIZE);
+    return buffer;
+}
+
+static void optional_buffer(uint8_t *buffer)
+{
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+}
+"""
+)
+
 
 def _scan_ffmpeg_c(source: str) -> list[dict]:
     """Scan synthetic C source with .semgrep-ffmpeg.yml and return its result entries."""
@@ -775,6 +871,55 @@ class FfmpegRuleIdTest(unittest.TestCase):
 @unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
 class FfmpegSemgrepRulesTest(unittest.TestCase):
     """Verify .semgrep-ffmpeg.yml C rules against synthetic FFmpeg call fixtures."""
+
+    def test_planted_allocation_ternary_declarations_flagged(self) -> None:
+        """Flag both reviewed pointer declarations on their ternary lines."""
+        results = _scan_ffmpeg_c(FFMPEG_PLANTED_ALLOCATION_TERNARY_DECLARATIONS)
+        expected_lines = {
+            index
+            for index, line in enumerate(
+                FFMPEG_PLANTED_ALLOCATION_TERNARY_DECLARATIONS.splitlines(), 1
+            )
+            if " ? " in line
+        }
+        self.assertEqual(len(results), 2)
+        self.assertEqual({item["start"]["line"] for item in results}, expected_lines)
+        self.assertEqual(
+            {item["check_id"].split(".")[-1] for item in results},
+            {"ffmpeg-null-ternary-after-allocation"},
+        )
+
+    def test_planted_allocation_ternary_assignment_flagged(self) -> None:
+        """Flag a ternary assignment after an assigned av_mallocz result."""
+        results = _scan_ffmpeg_c(FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT)
+        ternary_line = next(
+            index
+            for index, line in enumerate(
+                FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT.splitlines(), 1
+            )
+            if " ? " in line
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"]["line"], ternary_line)
+        self.assertEqual(
+            results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
+        )
+
+    def test_checked_allocation_without_ternary_passes(self) -> None:
+        """Accept pointer assignments after an allocation failure check."""
+        self.assertEqual(_scan_ffmpeg_c(FFMPEG_CHECKED_ALLOCATION), [])
+
+    def test_parameter_null_ternary_passes(self) -> None:
+        """Accept a NULL ternary testing a parameter without an allocation."""
+        self.assertEqual(_scan_ffmpeg_c(FFMPEG_PARAMETER_NULL_TERNARY), [])
+
+    def test_allocation_ternary_with_other_else_passes(self) -> None:
+        """Accept an allocation ternary whose fallback is another pointer."""
+        self.assertEqual(_scan_ffmpeg_c(FFMPEG_ALLOCATION_OTHER_ELSE), [])
+
+    def test_allocation_in_separate_function_passes(self) -> None:
+        """Keep allocation bindings local to the function containing the ternary."""
+        self.assertEqual(_scan_ffmpeg_c(FFMPEG_ALLOCATION_SEPARATE_FUNCTION), [])
 
     def test_planted_write_header_missing_network_close_flagged(self) -> None:
         """Planted connect-then-close failure without ff_network_close flags the close line."""

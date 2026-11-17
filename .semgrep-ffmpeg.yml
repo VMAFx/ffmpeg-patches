@@ -29,3 +29,32 @@ rules:
           ff_network_close(...);
           ...
           return ...;
+
+  # Derive pointers after checking allocation results; NULL ternaries add no value
+  # (review of upstream FFmpeg pull request 25480, November 2026).
+  - id: ffmpeg-null-ternary-after-allocation
+    languages: [c]
+    severity: ERROR
+    message: >-
+      The allocation is checked anyway; check it first and derive the pointer
+      after the check instead of using a ternary with a NULL fallback.
+    patterns:
+      - pattern-inside: |
+          $RET $FUNC(...) {
+            ...
+          }
+      - pattern-either:
+          - pattern-inside: |
+              $BUF_TYPE *$BUF = $ALLOC(...);
+              ...
+          - pattern-inside: |
+              $BUF = $ALLOC(...);
+              ...
+      - metavariable-regex:
+          metavariable: $ALLOC
+          regex: ^(av_malloc|av_mallocz|av_malloc_array|av_calloc|av_realloc|av_realloc_array|av_memdup|malloc|calloc|realloc)$
+      - pattern-either:
+          - pattern: |
+              $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+          - pattern: |
+              $DST = $BUF ? $VALUE : NULL;
