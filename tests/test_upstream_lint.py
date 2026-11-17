@@ -31,7 +31,7 @@ SOURCE = "int ff_value(void)\n{\n    return 1;\n}\n"
 FAKE_CONFIG = "repos: []\n"
 FAKE_MESSAGE = '#!/bin/sh\ngit log --format=%s "$1" | grep -Eq "^[^:]+: .+"\n'
 FAKE_PATCHECK = "#!/bin/sh\ncat > patcheck.stdout\nprintf 'patcheck fixture\\n'\n"
-DOCSTRING_EMPTY_PASS = (
+DOCSTRING_EMPTY_CLEAN = (
     "Docstring coverage: 100.00% (0/0 covered, counted: 0, covered: 0, threshold: 80%)\n"
 )
 DOCSTRING_FINDING = (
@@ -1370,7 +1370,7 @@ class DocstringsStepTest(unittest.TestCase):
         covered = (
             "Docstring coverage: 85.71% (6/7 covered, counted: 7, covered: 6, threshold: 80%)\n"
         )
-        for stdout in (DOCSTRING_EMPTY_PASS, covered):
+        for stdout in (DOCSTRING_EMPTY_CLEAN, covered):
             with self.subTest(stdout=stdout):
                 expected = stdout.rstrip("\n")
                 self.assertEqual(
@@ -1437,7 +1437,7 @@ class DocstringsStepTest(unittest.TestCase):
 
     def test_timeout_exit_returns_two(self) -> None:
         """A timed-out engine run with exit 124 fails closed with rc 2."""
-        for stdout in ("\ncommand timed out\n", f"{DOCSTRING_EMPTY_PASS}command timed out\n"):
+        for stdout in ("\ncommand timed out\n", f"{DOCSTRING_EMPTY_CLEAN}command timed out\n"):
             with self.subTest(stdout=stdout):
                 step = self.run_step(124, stdout, "not waivable")
                 self.assertEqual(step.rc, 2)
@@ -1455,7 +1455,7 @@ class DocstringsStepTest(unittest.TestCase):
     def test_non_first_coverage_line_returns_two(self) -> None:
         """A coverage summary preceded by another line fails closed with rc 2."""
         cases = (
-            (0, f"praetor hooks: running engine on PATH\n{DOCSTRING_EMPTY_PASS}"),
+            (0, f"praetor hooks: running engine on PATH\n{DOCSTRING_EMPTY_CLEAN}"),
             (1, f"\n{DOCSTRING_FINDING}"),
         )
         for returncode, stdout in cases:
@@ -1467,7 +1467,7 @@ class DocstringsStepTest(unittest.TestCase):
     def test_step_passes_expected_argv_and_cwd_to_run(self) -> None:
         """The step runs engine.sh via bash from REPO_ROOT with DOCSTRINGS_TIMEOUT."""
         tree = Path("/fixture/ffmpeg")
-        stub = upstream_lint.RunResult((), 0, DOCSTRING_EMPTY_PASS)
+        stub = upstream_lint.RunResult((), 0, DOCSTRING_EMPTY_CLEAN)
         with unittest.mock.patch.object(upstream_lint, "_run", return_value=stub) as run:
             step = upstream_lint._docstrings(tree, "base_rev", "head_rev", "")
         self.assertEqual(step.rc, 0)
@@ -1511,7 +1511,7 @@ class FixtureTest(unittest.TestCase):
         self.hook_effect = lambda cwd: None
         self.hook_calls = []
         self.engine_rc = 0
-        self.engine_output = DOCSTRING_EMPTY_PASS
+        self.engine_output = DOCSTRING_EMPTY_CLEAN
         self.engine_calls = []
 
     def git(self, *args: str) -> str:
