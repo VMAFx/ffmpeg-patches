@@ -734,8 +734,21 @@ def _fate_uncomment(text: str) -> str:
     return text
 
 
-def _fate_lines(source: str) -> list[FateLine]:
-    """Join continuations while retaining both physical endpoints."""
+def _fate_shell_uncomment(text: str) -> str:
+    """Strip word-start shell comments outside quotes and escaped characters."""
+    for match in FATE_SHELL_TOKEN.finditer(text):
+        if match[0].startswith(("'", '"', "\\")):
+            continue
+        for comment in re.finditer("#", match[0]):
+            index = match.start() + comment.start()
+            if index == 0 or text[index - 1].isspace():
+                return text[:index]
+    return text
+
+
+def _fate_lines(source: str, *, shell: bool = False) -> list[FateLine]:
+    """Join continuations with syntax-specific comments and physical endpoints."""
+    uncomment = _fate_shell_uncomment if shell else _fate_uncomment
     lines, parts, first = [], [], 1
     for number, text in enumerate(source.splitlines(), 1):
         if not parts:
@@ -743,10 +756,10 @@ def _fate_lines(source: str) -> list[FateLine]:
         continued = text.endswith("\\")
         parts.append(text[:-1] if continued else text)
         if not continued:
-            lines.append(FateLine(_fate_uncomment(" ".join(parts)).strip(), first, number))
+            lines.append(FateLine(uncomment(" ".join(parts)).strip(), first, number))
             parts = []
     if parts:
-        lines.append(FateLine(_fate_uncomment(" ".join(parts)).strip(), first, number))
+        lines.append(FateLine(uncomment(" ".join(parts)).strip(), first, number))
     return lines
 
 
@@ -1389,12 +1402,19 @@ def _fate_shell_operators(command: str) -> list[tuple[int, str]]:
     return operators
 
 
+def _fate_shape_producer(segment: str) -> str:
+    """Choose the first producer after leading whole shell control words."""
+    for word in segment.split():
+        if word not in {"if", "then", "elif", "else", "while", "until", "do", "!", "{", "("}:
+            return word.strip("\"'")
+    return ""
+
+
 def _fate_shape_pipes(command: str, shell: bool) -> list[str]:
     """Report test producers while allowing only literal data-generator commands."""
     messages, start = [], 0
     for index, operator in _fate_shell_operators(command):
-        words = command[start:index].split()
-        first = words[0].strip("\"'") if words else ""
+        first = _fate_shape_producer(command[start:index])
         test = first in {"run", "ffmpeg", "ffprobe"} or first.startswith("$")
         refused = test if shell else bool(first) and first not in {"printf", "echo", "cat"}
         if operator == "|" and refused:
@@ -1409,15 +1429,21 @@ def _fate_shape_filter(item: str) -> str:
     return re.sub(r"(?:\s*\[[^\]]+\])+\s*$", "", item).strip()
 
 
+def _fate_shape_filter_name(item: str) -> str:
+    """Extract a filter class without its optional instance ID or arguments."""
+    return item.split("=", 1)[0].split("@", 1)[0]
+
+
 def _fate_shape_endian_chain(chain: str) -> list[str]:
     """Report forced endian formats handed to a non-converting next filter."""
     items = [_fate_shape_filter(item) for item in chain.split(",")]
     messages = []
     for item, consumer in zip(items, items[1:], strict=False):
-        formats = re.match(r"format=(?:pix_fmts=)?([^:\[\]]+)", item)
+        formats = re.match(r"(?:pix_fmts=)?([^:\[\]]+)", item.partition("=")[2])
         if (
-            formats
-            and consumer.split("=", 1)[0] not in {"scale", "format"}
+            _fate_shape_filter_name(item) == "format"
+            and formats
+            and _fate_shape_filter_name(consumer) not in {"scale", "format"}
             and any(name.strip("\"' ").endswith(("le", "be")) for name in formats[1].split("|"))
         ):
             messages.append(f"{item}: endian format reaches consumer {consumer}")
@@ -1473,6 +1499,7 @@ def _fate_shape_normalize(name: str) -> str:
 
 
 FATE_SHAPE_REFERENCE = re.compile(r"\$\(([A-Za-z_]\w*(?:-yes|-\$\([^()]*\))?)\)")
+FATE_SHAPE_FUNCTION = re.compile(r"\$\([^\s()]+\s")
 FATE_SHAPE_ASSIGNMENT = re.compile(r"([A-Za-z_]\w*(?:-\$\(.+\)|-yes)?)\s*(\+=|:=|=)\s*(.*)")
 
 
@@ -1494,6 +1521,24 @@ def _fate_shape_ffmpeg(makefile: str) -> set[str]:
     return variables
 
 
+def _fate_shape_references(text: str) -> list[str]:
+    """Keep direct make references while skipping balanced function expressions."""
+    names, depth, end = [], 0, 0
+    for index, char in enumerate(text):
+        if index < end:
+            continue
+        if depth:
+            depth += (char == "(") - (char == ")")
+            continue
+        reference = FATE_SHAPE_REFERENCE.match(text, index)
+        if reference:
+            names.append(reference[1])
+            end = reference.end()
+        elif FATE_SHAPE_FUNCTION.match(text, index):
+            depth, end = 1, index + 2
+    return names
+
+
 def _fate_shape_graph(sources: list[str]) -> dict[str, set[str]]:
     """Read plain reference edges from logical make assignment lines."""
     graph: dict[str, set[str]] = {}
@@ -1502,7 +1547,7 @@ def _fate_shape_graph(sources: list[str]) -> dict[str, set[str]]:
             assignment = FATE_SHAPE_ASSIGNMENT.fullmatch(line.text)
             if assignment:
                 destination = _fate_shape_normalize(assignment[1])
-                for name in FATE_SHAPE_REFERENCE.findall(assignment[3]):
+                for name in _fate_shape_references(assignment[3]):
                     graph.setdefault(_fate_shape_normalize(name), set()).add(destination)
     return graph
 
@@ -1573,7 +1618,7 @@ def _fate_shape_file(
     ffmpeg: set[str],
 ) -> list[FateShapeFinding]:
     """Check shared logical lines and report only added physical provenance."""
-    lines = _fate_lines(source)
+    lines = _fate_lines(source, shell=path == "tests/fate-run.sh")
     if path == "tests/fate-run.sh":
         return [
             FateShapeFinding("helper-pipe", number, message)

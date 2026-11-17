@@ -607,6 +607,52 @@ class FateShapeTest(unittest.TestCase):
         self.assertNotIn("IGNORED", graph)
         self.assertNotIn("SRC", graph)
 
+    def test_direct_aggregation_references_keep_edges(self) -> None:
+        """Direct plain and conditional references retain their ffmpeg edges."""
+        for reference, name in (
+            ("FATE_LIBAVUTIL", "FATE_LIBAVUTIL"),
+            ("FATE_X-yes", "FATE_X-yes"),
+            ("FATE_X-$(CONFIG_Y)", "FATE_X-yes"),
+        ):
+            with self.subTest(reference=reference):
+                source = f"FATE_FFMPEG += $({reference})\n"
+                self.assertEqual(upstream_lint._fate_shape_graph([source]), {name: {"FATE_FFMPEG"}})
+                source += f"{reference} += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_make_function_arguments_do_not_create_edges(self) -> None:
+        """Make function arguments create no plain variable aggregation edges."""
+        for expression in (
+            "$(filter-out $(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(filter $(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(patsubst %,x,$(FATE_LIBAVUTIL))",
+            "$(foreach x,$(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(if $(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(call fn,$(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(sort $(FATE_LIBAVUTIL))",
+            "$(addprefix x,$(FATE_LIBAVUTIL))",
+            "$(wildcard $(FATE_LIBAVUTIL))",
+            "$(sort\t$(FATE_LIBAVUTIL))",
+            "$(sort $(filter-out $(FATE_LIBAVUTIL),$(FATE_OTHER)))",
+        ):
+            with self.subTest(expression=expression):
+                source = f"FATE_FFMPEG += $(BEFORE) {expression} $(AFTER-$(CONFIG_X))\n"
+                self.assertEqual(
+                    upstream_lint._fate_shape_graph([source]),
+                    {"BEFORE": {"FATE_FFMPEG"}, "AFTER-yes": {"FATE_FFMPEG"}},
+                )
+
+    def test_range_make_function_aggregation_passes(self) -> None:
+        """A library command aggregated only through filter-out has no finding."""
+        fixture = self.fixture(
+            "FATE_LIBAVUTIL += fate-x\n"
+            "fate-x: CMD = run libavutil/tests/x\n"
+            "FATE_FFMPEG += $(filter-out $(FATE_LIBAVUTIL),$(FATE_OTHER))\n"
+        )
+        step = upstream_lint._fate_shape(fixture.root, fixture.base, "HEAD", "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("registration=0", step.output)
+
     def test_ffmpeg_dependencies_discovered_from_rule(self) -> None:
         """Only variables on targets with the exact executable prerequisite qualify."""
         makefile = (
@@ -665,6 +711,41 @@ class FateShapeTest(unittest.TestCase):
                 findings = self.findings(f"    {command} | sort\n", shell=True)
                 self.assertEqual([f.rule for f in findings], ["helper-pipe"])
 
+    def test_control_word_helper_pipelines_fail(self) -> None:
+        """Control words do not hide helper test producers before a pipe."""
+        for command in (
+            "if ffmpeg -i in -f null - | sort; then :; fi",
+            "while run foo | head; do :; done",
+            "! ffprobe x | sort",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell=True)], ["helper-pipe"]
+                )
+
+    def test_control_word_generators_pass(self) -> None:
+        """Control words preserve exemptions for literal data generators."""
+        self.assertEqual(self.findings("if printf x | sort; then :; fi", shell=True), [])
+        for producer in ("printf", "echo", "cat"):
+            with self.subTest(producer=producer):
+                self.assertEqual(self.findings(f"CMD = if {producer} x | sort\n"), [])
+
+    def test_control_word_prefixes_and_sequences(self) -> None:
+        """Only whole leading control words are skipped in either pipe rule."""
+        for prefix in ("if", "then", "elif", "else", "while", "until", "do", "!", "{", "("):
+            with self.subTest(prefix=prefix):
+                findings = self.findings(f"{prefix} run x | sort", shell=True)
+                self.assertEqual([f.rule for f in findings], ["helper-pipe"])
+                self.assertEqual(self.findings(f"CMD = {prefix} printf x | sort\n"), [])
+        self.assertEqual(
+            [f.rule for f in self.findings("if then ! { ( run x | sort", shell=True)],
+            ["helper-pipe"],
+        )
+        self.assertEqual(self.findings("ifconfig ffmpeg x | sort", shell=True), [])
+        self.assertEqual(
+            [f.rule for f in self.findings("CMD = ifconfig printf x | sort\n")], ["pipe"]
+        )
+
     def test_helper_boundaries_pass(self) -> None:
         """Comments, ordinary text processing and quoted helper pipes pass."""
         for line in (
@@ -678,6 +759,53 @@ class FateShapeTest(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(self.findings(line, shell=True), [])
 
+    def test_shell_quoted_hash_pipelines_fail(self) -> None:
+        """Quoted hashes retain helper pipelines for producer status checking."""
+        for command in (
+            "ffmpeg -metadata title='#' -i input | sort",
+            'run x "a # b" | sort',
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell=True)], ["helper-pipe"]
+                )
+
+    def test_shell_comment_word_boundaries(self) -> None:
+        """Word hashes and parameter expansions preserve pipes unlike real comments."""
+        for argument in ("foo#bar", "$#", "${#x}", r"\#", r'"a\" # b"'):
+            with self.subTest(argument=argument):
+                command = f"run x {argument} | sort"
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell=True)], ["helper-pipe"]
+                )
+
+    def test_shell_real_comments_and_generators_pass(self) -> None:
+        """Real shell comments end commands while quoted generator hashes pass."""
+        for command in (
+            "echo foo # | sort",
+            "ffmpeg x # | sort",
+            "# ffmpeg x | sort",
+            "printf '%s\\n' \"#\" | sort",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.findings(command, shell=True), [])
+        self.assertEqual(self.findings("CMD = run x # | sort\n"), [])
+        self.assertEqual(self.findings("CMD = run x '#' | sort\n"), [])
+        makefile = "$(FATE_X): # ffmpeg$(PROGSSUF)$(EXESUF)\n"
+        with self.assertRaisesRegex(ValueError, "no ffmpeg"):
+            upstream_lint._fate_shape_ffmpeg(makefile)
+
+    def test_shell_quoted_hash_continuation_provenance(self) -> None:
+        """Shell comment handling retains both endpoints of joined physical lines."""
+        source = "ffmpeg -metadata title='#' \\\n    -i input | sort\n"
+        for added in ({1}, {2}):
+            with self.subTest(added=added):
+                findings = self.findings(source, added, shell=True)
+                self.assertEqual([f.rule for f in findings], ["helper-pipe"])
+                self.assertEqual([f.line for f in findings], list(added))
+        self.assertEqual(self.findings(source, {3}, shell=True), [])
+        self.assertEqual(self.findings("ffmpeg x # comment \\\n | sort\n", shell=True), [])
+
     def test_endian_graph_fails(self) -> None:
         """Explicit endian format filters fail for each supported graph option."""
         for option in ("-lavfi", "-vf", "-filter_complex", "-filter:v"):
@@ -688,6 +816,27 @@ class FateShapeTest(unittest.TestCase):
                         "-frames:v 5\n"
                     )
                     self.assertEqual([f.rule for f in findings], ["endian"])
+
+    def test_endian_instance_producers_fail(self) -> None:
+        """Format instance IDs do not hide endian forcing before native consumers."""
+        for graph in (
+            "format@forced=gray16le,hqdn3d",
+            "format@a=pix_fmts=yuv420p10le,hqdn3d",
+        ):
+            with self.subTest(graph=graph):
+                findings = self.findings(f"CMD = framecrc -vf {graph}\n")
+                self.assertEqual([f.rule for f in findings], ["endian"])
+
+    def test_endian_instance_converters_pass(self) -> None:
+        """Scale and format instance IDs retain their conversion exemptions."""
+        for graph in (
+            "format=gray16le,scale@convert=w=32:h=32",
+            "format@f=gray16le,format@g=gray",
+            "format=gray16le,format@g=gray",
+            "format@f=gray16le,scale@convert=w=32:h=32",
+        ):
+            with self.subTest(graph=graph):
+                self.assertEqual(self.findings(f"CMD = framecrc -vf {graph}\n"), [])
 
     def test_unquoted_endian_example_fails(self) -> None:
         """The planted unquoted native-endian-filter graph reports its format."""
