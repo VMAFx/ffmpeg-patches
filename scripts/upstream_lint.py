@@ -65,18 +65,18 @@ speed= followed by a number, or hyperfine. A benchmark of one helper does not
 show that; a claim after not, never, cannot, without, no or an n't contraction
 earlier in its sentence (a decimal point inside a number is not a sentence end)
 is no claim, and speed words other than these, such as time or a bare encoding
-speed, are not detected. It also fails a commit whose
-message claims several sites (both or all followed within two words, line
-breaks included, by loops, callers, call sites, branches, paths, cases,
-functions, uses, instances, places, sites or occurrences; every or each
-followed the same way by the singular or plural of those nouns) while its diff
-changes exactly one hunk in library or fftools sources; renamed files are
-diffed as renames, a deleted source file counts its hunks, and one contiguous
-hunk counts as one site even when it edits two adjacent branches or states an
-invariant of all callers; --claim-reason TEXT waives only that several-sites
-rule. Signed-off-by lines in any letter case are ignored, and a range of more
-than MAX_CLAIM_COMMITS commits fails with rc 2; claims worded otherwise, and
-claims that a multi-hunk diff still does not support, are not detected.
+speed, are not detected. It also fails a commit whose message claims several
+sites (both or all followed within two words, line breaks included, by loops,
+callers, call sites, branches, paths, cases, functions, uses, instances,
+places, sites or occurrences; every or each followed the same way by the
+singular or plural of those nouns) while its diff changes exactly one hunk in
+library or fftools sources; renamed files are diffed as renames, a deleted
+source file counts its hunks, and one contiguous hunk counts as one site even
+when it edits two adjacent branches or states an invariant of all callers;
+--claim-reason TEXT waives only that several-sites rule. Signed-off-by lines in
+any letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
+fails with rc 2; claims worded otherwise, and claims that a multi-hunk diff
+still does not support, are not detected.
 
 The doc-terms step fails when base..head adds lines both to library or fftools
 sources and to Texinfo files under doc/, and an added source line shows a
