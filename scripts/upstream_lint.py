@@ -59,7 +59,16 @@ claim (passes all tests, all or every test passes, fully or thoroughly tested
 or verified, no regressions or no performance regressions, completely or 100%
 safe, verified or tested), never waivable; a claim directly after not, never,
 cannot, without or an n't contraction, and a safe claim followed by because or
-since, are not claims. It also fails a commit whose message claims several
+since, are not claims. It also fails, never waivable, a commit whose message
+claims faster encoding, decoding or transcoding (encoding is faster, faster
+decoding, an encoder speedup, speeds up the encoder, an end-to-end speedup,
+performance or throughput) without an end-to-end figure anywhere in the
+message: an fps or frames/s number, ffmpeg -benchmark, a bench: utime= line,
+speed= followed by a number, or hyperfine. A benchmark of one helper does not
+show that; a claim after not, never, cannot, without, no or an n't contraction
+earlier in its sentence (a decimal point inside a number is not a sentence end)
+is no claim, and speed words other than these, such as time or a bare encoding
+speed, are not detected. It also fails a commit whose message claims several
 sites (both or all followed within two words, line breaks included, by loops,
 callers, call sites, branches, paths, cases, functions, uses, instances,
 places, sites or occurrences; every or each followed the same way by the
@@ -67,8 +76,8 @@ singular or plural of those nouns) while its diff changes exactly one hunk in
 library or fftools sources; renamed files are diffed as renames, a deleted
 source file counts its hunks, and one contiguous hunk counts as one site even
 when it edits two adjacent branches or states an invariant of all callers;
---claim-reason TEXT waives only the second rule. Signed-off-by lines in any
-letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
+--claim-reason TEXT waives only that several-sites rule. Signed-off-by lines in
+any letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
 fails with rc 2; claims worded otherwise, and claims that a multi-hunk diff
 still does not support, are not detected.
 
@@ -85,6 +94,20 @@ lines blanked, so a comment that names the behaviour does not count, and
 neither does a macro that tests the flag. --doc-reason TEXT waives it and
 prints the reason. Only these two pairs are checked; any other gap between
 what the code does and what the docs say is not detected.
+
+The doc-wrap step fails an added line of filled prose in a changed doc/*.texi
+file that is shorter than half of both neighbouring prose lines, each at least
+WRAP_MIN_NEIGHBOUR characters, does not end with a sentence mark or @*, and
+leaves room on it for the first word of the next line (a leading inline
+command counts up to its closing brace). Prose is a non-blank line outside
+every block except the filled ones in TEXI_FILLED that starts with text or with
+a TEXI_INLINE command and its brace; block names come from the file's own @end
+lines read outside raw blocks, so lines in an unlisted block are never checked.
+The raw blocks in TEXI_RAW (@verbatim, @ignore, @macro, @rmacro, @linemacro)
+always open, and inside one only a nested opener that texi2any counts there and
+an @end naming the innermost raw block change the open blocks, so an @end line
+shown inside a raw block closes no outer block. --doc-reason TEXT waives it and
+prints the reason.
 
 The test-program step fails when base..head adds a C file directly under a
 lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
@@ -224,6 +247,25 @@ SCOPE_CLAIM = re.compile(
     r"|(?:every|each)\s+(?:\w+(?:\s+|-)){0,2}?"
     r"(?:branch(?:es)?|(?:loop|caller|call(?:\s+|-)site|path|case"
     r"|function|use|instance|place|site|occurrence)s?))\b",
+    re.IGNORECASE,
+)
+CODING = r"(?:encod|decod|transcod)\w*"
+SPEED_CLAIM = re.compile(
+    rf"\b(?:{CODING}\s+(?:is\s+|runs\s+|gets\s+|becomes\s+)?"
+    r"(?:\d+(?:\.\d+)?\s*(?:x|%|times)\s+)?(?:faster|quicker)"
+    rf"|(?:faster|quicker)\s+{CODING}"
+    rf"|{CODING}\s+speed-?ups?"
+    rf"|speeds?\s+up\s+(?:the\s+)?{CODING}"
+    rf"|end-to-end\s+(?:{CODING}\s+)?(?:speed(?:-?ups?)?|performance|throughput))\b",
+    re.IGNORECASE,
+)
+SPEED_NEGATION = re.compile(
+    r"(?:\bnot|\bnever|\bcannot|\bwithout|\bno|n't)\b(?:[^.;!?]|(?<=\d)\.(?=\d))*$",
+    re.IGNORECASE,
+)
+END_TO_END_MEASURE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:fps|frames/s)\b|(?<![\w-])-benchmark\b|\bbench:\s*utime="
+    r"|\bspeed=\s*\d|\bhyperfine\b",
     re.IGNORECASE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an
@@ -1477,6 +1519,35 @@ def scope_claim(message: str) -> str | None:
     return match[0] if match else None
 
 
+def speed_claim(message: str) -> str | None:
+    """Return the first encode or decode speed claim in a message without an end-to-end figure."""
+    text = _without_signoff(message)
+    if END_TO_END_MEASURE.search(text):
+        return None
+    for match in SPEED_CLAIM.finditer(text):
+        if not SPEED_NEGATION.search(text, max(0, match.start() - 48), match.start()):
+            return match[0]
+    return None
+
+
+def _unverified_findings(commit: str, message: str) -> list[str]:
+    """Return the never-waivable claim findings of one commit message."""
+    findings: list[str] = []
+    blanket = unverified_claim(message)
+    if blanket is not None:
+        findings.append(
+            f'{commit[:12]}: claims "{blanket}"; '
+            "name the test command and platform that ran instead"
+        )
+    speed = speed_claim(message)
+    if speed is not None:
+        findings.append(
+            f'{commit[:12]}: claims "{speed}" without an end-to-end measurement; '
+            "name an ffmpeg -benchmark or fps result, or drop the claim"
+        )
+    return findings
+
+
 def _source_header(line: str, old_source: bool) -> bool:
     """Return whether a +++ header line opens a library or fftools source file."""
     if line == "+++ /dev/null":
@@ -1520,17 +1591,11 @@ def source_hunks(patch: str) -> int:
     return count
 
 
-def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[str | None, str | None]:
+def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[list[str], str | None]:
     """Check one commit's message and rename-aware diff for unverified or
     single-hunk scope claims.
     """
-    unverified_finding = None
-    blanket = unverified_claim(message)
-    if blanket is not None:
-        unverified_finding = (
-            f'{commit[:12]}: claims "{blanket}"; '
-            "name the test command and platform that ran instead"
-        )
+    unverified_findings = _unverified_findings(commit, message)
     scope_finding = None
     scoped = scope_claim(message)
     if scoped is not None:
@@ -1552,7 +1617,7 @@ def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[str |
                 f'{commit[:12]}: claims "{scoped}" but changes 1 source hunk; '
                 "show each site or pass --claim-reason"
             )
-    return unverified_finding, scope_finding
+    return unverified_findings, scope_finding
 
 
 def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
@@ -1566,8 +1631,7 @@ def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
     for record in records:
         commit, _, message = record.partition("\n")
         rule_a, rule_b = _commit_claim_findings(tree, commit, message)
-        if rule_a is not None:
-            unverified.append(rule_a)
+        unverified.extend(rule_a)
         if rule_b is not None:
             scoped.append(rule_b)
     if not (unverified or scoped):
@@ -1615,6 +1679,35 @@ DOC_TERMS = (
 )
 
 
+TEXI_INLINE = frozenset((
+    "abbr", "acronym", "b", "code", "command", "dfn", "dots", "email", "emph", "env",
+    "file", "i", "kbd", "key", "math", "option", "pxref", "r", "ref", "samp", "sc",
+    "strong", "t", "tie", "uref", "url", "var", "verb", "w", "xref",
+))  # fmt: skip
+TEXI_FILLED = frozenset((
+    "enumerate", "ftable", "ifclear", "ifhtml", "ifinfo", "ifnothtml", "ifnotinfo",
+    "ifnottex", "ifset", "iftex", "itemize", "quotation", "table", "vtable",
+))  # fmt: skip
+TEXI_COMMAND = re.compile(r"@([A-Za-z]+)")
+TEXI_END = re.compile(r"@end\s+([A-Za-z]+)\s*$")
+# Raw block commands of texi2any 7.3 (Texinfo/Commands.pm, class 'raw'). Inside one,
+# only a nested opener that its pattern matches and an @end naming the innermost raw
+# block count (ParserNonXS.pm _process_raw_block_contents and
+# _process_macro_block_contents); every other line is literal text.
+TEXI_MACROS = re.compile(r"\s*@((?:line|r)?macro)(?:\s|$)")
+TEXI_RAW = {
+    "ignore": re.compile(r"\s*@(ignore)(?:@|\s|$)"),
+    "linemacro": TEXI_MACROS,
+    "macro": TEXI_MACROS,
+    "rmacro": TEXI_MACROS,
+    "verbatim": re.compile(r"\s*@(verbatim)(?:@|\s|$)"),
+}
+TEXI_RAW_END = re.compile(r"\s*@end\s+([A-Za-z][\w-]*)")
+TEXI_FIRST_WORD = re.compile(r"@[A-Za-z]+\{[^}]*\}\S*|\S+")
+WRAP_MIN_NEIGHBOUR = 50
+SENTENCE_END = re.compile(r"(?:[.:;!?]|@\*)\s*$")
+
+
 def is_doc_path(name: str) -> bool:
     """Return whether a repository path is a Texinfo file under doc/."""
     parts = PurePosixPath(name).parts
@@ -1654,14 +1747,127 @@ def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
             code.extend(_added_code(tree, head, path, hunks))
         elif is_doc_path(path):
             docs.extend(added)
-    findings = doc_term_findings("\n".join(code), "\n".join(docs))
+    return _waivable_step(
+        "doc-terms",
+        doc_term_findings("\n".join(code), "\n".join(docs)),
+        waiver,
+        f"no omitted doc term in {len(docs)} added doc line(s)",
+        "name the case in the docs, or pass --doc-reason",
+    )
+
+
+def _waivable_step(name: str, findings: list[str], waiver: str, clean: str, advice: str) -> Step:
+    """Pass without findings, pass and list them under a non-blank waiver, else fail with advice."""
     if not findings:
-        return Step("doc-terms", 0, f"no omitted doc term in {len(docs)} added doc line(s)")
+        return Step(name, 0, clean)
     reason = waiver.strip()
     if reason:
-        return Step("doc-terms", 0, "\n".join([f"waived: {reason}", *findings]))
-    advice = "name the case in the docs, or pass --doc-reason"
-    return Step("doc-terms", 1, "\n".join([*findings, advice]))
+        return Step(name, 0, "\n".join([f"waived: {reason}", *findings]))
+    return Step(name, 1, "\n".join([*findings, advice]))
+
+
+def _texi_raw_line(line: str, stack: list[str]) -> None:
+    """Track one line inside the raw block on top of the stack the way texi2any reads it."""
+    nested = TEXI_RAW[stack[-1]].match(line)
+    end = TEXI_RAW_END.match(line)
+    if nested:
+        stack.append(nested[1])
+    elif end and end[1] == stack[-1]:
+        stack.pop()
+
+
+def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
+    """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+    if stack and stack[-1] in TEXI_RAW:
+        _texi_raw_line(line, stack)
+        return False
+    end = TEXI_END.match(line)
+    if end:
+        if end[1] in stack:
+            del stack[len(stack) - 1 - stack[::-1].index(end[1]) :]
+        return False
+    command = TEXI_COMMAND.match(line)
+    if command and command[1] in blocks:
+        stack.append(command[1])
+        return False
+    if command and not (command[1] in TEXI_INLINE and line[command.end() :].startswith("{")):
+        return False
+    return bool(line.strip()) and all(name in TEXI_FILLED for name in stack)
+
+
+def _texi_blocks(lines: list[str]) -> frozenset[str]:
+    """Collect Texinfo block names from TEXI_RAW and @end lines read outside raw blocks."""
+    blocks = set(TEXI_RAW)
+    stack: list[str] = []
+    for line in lines:
+        if stack:
+            _texi_raw_line(line, stack)
+        elif end := TEXI_END.match(line):
+            blocks.add(end[1])
+        elif (command := TEXI_COMMAND.match(line)) and command[1] in TEXI_RAW:
+            stack.append(command[1])
+    return frozenset(blocks)
+
+
+def texi_prose(lines: list[str]) -> list[bool]:
+    """Flag each Texinfo line that is filled prose, outside every block not in TEXI_FILLED.
+
+    Block names come from @end lines read outside raw blocks; a raw block in TEXI_RAW
+    always opens.
+    """
+    blocks = _texi_blocks(lines)
+    stack: list[str] = []
+    return [_texi_prose_line(line, blocks, stack) for line in lines]
+
+
+def _unfilled(before: str, line: str, after: str) -> bool:
+    """Return whether a prose line ends under half its neighbours' width with room for a word."""
+    column = min(len(before), len(after))
+    return (
+        column >= WRAP_MIN_NEIGHBOUR
+        and not SENTENCE_END.search(line)
+        and 2 * len(line) < column
+        and len(line) + 1 + len(TEXI_FIRST_WORD.findall(after)[0]) <= len(before)
+    )
+
+
+def wrap_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
+    """Return a finding per added prose line that breaks a filled paragraph early."""
+    prose = texi_prose(lines)
+    findings: list[str] = []
+    for number in sorted(added):
+        index = number - 1
+        if not (0 < index < len(lines) - 1 and all(prose[index - 1 : index + 2])):
+            continue
+        before, line, after = (lines[at].rstrip() for at in (index - 1, index, index + 1))
+        if _unfilled(before, line, after):
+            findings.append(
+                f'{path}:{number}: "{line.strip()}" ends a filled paragraph line early '
+                f"({len(line)} of {len(before)} columns) and the next word fits on it"
+            )
+    return findings
+
+
+def _doc_files(tree: Path, base: str, head: str) -> list[tuple[str, list[str], set[int]]]:
+    """Return each changed doc/*.texi file with its head lines and added line numbers."""
+    files: list[tuple[str, list[str], set[int]]] = []
+    for path, hunks, _ in _patch_files(_git(tree, *DIFF_COMMON, "-U0", base, head)):
+        added = _added_lines("\n".join(hunks))
+        if is_doc_path(path) and added:
+            files.append((path, _git(tree, "show", f"{head}:{path}").splitlines(), added))
+    return files
+
+
+def _doc_wrap(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Fail added doc prose lines that end early inside a filled paragraph."""
+    files = _doc_files(tree, base, head)
+    return _waivable_step(
+        "doc-wrap",
+        [finding for path, lines, added in files for finding in wrap_findings(path, lines, added)],
+        waiver,
+        f"no early line break in {len(files)} changed doc file(s)",
+        "join each line with the next one, or pass --doc-reason",
+    )
 
 
 def is_test_program_path(name: str) -> bool:
@@ -1730,11 +1936,8 @@ def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
         "sample and compares the output with a tests/ref reference"
         for name in programs
     ]
-    reason = waiver.strip()
-    if reason:
-        return Step("test-program", 0, "\n".join([f"waived: {reason}", *findings]))
     advice = "add a FATE sample test with a tests/ref reference, or pass --test-program-reason"
-    return Step("test-program", 1, "\n".join([*findings, advice]))
+    return _waivable_step("test-program", findings, waiver, "", advice)
 
 
 def _collect(name: str, action: Callable[[], Step]) -> Step:
@@ -1760,6 +1963,7 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
             _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
+            _collect("doc-wrap", lambda: _doc_wrap(tree, base, head, waivers.doc)),
             _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
         ]
 
@@ -1788,7 +1992,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--doc-reason",
         default="",
-        help="why the added docs may leave out a case the doc-terms step names; waives that step",
+        help="why the added docs may leave out a case the doc-terms step names or break a "
+        "line early; waives the doc-terms and doc-wrap steps",
     )
     parser.add_argument(
         "--test-program-reason",
