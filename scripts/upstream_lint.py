@@ -94,6 +94,16 @@ ffprobe and compared against a tests/ref reference. --test-program-reason TEXT
 waives it and prints the reason. A program registered in another file or
 through another variable, and a FATE test whose input another custom tool
 builds, are not detected.
+
+The docstrings step checks diff-scoped doc-comment coverage across base..head
+in --tree by running the pinned Praetor engine via .config/lefthook/engine.sh
+docstrings check from this repository's root directory, where engine.sh reads
+the workflow pin. Results pass through an allow-list: only exit 0 or 1 whose
+first output line has the exact `Docstring coverage: ...% (... covered,
+counted: ..., covered: ..., threshold: ...%)` form counts as a measured pass
+(rc 0) or finding (rc 1); any other exit status or output, including a timeout
+or an engine.sh refusal, fails with rc 2. --docstring-reason TEXT waives a
+finding and prints the reason, and never waives an rc 2 result.
 """
 
 from __future__ import annotations
@@ -159,10 +169,12 @@ DIFF_COMMON = (
 MAX_PATHS = 2000
 MAX_CLAIM_COMMITS = 1000
 RUN_TIMEOUT = 1800
+DOCSTRINGS_TIMEOUT = 300
 CLEANUP_TIMEOUT = 30
 REAP_TIMEOUT = 10
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
 CONFIG = ".forgejo/pre-commit/config.yaml"
+ENGINE_SCRIPT = ".config/lefthook/engine.sh"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 HUNK_LENGTHS = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 GIT_QUOTED_ESCAPE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
@@ -264,6 +276,7 @@ class Waivers:
     claim: str = ""
     doc: str = ""
     test_program: str = ""
+    docstring: str = ""
 
 
 @dataclass
@@ -1730,6 +1743,43 @@ def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("test-program", 1, "\n".join([*findings, advice]))
 
 
+DOCSTRING_COVERAGE = re.compile(
+    r"^Docstring coverage: \d+\.\d{2}% "
+    r"\(\d+/\d+ covered, counted: \d+, covered: \d+, threshold: \d+(?:\.\d+)?%\)$"
+)
+
+
+def docstring_result(returncode: int, output: str, waiver: str = "") -> Step:
+    """Classify Praetor docstrings output through the coverage-line allow-list."""
+    first_line = output.partition("\n")[0].removesuffix("\r")
+    body = output.rstrip("\r\n")
+    if returncode in (0, 1) and DOCSTRING_COVERAGE.fullmatch(first_line):
+        if returncode == 0:
+            return Step("docstrings", 0, body)
+        reason = waiver.strip()
+        if reason:
+            return Step("docstrings", 0, f"waived: {reason}\n{body}")
+        advice = "add a doc comment to each listed function, or pass --docstring-reason"
+        return Step("docstrings", 1, f"{body}\n{advice}")
+    header = f"engine exit status: {returncode}"
+    return Step("docstrings", 2, f"{header}\n{body}" if body else header)
+
+
+def _docstrings(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Run the pinned Praetor engine's diff-scoped docstring check on base..head."""
+    argv = [
+        "bash",
+        str(REPO_ROOT / ENGINE_SCRIPT),
+        "docstrings",
+        "check",
+        f"--path={tree}",
+        f"--base={base}",
+        f"--head={head}",
+    ]
+    result = _run(argv, REPO_ROOT, timeout=DOCSTRINGS_TIMEOUT)
+    return docstring_result(result.returncode, result.stdout, waiver)
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
     try:
         return action()
@@ -1754,6 +1804,7 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
             _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
+            _collect("docstrings", lambda: _docstrings(tree, base, head, waivers.docstring)),
         ]
 
 
@@ -1788,6 +1839,11 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help="why a new lib*/tests program cannot be a FATE sample test; waives that step",
     )
+    parser.add_argument(
+        "--docstring-reason",
+        default="",
+        help="why changed functions fall below the docstring threshold; waives that step",
+    )
     return parser
 
 
@@ -1803,6 +1859,7 @@ def main(argv: list[str] | None = None) -> int:
             claim=args.claim_reason,
             doc=args.doc_reason,
             test_program=args.test_program_reason,
+            docstring=args.docstring_reason,
         )
         steps = _checks(tree, base, head, waivers)
         _remaining(0)
