@@ -1676,6 +1676,77 @@ class DocReferenceTest(unittest.TestCase):
         missing = REFERENCE_TEXT.replace("@ref{libaom-av1-qpfile", "@ref{other-qpfile")
         self.assertEqual(self.findings(missing), [])
 
+    def test_reference_after_exclamation_passes(self) -> None:
+        """An exclamation followed by whitespace ends the earlier deferral sentence."""
+        text = REFERENCE_TEXT.replace("in the format described for", "as described for libaom! See")
+        self.assertEqual(self.findings(text), [])
+
+    def test_reference_after_question_passes(self) -> None:
+        """A question mark followed by whitespace ends the earlier deferral sentence."""
+        text = REFERENCE_TEXT.replace("in the format described for", "as described for libaom? See")
+        self.assertEqual(self.findings(text), [])
+
+    def test_defer_wording_in_same_sentence_is_found(self) -> None:
+        """Deferral wording in the same sentence still flags the reference."""
+        for wording in (
+            "as described for libaom in",
+            "as described for qp!file in",
+            "as described for qp?file in",
+        ):
+            with self.subTest(wording=wording):
+                text = REFERENCE_TEXT.replace("in the format described for", wording)
+                self.assertEqual(len(self.findings(text)), 1)
+
+    def test_reference_after_chapter_heading_passes(self) -> None:
+        """Chapter-level and higher headings clear the earlier section's ownership."""
+        for heading in (
+            "chapter",
+            "unnumbered",
+            "appendix",
+            "top",
+            "part",
+            "majorheading",
+            "chapheading",
+            "centerchap",
+        ):
+            with self.subTest(heading=heading):
+                text = REFERENCE_TEXT.replace(
+                    "@section libsvtav1\n", f"@section libsvtav1\n@{heading} Overview\n"
+                )
+                self.assertEqual(self.findings(text, {12}), [])
+                self.assertEqual(upstream_lint.texi_sections(text.splitlines())[7], "")
+
+    def test_reference_under_subsection_is_found(self) -> None:
+        """Subsection and subsubsection references retain the containing section."""
+        for heading in ("subsection", "subsubsection"):
+            with self.subTest(heading=heading):
+                text = REFERENCE_TEXT.replace(
+                    "@section libsvtav1\n", f"@section libsvtav1\n@{heading} Details\n"
+                )
+                self.assertEqual(len(self.findings(text, {12})), 1)
+
+    def test_reference_to_external_manual_passes(self) -> None:
+        """A non-empty fourth argument makes each reference command external."""
+        for command in ("ref", "xref", "pxref"):
+            for arguments in (
+                ",,,othermanual",
+                ",,,othermanual,Printed Manual",
+                ",,libaom @option{qpfile}, othermanual ",
+            ):
+                with self.subTest(command=command, arguments=arguments):
+                    lines = REFERENCE_TEXT.splitlines()
+                    lines[10] = f"the @{command}{{libaom-av1-qpfile{arguments}}} for details."
+                    self.assertEqual(self.findings("\n".join(lines)), [])
+
+    def test_reference_with_empty_manual_is_found(self) -> None:
+        """An empty fourth argument or fewer arguments keeps the reference local."""
+        for command in ("ref", "xref", "pxref"):
+            for arguments in ("", ",,,", ",,, ", ",,,,Printed Manual", ",,libaom @option{qpfile},"):
+                with self.subTest(command=command, arguments=arguments):
+                    lines = REFERENCE_TEXT.splitlines()
+                    lines[10] = f"the @{command}{{libaom-av1-qpfile{arguments}}} for details."
+                    self.assertEqual(len(self.findings("\n".join(lines))), 1)
+
     def test_item_without_other_library_passes(self) -> None:
         """An anchored item that names no library of its section passes."""
         text = REFERENCE_TEXT.replace("libaom reads a missing offset as 0", "a gap reads as 0")

@@ -1710,12 +1710,15 @@ WRAP_MIN_NEIGHBOUR = 50
 SENTENCE_END = re.compile(r"(?:[.:;!?]|@\*)\s*$")
 TEXI_ANCHOR = re.compile(r"@anchor\{([^}]+)\}")
 TEXI_SECTION = re.compile(r"@section\s+(.+?)\s*$")
+TEXI_CHAPTER = re.compile(
+    r"@(?:chapter|unnumbered|appendix|top|part|majorheading|chapheading|centerchap)\b"
+)
 TEXI_ITEM = re.compile(r"@itemx?\b")
 TEXI_ITEM_END = re.compile(r"@(?:itemx?|end|section|subsection|chapter|anchor)\b")
-TEXI_REF = re.compile(r"@(?:ref|xref|pxref)\{([^,}]+)")
+TEXI_REF = re.compile(r"@(?:ref|xref|pxref)\{")
 DEFER_WORDING = re.compile(
     r"\b(?:(?:described|documented|defined|specified|explained)\s+(?:for|in|under|by|with)"
-    r"|(?:same|identical)\s+(?:format|syntax)\s+as)\b(?:(?!\.\s)[^;])*$",
+    r"|(?:same|identical)\s+(?:format|syntax)\s+as)\b(?:(?![.!?]\s)[^;])*$",
     re.IGNORECASE,
 )
 ANCHOR_ITEM_LIMIT = 400
@@ -1862,12 +1865,15 @@ def wrap_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
 
 
 def texi_sections(lines: list[str]) -> list[str]:
-    """Return the title of the @section each line belongs to, or an empty string."""
+    """Return each line's @section title, cleared by headings at chapter level or above."""
     current = ""
     titles: list[str] = []
     for line in lines:
         match = TEXI_SECTION.match(line)
-        current = match[1] if match else current
+        if match:
+            current = match[1]
+        elif TEXI_CHAPTER.match(line):
+            current = ""
         titles.append(current)
     return titles
 
@@ -1892,6 +1898,28 @@ def _anchor_item(lines: list[str], start: int) -> list[str]:
     return body
 
 
+def _texi_ref_arguments(text: str) -> list[str]:
+    """Split reference arguments at top-level commas through the matching closing brace."""
+    parts: list[str] = []
+    start, depth, escaped = 0, 0, False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if char == "@":
+            escaped = True
+        elif char == "{":
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+        elif char == "}":
+            return [*parts, text[start:index].strip()]
+        elif char == "," and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    return []
+
+
 def _reference_finding(
     path: str, lines: list[str], sections: list[str], anchors: dict[str, int], number: int
 ) -> list[str]:
@@ -1900,7 +1928,10 @@ def _reference_finding(
     before = lines[index - 1] if index else ""
     findings: list[str] = []
     for ref in TEXI_REF.finditer(lines[index]):
-        target = anchors.get(ref[1].strip())
+        args = _texi_ref_arguments(lines[index][ref.end() :])
+        if not args or (len(args) > 3 and args[3]):
+            continue
+        target = anchors.get(args[0])
         if target is None or not sections[index]:
             continue
         if not DEFER_WORDING.search(f"{before} {lines[index][: ref.start()]}"):
@@ -1912,7 +1943,7 @@ def _reference_finding(
         )
         if named:
             findings.append(
-                f"{path}:{number}: the {sections[index]} text defers to @ref{{{ref[1].strip()}}}, "
+                f"{path}:{number}: the {sections[index]} text defers to @ref{{{args[0]}}}, "
                 f"whose item in the {sections[target]} section names {', '.join(named)}"
             )
     return findings
