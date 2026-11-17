@@ -24,6 +24,10 @@ WRAPPED_AVFRAME_DECODER: lavfi emits wrapped_avframe video packets, so an encode
 alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
+It also flags a touched CMD that names one tests/data directory both under
+`$(TARGET_PATH)/` and relative, because TARGET_EXEC programs see the target view
+while shell words see the host view; single-root commands and CLEANFILES are not
+checked.
 
 The regression-test step fails when a commit whose subject or body, outside its
 Signed-off-by lines, says fix, fixes or fixed or names a defect (bug, regression,
@@ -548,6 +552,8 @@ LAVFI_FORMAT = re.compile(r"(?:^|\s)-f\s+lavfi(?=\s|$)")
 LAVFI_OPTION = re.compile(r"^-[\w:]+$")
 LAVFI_NAME = re.compile(r"""^["']?([a-z0-9_]+)(?=[=,;\s"']|$)""")
 FATE_REQUIRED = ("LAVFI_INDEV", "WRAPPED_AVFRAME_DECODER")
+FATE_ROOTED_DATA = re.compile(r"\$\(TARGET_PATH\)/tests/data/([A-Za-z0-9_.-]+)")
+FATE_RELATIVE_DATA = re.compile(r"""(?:^|[ \t=<>"'])tests/data/([A-Za-z0-9_.-]+)""")
 
 
 @dataclass(frozen=True)
@@ -1097,6 +1103,30 @@ def _fate_diagnostics(path: str, parsed: FateFile, touched: set[int], report: Fa
                 )
 
 
+def _fate_mixed_data(command: str) -> list[str]:
+    """Return sorted tests/data directory names used both rooted and relative."""
+    rooted = set(FATE_ROOTED_DATA.findall(command))
+    if not rooted:
+        return []
+    return sorted(rooted & set(FATE_RELATIVE_DATA.findall(command)))
+
+
+def _fate_paths(
+    path: str, variants: list[FateEntry], touched: set[int], report: FateReport
+) -> None:
+    """Report tests/data directories that any command variant accesses through two roots."""
+    for command in variants:
+        changed = _fate_touched(command, touched)
+        label = "finding" if changed else "pre-existing (untouched)"
+        for directory in _fate_mixed_data(command.command):
+            report.findings += int(changed)
+            report.lines.append(
+                f"{label}: {path}:{command.line.first}: {command.target.text}: "
+                f"tests/data/{directory} named with and without $(TARGET_PATH)/; "
+                f"run every access through $(TARGET_PATH)/tests/data/{directory}"
+            )
+
+
 def _fate_check(
     path: str,
     parsed: FateFile,
@@ -1104,10 +1134,11 @@ def _fate_check(
     sources: dict[str, str],
     base: FateFile | None = None,
 ) -> FateReport:
-    """Check each registration against all video variants and its own touched provenance."""
+    """Check command paths and each registration against all video variants."""
     report = FateReport()
     _fate_diagnostics(path, parsed, added, report)
     for name, variants in parsed.commands.items():
+        _fate_paths(path, variants, added, report)
         if "$(" in name:
             continue
         video = [
@@ -1149,7 +1180,8 @@ def _fate_summary(report: FateReport, rc: int = 0) -> Step:
         f"{report.checked} lavfi video test(s) checked, {report.audio} audio skipped, "
         f"{report.unclassified} unclassified, {report.unresolved} unresolved, "
         f"{report.findings} finding(s); "
-        "FATE dependencies: wrapped_avframe decoder"
+        "FATE dependencies: wrapped_avframe decoder; "
+        "FATE paths: $(TARGET_PATH)/tests/data"
     )
     return Step("fate-deps", rc or int(report.findings > 0), "\n".join([*report.lines, summary]))
 
