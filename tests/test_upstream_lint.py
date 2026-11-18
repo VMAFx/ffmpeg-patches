@@ -300,6 +300,134 @@ class FixWordTest(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertIsNone(upstream_lint.fix_word(message))
 
+    def test_added_defect_words_and_phrases(self) -> None:
+        """Every added memory-safety and UB defect word or phrase matches in the body."""
+        words = (
+            "uninitialised",
+            "uninitialized",
+            "use after free",
+            "use-after-free",
+            "double free",
+            "double-free",
+            "null dereference",
+            "null dereferences",
+            "null pointer dereference",
+            "null pointer dereferences",
+            "division by zero",
+            "divide by zero",
+            "undefined behaviour",
+            "undefined behavior",
+            "deadlock",
+            "deadlocks",
+            "deadlocked",
+            "segfault",
+            "segfaults",
+            "segfaulted",
+            "segmentation fault",
+            "segmentation faults",
+            "memory corruption",
+            "heap corruption",
+            "stack corruption",
+            "OOB",
+            "oob",
+        )
+        for word in words:
+            with self.subTest(word=word):
+                message = f"avformat/rtsp: check write\n\nAvoid {word} on reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), word)
+
+    def test_wrapped_and_hyphenated_added_defect_phrases(self) -> None:
+        """Added multi-word phrases match across line breaks, and free phrases across hyphens."""
+        phrases = (
+            "use\nafter free",
+            "use after\nfree",
+            "use-after-free",
+            "use-after-\nfree",
+            "use\n-after-free",
+            "double\nfree",
+            "double-free",
+            "double-\nfree",
+            "double\n-free",
+            "null\ndereference",
+            "null\ndereferences",
+            "null\npointer dereference",
+            "null pointer\ndereferences",
+            "division\nby zero",
+            "division by\nzero",
+            "divide\nby zero",
+            "divide by\nzero",
+            "undefined\nbehaviour",
+            "undefined\nbehavior",
+            "segmentation\nfault",
+            "segmentation\nfaults",
+            "memory\ncorruption",
+            "heap\ncorruption",
+            "stack\ncorruption",
+        )
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                message = f"avformat/rtsp: check write\n\nAvoid {phrase} on reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), phrase)
+
+    def test_excluded_and_partial_words_return_none(self) -> None:
+        """Excluded concurrency words and isolated parts of defect phrases return None."""
+        words = (
+            "hang",
+            "hangs",
+            "race",
+            "race condition",
+            "data race",
+            "infinite loop",
+            "free",
+            "freed",
+            "double",
+            "zero",
+            "undefined",
+            "behaviour",
+            "behavior",
+            "pointer",
+            "initialised",
+            "initialized",
+            "lock",
+        )
+        for word in words:
+            with self.subTest(word=word):
+                message = f"avformat/rtsp: check write\n\nHandle {word} in reply.\n"
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_added_defect_word_in_signoff_returns_none(self) -> None:
+        """Added defect words inside Signed-off-by trailers are ignored."""
+        for trailer in (
+            "Signed-off-by: Uninitialised Segfault <x@invalid>",
+            "signed-off-by: Double Free <oob@invalid>",
+        ):
+            with self.subTest(trailer=trailer):
+                message = f"avformat/rtsp: check write\n\n{trailer}\n"
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_hyphenated_uninitialised_and_warning_flags(self) -> None:
+        """Sanitizer hyphenated forms match while warning flag prefixes return None."""
+        for token, expected in (
+            ("use-of-uninitialized-value", "uninitialized"),
+            ("use-of-uninitialised-value", "uninitialised"),
+        ):
+            with self.subTest(token=token):
+                message = f"avformat/rtsp: check write\n\nHandle {token} in reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), expected)
+        for flag in (
+            "-Wmaybe-uninitialized",
+            "-Wmaybe-uninitialised",
+            "maybe-uninitialized",
+            "maybe-uninitialised",
+            "-Wsometimes-uninitialized",
+            "-Wsometimes-uninitialised",
+            "sometimes-uninitialized",
+            "sometimes-uninitialised",
+        ):
+            with self.subTest(flag=flag):
+                message = f"avformat/rtsp: check write\n\nHandle {flag} in reply.\n"
+                self.assertIsNone(upstream_lint.fix_word(message))
+
 
 class TestReachTest(unittest.TestCase):
     """Positive, negative and boundary coverage of reach_names and test_words."""
@@ -2182,6 +2310,41 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: regression-test rc: 1", output)
+
+    def test_body_uninitialised_defect_word_requires_test_or_waiver(self) -> None:
+        """An uninitialised-reply body fails without a test and passes when waived or neutral."""
+        subject = "avformat/rtsp: check command write before using replies"
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit(
+            f"{subject}\n\nIgnoring that error can make callers inspect an uninitialised reply."
+        )
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        rc, output = self.check("--no-test-reason", "needs a live RTSP server")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("waived: needs a live RTSP server", output)
+        self.git("commit", "--amend", "-qm", f"{subject}\n\nRename the reply helper.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_hyphenated_uninitialized_subject_requires_test_or_waiver(self) -> None:
+        """A use-of-uninitialized-value subject fails without a test unless waived."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avformat/x: use-of-uninitialized-value in keybuffer")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        rc, output = self.check("--no-test-reason", "reproducer requires MemorySanitizer")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("waived: reproducer requires MemorySanitizer", output)
+        self.git("commit", "--amend", "-qm", "avformat/x: clear keybuffer")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
 
     def test_wrapped_body_defect_phrase_without_test_fails(self) -> None:
         """A source commit whose body wraps a defect phrase fails without a changed test path."""
