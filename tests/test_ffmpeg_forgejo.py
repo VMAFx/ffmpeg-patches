@@ -4002,6 +4002,123 @@ class SweepTest(ForgejoTest):
         self.assertFalse((self.tmp / "push-argv.json").exists())
         self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
 
+    def plant_first_file_removal_failure(self) -> tuple[Path, Path, Path]:
+        """Install an rm wrapper that fails once on the first private merge file."""
+        real_rm = shutil.which("rm")
+        self.assertIsNotNone(real_rm)
+        refused = self.tmp / "refused-removal.txt"
+        refused.unlink(missing_ok=True)
+        wrapper = self.bin_dir / "rm"
+        clean_tmp = self.tmp / "merge-tmp"
+        clean_tmp.mkdir(exist_ok=True)
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            f'if [ "$1" = -f ] && [ ! -e {shlex.quote(str(refused))} ]; then\n'
+            f'  printf "%s\\n" "${{@: -1}}" >{shlex.quote(str(refused))}\n'
+            "  exit 1\nfi\n"
+            f'exec {shlex.quote(str(real_rm))} "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        return wrapper, refused, clean_tmp
+
+    def assert_first_file_removal_failed(
+        self, result: subprocess.CompletedProcess[str], refused: Path
+    ) -> None:
+        """Assert status 1 and a single final cannot-delete stderr line for the kept file."""
+        path = refused.read_text(encoding="utf-8").strip()
+        self.assertTrue(path)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        message = f"ffmpeg-forgejo: cannot delete {path}."
+        lines = result.stderr.splitlines()
+        self.assertEqual(lines[-1], message)
+        self.assertEqual(lines.count(message), 1)
+        self.assertTrue(Path(path).exists())
+
+    def test_push_first_private_file_removal_failure_stops_before_push(self) -> None:
+        """A failed removal of the first private merge file stops push with status 1."""
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        wrapper, refused, clean_tmp = self.plant_first_file_removal_failure()
+        result = self.sweep_command(
+            "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+        )
+        self.assert_first_file_removal_failed(result, refused)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        wrapper.unlink()
+        control = self.sweep_command(
+            "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+        )
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_pr_first_private_file_removal_failure_stops_before_writes(self) -> None:
+        """A failed removal of the first private merge file stops PR creation before writes."""
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        wrapper, refused, clean_tmp = self.plant_first_file_removal_failure()
+        stub = Stub(reviewers=[["alice"]])
+        result = self.sweep_command(
+            "pr",
+            "--sweep",
+            str(self.sweep),
+            stub=stub,
+            env_updates={"TMPDIR": str(clean_tmp)},
+        )
+        self.assert_first_file_removal_failed(result, refused)
+        self.assertEqual(self.sweep_requests, [])
+        self.assertEqual(stub.requested_users, [])
+        wrapper.unlink()
+        control_stub = Stub(reviewers=[["alice"]])
+        control = self.sweep_command(
+            "pr",
+            "--sweep",
+            str(self.sweep),
+            stub=control_stub,
+            env_updates={"TMPDIR": str(clean_tmp)},
+        )
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertIn("stub/pulls/1", control.stdout)
+        self.assertEqual(control_stub.requested_users, ["alice", "Forgejo_Fairy"])
+
+    def test_conflict_first_private_file_removal_failure_overrides_conflict(self) -> None:
+        """A failed removal on the merge-conflict path exits 1 without deferring status 73."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        wrapper, refused, clean_tmp = self.plant_first_file_removal_failure()
+        result = self.sweep_command(
+            "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+        )
+        self.assert_first_file_removal_failed(result, refused)
+        self.assertNotIn("does not merge cleanly", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        wrapper.unlink()
+        control = self.sweep_command(
+            "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+        )
+        self.assertEqual(control.returncode, 73, control.stderr)
+        self.assertIn("does not merge cleanly into live master", control.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_landed_first_private_file_removal_failure_overrides_landed_status(self) -> None:
+        """A failed removal of the first private merge file on a landed head exits 1, not 82."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        for index in range(2):
+            if index == 1:
+                advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "later base edit\n")
+            with self.subTest(conflicting=bool(index)):
+                wrapper, refused, clean_tmp = self.plant_first_file_removal_failure()
+                result = self.sweep_command(
+                    "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+                )
+                self.assert_first_file_removal_failed(result, refused)
+                self.assertNotIn("already on the live base", result.stderr)
+                self.assertFalse((self.tmp / "push-argv.json").exists())
+                wrapper.unlink()
+                control = self.sweep_command(
+                    "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+                )
+                self.assertEqual(control.returncode, 82, control.stderr)
+                self.assertIn("already on the live base", control.stderr)
+                self.assertFalse((self.tmp / "push-argv.json").exists())
+
     def test_push_refuses_landed_head_before_sending(self) -> None:
         """A landed head exits 82 without reaching Git push or API writes."""
         base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")

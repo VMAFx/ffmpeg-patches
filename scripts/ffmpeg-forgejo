@@ -1113,30 +1113,31 @@ MERGE_TREE_OUT=""
 MERGE_TREE_MAX_BYTES=1048576
 LANDED_DIR=""
 
-# merge_base_cleanup: remove private state, preserving status unless any cleanup fails.
+# merge_base_cleanup: remove private state, preserving status or exiting 1 when any cleanup fails.
 merge_base_cleanup() {
-  local save_status=$?
+  local save_status=$? failed=0
   if [ -n "$LANDED_DIR" ]; then
     if ! rm -rf -- "$LANDED_DIR"; then
       printf 'ffmpeg-forgejo: cannot delete %s.\n' "$LANDED_DIR" >&2
-      save_status=1
+      failed=1
     fi
     LANDED_DIR=""
   fi
   if [ -n "$MERGE_TREE_OUT" ]; then
     if ! rm -f "$MERGE_TREE_OUT"; then
       printf 'ffmpeg-forgejo: cannot delete %s.\n' "$MERGE_TREE_OUT" >&2
-      save_status=1
+      failed=1
     fi
     MERGE_TREE_OUT=""
   fi
   if [ -n "$MERGE_BASE_REF" ]; then
     if ! timeout 120 git update-ref -d "$MERGE_BASE_REF"; then
       printf 'ffmpeg-forgejo: cannot delete %s.\n' "$MERGE_BASE_REF" >&2
-      save_status=1
+      failed=1
     fi
     MERGE_BASE_REF=""
   fi
+  [ "$failed" -eq 0 ] || exit 1
   return "$save_status"
 }
 
@@ -1213,12 +1214,12 @@ neutral_merge_tree() {
   local ref="$1" sha="$2" empty size
   local -a pipe_status=()
   if ! empty="$(timeout 120 git hash-object -t tree --stdin </dev/null)" || [ -z "$empty" ]; then
-    merge_base_cleanup
+    merge_base_cleanup || exit 1
     printf 'ffmpeg-forgejo: cannot compute empty tree id; merge with the live base not proven.\n' >&2
     exit 1
   fi
   if ! MERGE_TREE_OUT="$(mktemp)"; then
-    merge_base_cleanup
+    merge_base_cleanup || exit 1
     printf 'ffmpeg-forgejo: cannot create temporary file; merge with the live base not proven.\n' >&2
     exit 1
   fi
@@ -1232,19 +1233,19 @@ neutral_merge_tree() {
     pipe_status=("${PIPESTATUS[@]}")
   fi
   if ! size="$(wc -c <"$MERGE_TREE_OUT")"; then
-    merge_base_cleanup
+    merge_base_cleanup || exit 1
     printf 'ffmpeg-forgejo: cannot measure merge-tree output; merge with the live base not proven.\n' >&2
     exit 1
   fi
   size="${size//[[:space:]]/}"
   if [ "$size" -gt "$MERGE_TREE_MAX_BYTES" ]; then
-    merge_base_cleanup
+    merge_base_cleanup || exit 1
     printf 'ffmpeg-forgejo: merge-tree output exceeds %s bytes; merge with the live base not proven.\n' \
       "$MERGE_TREE_MAX_BYTES" >&2
     exit 1
   fi
   if [ "${pipe_status[1]:-1}" -ne 0 ]; then
-    merge_base_cleanup
+    merge_base_cleanup || exit 1
     printf 'ffmpeg-forgejo: merge-tree output capture failed with status %s; merge with the live base not proven.\n' \
       "${pipe_status[1]:-1}" >&2
     exit 1
@@ -1257,15 +1258,15 @@ require_clean_merge() {
   local sha="$1" ref rc base_sha paths
   ref="refs/ffmpeg-forgejo/merge-base-$$"
   MERGE_BASE_REF="$ref"
-  trap merge_base_cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  trap 'merge_base_cleanup || exit $?' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
   if ! fetch_base_ref "$ref"; then
     printf 'ffmpeg-forgejo: cannot fetch %s from %s; merge with the live base not proven.\n' \
       "$BASE" "$GIT_URL" >&2
-    merge_base_cleanup
+    merge_base_cleanup || exit 1
     exit 1
   fi
   if ! merge_settings_neutral; then
-    merge_base_cleanup
+    merge_base_cleanup || exit 1
     exit 1
   fi
   if neutral_merge_tree "$ref" "$sha"; then
@@ -1274,21 +1275,21 @@ require_clean_merge() {
     rc=$?
   fi
   if [ "$rc" -eq 0 ]; then
-    merge_base_cleanup
+    merge_base_cleanup || exit 1
     trap - EXIT
     return 0
   fi
   if [ "$rc" -eq 1 ]; then
-    base_sha="$(timeout 120 git rev-parse --verify "$ref")" || { merge_base_cleanup; exit 1; }
+    base_sha="$(timeout 120 git rev-parse --verify "$ref")" || { merge_base_cleanup || exit 1; exit 1; }
     paths="$(python3 -I -c \
       'import sys; print(" ".join(dict.fromkeys(filter(None, sys.stdin.read().split("\n")[1:]))))' \
-      <"$MERGE_TREE_OUT")" || { merge_base_cleanup; exit 1; }
-    merge_base_cleanup
+      <"$MERGE_TREE_OUT")" || { merge_base_cleanup || exit 1; exit 1; }
+    merge_base_cleanup || exit 1
     printf 'ffmpeg-forgejo: %s does not merge cleanly into live %s at %s; conflicting files: %s; rebase onto the live base and sweep again.\n' \
       "${sha:0:12}" "$BASE" "${base_sha:0:12}" "$paths" >&2
     exit 73
   fi
-  merge_base_cleanup
+  merge_base_cleanup || exit 1
   printf 'ffmpeg-forgejo: merge-tree failed with status %s; merge with the live base not proven.\n' \
     "$rc" >&2
   exit 1
@@ -1304,7 +1305,7 @@ prepare_clean_merge() {
     return 0
   fi
   [ -z "$report" ] || printf '%s\n' "$report" >&2
-  return "$rc"
+  [ "$rc" -eq 0 ] || exit "$rc"
 }
 
 # require_sendable_head SHA: refuse landed changes, then any deferred live-base conflict before a write.
@@ -1424,7 +1425,7 @@ require_unlanded() {
     printf 'ffmpeg-forgejo: change is already on the live base %s; outbound act refused.\n%s\n' \
       "$BASE" "$report" >&2
   fi
-  return "$rc"
+  [ "$rc" -eq 0 ] || exit "$rc"
 }
 
 # select_promise_pull BRANCH LOGIN: reject malformed rows before selecting an own PR.
