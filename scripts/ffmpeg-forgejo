@@ -11,7 +11,7 @@
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
 #   ffmpeg-forgejo push    --sweep <file> [--promises <file>] [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#                          --promises maps own next-push comment IDs to literal fragments, compared after collapsing whitespace runs to one space, in commit messages or PR body;
+#                          --promises maps own comment IDs with non-question sentences (at most 300 characters) naming the/my next push/revision/version/iteration/round to literal fragments in whitespace-normalized commit messages or PR body;
 #                          missing or unfulfilled promises exit 79 before Git push
 #   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
@@ -1319,7 +1319,16 @@ import stat
 import subprocess
 import sys
 
-PATTERN = re.compile(r"\bI(?: will|['\u2019]ll)\b[^.!?\n]{0,300}?\b(?:with|in|into|on|for) (?:the|my) next (?:push|revision|version|iteration|round)\b", re.I)
+PATTERN = re.compile(r"\b(?:the|my) next (?:push|revision|version|iteration|round)\b", re.I)
+
+
+def promise_sentence(body: str) -> str | None:
+    """Return the first non-question next-revision sentence of at most 300 characters."""
+    for match in re.finditer(r"[^.!?\n]+[.!?]?", body):
+        sentence = match[0].strip()
+        if len(sentence) <= 300 and not sentence.endswith("?") and PATTERN.search(sentence):
+            return sentence
+    return None
 
 
 def refuse(message: str) -> None:
@@ -1333,7 +1342,7 @@ PY
 promise_python_comments() {
   cat <<'PY'
 def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
-    """Find the first next-push promise sentence in each own comment."""
+    """Find the first bounded non-question next-revision sentence in each own comment."""
     if len(comments) > 1000:
         refuse("too many issue comments")
     found = {}
@@ -1346,13 +1355,9 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
         if not isinstance(body, str):
             refuse("malformed own issue comment")
         body = re.sub(r"(?m)^[^\S\n]*>[^\n]*", "", body)
-        match = PATTERN.search(body)
-        if match is None:
+        sentence = promise_sentence(body)
+        if sentence is None:
             continue
-        start = max(body.rfind(mark, 0, match.start()) for mark in ".!?\n") + 1
-        ends = [body.find(mark, match.end()) for mark in ".!?\n"]
-        end = min((pos for pos in ends if pos >= 0), default=len(body))
-        sentence = body[start : end + (end < len(body))].strip()
         ident, url = row.get("id"), row.get("html_url")
         if isinstance(ident, bool) or not isinstance(ident, int) or ident < 1 or not isinstance(url, str):
             refuse("malformed own promise comment")

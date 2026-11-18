@@ -4196,19 +4196,97 @@ class SweepTest(ForgejoTest):
         ):
             with self.subTest(sentence=sentence):
                 self.assert_promise_refused(self.promise_stub(comment=sentence), None, "81815")
-        result = self.promise_push(self.promise_stub(comment="the next push from the bot"))
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_promise_refused(
+            self.promise_stub(comment="the next push from the bot"), None, "81815"
+        )
+
+    def test_push_matches_subject_independent_promise_wording(self) -> None:
+        """Each missed wording needs a promise row fulfilled by a pushed commit message."""
+
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "qualify the close errors",
+        )
+        sha = git_output(self.repo, "rev-parse", "topic")
+        self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
+        for sentence in (
+            "The commit message does not yet qualify the wording; that follows with the next push.",
+            "Will fix in the next push.",
+            "The scope qualification will be added in the next revision.",
+            "We will qualify the commit message with the next push.",
+            "I am going to qualify the commit message in the next push.",
+            "Fixed locally, coming with the next push.",
+            "The next push carries the qualified commit message.",
+        ):
+            with self.subTest(sentence=sentence):
+                (self.tmp / "push-argv.json").unlink(missing_ok=True)
+                stub = self.promise_stub(comment=sentence)
+                self.assert_promise_refused(stub, None, sentence)
+                result = self.promise_push(stub, self.promise_file())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_ignores_past_and_question_sentences(self) -> None:
+        """Past revisions and questions about the next push impose no promise row."""
+
+        for sentence in (
+            "The last push qualified the commit message.",
+            "This was fixed in the previous revision.",
+            "Should that wait for the next push?",
+        ):
+            with self.subTest(sentence=sentence):
+                (self.tmp / "push-argv.json").unlink(missing_ok=True)
+                result = self.promise_push(self.promise_stub(comment=sentence))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.tmp / "push-argv.json").exists())
 
     def test_push_promise_sentence_bound_is_300_characters(self) -> None:
-        """The matcher accepts 300 intervening characters and rejects 301."""
+        """The matcher accepts a 300-character sentence and rejects 301 characters."""
 
         prefix = "I will "
         suffix = " with my next push."
-        self.assert_promise_refused(
-            self.promise_stub(comment=prefix + "x" * 298 + suffix), None, "81815"
-        )
-        result = self.promise_push(self.promise_stub(comment=prefix + "x" * 299 + suffix))
+        sentence = prefix + "x" * (300 - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(len(sentence), 300)
+        self.assert_promise_refused(self.promise_stub(comment=sentence), None, "81815")
+        result = self.promise_push(self.promise_stub(comment="x" + sentence))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_push_promise_bound_includes_text_after_next_push(self) -> None:
+        """A subject-independent promise is bounded through its sentence terminator."""
+
+        prefix = "The next push carries "
+        sentence = prefix + "x" * (299 - len(prefix)) + "."
+        self.assertEqual(len(sentence), 300)
+        self.assert_promise_refused(self.promise_stub(comment=sentence), None, sentence)
+        result = self.promise_push(self.promise_stub(comment=sentence + "x"))
+        self.assertEqual(result.returncode, 79, result.stderr)
+        result = self.promise_push(self.promise_stub(comment=sentence[:-1] + "x."))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_records_first_non_question_promise_sentence(self) -> None:
+        """Skip quoted promises and questions before recording the first promise sentence."""
+
+        sentence = "Fixed locally, coming with the next push."
+        comment = (
+            "> The next push carries quoted changes.\n"
+            "Should that wait for the next push? "
+            f"{sentence} We will add more in my next revision."
+        )
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 79, result.stderr)
+        self.assertIn(f": {sentence}; --promises <file> required", result.stderr)
+        self.assertNotIn("We will add more", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
 
     def test_push_accepts_fragment_only_in_pr_body(self) -> None:
         """The PR body can supply literal promise evidence."""
