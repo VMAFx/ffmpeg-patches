@@ -4267,7 +4267,7 @@ class SweepTest(ForgejoTest):
         sentence = prefix + "x" * (299 - len(prefix)) + "."
         self.assertEqual(len(sentence), 300)
         self.assert_promise_refused(self.promise_stub(comment=sentence), None, sentence)
-        result = self.promise_push(self.promise_stub(comment=sentence + "x"))
+        result = self.promise_push(self.promise_stub(comment=sentence + " x"))
         self.assertEqual(result.returncode, 79, result.stderr)
         result = self.promise_push(self.promise_stub(comment=sentence[:-1] + "x."))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -4287,6 +4287,151 @@ class SweepTest(ForgejoTest):
         self.assertIn(f": {sentence}; --promises <file> required", result.stderr)
         self.assertNotIn("We will add more", result.stderr)
         self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_wrapped_promise_marker(self) -> None:
+        """A marker wrapped inside a paragraph still requires a promise row."""
+
+        comment = "I will fix parser.c in the next\npush."
+        expected = " ".join(comment.split())
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, expected)
+
+    def test_push_refuses_wrapped_list_promise(self) -> None:
+        """A continuation line belongs to the same list-item promise sentence."""
+
+        comment = "- I will fix parser.c with the next\n  push."
+        expected = " ".join(comment.split())
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, expected)
+
+    def test_push_refuses_promise_with_parenthesized_question(self) -> None:
+        """An internal parenthesized question does not make the sentence a question."""
+
+        comment = "I will fix this in the next push (OK?)."
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, comment)
+
+    def test_push_accepts_question_with_dotted_filename(self) -> None:
+        """The final question mark governs a sentence containing a dotted filename."""
+
+        comment = "Does the next push fix parser.c?"
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_accepts_301_character_dotted_sentence(self) -> None:
+        """A dotted filename cannot hide the rest of an overlength promise sentence."""
+
+        prefix = "The next push fixes parser.c "
+        comment = prefix + "x" * (300 - len(prefix)) + "."
+        self.assertEqual(len(" ".join(comment.split())), 301)
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_records_promise_after_301_character_sentence(self) -> None:
+        """An overlength first sentence leaves the later short promise eligible."""
+
+        prefix = "The next push fixes parser.c "
+        first = prefix + "x" * (300 - len(prefix)) + "."
+        comment = first + " I will fix parser.c in the next push."
+        expected = " ".join(comment[len(first) :].split())
+        self.assertEqual(len(first), 301)
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 79, result.stderr)
+        self.assertIn(f": {expected}; --promises <file> required", result.stderr)
+        self.assertNotIn(first, result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_push_records_complete_collapsed_wrapped_promise(self) -> None:
+        """Recorded text collapses whitespace and preserves dotted tokens intact."""
+
+        comment = "I will fix parser.c\tand v1.2 in my\n  next\tpush."
+        expected = " ".join(comment.split())
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 79, result.stderr)
+        self.assertIn(f": {expected}; --promises <file> required", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_push_accepts_fulfilled_collapsed_wrapped_promise(self) -> None:
+        """A collapsed recorded promise can supply the unchanged promise-file fragment."""
+
+        comment = "I will fix parser.c\tand v1.2 in my\n  next\tpush."
+        expected = " ".join(comment.split())
+        stub = self.promise_stub(comment=comment, body=comment)
+        result = self.promise_push(stub, self.promise_file(f"81815: {expected}\n"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_respects_blank_line_and_list_sentence_boundaries(self) -> None:
+        """Blank lines and new list items end a preceding unpunctuated paragraph."""
+
+        separators = ("\n\n", "\n- ", "\n  1. ", "\n+ ", "\n* ", "\n2) ")
+        for index in range(6):
+            with self.subTest(separator=separators[index]):
+                comment = "x" * 301 + separators[index] + "The next push fixes parser.c."
+                expected = " ".join(comment[301:].split())
+                self.assert_promise_refused(self.promise_stub(comment=comment), None, expected)
+
+    def test_push_collapses_whitespace_before_sentence_length_check(self) -> None:
+        """Only collapsed whitespace counts toward the whole-sentence length bound."""
+
+        prefix = "The next\n\tpush fixes parser.c "
+        comment = prefix + "x" * (299 - len(" ".join(prefix.split()) + " ")) + "."
+        expected = " ".join(comment.split())
+        self.assertEqual(len(expected), 300)
+        self.assertGreater(len(comment), 300)
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, expected)
+
+    def test_push_refuses_comment_above_byte_cap(self) -> None:
+        """An own comment one byte above the cap refuses before quote removal."""
+
+        comment = "> " + "x" * 65535
+        self.assertEqual(len(comment.encode("utf-8")), 65537)
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment), None, "comment 81815: body exceeds 65536-byte cap"
+        )
+
+    def test_push_refuses_multibyte_comment_above_byte_cap(self) -> None:
+        """The own-comment cap counts UTF-8 bytes rather than Unicode characters."""
+
+        comment = "\u00e9" * 32768 + "x"
+        self.assertEqual(len(comment.encode("utf-8")), 65537)
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment), None, "comment 81815: body exceeds 65536-byte cap"
+        )
+
+    def test_push_accepts_comment_at_byte_cap_without_promise(self) -> None:
+        """A comment exactly at the byte cap remains eligible for a normal push."""
+
+        comment = "x" * 65536
+        self.assertEqual(len(comment.encode("utf-8")), 65536)
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_comment_at_sentence_cap(self) -> None:
+        """Reaching 2000 logical sentences refuses even without promise wording."""
+
+        comment = "No promise. " * 2000
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment), None, "comment 81815: reached 2000-sentence cap"
+        )
+
+    def test_push_accepts_comment_below_sentence_cap(self) -> None:
+        """A comment with 1999 sentences does not trigger the sentence cap."""
+
+        comment = "No promise. " * 1999
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_sentence_cap_after_early_promise(self) -> None:
+        """An early eligible promise cannot stop the scan before the sentence cap."""
+
+        comment = "The next push fixes parser.c. " + "No promise. " * 1999
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment, body="fix parser.c"),
+            self.promise_file("81815: fix parser.c\n"),
+            "comment 81815: reached 2000-sentence cap",
+        )
 
     def test_push_accepts_fragment_only_in_pr_body(self) -> None:
         """The PR body can supply literal promise evidence."""

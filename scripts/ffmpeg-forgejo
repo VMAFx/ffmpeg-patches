@@ -1319,16 +1319,40 @@ import stat
 import subprocess
 import sys
 
-PATTERN = re.compile(r"\b(?:the|my) next (?:push|revision|version|iteration|round)\b", re.I)
+PATTERN = re.compile(r"\b(?:the|my)\s+next\s+(?:push|revision|version|iteration|round)\b", re.I)
+BOUNDARY = re.compile(
+    r"[.!?](?=\s|$)|\n[^\S\n]*\n|^[^\S\n]*(?:[-+*]|[0-9]+[.)])(?=\s|$)", re.M
+)
 
 
-def promise_sentence(body: str) -> str | None:
-    """Return the first non-question next-revision sentence of at most 300 characters."""
-    for match in re.finditer(r"[^.!?\n]+[.!?]?", body):
-        sentence = match[0].strip()
-        if len(sentence) <= 300 and not sentence.endswith("?") and PATTERN.search(sentence):
-            return sentence
-    return None
+def logical_sentences(body: str):
+    """Yield collapsed sentences at whitespace-delimited punctuation or block boundaries."""
+    start = 0
+    boundaries = BOUNDARY.finditer(body)
+    for _ in range(65537):
+        match = next(boundaries, None)
+        end = len(body) if match is None else match.start()
+        if match is not None and body[match.start()] in ".!?":
+            end = match.end()
+        sentence = " ".join(body[start:end].split())
+        if sentence:
+            yield sentence
+        if match is None:
+            return
+        start = end
+
+
+def promise_sentence(body: str, ident: object) -> str | None:
+    """Find the first eligible whole sentence while enforcing the per-comment scan cap."""
+    sentences = logical_sentences(body)
+    first = None
+    for _ in range(2000):
+        sentence = next(sentences, None)
+        if sentence is None:
+            return first
+        if first is None and len(sentence) <= 300 and not sentence.endswith("?") and PATTERN.search(sentence):
+            first = sentence
+    refuse(f"comment {ident}: reached 2000-sentence cap")
 
 
 def refuse(message: str) -> None:
@@ -1354,8 +1378,11 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
         body = row.get("body")
         if not isinstance(body, str):
             refuse("malformed own issue comment")
+        ident = row.get("id")
+        if len(body) > 65536 or len(body.encode("utf-8")) > 65536:
+            refuse(f"comment {ident}: body exceeds 65536-byte cap")
         body = re.sub(r"(?m)^[^\S\n]*>[^\n]*", "", body)
-        sentence = promise_sentence(body)
+        sentence = promise_sentence(body, ident)
         if sentence is None:
             continue
         ident, url = row.get("id"), row.get("html_url")
