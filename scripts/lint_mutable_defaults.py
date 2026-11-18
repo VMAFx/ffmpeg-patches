@@ -11,7 +11,7 @@ import subprocess  # nosec B404 - bounded local tool invocations, without a shel
 import sys
 from pathlib import Path
 
-PYLINT_VERSION = "4.1.3"
+PYLINT_VERSION = "4.1.4"
 PYLINT_FLAGS = (
     "--disable=all",
     "--enable=dangerous-default-value",
