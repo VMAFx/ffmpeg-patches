@@ -9,6 +9,20 @@ import unittest
 
 from tests import helpers
 
+RESET_LINES = (
+    "0 128 72 same",
+    "1 128 72 same",
+    "2 128 72 same",
+    "3 128 72 same",
+    "4 96 56 same",
+    "5 96 56 same",
+    "6 96 56 same",
+    "7 96 56 same",
+    "8 160 96 same",
+    "9 160 96 same",
+    "10 160 96 same",
+    "11 160 96 same",
+)
 VULKAN_LINES = (
     "14 160 96 first same",
     "12 160 96 yuv420p10 refused EINVAL",
@@ -27,8 +41,12 @@ class ResetOutputTest(unittest.TestCase):
 
     def test_reset_frames_pass(self) -> None:
         """Accept the twelve expected frames with exit status zero."""
-        stdout = "\n".join(helpers.RESET_LINES) + "\n"
+        stdout = "\n".join(RESET_LINES) + "\n"
         self.assertEqual(helpers.reset_output_problems(0, stdout), [])
+
+    def test_reset_lines_match_literal_transcript(self) -> None:
+        """Keep the shared reset expectations equal to the fixed transcript."""
+        self.assertEqual(RESET_LINES, helpers.RESET_LINES)
 
     def test_vulkan_extra_lines_pass(self) -> None:
         """Accept Vulkan checks following the twelve expected frames."""
