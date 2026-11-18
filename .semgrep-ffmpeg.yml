@@ -45,7 +45,7 @@ rules:
                   - pattern-inside: |
                       $BUF_TYPE *$BUF = $ALLOC(...);
                       ...
-                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                      $DST_TYPE *$DST = $TERNARY;
                       ...
                       if ($CHECK) {
                         ...
@@ -53,7 +53,7 @@ rules:
                   - pattern-inside: |
                       $BUF_TYPE *$BUF = $ALLOC(...);
                       ...
-                      $DST = $BUF ? $VALUE : NULL;
+                      $DST = $TERNARY;
                       ...
                       if ($CHECK) {
                         ...
@@ -61,7 +61,7 @@ rules:
                   - pattern-inside: |
                       $BUF = $ALLOC(...);
                       ...
-                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                      $DST_TYPE *$DST = $TERNARY;
                       ...
                       if ($CHECK) {
                         ...
@@ -69,7 +69,7 @@ rules:
                   - pattern-inside: |
                       $BUF = $ALLOC(...);
                       ...
-                      $DST = $BUF ? $VALUE : NULL;
+                      $DST = $TERNARY;
                       ...
                       if ($CHECK) {
                         ...
@@ -81,12 +81,53 @@ rules:
                     - pattern: '$BUF == NULL'
                     - pattern: '... || !$BUF || ...'
                     - pattern: '... || $BUF == NULL || ...'
+              # Buffer writes invalidate only later buffer checks.
+              - pattern-not-inside: |
+                  $BUF_TYPE *$BUF = $ALLOC(...);
+                  ...
+                  $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                  ...
+                  $BUF = $OTHER;
+                  ...
+                  if ($CHECK) {
+                    ...
+                  }
+              - pattern-not-inside: |
+                  $BUF_TYPE *$BUF = $ALLOC(...);
+                  ...
+                  $DST = $BUF ? $VALUE : NULL;
+                  ...
+                  $BUF = $OTHER;
+                  ...
+                  if ($CHECK) {
+                    ...
+                  }
+              - pattern-not-inside: |
+                  $BUF = $ALLOC(...);
+                  ...
+                  $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                  ...
+                  $BUF = $OTHER;
+                  ...
+                  if ($CHECK) {
+                    ...
+                  }
+              - pattern-not-inside: |
+                  $BUF = $ALLOC(...);
+                  ...
+                  $DST = $BUF ? $VALUE : NULL;
+                  ...
+                  $BUF = $OTHER;
+                  ...
+                  if ($CHECK) {
+                    ...
+                  }
           - patterns:
               - pattern-either:
                   - pattern-inside: |
                       $BUF_TYPE *$BUF = $ALLOC(...);
                       ...
-                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                      $DST_TYPE *$DST = $TERNARY;
                       ...
                       if ($CHECK) {
                         ...
@@ -94,7 +135,7 @@ rules:
                   - pattern-inside: |
                       $BUF_TYPE *$BUF = $ALLOC(...);
                       ...
-                      $DST = $BUF ? $VALUE : NULL;
+                      $DST = $TERNARY;
                       ...
                       if ($CHECK) {
                         ...
@@ -102,7 +143,7 @@ rules:
                   - pattern-inside: |
                       $BUF = $ALLOC(...);
                       ...
-                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                      $DST_TYPE *$DST = $TERNARY;
                       ...
                       if ($CHECK) {
                         ...
@@ -110,7 +151,7 @@ rules:
                   - pattern-inside: |
                       $BUF = $ALLOC(...);
                       ...
-                      $DST = $BUF ? $VALUE : NULL;
+                      $DST = $TERNARY;
                       ...
                       if ($CHECK) {
                         ...
@@ -168,35 +209,27 @@ rules:
                   - pattern-inside: |
                       $BUF_TYPE *$BUF = $ALLOC(...);
                       ...
-                      if ($CHECK) {
-                        ...
-                      }
+                      if ($CHECK) $BODY;
                       ...
-                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                      $DST_TYPE *$DST = $TERNARY;
                   - pattern-inside: |
                       $BUF_TYPE *$BUF = $ALLOC(...);
                       ...
-                      if ($CHECK) {
-                        ...
-                      }
+                      if ($CHECK) $BODY;
                       ...
-                      $DST = $BUF ? $VALUE : NULL;
+                      $DST = $TERNARY;
                   - pattern-inside: |
                       $BUF = $ALLOC(...);
                       ...
-                      if ($CHECK) {
-                        ...
-                      }
+                      if ($CHECK) $BODY;
                       ...
-                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                      $DST_TYPE *$DST = $TERNARY;
                   - pattern-inside: |
                       $BUF = $ALLOC(...);
                       ...
-                      if ($CHECK) {
-                        ...
-                      }
+                      if ($CHECK) $BODY;
                       ...
-                      $DST = $BUF ? $VALUE : NULL;
+                      $DST = $TERNARY;
               - metavariable-pattern:
                   metavariable: $CHECK
                   pattern-either:
@@ -204,6 +237,20 @@ rules:
                     - pattern: '$BUF == NULL'
                     - pattern: '... || !$BUF || ...'
                     - pattern: '... || $BUF == NULL || ...'
+              - metavariable-pattern:
+                  metavariable: $BODY
+                  patterns:
+                    - pattern-either:
+                        - pattern: return ...;
+                        - pattern: goto $LABEL;
+                        - pattern: break;
+                        - pattern: continue;
+                    # Conditional or nested-loop exits need not leave this check.
+                    - pattern-not-inside: if (...) { ... }
+                    - pattern-not-inside: for (...) { ... }
+                    - pattern-not-inside: while (...) { ... }
+                    - pattern-not-inside: do { ... } while (...);
+                    - pattern-not-inside: switch (...) { ... }
       - pattern-either:
           - pattern: |
               $BUF_TYPE *$BUF = $ALLOC(...);
@@ -224,7 +271,7 @@ rules:
       - metavariable-regex:
           metavariable: $ALLOC
           regex: ^(av_malloc|av_mallocz|av_malloc_array|av_calloc|av_realloc|av_realloc_array|av_memdup|malloc|calloc|realloc)$
-      # Filter complete source-to-ternary ranges before focusing the destination.
+      # Filter complete source-to-ternary ranges before focusing the expression.
       # A later allocation starts a new range with no intervening write.
       - pattern-not: |
           $BUF_TYPE *$BUF = $ALLOC(...);
@@ -250,4 +297,4 @@ rules:
           $BUF = $OTHER;
           ...
           $DST = $BUF ? $VALUE : NULL;
-      - focus-metavariable: $DST
+      - focus-metavariable: $TERNARY

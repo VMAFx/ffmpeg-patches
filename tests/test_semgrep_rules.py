@@ -829,6 +829,8 @@ FFMPEG_ALLOCATION_OTHER_ELSE = (
 static void fallback_buffer(uint8_t *other)
 {
     uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    if (!buffer)
+        return;
     uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : other;
 }
 """
@@ -1023,6 +1025,90 @@ class FfmpegSemgrepRulesTest(unittest.TestCase):
     def test_allocation_ternary_with_other_else_passes(self) -> None:
         """Accept an allocation ternary whose fallback is another pointer."""
         self.assertEqual(_scan_ffmpeg_c(FFMPEG_ALLOCATION_OTHER_ELSE), [])
+
+    def test_checked_allocation_ternary_with_null_else_flagged(self) -> None:
+        """Flag the checked non-NULL fallback fixture when only its fallback becomes NULL."""
+        source = FFMPEG_ALLOCATION_OTHER_ELSE.replace(" : other;", " : NULL;")
+        self.assertEqual(len(_scan_ffmpeg_c(source)), 1)
+
+    def test_replaced_buffer_before_later_check_passes(self) -> None:
+        """Accept later checks of a buffer replaced after the ternary in all four forms."""
+        checks = ("!buffer", "buffer == NULL", "!other || !buffer", "!other || buffer == NULL")
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            for check in checks:
+                with self.subTest(allocation=allocation, destination=destination, check=check):
+                    source = (
+                        FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                            "ALLOCATION", f"{allocation} = av_malloc(128)"
+                        )
+                        .replace("DECLARATIONS", declarations)
+                        .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                        .replace("dst = other;", "buffer = other;")
+                        .replace("CHECK", check)
+                    )
+                    self.assertEqual(_scan_ffmpeg_c(source), [])
+
+    def test_original_buffer_later_check_flagged(self) -> None:
+        """Keep later buffer checks when no assignment replaces the allocation result."""
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            with self.subTest(allocation=allocation, destination=destination):
+                source = (
+                    FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                        "ALLOCATION", f"{allocation} = av_malloc(128)"
+                    )
+                    .replace("DECLARATIONS", declarations)
+                    .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                    .replace("    dst = other;\n", "")
+                    .replace("CHECK", "!buffer")
+                )
+                self.assertEqual(len(_scan_ffmpeg_c(source)), 1)
+
+    def test_fallthrough_buffer_check_before_ternary_passes(self) -> None:
+        """Accept earlier NULL checks that only log and leave NULL on the ternary path."""
+        for body in ("log_failure();", "if (DST_RECT_BUF_SIZE == 0) return -1;"):
+            with self.subTest(body=body):
+                source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+                    "if (buffer == NULL)\n        return -1;",
+                    f"if (buffer == NULL) {{ {body} }}",
+                )
+                self.assertEqual(_scan_ffmpeg_c(source), [])
+
+    def test_exiting_buffer_checks_before_ternary_flagged(self) -> None:
+        """Keep direct return, goto, break and continue exits that skip the ternary."""
+        for exit_kind in ("return", "goto", "break", "continue"):
+            with self.subTest(exit_kind=exit_kind):
+                source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY
+                if exit_kind == "goto":
+                    source = source.replace("return -1;", "goto failed;").replace(
+                        "    return 0;", "    return 0;\nfailed:\n    return -1;"
+                    )
+                elif exit_kind in ("break", "continue"):
+                    source = (
+                        source.replace("{\n", "{\n    for (int i = 0; i < 2; i++) {\n", 1)
+                        .replace("return -1;", f"{exit_kind};")
+                        .replace("    return 0;", "    }\n    return 0;")
+                    )
+                self.assertEqual(len(_scan_ffmpeg_c(source)), 1)
+
+    def test_multiline_ternary_span_covers_fallback(self) -> None:
+        """Report only the three-line ternary expression, including its NULL fallback."""
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+            "buffer ? buffer + DST_RECT_OFFSET : NULL",
+            "buffer\n        ? buffer + DST_RECT_OFFSET\n        : NULL",
+        )
+        results = _scan_ffmpeg_c(source)
+        lines = source.splitlines()
+        start = next(index for index, line in enumerate(lines, 1) if "*dst =" in line)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"]["line"], start)
+        self.assertEqual(results[0]["end"]["line"], start + 2)
+        self.assertEqual(results[0]["start"]["col"], lines[start - 1].index("= buffer") + 3)
+        self.assertEqual(results[0]["end"]["col"], lines[start + 1].index(";") + 1)
+        wrapped = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+            "buffer ? buffer + DST_RECT_OFFSET : NULL",
+            "choose(buffer ? buffer + DST_RECT_OFFSET : NULL)",
+        )
+        self.assertEqual(_scan_ffmpeg_c(wrapped), [])
 
     def test_allocation_in_separate_function_passes(self) -> None:
         """Keep allocation bindings local to the function containing the ternary."""
