@@ -7,7 +7,7 @@
 
   <img src="docs/assets/ffmpeg-patches-readme-banner.svg" alt="ffmpeg-patches — shared FFmpeg patch series for VMAFx and Pelorus" height="120" />
 
-  <!-- README-STANDARD badge block: one group, fixed order (docs/README-STANDARD.md) -->
+  <!-- Badge block: one group, fixed order. -->
   <!-- 1 release/version -->
   [![Release](https://img.shields.io/badge/Release-Releases-3b82f6?style=for-the-badge&labelColor=111a35)](https://github.com/VMAFx/ffmpeg-patches/releases)
   <!-- 3 security/scorecard -->
@@ -52,6 +52,9 @@ release contains it (see [How it works](#how-it-works)).
 
 ## Get started
 
+This repository ships patches only and builds nothing
+(see the [`build` target in Makefile](Makefile#L53-L55)).
+
 ```bash
 . ./base.env
 git clone --branch "$FFMPEG_TAG" --depth 1 "$FFMPEG_REMOTE" ffmpeg
@@ -59,9 +62,11 @@ test "$(git -C ffmpeg rev-parse HEAD)" = "$FFMPEG_COMMIT"
 python3 scripts/series.py apply --expect-base ffmpeg
 ```
 
-`apply` checks each patch and prints one result per patch. It runs
-`git am --3way` without your git configuration only when the patch does not
-already apply and its added lines are not in the tree:
+`apply` checks each patch and prints one result per patch. In
+[`apply_one`](scripts/series.py#L975-L984), it skips `git am --3way` only
+when the forward application check fails and all added lines are already
+in the tree. Otherwise, it attempts `git am --3way` without your git
+configuration and reports the result:
 
 - `applied`: the patch applied
 - `conflict`: it did not; the run stops unless `--keep-going` is given
@@ -384,7 +389,28 @@ https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard).
 
 ## Support ffmpeg-patches
 
-**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [40 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 12 merged, 25 open.
+**Why it matters.** ffmpeg-patches keeps one shared series of FFmpeg fixes
+for VMAFx and pelorus and sends every fix upstream; a patch is dropped once
+a pinned FFmpeg release carries it
+([ADR-0001](docs/adr/0001-shared-fix-series.md)). The current patch list is
+[`series.txt`](series.txt); its own and backported upstream pull requests
+and their states are in
+[`upstream-contributions.json`](upstream-contributions.json).
+From the repository root, this command prints the current patch total and
+pull request totals by state from those files:
+
+```bash
+python3 - <<'PY'
+import json
+from collections import Counter
+from pathlib import Path
+
+patches = (p.strip() for p in Path("series.txt").read_text().splitlines())
+pulls = json.loads(Path("upstream-contributions.json").read_text())["contributions"]
+print("Patches:", sum(bool(p) and not p.startswith("#") for p in patches))
+print("Pull requests:", len(pulls), dict(Counter(p["state"] for p in pulls)))
+PY
+```
 
 **What support funds.**
 - Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
