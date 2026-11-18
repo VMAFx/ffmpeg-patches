@@ -49,6 +49,15 @@ RTSP_WITHOUT_CLOSE = RTSP_WITH_CLOSE.replace("        ff_network_close();\n", ""
 FAKE_CONFIG = "repos: []\n"
 FAKE_MESSAGE = '#!/bin/sh\ngit log --format=%s "$1" | grep -Eq "^[^:]+: .+"\n'
 FAKE_PATCHECK = "#!/bin/sh\ncat > patcheck.stdout\nprintf 'patcheck fixture\\n'\n"
+DOCSTRING_EMPTY_CLEAN = (
+    "Docstring coverage: 100.00% (0/0 covered, counted: 0, covered: 0, threshold: 80%)\n"
+)
+DOCSTRING_FINDING = (
+    "Docstring coverage: 0.00% (0/2 covered, counted: 2, covered: 0, threshold: 80%)\n"
+    "libavfilter/vf_x.c:5 ff_alpha\n"
+    "libavfilter/vf_x.c:12 ff_beta\n"
+)
+DOCSTRING_ADVICE = "add a doc comment to each listed function, or pass --docstring-reason"
 
 
 class RulesTest(unittest.TestCase):
@@ -289,6 +298,134 @@ class FixWordTest(unittest.TestCase):
             "avfilter/vf_x: update y\n\nSigned-off-by: Bug Fixer <fixer@invalid>\n",
         ):
             with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_added_defect_words_and_phrases(self) -> None:
+        """Every added memory-safety and UB defect word or phrase matches in the body."""
+        words = (
+            "uninitialised",
+            "uninitialized",
+            "use after free",
+            "use-after-free",
+            "double free",
+            "double-free",
+            "null dereference",
+            "null dereferences",
+            "null pointer dereference",
+            "null pointer dereferences",
+            "division by zero",
+            "divide by zero",
+            "undefined behaviour",
+            "undefined behavior",
+            "deadlock",
+            "deadlocks",
+            "deadlocked",
+            "segfault",
+            "segfaults",
+            "segfaulted",
+            "segmentation fault",
+            "segmentation faults",
+            "memory corruption",
+            "heap corruption",
+            "stack corruption",
+            "OOB",
+            "oob",
+        )
+        for word in words:
+            with self.subTest(word=word):
+                message = f"avformat/rtsp: check write\n\nAvoid {word} on reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), word)
+
+    def test_wrapped_and_hyphenated_added_defect_phrases(self) -> None:
+        """Added multi-word phrases match across line breaks, and free phrases across hyphens."""
+        phrases = (
+            "use\nafter free",
+            "use after\nfree",
+            "use-after-free",
+            "use-after-\nfree",
+            "use\n-after-free",
+            "double\nfree",
+            "double-free",
+            "double-\nfree",
+            "double\n-free",
+            "null\ndereference",
+            "null\ndereferences",
+            "null\npointer dereference",
+            "null pointer\ndereferences",
+            "division\nby zero",
+            "division by\nzero",
+            "divide\nby zero",
+            "divide by\nzero",
+            "undefined\nbehaviour",
+            "undefined\nbehavior",
+            "segmentation\nfault",
+            "segmentation\nfaults",
+            "memory\ncorruption",
+            "heap\ncorruption",
+            "stack\ncorruption",
+        )
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                message = f"avformat/rtsp: check write\n\nAvoid {phrase} on reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), phrase)
+
+    def test_excluded_and_partial_words_return_none(self) -> None:
+        """Excluded concurrency words and isolated parts of defect phrases return None."""
+        words = (
+            "hang",
+            "hangs",
+            "race",
+            "race condition",
+            "data race",
+            "infinite loop",
+            "free",
+            "freed",
+            "double",
+            "zero",
+            "undefined",
+            "behaviour",
+            "behavior",
+            "pointer",
+            "initialised",
+            "initialized",
+            "lock",
+        )
+        for word in words:
+            with self.subTest(word=word):
+                message = f"avformat/rtsp: check write\n\nHandle {word} in reply.\n"
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_added_defect_word_in_signoff_returns_none(self) -> None:
+        """Added defect words inside Signed-off-by trailers are ignored."""
+        for trailer in (
+            "Signed-off-by: Uninitialised Segfault <x@invalid>",
+            "signed-off-by: Double Free <oob@invalid>",
+        ):
+            with self.subTest(trailer=trailer):
+                message = f"avformat/rtsp: check write\n\n{trailer}\n"
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_hyphenated_uninitialised_and_warning_flags(self) -> None:
+        """Sanitizer hyphenated forms match while warning flag prefixes return None."""
+        for token, expected in (
+            ("use-of-uninitialized-value", "uninitialized"),
+            ("use-of-uninitialised-value", "uninitialised"),
+        ):
+            with self.subTest(token=token):
+                message = f"avformat/rtsp: check write\n\nHandle {token} in reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), expected)
+        for flag in (
+            "-Wmaybe-uninitialized",
+            "-Wmaybe-uninitialised",
+            "maybe-uninitialized",
+            "maybe-uninitialised",
+            "-Wsometimes-uninitialized",
+            "-Wsometimes-uninitialised",
+            "sometimes-uninitialized",
+            "sometimes-uninitialised",
+        ):
+            with self.subTest(flag=flag):
+                message = f"avformat/rtsp: check write\n\nHandle {flag} in reply.\n"
                 self.assertIsNone(upstream_lint.fix_word(message))
 
 
@@ -1725,8 +1862,139 @@ class TestProgramTest(unittest.TestCase):
                 self.assertFalse(upstream_lint.is_test_program_path(name))
 
 
+class DocstringsStepTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of the docstrings step and reader."""
+
+    def run_step(self, returncode: int, stdout: str, waiver: str = "") -> upstream_lint.Step:
+        """Run _docstrings with _run stubbed to return the chosen status and output."""
+        stub = upstream_lint.RunResult((), returncode, stdout)
+        with unittest.mock.patch.object(upstream_lint, "_run", return_value=stub):
+            return upstream_lint._docstrings(Path("/fixture/ffmpeg"), "base", "head", waiver)
+
+    def test_coverage_pass_returns_zero(self) -> None:
+        """Exit 0 with a valid first-line coverage summary returns step rc 0."""
+        covered = (
+            "Docstring coverage: 85.71% (6/7 covered, counted: 7, covered: 6, threshold: 80%)\n"
+        )
+        for stdout in (DOCSTRING_EMPTY_CLEAN, covered):
+            with self.subTest(stdout=stdout):
+                expected = stdout.rstrip("\n")
+                self.assertEqual(
+                    upstream_lint.docstring_result(0, stdout),
+                    upstream_lint.Step("docstrings", 0, expected),
+                )
+                step = self.run_step(0, stdout)
+                self.assertEqual(step, upstream_lint.Step("docstrings", 0, expected))
+
+    def test_coverage_finding_returns_one_with_functions_and_advice(self) -> None:
+        """Exit 1 with a coverage summary keeps the function lines and appends advice."""
+        expected = f"{DOCSTRING_FINDING.rstrip()}\n{DOCSTRING_ADVICE}"
+        self.assertEqual(
+            upstream_lint.docstring_result(1, DOCSTRING_FINDING),
+            upstream_lint.Step("docstrings", 1, expected),
+        )
+        step = self.run_step(1, DOCSTRING_FINDING)
+        self.assertEqual(step.rc, 1)
+        self.assertEqual(step.output, expected)
+        self.assertIn("libavfilter/vf_x.c:5 ff_alpha", step.output)
+        self.assertIn("libavfilter/vf_x.c:12 ff_beta", step.output)
+
+    def test_blank_or_whitespace_waiver_returns_one(self) -> None:
+        """An empty or whitespace-only --docstring-reason leaves a finding at rc 1."""
+        for reason in ("", " ", " \t\n "):
+            with self.subTest(reason=reason):
+                step = self.run_step(1, DOCSTRING_FINDING, reason)
+                self.assertEqual(step.rc, 1)
+                self.assertNotIn("waived:", step.output)
+                self.assertTrue(step.output.endswith(DOCSTRING_ADVICE))
+
+    def test_non_blank_waiver_waives_finding(self) -> None:
+        """A non-blank --docstring-reason returns rc 0 with the waived header line."""
+        expected = f"waived: internal wrappers\n{DOCSTRING_FINDING.rstrip()}"
+        self.assertEqual(
+            upstream_lint.docstring_result(1, DOCSTRING_FINDING, "  internal wrappers  "),
+            upstream_lint.Step("docstrings", 0, expected),
+        )
+        step = self.run_step(1, DOCSTRING_FINDING, "internal wrappers")
+        self.assertEqual(step.rc, 0)
+        self.assertEqual(step.output, expected)
+
+    def test_hook_refusal_returns_two(self) -> None:
+        """Exit 1 starting with a praetor hooks refusal fails closed with rc 2."""
+        refusal = "praetor hooks: installing the engine failed\n"
+        for reason in ("", "cannot waive refusal"):
+            with self.subTest(reason=reason):
+                step = self.run_step(1, refusal, reason)
+                self.assertEqual(step.rc, 2)
+                self.assertIn("1", step.output.splitlines()[0])
+                self.assertIn("praetor hooks: installing the engine failed", step.output)
+                self.assertNotIn("waived:", step.output)
+
+    def test_engine_error_exit_two_returns_two_even_when_waived(self) -> None:
+        """Exit 2 with an [ERROR] line returns rc 2 even when a waiver is supplied."""
+        error = "[ERROR] cannot read base revision\n"
+        for reason in ("", "not a finding"):
+            with self.subTest(reason=reason):
+                step = self.run_step(2, error, reason)
+                self.assertEqual(step.rc, 2)
+                self.assertIn("2", step.output.splitlines()[0])
+                self.assertIn("[ERROR] cannot read base revision", step.output)
+                self.assertNotIn("waived:", step.output)
+
+    def test_timeout_exit_returns_two(self) -> None:
+        """A timed-out engine run with exit 124 fails closed with rc 2."""
+        for stdout in ("\ncommand timed out\n", f"{DOCSTRING_EMPTY_CLEAN}command timed out\n"):
+            with self.subTest(stdout=stdout):
+                step = self.run_step(124, stdout, "not waivable")
+                self.assertEqual(step.rc, 2)
+                self.assertIn("124", step.output.splitlines()[0])
+                self.assertNotIn("waived:", step.output)
+
+    def test_zero_exit_without_coverage_line_returns_two(self) -> None:
+        """Exit 0 without the allow-listed coverage line fails closed with rc 2."""
+        for stdout in ("", "ok\n", "Docstring coverage: ok\n"):
+            with self.subTest(stdout=stdout):
+                step = self.run_step(0, stdout)
+                self.assertEqual(step.rc, 2)
+                self.assertIn("0", step.output.splitlines()[0])
+
+    def test_non_first_coverage_line_returns_two(self) -> None:
+        """A coverage summary preceded by another line fails closed with rc 2."""
+        cases = (
+            (0, f"praetor hooks: running engine on PATH\n{DOCSTRING_EMPTY_CLEAN}"),
+            (1, f"\n{DOCSTRING_FINDING}"),
+        )
+        for returncode, stdout in cases:
+            with self.subTest(returncode=returncode):
+                step = self.run_step(returncode, stdout, "not a finding")
+                self.assertEqual(step.rc, 2)
+                self.assertNotIn("waived:", step.output)
+
+    def test_step_passes_expected_argv_and_cwd_to_run(self) -> None:
+        """The step runs engine.sh via bash from REPO_ROOT with DOCSTRINGS_TIMEOUT."""
+        tree = Path("/fixture/ffmpeg")
+        stub = upstream_lint.RunResult((), 0, DOCSTRING_EMPTY_CLEAN)
+        with unittest.mock.patch.object(upstream_lint, "_run", return_value=stub) as run:
+            step = upstream_lint._docstrings(tree, "base_rev", "head_rev", "")
+        self.assertEqual(step.rc, 0)
+        self.assertEqual(upstream_lint.DOCSTRINGS_TIMEOUT, 300)
+        run.assert_called_once_with(
+            [
+                "bash",
+                str(upstream_lint.REPO_ROOT / ".config" / "lefthook" / "engine.sh"),
+                "docstrings",
+                "check",
+                f"--path={tree}",
+                "--base=base_rev",
+                "--head=head_rev",
+            ],
+            upstream_lint.REPO_ROOT,
+            timeout=upstream_lint.DOCSTRINGS_TIMEOUT,
+        )
+
+
 class FixtureTest(unittest.TestCase):
-    """Shared disposable Git fixture; stub pre-commit and semgrep_scan.sh only."""
+    """Shared disposable Git fixture; stub pre-commit, semgrep_scan.sh and the Praetor engine."""
 
     def setUp(self) -> None:
         """Create a minimal committed base without inheriting template hooks."""
@@ -1752,6 +2020,9 @@ class FixtureTest(unittest.TestCase):
         self.c_rules_stdout = ""
         self.c_rules_json: str | None = ""
         self.c_rules_calls: list[tuple[list[str], Path, float]] = []
+        self.engine_rc = 0
+        self.engine_output = DOCSTRING_EMPTY_CLEAN
+        self.engine_calls = []
 
     def git(self, *args: str) -> str:
         """Run bounded fixture Git commands with explicit author and signing settings."""
@@ -1791,7 +2062,7 @@ class FixtureTest(unittest.TestCase):
     def command(
         self, argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60
     ) -> upstream_lint.RunResult:
-        """Stub hooks and scans with complete default path coverage; bound other commands."""
+        """Stub hooks, scans and the engine with full default path coverage; bound the rest."""
         if Path(argv[0]).name == upstream_lint.PRE_COMMIT:
             self.hook_calls.append((argv, Path(argv[3]).read_text(encoding="utf-8")))
             self.hook_effect(Path(cwd))
@@ -1806,10 +2077,13 @@ class FixtureTest(unittest.TestCase):
                     encoding="utf-8",
                 )
             return upstream_lint.RunResult(tuple(argv), self.c_rules_rc, self.c_rules_stdout)
+        if argv[:2] == ["bash", str(upstream_lint.REPO_ROOT / upstream_lint.ENGINE_SCRIPT)]:
+            self.engine_calls.append((argv, Path(cwd)))
+            return upstream_lint.RunResult(tuple(argv), self.engine_rc, self.engine_output)
         return self.real_run(argv, cwd, data, timeout)
 
     def check(self, *args: str) -> tuple[int, str]:
-        """Capture the complete gate report with a controlled pre-commit result."""
+        """Capture the complete gate report with controlled hook and engine results."""
         output = io.StringIO()
         with (
             unittest.mock.patch.object(
@@ -1823,7 +2097,7 @@ class FixtureTest(unittest.TestCase):
 
 
 class PipelineTest(FixtureTest):
-    """Run Git and base tools in a throwaway repository; stub pre-commit only."""
+    """Run Git and base tools in a throwaway repository; stub external hooks and engine."""
 
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
         """A correctly named clean commit passes every collected check."""
@@ -1844,6 +2118,7 @@ class PipelineTest(FixtureTest):
             "doc-wrap",
             "test-program",
             "c-rules",
+            "docstrings",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
 
@@ -2035,6 +2310,41 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: regression-test rc: 1", output)
+
+    def test_body_uninitialised_defect_word_requires_test_or_waiver(self) -> None:
+        """An uninitialised-reply body fails without a test and passes when waived or neutral."""
+        subject = "avformat/rtsp: check command write before using replies"
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit(
+            f"{subject}\n\nIgnoring that error can make callers inspect an uninitialised reply."
+        )
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        rc, output = self.check("--no-test-reason", "needs a live RTSP server")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("waived: needs a live RTSP server", output)
+        self.git("commit", "--amend", "-qm", f"{subject}\n\nRename the reply helper.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_hyphenated_uninitialized_subject_requires_test_or_waiver(self) -> None:
+        """A use-of-uninitialized-value subject fails without a test unless waived."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avformat/x: use-of-uninitialized-value in keybuffer")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        rc, output = self.check("--no-test-reason", "reproducer requires MemorySanitizer")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("waived: reproducer requires MemorySanitizer", output)
+        self.git("commit", "--amend", "-qm", "avformat/x: clear keybuffer")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
 
     def test_wrapped_body_defect_phrase_without_test_fails(self) -> None:
         """A source commit whose body wraps a defect phrase fails without a changed test path."""
@@ -2459,6 +2769,29 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: test-program rc: 0", output)
+
+    def test_docstrings_finding_fails(self) -> None:
+        """An unwaived docstrings engine finding fails its step and the overall run."""
+        self.engine_rc = 1
+        self.engine_output = DOCSTRING_FINDING
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: docstrings rc: 1", output)
+        self.assertIn("libavfilter/vf_x.c:5 ff_alpha", output)
+        self.assertIn(DOCSTRING_ADVICE, output)
+
+    def test_docstrings_waiver_passes(self) -> None:
+        """A non-blank --docstring-reason waives a docstrings finding in the report."""
+        self.engine_rc = 1
+        self.engine_output = DOCSTRING_FINDING
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit()
+        rc, output = self.check("--docstring-reason", "internal static wrappers")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: docstrings rc: 0\nwaived: internal static wrappers", output)
+        self.assertIn("libavfilter/vf_x.c:5 ff_alpha", output)
 
     def test_renamed_two_hunk_scope_claim_passes(self) -> None:
         """A renamed file with two source hunks satisfies a multi-site scope claim."""
