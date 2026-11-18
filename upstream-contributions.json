@@ -1,5 +1,5 @@
 {
-  "checked": "2026-11-14",
+  "checked": "2026-11-17",
   "contributions": [
     {
       "number": 24045,
@@ -292,9 +292,9 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25474",
       "title": "avfilter: fix GCC 14 and 16 warnings in vf_median, af_firequalizer and af_afftfilt",
       "base": "master",
-      "state": "open",
-      "merged_at": "",
-      "merged_commit": "",
+      "state": "merged",
+      "merged_at": "2026-11-15T14:04:25Z",
+      "merged_commit": "afa6f9089798fde73dbcabfd26d700a38188505a",
       "in_release": "",
       "patch": "",
       "project": "vmafx",
@@ -331,7 +331,7 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25477",
       "title": "avcodec/ffv1enc: move float remap scratch off the stack",
       "base": "master",
-      "state": "open",
+      "state": "closed",
       "merged_at": "",
       "merged_commit": "",
       "in_release": "",
