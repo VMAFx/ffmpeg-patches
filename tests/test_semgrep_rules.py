@@ -890,6 +890,8 @@ static int null_checked(void)
     if (buffer == NULL)
         return -1;
     uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
     return 0;
 }
 """
@@ -1106,6 +1108,24 @@ static int second_ternary(uint8_t *other)
         )
         self.assertEqual(_ternary_finding_lines(source), [12])
 
+    def test_ternary_scope_same_buffer_two_ternaries_reported(self) -> None:
+        """Report both same-buffer ternaries before the later destination NULL check."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int same_buffer_two_ternaries(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!dst)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), [12, 13])
+
     def test_ternary_scope_conditional_early_check(self) -> None:
         """Skip conditional-early-check when a nested NULL check precedes the ternary."""
         source = (
@@ -1246,7 +1266,7 @@ static int unbraced_inner_loop_break(void)
                 self.assertEqual(len(_scan_ffmpeg_c(source)), 1)
 
     def test_fallthrough_buffer_check_before_ternary_passes(self) -> None:
-        """Accept earlier NULL checks that only log and leave NULL on the ternary path."""
+        """Skip earlier log-only NULL checks despite a later buffer failure check."""
         for body in ("log_failure();", "if (DST_RECT_BUF_SIZE == 0) return -1;"):
             with self.subTest(body=body):
                 source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
@@ -1256,18 +1276,18 @@ static int unbraced_inner_loop_break(void)
                 self.assertEqual(_scan_ffmpeg_c(source), [])
 
     def test_exiting_buffer_checks_before_ternary_out_of_scope(self) -> None:
-        """Treat exiting buffer checks before the ternary as out of scope."""
+        """Skip earlier exiting buffer checks despite a later buffer failure check."""
         for exit_kind in ("return", "goto", "break", "continue"):
             with self.subTest(exit_kind=exit_kind):
                 source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY
                 if exit_kind == "goto":
-                    source = source.replace("return -1;", "goto failed;").replace(
+                    source = source.replace("return -1;", "goto failed;", 1).replace(
                         "    return 0;", "    return 0;\nfailed:\n    return -1;"
                     )
                 elif exit_kind in ("break", "continue"):
                     source = (
                         source.replace("{\n", "{\n    for (int i = 0; i < 2; i++) {\n", 1)
-                        .replace("return -1;", f"{exit_kind};")
+                        .replace("return -1;", f"{exit_kind};", 1)
                         .replace("    return 0;", "    }\n    return 0;")
                     )
                 self.assertEqual(_ternary_finding_lines(source), [])
@@ -1305,8 +1325,18 @@ static int unbraced_inner_loop_break(void)
         self.assertEqual(_scan_ffmpeg_c(FFMPEG_REASSIGNED_ALLOCATION_TERNARY), [])
 
     def test_null_checked_allocation_ternary_out_of_scope(self) -> None:
-        """Treat a NULL-checked allocation ternary as out of scope."""
+        """Skip an earlier allocation NULL check despite a later buffer failure check."""
         self.assertEqual(_ternary_finding_lines(FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY), [])
+
+    def test_allocation_ternary_without_earlier_check_flagged(self) -> None:
+        """Report the shared fixture ternary when only its earlier NULL check is removed."""
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+            "    if (buffer == NULL)\n        return -1;\n", "", 1
+        )
+        ternary_line = next(
+            index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+        )
+        self.assertEqual(_ternary_finding_lines(source), [ternary_line])
 
     def test_later_or_checked_allocation_ternary_flagged(self) -> None:
         """Flag the ternary when a later OR condition checks the same buffer."""
@@ -1366,7 +1396,7 @@ static int derived_checked(void)
                     self.assertEqual(_ternary_finding_lines(source), [ternary_line])
 
     def test_overwritten_destination_with_later_or_earlier_buffer_check(self) -> None:
-        """Report later or skip earlier buffer check with an overwritten destination."""
+        """Keep the later buffer check and skip only when an earlier check is added."""
         failure_check = "if (!buffer) {\n        return -1;\n    }"
         for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
             for earlier in (False, True):
@@ -1380,9 +1410,10 @@ static int derived_checked(void)
                         .replace("CHECK", "!buffer")
                     )
                     if earlier:
-                        source = source.replace(failure_check, "").replace(
-                            f"    {destination} =",
-                            "    " + failure_check + f"\n    {destination} =",
+                        source = source.replace(
+                            f"    {destination} = buffer ?",
+                            "    " + failure_check + f"\n    {destination} = buffer ?",
+                            1,
                         )
                     ternary_line = next(
                         index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
@@ -1461,7 +1492,7 @@ static int earlier_derived_check(uint8_t *dst)
         )
 
     def test_earlier_or_buffer_null_equality_out_of_scope(self) -> None:
-        """Treat an earlier OR buffer NULL equality as out of scope."""
+        """Skip an earlier OR buffer NULL equality despite a later buffer failure check."""
         source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
             "if (buffer == NULL)\n        return -1;",
             "if (buffer == NULL || DST_RECT_BUF_SIZE == 0) {\n        return -1;\n    }",
