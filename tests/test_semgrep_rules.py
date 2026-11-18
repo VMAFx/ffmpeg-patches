@@ -1210,8 +1210,8 @@ static int unbraced_inner_loop_break(void)
         source = FFMPEG_ALLOCATION_OTHER_ELSE.replace(" : other;", " : NULL;")
         self.assertEqual(len(_scan_ffmpeg_c(source)), 1)
 
-    def test_replaced_buffer_before_later_check_passes(self) -> None:
-        """Report later checks after buffer replacement because the rule does not follow flow."""
+    def test_replaced_buffer_before_later_check_reported_plain_shape(self) -> None:
+        """Report replaced buffer before later check by plain shape without flow."""
         checks = ("!buffer", "buffer == NULL", "!other || !buffer", "!other || buffer == NULL")
         for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
             for check in checks:
@@ -1255,8 +1255,8 @@ static int unbraced_inner_loop_break(void)
                 )
                 self.assertEqual(_scan_ffmpeg_c(source), [])
 
-    def test_exiting_buffer_checks_before_ternary_flagged(self) -> None:
-        """Skip earlier NULL checks before the ternary because the rule does not follow flow."""
+    def test_exiting_buffer_checks_before_ternary_out_of_scope(self) -> None:
+        """Treat exiting buffer checks before the ternary as out of scope."""
         for exit_kind in ("return", "goto", "break", "continue"):
             with self.subTest(exit_kind=exit_kind):
                 source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY
@@ -1304,8 +1304,8 @@ static int unbraced_inner_loop_break(void)
         """Accept a ternary testing a parameter assigned over the allocation result."""
         self.assertEqual(_scan_ffmpeg_c(FFMPEG_REASSIGNED_ALLOCATION_TERNARY), [])
 
-    def test_null_checked_allocation_ternary_flagged(self) -> None:
-        """Skip a ternary when an earlier NULL equality checks the allocation before it."""
+    def test_null_checked_allocation_ternary_out_of_scope(self) -> None:
+        """Treat a NULL-checked allocation ternary as out of scope."""
         self.assertEqual(_ternary_finding_lines(FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY), [])
 
     def test_later_or_checked_allocation_ternary_flagged(self) -> None:
@@ -1346,8 +1346,8 @@ static int derived_checked(void)
             results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
         )
 
-    def test_overwritten_destination_then_destination_check_passes(self) -> None:
-        """Report later checks of an overwritten destination because flow is not followed."""
+    def test_overwritten_destination_then_destination_check_reported_plain_shape(self) -> None:
+        """Report overwritten destination then destination check by plain shape."""
         checks = ("!dst", "dst == NULL", "!other || !dst", "!other || dst == NULL")
         for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
             for check in checks:
@@ -1365,8 +1365,8 @@ static int derived_checked(void)
                     )
                     self.assertEqual(_ternary_finding_lines(source), [ternary_line])
 
-    def test_overwritten_destination_with_buffer_check_flagged(self) -> None:
-        """Report later buffer checks and skip earlier ones because flow is not followed."""
+    def test_overwritten_destination_with_later_or_earlier_buffer_check(self) -> None:
+        """Report later or skip earlier buffer check with an overwritten destination."""
         failure_check = "if (!buffer) {\n        return -1;\n    }"
         for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
             for earlier in (False, True):
@@ -1460,16 +1460,16 @@ static int earlier_derived_check(uint8_t *dst)
             results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
         )
 
-    def test_earlier_or_buffer_null_equality_flagged(self) -> None:
-        """Skip an earlier braced OR condition checking the buffer before the ternary."""
+    def test_earlier_or_buffer_null_equality_out_of_scope(self) -> None:
+        """Treat an earlier OR buffer NULL equality as out of scope."""
         source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
             "if (buffer == NULL)\n        return -1;",
             "if (buffer == NULL || DST_RECT_BUF_SIZE == 0) {\n        return -1;\n    }",
         )
         self.assertEqual(_ternary_finding_lines(source), [])
 
-    def test_reallocated_allocation_ternary_flagged(self) -> None:
-        """Skip a second allocation after an earlier NULL check because flow is not followed."""
+    def test_reallocated_allocation_ternary_out_of_scope(self) -> None:
+        """Treat a reallocated allocation ternary as out of scope."""
         self.assertEqual(_ternary_finding_lines(FFMPEG_REALLOCATED_ALLOCATION_TERNARY), [])
 
     def test_planted_write_header_missing_network_close_flagged(self) -> None:
