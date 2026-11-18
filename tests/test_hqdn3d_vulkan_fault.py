@@ -91,6 +91,23 @@ def _header_present(header: str) -> bool:
     return proc.returncode == 0
 
 
+def _secure_getenv_present() -> bool:
+    """Return whether cc compiles and links a call to secure_getenv."""
+    try:
+        compiler = _compiler()
+    except FileNotFoundError:
+        return False
+    proc = subprocess.run(  # nosec B603 - compiler argv and source are fixed.
+        [compiler, "-std=c17", "-D_GNU_SOURCE", "-Werror", "-x", "c", "-o", os.devnull, "-"],
+        input='#include <stdlib.h>\nint main(void) { return secure_getenv("PATH") != NULL; }\n',
+        text=True,
+        timeout=COMPILE_DEADLINE,
+        check=False,
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
 def _required_markers(fault: str) -> tuple[str, ...]:
     """Return the stderr substrings required for a configured fault."""
     if not fault:
@@ -284,14 +301,51 @@ class FaultRuleTest(unittest.TestCase):
         self.assertTrue(Path(compiler).is_absolute(), compiler)
 
     def test_build_layer_compiles_without_device(self) -> None:
-        """Build the fault layer with no device; skip without Vulkan headers outside the VK job."""
-        if not (FFMPEG and DEVICE) and not _header_present("vulkan/vulkan.h"):
+        """Build without a device; skip missing cc, Vulkan headers or secure_getenv outside VK."""
+        if not (FFMPEG and DEVICE) and (
+            not _header_present("vulkan/vulkan.h") or not _secure_getenv_present()
+        ):
             self.skipTest(
-                "no cc or Vulkan headers; VK_FFMPEG and VK_DEVICE make the build mandatory"
+                "no cc, Vulkan headers or secure_getenv; "
+                "VK_FFMPEG and VK_DEVICE make the build mandatory"
             )
         with tempfile.TemporaryDirectory() as tmp:
             lib = build_layer(Path(tmp)) / "libvk_fault.so"
             self.assertTrue(lib.is_file())
+
+    def test_build_layer_skips_without_secure_getenv_or_device(self) -> None:
+        """Skip the no-device layer build when secure_getenv is unavailable."""
+        with (
+            unittest.mock.patch(__name__ + ".FFMPEG", ""),
+            unittest.mock.patch(__name__ + ".DEVICE", ""),
+            unittest.mock.patch(__name__ + "._header_present", return_value=True),
+            unittest.mock.patch(__name__ + "._secure_getenv_present", return_value=False),
+            unittest.mock.patch(
+                __name__ + ".build_layer", side_effect=AssertionError("unexpected layer build")
+            ) as build,
+        ):
+            with self.assertRaises(unittest.SkipTest):
+                self.test_build_layer_compiles_without_device()
+            build.assert_not_called()
+
+    def test_build_layer_is_mandatory_with_device_without_secure_getenv(self) -> None:
+        """Build the layer in the VK job even when secure_getenv is unavailable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "libvk_fault.so").write_bytes(b"")
+            with (
+                unittest.mock.patch(__name__ + ".FFMPEG", "/fixture/ffmpeg"),
+                unittest.mock.patch(__name__ + ".DEVICE", "0"),
+                unittest.mock.patch(__name__ + "._header_present", return_value=True),
+                unittest.mock.patch(__name__ + "._secure_getenv_present", return_value=False),
+                unittest.mock.patch(__name__ + ".build_layer", return_value=Path(tmp)) as build,
+            ):
+                self.test_build_layer_compiles_without_device()
+                build.assert_called_once()
+
+    def test_secure_getenv_without_compiler_is_false(self) -> None:
+        """Report secure_getenv as unavailable when no compiler exists."""
+        with unittest.mock.patch(__name__ + "._compiler", side_effect=FileNotFoundError):
+            self.assertFalse(_secure_getenv_present())
 
     @unittest.skipUnless(shutil.which("cc"), "no C compiler cc on PATH")
     def test_header_probe_finds_a_standard_header(self) -> None:
