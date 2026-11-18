@@ -4218,7 +4218,7 @@ class SweepTest(ForgejoTest):
         )
         sha = git_output(self.repo, "rev-parse", "topic")
         self.sweep.write_text(full_sweep_report(sha), encoding="utf-8")
-        for sentence in (
+        sentences = (
             "The commit message does not yet qualify the wording; that follows with the next push.",
             "Will fix in the next push.",
             "The scope qualification will be added in the next revision.",
@@ -4226,7 +4226,9 @@ class SweepTest(ForgejoTest):
             "I am going to qualify the commit message in the next push.",
             "Fixed locally, coming with the next push.",
             "The next push carries the qualified commit message.",
-        ):
+        )
+        for index in range(7):
+            sentence = sentences[index]
             with self.subTest(sentence=sentence):
                 (self.tmp / "push-argv.json").unlink(missing_ok=True)
                 stub = self.promise_stub(comment=sentence)
@@ -4235,56 +4237,48 @@ class SweepTest(ForgejoTest):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue((self.tmp / "push-argv.json").exists())
 
-    def test_push_ignores_past_and_question_sentences(self) -> None:
-        """Past revisions and questions about the next push impose no promise row."""
+    def test_push_ignores_past_revision_wording(self) -> None:
+        """Past revisions without a next-push marker impose no promise row."""
 
-        for sentence in (
+        sentences = (
             "The last push qualified the commit message.",
             "This was fixed in the previous revision.",
-            "Should that wait for the next push?",
-        ):
+        )
+        for index in range(2):
+            sentence = sentences[index]
             with self.subTest(sentence=sentence):
                 (self.tmp / "push-argv.json").unlink(missing_ok=True)
                 result = self.promise_push(self.promise_stub(comment=sentence))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue((self.tmp / "push-argv.json").exists())
 
-    def test_push_promise_sentence_bound_is_300_characters(self) -> None:
-        """The matcher accepts a 300-character sentence and rejects 301 characters."""
+    def test_push_refuses_2000_character_paragraph_with_marker_at_end(self) -> None:
+        """A 2000-character own paragraph ending with the marker refuses with a bounded window."""
 
-        prefix = "I will "
-        suffix = " with my next push."
-        sentence = prefix + "x" * (300 - len(prefix) - len(suffix)) + suffix
-        self.assertEqual(len(sentence), 300)
-        self.assert_promise_refused(self.promise_stub(comment=sentence), None, "81815")
-        result = self.promise_push(self.promise_stub(comment="x" + sentence))
-        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = "the next push"
+        comment = "x" * (2000 - len(marker) - 1) + " " + marker
+        expected = "x" * 149 + " " + marker
+        self.assertEqual(len(comment), 2000)
+        self.assertLessEqual(len(expected), 150 + len(marker) + 150)
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            f": {expected}; --promises <file> required",
+        )
 
-    def test_push_promise_bound_includes_text_after_next_push(self) -> None:
-        """A subject-independent promise is bounded through its sentence terminator."""
+    def test_push_records_first_unquoted_promise_match(self) -> None:
+        """Skip quoted lines and record only the bounded window around the first own match."""
 
-        prefix = "The next push carries "
-        sentence = prefix + "x" * (299 - len(prefix)) + "."
-        self.assertEqual(len(sentence), 300)
-        self.assert_promise_refused(self.promise_stub(comment=sentence), None, sentence)
-        result = self.promise_push(self.promise_stub(comment=sentence + " x"))
-        self.assertEqual(result.returncode, 79, result.stderr)
-        result = self.promise_push(self.promise_stub(comment=sentence[:-1] + "x."))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.tmp / "push-argv.json").exists())
-
-    def test_push_records_first_non_question_promise_sentence(self) -> None:
-        """Skip quoted promises and questions before recording the first promise sentence."""
-
-        sentence = "Fixed locally, coming with the next push."
+        first = "Should that wait for the next push?"
+        filler = " " + "x" * 160 + " "
         comment = (
             "> The next push carries quoted changes.\n"
-            "Should that wait for the next push? "
-            f"{sentence} We will add more in my next revision."
+            f"{first}{filler}We will add more in my next revision."
         )
+        expected = first + " " + "x" * 148
         result = self.promise_push(self.promise_stub(comment=comment))
         self.assertEqual(result.returncode, 79, result.stderr)
-        self.assertIn(f": {sentence}; --promises <file> required", result.stderr)
+        self.assertIn(f": {expected}; --promises <file> required", result.stderr)
         self.assertNotIn("We will add more", result.stderr)
         self.assertFalse((self.tmp / "push-argv.json").exists())
 
@@ -4296,131 +4290,196 @@ class SweepTest(ForgejoTest):
         self.assert_promise_refused(self.promise_stub(comment=comment), None, expected)
 
     def test_push_refuses_wrapped_list_promise(self) -> None:
-        """A continuation line belongs to the same list-item promise sentence."""
+        """A continuation line inside a list item still matches the split marker."""
 
         comment = "- I will fix parser.c with the next\n  push."
         expected = " ".join(comment.split())
         self.assert_promise_refused(self.promise_stub(comment=comment), None, expected)
 
     def test_push_refuses_promise_with_parenthesized_question(self) -> None:
-        """An internal parenthesized question does not make the sentence a question."""
+        """An internal parenthesized question still requires a promise row."""
 
         comment = "I will fix this in the next push (OK?)."
         self.assert_promise_refused(self.promise_stub(comment=comment), None, comment)
 
-    def test_push_accepts_question_with_dotted_filename(self) -> None:
-        """The final question mark governs a sentence containing a dotted filename."""
+    def test_push_refuses_question_naming_next_push(self) -> None:
+        """Questions naming the next push require a promise row like any other own match."""
 
-        comment = "Does the next push fix parser.c?"
-        result = self.promise_push(self.promise_stub(comment=comment))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.tmp / "push-argv.json").exists())
+        questions = (
+            "Should that wait for the next push?",
+            "should this go into the next push?",
+            "Does the next push fix parser.c?",
+        )
+        for index in range(3):
+            question = questions[index]
+            with self.subTest(question=question):
+                self.assert_promise_refused(
+                    self.promise_stub(comment=question),
+                    None,
+                    f": {question}; --promises <file> required",
+                )
 
     def test_push_refuses_promise_with_round_bracket_internal_question(self) -> None:
-        """A question mark inside an open round bracket leaves the promise eligible."""
+        """A question mark inside round brackets records the full surrounding window."""
 
         comment = "I will fix parser.c in the next push (OK? please wait)."
-        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            f": {comment}; --promises <file> required",
+        )
 
     def test_push_refuses_promise_with_square_bracket_internal_question(self) -> None:
-        """A question mark inside an open square bracket leaves the promise eligible."""
+        """A question mark inside square brackets records the full surrounding window."""
 
         comment = "I will fix parser.c in the next push [OK? please wait]."
-        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            f": {comment}; --promises <file> required",
+        )
 
     def test_push_refuses_promise_ending_inside_bracket_before_question(self) -> None:
-        """A period before a closing bracket separates the promise from a later question."""
+        """A promise before a bracketed period and trailing question is refused."""
 
         comment = "I will fix parser.c in the next push (including tests.) Should I mention tests?"
         self.assert_promise_refused(
             self.promise_stub(comment=comment),
             None,
-            ": I will fix parser.c in the next push (including tests.); --promises <file> required",
+            f": {comment}; --promises <file> required",
         )
 
     def test_push_refuses_promise_ending_inside_quote_before_question(self) -> None:
-        """A period before a closing quote separates the promise from a later question."""
+        """A promise before a quoted period and trailing question is refused."""
 
         comment = 'I will fix parser.c in the next push as "promised." Should I mention tests?'
         self.assert_promise_refused(
             self.promise_stub(comment=comment),
             None,
-            ': I will fix parser.c in the next push as "promised."; --promises <file> required',
+            f": {comment}; --promises <file> required",
         )
 
     def test_push_refuses_promise_with_parenthesized_question_before_continuation(self) -> None:
-        """A parenthesized question before trailing text keeps the promise detected."""
+        """A parenthesized question before trailing text records the full window."""
 
         comment = "I will fix this in the next push (OK?) after review."
-        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            f": {comment}; --promises <file> required",
+        )
 
     def test_push_refuses_parenthesized_question_with_promise_marker(self) -> None:
-        """A parenthesized question keeps the existing conservative promise refusal."""
+        """A parenthesized question naming the next push is refused."""
 
         comment = "(Does the next push fix parser.c?)"
         self.assert_promise_refused(self.promise_stub(comment=comment), None, comment)
 
     def test_push_refuses_quoted_question_with_promise_marker(self) -> None:
-        """A question ending inside quotes keeps the existing conservative refusal."""
+        """A question ending inside quotes and naming the next push is refused."""
 
         comment = 'Does the next push fix "parser.c?"'
         self.assert_promise_refused(self.promise_stub(comment=comment), None, comment)
 
-    def test_push_refuses_promise_after_bare_cr_list_boundary(self) -> None:
-        """A bare carriage return starts a promise list after an overlong paragraph."""
+    def test_push_refuses_numbered_list_promise_with_internal_question(self) -> None:
+        """A numbered list item with a closing parenthesis and internal question is refused."""
 
-        comment = "x" * 301 + "\r- I will fix parser.c in the next push."
+        comment = "1) I will fix parser.c in the next push (OK? please wait)."
         self.assert_promise_refused(
-            self.promise_stub(comment=comment), None, "- I will fix parser.c in the next push."
+            self.promise_stub(comment=comment),
+            None,
+            f": {comment}; --promises <file> required",
         )
 
-    def test_push_refuses_promise_after_bare_cr_blank_line(self) -> None:
-        """Two bare carriage returns separate a promise from an overlong paragraph."""
+    def test_push_refuses_nested_numbered_list_promise_with_internal_question(self) -> None:
+        """A nested numbered list item with a closing parenthesis and question is refused."""
 
-        comment = "x" * 301 + "\r\rI will fix parser.c in the next push."
+        comment = "- Outer\n  1) I will fix parser.c in the next push (OK? please wait)."
+        expected = " ".join(comment.split())
         self.assert_promise_refused(
-            self.promise_stub(comment=comment), None, "I will fix parser.c in the next push."
+            self.promise_stub(comment=comment),
+            None,
+            f": {expected}; --promises <file> required",
         )
 
-    def test_push_refuses_promise_after_crlf_list_boundary(self) -> None:
-        """A CRLF list boundary keeps a promise after an overlong paragraph eligible."""
+    def test_push_refuses_bracketed_period_before_promise_and_question(self) -> None:
+        """An earlier period inside parentheses cannot hide a later next-push promise."""
 
-        comment = "x" * 301 + "\r\n- I will fix parser.c in the next push."
+        comment = (
+            "I will fix parser.c (tests first. It will land in the next push, OK? please wait)."
+        )
         self.assert_promise_refused(
-            self.promise_stub(comment=comment), None, "- I will fix parser.c in the next push."
+            self.promise_stub(comment=comment),
+            None,
+            f": {comment}; --promises <file> required",
         )
 
-    def test_push_refuses_promise_after_crlf_blank_line(self) -> None:
-        """A CRLF blank line keeps a promise after an overlong paragraph eligible."""
+    def test_push_refuses_typographic_quote_promise_before_question(self) -> None:
+        """A promise followed by typographic quotes and a question is refused."""
 
-        comment = "x" * 301 + "\r\n\r\nI will fix parser.c in the next push."
+        comment = (
+            "I will fix parser.c in the next push as \u201cpromised.\u201d Should I mention tests?"
+        )
         self.assert_promise_refused(
-            self.promise_stub(comment=comment), None, "I will fix parser.c in the next push."
+            self.promise_stub(comment=comment),
+            None,
+            f": {comment}; --promises <file> required",
         )
 
-    def test_push_accepts_301_character_dotted_sentence(self) -> None:
-        """A dotted filename cannot hide the rest of an overlength promise sentence."""
+    def test_push_promise_window_marker_at_position_zero(self) -> None:
+        """A marker at position zero records from the comment start through 150 trailing chars."""
 
-        prefix = "The next push fixes parser.c "
-        comment = prefix + "x" * (300 - len(prefix)) + "."
-        self.assertEqual(len(" ".join(comment.split())), 301)
-        result = self.promise_push(self.promise_stub(comment=comment))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.tmp / "push-argv.json").exists())
+        marker = "The next push"
+        after = " " + "b" * 148 + "Z"
+        comment = marker + after + "Y"
+        expected = marker + after
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            f": {expected}; --promises <file> required",
+        )
 
-    def test_push_records_promise_after_301_character_sentence(self) -> None:
-        """An overlength first sentence leaves the later short promise eligible."""
+    def test_push_promise_window_marker_at_end(self) -> None:
+        """A marker at the end of the comment stops at the comment end without trailing padding."""
 
-        prefix = "The next push fixes parser.c "
-        first = prefix + "x" * (300 - len(prefix)) + "."
-        comment = first + " I will fix parser.c in the next push."
-        expected = " ".join(comment[len(first) :].split())
-        self.assertEqual(len(first), 301)
-        result = self.promise_push(self.promise_stub(comment=comment))
-        self.assertEqual(result.returncode, 79, result.stderr)
-        self.assertIn(f": {expected}; --promises <file> required", result.stderr)
-        self.assertNotIn(first, result.stderr)
-        self.assertFalse((self.tmp / "push-argv.json").exists())
+        before = "A" + "a" * 148 + " "
+        marker = "the next push"
+        comment = "X" + before + marker
+        expected = before + marker
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            f": {expected}; --promises <file> required",
+        )
+
+    def test_push_promise_window_with_150_characters_on_each_side(self) -> None:
+        """A marker with 150 characters on each side keeps both outer boundary characters."""
+
+        before = "A" + "a" * 148 + " "
+        marker = "the next push"
+        after = " " + "b" * 148 + "Z"
+        comment = before + marker + after
+        self.assertEqual(len(before), 150)
+        self.assertEqual(len(after), 150)
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            f": {comment}; --promises <file> required",
+        )
+
+    def test_push_promise_window_cuts_at_151_characters_on_each_side(self) -> None:
+        """A marker with 151 characters on each side cuts the 151st character on both sides."""
+
+        before = "A" + "a" * 148 + " "
+        marker = "the next push"
+        after = " " + "b" * 148 + "Z"
+        expected = before + marker + after
+        comment = "X" + expected + "Y"
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            f": {expected}; --promises <file> required",
+        )
 
     def test_push_records_complete_collapsed_wrapped_promise(self) -> None:
         """Recorded text collapses whitespace and preserves dotted tokens intact."""
@@ -4441,26 +4500,6 @@ class SweepTest(ForgejoTest):
         result = self.promise_push(stub, self.promise_file(f"81815: {expected}\n"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.tmp / "push-argv.json").exists())
-
-    def test_push_respects_blank_line_and_list_sentence_boundaries(self) -> None:
-        """Blank lines and new list items end a preceding unpunctuated paragraph."""
-
-        separators = ("\n\n", "\n- ", "\n  1. ", "\n+ ", "\n* ", "\n2) ")
-        for index in range(6):
-            with self.subTest(separator=separators[index]):
-                comment = "x" * 301 + separators[index] + "The next push fixes parser.c."
-                expected = " ".join(comment[301:].split())
-                self.assert_promise_refused(self.promise_stub(comment=comment), None, expected)
-
-    def test_push_collapses_whitespace_before_sentence_length_check(self) -> None:
-        """Only collapsed whitespace counts toward the whole-sentence length bound."""
-
-        prefix = "The next\n\tpush fixes parser.c "
-        comment = prefix + "x" * (299 - len(" ".join(prefix.split()) + " ")) + "."
-        expected = " ".join(comment.split())
-        self.assertEqual(len(expected), 300)
-        self.assertGreater(len(comment), 300)
-        self.assert_promise_refused(self.promise_stub(comment=comment), None, expected)
 
     def test_push_refuses_comment_above_byte_cap(self) -> None:
         """An own comment one byte above the cap refuses before quote removal."""
@@ -4489,31 +4528,14 @@ class SweepTest(ForgejoTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.tmp / "push-argv.json").exists())
 
-    def test_push_refuses_comment_at_sentence_cap(self) -> None:
-        """Reaching 2000 logical sentences refuses even without promise wording."""
+    def test_push_accepts_multibyte_comment_at_byte_cap_without_promise(self) -> None:
+        """A multibyte comment of exactly 65536 UTF-8 bytes is accepted."""
 
-        comment = "No promise. " * 2000
-        self.assert_promise_refused(
-            self.promise_stub(comment=comment), None, "comment 81815: reached 2000-sentence cap"
-        )
-
-    def test_push_accepts_comment_below_sentence_cap(self) -> None:
-        """A comment with 1999 sentences does not trigger the sentence cap."""
-
-        comment = "No promise. " * 1999
+        comment = "\u00e9" * 32768
+        self.assertEqual(len(comment.encode("utf-8")), 65536)
         result = self.promise_push(self.promise_stub(comment=comment))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.tmp / "push-argv.json").exists())
-
-    def test_push_refuses_sentence_cap_after_early_promise(self) -> None:
-        """An early eligible promise cannot stop the scan before the sentence cap."""
-
-        comment = "The next push fixes parser.c. " + "No promise. " * 1999
-        self.assert_promise_refused(
-            self.promise_stub(comment=comment, body="fix parser.c"),
-            self.promise_file("81815: fix parser.c\n"),
-            "comment 81815: reached 2000-sentence cap",
-        )
 
     def test_push_accepts_fragment_only_in_pr_body(self) -> None:
         """The PR body can supply literal promise evidence."""

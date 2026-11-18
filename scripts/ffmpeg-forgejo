@@ -11,7 +11,8 @@
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
 #   ffmpeg-forgejo push    --sweep <file> [--promises <file>] [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#                          --promises maps own comment IDs with non-question sentences (at most 300 characters) naming the/my next push/revision/version/iteration/round to literal fragments in whitespace-normalized commit messages or PR body;
+#                          --promises maps own comment IDs naming the/my next push/revision/version/iteration/round outside quoted lines to literal fragments in whitespace-normalized commit messages or PR body;
+#                          A question that names the next push is refused too; the author answers through the unchanged promise file.
 #                          missing or unfulfilled promises exit 79 before Git push
 #   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
@@ -1320,44 +1321,6 @@ import subprocess
 import sys
 
 PATTERN = re.compile(r"\b(?:the|my)\s+next\s+(?:push|revision|version|iteration|round)\b", re.I)
-BOUNDARY = re.compile(
-    r"[.!?][)\]\"']*(?=\s|$)|\n[^\S\n]*\n|^[^\S\n]*(?:[-+*]|[0-9]+[.)])(?=\s|$)", re.M
-)
-
-
-def logical_sentences(body: str):
-    """Yield collapsed sentences at whitespace-delimited punctuation or block boundaries."""
-    start = 0
-    boundaries = BOUNDARY.finditer(body)
-    for _ in range(65537):
-        match = next(boundaries, None)
-        end = len(body) if match is None else match.start()
-        if match is not None and body[match.start()] in ".!?":
-            end = match.end()
-        sentence = " ".join(body[start:end].split())
-        if sentence:
-            yield sentence
-        if match is None:
-            return
-        start = end
-
-
-def promise_sentence(body: str, ident: object) -> str | None:
-    """Find the first eligible whole sentence while enforcing the per-comment scan cap."""
-    sentences = logical_sentences(body)
-    first = None
-    for _ in range(2000):
-        sentence = next(sentences, None)
-        if sentence is None:
-            return first
-        question = (
-            sentence.endswith("?")
-            and sentence.count("(") <= sentence.count(")")
-            and sentence.count("[") <= sentence.count("]")
-        )
-        if first is None and len(sentence) <= 300 and not question and PATTERN.search(sentence):
-            first = sentence
-    refuse(f"comment {ident}: reached 2000-sentence cap")
 
 
 def refuse(message: str) -> None:
@@ -1368,10 +1331,11 @@ PY
 }
 
 # promise_python_comments: emit bounded own-comment extraction.
+# A question that names the next push is refused too; the author answers through the unchanged promise file.
 promise_python_comments() {
   cat <<'PY'
 def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
-    """Find the first bounded non-question next-revision sentence in each own comment."""
+    """Record a bounded window around the first next-push marker in each own comment."""
     if len(comments) > 1000:
         refuse("too many issue comments")
     found = {}
@@ -1388,13 +1352,15 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
             refuse(f"comment {ident}: body exceeds 65536-byte cap")
         body = body.replace("\r\n", "\n").replace("\r", "\n")
         body = re.sub(r"(?m)^[^\S\n]*>[^\n]*", "", body)
-        sentence = promise_sentence(body, ident)
-        if sentence is None:
+        body = " ".join(body.split())
+        match = PATTERN.search(body)
+        if match is None:
             continue
+        window = body[max(0, match.start() - 150) : match.end() + 150]
         ident, url = row.get("id"), row.get("html_url")
         if isinstance(ident, bool) or not isinstance(ident, int) or ident < 1 or not isinstance(url, str):
             refuse("malformed own promise comment")
-        found[ident] = (url, sentence)
+        found[ident] = (url, window)
     return found
 PY
 }
