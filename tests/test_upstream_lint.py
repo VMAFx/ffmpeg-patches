@@ -4084,6 +4084,44 @@ class CRulesTest(unittest.TestCase):
 class RevertProofStepTest(FixtureTest):
     """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
 
+    def test_noop_graft_cli_demands_source_record(self) -> None:
+        """Full CLI preflight admits a no-op graft and demands the source fix record."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix value")
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.write(".git/info/grafts", f"{self.base}\n")
+        self.git("config", "advice.graftFileDeprecated", "true")
+        rc, output = self.check("--no-test-reason", "fixture exercises proof demand")
+        self.assertEqual(rc, 1, output)
+        self.assertNotIn("step: preflight", output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix value", output)
+        self.assertIn("no revert-proof record", output)
+        self.assertNotIn("history is incomplete", output)
+
+    def test_hidden_graft_cli_reports_named_history_finding(self) -> None:
+        """Full CLI reaches the named history finding when a side graft hides its parent."""
+        branch = self.git("symbolic-ref", "--short", "HEAD").strip()
+        self.git("commit", "--allow-empty", "-qm", "main: advance base")
+        base = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-qb", "side", self.base)
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix side value")
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", branch)
+        self.git("merge", "--no-ff", "-qm", "merge side history", "side")
+        self.base = base
+        self.write(".git/info/grafts", f"{commit}\n")
+        self.git("config", "advice.graftFileDeprecated", "true")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertNotIn("step: preflight", output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix side value: {commit}", output)
+        self.assertIn("history is incomplete", output)
+        self.assertIn("git fetch --unshallow", output)
+        self.assertNotIn("no revert-proof record", output)
+
     def test_shallow_docs_fix_reports_incomplete_history(self) -> None:
         """A docs-only side boundary produces its own history finding without a proof demand."""
         clone = self.root.parent / "shallow"

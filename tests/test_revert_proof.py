@@ -192,6 +192,143 @@ class RevertProofTest(unittest.TestCase):
         self.assertEqual(record["rc_reverted"], 1)
         self.assertEqual(record["reverted_paths"], ["libavfilter/vf_x.c"])
 
+    def test_git_runner_keeps_successful_stdout_separate_from_advice(self) -> None:
+        """A raw Git read returns only the hash even with real graft advice enabled."""
+        self.write(".git/info/grafts", f"{self.base}\n")
+        result = upstream_lint._run(
+            ["git", "-c", "advice.graftFileDeprecated=true", "rev-parse", "HEAD^{commit}"],
+            self.tree,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, f"{self.base}\n")
+
+    def test_git_failure_retains_stderr_diagnostic(self) -> None:
+        """Both Git wrappers retain the real fatal diagnostic for an invalid revision."""
+        with self.assertRaises(RuntimeError) as consumer:
+            upstream_lint._git(self.tree, "rev-parse", "--verify", "missing-fixture-ref")
+        self.assertIn("rc=128", str(consumer.exception))
+        self.assertIn("fatal: Needed a single revision", str(consumer.exception))
+        with self.assertRaises(revert_proof._PreflightError) as producer:
+            revert_proof.git_out(self.tree, "rev-parse", "--verify", "missing-fixture-ref")
+        self.assertIn("fatal: Needed a single revision", str(producer.exception))
+
+    def test_git_timeout_retains_stderr_through_bounded_reap(self) -> None:
+        """Git timeout diagnostics survive both a completed reap and an exhausted drain."""
+        argv = ["git", "--version"]
+        for exhausted in (False, True):
+            with self.subTest(exhausted=exhausted):
+                process = unittest.mock.MagicMock(pid=123, returncode=-signal.SIGKILL)
+                first = upstream_lint.subprocess.TimeoutExpired(
+                    argv, 1, output=b"partial stdout", stderr=b"git timeout diagnostic"
+                )
+                second = (
+                    upstream_lint.subprocess.TimeoutExpired(argv, 10)
+                    if exhausted
+                    else (b"complete stdout", b"git timeout diagnostic")
+                )
+                process.communicate.side_effect = [first, second]
+                with (
+                    unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen,
+                    unittest.mock.patch.object(upstream_lint.os, "killpg"),
+                ):
+                    popen.return_value.__enter__.return_value = process
+                    result = upstream_lint._run(argv, self.tree, timeout=1)
+                self.assertEqual(result.returncode, 124)
+                self.assertTrue(result.timed_out)
+                self.assertIn("git timeout diagnostic", result.stdout)
+                self.assertIn("partial stdout" if exhausted else "complete stdout", result.stdout)
+
+    def test_non_git_command_keeps_successful_stderr(self) -> None:
+        """Successful test commands still expose both output streams in their result."""
+        result = upstream_lint._run(
+            [sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr)"],
+            self.tree,
+            allow_any_executable=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(sorted(result.stdout.splitlines()), ["err", "out"])
+
+    def test_noop_graft_demands_and_accepts_measured_source_proof(self) -> None:
+        """A no-op graft keeps the fix visible and measures both runs without moving HEAD."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        commit = self.commit("avfilter/vf_x: fix value")
+        self.write(".git/info/grafts", f"{self.base}\n")
+        run_git(self.tree, "config", "advice.graftFileDeprecated", "true", preserve_config=True)
+        self.assertEqual(
+            run_git(self.tree, "rev-parse", "--is-shallow-repository", preserve_config=True),
+            "false",
+        )
+        missing = upstream_lint._revert_proof(self.tree, self.base, commit)
+        self.assertEqual(missing.rc, 1, missing.output)
+        self.assertIn(commit[:12], missing.output)
+        self.assertIn("no revert-proof record", missing.output)
+        command = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; "
+            "sys.exit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 17)",
+        ]
+        rc, _, error = self.run_cli(commit, command)
+        self.assertEqual(rc, 0, error)
+        payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["head"], commit)
+        self.assertEqual(payload["rc_head"], 0)
+        self.assertEqual(payload["rc_reverted"], 17)
+        self.assertEqual(payload["reverted_paths"], ["libavfilter/vf_x.c"])
+        self.assertEqual(run_git(self.tree, "rev-parse", "HEAD", preserve_config=True), commit)
+        proved = upstream_lint._revert_proof(self.tree, self.base, commit, (self.record_path,))
+        self.assertEqual(proved.rc, 0, proved.output)
+        self.assertEqual(proved.output, "1 fix commit(s), 1 revert-proof record(s)")
+
+    def test_noop_graft_producer_finishes_after_good_measurements(self) -> None:
+        """Real graft advice cannot turn a successful producer run into a moved-HEAD error."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        commit = self.commit("avfilter/vf_x: fix value")
+        self.write(".git/info/grafts", f"{self.base}\n")
+        run_git(self.tree, "config", "advice.graftFileDeprecated", "true", preserve_config=True)
+        command = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; "
+            "sys.exit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 17)",
+        ]
+        rc, _, error = self.run_cli(commit, command)
+        self.assertEqual(rc, 0, error)
+        payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual((payload["rc_head"], payload["rc_reverted"]), (0, 17))
+        self.assertEqual(payload["head"], commit)
+        self.assertEqual(run_git(self.tree, "rev-parse", "HEAD", preserve_config=True), commit)
+
+    def test_hidden_graft_lint_cli_reaches_history_finding(self) -> None:
+        """CLI preflight reaches hidden-parent findings with unrelated external tools stubbed."""
+        branch = run_git(self.tree, "symbolic-ref", "--short", "HEAD", preserve_config=True)
+        run_git(self.tree, "commit", "--allow-empty", "-qm", "main: advance", preserve_config=True)
+        base = run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
+        run_git(self.tree, "checkout", "-qb", "side", self.base, preserve_config=True)
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        commit = self.commit("avfilter/vf_x: fix side value")
+        run_git(self.tree, "checkout", "-q", branch, preserve_config=True)
+        run_git(self.tree, "merge", "--no-ff", "-qm", "merge side", "side", preserve_config=True)
+        self.write(".git/info/grafts", f"{commit}\n")
+        run_git(self.tree, "config", "advice.graftFileDeprecated", "true", preserve_config=True)
+        with contextlib.ExitStack() as stubs:
+            for name in ("_precommit", "_commit_messages", "_patcheck", "_c_rules", "_docstrings"):
+                stubs.enter_context(
+                    unittest.mock.patch.object(
+                        upstream_lint, name, return_value=upstream_lint.Step(name, 0, "fixture")
+                    )
+                )
+            rc, output, error = capture_main(
+                upstream_lint.main, "--tree", str(self.tree), "--base", base, "--head", "HEAD"
+            )
+        self.assertEqual(rc, 1, output + error)
+        self.assertNotIn("step: preflight", output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix side value: {commit}", output)
+        self.assertIn("history is incomplete", output)
+        self.assertIn("git fetch --unshallow", output)
+        self.assertNotIn("no revert-proof record", output)
+
     def import_root_fix(self) -> str:
         """Merge an unrelated source-fix root into the caller's existing history."""
         branch = run_git(self.tree, "symbolic-ref", "--short", "HEAD", preserve_config=True)

@@ -53,6 +53,8 @@ Stored parent headers are compared with Git's visible parents before classificat
 Shallow, grafted or replaced ancestry that hides parents gets an incomplete-history
 finding instead of a snapshot diff; fetch missing history or restore the original
 ancestry. A genuine zero-parent root keeps the empty-tree comparison.
+The shared runner keeps successful Git stdout separate from stderr so advice
+cannot become parsed data; failed and timed-out calls retain stderr diagnostics.
 scripts/revert_proof.py runs the same trusted test command at HEAD and after
 reversing source paths in clean detached scratch; the module itself never writes
 to the caller work tree or index, but the command runs with the rights of the
@@ -430,22 +432,26 @@ def _remaining(timeout: float) -> float:
 
 
 def _reap_timeout(
-    process: subprocess.Popen[bytes], argv: list[str], partial_output: bytes | None = None
+    process: subprocess.Popen[bytes],
+    argv: list[str],
+    partial_output: bytes | None = None,
+    partial_errors: bytes | None = None,
 ) -> RunResult:
     """Kill a timed-out process group and bound the remaining pipe drain."""
     kill_process_group(process)
     try:
-        output, _ = process.communicate(timeout=_remaining(REAP_TIMEOUT))
+        output, errors = process.communicate(timeout=_remaining(REAP_TIMEOUT))
     except subprocess.TimeoutExpired as error:
         output = error.output if error.output is not None else partial_output
-        text = (output or b"").decode("utf-8", errors="replace")
+        errors = error.stderr if error.stderr is not None else partial_errors
+        text = _run_output(output or b"", errors, 124)
         return RunResult(
             tuple(argv),
             124,
             text + "\ncommand timed out (descendant kept the pipe open)\n",
             timed_out=True,
         )
-    text = output.decode("utf-8", errors="replace")
+    text = _run_output(output, errors, 124)
     if process.returncode == -signal.SIGKILL:
         return RunResult(tuple(argv), 124, text + "\ncommand timed out\n", timed_out=True)
     return RunResult(tuple(argv), process.returncode, text, timed_out=True)
@@ -467,6 +473,13 @@ def _command_environment(source: Mapping[str, str], cwd: Path) -> dict[str, str]
     return environment
 
 
+def _run_output(output: bytes, errors: bytes | None, returncode: int) -> str:
+    """Decode machine stdout alone on success and include separate stderr on failure."""
+    if returncode and errors:
+        output += errors
+    return output.decode("utf-8", errors="replace")
+
+
 def _run(
     argv: list[str],
     cwd: Path,
@@ -475,7 +488,7 @@ def _run(
     *,
     allow_any_executable: bool = False,
 ) -> RunResult:
-    """Run an allowed tool with isolated Git state and bounded communication."""
+    """Run a bounded isolated tool, keeping successful Git stdout free of stderr."""
     if not allow_any_executable:
         try:
             _validate_executable(argv)
@@ -495,19 +508,19 @@ def _run(
         env=environment,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if Path(argv[0]).name == "git" else subprocess.STDOUT,
         start_new_session=True,
         shell=False,
     ) as process:
         try:
-            output, _ = process.communicate(
+            output, errors = process.communicate(
                 None if data is None else data.encode("utf-8"), timeout=timeout
             )
             return RunResult(
-                tuple(argv), process.returncode, output.decode("utf-8", errors="replace")
+                tuple(argv), process.returncode, _run_output(output, errors, process.returncode)
             )
         except subprocess.TimeoutExpired as error:
-            return _reap_timeout(process, argv, error.output)
+            return _reap_timeout(process, argv, error.output, error.stderr)
         except KeyboardInterrupt:
             _reap_timeout(process, argv)
             raise
