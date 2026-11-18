@@ -1956,6 +1956,24 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.posts(stub), [BODY])
 
+    def test_unresolvable_tested_head_is_refused_before_post(self) -> None:
+        """A live head missing locally reaches the landed check and names the head."""
+        stub = Stub([A])
+        result = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "--evidence",
+            self.evidence(A),
+            "1",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"cannot resolve landed-check head {A}", result.stderr)
+        self.assertTrue(stub.requests)
+        self.assertTrue(all(method == "GET" for method, _, _ in stub.requests))
+
     def test_own_duplicate_comment_is_refused(self) -> None:
         """A whitespace-equivalent own reply exits 78 without a POST."""
 
@@ -2602,12 +2620,19 @@ class FairyRequestTestBase(unittest.TestCase):
         for name, body in {
             "secret-tool": "printf 'fixture-token\\n'",
             "git": (
+                'if [ "$1" = --no-replace-objects ]; then shift; fi; '
                 'case "$1" in fetch|diff) exit 0;; '
                 "config) exit 1;; "
+                f"merge-base) echo {MERGE_BASE};; "
+                f'rev-list) if [ "$3" = {MERGE_BASE}..{FAIRY_FIXTURE_HEAD} ]; '
+                f"then echo {FAIRY_FIXTURE_HEAD}; fi; exit 0;; "
+                'patch-id) if read -r commit; then printf "fixture-patch %s\\n" "$commit"; '
+                "fi; exit 0;; "
                 "hash-object) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904;; "
                 "merge-tree) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; "
                 '-c) case " $* " in *" merge-tree "*)'
-                " echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; esac; exit 97;; "
+                " echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; "
+                '*" diff-tree "*) cat; exit 0;; esac; exit 97;; '
                 "update-ref) exit 0;; "
                 'rev-parse) if [ "$2" = --git-path ]; then echo "$PWD/fixture-git-dir/$3"; '
                 f"else echo {FAIRY_FIXTURE_HEAD}; fi;; *) exit 97;; esac"
@@ -3892,6 +3917,20 @@ class SweepTest(ForgejoTest):
                 self.assertIn(base[:12], result.stderr)
                 self.assertFalse((self.tmp / "push-argv.json").exists())
                 self.assertFalse(any(method == "POST" for method, _, _ in self.sweep_requests))
+
+    def test_invalid_bot_login_precedes_landed_refusal(self) -> None:
+        """An invalid reviewer wins even when the landed patch later conflicts."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "later base edit\n")
+        result = self.sweep_command(
+            "pr",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"FFMPEG_FORGEJO_BOT_REVIEWER": "bad@login"},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("not a login: bad@login", result.stderr)
+        self.assertEqual(self.sweep_requests, [])
 
     def test_pr_refuses_head_conflicting_with_live_base(self) -> None:
         """Refuse PR creation when the swept head conflicts with the live upstream base."""

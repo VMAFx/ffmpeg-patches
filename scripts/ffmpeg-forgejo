@@ -19,7 +19,7 @@
 #                          exits 3 when Fairy is missing or no human reviewer is requested
 #                          pr/push require a sweep for the local head; every row must be fold, follow-up: <reproducer path> or no-variant: <reason>
 #                          pr/push refuse (exit 73) a swept head that does not merge cleanly into the live $FFMPEG_FORGEJO_BASE fetched from FFMPEG_FORGEJO_GIT
-#                          pr/push first refuse (exit 82) changes already on the live base, naming matching base commits
+#                          pr/push refuse (exit 82) landed changes after existing validation, before writes or a merge-conflict refusal
 #                          pr/push run only as scripts/ffmpeg-forgejo of a Git checkout, directly or through a symlink (exit 74 otherwise)
 #   ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>
 #                          lists every own open pull sharing a file with the branch diff against the fetched base; exit 77 when any, 0 when none, 1 when not proven
@@ -1288,6 +1288,28 @@ require_clean_merge() {
   exit 1
 }
 
+# prepare_clean_merge SHA: keep existing merge errors, deferring only conflicts until landed status is known.
+prepare_clean_merge() {
+  local report rc
+  MERGE_CONFLICT=""
+  if report="$(require_clean_merge "$1" 2>&1)"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 73 ]; then
+    MERGE_CONFLICT="$report"
+    return 0
+  fi
+  [ -z "$report" ] || printf '%s\n' "$report" >&2
+  return "$rc"
+}
+
+# require_sendable_head SHA: refuse landed changes, then any deferred live-base conflict before a write.
+require_sendable_head() {
+  require_unlanded "$1"
+  if [ -n "$MERGE_CONFLICT" ]; then
+    printf '%s\n' "$MERGE_CONFLICT" >&2
+    exit 73
+  fi
+}
+
 # landed_git ARGS...: run bounded Git without host-local replacement or graft history.
 landed_git() {
   GIT_GRAFT_FILE=/dev/null timeout 120 git --no-replace-objects "$@"
@@ -1682,11 +1704,11 @@ for i in json.load(sys.stdin):
     done
     [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: $usage"
     require_sweep "$sweep" "$1"
-    require_unlanded "$SWEPT_SHA"
-    require_clean_merge "$SWEPT_SHA"
+    prepare_clean_merge "$SWEPT_SHA"
     me="$(login)"
     rb="${2:-$1}"
     require_promises "$rb" "$promises" "$me"
+    require_sendable_head "$SWEPT_SHA"
     # The credential helper reads the keyring at push time; nothing lands in argv or config.
     # --lease rewrites the remote branch only while it still points at the expected sha.
     timeout 120 git -c credential.helper= \
@@ -1712,10 +1734,9 @@ for i in json.load(sys.stdin):
     done
     [ $# -eq 3 ] || usage_error "$usage"
     require_sweep "$sweep" "$1"
-    require_unlanded "$SWEPT_SHA"
     [ -f "$3" ] || die "no body file $3"
     require_forge_text "$3"
-    require_clean_merge "$SWEPT_SHA"
+    prepare_clean_merge "$SWEPT_SHA"
     is_login "$BOT_REVIEWER" || die "not a login: $BOT_REVIEWER"
     me="$(login)"
     if check_pr_overlap "$1" "$me" "$overlap_ok" first; then rc=0; else rc=$?; fi
@@ -1724,6 +1745,7 @@ for i in json.load(sys.stdin):
       exit "$rc"
     fi
     require_swept_fork_head "$me" "$1"
+    require_sendable_head "$SWEPT_SHA"
     body="$(mktemp)"
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
     out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
