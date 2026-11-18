@@ -1547,8 +1547,8 @@ static int derived_checked(void)
             results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
         )
 
-    def test_derived_pointer_checked_before_ternary_passes(self) -> None:
-        """Skip an earlier destination check with a later check; removing it reports."""
+    def test_derived_pointer_checked_before_ternary_flagged(self) -> None:
+        """Flag an earlier destination check; only a direct buffer check excludes the ternary."""
         source = (
             FFMPEG_ALLOCATION_DECLARATIONS
             + """\
@@ -1564,9 +1564,9 @@ static int earlier_derived_check(uint8_t *dst)
 }
 """
         )
-        self.assertEqual(_ternary_finding_lines(source), [])
-        control = source.replace("    if (!dst)\n        return -1;\n", "", 1)
-        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+        control = source.replace("if (!dst)", "if (!buffer)", 1)
+        self.assertEqual(_ternary_finding_lines(control), [])
 
     def test_braced_derived_null_equality_flagged(self) -> None:
         """Flag a later braced NULL equality checking only the derived pointer."""
