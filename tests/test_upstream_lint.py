@@ -4083,6 +4083,64 @@ class CRulesTest(unittest.TestCase):
 class RevertProofStepTest(FixtureTest):
     """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
 
+    def import_root_commit(self, path: str, subject: str) -> tuple[str, str, str]:
+        """Merge an unrelated root into a range whose base remains an ancestor."""
+        branch = self.git("symbolic-ref", "--short", "HEAD").strip()
+        self.git("checkout", "--orphan", "imported-root")
+        self.git("rm", "-rf", ".")
+        self.write(path, SOURCE)
+        self.commit(subject)
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", branch)
+        self.git(
+            "merge",
+            "--allow-unrelated-histories",
+            "--no-ff",
+            "-qm",
+            "merge imported history",
+            "imported-root",
+        )
+        head = self.git("rev-parse", "HEAD").strip()
+        self.git("merge-base", "--is-ancestor", self.base, head)
+        return commit, head, self.git("rev-parse", "HEAD^{tree}").strip()
+
+    def test_imported_root_source_fix_requires_record(self) -> None:
+        """An imported root source fix cannot silently pass as a zero-fix range."""
+        commit, _, _ = self.import_root_commit(
+            "libavfilter/vf_root.c", "avfilter/vf_root: fix imported value"
+        )
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_root: fix imported value", step.output)
+        self.assertIn("no revert-proof record", step.output)
+
+    def test_imported_root_source_fix_accepts_valid_record(self) -> None:
+        """A complete matching record satisfies an imported root source fix."""
+        commit, head, head_tree = self.import_root_commit(
+            "libavfilter/vf_root.c", "avfilter/vf_root: fix imported value"
+        )
+        record = self.write_record(
+            "root.json",
+            self.valid_record(commit, head, head_tree, reverted_paths=["libavfilter/vf_root.c"]),
+        )
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("1 fix commit(s), 1 revert-proof record(s)", step.output)
+
+    def test_imported_root_without_fix_wording_is_exempt(self) -> None:
+        """An imported root source addition without fix wording remains exempt."""
+        self.import_root_commit("libavfilter/vf_root.c", "avfilter/vf_root: add imported value")
+        step = self.proof_step()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 fix commit(s)", step.output)
+
+    def test_imported_root_without_library_source_is_exempt(self) -> None:
+        """An imported root documentation fix remains exempt from source proof."""
+        self.import_root_commit("doc/imported.txt", "doc: fix imported wording")
+        step = self.proof_step()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 fix commit(s)", step.output)
+
     def test_record_keys_are_independent_of_path_bound(self) -> None:
         """A valid seven-key proof object remains readable with a one-path bound."""
         payload = self.valid_record("a" * 40, "b" * 40, "c" * 40, command=["pytest"])

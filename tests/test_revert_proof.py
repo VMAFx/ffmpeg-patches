@@ -168,6 +168,94 @@ class RevertProofTest(unittest.TestCase):
         self.assertEqual(record["rc_reverted"], 1)
         self.assertEqual(record["reverted_paths"], ["libavfilter/vf_x.c"])
 
+    def import_root_fix(self) -> str:
+        """Merge an unrelated source-fix root into the caller's existing history."""
+        branch = run_git(self.tree, "symbolic-ref", "--short", "HEAD", preserve_config=True)
+        run_git(self.tree, "checkout", "--orphan", "imported-root", preserve_config=True)
+        run_git(self.tree, "rm", "-rf", ".", preserve_config=True)
+        self.write("libavfilter/vf_root.c", FIXED_SOURCE)
+        commit = self.commit("avfilter/vf_root: fix imported value")
+        run_git(self.tree, "checkout", "-q", branch, preserve_config=True)
+        run_git(
+            self.tree,
+            "merge",
+            "--allow-unrelated-histories",
+            "--no-ff",
+            "-qm",
+            "merge imported history",
+            "imported-root",
+            preserve_config=True,
+        )
+        return commit
+
+    def test_root_fix_reversal_removes_source_in_scratch(self) -> None:
+        """An imported root fix yields a proof after its added source disappears."""
+        commit = self.import_root_fix()
+        head = run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
+        missing = upstream_lint._revert_proof(self.tree, self.base, head, ())
+        self.assertEqual(missing.rc, 1, missing.output)
+        self.assertIn("no revert-proof record", missing.output)
+        command = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; "
+            "sys.exit(0 if Path('libavfilter/vf_root.c').exists() else 17)",
+        ]
+        rc, _, err = self.run_cli(commit, command)
+        self.assertEqual(rc, 0, err)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["commit"], commit)
+        self.assertEqual(record["rc_head"], 0)
+        self.assertEqual(record["rc_reverted"], 17)
+        self.assertEqual(record["reverted_paths"], ["libavfilter/vf_root.c"])
+        self.assertTrue((self.tree / "libavfilter/vf_root.c").exists())
+        proved = upstream_lint._revert_proof(self.tree, self.base, head, (self.record_path,))
+        self.assertEqual(proved.rc, 0, proved.output)
+        self.assertIn("1 fix commit(s), 1 revert-proof record(s)", proved.output)
+
+    def test_root_fix_reverse_apply_conflict_is_refused(self) -> None:
+        """A changed root-added source refuses reverse apply with the existing exit 4."""
+        commit = self.import_root_fix()
+        self.write("libavfilter/vf_root.c", CONFLICT_SOURCE)
+        self.commit("avfilter/vf_root: update imported value")
+        rc, _, err = self.run_cli(commit, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 4, err)
+        self.assertIn(f"reverse apply failed for {commit}", err)
+        self.assertFalse(self.record_path.exists())
+
+    def test_command_at_consumer_argument_cap_is_accepted(self) -> None:
+        """Exactly the shared argument cap produces a consumer-valid command record."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        commit = self.commit("avfilter/vf_x: fix return value")
+        command = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; sys.exit(0 if 'return 2;' in "
+            "Path('libavfilter/vf_x.c').read_text(encoding='utf-8') else 1)",
+        ] + ["arg"] * (upstream_lint.MAX_COMMAND_ARGS - 3)
+        rc, _, err = self.run_cli(commit, command)
+        self.assertEqual(rc, 0, err)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(record["command"]), upstream_lint.MAX_COMMAND_ARGS)
+        self.assertEqual(record["command"], command)
+        self.assertIsNone(upstream_lint._revert_proof_schema_error(record))
+        step = upstream_lint._revert_proof(self.tree, self.base, commit, (self.record_path,))
+        self.assertEqual(step.rc, 0, step.output)
+
+    def test_command_above_consumer_argument_cap_is_refused_before_scratch(self) -> None:
+        """One argument beyond the shared cap refuses before scratch or command work."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        commit = self.commit("avfilter/vf_x: fix return value")
+        self.record_path.write_text("old record\n", encoding="utf-8")
+        count = upstream_lint.MAX_COMMAND_ARGS + 1
+        command = [sys.executable, "-c", "pass"] + ["arg"] * (count - 3)
+        with unittest.mock.patch.object(revert_proof, "run_test_command") as run_command:
+            rc, _, err = self.run_cli(commit, command, expect_scratch=False)
+        self.assertEqual(rc, 2, err)
+        self.assertIn(f"command arguments exceed MAX_COMMAND_ARGS={count - 1}: {count}", err)
+        run_command.assert_not_called()
+        self.assertEqual(self.record_path.read_text(encoding="utf-8"), "old record\n")
+
     def test_planted_weak_test_passes_with_and_without_fix(self) -> None:
         """A planted weak test that exits 0 with and without the fix records rc_reverted 0."""
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)

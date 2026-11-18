@@ -47,6 +47,8 @@ path is not detected.
 
 The revert-proof step requires one measured scripts/revert_proof.py JSON record
 (--revert-proof FILE, repeatable) per source fix commit in base..head.
+Root commits imported through unrelated history are included against the empty
+tree; fix wording and source-path classification apply as for other commits.
 scripts/revert_proof.py runs the same trusted test command at HEAD and after
 reversing source paths in clean detached scratch; the module itself never writes
 to the caller work tree or index, but the command runs with the rights of the
@@ -70,7 +72,8 @@ list is silently truncated. Command environments have a separate
 MAX_ENV_ENTRIES bound of 16384, leaving ample room for environments with
 hundreds of entries without coupling them to path or commit scans. JSON object
 keys and recorded command arguments have independent MAX_JSON_KEYS and
-MAX_COMMAND_ARGS bounds of 2000 each. One valid record for a commit
+MAX_COMMAND_ARGS bounds of 2000 each. The producer refuses commands above the
+shared argument cap before scratch work. One valid record for a commit
 satisfies the step; records that are schema-valid but stale or passing without
 the fix are ignored when a valid one exists, while malformed ones remain
 findings. A merge commit that carries fix wording cannot be proven by a revert
@@ -1510,6 +1513,7 @@ def _commit_paths(tree: Path, commit: str) -> list[str]:
             _git(
                 tree,
                 "diff-tree",
+                "--root",
                 "--no-commit-id",
                 "--name-only",
                 "--no-renames",

@@ -17,6 +17,10 @@ movement means exit 3, reverse-apply failure means exit 4, and scratch removal
 failure means exit 5 and names its path; an older record is removed before runs
 start, output must be outside the caller work tree and Git administration, and
 the temporary parent must be outside the caller work tree.
+Root fix commits are compared against the empty tree; reversing their source
+patch removes the added source files in scratch, with conflicts still exiting 4.
+Commands above upstream_lint.MAX_COMMAND_ARGS are refused with exit 2 before
+scratch work; commands at the cap are accepted.
 """
 
 from __future__ import annotations
@@ -114,6 +118,11 @@ def parse_config(argv: list[str] | None) -> ProofConfig:
         )
     if not command or not command[0]:
         raise _PreflightError("test command is empty")
+    if len(command) > upstream_lint.MAX_COMMAND_ARGS:
+        raise _PreflightError(
+            f"command arguments exceed MAX_COMMAND_ARGS={upstream_lint.MAX_COMMAND_ARGS}: "
+            f"{len(command)}"
+        )
     return ProofConfig(
         tree=args.tree.resolve(),
         commit=args.commit,
@@ -160,6 +169,7 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
             git_out(
                 tree,
                 "diff-tree",
+                "--root",
                 "--no-commit-id",
                 "--name-only",
                 "--no-renames",
@@ -262,6 +272,7 @@ def measure_reverted(
     patch = git_out(
         config.tree,
         "diff-tree",
+        "--root",
         "--no-commit-id",
         "-r",
         "-p",
