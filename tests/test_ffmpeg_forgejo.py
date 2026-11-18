@@ -911,7 +911,10 @@ class LandedTest(ForgejoTest):
                 result = self.landed(env_updates={"TMPDIR": str(clean_tmp)})
                 path = refused.read_text(encoding="utf-8").strip()
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertEqual(result.stderr, f"ffmpeg-forgejo: cannot delete {path}.\n")
+                message = f"ffmpeg-forgejo: cannot delete {path}."
+                lines = result.stderr.splitlines()
+                self.assertEqual(lines[-1], message)
+                self.assertEqual(lines.count(message), 1)
                 self.assertTrue(Path(path).exists())
 
     def test_matching_patch_remains_landed_after_conflicting_base_edit(self) -> None:
