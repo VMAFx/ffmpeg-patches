@@ -4261,6 +4261,112 @@ class SweepTest(ForgejoTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.tmp / "push-argv.json").exists())
 
+    def test_push_other_fence_kind_does_not_close(self) -> None:
+        """Neither fence kind closes the other kind before an author promise."""
+
+        markers = (("```", "~~~"), ("~~~", "```"))
+        for index in range(2):
+            opener, other = markers[index]
+            with self.subTest(opener=opener):
+                comment = f"{opener}\n{other}\n> I will fix this in the next push."
+                self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+
+    def test_push_shorter_fence_run_does_not_close(self) -> None:
+        """A three-character run cannot close a four-character fence of either kind."""
+
+        markers = ("`", "~")
+        for index in range(2):
+            marker = markers[index]
+            for indent in range(4):
+                with self.subTest(marker=marker, indent=indent):
+                    comment = (
+                        f"{' ' * indent}{marker * 4}\n{marker * 3}\n"
+                        "> I will fix this in the next push."
+                    )
+                    self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+
+    def test_push_fence_close_with_trailing_text_is_content(self) -> None:
+        """Trailing text prevents either fence kind from closing before a promise."""
+
+        markers = ("```", "~~~")
+        for index in range(2):
+            marker = markers[index]
+            with self.subTest(marker=marker):
+                comment = f"{marker}\n{marker} text\n> I will fix this in the next push."
+                self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+
+    def test_push_longer_fence_close_removes_following_quote(self) -> None:
+        """A longer matching run closes despite an earlier marker of the other kind."""
+
+        markers = (("`", "~~~"), ("~", "```"))
+        for index in range(2):
+            marker, other = markers[index]
+            with self.subTest(marker=marker):
+                comment = (
+                    f"{marker * 3}\n{other}\n{marker * 4} \t\n> I will fix this in the next push."
+                )
+                result = self.promise_push(self.promise_stub(comment=comment))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_backtick_in_info_string_opens_no_backtick_fence(self) -> None:
+        """Backticks invalidate a backtick info string but are allowed in tilde info."""
+
+        comment = "~~~text`~~~\n> I will fix this in the next push."
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+        comment = "```text`\n> I will fix this in the next push."
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_fence_close_respects_three_space_limit(self) -> None:
+        """A matching close permits three leading spaces and refuses four."""
+
+        markers = (("```", "~~~"), ("~~~", "```"))
+        for index in range(2):
+            marker, other = markers[index]
+            with self.subTest(marker=marker, indent=4):
+                comment = f"{marker}\n{other}\n    {marker}\n> I will fix this in the next push."
+                self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+        for index in range(2):
+            marker, other = markers[index]
+            with self.subTest(marker=marker, indent=3):
+                comment = f"{marker}\n{other}\n   {marker}\n> I will fix this in the next push."
+                result = self.promise_push(self.promise_stub(comment=comment))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_four_space_fence_marker_opens_no_fence(self) -> None:
+        """An indented marker opens nothing before a real fence or a quoted promise."""
+
+        comment = "    ```\n~~~\n```\n> I will fix this in the next push."
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+        markers = ("```", "~~~")
+        for index in range(2):
+            marker = markers[index]
+            with self.subTest(marker=marker):
+                comment = f"    {marker}\n> I will fix this in the next push."
+                result = self.promise_push(self.promise_stub(comment=comment))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_crlf_and_cr_fences_match_lf_fences(self) -> None:
+        """LF, CRLF and bare CR preserve author promises and remove actual quotes alike."""
+
+        endings = ("\n", "\r\n", "\r")
+        for index in range(3):
+            ending = endings[index]
+            with self.subTest(ending=repr(ending), fenced=True):
+                comment = ending.join(("````text", "```", "> I will fix this in the next push."))
+                self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+        for index in range(3):
+            ending = endings[index]
+            with self.subTest(ending=repr(ending), fenced=False):
+                comment = ending.join(("```text", "```", "> I will fix this in the next push."))
+                result = self.promise_push(self.promise_stub(comment=comment))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.tmp / "push-argv.json").exists())
+
     def test_push_matches_new_promise_wording(self) -> None:
         """New prepositions and next-revision nouns require promise rows."""
 

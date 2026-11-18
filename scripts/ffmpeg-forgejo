@@ -1327,6 +1327,31 @@ def refuse(message: str) -> None:
     """Exit with the documented promise rejection status."""
     print(f"ffmpeg-forgejo: promise: {message}", file=sys.stderr)
     raise SystemExit(79)
+
+
+# No container parsing for lists or quotes holding fences; retain doubtful author text.
+def promise_author_text(body: str) -> str:
+    """Remove quote lines outside fences while retaining fenced and indented code."""
+    kept = []
+    fence_char, fence_length = "", 0
+    for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n")[:65536]:
+        marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)\Z", line)
+        if fence_char:
+            if (
+                marker
+                and marker[1][0] == fence_char
+                and len(marker[1]) >= fence_length
+                and not marker[2].strip(" \t")
+            ):
+                fence_char, fence_length = "", 0
+        elif marker:
+            run, rest = marker.groups()
+            if run[0] == "~" or "`" not in rest:
+                fence_char, fence_length = run[0], len(run)
+        elif re.match(r" {0,3}>", line):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 PY
 }
 
@@ -1350,8 +1375,7 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
         ident = row.get("id")
         if len(body) > 65536 or len(body.encode("utf-8")) > 65536:
             refuse(f"comment {ident}: body exceeds 65536-byte cap")
-        body = body.replace("\r\n", "\n").replace("\r", "\n")
-        body = re.sub(r"(?m)^[^\S\n]*>[^\n]*", "", body)
+        body = promise_author_text(body)
         body = " ".join(body.split())
         match = PATTERN.search(body)
         if match is None:
