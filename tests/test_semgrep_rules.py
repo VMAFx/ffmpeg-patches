@@ -819,6 +819,8 @@ FFMPEG_PARAMETER_NULL_TERNARY = (
 static void optional_buffer(uint8_t *buffer)
 {
     uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return;
 }
 """
 )
@@ -839,15 +841,16 @@ static void fallback_buffer(uint8_t *other)
 FFMPEG_ALLOCATION_SEPARATE_FUNCTION = (
     FFMPEG_ALLOCATION_DECLARATIONS
     + """\
-static uint8_t *allocate_buffer(void)
+static void allocate_buffer(void)
 {
     uint8_t *buffer = av_mallocz(DST_RECT_BUF_SIZE);
-    return buffer;
 }
 
 static void optional_buffer(uint8_t *buffer)
 {
     uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return;
 }
 """
 )
@@ -872,10 +875,10 @@ FFMPEG_REASSIGNED_ALLOCATION_TERNARY = (
 static int reassigned(uint8_t *other)
 {
     uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
-    if (!buffer)
-        return -1;
     buffer = other;
     uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
     return 0;
 }
 """
@@ -956,6 +959,26 @@ FFMPEG_DESTINATION_WRITE_FORMS = (
     ("uint8_t *buffer;", "buffer", "uint8_t *dst"),
     ("uint8_t *buffer, *dst;", "buffer", "dst"),
 )
+
+FFMPEG_EARLY_NONNULL_CHECKS = (
+    "buffer",
+    "buffer != NULL",
+    "NULL != buffer",
+    "DST_RECT_BUF_SIZE > 0 && buffer && DST_RECT_OFFSET > 0",
+    "DST_RECT_BUF_SIZE > 0 && buffer != NULL && DST_RECT_OFFSET > 0",
+    "DST_RECT_BUF_SIZE > 0 && NULL != buffer && DST_RECT_OFFSET > 0",
+)
+
+
+def _buffer_ternary_lines(source: str) -> list[int]:
+    """Derive exact expected lines from buffer ternary statements in the fixture."""
+    lines = source.splitlines()
+    return [index + 1 for index in range(len(lines)) if " = buffer ? " in lines[index]]
+
+
+def _earlier_nonnull_ternary_source(check: str) -> str:
+    """Keep a later NULL check while replacing only the earlier check condition."""
+    return FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace("if (buffer == NULL)", f"if ({check})", 1)
 
 
 def _scan_ffmpeg_c(source: str) -> list[dict]:
@@ -1049,7 +1072,7 @@ static int use_before_check(uint8_t **out)
 }
 """
         )
-        self.assertEqual(_ternary_finding_lines(source), [12])
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
 
     def test_ternary_scope_log_only_later_check_reported_plain_shape(self) -> None:
         """Report log-only-later-check by plain shape because the rule does not follow flow."""
@@ -1068,7 +1091,7 @@ static int log_only_later_check(void)
 }
 """
         )
-        self.assertEqual(_ternary_finding_lines(source), [14])
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
 
     def test_ternary_scope_stale_later_check_reported_plain_shape(self) -> None:
         """Report stale-later-check by plain shape because the rule does not follow flow."""
@@ -1088,7 +1111,7 @@ static int stale_later_check(uint8_t *other)
 }
 """
         )
-        self.assertEqual(_ternary_finding_lines(source), [12])
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
 
     def test_ternary_scope_second_ternary_reported_plain_shape(self) -> None:
         """Report second-ternary by plain shape because the rule does not follow flow."""
@@ -1106,10 +1129,10 @@ static int second_ternary(uint8_t *other)
 }
 """
         )
-        self.assertEqual(_ternary_finding_lines(source), [12])
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
 
     def test_ternary_scope_same_buffer_two_ternaries_reported(self) -> None:
-        """Report both same-buffer ternaries before the later destination NULL check."""
+        """Report both same-buffer ternaries with distinct offsets before the later check."""
         source = (
             FFMPEG_ALLOCATION_DECLARATIONS
             + """\
@@ -1117,14 +1140,14 @@ static int same_buffer_two_ternaries(void)
 {
     uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
     uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
-    dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    dst = buffer ? buffer + 2 * DST_RECT_OFFSET : NULL;
     if (!dst)
         return -1;
     return 0;
 }
 """
         )
-        self.assertEqual(_ternary_finding_lines(source), [12, 13])
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
 
     def test_ternary_scope_conditional_early_check(self) -> None:
         """Skip conditional-early-check when a nested NULL check precedes the ternary."""
@@ -1218,8 +1241,14 @@ static int unbraced_inner_loop_break(void)
         self.assertEqual(_scan_ffmpeg_c(FFMPEG_CHECKED_ALLOCATION), [])
 
     def test_parameter_null_ternary_passes(self) -> None:
-        """Accept a NULL ternary testing a parameter without an allocation."""
-        self.assertEqual(_scan_ffmpeg_c(FFMPEG_PARAMETER_NULL_TERNARY), [])
+        """Accept a parameter ternary with a later check; adding an allocation reports it."""
+        source = FFMPEG_PARAMETER_NULL_TERNARY
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace(
+            "    uint8_t *dst =",
+            "    buffer = av_malloc(DST_RECT_BUF_SIZE);\n    uint8_t *dst =",
+        )
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
 
     def test_allocation_ternary_with_other_else_passes(self) -> None:
         """Accept an allocation ternary whose fallback is another pointer."""
@@ -1313,16 +1342,41 @@ static int unbraced_inner_loop_break(void)
         self.assertEqual(_scan_ffmpeg_c(wrapped), [])
 
     def test_allocation_in_separate_function_passes(self) -> None:
-        """Keep allocation bindings local to the function containing the ternary."""
-        self.assertEqual(_scan_ffmpeg_c(FFMPEG_ALLOCATION_SEPARATE_FUNCTION), [])
+        """Keep bindings local despite a later check; removing the function boundary reports."""
+        source = FFMPEG_ALLOCATION_SEPARATE_FUNCTION
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("}\n\nstatic void optional_buffer(uint8_t *buffer)\n{\n", "")
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
 
     def test_unchecked_allocation_ternary_passes(self) -> None:
         """Accept a ternary propagating allocation failure without a separate check."""
         self.assertEqual(_scan_ffmpeg_c(FFMPEG_UNCHECKED_ALLOCATION_TERNARY), [])
 
-    def test_reassigned_allocation_ternary_passes(self) -> None:
-        """Accept a ternary testing a parameter assigned over the allocation result."""
-        self.assertEqual(_scan_ffmpeg_c(FFMPEG_REASSIGNED_ALLOCATION_TERNARY), [])
+    def test_reassigned_allocation_ternary_reported_plain_shape(self) -> None:
+        """Report reassignment before the ternary by plain shape, as without reassignment."""
+        source = FFMPEG_REASSIGNED_ALLOCATION_TERNARY
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+        control = source.replace("    buffer = other;\n", "")
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_earlier_nonnull_checks_out_of_scope(self) -> None:
+        """Skip each earlier positive check; removing only that check reports the ternary."""
+        for index in range(len(FFMPEG_EARLY_NONNULL_CHECKS)):
+            check = FFMPEG_EARLY_NONNULL_CHECKS[index]
+            with self.subTest(check=check):
+                source = _earlier_nonnull_ternary_source(check)
+                self.assertEqual(_ternary_finding_lines(source), [])
+                control = source.replace(f"    if ({check})\n        return -1;\n", "", 1)
+                self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_earlier_assert_macro_reported_plain_shape(self) -> None:
+        """Report a macro assertion before the ternary because macros are not earlier ifs."""
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+            "static int null_checked(void)",
+            "#define av_assert0(condition) do { if (!(condition)) return -1; } while (0)\n"
+            "static int null_checked(void)",
+        ).replace("    if (buffer == NULL)\n        return -1;", "    av_assert0(buffer);", 1)
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
 
     def test_null_checked_allocation_ternary_out_of_scope(self) -> None:
         """Skip an earlier allocation NULL check despite a later buffer failure check."""
@@ -1459,7 +1513,7 @@ static int derived_checked(void)
         )
 
     def test_derived_pointer_checked_before_ternary_passes(self) -> None:
-        """Accept a ternary when only an earlier value of its destination is checked."""
+        """Skip an earlier destination check with a later check; removing it reports."""
         source = (
             FFMPEG_ALLOCATION_DECLARATIONS
             + """\
@@ -1469,11 +1523,15 @@ static int earlier_derived_check(uint8_t *dst)
     if (!dst)
         return -1;
     dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
     return 0;
 }
 """
         )
-        self.assertEqual(_scan_ffmpeg_c(source), [])
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("    if (!dst)\n        return -1;\n", "", 1)
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
 
     def test_braced_derived_null_equality_flagged(self) -> None:
         """Flag a later braced NULL equality checking only the derived pointer."""

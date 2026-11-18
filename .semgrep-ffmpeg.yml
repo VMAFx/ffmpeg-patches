@@ -32,10 +32,14 @@ rules:
 
   # Derive pointers after checking allocation results (review of upstream FFmpeg pull request 25480, November 2026):
   # in one function, a pointer from an allocation call feeds a NULL-fallback ternary with no
-  # earlier if checking the pointer for NULL, followed by a NULL check of the pointer or destination.
+  # earlier if checking the pointer for NULL/non-NULL (including positive AND chains and
+  # negative OR chains), followed by a NULL check of the pointer or destination.
   # - use-before-check: reported by plain shape
   # - log-only-later-check: reported by plain shape
   # - stale-later-check: reported by plain shape
+  # - macro-assertion-before-ternary: reported by plain shape
+  # - reassigned-buffer-before-ternary: reported by plain shape
+  # - earlier-destination-check: not seen
   # - second-ternary: reported by plain shape
   # - conditional-early-check: not seen
   # - earlier-allocation-check: not seen
@@ -48,8 +52,9 @@ rules:
     message: >-
       The allocation is checked anyway; check it first and derive the pointer
       after the check instead of using a ternary with a NULL fallback. This
-      rule reports only functions with no NULL check of the allocation before
-      the ternary and does not follow control or data flow.
+      rule reports only functions with no earlier if checking the allocation
+      for NULL/non-NULL before the ternary and does not follow control or data
+      flow or expand assertion macros.
     patterns:
       - pattern-either:
           - pattern-inside: |
@@ -155,6 +160,12 @@ rules:
                         - pattern: '!$BUF'
                         - pattern: '$BUF == NULL'
                         - pattern: 'NULL == $BUF'
+                        - pattern: '$BUF'
+                        - pattern: '$BUF != NULL'
+                        - pattern: 'NULL != $BUF'
+                        - pattern: '... && $BUF && ...'
+                        - pattern: '... && $BUF != NULL && ...'
+                        - pattern: '... && NULL != $BUF && ...'
                         - pattern: '... || !$BUF || ...'
                         - pattern: '... || $BUF == NULL || ...'
                         - pattern: '... || NULL == $BUF || ...'
