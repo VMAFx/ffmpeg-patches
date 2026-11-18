@@ -2112,6 +2112,7 @@ class PipelineTest(FixtureTest):
             "developer.texi",
             "fate-deps",
             "regression-test",
+            "revert-proof",
             "diagnostic-citation",
             "claim-scope",
             "doc-terms",
@@ -2280,7 +2281,7 @@ class PipelineTest(FixtureTest):
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.write("tests/ref/fate/filter-x", "0\n")
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2290,7 +2291,7 @@ class PipelineTest(FixtureTest):
         self.commit("avfilter/vf_x: fix y")
         self.write("tests/ref/fate/filter-x", "0\n")
         self.commit("tests/fate: add filter-x")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2321,7 +2322,12 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: regression-test rc: 1", output)
-        rc, output = self.check("--no-test-reason", "needs a live RTSP server")
+        rc, output = self.check(
+            "--no-test-reason",
+            "needs a live RTSP server",
+            "--no-revert-proof-reason",
+            "needs a live RTSP server",
+        )
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
         self.assertIn("waived: needs a live RTSP server", output)
@@ -2337,7 +2343,12 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: regression-test rc: 1", output)
-        rc, output = self.check("--no-test-reason", "reproducer requires MemorySanitizer")
+        rc, output = self.check(
+            "--no-test-reason",
+            "reproducer requires MemorySanitizer",
+            "--no-revert-proof-reason",
+            "reproducer requires MemorySanitizer",
+        )
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
         self.assertIn("waived: reproducer requires MemorySanitizer", output)
@@ -2366,7 +2377,12 @@ class PipelineTest(FixtureTest):
         """A non-blank --no-test-reason waives a source commit whose body says fix."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit("avfilter/vf_x: do not delete y\n\nFix this by skipping y.")
-        rc, output = self.check("--no-test-reason", "hardware-only path")
+        rc, output = self.check(
+            "--no-test-reason",
+            "hardware-only path",
+            "--no-revert-proof-reason",
+            "hardware-only path",
+        )
         self.assertEqual(rc, 0, output)
         self.assertIn("waived: hardware-only path", output)
 
@@ -2374,7 +2390,12 @@ class PipelineTest(FixtureTest):
         """A non-blank --no-test-reason waives a source fix without a test path."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check("--no-test-reason", "hardware-only path")
+        rc, output = self.check(
+            "--no-test-reason",
+            "hardware-only path",
+            "--no-revert-proof-reason",
+            "hardware-only path",
+        )
         self.assertEqual(rc, 0, output)
         self.assertIn("waived: hardware-only path", output)
 
@@ -2412,7 +2433,7 @@ class PipelineTest(FixtureTest):
             "int main(void)\n{\n    return ff_value();\n}\n",
         )
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2423,6 +2444,8 @@ class PipelineTest(FixtureTest):
         self.commit("avfilter/vf_x: fix y")
         rc, output = self.check(
             "--no-test-reason",
+            "the parser runs only behind a hardware decoder",
+            "--no-revert-proof-reason",
             "the parser runs only behind a hardware decoder",
         )
         self.assertEqual(rc, 0, output)
@@ -2454,7 +2477,7 @@ class PipelineTest(FixtureTest):
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.write("tests/data/filter-x.bin", "\x00\x01\x02")
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2463,7 +2486,7 @@ class PipelineTest(FixtureTest):
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.write("tests/café_x.c", "int main(void)\n{\n    return ff_value();\n}\n")
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2476,7 +2499,7 @@ class PipelineTest(FixtureTest):
             "int main(void)\n{\n    return ff_value();\n}\n",
         )
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2515,6 +2538,7 @@ class PipelineTest(FixtureTest):
             "developer.texi",
             "fate-deps",
             "regression-test",
+            "revert-proof",
             "diagnostic-citation",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
@@ -3993,6 +4017,223 @@ class CRulesTest(unittest.TestCase):
                 )
                 step = self.run_c_rules()
                 self.assertEqual(step.rc, 2, step.output)
+
+
+class RevertProofStepTest(FixtureTest):
+    """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
+
+    def add_fix_commit(
+        self, path: str = "libavfilter/vf_x.c", subject: str = "avfilter/vf_x: fix y"
+    ) -> tuple[str, str, str]:
+        """Write a source fix and test path, commit them and return commit, head and head_tree."""
+        self.write(path, SOURCE.replace("return 1", "return 2"))
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.commit(subject)
+        head = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        return head, head, head_tree
+
+    def write_record(self, filename: str, payload: dict[str, object]) -> Path:
+        """Write a JSON record dictionary to the temporary parent directory."""
+        target = self.root.parent / filename
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        return target
+
+    def valid_record(
+        self, commit: str, head: str, head_tree: str, /, **overrides: object
+    ) -> dict[str, object]:
+        """Build a valid revert-proof record dictionary with optional field overrides."""
+        base_record: dict[str, object] = {
+            "commit": commit,
+            "head": head,
+            "head_tree": head_tree,
+            "command": ["pytest", "-q"],
+            "rc_head": 0,
+            "rc_reverted": 1,
+            "reverted_paths": ["libavfilter/vf_x.c"],
+        }
+        base_record.update(overrides)
+        return base_record
+
+    def test_step_accepts_matching_record_with_nonzero_rc_reverted(self) -> None:
+        """A matching record with rc_head 0 and nonzero rc_reverted passes revert-proof."""
+        commit, head, head_tree = self.add_fix_commit()
+        record_file = self.write_record("proof.json", self.valid_record(commit, head, head_tree))
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0", output)
+
+    def test_step_refuses_missing_record(self) -> None:
+        """A fix commit with no revert-proof record fails and names the commit and subject."""
+        commit, _, _ = self.add_fix_commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("no revert-proof record", output)
+
+    def test_step_refuses_record_of_another_head_tree(self) -> None:
+        """A record whose head_tree differs from the range head tree fails as stale."""
+        commit, head, _ = self.add_fix_commit()
+        stale_tree = "0" * 40
+        record_file = self.write_record("stale.json", self.valid_record(commit, head, stale_tree))
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("stale", output)
+
+    def test_step_refuses_rc_reverted_zero(self) -> None:
+        """A record with rc_reverted 0 fails because the test passes without the fix."""
+        commit, head, head_tree = self.add_fix_commit()
+        record_file = self.write_record(
+            "weak.json", self.valid_record(commit, head, head_tree, rc_reverted=0)
+        )
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("test passes without the fix", output)
+
+    def test_step_refuses_rc_reverted_timeout(self) -> None:
+        """A record with rc_reverted timeout fails because a timeout gives no verdict."""
+        commit, head, head_tree = self.add_fix_commit()
+        record_file = self.write_record(
+            "timeout.json", self.valid_record(commit, head, head_tree, rc_reverted="timeout")
+        )
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("no verdict", output)
+
+    def test_step_refuses_rc_head_nonzero(self) -> None:
+        """A record whose rc_head is nonzero fails and names the commit and subject."""
+        commit, head, head_tree = self.add_fix_commit()
+        record_file = self.write_record(
+            "bad_head.json", self.valid_record(commit, head, head_tree, rc_head=2)
+        )
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("rc_head", output)
+
+    def test_step_refuses_duplicate_key(self) -> None:
+        """A record JSON file containing a duplicate key is refused by the JSON reader."""
+        commit, head, head_tree = self.add_fix_commit()
+        dup_path = self.root.parent / "dup.json"
+        dup_path.write_text(
+            "{\n"
+            f'  "commit": "{commit}",\n'
+            f'  "head": "{head}",\n'
+            f'  "head_tree": "{head_tree}",\n'
+            '  "command": ["pytest"],\n'
+            '  "rc_head": 0,\n'
+            '  "rc_head": 0,\n'
+            '  "rc_reverted": 1,\n'
+            '  "reverted_paths": ["libavfilter/vf_x.c"]\n'
+            "}\n",
+            encoding="utf-8",
+        )
+        rc, output = self.check("--revert-proof", str(dup_path))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("duplicate key", output)
+
+    def test_step_refuses_missing_key(self) -> None:
+        """A record JSON file missing a required key fails and names the missing key."""
+        commit, head, head_tree = self.add_fix_commit()
+        payload = self.valid_record(commit, head, head_tree)
+        del payload["reverted_paths"]
+        record_file = self.write_record("missing.json", payload)
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("missing key", output)
+
+    def test_step_refuses_extra_key(self) -> None:
+        """A record JSON file with an extra key fails and names the extra key."""
+        commit, head, head_tree = self.add_fix_commit()
+        payload = self.valid_record(commit, head, head_tree, unexpected="value")
+        record_file = self.write_record("extra.json", payload)
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("extra key", output)
+
+    def test_step_refuses_wrong_type(self) -> None:
+        """A record JSON file with a wrong field value type fails and names the commit."""
+        commit, head, head_tree = self.add_fix_commit()
+        for idx, overrides in enumerate(
+            (
+                {"commit": "not-40-hex"},
+                {"head": 123},
+                {"head_tree": "Z" * 40},
+                {"command": "pytest"},
+                {"rc_head": True},
+                {"rc_reverted": "other"},
+                {"rc_reverted": False},
+                {"reverted_paths": ["b.c", "a.c"]},
+            )
+        ):
+            with self.subTest(overrides=overrides):
+                record_file = self.write_record(
+                    f"wrong_{idx}.json", self.valid_record(commit, head, head_tree, **overrides)
+                )
+                rc, output = self.check("--revert-proof", str(record_file))
+                self.assertEqual(rc, 1, output)
+                self.assertIn("step: revert-proof rc: 1", output)
+                self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+                self.assertIn("wrong value type", output)
+
+    def test_step_refuses_file_that_is_not_json(self) -> None:
+        """A record file that is not valid JSON fails and names the commit and subject."""
+        commit, _, _ = self.add_fix_commit()
+        bad_path = self.root.parent / "not_json.txt"
+        bad_path.write_text("{not valid json\n", encoding="utf-8")
+        rc, output = self.check("--revert-proof", str(bad_path))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("not valid JSON", output)
+
+    def test_step_waiver_passes_and_names_commit(self) -> None:
+        """A non-blank --no-revert-proof-reason passes the step and lists the waived commit."""
+        commit, _, _ = self.add_fix_commit()
+        rc, output = self.check("--no-revert-proof-reason", "hardware-only path")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: hardware-only path", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+
+    def test_step_boundary_range_without_fix_commit_passes(self) -> None:
+        """A range without a source fix commit passes revert-proof with a summary line."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0\n0 fix commit(s)", output)
+
+    def test_step_boundary_two_fixes_with_one_record_names_only_unrecorded_commit(self) -> None:
+        """When one of two fix commits has a valid record, only the other commit is reported."""
+        first_commit, _, _ = self.add_fix_commit("libavfilter/vf_x.c", "avfilter/vf_x: fix first")
+        self.write("libavfilter/vf_y.c", SOURCE.replace("return 1", "return 3"))
+        self.write("tests/ref/fate/filter-y", "0\n")
+        self.commit("avfilter/vf_y: fix second")
+        second_commit = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record_file = self.write_record(
+            "first.json", self.valid_record(first_commit, second_commit, head_tree)
+        )
+
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{second_commit[:12]}: avfilter/vf_y: fix second", output)
+        self.assertNotIn(f"{first_commit[:12]}: avfilter/vf_x: fix first", output)
 
 
 if __name__ == "__main__":

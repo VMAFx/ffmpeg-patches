@@ -45,6 +45,16 @@ and b/ prefixes whatever diff.noprefix says. The same waiver covers a fix the
 changed tests do not name. A test that names the code without running the fixed
 path is not detected.
 
+The revert-proof step requires one measured scripts/revert_proof.py JSON record
+(--revert-proof FILE, repeatable) per source fix commit in base..head.
+scripts/revert_proof.py runs a test command at HEAD, reverse-applies only the
+fix commit's source paths with git apply -R, runs the test command again,
+restores the tree to HEAD and writes the record with commit, head, head_tree,
+command, rc_head, rc_reverted and reverted_paths. The step checks that each
+fix commit has a valid record whose head_tree matches head, whose rc_head is 0
+and whose rc_reverted is a nonzero integer. --no-revert-proof-reason TEXT
+waives the step and lists the waived commits.
+
 The diagnostic-citation step fails a commit whose message names a compiler
 diagnostic flag (-W...) together with workaround wording (workaround, false
 positive, silence, suppress, spurious) unless the message carries a GCC
@@ -344,6 +354,7 @@ class RunResult:
     args: tuple[str, ...]
     returncode: int
     stdout: str
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -351,11 +362,13 @@ class Waivers:
     """Reasons that waive single upstream checks; a blank reason waives nothing."""
 
     no_test: str = ""
+    no_revert_proof: str = ""
     claim: str = ""
     doc: str = ""
     test_program: str = ""
     c_rule: str = ""
     docstring: str = ""
+    revert_proofs: tuple[Path, ...] = ()
 
 
 @dataclass
@@ -393,20 +406,31 @@ def _reap_timeout(
         output = error.output if error.output is not None else partial_output
         text = (output or b"").decode("utf-8", errors="replace")
         return RunResult(
-            tuple(argv), 124, text + "\ncommand timed out (descendant kept the pipe open)\n"
+            tuple(argv),
+            124,
+            text + "\ncommand timed out (descendant kept the pipe open)\n",
+            timed_out=True,
         )
     text = output.decode("utf-8", errors="replace")
     if process.returncode == -signal.SIGKILL:
-        return RunResult(tuple(argv), 124, text + "\ncommand timed out\n")
+        return RunResult(tuple(argv), 124, text + "\ncommand timed out\n", timed_out=True)
     return RunResult(tuple(argv), process.returncode, text)
 
 
-def _run(argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60) -> RunResult:
+def _run(
+    argv: list[str],
+    cwd: Path,
+    data: str | None = None,
+    timeout: float = 60,
+    *,
+    allow_any_executable: bool = False,
+) -> RunResult:
     """Run an allowed tool with isolated Git state and bounded communication."""
-    try:
-        _validate_executable(argv)
-    except ValueError as error:
-        return RunResult(tuple(argv), 2, str(error))
+    if not allow_any_executable:
+        try:
+            _validate_executable(argv)
+        except ValueError as error:
+            return RunResult(tuple(argv), 2, str(error))
     if _DEADLINE.get() is not None:
         timeout = min(timeout, _remaining(timeout + REAP_TIMEOUT) - REAP_TIMEOUT)
         if timeout <= 0:
@@ -1507,6 +1531,204 @@ def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("regression-test", 1, "\n".join(lines))
 
 
+HEX_40 = re.compile(r"^[0-9a-f]{40}$")
+REVERT_PROOF_KEYS = frozenset(
+    {
+        "commit",
+        "head",
+        "head_tree",
+        "command",
+        "rc_head",
+        "rc_reverted",
+        "reverted_paths",
+    }
+)
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build a JSON object dictionary while refusing duplicate keys."""
+    if len(pairs) > MAX_PATHS:
+        raise ValueError(f"JSON object keys exceed MAX_PATHS={MAX_PATHS}")
+    result: dict[str, object] = {}
+    for key, value in pairs[:MAX_PATHS]:
+        if key in result:
+            raise ValueError(f"duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _is_nonempty_str_list(value: object) -> bool:
+    """Return whether value is a bounded non-empty list of non-empty strings."""
+    return (
+        isinstance(value, list)
+        and 0 < len(value) <= MAX_PATHS
+        and all(isinstance(item, str) and bool(item) for item in value[:MAX_PATHS])
+    )
+
+
+def _valid_hex_fields(payload: dict[str, object]) -> str | None:
+    """Return the first non-40-hex commit or tree field name, or None."""
+    for key in ("commit", "head", "head_tree"):
+        value = payload[key]
+        if not isinstance(value, str) or not HEX_40.fullmatch(value):
+            return f"wrong value type for {key}"
+    return None
+
+
+def _revert_proof_type_error(payload: dict[str, object]) -> str | None:
+    """Return a field type diagnostic for a revert-proof JSON object, or None."""
+    hex_error = _valid_hex_fields(payload)
+    if hex_error is not None:
+        return hex_error
+    if not _is_nonempty_str_list(payload["command"]):
+        return "wrong value type for command"
+    rc_head = payload["rc_head"]
+    if not isinstance(rc_head, int) or isinstance(rc_head, bool):
+        return "wrong value type for rc_head"
+    rc_reverted = payload["rc_reverted"]
+    if not (
+        (isinstance(rc_reverted, int) and not isinstance(rc_reverted, bool))
+        or rc_reverted == "timeout"
+    ):
+        return "wrong value type for rc_reverted"
+    paths = payload["reverted_paths"]
+    if not _is_nonempty_str_list(paths) or paths != sorted(paths):
+        return "wrong value type for reverted_paths"
+    return None
+
+
+def _revert_proof_schema_error(payload: dict[str, object]) -> str | None:
+    """Check required keys and field value types of a revert-proof JSON dictionary."""
+    missing = sorted(REVERT_PROOF_KEYS - payload.keys())
+    if missing:
+        return f"missing key: {', '.join(missing)}"
+    extra = sorted(payload.keys() - REVERT_PROOF_KEYS)
+    if extra:
+        return f"extra key: {', '.join(extra)}"
+    return _revert_proof_type_error(payload)
+
+
+def _read_revert_proof(
+    path: Path,
+) -> tuple[dict[str, object] | None, str | None, str | None]:
+    """Read and validate one revert-proof JSON file, refusing duplicate keys."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, None, f"{path}: not valid JSON"
+    except ValueError as error:
+        return None, None, f"{path}: {error}"
+    if not isinstance(payload, dict):
+        return None, None, f"{path}: wrong value type (expected JSON object)"
+    raw_commit = payload.get("commit")
+    commit = raw_commit if isinstance(raw_commit, str) else None
+    schema_error = _revert_proof_schema_error(payload)
+    if schema_error is not None:
+        return None, commit, f"{path}: {schema_error}"
+    return payload, str(payload["commit"]), None
+
+
+def _record_verdict(record: dict[str, object], head_tree: str) -> str | None:
+    """Return a finding when a validated record does not prove its fix commit at head_tree."""
+    if record["head_tree"] != head_tree:
+        return (
+            f"record for another head tree ({str(record['head_tree'])[:12]}, "
+            f"expected {head_tree[:12]}; stale)"
+        )
+    if record["rc_head"] != 0:
+        return f"rc_head is {record['rc_head']}, expected 0"
+    if record["rc_reverted"] == 0:
+        return "rc_reverted is 0 (test passes without the fix)"
+    if record["rc_reverted"] == "timeout":
+        return "rc_reverted is timeout (no verdict)"
+    return None
+
+
+def _load_revert_proofs(
+    records: tuple[Path, ...],
+    fix_ids: frozenset[str],
+) -> tuple[dict[str, list[dict[str, object]]], dict[str, list[str]], list[str]]:
+    """Group validated revert-proof records and errors by fix commit hash."""
+    if len(records) > MAX_PATHS:
+        raise RuntimeError(f"revert-proof records exceed MAX_PATHS={MAX_PATHS}: {len(records)}")
+    by_commit: dict[str, list[dict[str, object]]] = {}
+    errors_by_commit: dict[str, list[str]] = {}
+    unmatched_errors: list[str] = []
+    for path in records[:MAX_PATHS]:
+        payload, commit, error = _read_revert_proof(path)
+        if payload is not None and commit in fix_ids:
+            by_commit.setdefault(commit, []).append(payload)
+        elif error is not None and commit in fix_ids:
+            errors_by_commit.setdefault(commit, []).append(error)
+        elif error is not None:
+            unmatched_errors.append(error)
+    return by_commit, errors_by_commit, unmatched_errors
+
+
+def _commit_revert_findings(
+    commit: str,
+    subject: str,
+    head_tree: str,
+    loaded: tuple[dict[str, list[dict[str, object]]], dict[str, list[str]], list[str]],
+) -> list[str]:
+    """Return the revert-proof findings for one source fix commit."""
+    by_commit, errors_by_commit, unmatched_errors = loaded
+    prefix = f"{commit[:12]}: {subject}"
+    findings = [f"{prefix}: {err}" for err in errors_by_commit.get(commit, ())[:MAX_PATHS]]
+    records = by_commit.get(commit, [])
+    verdicts = [
+        verdict for rec in records[:MAX_PATHS] if (verdict := _record_verdict(rec, head_tree))
+    ]
+    if len(records) > len(verdicts) and not findings:
+        return []
+    findings.extend(f"{prefix}: {verdict}" for verdict in verdicts[:MAX_PATHS])
+    if not findings:
+        if unmatched_errors:
+            findings.extend(f"{prefix}: {err}" for err in unmatched_errors[:MAX_PATHS])
+            unmatched_errors.clear()
+        else:
+            findings.append(
+                f"{prefix}: no revert-proof record; run scripts/revert_proof.py "
+                "and pass --revert-proof, or pass --no-revert-proof-reason"
+            )
+    return findings
+
+
+def _revert_proof(
+    tree: Path,
+    base: str,
+    head: str,
+    records: tuple[Path, ...] = (),
+    waiver: str = "",
+) -> Step:
+    """Require a measured revert-proof record for each source fix commit in base..head."""
+    fixes = _fix_commits(tree, base, head)
+    summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
+    if not fixes:
+        return Step("revert-proof", 0, summary)
+    head_tree = _git(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
+    fix_ids = frozenset(commit for commit, _, _ in fixes[:MAX_CLAIM_COMMITS])
+    loaded = _load_revert_proofs(tuple(records), fix_ids)
+    findings: list[str] = []
+    unproved: list[str] = []
+    for commit, subject, _ in fixes[:MAX_CLAIM_COMMITS]:
+        commit_findings = _commit_revert_findings(commit, subject, head_tree, loaded)
+        if commit_findings:
+            findings.extend(commit_findings)
+            unproved.append(f"{commit[:12]}: {subject}")
+    for error in loaded[2][:MAX_PATHS]:
+        prefix = f"{fixes[0][0][:12]}: {fixes[0][1]}"
+        findings.append(f"{prefix}: {error}")
+        if prefix not in unproved:
+            unproved.append(prefix)
+    if not findings:
+        return Step("revert-proof", 0, summary)
+    reason = waiver.strip()
+    if reason:
+        return Step("revert-proof", 0, "\n".join([f"waived: {reason}", *unproved]))
+    return Step("revert-proof", 1, "\n".join(findings))
+
+
 def _without_signoff(message: str) -> str:
     """Return a commit message with Signed-off-by trailer lines removed, in any letter case."""
     return "\n".join(
@@ -2255,6 +2477,12 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect(
                 "regression-test", lambda: _regression_test(tree, base, head, waivers.no_test)
             ),
+            _collect(
+                "revert-proof",
+                lambda: _revert_proof(
+                    tree, base, head, waivers.revert_proofs, waivers.no_revert_proof
+                ),
+            ),
             _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
             _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
@@ -2263,6 +2491,25 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule)),
             _collect("docstrings", lambda: _docstrings(tree, base, head, waivers.docstring)),
         ]
+
+
+def _add_revert_proof_options(parser: argparse.ArgumentParser) -> None:
+    """Register the revert-proof record option and its waiver option."""
+    parser.add_argument(
+        "--revert-proof",
+        type=Path,
+        action="append",
+        default=[],
+        help="measured revert_proof.py JSON record for one fix commit; repeatable",
+    )
+    parser.add_argument(
+        "--no-revert-proof-reason",
+        default="",
+        help=(
+            "why the fix commits in the range carry no revert-proof record; "
+            "waives the revert-proof step"
+        ),
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2280,6 +2527,7 @@ def _parser() -> argparse.ArgumentParser:
             "do not name them; waives the regression-test step"
         ),
     )
+    _add_revert_proof_options(parser)
     parser.add_argument(
         "--claim-reason",
         default="",
@@ -2322,11 +2570,13 @@ def main(argv: list[str] | None = None) -> int:
         base, head = _prepare(tree, base, head)
         waivers = Waivers(
             no_test=args.no_test_reason,
+            no_revert_proof=args.no_revert_proof_reason,
             claim=args.claim_reason,
             doc=args.doc_reason,
             test_program=args.test_program_reason,
             c_rule=args.c_rule_reason,
             docstring=args.docstring_reason,
+            revert_proofs=tuple(args.revert_proof),
         )
         steps = _checks(tree, base, head, waivers)
         _remaining(0)
