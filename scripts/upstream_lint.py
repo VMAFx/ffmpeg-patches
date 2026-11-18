@@ -66,7 +66,11 @@ fix commit has a valid record whose head_tree matches head, whose rc_head is 0
 and whose rc_reverted is a nonzero integer. The head must resolve to a commit
 with head_tree, and reverted_paths must equal the sorted source paths of the fix.
 Raw commit and path lists above MAX_PATHS fail before classification; neither
-list is silently truncated. One valid record for a commit
+list is silently truncated. Command environments have a separate
+MAX_ENV_ENTRIES bound of 16384, leaving ample room for environments with
+hundreds of entries without coupling them to path or commit scans. JSON object
+keys and recorded command arguments have independent MAX_JSON_KEYS and
+MAX_COMMAND_ARGS bounds of 2000 each. One valid record for a commit
 satisfies the step; records that are schema-valid but stale or passing without
 the fix are ignored when a valid one exists, while malformed ones remain
 findings. A merge commit that carries fix wording cannot be proven by a revert
@@ -249,6 +253,10 @@ C_RULES_DIFF = (
 )
 MAX_PATHS = 2000
 MAX_CLAIM_COMMITS = 1000
+# Bound environment iteration with ample headroom above hundreds of entries.
+MAX_ENV_ENTRIES = 16384
+MAX_JSON_KEYS = 2000
+MAX_COMMAND_ARGS = 2000
 RUN_TIMEOUT = 1800
 C_RULES_TIMEOUT = 300
 DOCSTRINGS_TIMEOUT = 300
@@ -438,11 +446,13 @@ def _reap_timeout(
 
 def _command_environment(source: Mapping[str, str], cwd: Path) -> dict[str, str]:
     """Refuse oversized command environments before preserving bounded isolated entries."""
-    if len(source) > MAX_PATHS:
-        raise ValueError(f"command environment exceeds MAX_PATHS={MAX_PATHS}: {len(source)}")
+    if len(source) > MAX_ENV_ENTRIES:
+        raise ValueError(
+            f"command environment exceeds MAX_ENV_ENTRIES={MAX_ENV_ENTRIES}: {len(source)}"
+        )
     environment = {
         name: value
-        for name, value in list(source.items())[:MAX_PATHS]
+        for name, value in list(source.items())[:MAX_ENV_ENTRIES]
         if name not in GIT_ENVIRONMENT_NAMES and not name.startswith(GIT_CONFIG_PREFIXES)
     }
     environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
@@ -1608,22 +1618,22 @@ REVERT_PROOF_KEYS = frozenset(
 
 def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     """Build a JSON object dictionary while refusing duplicate keys."""
-    if len(pairs) > MAX_PATHS:
-        raise ValueError(f"JSON object keys exceed MAX_PATHS={MAX_PATHS}")
+    if len(pairs) > MAX_JSON_KEYS:
+        raise ValueError(f"JSON object keys exceed MAX_JSON_KEYS={MAX_JSON_KEYS}")
     result: dict[str, object] = {}
-    for key, value in pairs[:MAX_PATHS]:
+    for key, value in pairs[:MAX_JSON_KEYS]:
         if key in result:
             raise ValueError(f"duplicate key: {key}")
         result[key] = value
     return result
 
 
-def _is_nonempty_str_list(value: object) -> bool:
+def _is_nonempty_str_list(value: object, bound: int) -> bool:
     """Return whether value is a bounded non-empty list of non-empty strings."""
     return (
         isinstance(value, list)
-        and 0 < len(value) <= MAX_PATHS
-        and all(isinstance(item, str) and bool(item) for item in value[:MAX_PATHS])
+        and 0 < len(value) <= bound
+        and all(isinstance(item, str) and bool(item) for item in value[:bound])
     )
 
 
@@ -1641,7 +1651,7 @@ def _revert_proof_type_error(payload: dict[str, object]) -> str | None:
     hex_error = _valid_hex_fields(payload)
     if hex_error is not None:
         return hex_error
-    if not _is_nonempty_str_list(payload["command"]):
+    if not _is_nonempty_str_list(payload["command"], MAX_COMMAND_ARGS):
         return "wrong value type for command"
     rc_head = payload["rc_head"]
     if not isinstance(rc_head, int) or isinstance(rc_head, bool):
@@ -1653,7 +1663,7 @@ def _revert_proof_type_error(payload: dict[str, object]) -> str | None:
     ):
         return "wrong value type for rc_reverted"
     paths = payload["reverted_paths"]
-    if not _is_nonempty_str_list(paths) or paths != sorted(paths):
+    if not _is_nonempty_str_list(paths, MAX_PATHS) or paths != sorted(paths):
         return "wrong value type for reverted_paths"
     return None
 

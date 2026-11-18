@@ -2099,6 +2099,16 @@ class FixtureTest(unittest.TestCase):
 class PipelineTest(FixtureTest):
     """Run Git and base tools in a throwaway repository; stub external hooks and engine."""
 
+    def test_command_environment_is_independent_of_path_bound(self) -> None:
+        """Lowering the path bound to one still accepts every fixture environment entry."""
+        environment = {"FIXTURE_FIRST": "first", "FIXTURE_LAST": "last"}
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            result = upstream_lint._command_environment(environment, self.root)
+        self.assertEqual(
+            result,
+            {**environment, "PRE_COMMIT_NO_CONCURRENCY": "1", "PWD": str(self.root.resolve())},
+        )
+
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
         """A correctly named clean commit passes every collected check."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
@@ -3378,32 +3388,40 @@ class RunnerTest(unittest.TestCase):
 
     def test_command_environment_above_bound_is_refused(self) -> None:
         """An oversized fixture environment fails before any command starts."""
-        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_PATHS)}
+        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_ENV_ENTRIES)}
         environment["REQUIRED_LAST"] = "present"
         with self.assertRaises(ValueError) as caught:
             upstream_lint._command_environment(environment, Path.cwd())
-        self.assertIn(f"MAX_PATHS={upstream_lint.MAX_PATHS}", str(caught.exception))
-        self.assertIn(str(upstream_lint.MAX_PATHS + 1), str(caught.exception))
+        self.assertIn(f"MAX_ENV_ENTRIES={upstream_lint.MAX_ENV_ENTRIES}", str(caught.exception))
+        self.assertIn(str(upstream_lint.MAX_ENV_ENTRIES + 1), str(caught.exception))
 
     def test_command_environment_exact_bound_preserves_last_entry(self) -> None:
         """The exact environment bound accepts and preserves the final required entry."""
-        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_PATHS - 1)}
+        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_ENV_ENTRIES - 1)}
         environment["REQUIRED_LAST"] = "present"
         result = upstream_lint._command_environment(environment, Path.cwd())
         self.assertEqual(result["REQUIRED_LAST"], "present")
-        self.assertEqual(len(result), upstream_lint.MAX_PATHS + 2)
+        self.assertEqual(len(result), upstream_lint.MAX_ENV_ENTRIES + 2)
 
     def test_command_environment_overflow_returns_usage_error(self) -> None:
         """The runner reports environment overflow as usage error without spawning."""
+        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_ENV_ENTRIES + 1)}
+        command_environment = upstream_lint._command_environment
         with (
             unittest.mock.patch.object(
-                upstream_lint, "_command_environment", side_effect=ValueError("fixture overflow")
+                upstream_lint,
+                "_command_environment",
+                side_effect=lambda source, cwd: command_environment(environment, cwd),
             ),
             unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen,
         ):
             result = upstream_lint._run(["git", "--version"], Path.cwd())
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stdout, "fixture overflow")
+        self.assertEqual(
+            result.stdout,
+            f"command environment exceeds MAX_ENV_ENTRIES={upstream_lint.MAX_ENV_ENTRIES}: "
+            f"{len(environment)}",
+        )
         popen.assert_not_called()
 
     def test_fixture_git_uses_isolated_environment(self) -> None:
@@ -4064,6 +4082,21 @@ class CRulesTest(unittest.TestCase):
 
 class RevertProofStepTest(FixtureTest):
     """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
+
+    def test_record_keys_are_independent_of_path_bound(self) -> None:
+        """A valid seven-key proof object remains readable with a one-path bound."""
+        payload = self.valid_record("a" * 40, "b" * 40, "c" * 40, command=["pytest"])
+        record = self.write_record("proof.json", payload)
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            result = upstream_lint._read_revert_proof(record)
+        self.assertEqual(result, (payload, "a" * 40, None))
+
+    def test_command_arguments_are_independent_of_path_bound(self) -> None:
+        """A two-argument command remains valid with a one-path bound."""
+        payload = self.valid_record("a" * 40, "b" * 40, "c" * 40)
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            error = upstream_lint._revert_proof_schema_error(payload)
+        self.assertIsNone(error)
 
     def add_fix_commit(
         self, path: str = "libavfilter/vf_x.c", subject: str = "avfilter/vf_x: fix y"
