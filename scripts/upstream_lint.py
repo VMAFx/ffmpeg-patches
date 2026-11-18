@@ -49,6 +49,10 @@ The revert-proof step requires one measured scripts/revert_proof.py JSON record
 (--revert-proof FILE, repeatable) per source fix commit in base..head.
 Root commits imported through unrelated history are included against the empty
 tree; fix wording and source-path classification apply as for other commits.
+Stored parent headers are compared with Git's visible parents before classification.
+Shallow, grafted or replaced ancestry that hides parents gets an incomplete-history
+finding instead of a snapshot diff; fetch missing history or restore the original
+ancestry. A genuine zero-parent root keeps the empty-tree comparison.
 scripts/revert_proof.py runs the same trusted test command at HEAD and after
 reversing source paths in clean detached scratch; the module itself never writes
 to the caller work tree or index, but the command runs with the rights of the
@@ -1528,12 +1532,36 @@ def _commit_paths(tree: Path, commit: str) -> list[str]:
     return paths
 
 
+def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -> str | None:
+    """Compare stored and visible parents to distinguish real roots from hidden ancestry."""
+    raw = _git(tree, "--no-advice", "--no-replace-objects", "cat-file", "commit", commit)
+    stored = re.findall(r"^parent ([0-9a-f]+)$", raw.partition("\n\n")[0], re.MULTILINE)
+    if parents is None:
+        parents = _git(tree, "--no-advice", "log", "-1", "--format=%P", commit).strip()
+    if stored != parents.split():
+        return (
+            f"{commit}: history is incomplete; fetch missing parents with git fetch --unshallow "
+            "or git fetch --deepen=<commits>, or restore parents hidden by grafts/replace refs"
+        )
+    return None
+
+
 def _fix_commits(
-    tree: Path, base: str, head: str, *, include_merges: bool = False
+    tree: Path,
+    base: str,
+    head: str,
+    *,
+    include_merges: bool = False,
+    history_errors: list[str] | None = None,
 ) -> list[tuple[str, str, frozenset[str]]]:
-    """Collect source fix commits in base..head with their reachable names."""
+    """Collect source fixes while reporting hidden ancestry before path classification."""
     records = list(
-        filter(None, _git(tree, "log", "-z", "--format=%H%n%P%n%B", f"{base}..{head}").split("\0"))
+        filter(
+            None,
+            _git(tree, "--no-advice", "log", "-z", "--format=%H%n%P%n%B", f"{base}..{head}").split(
+                "\0"
+            ),
+        )
     )
     if len(records) > MAX_PATHS:
         raise RuntimeError(f"commit scan exceeds MAX_PATHS={MAX_PATHS}: {len(records)}")
@@ -1542,6 +1570,12 @@ def _fix_commits(
         commit, _, rest = record.partition("\n")
         parents, _, message = rest.partition("\n")
         subject = message.partition("\n")[0].rstrip("\r")
+        history_error = _commit_history_error(tree, commit, parents)
+        if history_error:
+            if history_errors is None:
+                raise RuntimeError(history_error)
+            history_errors.append(f"{commit[:12]}: {subject}: {history_error}")
+            continue
         if not fix_word(message):
             continue
         if " " in parents.strip():
@@ -1807,13 +1841,14 @@ def _revert_proof(
     records: tuple[Path, ...] = (),
     waiver: str = "",
 ) -> Step:
-    """Require a measured revert-proof record for each source fix commit in base..head."""
+    """Report incomplete history and require measured records for source fixes in base..head."""
+    history_errors: list[str] = []
     try:
-        fixes = _fix_commits(tree, base, head, include_merges=True)
+        fixes = _fix_commits(tree, base, head, include_merges=True, history_errors=history_errors)
     except RuntimeError as error:
         return Step("revert-proof", 1, str(error))
     summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
-    if not fixes:
+    if not fixes and not history_errors:
         return Step("revert-proof", 0, summary)
     if len(fixes) > MAX_CLAIM_COMMITS:
         return Step(
@@ -1824,8 +1859,8 @@ def _revert_proof(
     head_tree = _git(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
     fix_ids = frozenset(commit for commit, _, _ in fixes[:MAX_CLAIM_COMMITS])
     loaded = _load_revert_proofs(tuple(records), fix_ids)
-    findings: list[str] = []
-    unproved: list[str] = []
+    findings: list[str] = list(history_errors)
+    unproved: list[str] = list(history_errors)
     for fix in fixes[:MAX_CLAIM_COMMITS]:
         commit, subject, _ = fix
         commit_findings = _commit_revert_findings(tree, fix, head_tree, loaded)

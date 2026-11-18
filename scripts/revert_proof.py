@@ -19,6 +19,8 @@ start, output must be outside the caller work tree and Git administration, and
 the temporary parent must be outside the caller work tree.
 Root fix commits are compared against the empty tree; reversing their source
 patch removes the added source files in scratch, with conflicts still exiting 4.
+Parents hidden by shallow history, grafts or replace refs cause exit 2 before
+scratch work or old-record removal; fetch missing history or restore the parents.
 Commands above upstream_lint.MAX_COMMAND_ARGS are refused with exit 2 before
 scratch work; commands at the cap are accepted.
 """
@@ -76,8 +78,13 @@ class ProofConfig:
 
 
 def git_out(tree: Path, *args: str) -> str:
-    """Run a bounded Git command in tree or raise _PreflightError."""
-    result = upstream_lint._run(["git", *args], tree, timeout=GIT_TIMEOUT)
+    """Run bounded Git, suppressing advice in machine reads, or raise _PreflightError."""
+    options = (
+        ["--no-advice"]
+        if args and args[0] in ("rev-parse", "diff-tree", "--no-optional-locks")
+        else []
+    )
+    result = upstream_lint._run(["git", *options, *args], tree, timeout=GIT_TIMEOUT)
     if result.returncode != 0 or result.timed_out:
         detail = result.stdout.strip() or f"rc={result.returncode}"
         raise _PreflightError(f"git {shlex.join(args)}: {detail}")
@@ -144,7 +151,7 @@ def worktree_root(tree: Path) -> Path:
 
 
 def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str], str]:
-    """Refuse status-visible tracked changes and validate ancestry and source paths."""
+    """Refuse tracked changes or hidden parents and validate ancestry and source paths."""
     if not tree.is_dir():
         raise _PreflightError(f"work tree not found: {tree}")
     if tracked_status(tree):
@@ -158,6 +165,12 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
     commit = git_out(
         tree, "rev-parse", "--verify", "--end-of-options", f"{raw_commit}^{{commit}}"
     ).strip()
+    try:
+        history_error = upstream_lint._commit_history_error(tree, commit)
+    except RuntimeError as error:
+        raise _PreflightError(str(error)) from error
+    if history_error:
+        raise _PreflightError(history_error)
     ancestor = upstream_lint._run(
         ["git", "merge-base", "--is-ancestor", commit, head], tree, timeout=GIT_TIMEOUT
     )

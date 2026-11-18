@@ -24,6 +24,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
+from tests.test_revert_proof import clone_shallow_side_fix
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402
@@ -4082,6 +4083,62 @@ class CRulesTest(unittest.TestCase):
 
 class RevertProofStepTest(FixtureTest):
     """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
+
+    def test_shallow_docs_fix_reports_incomplete_history(self) -> None:
+        """A docs-only side boundary produces its own history finding without a proof demand."""
+        clone = self.root.parent / "shallow"
+        base, commit = clone_shallow_side_fix(self.root, clone, "doc/manual.txt")
+        self.root, self.base = clone, base
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(len(step.output.splitlines()), 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn("history is incomplete", step.output)
+        self.assertIn("fetch --unshallow", step.output)
+        self.assertNotIn("no revert-proof record", step.output)
+        self.assertNotIn("merge commit", step.output)
+
+    def test_shallow_source_fix_cannot_accept_record_until_history_is_complete(self) -> None:
+        """A matching source proof fails at a shallow boundary and passes after local deepening."""
+        clone = self.root.parent / "shallow"
+        base, commit = clone_shallow_side_fix(self.root, clone, "libavfilter/vf_x.c")
+        self.root, self.base = clone, base
+        head = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record = self.write_record("shallow.json", self.valid_record(commit, head, head_tree))
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(len(step.output.splitlines()), 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn("history is incomplete", step.output)
+        self.assertNotIn("no revert-proof record", step.output)
+        self.git("fetch", "-q", "--unshallow", "origin")
+        complete = self.proof_step(record)
+        self.assertEqual(complete.rc, 0, complete.output)
+        self.assertIn("1 fix commit(s), 1 revert-proof record(s)", complete.output)
+
+    def test_neutral_shallow_boundary_is_not_silently_skipped(self) -> None:
+        """A boundary with no fix wording still reports unknown parents by commit."""
+        clone = self.root.parent / "shallow"
+        base, commit = clone_shallow_side_fix(
+            self.root, clone, "doc/manual.txt", "doc: update wording"
+        )
+        self.root, self.base = clone, base
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn("history is incomplete", step.output)
+
+    def test_imported_true_root_remains_provable_after_history_check(self) -> None:
+        """A stored zero-parent source fix keeps the round-seven required-proof result."""
+        commit, _, _ = self.import_root_commit(
+            "libavfilter/vf_root.c", "avfilter/vf_root: fix imported value"
+        )
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(commit[:12], step.output)
+        self.assertIn("no revert-proof record", step.output)
+        self.assertNotIn("history is incomplete", step.output)
 
     def import_root_commit(self, path: str, subject: str) -> tuple[str, str, str]:
         """Merge an unrelated root into a range whose base remains an ancestor."""
