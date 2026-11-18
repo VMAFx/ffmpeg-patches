@@ -52,7 +52,12 @@ fix commit's source paths with git apply -R, runs the test command again,
 restores the tree to HEAD and writes the record with commit, head, head_tree,
 command, rc_head, rc_reverted and reverted_paths. The step checks that each
 fix commit has a valid record whose head_tree matches head, whose rc_head is 0
-and whose rc_reverted is a nonzero integer. --no-revert-proof-reason TEXT
+and whose rc_reverted is a nonzero integer. One valid record for a commit
+satisfies the step; records that are schema-valid but stale or passing without
+the fix are ignored when a valid one exists, while malformed ones remain
+findings. A merge commit that carries fix wording cannot be proven by a revert
+and is refused unless put in its own commit or waived, and more fix commits
+than MAX_CLAIM_COMMITS is a finding of the step. --no-revert-proof-reason TEXT
 waives the step and lists the waived commits.
 
 The diagnostic-citation step fails a commit whose message names a compiler
@@ -437,7 +442,7 @@ def _run(
             raise RuntimeError("overall deadline exhausted (reap budget reserved)")
     environment = {
         name: value
-        for name, value in os.environ.items()
+        for name, value in list(os.environ.items())[:MAX_PATHS]
         if name not in GIT_ENVIRONMENT_NAMES and not name.startswith(GIT_CONFIG_PREFIXES)
     }
     environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
@@ -460,6 +465,9 @@ def _run(
             )
         except subprocess.TimeoutExpired as error:
             return _reap_timeout(process, argv, error.output)
+        except KeyboardInterrupt:
+            _reap_timeout(process, argv)
+            raise
 
 
 def _git(tree: Path, *args: str) -> str:
@@ -1458,23 +1466,30 @@ def fix_word(message: str) -> str | None:
     return match[0] if match else None
 
 
-def _fix_commits(tree: Path, base: str, head: str) -> list[tuple[str, str, frozenset[str]]]:
+def _fix_commits(
+    tree: Path, base: str, head: str, *, include_merges: bool = False
+) -> list[tuple[str, str, frozenset[str]]]:
     """Collect source fix commits in base..head with their reachable names."""
-    records = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}").split("\0")
+    records = _git(tree, "log", "-z", "--format=%H%n%P%n%B", f"{base}..{head}").split("\0")
     fixes: list[tuple[str, str, frozenset[str]]] = []
-    for record in filter(None, records):
-        commit, _, message = record.partition("\n")
+    for record in list(filter(None, records))[:MAX_PATHS]:
+        commit, _, rest = record.partition("\n")
+        parents, _, message = rest.partition("\n")
         subject = message.partition("\n")[0].rstrip("\r")
         if not fix_word(message):
+            continue
+        if " " in parents.strip():
+            if include_merges:
+                fixes.append((commit, subject, frozenset()))
             continue
         paths = [
             path
             for path in _git(
                 tree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit
-            ).split("\0")
+            ).split("\0")[:MAX_PATHS]
             if path
         ]
-        if any(is_source_path(path) for path in paths):
+        if any(is_source_path(path) for path in paths[:MAX_PATHS]):
             patch = _git(
                 tree,
                 "diff-tree",
@@ -1670,27 +1685,33 @@ def _commit_revert_findings(
     subject: str,
     head_tree: str,
     loaded: tuple[dict[str, list[dict[str, object]]], dict[str, list[str]], list[str]],
+    *,
+    is_merge: bool = False,
 ) -> list[str]:
     """Return the revert-proof findings for one source fix commit."""
     by_commit, errors_by_commit, unmatched_errors = loaded
     prefix = f"{commit[:12]}: {subject}"
-    findings = [f"{prefix}: {err}" for err in errors_by_commit.get(commit, ())[:MAX_PATHS]]
+    raw_errors = [*errors_by_commit.get(commit, ()), *unmatched_errors]
+    unmatched_errors.clear()
+    findings = [f"{prefix}: {err}" for err in raw_errors[:MAX_PATHS]]
+    if is_merge:
+        findings.append(
+            f"{prefix}: merge commit with fix wording cannot be proven by a revert; "
+            "put the fix in its own commit, or pass --no-revert-proof-reason"
+        )
+        return findings
     records = by_commit.get(commit, [])
     verdicts = [
         verdict for rec in records[:MAX_PATHS] if (verdict := _record_verdict(rec, head_tree))
     ]
-    if len(records) > len(verdicts) and not findings:
-        return []
+    if len(records) > len(verdicts):
+        return findings
     findings.extend(f"{prefix}: {verdict}" for verdict in verdicts[:MAX_PATHS])
     if not findings:
-        if unmatched_errors:
-            findings.extend(f"{prefix}: {err}" for err in unmatched_errors[:MAX_PATHS])
-            unmatched_errors.clear()
-        else:
-            findings.append(
-                f"{prefix}: no revert-proof record; run scripts/revert_proof.py "
-                "and pass --revert-proof, or pass --no-revert-proof-reason"
-            )
+        findings.append(
+            f"{prefix}: no revert-proof record; run scripts/revert_proof.py "
+            "and pass --revert-proof, or pass --no-revert-proof-reason"
+        )
     return findings
 
 
@@ -1702,25 +1723,28 @@ def _revert_proof(
     waiver: str = "",
 ) -> Step:
     """Require a measured revert-proof record for each source fix commit in base..head."""
-    fixes = _fix_commits(tree, base, head)
+    fixes = _fix_commits(tree, base, head, include_merges=True)
     summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
     if not fixes:
         return Step("revert-proof", 0, summary)
+    if len(fixes) > MAX_CLAIM_COMMITS:
+        return Step(
+            "revert-proof",
+            1,
+            f"fix commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(fixes)}",
+        )
     head_tree = _git(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
     fix_ids = frozenset(commit for commit, _, _ in fixes[:MAX_CLAIM_COMMITS])
     loaded = _load_revert_proofs(tuple(records), fix_ids)
     findings: list[str] = []
     unproved: list[str] = []
-    for commit, subject, _ in fixes[:MAX_CLAIM_COMMITS]:
-        commit_findings = _commit_revert_findings(commit, subject, head_tree, loaded)
+    for commit, subject, names in fixes[:MAX_CLAIM_COMMITS]:
+        commit_findings = _commit_revert_findings(
+            commit, subject, head_tree, loaded, is_merge=not names
+        )
         if commit_findings:
             findings.extend(commit_findings)
             unproved.append(f"{commit[:12]}: {subject}")
-    for error in loaded[2][:MAX_PATHS]:
-        prefix = f"{fixes[0][0][:12]}: {fixes[0][1]}"
-        findings.append(f"{prefix}: {error}")
-        if prefix not in unproved:
-            unproved.append(prefix)
     if not findings:
         return Step("revert-proof", 0, summary)
     reason = waiver.strip()
@@ -2500,7 +2524,11 @@ def _add_revert_proof_options(parser: argparse.ArgumentParser) -> None:
         type=Path,
         action="append",
         default=[],
-        help="measured revert_proof.py JSON record for one fix commit; repeatable",
+        help=(
+            "measured revert_proof.py JSON record for one fix commit; repeatable "
+            "(one valid record per commit satisfies the step; stale or passing-without-fix "
+            "records are ignored when a valid one exists, malformed ones remain findings)"
+        ),
     )
     parser.add_argument(
         "--no-revert-proof-reason",

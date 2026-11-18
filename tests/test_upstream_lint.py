@@ -4235,6 +4235,73 @@ class RevertProofStepTest(FixtureTest):
         self.assertIn(f"{second_commit[:12]}: avfilter/vf_y: fix second", output)
         self.assertNotIn(f"{first_commit[:12]}: avfilter/vf_x: fix first", output)
 
+    def test_step_refuses_merge_commit_with_fix_wording_unless_waived(self) -> None:
+        """A merge commit with fix wording is refused by name unless waived by reason."""
+        self.git("checkout", "-qb", "side", self.base)
+        self.write("libavfilter/vf_y.c", SOURCE.replace("return 1", "return 3"))
+        self.commit("avfilter/vf_y: add y")
+        self.git("checkout", "-q", "-")
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update x")
+        self.git("merge", "--no-ff", "-qm", "avfilter/vf_x: merge side and fix y", "side")
+        merge_sha = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record_file = self.write_record(
+            "merge.json", self.valid_record(merge_sha, merge_sha, head_tree)
+        )
+
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{merge_sha[:12]}: avfilter/vf_x: merge side and fix y", output)
+        self.assertIn("own commit", output)
+
+        rc, output = self.check("--no-revert-proof-reason", "merge conflict resolution")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: merge conflict resolution", output)
+        self.assertIn(f"{merge_sha[:12]}: avfilter/vf_x: merge side and fix y", output)
+
+    def test_step_accepts_good_plus_stale_duplicate_records(self) -> None:
+        """A valid record for a commit satisfies the step even when a stale duplicate exists."""
+        commit, head, head_tree = self.add_fix_commit()
+        stale_file = self.write_record("stale.json", self.valid_record(commit, head, "0" * 40))
+        good_file = self.write_record("good.json", self.valid_record(commit, head, head_tree))
+
+        rc, output = self.check("--revert-proof", str(stale_file), "--revert-proof", str(good_file))
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0", output)
+
+    def test_step_refuses_good_plus_malformed_duplicate_records(self) -> None:
+        """A malformed record remains a finding even when a valid record for the commit exists."""
+        commit, head, head_tree = self.add_fix_commit()
+        good_file = self.write_record("good.json", self.valid_record(commit, head, head_tree))
+        bad_payload = self.valid_record(commit, head, head_tree)
+        del bad_payload["reverted_paths"]
+        bad_file = self.write_record("bad.json", bad_payload)
+
+        rc, output = self.check("--revert-proof", str(good_file), "--revert-proof", str(bad_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("missing key", output)
+
+    def test_step_refuses_fix_commits_above_commit_cap(self) -> None:
+        """More fix commits than MAX_CLAIM_COMMITS fails revert-proof without truncating."""
+        self.add_fix_commit("libavfilter/vf_x.c", "avfilter/vf_x: fix first")
+        self.write("libavfilter/vf_y.c", SOURCE.replace("return 1", "return 3"))
+        self.write("tests/ref/fate/filter-y", "0\n")
+        self.commit("avfilter/vf_y: fix second")
+        second_commit = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record_file = self.write_record(
+            "second.json", self.valid_record(second_commit, second_commit, head_tree)
+        )
+
+        with unittest.mock.patch.object(upstream_lint, "MAX_CLAIM_COMMITS", 1):
+            _, output = self.check("--revert-proof", str(record_file))
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn("fix commits exceed MAX_CLAIM_COMMITS=1: 2", output)
+
 
 if __name__ == "__main__":
     unittest.main()

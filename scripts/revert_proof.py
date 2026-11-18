@@ -103,6 +103,29 @@ def parse_config(argv: list[str] | None) -> ProofConfig:
     )
 
 
+def absent_source_paths(tree: Path, head: str, source_paths: list[str]) -> list[str]:
+    """Return changed source paths of the commit that are absent from head."""
+    present = set(
+        filter(
+            None,
+            git_out(tree, "ls-tree", "--name-only", "-r", "-z", head, "--", *source_paths).split(
+                "\0"
+            ),
+        )
+    )
+    return [path for path in source_paths[: upstream_lint.MAX_PATHS] if path not in present]
+
+
+def check_absent_paths(tree: Path, head: str, source_paths: list[str]) -> list[str]:
+    """Return source paths absent at head after refusing any existing untracked path."""
+    absent = absent_source_paths(tree, head, source_paths)
+    for relpath in absent[: upstream_lint.MAX_PATHS]:
+        target = tree / relpath
+        if target.exists() or target.is_symlink():
+            raise _PreflightError(f"untracked path exists at reverse-apply target: {relpath}")
+    return absent
+
+
 def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str]]:
     """Verify clean tracked tree, commit ancestry and changed source paths."""
     if not tree.is_dir():
@@ -129,6 +152,7 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str]]
     )
     if not source_paths:
         raise _PreflightError(f"commit {commit} changes no source path")
+    check_absent_paths(tree, head, source_paths)
     return commit, head, head_tree, source_paths
 
 
@@ -143,27 +167,98 @@ def run_test_command(command: list[str], tree: Path, timeout: float) -> int | st
     return result.returncode
 
 
-def restore_tree(tree: Path, absent_at_head: list[str]) -> None:
-    """Restore tracked files to HEAD and verify tracked status is empty."""
-    for relpath in absent_at_head[: upstream_lint.MAX_PATHS]:
+def current_head_and_tree(tree: Path) -> tuple[str | None, str | None]:
+    """Return the current HEAD commit and tree hashes, or None on Git failure."""
+    head_res = upstream_lint._run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"], tree, timeout=GIT_TIMEOUT
+    )
+    tree_res = upstream_lint._run(
+        ["git", "rev-parse", "--verify", "HEAD^{tree}"], tree, timeout=GIT_TIMEOUT
+    )
+    cur_head = head_res.stdout.strip() if head_res.returncode == 0 else None
+    cur_tree = tree_res.stdout.strip() if tree_res.returncode == 0 else None
+    return cur_head, cur_tree
+
+
+def tracked_matches_tree(tree: Path, head_tree: str) -> bool:
+    """Return whether tracked files in the index and work tree match head_tree."""
+    status = upstream_lint._run(
+        ["git", "status", "--porcelain", "--untracked-files=no"], tree, timeout=GIT_TIMEOUT
+    )
+    diff = upstream_lint._run(
+        ["git", "diff-index", "--quiet", head_tree, "--"], tree, timeout=GIT_TIMEOUT
+    )
+    return status.returncode == 0 and not status.stdout and diff.returncode == 0
+
+
+def verify_head_run(
+    config: ProofConfig,
+    rc_head: int | str,
+    head: str,
+    head_tree: str,
+    absent: list[str],
+) -> int:
+    """Verify HEAD run exit code and that HEAD and tracked files remain at head_tree."""
+    cur_head, cur_tree = current_head_and_tree(config.tree)
+    if cur_head != head:
+        raise _RestoreError(f"HEAD moved from {head} to {cur_head or '<invalid>'} in {config.tree}")
+    if rc_head != 0:
+        raise _HeadTestError(f"test fails at head (rc={rc_head})")
+    if cur_tree != head_tree or not tracked_matches_tree(config.tree, head_tree):
+        raise _HeadTestError(f"test modified tracked files at head in {config.tree}")
+    for relpath in absent[: upstream_lint.MAX_PATHS]:
+        target = config.tree / relpath
+        if target.exists() or target.is_symlink():
+            raise _HeadTestError(f"test created untracked path at reverse-apply target: {relpath}")
+    return 0
+
+
+def restore_tree(
+    tree: Path,
+    created_paths: list[str],
+    head: str | None = None,
+    head_tree: str | None = None,
+) -> None:
+    """Restore tracked files to head_tree and verify HEAD and tracked content match."""
+    for relpath in created_paths[: upstream_lint.MAX_PATHS]:
         target = tree / relpath
         if target.is_file() or target.is_symlink():
             try:
                 target.unlink()
             except OSError as error:
                 raise _RestoreError(f"failed to restore tree {tree}: {error}") from error
-    reset = upstream_lint._run(["git", "reset", "--hard", "HEAD"], tree, timeout=GIT_TIMEOUT)
-    status = upstream_lint._run(
-        ["git", "status", "--porcelain", "--untracked-files=no"], tree, timeout=GIT_TIMEOUT
-    )
-    if reset.returncode != 0 or status.returncode != 0 or status.stdout:
+    cur_head, _ = current_head_and_tree(tree)
+    if head is not None and cur_head != head:
+        if head_tree is not None:
+            upstream_lint._run(
+                ["git", "read-tree", "--reset", "-u", head_tree], tree, timeout=GIT_TIMEOUT
+            )
+            upstream_lint._run(
+                ["git", "checkout-index", "-f", "-u", "-a"], tree, timeout=GIT_TIMEOUT
+            )
+        raise _RestoreError(f"HEAD moved from {head} to {cur_head or '<invalid>'} in {tree}")
+    target_rev = head or "HEAD"
+    reset = upstream_lint._run(["git", "reset", "--hard", target_rev], tree, timeout=GIT_TIMEOUT)
+    after_head, after_tree = current_head_and_tree(tree)
+    expected_tree = head_tree or after_tree or ""
+    if (
+        reset.returncode != 0
+        or (head is not None and after_head != head)
+        or (head_tree is not None and after_tree != head_tree)
+        or not expected_tree
+        or not tracked_matches_tree(tree, expected_tree)
+    ):
         raise _RestoreError(f"failed to restore tree {tree}")
 
 
 def measure_reverted(
-    config: ProofConfig, commit: str, head: str, source_paths: list[str]
+    config: ProofConfig,
+    commit: str,
+    source_paths: list[str],
+    absent: list[str],
+    created_paths: list[str],
 ) -> int | str:
-    """Reverse-apply source paths of commit, run test command, and always restore tree."""
+    """Reverse-apply commit source paths, record created files and run the test command."""
     patch = git_out(
         config.tree,
         "diff-tree",
@@ -181,33 +276,34 @@ def measure_reverted(
         "--",
         *source_paths,
     )
-    present = set(
-        filter(
-            None,
-            git_out(
-                config.tree, "ls-tree", "--name-only", "-r", "-z", head, "--", *source_paths
-            ).split("\0"),
-        )
+    pre_absent = [
+        path
+        for path in absent[: upstream_lint.MAX_PATHS]
+        if not (config.tree / path).exists() and not (config.tree / path).is_symlink()
+    ]
+    applied = upstream_lint._run(
+        ["git", "apply", "-R", "-"], config.tree, data=patch, timeout=GIT_TIMEOUT
     )
-    absent = [path for path in source_paths[: upstream_lint.MAX_PATHS] if path not in present]
-    try:
-        applied = upstream_lint._run(
-            ["git", "apply", "-R", "-"], config.tree, data=patch, timeout=GIT_TIMEOUT
-        )
-        if applied.returncode != 0:
-            raise _ReverseApplyError(f"reverse apply failed for {commit}: {applied.stdout.strip()}")
-        return run_test_command(config.command, config.tree, config.timeout)
-    finally:
-        restore_tree(config.tree, absent)
+    for relpath in pre_absent[: upstream_lint.MAX_PATHS]:
+        target = config.tree / relpath
+        if target.exists() or target.is_symlink():
+            created_paths.append(relpath)
+    if applied.returncode != 0:
+        raise _ReverseApplyError(f"reverse apply failed for {commit}: {applied.stdout.strip()}")
+    return run_test_command(config.command, config.tree, config.timeout)
 
 
 def run_proof(config: ProofConfig) -> None:
     """Execute run 1 at HEAD, run 2 with source paths reverted, and write the record."""
     commit, head, head_tree, source_paths = prepare_tree(config.tree, config.commit)
-    rc_head = run_test_command(config.command, config.tree, config.timeout)
-    if rc_head != 0:
-        raise _HeadTestError(f"test fails at head (rc={rc_head})")
-    rc_reverted = measure_reverted(config, commit, head, source_paths)
+    absent = absent_source_paths(config.tree, head, source_paths)
+    created_paths: list[str] = []
+    try:
+        raw_head = run_test_command(config.command, config.tree, config.timeout)
+        rc_head = verify_head_run(config, raw_head, head, head_tree, absent)
+        rc_reverted = measure_reverted(config, commit, source_paths, absent, created_paths)
+    finally:
+        restore_tree(config.tree, created_paths, head, head_tree)
     payload = {
         "commit": commit,
         "head": head,

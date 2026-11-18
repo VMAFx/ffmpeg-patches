@@ -4,9 +4,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import signal
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -272,6 +276,170 @@ class RevertProofTest(unittest.TestCase):
             self.assertRaises(KeyboardInterrupt),
         ):
             self.run_cli(fix_sha, [sys.executable, "-c", "pass"])
+        self.assert_clean_tree(FIXED_SOURCE)
+        self.assertFalse(self.record_path.exists())
+
+    def test_head_failure_and_timeout_restore_edited_tracked_file(self) -> None:
+        """A HEAD test run that edits a tracked file and fails or times out restores the tree."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        fix_sha = self.commit("avfilter/vf_x: fix return value")
+        fail_cmd = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys\n"
+            "Path('libavfilter/vf_x.c').write_text('dirty\\n', encoding='utf-8')\n"
+            "sys.exit(1)\n",
+        ]
+        rc, _, err = self.run_cli(fix_sha, fail_cmd)
+        self.assertEqual(rc, 3)
+        self.assertIn("test fails at head", err)
+        self.assertFalse(self.record_path.exists())
+        self.assert_clean_tree(FIXED_SOURCE)
+
+        timeout_cmd = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import time\n"
+            "Path('libavfilter/vf_x.c').write_text('dirty timeout\\n', encoding='utf-8')\n"
+            "time.sleep(5)\n",
+        ]
+        rc, _, err = self.run_cli(fix_sha, timeout_cmd, timeout="0.2")
+        self.assertEqual(rc, 3)
+        self.assertIn("rc=timeout", err)
+        self.assertFalse(self.record_path.exists())
+        self.assert_clean_tree(FIXED_SOURCE)
+
+    def test_head_failure_with_restore_failure_exits_five(self) -> None:
+        """A failed restore after a failing HEAD test run exits with restore status 5."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        fix_sha = self.commit("avfilter/vf_x: fix return value")
+        real_run = upstream_lint._run
+
+        def fail_reset(
+            argv: list[str],
+            cwd: Path,
+            data: str | None = None,
+            timeout: float = 60,
+            *,
+            allow_any_executable: bool = False,
+        ) -> upstream_lint.RunResult:
+            """Simulate a failed git reset after a failing HEAD test run."""
+            if argv[:3] == ["git", "reset", "--hard"]:
+                return upstream_lint.RunResult(tuple(argv), 1, "reset failed\n")
+            return real_run(argv, cwd, data, timeout, allow_any_executable=allow_any_executable)
+
+        cmd = [sys.executable, "-c", "import sys; sys.exit(1)"]
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fail_reset):
+            rc, _, err = self.run_cli(fix_sha, cmd)
+        self.assertEqual(rc, 5)
+        self.assertIn(str(self.tree), err)
+        self.assertFalse(self.record_path.exists())
+
+    def test_refuse_head_run_that_modifies_tracked_file_and_exits_zero(self) -> None:
+        """A HEAD test run that edits a tracked file and exits 0 is refused and restored."""
+        self.write("libavfilter/other.c", BASE_SOURCE)
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        fix_sha = self.commit("avfilter/vf_x: fix return value")
+        cmd = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys\n"
+            "Path('libavfilter/other.c').write_text('tampered\\n', encoding='utf-8')\n"
+            "text = Path('libavfilter/vf_x.c').read_text(encoding='utf-8')\n"
+            "sys.exit(0 if 'return 2;' in text else 1)\n",
+        ]
+
+        rc, _, err = self.run_cli(fix_sha, cmd)
+        self.assertEqual(rc, 3)
+        self.assertIn("modified tracked files at head", err)
+        self.assertFalse(self.record_path.exists())
+        self.assert_clean_tree(FIXED_SOURCE)
+        self.assertEqual(
+            (self.tree / "libavfilter/other.c").read_text(encoding="utf-8"), BASE_SOURCE
+        )
+
+    def test_refuse_moved_head_restores_captured_tree_without_moving_branch(self) -> None:
+        """A test that moves HEAD exits 5, restores the captured tree and leaves the branch."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        fix_sha = self.commit("avfilter/vf_x: fix return value")
+        script = (
+            "from pathlib import Path\n"
+            "import subprocess, sys\n"
+            "Path('libavfilter/vf_x.c').write_text('moved tree\\n', encoding='utf-8')\n"
+            "subprocess.run(['git', 'add', 'libavfilter/vf_x.c'], check=True)\n"
+            "subprocess.run([\n"
+            "    'git', '-c', 'user.name=Test', '-c', 'user.email=test@invalid',\n"
+            "    '-c', 'commit.gpgsign=false', 'commit', '-qm', 'moved head'\n"
+            "], check=True)\n"
+            "sys.exit(0)\n"
+        )
+
+        rc, _, err = self.run_cli(fix_sha, [sys.executable, "-c", script])
+        self.assertEqual(rc, 5)
+        self.assertIn("HEAD moved", err)
+        self.assertFalse(self.record_path.exists())
+        moved_head = run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
+        self.assertNotEqual(moved_head, fix_sha)
+        self.assertEqual(
+            (self.tree / "libavfilter/vf_x.c").read_text(encoding="utf-8"), FIXED_SOURCE
+        )
+
+    def test_refuse_preexisting_untracked_file_at_reverse_apply_path(self) -> None:
+        """An untracked file at a path reverse-apply would create is refused and preserved."""
+        self.write("libavfilter/old.c", BASE_SOURCE)
+        self.commit("avfilter/old: add legacy file")
+        run_git(self.tree, "rm", "-q", "libavfilter/old.c", preserve_config=True)
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        fix_sha = self.commit("avfilter/vf_x: fix return value and drop old.c")
+        untracked = self.write("libavfilter/old.c", "user untracked content\n")
+
+        rc, _, err = self.run_cli(fix_sha, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 2)
+        self.assertIn("libavfilter/old.c", err)
+        self.assertFalse(self.record_path.exists())
+        self.assertTrue(untracked.is_file())
+        self.assertEqual(untracked.read_text(encoding="utf-8"), "user untracked content\n")
+
+    def test_keyboard_interrupt_reaps_real_child_process_group_and_restores_tree(self) -> None:
+        """An interrupt during a real child command kills its process group and restores tree."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        fix_sha = self.commit("avfilter/vf_x: fix return value")
+        pid_file = self.root / "pids.txt"
+        script = (
+            "from pathlib import Path\n"
+            "import os, signal, subprocess, sys, time\n"
+            "Path('libavfilter/vf_x.c').write_text('interrupted edit\\n', encoding='utf-8')\n"
+            "grandchild = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(5)'],\n"
+            "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            f"Path({str(pid_file)!r}).write_text(\n"
+            "    f'{os.getpid()}\\n{grandchild.pid}\\n', encoding='utf-8'\n"
+            ")\n"
+            "os.kill(os.getppid(), signal.SIGINT)\n"
+            "time.sleep(2)\n"
+        )
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cli(fix_sha, [sys.executable, "-c", script], timeout="3")
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        pids = [int(line) for line in pid_file.read_text(encoding="utf-8").splitlines() if line]
+        self.assertEqual(len(pids), 2)
+        for pid in pids:
+            for _ in range(25):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            try:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
         self.assert_clean_tree(FIXED_SOURCE)
         self.assertFalse(self.record_path.exists())
 
