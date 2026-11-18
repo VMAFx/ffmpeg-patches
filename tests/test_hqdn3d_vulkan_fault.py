@@ -183,6 +183,22 @@ def build_layer(directory: Path) -> Path:
     return directory
 
 
+def _fault_environment(layer_dir: Path, fault: str) -> dict[str, str]:
+    """Build the child environment with the fault layer in the loader search path."""
+    env = {
+        **os.environ,
+        "VK_ADD_LAYER_PATH": str(layer_dir),
+        "VK_LOADER_LAYERS_ENABLE": LAYER_NAME,
+        "VMAFX_VK_FAULT": fault,
+    }
+    caller_path = os.environ.get("VK_LAYER_PATH")
+    if caller_path:
+        env["VK_LAYER_PATH"] = str(layer_dir) + os.pathsep + caller_path
+    else:
+        env.pop("VK_LAYER_PATH", None)
+    return env
+
+
 def run_fault(binary: str, device: str, layer_dir: Path, fault: str) -> FaultRun:
     """Run FFmpeg hqdn3d_vulkan with the fault layer and return its bounded result."""
     cmd = [
@@ -204,12 +220,7 @@ def run_fault(binary: str, device: str, layer_dir: Path, fault: str) -> FaultRun
         "null",
         "-",
     ]
-    env = {
-        **os.environ,
-        "VK_ADD_LAYER_PATH": str(layer_dir),
-        "VK_LOADER_LAYERS_ENABLE": LAYER_NAME,
-        "VMAFX_VK_FAULT": fault,
-    }
+    env = _fault_environment(layer_dir, fault)
     try:
         done = subprocess.run(  # nosec B603 - explicit FFmpeg binary and fixed filter graph.
             cmd, env=env, capture_output=True, timeout=DEADLINE, check=False
@@ -219,6 +230,42 @@ def run_fault(binary: str, device: str, layer_dir: Path, fault: str) -> FaultRun
         stderr = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else (raw or "")
         return FaultRun(None, stderr)
     return FaultRun(done.returncode, done.stderr.decode("utf-8", errors="replace"))
+
+
+class FaultEnvironmentTest(unittest.TestCase):
+    """Fault layer discovery with inherited loader paths, without a device."""
+
+    def test_caller_layer_path_is_prefixed(self) -> None:
+        """Prepend the fault layer directory to the caller's nonempty layer path."""
+        layer_dir = Path("fault-layer")
+        caller_path = os.pathsep.join(("caller-layer", "other-layer"))
+        with unittest.mock.patch.dict(os.environ, {"VK_LAYER_PATH": caller_path}):
+            env = _fault_environment(layer_dir, "begin=1")
+        self.assertEqual(env["VK_LAYER_PATH"], str(layer_dir) + os.pathsep + caller_path)
+        self.assertEqual(env["VK_ADD_LAYER_PATH"], str(layer_dir))
+        self.assertEqual(env["VK_LOADER_LAYERS_ENABLE"], LAYER_NAME)
+        self.assertEqual(env["VMAFX_VK_FAULT"], "begin=1")
+
+    def test_absent_caller_layer_path_stays_absent(self) -> None:
+        """Keep the additive layer path when the caller has no layer path."""
+        layer_dir = Path("fault-layer")
+        with unittest.mock.patch.dict(os.environ):
+            os.environ.pop("VK_LAYER_PATH", None)
+            env = _fault_environment(layer_dir, "submit=2")
+        self.assertNotIn("VK_LAYER_PATH", env)
+        self.assertEqual(env["VK_ADD_LAYER_PATH"], str(layer_dir))
+        self.assertEqual(env["VK_LOADER_LAYERS_ENABLE"], LAYER_NAME)
+        self.assertEqual(env["VMAFX_VK_FAULT"], "submit=2")
+
+    def test_empty_caller_layer_path_is_omitted(self) -> None:
+        """Omit an empty caller layer path while retaining the additive layer path."""
+        layer_dir = Path("fault-layer")
+        with unittest.mock.patch.dict(os.environ, {"VK_LAYER_PATH": ""}):
+            env = _fault_environment(layer_dir, "")
+        self.assertNotIn("VK_LAYER_PATH", env)
+        self.assertEqual(env["VK_ADD_LAYER_PATH"], str(layer_dir))
+        self.assertEqual(env["VK_LOADER_LAYERS_ENABLE"], LAYER_NAME)
+        self.assertEqual(env["VMAFX_VK_FAULT"], "")
 
 
 class FaultRuleTest(unittest.TestCase):
