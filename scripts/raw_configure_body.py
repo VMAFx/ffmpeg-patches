@@ -149,6 +149,10 @@ ANSI_C_SIMPLE = {
     '"': '"',
     "?": "?",
 }
+ARITHMETIC_WRITES = frozenset(
+    ["=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "^=", "|=", "++", "--"]
+)
+ARITHMETIC_WRITE = re.compile(r"<<=|>>=|[+*/%&^|-]=|(?<![=!<>])=(?!=)|\+\+|--")
 WRITER_NODES = frozenset(["command", "declaration_command", "unset_command"])
 # Builtins that run their operands as shell text: eval now, trap when the signal arrives.
 EVAL_BUILTINS = frozenset(["eval", "trap"])
@@ -481,6 +485,8 @@ class BodyBudget:
     nodes: int = 0
     inline_bodies: int = 0
     peeks: int = 0
+    rebound_scripts: set[Path] = field(default_factory=set)
+    rebound_unknown: bool = False
 
 
 class _DirState(NamedTuple):
@@ -488,6 +494,7 @@ class _DirState(NamedTuple):
 
     dir_changed: bool
     moved: bool
+    command_rebound: bool
 
 
 class _Writer(NamedTuple):
@@ -503,9 +510,11 @@ class _Writer(NamedTuple):
     naming: str
     operands: str
     functions: str = ""
+    referents: bool = False
 
 
 DECLARING = _Writer("", "", "names", "fF")
+NAMEREFS = _Writer("", "", "names", "fF", True)
 # wait -p is from bash 5.1 and compgen -V from bash 5.3.
 WRITERS = {
     "printf": _Writer("v", "v", ""),
@@ -516,12 +525,12 @@ WRITERS = {
     "wait": _Writer("p", "p", ""),
     "compgen": _Writer("AGWFCXPSoV", "V", ""),
     "unset": _Writer("", "", "all", "f"),
-    "declare": DECLARING,
-    "typeset": DECLARING,
-    "local": DECLARING,
+    "declare": NAMEREFS,
+    "typeset": NAMEREFS,
+    "local": NAMEREFS,
     "export": DECLARING,
     "readonly": DECLARING,
-    "let": _Writer("", "", "names"),
+    "let": _Writer("", "", "arithmetic"),
     "eval": _Writer("", "", "any"),
     "trap": _Writer("", "", "any"),
 }
@@ -570,6 +579,8 @@ class _Scan:
     var_scope: _VarScope = field(default_factory=_VarScope)
     moved: bool = False
     rebound: bool = False
+    command_rebound: bool = False
+    child_rebound: bool = False
     prefix: str | None = None
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
@@ -611,12 +622,26 @@ def _candidate_allowed(operand: str) -> bool:
     return bool(operand and operand != "-" and "$" not in operand and "`" not in operand)
 
 
+def _remember_rebinding(operand: str, scan: _Scan) -> None:
+    """Carry a possibly rebound command environment into scans of child file candidates."""
+    if not scan.child_rebound:
+        return
+    if not _candidate_allowed(operand) or (scan.dir_changed and not os.path.isabs(operand)):
+        scan.budget.rebound_unknown = True
+        return
+    try:
+        scan.budget.rebound_scripts.add((scan.context.cwd / operand).resolve())
+    except (OSError, RuntimeError):
+        scan.budget.rebound_unknown = True
+
+
 def _record_candidate(operand: str, is_program: bool, scan: _Scan) -> None:
     """Preserve the directory state at each concrete candidate's encounter.
 
     Words arrive with plain references to resolved own-directory names substituted, so a
     reference still left (an operator form such as ${N%/}) refuses.
     """
+    _remember_rebinding(operand, scan)
     reason = _reference_refusal(operand, scan)
     if reason is not None:
         scan.refusal = reason
@@ -1190,6 +1215,8 @@ def _inspect_resolved_command(
     for head, extra, pos in calls:
         tail = [head, *extra, *words[idx + max(pos - base_idx, 1) :]]
         sub_handled, sub_hit = _dispatch_command(node, raw, tail, scan)
+        if not sub_handled:
+            sub_hit = _ordinary_command(tail, 0, scan)
         if sub_hit is not None or scan.refusal is not None:
             return True, sub_hit
         any_handled |= sub_handled
@@ -1201,6 +1228,7 @@ def _inspect_command(node: Any, raw: bytes, scan: _Scan) -> str | None:
     words, idx, _ = _command_info(node, raw, _live_literals(scan))
     if idx >= len(words):
         return None
+    scan.child_rebound = scan.rebound or scan.command_rebound or _prefix_rebinds(words[:idx])
     handled, hit = _dispatch_command(node, raw, words[idx:], scan)
     if handled:
         return hit
@@ -1762,7 +1790,7 @@ def _push_visit_children(
 def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
     """Apply the grammar allow-list, push children in order and restore subshell directories."""
     if isinstance(node, _DirState):
-        scan.dir_changed, scan.moved = node
+        scan.dir_changed, scan.moved, scan.command_rebound = node
         return None
     kind = node.type
     if kind not in STRUCTURE | ASSIGNMENTS | DATA | LEAVES | SPECIAL:
@@ -1778,7 +1806,7 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
         return None
     if kind in ("command_substitution", "process_substitution"):
         data_only = False
-    entry = _DirState(scan.dir_changed, scan.moved)
+    entry = _DirState(scan.dir_changed, scan.moved, scan.command_rebound)
     hit, children = _visit_semantics(node, raw, data_only, scan)
     _push_visit_children(kind, entry, children, raw, scan)
     return hit
@@ -1845,6 +1873,7 @@ def _visit_semantics(
     elif kind == "pipeline":
         hit = _pipeline_hit(node, raw, scan)
     elif kind in ASSIGNMENTS:
+        scan.command_rebound |= _prefix_rebinds([_text(a, raw) for a in _assignment_nodes(node)])
         _settle_script_dir(node, raw, scan)
         hit = _assignment_hit(node, raw)
     children = _child_modes(node, kind in DATA | ASSIGNMENTS | {"test_command", "file_redirect"})
@@ -2306,13 +2335,26 @@ def _command_runs(node: Any, raw: bytes) -> list[list[Any]]:
     return [name.named_children, *_word_runs(node, raw)]
 
 
+def _assignment_operand(node: Any, raw: bytes) -> tuple[str, int]:
+    """Keep a declaration's assignment prefix and its value's first expansion offset."""
+    value = node.child_by_field_name("value")
+    if value is None:
+        return _text(node, raw), -1
+    prefix = raw[node.start_byte : value.start_byte].decode("utf-8", "surrogateescape")
+    text, dynamic = _static_value([value], raw)
+    return prefix + text, len(prefix) + dynamic if dynamic >= 0 else -1
+
+
 def _command_values(node: Any, raw: bytes) -> list[tuple[str, int]]:
     """Return a command's quote-removed words, its name first, with their run-time offsets."""
     if node.type != "command":
-        return [
-            (_text(node.children[0], raw), -1),
-            *(_static_value(run, raw) for run in _word_runs(node, raw)),
-        ]
+        operands = [(run[0].start_byte, _static_value(run, raw)) for run in _word_runs(node, raw)]
+        operands.extend(
+            (child.start_byte, _assignment_operand(child, raw))
+            for child in node.named_children
+            if child.type == "variable_assignment"
+        )
+        return [(_text(node.children[0], raw), -1), *(value for _, value in sorted(operands))]
     return [_static_value(run, raw) for run in _command_runs(node, raw)]
 
 
@@ -2487,6 +2529,17 @@ def _binding_target(name_node: Any, raw: bytes) -> str | None:
     return None
 
 
+def _record_array_binding(target: str, items: list[Any], raw: bytes, names: _Names) -> None:
+    """Bound array candidate storage and mark the array unknown whenever elements are dropped."""
+    if items:
+        names.raw_bindings.append((target, "=", [items[0]], raw))
+        names.array_bindings.append((target, items[:16], raw))
+    for idx, item in enumerate(items[:16]):
+        names.raw_bindings.append((f"{target}[{idx}]", "=", [item], raw))
+    if len(items) > 16:
+        names.unknown_names.add(target)
+
+
 def _record_binding(node: Any, raw: bytes, names: _Names) -> None:
     """Record a variable or array assignment's target, operator and RHS syntax nodes."""
     target = _binding_target(node.child_by_field_name("name"), raw)
@@ -2497,14 +2550,7 @@ def _record_binding(node: Any, raw: bytes, names: _Names) -> None:
     if value is None:
         names.static_bindings.append((target, op, ""))
     elif value.type == "array" and "[" not in target:
-        items = value.named_children
-        if items:
-            names.raw_bindings.append((target, "=", [items[0]], raw))
-            names.array_bindings.append((target, items[:8], raw))
-        for idx, item in enumerate(items[:16]):
-            names.raw_bindings.append((f"{target}[{idx}]", "=", [item], raw))
-        if len(items) > 16:
-            names.unknown_names.add(target)
+        _record_array_binding(target, value.named_children, raw, names)
     elif value.type != "array":
         names.raw_bindings.append((target, op, [value], raw))
         if target.endswith("[0]"):
@@ -2569,9 +2615,9 @@ def _array_element_strings(
         if not vals:
             break
         sep = " " if parts != ("",) else ""
-        joined = tuple(dict.fromkeys(f"{p}{sep}{v}"[:64] for p in parts for v in vals))
-        parts = joined[:16]
-        locale |= len(joined) > 16
+        joined = tuple(dict.fromkeys(f"{p}{sep}{v}" for p in parts for v in vals))
+        parts = tuple(value[:64] for value in joined[:16])
+        locale |= len(joined) > 16 or any(len(value) > 64 for value in joined)
     return parts, locale
 
 
@@ -2703,14 +2749,40 @@ def _dynamic_name(value: str, dynamic: int) -> bool:
     return dynamic >= 0 and (equals < 0 or dynamic <= equals)
 
 
+def _nameref_enabled(args: list[tuple[str, int]]) -> bool:
+    """Track literal -n and +n declaration options before the first operand."""
+    enabled = False
+    for value, dynamic in args:
+        if dynamic >= 0 or value == "--" or value[:1] not in ("-", "+"):
+            break
+        if "n" in value[1:]:
+            enabled = value.startswith("-")
+    return enabled
+
+
+def _names_dynamic(
+    spec: _Writer, args: list[tuple[str, int]], operands: list[tuple[str, int]]
+) -> bool:
+    """Treat an unknown declaration name or enabled nameref's referent as a possible writer."""
+    referents = spec.referents and _nameref_enabled(args)
+    return any(
+        _dynamic_name(value, dynamic) or (referents and dynamic >= 0) for value, dynamic in operands
+    )
+
+
 def _writer_dynamic(spec: _Writer, args: list[tuple[str, int]]) -> bool:
     """Tell whether a writer builtin may name a variable through a run-time word."""
     split = _writer_operands(spec, args)
     if split is None:
         return False
     operands, named = split
+    if spec.operands == "arithmetic":
+        return any(
+            dynamic >= 0 and _arithmetic_writes(value[:dynamic] + "${_}" + value[dynamic:])
+            for value, dynamic in operands
+        )
     if spec.operands == "names":
-        return any(_dynamic_name(value, dynamic) for value, dynamic in operands)
+        return _names_dynamic(spec, args, operands)
     picks = {"all": operands, "any": operands, "last": operands[-1:], "second": operands[:2]}
     return any(dynamic >= 0 for _, dynamic in named + picks.get(spec.operands, []))
 
@@ -2874,6 +2946,41 @@ def _loop_prefix(node: Any, raw: bytes) -> str | None:
     return match.group(1)
 
 
+def _arithmetic_writes(text: str) -> bool:
+    """Refuse expanded arithmetic destinations, including write syntax the parser cannot model."""
+    if not any(mark in text for mark in ("$", "`")) or not ARITHMETIC_WRITE.search(text):
+        return False
+    raw = (": $((" + text + "))").encode("utf-8", "surrogateescape")
+    root = bash_parser().parse(raw).root_node
+    if root.has_error:
+        return True
+    stack = [root]
+    for _ in range(MAX_BODY_NODES):
+        if not stack:
+            return False
+        node = stack.pop()
+        operator = node.child_by_field_name("operator")
+        if operator is not None and _text(operator, raw) in ARITHMETIC_WRITES:
+            target = node.child_by_field_name("left") or node.named_children[0]
+            if _static_value([target], raw)[1] >= 0:
+                return True
+        stack.extend(node.named_children)
+    return True
+
+
+def _arithmetic_node_writes(node: Any, raw: bytes) -> bool:
+    """Check arithmetic expansions, commands and array indices through the same writer path."""
+    text = _text(node, raw)
+    if node.type == "arithmetic_expansion":
+        return _arithmetic_writes(text[3:-2])
+    if node.type == "compound_statement" and text.startswith("(("):
+        return _arithmetic_writes(text[2:-2])
+    if node.type == "subscript":
+        index = node.child_by_field_name("index")
+        return index is not None and _arithmetic_writes(_text(index, raw))
+    return False
+
+
 def _stage_writer(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -> None:
     """Queue static eval or trap texts immediately and stage writer nodes for resolution."""
     values = _command_values(node, raw)
@@ -2909,6 +3016,8 @@ def _note_words(node: Any, raw: bytes, names: _Names, owners: tuple[str, ...]) -
         _note_runs(node, raw, names, owners)
     if node.type in WRITER_NODES:
         _stage_writer(node, raw, names, owners)
+    if _arithmetic_node_writes(node, raw):
+        names.dynamic_write = True
     name = _function_key(node, raw) if node.type == "function_definition" else None
     return owners if name is None else (*owners, name)
 
@@ -3135,10 +3244,23 @@ def _finish(
     return None, scan.candidates, scan.cd_targets, scan.filtered
 
 
-def _environment_rebinds() -> bool:
-    """Detect environment startup files or exported Bash functions that can rebind commands."""
+def _prefix_rebinds(words: list[str]) -> bool:
+    """Recognize assignments of names already excluded by the command-rebinding allow-list."""
+    return any(
+        _protected_name(word.split("=", 1)[0].removesuffix("+")) for word in words if "=" in word
+    )
+
+
+def _environment_rebinds(context: InspectionContext, budget: BodyBudget) -> bool:
+    """Detect inherited startup hooks, exported functions or a caller's rebound environment."""
     has_func = any(key.startswith("BASH_FUNC_") for key in os.environ)
-    return "BASH_ENV" in os.environ or "ENV" in os.environ or has_func
+    return (
+        "BASH_ENV" in os.environ
+        or "ENV" in os.environ
+        or has_func
+        or budget.rebound_unknown
+        or context.script_path in budget.rebound_scripts
+    )
 
 
 def scan_body(
@@ -3156,7 +3278,7 @@ def scan_body(
     root = parser.parse(raw).root_node
     _prime_names(scan, _assignment_texts(root, raw, budget), raw)
     if context.script_dir is not None:
-        scan.rebound = _environment_rebinds()
+        scan.rebound = _environment_rebinds(context, budget)
     scan.stack.append((root, raw, False))
     for _ in range(MAX_BODY_NODES):
         if not scan.stack:

@@ -1667,6 +1667,104 @@ SCRIPT_DIR = {
 }
 
 
+SCRIPT_DIR.update(
+    {
+        "r26-command-mixed-candidates": Case(
+            'c=bash\nc=<case>/other/run.sh\n"$c" <case>/inner.sh\n',
+            2,
+            "other/run.sh",
+            {"other/run.sh": CFG},
+        ),
+        "r26-command-harmless-candidates": Case('c=bash\nc=true\n"$c" <case>/inner.sh\n', 0),
+        "r26-array-nine-writer": Case(
+            CDPWD
+            + "arr=(bash)\n"
+            + "arr=(command command command command command command command command read)\n"
+            + NAME_HERE
+            + CALL_ARRAY
+            + SRC,
+            2,
+            WRITTEN,
+            OTHER,
+        ),
+        "r26-array-nine-harmless": Case(
+            CDPWD + "arr=(true true true true true true true true true)\n" + CALL_ARRAY + SRC,
+            0,
+        ),
+        **{
+            f"r26-nameref-{declaration}-{position}": Case(
+                (CDPWD if position == "after" else "")
+                + NAME_HERE
+                + declaration
+                + ' -n ref="$n$m"\n'
+                + (CDPWD if position == "before" else "")
+                + "ref=<case>/other\n"
+                + SRC,
+                2,
+                WRITTEN if position == "after" else REBOUND,
+                OTHER,
+            )
+            for declaration in ("declare", "local", "typeset")
+            for position in ("after", "before")
+        },
+        "r26-nameref-quoted-operand": Case(
+            CDPWD + NAME_HERE + 'builtin declare -n "ref=$n$m"\nref=<case>/other\n' + SRC,
+            2,
+            WRITTEN,
+            OTHER,
+        ),
+        "r26-nameref-literal-unrelated": Case(
+            CDPWD + "declare -n ref=unrelated\nref=<case>/other\n" + SRC, 0, None, OTHER
+        ),
+        **{
+            f"r26-arithmetic-{form}": Case(
+                CDPWD + "p=HE\nq=RE\n" + writer + SRC, 2, WRITTEN, {"7/lib.sh": CFG}
+            )
+            for form, writer in (
+                ("expansion", ": $(( ${p}${q}=7 ))\n"),
+                ("command", "(( ${p}${q}=7 ))\n"),
+                ("let", 'let "${p}${q}=7"\n'),
+                ("subscript", "arr[${p}${q}=7]=x\n"),
+                ("postincrement", "(( ${p}${q}++ ))\n"),
+                ("preincrement", ": $(( ++${p}${q} ))\n"),
+                ("let-increment", 'let "${p}${q}++"\n'),
+            )
+        },
+        "r26-arithmetic-readonly": Case(CDPWD + "p=1\nq=2\n: $(( ${p}${q}+7 ))\n" + SRC, 0),
+        "r26-arithmetic-literal-unrelated": Case(CDPWD + ": $(( unrelated=7 ))\n" + SRC, 0),
+        "r26-arithmetic-literal-dynamic-rhs": Case(
+            CDPWD + "p=1\n: $(( unrelated=${p}+7 ))\n" + SRC, 0
+        ),
+        "r26-arithmetic-let-readonly": Case(CDPWD + 'p=1\nlet "${p}+7"\n' + SRC, 0),
+        "r26-child-prefix-path": Case(
+            "PATH=<case>/bin:/usr/bin:/bin /bin/bash <case>/tools/child.sh\n",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+        ),
+        "r26-tool-prefix-path": Case(
+            "",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="PATH=<case>/bin:/usr/bin:/bin /bin/bash tools/child.sh",
+        ),
+        "r26-child-export-path": Case(
+            "export PATH=<case>/bin:/usr/bin:/bin\n/bin/bash <case>/tools/child.sh\n",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+        ),
+        "r26-child-unchanged-environment": Case(
+            "/bin/bash <case>/tools/child.sh\n",
+            0,
+            None,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+        ),
+    }
+)
+
+
 class TestRawConfigureScriptDir(RawConfigureGuardBase):
     """Resolve the own-directory idiom only where the guard knows the script directory."""
 
@@ -1711,8 +1809,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 527 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 527)
+        """Replay all 554 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 554)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
