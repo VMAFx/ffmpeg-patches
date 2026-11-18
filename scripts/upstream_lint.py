@@ -47,14 +47,20 @@ path is not detected.
 
 The revert-proof step requires one measured scripts/revert_proof.py JSON record
 (--revert-proof FILE, repeatable) per source fix commit in base..head.
-scripts/revert_proof.py runs a test command at HEAD, reverse-applies only the
-fix commit's source paths with git apply -R and runs the test command again,
-all in a clean detached scratch checkout. It removes the scratch worktree before
-writing the record; caller tree, index and branch remain untouched. Commands
-needing caller-only ignored or untracked files fail at HEAD (exit 3). PWD names
-scratch; absolute paths to external tools are allowed. A moved caller HEAD exits
-3 without a record; failed scratch removal exits 5 and names its path. An older
-record is removed before the commands start. The record contains commit, head, head_tree,
+scripts/revert_proof.py runs the same trusted test command at HEAD and after
+reversing source paths in clean detached scratch; the module itself never writes
+to the caller work tree or index, but the command runs with the rights of the
+user and can reach the caller by absolute path or through the shared Git directory.
+Afterwards it detects only a moved head commit of the recorded ref or current HEAD;
+a record binds content (commit and tree), not provenance.
+Commands needing caller-only ignored or untracked inputs fail at HEAD (exit 3),
+tracked changes that Git status shows are refused, and PWD names scratch.
+Cleanup is attempted after every outcome the module survives, with failed removal
+giving exit 5 and its path; input errors give exit 2, HEAD failure or movement
+gives exit 3 without a record, and reverse-apply failure gives exit 4.
+An older record is removed before commands start; the tree argument must name the
+root, and output must be outside that root and Git administration.
+The record contains commit, head, head_tree,
 command, rc_head, rc_reverted and reverted_paths. The step checks that each
 fix commit has a valid record whose head_tree matches head, whose rc_head is 0
 and whose rc_reverted is a nonzero integer. The head must resolve to a commit
@@ -181,7 +187,7 @@ import subprocess  # nosec B404 - explicit argv, process-group cleanup, bounded 
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -430,6 +436,20 @@ def _reap_timeout(
     return RunResult(tuple(argv), process.returncode, text, timed_out=True)
 
 
+def _command_environment(source: Mapping[str, str], cwd: Path) -> dict[str, str]:
+    """Refuse oversized command environments before preserving bounded isolated entries."""
+    if len(source) > MAX_PATHS:
+        raise ValueError(f"command environment exceeds MAX_PATHS={MAX_PATHS}: {len(source)}")
+    environment = {
+        name: value
+        for name, value in list(source.items())[:MAX_PATHS]
+        if name not in GIT_ENVIRONMENT_NAMES and not name.startswith(GIT_CONFIG_PREFIXES)
+    }
+    environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
+    environment["PWD"] = str(cwd.resolve())
+    return environment
+
+
 def _run(
     argv: list[str],
     cwd: Path,
@@ -448,13 +468,10 @@ def _run(
         timeout = min(timeout, _remaining(timeout + REAP_TIMEOUT) - REAP_TIMEOUT)
         if timeout <= 0:
             raise RuntimeError("overall deadline exhausted (reap budget reserved)")
-    environment = {
-        name: value
-        for name, value in list(os.environ.items())[:MAX_PATHS]
-        if name not in GIT_ENVIRONMENT_NAMES and not name.startswith(GIT_CONFIG_PREFIXES)
-    }
-    environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
-    environment["PWD"] = str(cwd.resolve())
+    try:
+        environment = _command_environment(os.environ, cwd)
+    except ValueError as error:
+        return RunResult(tuple(argv), 2, str(error))
     with subprocess.Popen(  # nosec B603 - _validate_executable enforces the tool allow-list.
         argv,
         cwd=cwd,

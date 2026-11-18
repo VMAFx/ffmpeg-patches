@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -75,11 +76,11 @@ class RevertProofTest(unittest.TestCase):
         self.assertEqual((self.tree / "ignored-user.txt").read_bytes(), b"user ignored\n")
 
     def assert_no_scratch(self) -> None:
-        """Require every temporary directory and linked worktree entry to be gone."""
+        """Require removed scratch files and the expected number of Git entries."""
         for path in self.scratch_paths[:2]:
             self.assertFalse(path.exists(), str(path))
         entries = run_git(self.tree, "worktree", "list", "--porcelain", preserve_config=True)
-        self.assertEqual(entries.count("worktree "), 1, entries)
+        self.assertEqual(entries.count("worktree "), getattr(self, "expected_entries", 1), entries)
 
     def run_cli(
         self,
@@ -450,7 +451,7 @@ class RevertProofTest(unittest.TestCase):
                     failure_kind: str = failure,
                     **kwargs: object,
                 ):
-                    """Fail only scratch worktree removal while permitting prune to run."""
+                    """Fail only named scratch removal without affecting unrelated Git commands."""
                     if argv[:3] == ["git", "worktree", "remove"]:
                         if failure_kind == "spawn":
                             raise OSError("planted cleanup spawn failure")
@@ -458,11 +459,20 @@ class RevertProofTest(unittest.TestCase):
                     return real_run(argv, cwd, *args, **kwargs)
 
                 with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fail_remove):
+                    self.expected_entries = 2
                     rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"])
                 self.assertEqual(rc, 5, err)
                 self.assertIn(str(self.scratch_paths[0] / "tree"), err)
                 self.assertIn("scratch removal failed", err)
                 self.assertFalse(self.record_path.exists())
+                run_git(
+                    self.tree,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(self.scratch_paths[0] / "tree"),
+                    preserve_config=True,
+                )
 
     def test_failed_scratch_creation_still_cleans_partial_checkout(self) -> None:
         """A creation failure after Git registers scratch still removes its entry."""
@@ -557,13 +567,15 @@ class RevertProofTest(unittest.TestCase):
         payload = json.loads(self.record_path.read_text(encoding="utf-8"))
         self.assertEqual((payload["rc_head"], payload["rc_reverted"]), (0, 0))
 
-    def test_tempdir_inside_caller_uses_external_private_parent(self) -> None:
-        """A caller-contained temporary root cannot place scratch inside the caller."""
+    def test_tempdir_inside_caller_is_refused_before_record_removal(self) -> None:
+        """A caller-contained temporary root is refused before old output is removed."""
         fix = self.make_fix()
+        self.record_path.write_text("old proof\n", encoding="utf-8")
         with unittest.mock.patch.object(tempfile, "gettempdir", return_value=str(self.tree)):
-            rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"])
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(self.scratch_paths[0].parent, self.root)
+            rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("temporary directory must be outside", err)
+        self.assertEqual(self.record_path.read_text(encoding="utf-8"), "old proof\n")
 
     def test_record_path_inside_caller_is_refused_without_touching_it(self) -> None:
         """An output path inside the caller cannot break the read-only caller contract."""
@@ -577,6 +589,11 @@ class RevertProofTest(unittest.TestCase):
     def test_help_explains_moved_head_cleanup_and_clean_checkout_cost(self) -> None:
         """Help states the changed exit classes and clean-checkout command limitation."""
         help_text = revert_proof.build_parser().format_help()
+        self.assertIn("exit 2", help_text)
+        self.assertIn("exit 4", help_text)
+        self.assertIn("rights of the user", help_text)
+        self.assertIn("not provenance", help_text)
+        self.assertIn("outcome the module survives", help_text)
         self.assertIn("exit 3", help_text)
         self.assertIn("exit 5", help_text)
         self.assertIn("clean checkout", help_text)
@@ -622,6 +639,7 @@ class RevertProofTest(unittest.TestCase):
             return real_run(argv, cwd, *args, **kwargs)
 
         with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fail_remove):
+            self.expected_entries = 2
             rc, _, err = self.run_cli(fix, [sys.executable, "-c", "raise SystemExit(1)"])
         self.assertEqual(rc, 5, err)
         self.assertIn(str(self.scratch_paths[0] / "tree"), err)
@@ -650,6 +668,116 @@ class RevertProofTest(unittest.TestCase):
         self.assertIn("HEAD moved", err)
         self.assertFalse(self.record_path.exists())
         self.assertEqual(run_git(self.tree, "rev-parse", "HEAD", preserve_config=True), fix)
+
+    def test_subdirectory_tree_preserves_record_elsewhere_in_caller(self) -> None:
+        """A repository subdirectory cannot bypass caller record containment."""
+        fix = self.make_fix()
+        record = self.write("user-record.json", "caller bytes\n")
+        with unittest.mock.patch.object(revert_proof, "run_test_command") as command:
+            rc, _, err = capture_main(
+                revert_proof.main,
+                "--tree",
+                str(self.tree / "libavfilter"),
+                "--commit",
+                fix,
+                "--record",
+                str(record),
+                "--",
+                sys.executable,
+                "-c",
+                "pass",
+            )
+        self.assertEqual(rc, 2, err)
+        self.assertIn("work tree root", err)
+        self.assertEqual(record.read_bytes(), b"caller bytes\n")
+        command.assert_not_called()
+
+    def test_linked_caller_git_administration_record_paths_are_refused(self) -> None:
+        """Linked indexes, common paths and symlink aliases survive record refusal."""
+        fix = self.make_fix()
+        linked = self.root / "linked"
+        run_git(self.tree, "worktree", "add", "--detach", str(linked), fix, preserve_config=True)
+        gitdir = Path(run_git(linked, "rev-parse", "--absolute-git-dir", preserve_config=True))
+        common = (
+            linked / run_git(linked, "rev-parse", "--git-common-dir", preserve_config=True)
+        ).resolve()
+        index = gitdir / "index"
+        admin = common / "user-record"
+        admin.write_bytes(b"admin bytes\n")
+        alias = self.root / "alias"
+        alias.symlink_to(admin)
+        before_index = index.read_bytes()
+        for record in (index, admin, alias):
+            with self.subTest(record=record):
+                with unittest.mock.patch.object(revert_proof, "run_test_command") as command:
+                    rc, _, err = capture_main(
+                        revert_proof.main,
+                        "--tree",
+                        str(linked),
+                        "--commit",
+                        fix,
+                        "--record",
+                        str(record),
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "pass",
+                    )
+                self.assertEqual(rc, 2, err)
+                self.assertIn("Git administration", err)
+                self.assertEqual(index.read_bytes(), before_index)
+                self.assertEqual(admin.read_bytes(), b"admin bytes\n")
+                self.assertTrue(alias.is_symlink())
+                command.assert_not_called()
+
+    def test_unrelated_missing_worktree_survives_pass_fail_and_timeout(self) -> None:
+        """Cleanup preserves unrelated unavailable worktrees after each command outcome."""
+        fix = self.make_fix()
+        missing = self.root / "unrelated"
+        run_git(self.tree, "worktree", "add", "--detach", str(missing), fix, preserve_config=True)
+        shutil.rmtree(missing)
+        for script, expected in (
+            ("pass", 0),
+            ("raise SystemExit(1)", 3),
+            ("import time; time.sleep(5)", 3),
+        ):
+            with self.subTest(script=script):
+                self.expected_entries = 2
+                rc, _, err = self.run_cli(fix, [sys.executable, "-c", script], timeout="0.2")
+                self.assertEqual(rc, expected, err)
+                entries = run_git(
+                    self.tree, "worktree", "list", "--porcelain", preserve_config=True
+                )
+                self.assertIn(f"worktree {missing}\n", entries)
+
+    def test_named_removal_cleans_an_already_missing_owned_scratch(self) -> None:
+        """Named Git removal handles a missing owned checkout without global pruning."""
+        fix = self.make_fix()
+        directory = self.root / "owned"
+        directory.mkdir()
+        scratch = directory / "tree"
+        run_git(self.tree, "worktree", "add", "--detach", str(scratch), fix, preserve_config=True)
+        shutil.rmtree(scratch)
+        revert_proof.remove_scratch(self.tree, scratch)
+        self.assertFalse(directory.exists())
+        entries = run_git(self.tree, "worktree", "list", "--porcelain", preserve_config=True)
+        self.assertEqual(entries.count("worktree "), 1, entries)
+
+    def test_successful_head_edit_of_unrelated_tracked_file_is_refused(self) -> None:
+        """Editing an unrelated tracked scratch file cannot prove committed HEAD."""
+        self.write("libavfilter/other.c", BASE_SOURCE)
+        self.commit("avfilter/other: add independent source")
+        fix = self.make_fix()
+        script = (
+            "from pathlib import Path; Path('libavfilter/other.c').write_text('scratch edit\\n')"
+        )
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 3, err)
+        self.assertIn("modified tracked files at head", err)
+        self.assertFalse(self.record_path.exists())
+        self.assertEqual(
+            (self.tree / "libavfilter/other.c").read_text(encoding="utf-8"), BASE_SOURCE
+        )
 
 
 if __name__ == "__main__":

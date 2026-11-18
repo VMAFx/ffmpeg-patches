@@ -3,19 +3,20 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Measure whether a regression test fails when a fix commit's source paths are reverted.
 
-Both commands run in a clean checkout of the captured HEAD in a private detached
-scratch worktree, outside the caller tree. The caller tree, index and branch
-are never changed. PWD names the scratch tree. Commands needing untracked or
-ignored caller files (build directories or in-tree virtual environments) fail
-at the HEAD run: exit 3, no record. Commands may use absolute paths to tools
-outside the tree. A dirty caller is refused: this proof is about the commit.
-
-The scratch worktree is forcibly removed, its private temporary directory is
-removed, and Git's worktree list is pruned on success, refusal, timeout or
-interrupt. A moved caller HEAD means exit 3 and no record; scratch removal
-failure means exit 5 and names the scratch path. Input errors mean exit 2;
-a reverse-apply conflict means exit 4. An older record is removed before the
-runs start; record output must be outside the caller tree.
+Both commands run in a clean checkout of captured HEAD in detached scratch outside
+the caller; PWD names scratch, absolute paths to tools are allowed, and missing
+caller-only ignored or untracked inputs cause exit 3 without a record.
+The module itself never writes to the caller work tree or index; the test command
+is trusted and runs with the rights of the user, so it can reach the caller by
+absolute path or through the shared Git directory.
+Afterwards the module detects only a moved head commit of the recorded ref or
+current HEAD; a record binds content (commit and tree), not provenance.
+Tracked changes that Git status shows are refused, and cleanup is attempted after
+every outcome the module survives; input errors mean exit 2, HEAD failure or
+movement means exit 3, reverse-apply failure means exit 4, and scratch removal
+failure means exit 5 and names its path; an older record is removed before runs
+start, output must be outside the caller work tree and Git administration, and
+the temporary parent must be outside the caller work tree.
 """
 
 from __future__ import annotations
@@ -122,13 +123,24 @@ def parse_config(argv: list[str] | None) -> ProofConfig:
     )
 
 
+def worktree_root(tree: Path) -> Path:
+    """Resolve the caller root and refuse a repository subdirectory."""
+    tree = tree.resolve()
+    if not tree.is_dir():
+        raise _PreflightError(f"work tree not found: {tree}")
+    root = Path(git_out(tree, "rev-parse", "--show-toplevel").strip()).resolve()
+    if tree != root:
+        raise _PreflightError(f"--tree must name the work tree root {root}: {tree}")
+    return root
+
+
 def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str], str]:
-    """Verify clean tracked tree, commit ancestry and changed source paths."""
+    """Refuse status-visible tracked changes and validate ancestry and source paths."""
     if not tree.is_dir():
         raise _PreflightError(f"work tree not found: {tree}")
     if tracked_status(tree):
         raise _PreflightError(
-            f"dirty tree: uncommitted changes to tracked files in {tree}; "
+            f"dirty tree: uncommitted changes to tracked files that git status shows in {tree}; "
             "the proof is about the commit, not uncommitted work"
         )
     head_ref = git_out(tree, "rev-parse", "--symbolic-full-name", "HEAD").strip()
@@ -192,9 +204,11 @@ def verify_head_run(scratch: Path, rc_head: int | str, head: str) -> int:
 
 
 def scratch_parent(tree: Path) -> Path:
-    """Choose a temporary parent outside the caller even when TMPDIR is inside it."""
+    """Refuse a temporary parent at or below the resolved caller root."""
     parent = Path(tempfile.gettempdir()).resolve()
-    return tree.parent if parent.is_relative_to(tree) else parent
+    if parent.is_relative_to(tree):
+        raise _PreflightError(f"temporary directory must be outside the caller tree: {parent}")
+    return parent
 
 
 def cleanup_git(tree: Path, failures: list[str], *args: str) -> None:
@@ -210,23 +224,29 @@ def cleanup_git(tree: Path, failures: list[str], *args: str) -> None:
 
 
 def remove_scratch(tree: Path, scratch: Path) -> None:
-    """Attempt Git removal, directory removal and prune, mapping cleanup failures to 5."""
+    """Remove only owned scratch and its directory, mapping cleanup failures to 5."""
     failures: list[str] = []
     cleanup_git(tree, failures, "worktree", "remove", "--force", str(scratch))
     try:
         shutil.rmtree(scratch.parent)
     except (OSError, KeyboardInterrupt) as error:
         failures.append(f"temporary directory removal: {error}")
-    cleanup_git(tree, failures, "worktree", "prune", "--expire", "now")
     if failures:
         raise _ScratchRemovalError(f"scratch removal failed for {scratch}: {'; '.join(failures)}")
 
 
 def clear_record(config: ProofConfig) -> None:
-    """Refuse caller-contained output and remove any old record before running commands."""
+    """Exclude caller work tree and Git administration before removing an old record."""
     path = config.record
-    if path.absolute().is_relative_to(config.tree) or path.resolve().is_relative_to(config.tree):
-        raise _PreflightError(f"--record must be outside the caller tree: {path}")
+    directories = [config.tree]
+    for option in ("--absolute-git-dir", "--git-common-dir"):
+        directory = Path(git_out(config.tree, "rev-parse", option).strip())
+        directories.append((config.tree / directory).resolve())
+    for directory in directories[:3]:
+        if path.absolute().is_relative_to(directory) or path.resolve().is_relative_to(directory):
+            raise _PreflightError(
+                f"--record must be outside the caller tree and Git administration: {path}"
+            )
     try:
         path.unlink(missing_ok=True)
     except OSError as error:
@@ -277,11 +297,13 @@ def verify_caller_head(tree: Path, head: str, head_ref: str) -> None:
 
 def run_proof(config: ProofConfig) -> None:
     """Run both measurements in detached scratch, remove it, then publish the record."""
-    commit, head, head_tree, source_paths, head_ref = prepare_tree(config.tree, config.commit)
-    clear_record(config)
-    directory = Path(
-        tempfile.mkdtemp(prefix="ffmpeg-revert-proof-", dir=scratch_parent(config.tree))
+    config = ProofConfig(
+        worktree_root(config.tree), config.commit, config.record, config.timeout, config.command
     )
+    commit, head, head_tree, source_paths, head_ref = prepare_tree(config.tree, config.commit)
+    parent = scratch_parent(config.tree)
+    clear_record(config)
+    directory = Path(tempfile.mkdtemp(prefix="ffmpeg-revert-proof-", dir=parent))
     scratch = directory / "tree"
     scratch_config = ProofConfig(scratch, commit, config.record, config.timeout, config.command)
     try:

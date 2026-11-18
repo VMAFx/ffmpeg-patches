@@ -3376,6 +3376,36 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(overrides.keys().isdisjoint(environment))
         self.assertEqual(environment["PRE_COMMIT_NO_CONCURRENCY"], "1")
 
+    def test_command_environment_above_bound_is_refused(self) -> None:
+        """An oversized fixture environment fails before any command starts."""
+        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_PATHS)}
+        environment["REQUIRED_LAST"] = "present"
+        with self.assertRaises(ValueError) as caught:
+            upstream_lint._command_environment(environment, Path.cwd())
+        self.assertIn(f"MAX_PATHS={upstream_lint.MAX_PATHS}", str(caught.exception))
+        self.assertIn(str(upstream_lint.MAX_PATHS + 1), str(caught.exception))
+
+    def test_command_environment_exact_bound_preserves_last_entry(self) -> None:
+        """The exact environment bound accepts and preserves the final required entry."""
+        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_PATHS - 1)}
+        environment["REQUIRED_LAST"] = "present"
+        result = upstream_lint._command_environment(environment, Path.cwd())
+        self.assertEqual(result["REQUIRED_LAST"], "present")
+        self.assertEqual(len(result), upstream_lint.MAX_PATHS + 2)
+
+    def test_command_environment_overflow_returns_usage_error(self) -> None:
+        """The runner reports environment overflow as usage error without spawning."""
+        with (
+            unittest.mock.patch.object(
+                upstream_lint, "_command_environment", side_effect=ValueError("fixture overflow")
+            ),
+            unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen,
+        ):
+            result = upstream_lint._run(["git", "--version"], Path.cwd())
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "fixture overflow")
+        popen.assert_not_called()
+
     def test_fixture_git_uses_isolated_environment(self) -> None:
         """Fixture Git receives the shared isolation helper's environment."""
         fixture = FixtureTest()
