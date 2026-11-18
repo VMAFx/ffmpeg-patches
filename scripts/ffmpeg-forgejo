@@ -24,12 +24,12 @@
 #   ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>
 #                          lists every own open pull sharing a file with the branch diff against the fetched base; exit 77 when any, 0 when none, 1 when not proven
 #   ffmpeg-forgejo landed <branch-or-sha>
-#                          exits 82 with matching base commits or "no change left against the base" when landed; otherwise prints "not landed" (exit 0)
+#                          exits 82 when every own commit matches a stable base patch ID or merging leaves the base tree unchanged ("no change left against the base"); otherwise prints "not landed" (exit 0)
 #                          reads at most 256 own commits and 10000 base commits; fetch/Git failure or excess commits exit 1; needs no token
 #   ffmpeg-forgejo issue   <title> <body-file>
-#   ffmpeg-forgejo comment [--landed-note] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
+#   ffmpeg-forgejo comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head;
-#                          with --tested-head, exits 82 when already on the live base; --landed-note permits a note about the landing
+#                          with --tested-head, exits 82 when already on the live base
 #                          exits 78 when the body equals an own existing comment after whitespace normalization
 #                          with --tested-head, exits 80 when the comment or the live PR body names a base commit other than the live merge base
 #                          the comment posts the body file as read once at start; a head change seen by the base check exits 76
@@ -1113,15 +1113,21 @@ MERGE_TREE_OUT=""
 MERGE_TREE_MAX_BYTES=1048576
 LANDED_DIR=""
 
-# merge_base_cleanup: remove private state, preserving status unless ref cleanup fails.
+# merge_base_cleanup: remove private state, preserving status unless any cleanup fails.
 merge_base_cleanup() {
   local save_status=$?
   if [ -n "$LANDED_DIR" ]; then
-    rm -rf -- "$LANDED_DIR"
+    if ! rm -rf -- "$LANDED_DIR"; then
+      printf 'ffmpeg-forgejo: cannot delete %s.\n' "$LANDED_DIR" >&2
+      save_status=1
+    fi
     LANDED_DIR=""
   fi
   if [ -n "$MERGE_TREE_OUT" ]; then
-    rm -f "$MERGE_TREE_OUT"
+    if ! rm -f "$MERGE_TREE_OUT"; then
+      printf 'ffmpeg-forgejo: cannot delete %s.\n' "$MERGE_TREE_OUT" >&2
+      save_status=1
+    fi
     MERGE_TREE_OUT=""
   fi
   if [ -n "$MERGE_BASE_REF" ]; then
@@ -1337,7 +1343,7 @@ landed_patch_ids() {
     || die "cannot compute stable patch IDs"
 }
 
-# landed_report SAME-TREE: print all matches, or one not-landed line when any own patch remains.
+# landed_report SAME-TREE: report landed when all own patch IDs match or merging leaves the base tree unchanged.
 landed_report() {
   python3 -I - "$LANDED_DIR" "$1" <<'PY'
 import sys
@@ -1385,7 +1391,7 @@ raise SystemExit(82)
 PY
 }
 
-# check_landed HEAD: prove landed status against a freshly fetched base, cleaning private state on exit.
+# check_landed HEAD: every own commit matches a stable base patch ID or merging leaves the base tree unchanged; clean private state on exit.
 check_landed() (
   local sha ancestor rc tree base_tree same_tree=0
   MERGE_BASE_REF="refs/ffmpeg-forgejo/landed-base-$$"
@@ -1798,9 +1804,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     rm -f "$body"
     ;;
   comment)
-    usage='comment [--landed-note] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>'
-    landed_note=0
-    if [ "${1:-}" = "--landed-note" ]; then landed_note=1; shift; fi
+    usage='comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>'
     parse_claim_option "$usage" "$@"
     shift "$claim_args"
     [ $# -eq 2 ] || usage_error "$usage"
@@ -1824,7 +1828,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
         "$tested_head" >&2
       exit 76
     fi
-    if [ "$claim_mode" = "tested-head" ] && [ "$landed_note" -eq 0 ]; then
+    if [ "$claim_mode" = "tested-head" ]; then
       require_unlanded "$tested_live_head"
     fi
     body="$(mktemp)"

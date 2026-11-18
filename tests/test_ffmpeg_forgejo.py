@@ -824,6 +824,96 @@ class LandedTest(ForgejoTest):
         self.assertIn("cannot fetch", result.stderr)
         self.assertEqual(result.stdout, "")
 
+    def test_reverted_topic_has_no_change_left(self) -> None:
+        """An unlanded change and its revert leave no change against an advanced base."""
+        topic = git_output(self.repo, "rev-parse", "topic")
+        (self.repo / OVERLAP_FILE).write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", OVERLAP_FILE)
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "revert topic patch",
+        )
+        reverted = git_output(self.repo, "rev-parse", "topic")
+        advance_upstream(self.tmp, self.upstream, "other.txt", "other\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn(f"{topic[:12]}: no change left against the base\n", result.stdout)
+        self.assertIn(f"{reverted[:12]}: no change left against the base\n", result.stdout)
+
+    def test_head_at_merge_base_has_no_change_left(self) -> None:
+        """A head with no own commit leaves the live base unchanged and exits 82."""
+        git(
+            self.repo,
+            "update-ref",
+            "refs/heads/topic",
+            git_output(self.repo, "rev-parse", "master"),
+        )
+        advance_upstream(self.tmp, self.upstream, "other.txt", "other\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertEqual(result.stdout, "no change left against the base\n")
+
+    def test_own_range_over_commit_cap_is_refused(self) -> None:
+        """A range of 257 own commits exceeds the documented 256 cap and exits one."""
+        parent = git_output(self.repo, "rev-parse", "topic")
+        tree = git_output(self.repo, "rev-parse", "topic^{tree}")
+        for number in range(256):
+            parent = git_output(
+                self.repo,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit-tree",
+                tree,
+                "-p",
+                parent,
+                "-m",
+                f"topic commit {number}",
+            )
+        git(self.repo, "update-ref", "refs/heads/topic", parent)
+        result = self.landed()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("landed-check range exceeds 256 commits", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_private_state_removal_failure_overrides_landed_status(self) -> None:
+        """Either failed filesystem removal names its path and overrides landed status."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        real_rm = shutil.which("rm")
+        self.assertIsNotNone(real_rm)
+        refused = self.tmp / "refused-removal.txt"
+        wrapper = self.bin_dir / "rm"
+        clean_tmp = self.tmp / "landed-tmp"
+        clean_tmp.mkdir()
+        for index in range(2):
+            option = ("-rf", "-f")[index]
+            with self.subTest(option=option):
+                wrapper.write_text(
+                    "#!/bin/bash\n"
+                    f'if [ "$1" = {shlex.quote(option)} ]; then\n'
+                    f'  printf "%s\\n" "${{@: -1}}" >{shlex.quote(str(refused))}\n'
+                    "  exit 1\nfi\n"
+                    f'exec {shlex.quote(str(real_rm))} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+                result = self.landed(env_updates={"TMPDIR": str(clean_tmp)})
+                path = refused.read_text(encoding="utf-8").strip()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stderr, f"ffmpeg-forgejo: cannot delete {path}.\n")
+                self.assertTrue(Path(path).exists())
+
     def test_matching_patch_remains_landed_after_conflicting_base_edit(self) -> None:
         """Stable patch IDs prove landing even when later base edits conflict."""
         base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
@@ -1867,12 +1957,11 @@ class TestClaimHeadTest(ForgejoTest):
     def comment(
         self, stub: Stub, *args: str, env_updates: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        """Use a landing note to isolate claim checks from synthetic head Git history."""
+        """Run a comment command with the shared issue and body arguments."""
 
         return self.run_command(
             stub,
             "comment",
-            "--landed-note",
             *args,
             "1",
             str(self.tmp / "body.md"),
@@ -1883,19 +1972,19 @@ class TestClaimHeadTest(ForgejoTest):
         self,
         stub: Stub,
         *,
+        head: str = A,
         path_first: Path | None = None,
         env_updates: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Use a tested landing note to isolate claim checks from synthetic Git history."""
+        """Run a tested comment with matching evidence for the supplied head."""
 
         return self.run_command(
             stub,
             "comment",
-            "--landed-note",
             "--tested-head",
-            A,
+            head,
             "--evidence",
-            self.evidence(),
+            self.evidence(head),
             "1",
             str(self.tmp / "body.md"),
             path_first=path_first,
@@ -1937,24 +2026,29 @@ class TestClaimHeadTest(ForgejoTest):
         self.assertIn(base[:12], result.stderr)
         self.assertEqual(self.posts(stub), [])
 
-    def test_landed_note_comment_is_posted(self) -> None:
-        """The landed-note option permits a tested comment explaining the landing."""
+    def test_landed_no_test_claims_comment_is_posted(self) -> None:
+        """A comment without test claims can explain a landing without a special option."""
         advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
         sha = git_output(self.repo, "rev-parse", "topic")
         stub = Stub([sha])
         result = self.run_command(
             stub,
             "comment",
-            "--landed-note",
-            "--tested-head",
-            sha,
-            "--evidence",
-            self.evidence(sha),
+            "--no-test-claims",
             "1",
             str(self.tmp / "body.md"),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.posts(stub), [BODY])
+
+    def test_removed_landed_note_option_is_usage_error(self) -> None:
+        """The removed landed-note option exits 64 before any forge request."""
+        stub = Stub()
+        result = self.comment(stub, "--landed-note", "--no-test-claims")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("usage: comment", result.stderr)
+        self.assertEqual(self.posts(stub), [])
+        self.assertEqual(stub.requests, [])
 
     def test_unresolvable_tested_head_is_refused_before_post(self) -> None:
         """A live head missing locally reaches the landed check and names the head."""
@@ -2206,15 +2300,16 @@ class TestClaimHeadTest(ForgejoTest):
     def test_evidence_size_boundary(self) -> None:
         """Evidence at one MiB is accepted and larger evidence is refused."""
 
-        claim = f"- test: fate tree=/w head={A}\n"
+        head = git_output(self.repo, "rev-parse", "topic")
+        claim = f"- test: fate tree=/w head={head}\n"
         padding = "#" * 200 + "\n"
         remainder = 1048576 - len(claim)
         content = claim + padding * (remainder // len(padding)) + "#" * (remainder % len(padding))
         for extra in ("", "x"):
             with self.subTest(extra=extra):
-                stub = Stub([A])
+                stub = Stub([head])
                 evidence = self.evidence(content=content + extra)
-                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                proc = self.comment(stub, "--tested-head", head, "--evidence", evidence)
                 self.assertEqual(proc.returncode, 76 if extra else 0, proc.stderr)
                 if extra:
                     self.assertIn(f"{evidence}: evidence larger than 1 MiB", proc.stderr)
@@ -2234,12 +2329,13 @@ class TestClaimHeadTest(ForgejoTest):
     def test_evidence_line_count_boundary(self) -> None:
         """Ten thousand lines are accepted and an extra line is refused."""
 
-        claim = f"- test: fate tree=/w head={A}\n"
+        head = git_output(self.repo, "rev-parse", "topic")
+        claim = f"- test: fate tree=/w head={head}\n"
         for count in (10000, 10001):
             with self.subTest(count=count):
-                stub = Stub([A])
+                stub = Stub([head])
                 evidence = self.evidence(content=claim + "#\n" * (count - 1))
-                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                proc = self.comment(stub, "--tested-head", head, "--evidence", evidence)
                 self.assertEqual(proc.returncode, 0 if count == 10000 else 76, proc.stderr)
                 if count == 10001:
                     self.assertIn(f"{evidence}:10001: too many lines", proc.stderr)
@@ -2250,12 +2346,13 @@ class TestClaimHeadTest(ForgejoTest):
     def test_evidence_line_length_boundary(self) -> None:
         """A 65536-byte line is accepted and a longer line is refused."""
 
-        claim = f"- test: fate tree=/w head={A}\n"
+        head = git_output(self.repo, "rev-parse", "topic")
+        claim = f"- test: fate tree=/w head={head}\n"
         for length in (65536, 65537):
             with self.subTest(length=length):
-                stub = Stub([A])
+                stub = Stub([head])
                 evidence = self.evidence(content=claim + "#" * (length - 1) + "\n")
-                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                proc = self.comment(stub, "--tested-head", head, "--evidence", evidence)
                 self.assertEqual(proc.returncode, 0 if length == 65536 else 76, proc.stderr)
                 if length == 65537:
                     self.assertIn(f"{evidence}:2: line longer than 65536 bytes", proc.stderr)
@@ -2276,11 +2373,13 @@ class TestClaimHeadTest(ForgejoTest):
     def test_evidence_prefix_and_control_are_accepted(self) -> None:
         """A matching short head with a control line on another head posts."""
 
-        stub = Stub([A])
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head])
         evidence = self.evidence(
-            content=f"- control: red run head={STALE}\n  test: fate tree=/w head={A[:12].upper()}\n"
+            content=f"- control: red run head={STALE}\n"
+            f"  test: fate tree=/w head={head[:12].upper()}\n"
         )
-        proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+        proc = self.comment(stub, "--tested-head", head, "--evidence", evidence)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
 
@@ -2368,9 +2467,10 @@ class TestClaimHeadTest(ForgejoTest):
         """The tested-head pull read preserves headers configured in curlrc."""
 
         (self.tmp / ".curlrc").write_text('header = "X-Curlrc: 1"\n', encoding="utf-8")
-        stub = Stub()
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head])
         proc = self.comment_body(
-            stub, env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)}
+            stub, head=head, env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)}
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(stub.pull_headers[0].get("X-Curlrc"), "1")
@@ -2407,9 +2507,10 @@ class TestClaimHeadTest(ForgejoTest):
     def test_matching_prefix_and_full_head_are_posted(self) -> None:
         """Both matching head prefixes and full hashes authorize a comment."""
 
-        for tested in (LIVE[:12], LIVE):
+        head = git_output(self.repo, "rev-parse", "topic")
+        for tested in (head[:12], head):
             with self.subTest(tested=tested):
-                stub = Stub([LIVE])
+                stub = Stub([head])
                 proc = self.comment(
                     stub, "--tested-head", tested, "--evidence", self.evidence(tested)
                 )
@@ -2429,9 +2530,10 @@ class TestClaimHeadTest(ForgejoTest):
     def test_comment_current_live_base_is_posted(self) -> None:
         """A live PR body naming the current merge base authorizes the comment POST."""
 
-        stub = Stub([LIVE])
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head])
         stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
-        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        proc = self.comment(stub, "--tested-head", head, "--evidence", self.evidence(head))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
 
@@ -2439,10 +2541,11 @@ class TestClaimHeadTest(ForgejoTest):
         """Rewriting the comment body file during pull reads cannot alter the posted text."""
 
         body_path = self.tmp / "body.md"
-        stub = Stub([LIVE])
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head])
         stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
         stub.on_pull = lambda: body_path.write_text("changed\n", encoding="utf-8")
-        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        proc = self.comment(stub, "--tested-head", head, "--evidence", self.evidence(head))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
 
@@ -2471,13 +2574,14 @@ class TestClaimHeadTest(ForgejoTest):
     def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
         """Both writes reject a different full head sharing the tested prefix."""
 
-        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        head = git_output(self.repo, "rev-parse", "topic")
+        other = head[:7] + ("1" if head[7] != "1" else "2") + head[8:]
         for command, method in ((self.comment, "POST"), (self.edit_body, "PATCH")):
-            for evidence_head, expected in ((other, 76), (LIVE, 0), (LIVE[:7], 0)):
+            for evidence_head, expected in ((other, 76), (head, 0), (head[:7], 0)):
                 with self.subTest(command=command.__name__, evidence_head=evidence_head):
-                    stub = Stub([LIVE], {LIVE: [[label("success")]]})
+                    stub = Stub([head], {head: [[label("success")]]})
                     proc = command(
-                        stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(evidence_head)
+                        stub, "--tested-head", head[:7], "--evidence", self.evidence(evidence_head)
                     )
                     self.assertEqual(proc.returncode, expected, proc.stderr)
                     self.assertEqual(self.sent_bodies(stub, method), [] if expected else [BODY])
