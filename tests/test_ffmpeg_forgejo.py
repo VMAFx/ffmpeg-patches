@@ -4183,6 +4183,84 @@ class SweepTest(ForgejoTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.tmp / "push-argv.json").exists())
 
+    def test_push_requires_fulfilled_backtick_fenced_promise(self) -> None:
+        """A literal backtick-fenced promise refuses until its promise row is fulfilled."""
+
+        comment = (
+            "My commitment is the following literal line:\n"
+            "```text\n> I will fix this in the next push.\n```"
+        )
+        stub = self.promise_stub(comment=comment, body="qualify the close errors")
+        self.assert_promise_refused(stub, None, "81815")
+        result = self.promise_push(stub, self.promise_file())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_requires_fulfilled_tilde_fenced_promise(self) -> None:
+        """A literal tilde-fenced promise refuses until its promise row is fulfilled."""
+
+        comment = (
+            "My commitment is the following literal line:\n"
+            "~~~text\n> I will fix this in the next push.\n~~~"
+        )
+        stub = self.promise_stub(comment=comment, body="qualify the close errors")
+        self.assert_promise_refused(stub, None, "81815")
+        result = self.promise_push(stub, self.promise_file())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_indented_code_promise(self) -> None:
+        """A four-space-indented greater-than promise remains author text."""
+
+        self.assert_promise_refused(
+            self.promise_stub(comment="    > I will fix this in the next push."), None, "81815"
+        )
+
+    def test_push_ignores_quote_with_at_most_three_spaces(self) -> None:
+        """Zero through three leading spaces preserve quote removal outside fences."""
+
+        for indent in range(4):
+            with self.subTest(indent=indent):
+                comment = " " * indent + "> I will fix this in the next push."
+                result = self.promise_push(self.promise_stub(comment=comment))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_own_promise_after_quote(self) -> None:
+        """Removing another person's quote keeps the following own promise."""
+
+        comment = "> I will fix this in the next push.\nI will fix this in my next revision."
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment), None, "I will fix this in my next revision."
+        )
+
+    def test_push_refuses_escaped_or_inline_greater_than_promise(self) -> None:
+        """Escaped and inline greater-than signs keep their author promises."""
+
+        comments = (
+            "\\> I will fix this in the next push.",
+            "Value > zero; I will fix this in the next push.",
+        )
+        for index in range(2):
+            with self.subTest(comment=comments[index]):
+                self.assert_promise_refused(
+                    self.promise_stub(comment=comments[index]), None, "81815"
+                )
+
+    def test_push_refuses_promise_in_unclosed_fence(self) -> None:
+        """An unclosed fence keeps subsequent greater-than promise lines."""
+
+        comment = "```text\n> Context.\n> I will fix this in the next push."
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+
+    def test_push_quoted_fence_marker_does_not_toggle_fence(self) -> None:
+        """A fence marker inside a quoted line leaves later quoted promises ignored."""
+
+        comment = "> ```\n> I will fix this in the next push."
+        result = self.promise_push(self.promise_stub(comment=comment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
     def test_push_matches_new_promise_wording(self) -> None:
         """New prepositions and next-revision nouns require promise rows."""
 
