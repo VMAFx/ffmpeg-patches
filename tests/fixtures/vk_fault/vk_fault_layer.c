@@ -360,14 +360,11 @@ static int submit_has_marked_cmd(const struct fault_state *st, const VkSubmitInf
     return 0;
 }
 
-/* Return 1 when a queue submission belongs to the filter or fence recovery. */
+/* Return 1 when a queue submission references a marked command buffer. */
 static int is_filter_submit(const struct fault_state *st, uint32_t submit_count,
-                            const VkSubmitInfo2 *submits, VkFence fence)
+                            const VkSubmitInfo2 *submits)
 {
-    if (submit_count == 0) {
-        return fence != VK_NULL_HANDLE ? 1 : 0;
-    }
-    if (submits == NULL) {
+    if (submit_count == 0 || submits == NULL) {
         return 0;
     }
     for (int i = 0; i < MAX_SUBMITS; i++) {
@@ -675,7 +672,7 @@ static VkResult handle_queue_submit2(VkQueue queue, uint32_t submit_count,
     if (dev != NULL) {
         next_fn = is_khr != 0 ? dev->next_submit2_khr : dev->next_submit2;
     }
-    if (is_filter_submit(st, submit_count, submits, fence) != 0) {
+    if (is_filter_submit(st, submit_count, submits) != 0) {
         st->submit_calls++;
         if (st->cfg.submit > 0 && st->submit_calls >= st->cfg.submit) {
             inject = 1;
