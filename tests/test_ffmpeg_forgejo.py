@@ -741,6 +741,192 @@ class ForgejoTest(unittest.TestCase):
         return [json.loads(data)["body"] for got, _, data in stub.requests if got == method]
 
 
+def plant_content_removal_failure(
+    bin_dir: Path, scratch: Path, content: bytes | tuple[bytes, ...]
+) -> Path:
+    """Install an rm stub that retains private files matching any supplied byte string."""
+    real_rm = shutil.which("rm")
+    if real_rm is None:
+        raise RuntimeError("rm missing")
+    refused = scratch / "refused-removal.txt"
+    wrapper = bin_dir / "rm"
+    contents = (content,) if isinstance(content, bytes) else content
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+        "path = Path(sys.argv[-1])\n"
+        f"if path.is_file() and path.read_bytes() in {contents!r}:\n"
+        f"    with Path({str(refused)!r}).open('a', encoding='utf-8') as record:\n"
+        "        record.write(str(path) + '\\n')\n"
+        "    raise SystemExit(1)\n"
+        f"os.execv({real_rm!r}, [{real_rm!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return refused
+
+
+def assert_private_removal_failed(
+    case: unittest.TestCase,
+    result: subprocess.CompletedProcess[str],
+    refused: Path,
+    status: int = 1,
+) -> None:
+    """Require the real status, one final path diagnostic, and the surviving private file."""
+    path = Path(refused.read_text(encoding="utf-8").strip())
+    message = f"ffmpeg-forgejo: cannot delete {path}."
+    case.assertEqual(result.returncode, status, result.stderr)
+    lines = result.stderr.splitlines()
+    case.assertTrue(lines, result.stderr)
+    case.assertEqual(lines[-1], message)
+    case.assertEqual(lines.count(message), 1)
+    case.assertTrue(path.exists())
+
+
+def write_request_paths(stub: Stub) -> list[tuple[str, str]]:
+    """Return write methods and paths with an explicit request-count bound."""
+    return [
+        (stub.requests[index][0], stub.requests[index][1])
+        for index in range(len(stub.requests))
+        if stub.requests[index][0] in {"POST", "PATCH"}
+    ]
+
+
+class PrivateRemovalTest(ForgejoTest):
+    """Exercise cleanup failures across main flow, conditional calls, and EXIT traps."""
+
+    def test_merge_cleanup_stops_main_flow_before_any_write(self) -> None:
+        """A private merge-output removal failure stops PR before any write reaches the stub."""
+        tree = git_output(self.repo, "rev-parse", "topic^{tree}")
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, f"{tree}\n".encode())
+        stub = Stub(reviewers=[["alice"]])
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(write_request_paths(stub), [])
+
+    def test_overlap_cleanup_failure_stops_conditional_pr_before_post(self) -> None:
+        """Conditional overlap cleanup cannot turn a failed candidate deletion into success."""
+        refused = plant_content_removal_failure(
+            self.bin_dir, self.tmp, OVERLAP_FILE.encode() + b"\0"
+        )
+        stub = Stub(reviewers=[["alice"]])
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(write_request_paths(stub), [])
+        self.assertEqual(stub.requested_users, [])
+
+    def test_pull_reader_cleanup_failure_stops_tested_comment_before_post(self) -> None:
+        """A checked pull-status substitution propagates header cleanup failure before POST."""
+        refused = plant_content_removal_failure(
+            self.bin_dir, self.tmp, b"Authorization: token testtoken\n"
+        )
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate head={A} tree=/w\n", encoding="utf-8")
+        stub = Stub()
+        result = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "--evidence",
+            str(evidence),
+            "1",
+            str(self.tmp / "body.md"),
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(len(stub.requests), 1)
+        self.assertEqual(stub.requests[0][:2], ("GET", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1"))
+        self.assertEqual(write_request_paths(stub), [])
+
+    def test_api_exit_cleanup_failure_stops_pr_before_post(self) -> None:
+        """An API header EXIT cleanup failure survives checked substitutions and stops PR."""
+        refused = plant_content_removal_failure(
+            self.bin_dir, self.tmp, b"Authorization: token testtoken\n"
+        )
+        stub = Stub(reviewers=[["alice"]])
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(len(stub.requests), 1)
+        self.assertEqual(stub.requests[0][:2], ("GET", "/api/v1/user"))
+
+    def test_exit_cleanup_failure_changes_success_to_one(self) -> None:
+        """A successful comment body still exits 1 when its EXIT snapshot removal fails."""
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, BODY.encode())
+        stub = Stub()
+        result = self.run_command(
+            stub, "comment", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertIn("stub/issues/1#issuecomment-1", result.stdout)
+        self.assertEqual(self.sent_bodies(stub, "POST"), [BODY])
+
+    def test_exit_cleanup_failure_keeps_earlier_refusal_status(self) -> None:
+        """A failed EXIT cleanup keeps an earlier duplicate refusal's status 78."""
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, BODY.encode())
+        stub = Stub()
+        stub.comments[1] = [
+            {"user": {"login": "tester"}, "id": 81918, "body": BODY, "html_url": "stub/81918"}
+        ]
+        result = self.run_command(
+            stub, "comment", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused, status=78)
+        self.assertIn("own comment 81918", result.stderr)
+        self.assertEqual(write_request_paths(stub), [])
+
+    def test_main_payload_cleanup_stops_after_pr_post_before_reviewer_post(self) -> None:
+        """A failed PR payload removal exits 1 after creation and before reviewer writes."""
+        content = json.dumps(
+            {"head": "tester:topic", "base": "master", "title": "title", "body": BODY}
+        )
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, f"{content}\n".encode())
+        stub = Stub(reviewers=[["alice"]])
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(write_request_paths(stub), [("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls")])
+        self.assertEqual(stub.requested_users, [])
+
+    def test_standalone_landed_explains_before_failed_cleanup(self) -> None:
+        """Standalone landed prints its explanation before cleanup fails with status 1."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        tree = git_output(self.repo, "rev-parse", "topic^{tree}")
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, f"{tree}\n".encode())
+        stub = Stub()
+        result = self.run_command(stub, "landed", "topic")
+        assert_private_removal_failed(self, result, refused)
+        self.assertIn(git_output(self.repo, "rev-parse", "topic")[:12], result.stdout)
+        self.assertEqual(stub.requests, [])
+
+    def test_exit_cleanup_tries_both_private_reply_paths(self) -> None:
+        """Reply EXIT cleanup tries both failed paths once while retaining the earlier status."""
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, (BODY.encode(), b""))
+        stub = Stub()
+        stub.review_comments[7] = copy.deepcopy(THREAD)
+        stub.review_comments[7].append(
+            {"user": {"login": "tester"}, "id": 81918, "body": BODY, "html_url": "stub/81918"}
+        )
+        result = self.run_command(
+            stub, "reply", "--no-test-claims", "1", "7", "85995", str(self.tmp / "body.md")
+        )
+        self.assertEqual(result.returncode, 78, result.stderr)
+        paths = refused.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(len(set(paths)), 2)
+        lines = result.stderr.splitlines()
+        for index in range(len(paths)):
+            self.assertTrue(Path(paths[index]).exists())
+            self.assertEqual(lines.count(f"ffmpeg-forgejo: cannot delete {paths[index]}."), 1)
+        self.assertEqual(lines[-1], f"ffmpeg-forgejo: cannot delete {paths[-1]}.")
+        self.assertEqual(write_request_paths(stub), [])
+
+
 class RunCommandTest(ForgejoTest):
     def test_unknown_subcommand_is_rejected_before_any_request(self) -> None:
         """An unknown helper subcommand raises before the stub receives a request."""
@@ -1686,6 +1872,52 @@ THREAD = [
 class ReplyTest(ForgejoTest):
     """The reply verb answers a review comment inside its thread."""
 
+    def test_unlanded_tested_head_reply_still_posts(self) -> None:
+        """A tested review reply on a real unlanded head still posts and reads back."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={sha}\n", encoding="utf-8")
+        stub = self.stub(heads=[sha])
+        result = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            sha,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.payloads(stub)), 1)
+        self.assertEqual(self.payloads(stub)[0]["body"], BODY)
+
+    def test_landed_tested_head_reply_is_refused_before_post(self) -> None:
+        """A tested review reply on a landed head exits 82 before its POST."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        sha = git_output(self.repo, "rev-parse", "topic")
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={sha}\n", encoding="utf-8")
+        stub = self.stub(heads=[sha])
+        result = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            sha,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("already on the live base", result.stderr)
+        self.assertEqual(result.stderr.splitlines()[-1], f"{sha[:12]}: {base[:12]}")
+        self.assertEqual(write_request_paths(stub), [])
+
     def test_reply_filler_is_refused_before_any_request(self) -> None:
         """A filler reply exits 81 before any token or review-comment request."""
         body = self.tmp / "body.md"
@@ -1929,6 +2161,25 @@ class ReplyTest(ForgejoTest):
 
 class TestClaimHeadTest(ForgejoTest):
     """Validate evidence before accepting claims about a tested head."""
+
+    def test_unlanded_tested_head_body_edit_still_patches(self) -> None:
+        """A tested PR body edit on a real unlanded head still sends its PATCH."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha], {sha: [[label("success")]]})
+        result = self.edit_body(stub, "--tested-head", sha, "--evidence", self.evidence(sha))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.patches(stub), [BODY])
+
+    def test_landed_tested_head_body_edit_is_refused_before_patch(self) -> None:
+        """A tested PR body edit on a landed head exits 82 before its PATCH."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha], {sha: [[label("success")]]})
+        result = self.edit_body(stub, "--tested-head", sha, "--evidence", self.evidence(sha))
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("already on the live base", result.stderr)
+        self.assertEqual(result.stderr.splitlines()[-1], f"{sha[:12]}: {base[:12]}")
+        self.assertEqual(self.patches(stub), [])
 
     def test_comment_filler_is_refused_before_any_request(self) -> None:
         """A filler comment exits 81 before any token, head or comment request."""
@@ -5034,6 +5285,63 @@ MUTANTS = {
         "test_a_failing_seq_does_not_skip_the_guard",
     ),
 }
+
+
+def private_removal_violations(source: str) -> list[int]:
+    """Return removal-token lines outside the single canonical private cleanup function."""
+    functions = list(re.finditer(r"(?ms)^remove_private_files\(\) \{\n.*?^\}\n", source))
+    if len(functions) != 1:
+        raise ValueError("exactly one private removal function required")
+    function = functions[0]
+    masked = (
+        source[: function.start()]
+        + re.sub(r"[^\n]", " ", function.group())
+        + source[function.end() :]
+    )
+    lines = masked.splitlines()
+    command = re.compile(r"(?<![\w-])(?:rm|rmdir|unlink|shred|-delete)(?![\w-])")
+    return [
+        index + 1
+        for index in range(len(lines))
+        if not lines[index].lstrip().startswith("#") and command.search(lines[index])
+    ]
+
+
+class PrivateRemovalSourceTest(unittest.TestCase):
+    """Require a single removal implementation and reject planted bypass commands."""
+
+    def test_helper_removals_use_the_private_cleanup_function(self) -> None:
+        """Every literal filesystem removal in the helper belongs to its canonical function."""
+        self.assertEqual(private_removal_violations(HELPER.read_text(encoding="utf-8")), [])
+
+    def test_planted_removal_commands_outside_cleanup_are_rejected(self) -> None:
+        """Bare commands, wrappers, traps, and find deletion cannot bypass the source guard."""
+        source = HELPER.read_text(encoding="utf-8")
+        commands = (
+            'rm -f "$body"',
+            '/bin/rm -f "$body"',
+            'command rm -f "$body"',
+            "trap 'rm -f \"$body\"' EXIT",
+            'rmdir "$body"',
+            'unlink "$body"',
+            'shred -u "$body"',
+            'find "$dir" -delete',
+            'printf "#"; rm -f "$body"',
+        )
+        for index in range(len(commands)):
+            with self.subTest(command=commands[index]):
+                self.assertEqual(
+                    private_removal_violations(source + commands[index] + "\n"),
+                    [len(source.splitlines()) + 1],
+                )
+
+    def test_private_removal_guard_requires_one_implementation(self) -> None:
+        """A missing or duplicate cleanup function fails the source guard closed."""
+        source = HELPER.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            private_removal_violations(source.replace("remove_private_files() {", "other() {"))
+        with self.assertRaises(ValueError):
+            private_removal_violations(source + "remove_private_files() {\n  :\n}\n")
 
 
 def top_level_trap_locals(source: str) -> list[str]:
