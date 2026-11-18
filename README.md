@@ -53,7 +53,7 @@ release contains it (see [How it works](#how-it-works)).
 ## Get started
 
 This repository ships patches only and builds nothing
-(see the [`build` target in Makefile](Makefile#L53-L55)).
+(see the `build` target in [Makefile](Makefile)).
 
 ```bash
 . ./base.env
@@ -63,10 +63,10 @@ python3 scripts/series.py apply --expect-base ffmpeg
 ```
 
 `apply` checks each patch and prints one result per patch. In
-[`apply_one`](scripts/series.py#L975-L984), it skips `git am --3way` only
-when the forward application check fails and all added lines are already
-in the tree. Otherwise, it attempts `git am --3way` without your git
-configuration and reports the result:
+`apply_one` in [`scripts/series.py`](scripts/series.py), it skips
+`git am --3way` only when the forward application check fails and all added
+lines are already in the tree. Otherwise, it attempts `git am --3way`
+without your git configuration and reports the result:
 
 - `applied`: the patch applied
 - `conflict`: it did not; the run stops unless `--keep-going` is given
@@ -396,21 +396,6 @@ a pinned FFmpeg release carries it
 [`series.txt`](series.txt); its own and backported upstream pull requests
 and their states are in
 [`upstream-contributions.json`](upstream-contributions.json).
-From the repository root, this command prints the current patch total and
-pull request totals by state from those files:
-
-```bash
-python3 - <<'PY'
-import json
-from collections import Counter
-from pathlib import Path
-
-patches = (p.strip() for p in Path("series.txt").read_text().splitlines())
-pulls = json.loads(Path("upstream-contributions.json").read_text())["contributions"]
-print("Patches:", sum(bool(p) and not p.startswith("#") for p in patches))
-print("Pull requests:", len(pulls), dict(Counter(p["state"] for p in pulls)))
-PY
-```
 
 **What support funds.**
 - Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
