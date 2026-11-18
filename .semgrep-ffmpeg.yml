@@ -39,22 +39,137 @@ rules:
       The allocation is checked anyway; check it first and derive the pointer
       after the check instead of using a ternary with a NULL fallback.
     patterns:
-      - pattern-inside: |
-          $RET $FUNC(...) {
-            ...
-          }
       - pattern-either:
-          - pattern-inside: |
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      $BUF_TYPE *$BUF = $ALLOC(...);
+                      ...
+                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                      ...
+                      if ($CHECK) {
+                        ...
+                      }
+                  - pattern-inside: |
+                      $BUF_TYPE *$BUF = $ALLOC(...);
+                      ...
+                      $DST = $BUF ? $VALUE : NULL;
+                      ...
+                      if ($CHECK) {
+                        ...
+                      }
+                  - pattern-inside: |
+                      $BUF = $ALLOC(...);
+                      ...
+                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                      ...
+                      if ($CHECK) {
+                        ...
+                      }
+                  - pattern-inside: |
+                      $BUF = $ALLOC(...);
+                      ...
+                      $DST = $BUF ? $VALUE : NULL;
+                      ...
+                      if ($CHECK) {
+                        ...
+                      }
+              - metavariable-pattern:
+                  metavariable: $CHECK
+                  pattern-either:
+                    - pattern: '!$BUF'
+                    - pattern: '$BUF == NULL'
+                    - pattern: '... || !$BUF || ...'
+                    - pattern: '... || $BUF == NULL || ...'
+                    - pattern: '!$DST'
+                    - pattern: '$DST == NULL'
+                    - pattern: '... || !$DST || ...'
+                    - pattern: '... || $DST == NULL || ...'
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      $BUF_TYPE *$BUF = $ALLOC(...);
+                      ...
+                      if ($CHECK) {
+                        ...
+                      }
+                      ...
+                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                  - pattern-inside: |
+                      $BUF_TYPE *$BUF = $ALLOC(...);
+                      ...
+                      if ($CHECK) {
+                        ...
+                      }
+                      ...
+                      $DST = $BUF ? $VALUE : NULL;
+                  - pattern-inside: |
+                      $BUF = $ALLOC(...);
+                      ...
+                      if ($CHECK) {
+                        ...
+                      }
+                      ...
+                      $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+                  - pattern-inside: |
+                      $BUF = $ALLOC(...);
+                      ...
+                      if ($CHECK) {
+                        ...
+                      }
+                      ...
+                      $DST = $BUF ? $VALUE : NULL;
+              - metavariable-pattern:
+                  metavariable: $CHECK
+                  pattern-either:
+                    - pattern: '!$BUF'
+                    - pattern: '$BUF == NULL'
+                    - pattern: '... || !$BUF || ...'
+                    - pattern: '... || $BUF == NULL || ...'
+      - pattern-either:
+          - pattern: |
               $BUF_TYPE *$BUF = $ALLOC(...);
               ...
-          - pattern-inside: |
+              $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+          - pattern: |
+              $BUF_TYPE *$BUF = $ALLOC(...);
+              ...
+              $DST = $BUF ? $VALUE : NULL;
+          - pattern: |
               $BUF = $ALLOC(...);
               ...
+              $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+          - pattern: |
+              $BUF = $ALLOC(...);
+              ...
+              $DST = $BUF ? $VALUE : NULL;
       - metavariable-regex:
           metavariable: $ALLOC
           regex: ^(av_malloc|av_mallocz|av_malloc_array|av_calloc|av_realloc|av_realloc_array|av_memdup|malloc|calloc|realloc)$
-      - pattern-either:
-          - pattern: |
-              $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
-          - pattern: |
-              $DST = $BUF ? $VALUE : NULL;
+      # Filter complete source-to-ternary ranges before focusing the destination.
+      # A later allocation starts a new range with no intervening write.
+      - pattern-not: |
+          $BUF_TYPE *$BUF = $ALLOC(...);
+          ...
+          $BUF = $OTHER;
+          ...
+          $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+      - pattern-not: |
+          $BUF_TYPE *$BUF = $ALLOC(...);
+          ...
+          $BUF = $OTHER;
+          ...
+          $DST = $BUF ? $VALUE : NULL;
+      - pattern-not: |
+          $BUF = $ALLOC(...);
+          ...
+          $BUF = $OTHER;
+          ...
+          $DST_TYPE *$DST = $BUF ? $VALUE : NULL;
+      - pattern-not: |
+          $BUF = $ALLOC(...);
+          ...
+          $BUF = $OTHER;
+          ...
+          $DST = $BUF ? $VALUE : NULL;
+      - focus-metavariable: $DST
