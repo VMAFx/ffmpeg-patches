@@ -1369,6 +1369,41 @@ static int unbraced_inner_loop_break(void)
                 control = source.replace(f"    if ({check})\n        return -1;\n", "", 1)
                 self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
 
+    def test_unrelated_earlier_conditions_keep_ternary_finding(self) -> None:
+        """Report ternaries when an earlier condition does not directly test the buffer."""
+        checks = (
+            "flag",
+            "ready()",
+            "flag > 0",
+            "record_attempt(buffer)",
+            "buffer->field",
+            "buffer[0]",
+            "flag && record_attempt(buffer)",
+            "buffer + 1",
+            "buffer > other",
+            "!flag",
+            "flag != NULL",
+        )
+        for index in range(len(checks)):
+            with self.subTest(check=checks[index]):
+                source = _earlier_nonnull_ternary_source(checks[index])
+                self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_direct_buffer_tests_as_boolean_operands_out_of_scope(self) -> None:
+        """Skip each direct buffer test alone or as a whole AND/OR operand."""
+        checks = ("buffer", "!buffer", "buffer == NULL", "NULL == buffer")
+        checks += ("buffer != NULL", "NULL != buffer")
+        operators = ("", "&&", "||")
+        for index in range(len(checks)):
+            for operator_index in range(len(operators)):
+                operator = operators[operator_index]
+                check = checks[index]
+                if operator:
+                    check = f"flag {operator} {check} {operator} ready()"
+                with self.subTest(check=check):
+                    source = _earlier_nonnull_ternary_source(check)
+                    self.assertEqual(_ternary_finding_lines(source), [])
+
     def test_earlier_assert_macro_reported_plain_shape(self) -> None:
         """Report a macro assertion before the ternary because macros are not earlier ifs."""
         source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
