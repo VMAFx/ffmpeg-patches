@@ -1670,7 +1670,7 @@ SCRIPT_DIR = {
 SCRIPT_DIR.update(
     {
         "r26-command-mixed-candidates": Case(
-            'c=bash\nc=<case>/other/run.sh\n"$c" <case>/inner.sh\n',
+            'c=bash\nc=./other/run.sh\n"$c" <case>/inner.sh\n',
             2,
             "other/run.sh",
             {"other/run.sh": CFG},
@@ -1749,6 +1749,34 @@ SCRIPT_DIR.update(
             {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
             command="PATH=<case>/bin:/usr/bin:/bin /bin/bash tools/child.sh",
         ),
+        "r26b-tool-env-prefix-path": Case(
+            "",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="env PATH=<case>/bin:/usr/bin:/bin /bin/bash tools/child.sh",
+        ),
+        "r26b-tool-prefix-unrelated": Case(
+            "",
+            0,
+            None,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="UNRELATED=<case>/bin:/usr/bin:/bin /bin/bash tools/child.sh",
+        ),
+        "r26b-tool-program-prefix-path": Case(
+            "",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="PATH=<case>/bin:/usr/bin:/bin ./tools/child.sh",
+        ),
+        "r26b-tool-program-prefix-unrelated": Case(
+            "",
+            0,
+            None,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="UNRELATED=<case>/bin:/usr/bin:/bin ./tools/child.sh",
+        ),
         "r26-child-export-path": Case(
             "export PATH=<case>/bin:/usr/bin:/bin\n/bin/bash <case>/tools/child.sh\n",
             2,
@@ -1809,8 +1837,8 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
 
     def test_script_dir_shapes(self) -> None:
-        """Replay all 554 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 554)
+        """Replay all 558 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 558)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)

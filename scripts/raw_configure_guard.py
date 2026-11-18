@@ -256,20 +256,13 @@ def _decide_shell_stdin(
 def _inspect_file_target(
     target: str,
     assignments: dict[str, str],
-    cwd: Path,
-    directory_changed: bool,
-    files_read: list[int] | None,
+    context: InspectionContext,
 ) -> Path | None:
     """Inspect a non-inline shell script operand or return a refusal Path."""
     sub_target = _substitute_literals(target, assignments)
     if _is_configure_word(sub_target) or not DECIDABLE_NAME.fullmatch(os.path.basename(sub_target)):
         return Path(sub_target)
-    read_tracker = files_read if files_read is not None else [0]
-    return inspect_script_file(
-        sub_target,
-        InspectionContext(cwd, directory_changed, read_tracker, classify_script_words),
-        is_program=False,
-    )
+    return inspect_script_file(sub_target, context, is_program=False)
 
 
 def _inspect_shell_stage(
@@ -277,7 +270,7 @@ def _inspect_shell_stage(
     prev_stage: list[str] | None,
     stdin_prog: str | None,
     context: tuple[dict[str, str], dict[str, str]],
-    file_ctx: tuple[Path, bool, list[int] | None] | None = None,
+    file_ctx: InspectionContext | None = None,
 ) -> tuple[Path | None, str | None]:
     """Inspect a shell stage for inline script, file operand, or stdin feeding."""
     target, inline = _shell_argument(shell_words)
@@ -285,11 +278,8 @@ def _inspect_shell_stage(
         return None, target
     assignments, stdin_map = context
     if not inline and target is not None and target != "-":
-        cwd, directory_changed, files_read = (
-            file_ctx if file_ctx is not None else (Path.cwd(), False, None)
-        )
-        blocked = _inspect_file_target(target, assignments, cwd, directory_changed, files_read)
-        return blocked, None
+        inspection = file_ctx or InspectionContext(Path.cwd(), False, [0], classify_script_words)
+        return _inspect_file_target(target, assignments, inspection), None
     return _decide_shell_stdin(prev_stage, stdin_prog, assignments, stdin_map, shell_words[0])
 
 
@@ -305,8 +295,16 @@ def _inspect_stage_interpreter(
     assignments, _ = parse_ctx
     name = os.path.basename(_substitute_literals(words[cmd_idx], assignments))
     if name in SHELLS:
+        cwd, directory_changed, files_read = file_ctx
+        inspection = InspectionContext(
+            cwd,
+            directory_changed,
+            files_read if files_read is not None else [0],
+            classify_script_words,
+            command_prefix=tuple(words[:cmd_idx]),
+        )
         blocked, to_queue = _inspect_shell_stage(
-            words[cmd_idx:], prev_stage, stdin_prog, parse_ctx, file_ctx
+            words[cmd_idx:], prev_stage, stdin_prog, parse_ctx, inspection
         )
         return True, blocked, to_queue, False
     if name in ("eval", "source", "."):
@@ -324,6 +322,7 @@ def _check_program_path(
     cwd: Path,
     directory_changed: bool,
     files_read: list[int] | None,
+    prefix: tuple[str, ...] = (),
 ) -> Path | None:
     """Inspect an executable script program path or return a refusal Path."""
     if _is_configure_word(cmd_word) or "$" in cmd_word or "`" in cmd_word:
@@ -336,7 +335,9 @@ def _check_program_path(
     read_tracker = files_read if files_read is not None else [0]
     return inspect_script_file(
         cmd_word,
-        InspectionContext(cwd, directory_changed, read_tracker, classify_script_words),
+        InspectionContext(
+            cwd, directory_changed, read_tracker, classify_script_words, command_prefix=prefix
+        ),
         is_program=True,
     )
 
@@ -373,7 +374,9 @@ def _inspect_stage(
                 pending.append((to_queue, depth + 1, stage_dir_changed))
             return None
         cmd_word = _substitute_literals(words[cmd_idx], assignments)
-        prog_blocked = _check_program_path(cmd_word, session_cwd, stage_dir_changed, files_read)
+        prog_blocked = _check_program_path(
+            cmd_word, session_cwd, stage_dir_changed, files_read, tuple(words[:cmd_idx])
+        )
         if prog_blocked is not None:
             return prog_blocked
         if os.path.basename(cmd_word) in ("cd", "pushd", "popd"):

@@ -476,6 +476,7 @@ class InspectionContext(NamedTuple):
     source_reader: Callable[[str, bool, InspectionContext, list[str]], list[str] | str] | None = (
         None
     )
+    command_prefix: tuple[str, ...] = ()
 
 
 @dataclass
@@ -3258,6 +3259,7 @@ def _environment_rebinds(context: InspectionContext, budget: BodyBudget) -> bool
         "BASH_ENV" in os.environ
         or "ENV" in os.environ
         or has_func
+        or _prefix_rebinds(list(context.command_prefix))
         or budget.rebound_unknown
         or context.script_path in budget.rebound_scripts
     )
