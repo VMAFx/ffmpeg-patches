@@ -627,11 +627,15 @@ def _inspect_files(
             return res
         if res is None:
             continue
+        resolved = (
+            Path(cur.operand).resolve()
+            if Path(cur.operand).is_absolute()
+            else (context.cwd / cur.operand).resolve()
+        )
         file_context = context._replace(
             directory_changed=cur.directory_changed,
-            script_dir=Path(cur.operand).resolve().parent
-            if Path(cur.operand).is_absolute()
-            else (context.cwd / cur.operand).resolve().parent,
+            script_dir=resolved.parent,
+            script_path=resolved,
         )
         candidates = _body_candidates(res, file_context, budget)
         if isinstance(candidates, Path):
@@ -653,7 +657,8 @@ def inspect_sourced_file(operand: str, context: InspectionContext) -> tuple[Path
     """Inspect a source in its caller's scan and expose its final directory state."""
     budget = BodyBudget()
     directory_state = [context.directory_changed]
-    file_context = context._replace(script_dir=(context.cwd / operand).resolve().parent)
+    resolved = (context.cwd / operand).resolve()
+    file_context = context._replace(script_dir=resolved.parent, script_path=resolved)
     candidates = _body_candidates(
         f". {shlex.quote(operand)}", file_context, budget, directory_state
     )
