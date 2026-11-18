@@ -926,6 +926,34 @@ static int reallocated(void)
 )
 
 
+FFMPEG_DESTINATION_WRITE_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+void consume_optional(uint8_t *dst);
+
+static int destination_write(uint8_t *other)
+{
+    DECLARATIONS
+    ALLOCATION;
+    TERNARY;
+    consume_optional(dst);
+    dst = other;
+    if (CHECK) {
+        return -1;
+    }
+    return 0;
+}
+"""
+)
+
+FFMPEG_DESTINATION_WRITE_FORMS = (
+    ("", "uint8_t *buffer", "uint8_t *dst"),
+    ("uint8_t *dst;", "uint8_t *buffer", "dst"),
+    ("uint8_t *buffer;", "buffer", "uint8_t *dst"),
+    ("uint8_t *buffer, *dst;", "buffer", "dst"),
+)
+
+
 def _scan_ffmpeg_c(source: str) -> list[dict]:
     """Scan synthetic C source with .semgrep-ffmpeg.yml and return its result entries."""
     with tempfile.TemporaryDirectory() as scratch_name:
@@ -1058,6 +1086,69 @@ static int derived_checked(void)
         self.assertEqual(
             results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
         )
+
+    def test_overwritten_destination_then_destination_check_passes(self) -> None:
+        """Accept later checks of a destination overwritten after its ternary."""
+        checks = ("!dst", "dst == NULL", "!other || !dst", "!other || dst == NULL")
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            for check in checks:
+                with self.subTest(allocation=allocation, destination=destination, check=check):
+                    source = (
+                        FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                            "ALLOCATION", f"{allocation} = av_malloc(128)"
+                        )
+                        .replace("DECLARATIONS", declarations)
+                        .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                        .replace("CHECK", check)
+                    )
+                    self.assertEqual(_scan_ffmpeg_c(source), [])
+
+    def test_overwritten_destination_with_buffer_check_flagged(self) -> None:
+        """Keep buffer checks before or after a ternary whose destination is overwritten."""
+        failure_check = "if (!buffer) {\n        return -1;\n    }"
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            for earlier in (False, True):
+                with self.subTest(allocation=allocation, destination=destination, earlier=earlier):
+                    source = (
+                        FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                            "ALLOCATION", f"{allocation} = av_malloc(128)"
+                        )
+                        .replace("DECLARATIONS", declarations)
+                        .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                        .replace("CHECK", "!buffer")
+                    )
+                    if earlier:
+                        source = source.replace(failure_check, "").replace(
+                            f"    {destination} =",
+                            "    " + failure_check + f"\n    {destination} =",
+                        )
+                    results = _scan_ffmpeg_c(source)
+                    ternary_line = next(
+                        index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+                    )
+                    self.assertEqual(len(results), 1)
+                    self.assertEqual(results[0]["start"]["line"], ternary_line)
+
+    def test_destination_assigned_after_check_flagged(self) -> None:
+        """Keep the ternary finding when its destination is assigned only after the check."""
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            with self.subTest(allocation=allocation, destination=destination):
+                source = (
+                    FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                        "ALLOCATION", f"{allocation} = av_malloc(128)"
+                    )
+                    .replace("DECLARATIONS", declarations)
+                    .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                    .replace("CHECK", "!dst")
+                    .replace("    dst = other;\n", "")
+                    .replace("    return 0;", "    dst = other;\n    return 0;")
+                )
+                results = _scan_ffmpeg_c(source)
+                ternary_line = next(
+                    index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+                )
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["start"]["line"], ternary_line)
 
     def test_later_buffer_check_without_braces_flagged(self) -> None:
         """Flag a ternary whose buffer is checked later without braces."""
