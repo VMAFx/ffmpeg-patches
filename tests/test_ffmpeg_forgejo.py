@@ -4316,6 +4316,88 @@ class SweepTest(ForgejoTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.tmp / "push-argv.json").exists())
 
+    def test_push_refuses_promise_with_round_bracket_internal_question(self) -> None:
+        """A question mark inside an open round bracket leaves the promise eligible."""
+
+        comment = "I will fix parser.c in the next push (OK? please wait)."
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+
+    def test_push_refuses_promise_with_square_bracket_internal_question(self) -> None:
+        """A question mark inside an open square bracket leaves the promise eligible."""
+
+        comment = "I will fix parser.c in the next push [OK? please wait]."
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+
+    def test_push_refuses_promise_ending_inside_bracket_before_question(self) -> None:
+        """A period before a closing bracket separates the promise from a later question."""
+
+        comment = "I will fix parser.c in the next push (including tests.) Should I mention tests?"
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            ": I will fix parser.c in the next push (including tests.); --promises <file> required",
+        )
+
+    def test_push_refuses_promise_ending_inside_quote_before_question(self) -> None:
+        """A period before a closing quote separates the promise from a later question."""
+
+        comment = 'I will fix parser.c in the next push as "promised." Should I mention tests?'
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment),
+            None,
+            ': I will fix parser.c in the next push as "promised."; --promises <file> required',
+        )
+
+    def test_push_refuses_promise_with_parenthesized_question_before_continuation(self) -> None:
+        """A parenthesized question before trailing text keeps the promise detected."""
+
+        comment = "I will fix this in the next push (OK?) after review."
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+
+    def test_push_refuses_parenthesized_question_with_promise_marker(self) -> None:
+        """A parenthesized question keeps the existing conservative promise refusal."""
+
+        comment = "(Does the next push fix parser.c?)"
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, comment)
+
+    def test_push_refuses_quoted_question_with_promise_marker(self) -> None:
+        """A question ending inside quotes keeps the existing conservative refusal."""
+
+        comment = 'Does the next push fix "parser.c?"'
+        self.assert_promise_refused(self.promise_stub(comment=comment), None, comment)
+
+    def test_push_refuses_promise_after_bare_cr_list_boundary(self) -> None:
+        """A bare carriage return starts a promise list after an overlong paragraph."""
+
+        comment = "x" * 301 + "\r- I will fix parser.c in the next push."
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment), None, "- I will fix parser.c in the next push."
+        )
+
+    def test_push_refuses_promise_after_bare_cr_blank_line(self) -> None:
+        """Two bare carriage returns separate a promise from an overlong paragraph."""
+
+        comment = "x" * 301 + "\r\rI will fix parser.c in the next push."
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment), None, "I will fix parser.c in the next push."
+        )
+
+    def test_push_refuses_promise_after_crlf_list_boundary(self) -> None:
+        """A CRLF list boundary keeps a promise after an overlong paragraph eligible."""
+
+        comment = "x" * 301 + "\r\n- I will fix parser.c in the next push."
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment), None, "- I will fix parser.c in the next push."
+        )
+
+    def test_push_refuses_promise_after_crlf_blank_line(self) -> None:
+        """A CRLF blank line keeps a promise after an overlong paragraph eligible."""
+
+        comment = "x" * 301 + "\r\n\r\nI will fix parser.c in the next push."
+        self.assert_promise_refused(
+            self.promise_stub(comment=comment), None, "I will fix parser.c in the next push."
+        )
+
     def test_push_accepts_301_character_dotted_sentence(self) -> None:
         """A dotted filename cannot hide the rest of an overlength promise sentence."""
 

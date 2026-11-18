@@ -1321,7 +1321,7 @@ import sys
 
 PATTERN = re.compile(r"\b(?:the|my)\s+next\s+(?:push|revision|version|iteration|round)\b", re.I)
 BOUNDARY = re.compile(
-    r"[.!?](?=\s|$)|\n[^\S\n]*\n|^[^\S\n]*(?:[-+*]|[0-9]+[.)])(?=\s|$)", re.M
+    r"[.!?][)\]\"']*(?=\s|$)|\n[^\S\n]*\n|^[^\S\n]*(?:[-+*]|[0-9]+[.)])(?=\s|$)", re.M
 )
 
 
@@ -1350,7 +1350,12 @@ def promise_sentence(body: str, ident: object) -> str | None:
         sentence = next(sentences, None)
         if sentence is None:
             return first
-        if first is None and len(sentence) <= 300 and not sentence.endswith("?") and PATTERN.search(sentence):
+        question = (
+            sentence.endswith("?")
+            and sentence.count("(") <= sentence.count(")")
+            and sentence.count("[") <= sentence.count("]")
+        )
+        if first is None and len(sentence) <= 300 and not question and PATTERN.search(sentence):
             first = sentence
     refuse(f"comment {ident}: reached 2000-sentence cap")
 
@@ -1381,6 +1386,7 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
         ident = row.get("id")
         if len(body) > 65536 or len(body.encode("utf-8")) > 65536:
             refuse(f"comment {ident}: body exceeds 65536-byte cap")
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
         body = re.sub(r"(?m)^[^\S\n]*>[^\n]*", "", body)
         sentence = promise_sentence(body, ident)
         if sentence is None:
