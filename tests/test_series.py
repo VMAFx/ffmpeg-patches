@@ -307,6 +307,7 @@ class ScopeTest(unittest.TestCase):
             self.assertIn(f"{key}=true: --full", stdout.getvalue())
 
     def test_direct_path_rules(self) -> None:
+        """Select only the required CI scopes for each direct path rule."""
         cases = {
             "series.txt": ("true", "false", "true"),
             "base.env": ("true", "true", "true"),
@@ -321,6 +322,7 @@ class ScopeTest(unittest.TestCase):
             "tests/helpers.py": ("true", "true", "false"),
             "tests/helpers_notes.py": ("false", "false", "false"),
             ".config/clang-tidy/config.yaml": ("true", "false", "false"),
+            ".config/cppcheck/vulkan-layer.cfg": ("true", "false", "false"),
             ".python-version": ("true", "false", "true"),
             "patches/0001-tonemap.toml": ("true", "false", "true"),
             "tests/test_series.py": ("false", "false", "false"),
