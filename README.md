@@ -87,7 +87,7 @@ Consumers apply this series first and their own feature patches on top:
 A fix lives here once. A consumer does not carry its own copy.
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'fontFamily': 'ui-sans-serif, Segoe UI, Helvetica, Arial, sans-serif', 'fontSize': '15px', 'primaryColor': '#111a35', 'primaryTextColor': '#e2e8f0', 'primaryBorderColor': '#3b82f6', 'lineColor': '#3b82f6', 'edgeLabelBackground': '#111a35', 'tertiaryColor': '#0b1020'}}}%%
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px', 'primaryColor': '#111a35', 'primaryTextColor': '#e2e8f0', 'primaryBorderColor': '#3b82f6', 'lineColor': '#3b82f6', 'edgeLabelBackground': '#111a35', 'tertiaryColor': '#0b1020'}}}%%
 flowchart TD
     found["Fix found in a consumer<br/>or in this series"]:::input
     series["Add patch to series<br/>for pinned FFmpeg release"]:::step
