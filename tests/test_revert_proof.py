@@ -35,6 +35,7 @@ class RevertProofTest(unittest.TestCase):
         self.tree.mkdir()
         self.record_path = self.root / "record.json"
         run_git(self.tree, "init", "-q", preserve_config=True)
+        self.write(".gitignore", "ignored-user.txt\n")
         self.write("libavfilter/vf_x.c", BASE_SOURCE)
         self.base = self.commit("avfilter/vf_x: base commit")
 
@@ -51,23 +52,72 @@ class RevertProofTest(unittest.TestCase):
         run_git(self.tree, "commit", "-qm", subject, preserve_config=True)
         return run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
 
+    def caller_snapshot(self) -> tuple[str, bytes, str]:
+        """Capture caller status, index bytes and branch without refreshing the index."""
+        status = run_git(
+            self.tree,
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+            preserve_config=True,
+        )
+        index = (self.tree / ".git/index").read_bytes()
+        head = run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
+        return status, index, head
+
+    def assert_caller_unchanged(self, before: tuple[str, bytes, str], moved: bool) -> None:
+        """Preserve caller bytes, allowing porcelain to reflect an external ref move."""
+        after = self.caller_snapshot()
+        self.assertEqual(after[1] if moved else after, before[1] if moved else before)
+        self.assertEqual((self.tree / "user.txt").read_bytes(), b"user untracked\n")
+        self.assertEqual((self.tree / "ignored-user.txt").read_bytes(), b"user ignored\n")
+
+    def assert_no_scratch(self) -> None:
+        """Require every temporary directory and linked worktree entry to be gone."""
+        for path in self.scratch_paths[:2]:
+            self.assertFalse(path.exists(), str(path))
+        entries = run_git(self.tree, "worktree", "list", "--porcelain", preserve_config=True)
+        self.assertEqual(entries.count("worktree "), 1, entries)
+
     def run_cli(
-        self, commit: str, command: list[str], *, timeout: str | None = None
+        self,
+        commit: str,
+        command: list[str],
+        *,
+        timeout: str | None = None,
+        expect_scratch: bool = True,
+        head_may_move: bool = False,
     ) -> tuple[int, str, str]:
-        """Invoke revert_proof.main with the fixture tree, commit, record path and command."""
-        argv = [
-            "--tree",
-            str(self.tree),
-            "--commit",
-            commit,
-            "--record",
-            str(self.record_path),
-        ]
+        """Run the CLI and require caller preservation and scratch cleanup on every outcome."""
+        self.write("user.txt", "user untracked\n")
+        self.write("ignored-user.txt", "user ignored\n")
+        before = self.caller_snapshot()
+        self.scratch_paths: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def capture_directory(*args: object, **kwargs: object) -> str:
+            """Record fresh private scratch directories without replacing their creation."""
+            directory = real_mkdtemp(*args, **kwargs)
+            path = Path(directory)
+            self.scratch_paths.append(path)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+            self.assertFalse(path.is_relative_to(self.tree))
+            return directory
+
+        argv = ["--tree", str(self.tree), "--commit", commit, "--record", str(self.record_path)]
         if timeout is not None:
             argv.extend(["--timeout", timeout])
         if command:
             argv.extend(["--", *command])
-        return capture_main(revert_proof.main, *argv)
+        try:
+            with unittest.mock.patch.object(tempfile, "mkdtemp", side_effect=capture_directory):
+                return capture_main(revert_proof.main, *argv)
+        finally:
+            self.assert_caller_unchanged(before, head_may_move)
+            self.assert_no_scratch()
+            self.assertEqual(len(self.scratch_paths), int(expect_scratch))
 
     def assert_clean_tree(self, expected_source: str = FIXED_SOURCE) -> None:
         """Assert tracked git status is empty and the source file holds expected_source."""
@@ -79,7 +129,7 @@ class RevertProofTest(unittest.TestCase):
             (self.tree / "libavfilter/vf_x.c").read_text(encoding="utf-8"), expected_source
         )
 
-    def test_accept_fix_commit_fails_when_reverted_and_restores_tree(self) -> None:
+    def test_accept_fix_commit_fails_when_reverted_in_scratch(self) -> None:
         """A fix commit whose test fails after reverse apply records nonzero rc_reverted."""
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         self.write(
@@ -136,7 +186,7 @@ class RevertProofTest(unittest.TestCase):
         fix_sha = self.commit("avfilter/vf_x: fix return value")
         self.write("libavfilter/vf_x.c", CONFLICT_SOURCE)
 
-        rc, _, err = self.run_cli(fix_sha, [sys.executable, "-c", "pass"])
+        rc, _, err = self.run_cli(fix_sha, [sys.executable, "-c", "pass"], expect_scratch=False)
         self.assertEqual(rc, 2)
         self.assertIn("uncommitted changes to tracked files", err)
         self.assertFalse(self.record_path.exists())
@@ -147,7 +197,7 @@ class RevertProofTest(unittest.TestCase):
         other_sha = self.commit("avfilter/vf_x: fix on side branch")
         run_git(self.tree, "reset", "--hard", self.base, preserve_config=True)
 
-        rc, _, err = self.run_cli(other_sha, [sys.executable, "-c", "pass"])
+        rc, _, err = self.run_cli(other_sha, [sys.executable, "-c", "pass"], expect_scratch=False)
         self.assertEqual(rc, 2)
         self.assertIn("not an ancestor of HEAD", err)
         self.assertFalse(self.record_path.exists())
@@ -157,7 +207,7 @@ class RevertProofTest(unittest.TestCase):
         self.write("tests/ref/fate/filter-x", "0\n")
         doc_sha = self.commit("tests/fate: add filter-x ref")
 
-        rc, _, err = self.run_cli(doc_sha, [sys.executable, "-c", "pass"])
+        rc, _, err = self.run_cli(doc_sha, [sys.executable, "-c", "pass"], expect_scratch=False)
         self.assertEqual(rc, 2)
         self.assertIn("changes no source path", err)
         self.assertFalse(self.record_path.exists())
@@ -167,7 +217,7 @@ class RevertProofTest(unittest.TestCase):
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         fix_sha = self.commit("avfilter/vf_x: fix return value")
 
-        rc, _, err = self.run_cli(fix_sha, [])
+        rc, _, err = self.run_cli(fix_sha, [], expect_scratch=False)
         self.assertEqual(rc, 2)
         self.assertIn("test command is empty", err)
         self.assertFalse(self.record_path.exists())
@@ -184,8 +234,8 @@ class RevertProofTest(unittest.TestCase):
         self.assertFalse(self.record_path.exists())
         self.assert_clean_tree(FIXED_SOURCE)
 
-    def test_refuse_reverse_apply_conflict_restores_tree(self) -> None:
-        """A reverse apply that conflicts exits 4, restores the tree and writes no record."""
+    def test_refuse_reverse_apply_conflict_removes_scratch(self) -> None:
+        """A conflicting reverse apply exits 4, removes scratch and preserves caller files."""
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         fix_sha = self.commit("avfilter/vf_x: fix return value")
         self.write("libavfilter/vf_x.c", CONFLICT_SOURCE)
@@ -198,7 +248,7 @@ class RevertProofTest(unittest.TestCase):
         self.assertFalse(self.record_path.exists())
         self.assert_clean_tree(CONFLICT_SOURCE)
 
-    def test_boundary_timeout_records_timeout_and_restores_tree(self) -> None:
+    def test_boundary_timeout_records_timeout_and_removes_scratch(self) -> None:
         """A test sleeping past a 1 second timeout on the reverted tree records timeout."""
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         fix_sha = self.commit("avfilter/vf_x: fix hang")
@@ -224,184 +274,15 @@ class RevertProofTest(unittest.TestCase):
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         fix_sha = self.commit("avfilter/vf_x: fix return value")
 
-        rc, _, err = self.run_cli(fix_sha, [sys.executable, "-c", "pass"], timeout="7201")
+        rc, _, err = self.run_cli(
+            fix_sha, [sys.executable, "-c", "pass"], timeout="7201", expect_scratch=False
+        )
         self.assertEqual(rc, 2)
         self.assertIn("7200", err)
         self.assertFalse(self.record_path.exists())
 
-    def test_restore_failure_exits_five_and_names_tree(self) -> None:
-        """A failed restore check exits 5 with the tree path named and writes no record."""
-        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
-        fix_sha = self.commit("avfilter/vf_x: fix return value")
-        real_run = upstream_lint._run
-
-        def dirty_on_reset(
-            argv: list[str],
-            cwd: Path,
-            data: str | None = None,
-            timeout: float = 60,
-            *,
-            allow_any_executable: bool = False,
-        ) -> upstream_lint.RunResult:
-            """Simulate a failed git reset so tracked status remains dirty."""
-            if argv[:3] == ["git", "reset", "--hard"]:
-                return upstream_lint.RunResult(tuple(argv), 1, "reset failed\n")
-            return real_run(argv, cwd, data, timeout, allow_any_executable=allow_any_executable)
-
-        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=dirty_on_reset):
-            rc, _, err = self.run_cli(fix_sha, [sys.executable, "-c", "pass"])
-        run_git(self.tree, "reset", "--hard", "HEAD", preserve_config=True)
-        self.assertEqual(rc, 5)
-        self.assertIn(str(self.tree), err)
-        self.assertFalse(self.record_path.exists())
-
-    def test_keyboard_interrupt_during_reverted_run_restores_tree(self) -> None:
-        """A KeyboardInterrupt during run 2 still restores the work tree to HEAD."""
-        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
-        fix_sha = self.commit("avfilter/vf_x: fix return value")
-        calls = 0
-
-        def interrupt_on_second_run(command: list[str], tree: Path, timeout: float) -> int | str:
-            """Pass at HEAD on call 1 and raise KeyboardInterrupt on call 2."""
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise KeyboardInterrupt
-            return 0
-
-        with (
-            unittest.mock.patch.object(
-                revert_proof, "run_test_command", side_effect=interrupt_on_second_run
-            ),
-            self.assertRaises(KeyboardInterrupt),
-        ):
-            self.run_cli(fix_sha, [sys.executable, "-c", "pass"])
-        self.assert_clean_tree(FIXED_SOURCE)
-        self.assertFalse(self.record_path.exists())
-
-    def test_head_failure_and_timeout_restore_edited_tracked_file(self) -> None:
-        """A HEAD test run that edits a tracked file and fails or times out restores the tree."""
-        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
-        fix_sha = self.commit("avfilter/vf_x: fix return value")
-        fail_cmd = [
-            sys.executable,
-            "-c",
-            "from pathlib import Path; import sys\n"
-            "Path('libavfilter/vf_x.c').write_text('dirty\\n', encoding='utf-8')\n"
-            "sys.exit(1)\n",
-        ]
-        rc, _, err = self.run_cli(fix_sha, fail_cmd)
-        self.assertEqual(rc, 3)
-        self.assertIn("test fails at head", err)
-        self.assertFalse(self.record_path.exists())
-        self.assert_clean_tree(FIXED_SOURCE)
-
-        timeout_cmd = [
-            sys.executable,
-            "-c",
-            "from pathlib import Path; import time\n"
-            "Path('libavfilter/vf_x.c').write_text('dirty timeout\\n', encoding='utf-8')\n"
-            "time.sleep(5)\n",
-        ]
-        rc, _, err = self.run_cli(fix_sha, timeout_cmd, timeout="0.2")
-        self.assertEqual(rc, 3)
-        self.assertIn("rc=timeout", err)
-        self.assertFalse(self.record_path.exists())
-        self.assert_clean_tree(FIXED_SOURCE)
-
-    def test_head_failure_with_restore_failure_exits_five(self) -> None:
-        """A failed restore after a failing HEAD test run exits with restore status 5."""
-        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
-        fix_sha = self.commit("avfilter/vf_x: fix return value")
-        real_run = upstream_lint._run
-
-        def fail_reset(
-            argv: list[str],
-            cwd: Path,
-            data: str | None = None,
-            timeout: float = 60,
-            *,
-            allow_any_executable: bool = False,
-        ) -> upstream_lint.RunResult:
-            """Simulate a failed git reset after a failing HEAD test run."""
-            if argv[:3] == ["git", "reset", "--hard"]:
-                return upstream_lint.RunResult(tuple(argv), 1, "reset failed\n")
-            return real_run(argv, cwd, data, timeout, allow_any_executable=allow_any_executable)
-
-        cmd = [sys.executable, "-c", "import sys; sys.exit(1)"]
-        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fail_reset):
-            rc, _, err = self.run_cli(fix_sha, cmd)
-        self.assertEqual(rc, 5)
-        self.assertIn(str(self.tree), err)
-        self.assertFalse(self.record_path.exists())
-
-    def test_refuse_head_run_that_modifies_tracked_file_and_exits_zero(self) -> None:
-        """A HEAD test run that edits a tracked file and exits 0 is refused and restored."""
-        self.write("libavfilter/other.c", BASE_SOURCE)
-        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
-        fix_sha = self.commit("avfilter/vf_x: fix return value")
-        cmd = [
-            sys.executable,
-            "-c",
-            "from pathlib import Path; import sys\n"
-            "Path('libavfilter/other.c').write_text('tampered\\n', encoding='utf-8')\n"
-            "text = Path('libavfilter/vf_x.c').read_text(encoding='utf-8')\n"
-            "sys.exit(0 if 'return 2;' in text else 1)\n",
-        ]
-
-        rc, _, err = self.run_cli(fix_sha, cmd)
-        self.assertEqual(rc, 3)
-        self.assertIn("modified tracked files at head", err)
-        self.assertFalse(self.record_path.exists())
-        self.assert_clean_tree(FIXED_SOURCE)
-        self.assertEqual(
-            (self.tree / "libavfilter/other.c").read_text(encoding="utf-8"), BASE_SOURCE
-        )
-
-    def test_refuse_moved_head_restores_captured_tree_without_moving_branch(self) -> None:
-        """A test that moves HEAD exits 5, restores the captured tree and leaves the branch."""
-        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
-        fix_sha = self.commit("avfilter/vf_x: fix return value")
-        script = (
-            "from pathlib import Path\n"
-            "import subprocess, sys\n"
-            "Path('libavfilter/vf_x.c').write_text('moved tree\\n', encoding='utf-8')\n"
-            "subprocess.run(['git', 'add', 'libavfilter/vf_x.c'], check=True)\n"
-            "subprocess.run([\n"
-            "    'git', '-c', 'user.name=Test', '-c', 'user.email=test@invalid',\n"
-            "    '-c', 'commit.gpgsign=false', 'commit', '-qm', 'moved head'\n"
-            "], check=True)\n"
-            "sys.exit(0)\n"
-        )
-
-        rc, _, err = self.run_cli(fix_sha, [sys.executable, "-c", script])
-        self.assertEqual(rc, 5)
-        self.assertIn("HEAD moved", err)
-        self.assertFalse(self.record_path.exists())
-        moved_head = run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
-        self.assertNotEqual(moved_head, fix_sha)
-        self.assertEqual(
-            (self.tree / "libavfilter/vf_x.c").read_text(encoding="utf-8"), FIXED_SOURCE
-        )
-
-    def test_refuse_preexisting_untracked_file_at_reverse_apply_path(self) -> None:
-        """An untracked file at a path reverse-apply would create is refused and preserved."""
-        self.write("libavfilter/old.c", BASE_SOURCE)
-        self.commit("avfilter/old: add legacy file")
-        run_git(self.tree, "rm", "-q", "libavfilter/old.c", preserve_config=True)
-        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
-        fix_sha = self.commit("avfilter/vf_x: fix return value and drop old.c")
-        untracked = self.write("libavfilter/old.c", "user untracked content\n")
-
-        rc, _, err = self.run_cli(fix_sha, [sys.executable, "-c", "pass"])
-        self.assertEqual(rc, 2)
-        self.assertIn("libavfilter/old.c", err)
-        self.assertFalse(self.record_path.exists())
-        self.assertTrue(untracked.is_file())
-        self.assertEqual(untracked.read_text(encoding="utf-8"), "user untracked content\n")
-
-    def test_keyboard_interrupt_reaps_real_child_process_group_and_restores_tree(self) -> None:
-        """An interrupt during a real child command kills its process group and restores tree."""
+    def test_keyboard_interrupt_reaps_real_child_process_group_and_removes_scratch(self) -> None:
+        """An interrupt kills the real child process group and removes its scratch checkout."""
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         fix_sha = self.commit("avfilter/vf_x: fix return value")
         pid_file = self.root / "pids.txt"
@@ -425,9 +306,9 @@ class RevertProofTest(unittest.TestCase):
                 self.run_cli(fix_sha, [sys.executable, "-c", script], timeout="3")
         finally:
             signal.signal(signal.SIGINT, previous)
-        pids = [int(line) for line in pid_file.read_text(encoding="utf-8").splitlines() if line]
+        pids = [int(line) for line in pid_file.read_text(encoding="utf-8").splitlines()[:2] if line]
         self.assertEqual(len(pids), 2)
-        for pid in pids:
+        for pid in pids[:2]:
             for _ in range(25):
                 try:
                     os.kill(pid, 0)
@@ -442,6 +323,333 @@ class RevertProofTest(unittest.TestCase):
                     os.kill(pid, signal.SIGKILL)
         self.assert_clean_tree(FIXED_SOURCE)
         self.assertFalse(self.record_path.exists())
+
+    def make_fix(self) -> str:
+        """Commit a source fix without adding caller-only fixture files."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        return self.commit("avfilter/vf_x: fix return value")
+
+    def test_scratch_staging_cannot_delete_untracked_caller_file(self) -> None:
+        """Staging a user-named file in the scratch index cannot delete caller data."""
+        fix = self.make_fix()
+        script = (
+            "from pathlib import Path; import subprocess\n"
+            "Path('user.txt').write_text('scratch copy\\n', encoding='utf-8')\n"
+            "subprocess.run(['git', 'add', 'user.txt'], check=True)\n"
+        )
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 3, err)
+        self.assertFalse(self.record_path.exists())
+
+    def test_refuse_staged_new_file_as_dirty(self) -> None:
+        """A staged new caller file is refused without changing its index or bytes."""
+        fix = self.make_fix()
+        self.write("staged.txt", "staged user data\n")
+        run_git(self.tree, "add", "staged.txt", preserve_config=True)
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("proof is about the commit", err)
+        self.assertEqual((self.tree / "staged.txt").read_bytes(), b"staged user data\n")
+
+    def test_hidden_caller_content_is_not_used_as_committed_source(self) -> None:
+        """Caller visibility flags cannot substitute hidden edits for committed source."""
+        fix = self.make_fix()
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag):
+                run_git(self.tree, "update-index", flag, "libavfilter/vf_x.c", preserve_config=True)
+                self.write("libavfilter/vf_x.c", CONFLICT_SOURCE)
+                rc, _, err = self.run_cli(
+                    fix,
+                    [
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; import sys; "
+                        "text = Path('libavfilter/vf_x.c').read_text(encoding='utf-8'); "
+                        "sys.exit(0 if 'return 2;' in text else 1)",
+                    ],
+                )
+                self.assertEqual(rc, 0, err)
+                payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+                self.assertEqual((payload["rc_head"], payload["rc_reverted"]), (0, 1))
+                self.assertEqual(
+                    (self.tree / "libavfilter/vf_x.c").read_bytes(), CONFLICT_SOURCE.encode()
+                )
+                self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+                run_git(
+                    self.tree,
+                    "update-index",
+                    "--no-assume-unchanged",
+                    "--no-skip-worktree",
+                    "libavfilter/vf_x.c",
+                    preserve_config=True,
+                )
+
+    def test_untracked_reverse_apply_target_in_caller_is_irrelevant(self) -> None:
+        """A deleted source path is recreated only in scratch despite caller collisions."""
+        self.write("libavfilter/old.c", BASE_SOURCE)
+        self.commit("avfilter/old: add legacy file")
+        run_git(self.tree, "rm", "-q", "libavfilter/old.c", preserve_config=True)
+        fix = self.make_fix()
+        target = self.write("libavfilter/old.c", "user old source\n")
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(target.read_bytes(), b"user old source\n")
+        payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["reverted_paths"], ["libavfilter/old.c", "libavfilter/vf_x.c"])
+
+    def test_keyboard_interrupt_in_either_run_removes_scratch(self) -> None:
+        """Either command interrupt removes scratch and preserves caller user files."""
+        fix = self.make_fix()
+        for results in ((KeyboardInterrupt(),), (0, KeyboardInterrupt())):
+            with self.subTest(run=len(results)):
+                with (
+                    unittest.mock.patch.object(
+                        revert_proof, "run_test_command", side_effect=results
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self.run_cli(fix, [sys.executable, "-c", "pass"])
+                self.assertFalse(self.record_path.exists())
+
+    def test_interrupt_during_reverse_apply_removes_created_scratch_paths(self) -> None:
+        """An interrupt after reverse apply recreates a source only in removed scratch."""
+        self.write("libavfilter/old.c", BASE_SOURCE)
+        self.commit("avfilter/old: add legacy file")
+        run_git(self.tree, "rm", "-q", "libavfilter/old.c", preserve_config=True)
+        fix = self.make_fix()
+        real_run = upstream_lint._run
+
+        def interrupt_apply(argv: list[str], cwd: Path, *args: object, **kwargs: object):
+            """Apply the actual patch before raising an interrupt at the return boundary."""
+            result = real_run(argv, cwd, *args, **kwargs)
+            if argv[:3] == ["git", "apply", "-R"]:
+                self.assertEqual(result.returncode, 0)
+                self.assertTrue((cwd / "libavfilter/old.c").exists())
+                raise KeyboardInterrupt
+            return result
+
+        with (
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=interrupt_apply),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertFalse((self.tree / "libavfilter/old.c").exists())
+        self.assertFalse(self.record_path.exists())
+
+    def test_removal_failure_and_spawn_error_exit_five_with_scratch_path(self) -> None:
+        """Nonzero removal and cleanup spawn errors both exit 5 and name scratch."""
+        fix = self.make_fix()
+        real_run = upstream_lint._run
+        for failure in ("returncode", "spawn"):
+            with self.subTest(failure=failure):
+
+                def fail_remove(
+                    argv: list[str],
+                    cwd: Path,
+                    *args: object,
+                    failure_kind: str = failure,
+                    **kwargs: object,
+                ):
+                    """Fail only scratch worktree removal while permitting prune to run."""
+                    if argv[:3] == ["git", "worktree", "remove"]:
+                        if failure_kind == "spawn":
+                            raise OSError("planted cleanup spawn failure")
+                        return upstream_lint.RunResult(tuple(argv), 1, "planted removal failure")
+                    return real_run(argv, cwd, *args, **kwargs)
+
+                with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fail_remove):
+                    rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"])
+                self.assertEqual(rc, 5, err)
+                self.assertIn(str(self.scratch_paths[0] / "tree"), err)
+                self.assertIn("scratch removal failed", err)
+                self.assertFalse(self.record_path.exists())
+
+    def test_failed_scratch_creation_still_cleans_partial_checkout(self) -> None:
+        """A creation failure after Git registers scratch still removes its entry."""
+        fix = self.make_fix()
+        real_run = upstream_lint._run
+
+        def fail_after_add(argv: list[str], cwd: Path, *args: object, **kwargs: object):
+            """Create the real worktree then report a planted creation failure."""
+            result = real_run(argv, cwd, *args, **kwargs)
+            if argv[:3] == ["git", "worktree", "add"]:
+                self.assertEqual(result.returncode, 0)
+                return upstream_lint.RunResult(tuple(argv), 1, "planted checkout failure")
+            return result
+
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fail_after_add):
+            rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("planted checkout failure", err)
+        self.assertFalse(self.record_path.exists())
+
+    def test_moved_caller_head_exits_three_without_record(self) -> None:
+        """Moving the caller branch during either run refuses proof with exit 3."""
+        fix = self.make_fix()
+        real_command = revert_proof.run_test_command
+        for phase in (1, 2):
+            run_git(self.tree, "update-ref", "HEAD", fix, preserve_config=True)
+            calls = 0
+
+            def move_caller(
+                command: list[str], tree: Path, timeout: float, at_phase: int = phase
+            ) -> int | str:
+                """Move only the caller ref at the selected command boundary."""
+                nonlocal calls
+                calls += 1
+                if calls == at_phase:
+                    run_git(self.tree, "update-ref", "HEAD", self.base, preserve_config=True)
+                return real_command(command, tree, timeout)
+
+            with unittest.mock.patch.object(
+                revert_proof, "run_test_command", side_effect=move_caller
+            ):
+                rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"], head_may_move=True)
+            self.assertEqual(rc, 3, err)
+            self.assertIn("HEAD moved", err)
+            self.assertFalse(self.record_path.exists())
+            self.assertEqual(
+                run_git(self.tree, "rev-parse", "HEAD", preserve_config=True), self.base
+            )
+
+    def test_old_record_is_removed_before_failing_head_run(self) -> None:
+        """A failed HEAD command cannot leave a previously successful record usable."""
+        fix = self.make_fix()
+        self.record_path.write_text("old proof\n", encoding="utf-8")
+        script = (
+            "from pathlib import Path; "
+            f"assert not Path({str(self.record_path)!r}).exists(); raise SystemExit(1)"
+        )
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 3, err)
+        self.assertFalse(self.record_path.exists())
+
+    def test_unremovable_old_record_refuses_before_runs(self) -> None:
+        """An unremovable record path refuses with exit 2 before scratch creation."""
+        fix = self.make_fix()
+        self.record_path.mkdir()
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("record", err)
+        self.assertTrue(self.record_path.is_dir())
+
+    def test_caller_only_build_file_fails_clean_head_run(self) -> None:
+        """A command requiring caller-only ignored build data fails at clean HEAD."""
+        fix = self.make_fix()
+        script = "from pathlib import Path; Path('ignored-user.txt').read_bytes()"
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 3, err)
+        self.assertIn("test fails at head", err)
+        self.assertFalse(self.record_path.exists())
+
+    def test_command_pwd_matches_detached_scratch_checkout(self) -> None:
+        """Command PWD names the clean detached scratch checkout on both runs."""
+        fix = self.make_fix()
+        script = (
+            "from pathlib import Path; import os, subprocess\n"
+            "assert os.environ['PWD'] == str(Path.cwd())\n"
+            f"assert Path.cwd() != Path({str(self.tree)!r})\n"
+            "assert not Path('user.txt').exists()\n"
+            "assert subprocess.run(['git', 'symbolic-ref', '-q', 'HEAD']).returncode == 1\n"
+        )
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 0, err)
+        payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual((payload["rc_head"], payload["rc_reverted"]), (0, 0))
+
+    def test_tempdir_inside_caller_uses_external_private_parent(self) -> None:
+        """A caller-contained temporary root cannot place scratch inside the caller."""
+        fix = self.make_fix()
+        with unittest.mock.patch.object(tempfile, "gettempdir", return_value=str(self.tree)):
+            rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.scratch_paths[0].parent, self.root)
+
+    def test_record_path_inside_caller_is_refused_without_touching_it(self) -> None:
+        """An output path inside the caller cannot break the read-only caller contract."""
+        fix = self.make_fix()
+        self.record_path = self.write("old-record.json", "caller record\n")
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("outside the caller", err)
+        self.assertEqual(self.record_path.read_bytes(), b"caller record\n")
+
+    def test_help_explains_moved_head_cleanup_and_clean_checkout_cost(self) -> None:
+        """Help states the changed exit classes and clean-checkout command limitation."""
+        help_text = revert_proof.build_parser().format_help()
+        self.assertIn("exit 3", help_text)
+        self.assertIn("exit 5", help_text)
+        self.assertIn("clean checkout", help_text)
+        self.assertIn("absolute paths", help_text)
+
+    def test_failing_or_timed_out_head_command_only_edits_scratch(self) -> None:
+        """Failed and timed-out HEAD edits leave caller bytes and index untouched."""
+        fix = self.make_fix()
+        for tail in ("raise SystemExit(1)", "import time; time.sleep(5)"):
+            script = (
+                "from pathlib import Path\n"
+                "Path('libavfilter/vf_x.c').write_text('scratch edit\\n', encoding='utf-8')\n"
+                + tail
+            )
+            rc, _, err = self.run_cli(fix, [sys.executable, "-c", script], timeout="0.2")
+            self.assertEqual(rc, 3, err)
+            self.assertIn("test fails at head", err)
+            self.assertFalse(self.record_path.exists())
+            self.assert_clean_tree()
+
+    def test_successful_head_edit_is_refused_before_reverse_apply(self) -> None:
+        """A successful command that edits scratch source cannot prove committed HEAD."""
+        fix = self.make_fix()
+        script = (
+            "from pathlib import Path\n"
+            "Path('libavfilter/vf_x.c').write_text('scratch edit\\n', encoding='utf-8')\n"
+        )
+        rc, _, err = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 3, err)
+        self.assertIn("modified tracked files at head", err)
+        self.assertFalse(self.record_path.exists())
+        self.assert_clean_tree()
+
+    def test_head_failure_cannot_hide_scratch_removal_failure(self) -> None:
+        """Scratch cleanup status 5 takes precedence over a failing HEAD command."""
+        fix = self.make_fix()
+        real_run = upstream_lint._run
+
+        def fail_remove(argv: list[str], cwd: Path, *args: object, **kwargs: object):
+            """Fail only the Git removal step after a real failing HEAD command."""
+            if argv[:3] == ["git", "worktree", "remove"]:
+                return upstream_lint.RunResult(tuple(argv), 1, "planted removal failure")
+            return real_run(argv, cwd, *args, **kwargs)
+
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fail_remove):
+            rc, _, err = self.run_cli(fix, [sys.executable, "-c", "raise SystemExit(1)"])
+        self.assertEqual(rc, 5, err)
+        self.assertIn(str(self.scratch_paths[0] / "tree"), err)
+        self.assertFalse(self.record_path.exists())
+
+    def test_missing_recorded_branch_refuses_even_if_new_head_has_same_commit(self) -> None:
+        """Deleting the recorded branch cannot hide behind a replacement HEAD ref."""
+        fix = self.make_fix()
+        reference = run_git(self.tree, "symbolic-ref", "HEAD", preserve_config=True)
+        real_command = revert_proof.run_test_command
+
+        def replace_branch(command: list[str], tree: Path, timeout: float) -> int | str:
+            """Replace the caller HEAD ref without changing its index or file bytes."""
+            run_git(self.tree, "update-ref", "refs/heads/replacement", fix, preserve_config=True)
+            run_git(
+                self.tree, "symbolic-ref", "HEAD", "refs/heads/replacement", preserve_config=True
+            )
+            run_git(self.tree, "update-ref", "-d", reference, preserve_config=True)
+            return real_command(command, tree, timeout)
+
+        with unittest.mock.patch.object(
+            revert_proof, "run_test_command", side_effect=replace_branch
+        ):
+            rc, _, err = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 3, err)
+        self.assertIn("HEAD moved", err)
+        self.assertFalse(self.record_path.exists())
+        self.assertEqual(run_git(self.tree, "rev-parse", "HEAD", preserve_config=True), fix)
 
 
 if __name__ == "__main__":

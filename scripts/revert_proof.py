@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Measure whether a regression test fails when a fix commit's source paths are reverted."""
+"""Measure whether a regression test fails when a fix commit's source paths are reverted.
+
+Both commands run in a clean checkout of the captured HEAD in a private detached
+scratch worktree, outside the caller tree. The caller tree, index and branch
+are never changed. PWD names the scratch tree. Commands needing untracked or
+ignored caller files (build directories or in-tree virtual environments) fail
+at the HEAD run: exit 3, no record. Commands may use absolute paths to tools
+outside the tree. A dirty caller is refused: this proof is about the commit.
+
+The scratch worktree is forcibly removed, its private temporary directory is
+removed, and Git's worktree list is pruned on success, refusal, timeout or
+interrupt. A moved caller HEAD means exit 3 and no record; scratch removal
+failure means exit 5 and names the scratch path. Input errors mean exit 2;
+a reverse-apply conflict means exit 4. An older record is removed before the
+runs start; record output must be outside the caller tree.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +24,9 @@ import argparse
 import json
 import math
 import shlex
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,15 +48,15 @@ class _PreflightError(ValueError):
 
 
 class _HeadTestError(RuntimeError):
-    """The test command did not exit 0 at HEAD; exits with status 3."""
+    """The HEAD command or caller HEAD check failed; exits with status 3."""
 
 
 class _ReverseApplyError(RuntimeError):
     """The commit's source diff did not reverse-apply cleanly; exits with status 4."""
 
 
-class _RestoreError(RuntimeError):
-    """The work tree could not be restored to HEAD; exits with status 5."""
+class _ScratchRemovalError(RuntimeError):
+    """The scratch worktree could not be removed; exits with status 5."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,20 +73,22 @@ class ProofConfig:
 def git_out(tree: Path, *args: str) -> str:
     """Run a bounded Git command in tree or raise _PreflightError."""
     result = upstream_lint._run(["git", *args], tree, timeout=GIT_TIMEOUT)
-    if result.returncode != 0:
+    if result.returncode != 0 or result.timed_out:
         detail = result.stdout.strip() or f"rc={result.returncode}"
         raise _PreflightError(f"git {shlex.join(args)}: {detail}")
     return result.stdout
 
 
 def tracked_status(tree: Path) -> str:
-    """Return porcelain status output for tracked files only."""
-    return git_out(tree, "status", "--porcelain", "--untracked-files=no")
+    """Read tracked porcelain status without refreshing the caller index."""
+    return git_out(tree, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no")
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for revert_proof.py."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--record", type=Path, required=True)
@@ -103,37 +122,18 @@ def parse_config(argv: list[str] | None) -> ProofConfig:
     )
 
 
-def absent_source_paths(tree: Path, head: str, source_paths: list[str]) -> list[str]:
-    """Return changed source paths of the commit that are absent from head."""
-    present = set(
-        filter(
-            None,
-            git_out(tree, "ls-tree", "--name-only", "-r", "-z", head, "--", *source_paths).split(
-                "\0"
-            ),
-        )
-    )
-    return [path for path in source_paths[: upstream_lint.MAX_PATHS] if path not in present]
-
-
-def check_absent_paths(tree: Path, head: str, source_paths: list[str]) -> list[str]:
-    """Return source paths absent at head after refusing any existing untracked path."""
-    absent = absent_source_paths(tree, head, source_paths)
-    for relpath in absent[: upstream_lint.MAX_PATHS]:
-        target = tree / relpath
-        if target.exists() or target.is_symlink():
-            raise _PreflightError(f"untracked path exists at reverse-apply target: {relpath}")
-    return absent
-
-
-def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str]]:
+def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str], str]:
     """Verify clean tracked tree, commit ancestry and changed source paths."""
     if not tree.is_dir():
         raise _PreflightError(f"work tree not found: {tree}")
     if tracked_status(tree):
-        raise _PreflightError(f"dirty tree: uncommitted changes to tracked files in {tree}")
-    head = git_out(tree, "rev-parse", "--verify", "HEAD^{commit}").strip()
-    head_tree = git_out(tree, "rev-parse", "--verify", "HEAD^{tree}").strip()
+        raise _PreflightError(
+            f"dirty tree: uncommitted changes to tracked files in {tree}; "
+            "the proof is about the commit, not uncommitted work"
+        )
+    head_ref = git_out(tree, "rev-parse", "--symbolic-full-name", "HEAD").strip()
+    head = git_out(tree, "rev-parse", "--verify", f"{head_ref}^{{commit}}").strip()
+    head_tree = git_out(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
     commit = git_out(
         tree, "rev-parse", "--verify", "--end-of-options", f"{raw_commit}^{{commit}}"
     ).strip()
@@ -142,18 +142,31 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str]]
     )
     if ancestor.returncode != 0:
         raise _PreflightError(f"commit {commit} is not an ancestor of HEAD ({head})")
-    names = git_out(tree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit).split(
-        "\0"
+    names = list(
+        filter(
+            None,
+            git_out(
+                tree,
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                "-z",
+                commit,
+            ).split("\0"),
+        )
     )
     if len(names) > upstream_lint.MAX_PATHS:
-        raise _PreflightError(f"commit paths exceed MAX_PATHS={upstream_lint.MAX_PATHS}")
+        raise _PreflightError(
+            f"commit paths exceed MAX_PATHS={upstream_lint.MAX_PATHS}: {len(names)}"
+        )
     source_paths = sorted(
         {path for path in names[: upstream_lint.MAX_PATHS] if path and is_source_path(path)}
     )
     if not source_paths:
         raise _PreflightError(f"commit {commit} changes no source path")
-    check_absent_paths(tree, head, source_paths)
-    return commit, head, head_tree, source_paths
+    return commit, head, head_tree, source_paths, head_ref
 
 
 def run_test_command(command: list[str], tree: Path, timeout: float) -> int | str:
@@ -167,98 +180,65 @@ def run_test_command(command: list[str], tree: Path, timeout: float) -> int | st
     return result.returncode
 
 
-def current_head_and_tree(tree: Path) -> tuple[str | None, str | None]:
-    """Return the current HEAD commit and tree hashes, or None on Git failure."""
-    head_res = upstream_lint._run(
-        ["git", "rev-parse", "--verify", "HEAD^{commit}"], tree, timeout=GIT_TIMEOUT
-    )
-    tree_res = upstream_lint._run(
-        ["git", "rev-parse", "--verify", "HEAD^{tree}"], tree, timeout=GIT_TIMEOUT
-    )
-    cur_head = head_res.stdout.strip() if head_res.returncode == 0 else None
-    cur_tree = tree_res.stdout.strip() if tree_res.returncode == 0 else None
-    return cur_head, cur_tree
-
-
-def tracked_matches_tree(tree: Path, head_tree: str) -> bool:
-    """Return whether tracked files in the index and work tree match head_tree."""
-    status = upstream_lint._run(
-        ["git", "status", "--porcelain", "--untracked-files=no"], tree, timeout=GIT_TIMEOUT
-    )
-    diff = upstream_lint._run(
-        ["git", "diff-index", "--quiet", head_tree, "--"], tree, timeout=GIT_TIMEOUT
-    )
-    return status.returncode == 0 and not status.stdout and diff.returncode == 0
-
-
-def verify_head_run(
-    config: ProofConfig,
-    rc_head: int | str,
-    head: str,
-    head_tree: str,
-    absent: list[str],
-) -> int:
-    """Verify HEAD run exit code and that HEAD and tracked files remain at head_tree."""
-    cur_head, cur_tree = current_head_and_tree(config.tree)
-    if cur_head != head:
-        raise _RestoreError(f"HEAD moved from {head} to {cur_head or '<invalid>'} in {config.tree}")
+def verify_head_run(scratch: Path, rc_head: int | str, head: str) -> int:
+    """Require a passing HEAD command that left the scratch checkout at its commit."""
     if rc_head != 0:
-        raise _HeadTestError(f"test fails at head (rc={rc_head})")
-    if cur_tree != head_tree or not tracked_matches_tree(config.tree, head_tree):
-        raise _HeadTestError(f"test modified tracked files at head in {config.tree}")
-    for relpath in absent[: upstream_lint.MAX_PATHS]:
-        target = config.tree / relpath
-        if target.exists() or target.is_symlink():
-            raise _HeadTestError(f"test created untracked path at reverse-apply target: {relpath}")
+        raise _HeadTestError(f"test fails at head (rc={rc_head}) in clean checkout {scratch}")
+    if git_out(scratch, "rev-parse", "--verify", "HEAD^{commit}").strip() != head:
+        raise _HeadTestError(f"test moved scratch HEAD in {scratch}")
+    if tracked_status(scratch):
+        raise _HeadTestError(f"test modified tracked files at head in {scratch}")
     return 0
 
 
-def restore_tree(
-    tree: Path,
-    created_paths: list[str],
-    head: str | None = None,
-    head_tree: str | None = None,
-) -> None:
-    """Restore tracked files to head_tree and verify HEAD and tracked content match."""
-    for relpath in created_paths[: upstream_lint.MAX_PATHS]:
-        target = tree / relpath
-        if target.is_file() or target.is_symlink():
-            try:
-                target.unlink()
-            except OSError as error:
-                raise _RestoreError(f"failed to restore tree {tree}: {error}") from error
-    cur_head, _ = current_head_and_tree(tree)
-    if head is not None and cur_head != head:
-        if head_tree is not None:
-            upstream_lint._run(
-                ["git", "read-tree", "--reset", "-u", head_tree], tree, timeout=GIT_TIMEOUT
+def scratch_parent(tree: Path) -> Path:
+    """Choose a temporary parent outside the caller even when TMPDIR is inside it."""
+    parent = Path(tempfile.gettempdir()).resolve()
+    return tree.parent if parent.is_relative_to(tree) else parent
+
+
+def cleanup_git(tree: Path, failures: list[str], *args: str) -> None:
+    """Collect a cleanup Git failure without skipping the remaining cleanup steps."""
+    try:
+        result = upstream_lint._run(["git", *args], tree, timeout=GIT_TIMEOUT)
+        if result.returncode != 0 or result.timed_out:
+            failures.append(
+                f"git {shlex.join(args)}: {result.stdout.strip()} (rc={result.returncode})"
             )
-            upstream_lint._run(
-                ["git", "checkout-index", "-f", "-u", "-a"], tree, timeout=GIT_TIMEOUT
-            )
-        raise _RestoreError(f"HEAD moved from {head} to {cur_head or '<invalid>'} in {tree}")
-    target_rev = head or "HEAD"
-    reset = upstream_lint._run(["git", "reset", "--hard", target_rev], tree, timeout=GIT_TIMEOUT)
-    after_head, after_tree = current_head_and_tree(tree)
-    expected_tree = head_tree or after_tree or ""
-    if (
-        reset.returncode != 0
-        or (head is not None and after_head != head)
-        or (head_tree is not None and after_tree != head_tree)
-        or not expected_tree
-        or not tracked_matches_tree(tree, expected_tree)
-    ):
-        raise _RestoreError(f"failed to restore tree {tree}")
+    except (OSError, RuntimeError, KeyboardInterrupt) as error:
+        failures.append(f"git {shlex.join(args)}: {error}")
+
+
+def remove_scratch(tree: Path, scratch: Path) -> None:
+    """Attempt Git removal, directory removal and prune, mapping cleanup failures to 5."""
+    failures: list[str] = []
+    cleanup_git(tree, failures, "worktree", "remove", "--force", str(scratch))
+    try:
+        shutil.rmtree(scratch.parent)
+    except (OSError, KeyboardInterrupt) as error:
+        failures.append(f"temporary directory removal: {error}")
+    cleanup_git(tree, failures, "worktree", "prune", "--expire", "now")
+    if failures:
+        raise _ScratchRemovalError(f"scratch removal failed for {scratch}: {'; '.join(failures)}")
+
+
+def clear_record(config: ProofConfig) -> None:
+    """Refuse caller-contained output and remove any old record before running commands."""
+    path = config.record
+    if path.absolute().is_relative_to(config.tree) or path.resolve().is_relative_to(config.tree):
+        raise _PreflightError(f"--record must be outside the caller tree: {path}")
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        raise _PreflightError(f"cannot remove old record {path}: {error}") from error
 
 
 def measure_reverted(
     config: ProofConfig,
     commit: str,
     source_paths: list[str],
-    absent: list[str],
-    created_paths: list[str],
 ) -> int | str:
-    """Reverse-apply commit source paths, record created files and run the test command."""
+    """Reverse-apply only fix source paths in scratch and run the same test command."""
     patch = git_out(
         config.tree,
         "diff-tree",
@@ -276,34 +256,42 @@ def measure_reverted(
         "--",
         *source_paths,
     )
-    pre_absent = [
-        path
-        for path in absent[: upstream_lint.MAX_PATHS]
-        if not (config.tree / path).exists() and not (config.tree / path).is_symlink()
-    ]
     applied = upstream_lint._run(
         ["git", "apply", "-R", "-"], config.tree, data=patch, timeout=GIT_TIMEOUT
     )
-    for relpath in pre_absent[: upstream_lint.MAX_PATHS]:
-        target = config.tree / relpath
-        if target.exists() or target.is_symlink():
-            created_paths.append(relpath)
-    if applied.returncode != 0:
+    if applied.returncode != 0 or applied.timed_out:
         raise _ReverseApplyError(f"reverse apply failed for {commit}: {applied.stdout.strip()}")
     return run_test_command(config.command, config.tree, config.timeout)
 
 
+def verify_caller_head(tree: Path, head: str, head_ref: str) -> None:
+    """Refuse a moved or missing recorded caller branch or current HEAD with exit 3."""
+    for reference in (head_ref, "HEAD"):
+        result = upstream_lint._run(
+            ["git", "rev-parse", "--verify", f"{reference}^{{commit}}"], tree, timeout=GIT_TIMEOUT
+        )
+        current = result.stdout.strip() if result.returncode == 0 else "<invalid>"
+        if result.timed_out or current != head:
+            raise _HeadTestError(f"HEAD moved from {head} to {current} ({reference}) in {tree}")
+
+
 def run_proof(config: ProofConfig) -> None:
-    """Execute run 1 at HEAD, run 2 with source paths reverted, and write the record."""
-    commit, head, head_tree, source_paths = prepare_tree(config.tree, config.commit)
-    absent = absent_source_paths(config.tree, head, source_paths)
-    created_paths: list[str] = []
+    """Run both measurements in detached scratch, remove it, then publish the record."""
+    commit, head, head_tree, source_paths, head_ref = prepare_tree(config.tree, config.commit)
+    clear_record(config)
+    directory = Path(
+        tempfile.mkdtemp(prefix="ffmpeg-revert-proof-", dir=scratch_parent(config.tree))
+    )
+    scratch = directory / "tree"
+    scratch_config = ProofConfig(scratch, commit, config.record, config.timeout, config.command)
     try:
-        raw_head = run_test_command(config.command, config.tree, config.timeout)
-        rc_head = verify_head_run(config, raw_head, head, head_tree, absent)
-        rc_reverted = measure_reverted(config, commit, source_paths, absent, created_paths)
+        git_out(config.tree, "worktree", "add", "--detach", str(scratch), head)
+        raw_head = run_test_command(config.command, scratch, config.timeout)
+        rc_head = verify_head_run(scratch, raw_head, head)
+        rc_reverted = measure_reverted(scratch_config, commit, source_paths)
     finally:
-        restore_tree(config.tree, created_paths, head, head_tree)
+        remove_scratch(config.tree, scratch)
+    verify_caller_head(config.tree, head, head_ref)
     payload = {
         "commit": commit,
         "head": head,
@@ -321,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run revert_proof CLI and map each failure class to its exit code."""
     try:
         run_proof(parse_config(argv))
-    except _RestoreError as error:
+    except _ScratchRemovalError as error:
         print(f"revert_proof: {error}", file=sys.stderr)
         return 5
     except _ReverseApplyError as error:

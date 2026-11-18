@@ -3422,8 +3422,21 @@ class RunnerTest(unittest.TestCase):
             popen.return_value.__enter__.return_value = process
             result = upstream_lint._run(["git", "--version"], Path.cwd(), timeout=1)
         self.assertEqual(result.returncode, 7)
+        self.assertTrue(result.timed_out)
         self.assertEqual(result.stdout, "finished\n")
         self.assertEqual(process.communicate.call_count, 2)
+
+    def test_completed_command_is_not_timed_out(self) -> None:
+        """An ordinary completed command retains a false timeout marker."""
+        process = unittest.mock.MagicMock()
+        process.communicate.return_value = (b"finished\n", None)
+        process.returncode = 7
+        with unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen:
+            popen.return_value.__enter__.return_value = process
+            result = upstream_lint._run(["git", "--version"], Path.cwd(), timeout=1)
+        self.assertEqual(result.returncode, 7)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(process.communicate.call_count, 1)
 
     def test_timeout_returns_failure(self):
         """A planted slow subprocess is killed and reported with rc 124."""
@@ -4301,6 +4314,102 @@ class RevertProofStepTest(FixtureTest):
             _, output = self.check("--revert-proof", str(record_file))
         self.assertIn("step: revert-proof rc: 1", output)
         self.assertIn("fix commits exceed MAX_CLAIM_COMMITS=1: 2", output)
+
+    def proof_step(self, *records: Path) -> upstream_lint.Step:
+        """Run only the revert-proof consumer against the fixture's committed range."""
+        head = self.git("rev-parse", "HEAD").strip()
+        return upstream_lint._revert_proof(self.root, self.base, head, records)
+
+    def test_step_refuses_commit_scan_overflow_before_classification(self) -> None:
+        """A fix behind the commit scan bound cannot disappear as a zero-fix range."""
+        self.add_fix_commit()
+        self.write("doc/new.txt", "newer neutral commit\n")
+        self.commit("doc: update text")
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("commit scan exceeds MAX_PATHS=1: 2", step.output)
+
+    def test_step_accepts_exact_commit_scan_bound(self) -> None:
+        """Exactly seven commits still prove the fix behind six neutral commits."""
+        commit, _, _ = self.add_fix_commit()
+        for number in range(6):
+            self.write("doc/new.txt", f"neutral update {number}\n")
+            self.commit("doc: update text")
+        head = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record = self.write_record("proof.json", self.valid_record(commit, head, head_tree))
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 7):
+            step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("1 fix commit(s), 1 revert-proof record(s)", step.output)
+
+    def test_step_refuses_path_scan_overflow_before_source_classification(self) -> None:
+        """A source behind seven doc paths cannot hide beyond the path scan bound."""
+        for number in range(7):
+            self.write(f"doc/{number}.txt", "documentation\n")
+        commit, _, _ = self.add_fix_commit()
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 7):
+            step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"{commit}: commit paths exceed MAX_PATHS=7: 9", step.output)
+
+    def test_step_accepts_exact_path_scan_bound(self) -> None:
+        """Exactly seven commit paths include the complete sorted source set."""
+        for number in range(5):
+            self.write(f"doc/{number}.txt", "documentation\n")
+        commit, head, head_tree = self.add_fix_commit()
+        record = self.write_record("proof.json", self.valid_record(commit, head, head_tree))
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 7):
+            step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
+
+    def test_step_refuses_record_head_with_wrong_tree_or_missing_commit(self) -> None:
+        """A plausible head hash must resolve to a commit with the recorded tree."""
+        commit, _, head_tree = self.add_fix_commit()
+        for head, diagnostic in (
+            (self.base, "head commit tree differs"),
+            ("0" * 40, "head does not resolve to a commit"),
+            (head_tree, "head does not resolve to a commit"),
+        ):
+            with self.subTest(head=head):
+                record = self.write_record(
+                    "bad-head.json", self.valid_record(commit, head, head_tree)
+                )
+                step = self.proof_step(record)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn(diagnostic, step.output)
+
+    def test_step_refuses_sorted_but_inexact_reverted_paths(self) -> None:
+        """Sorted source lists still fail when paths are missing, extra or duplicated."""
+        self.write("libavfilter/vf_y.c", SOURCE)
+        commit, head, head_tree = self.add_fix_commit()
+        for paths in (
+            ["libavfilter/vf_x.c"],
+            ["libavfilter/vf_x.c", "libavfilter/vf_y.c", "libavfilter/vf_z.c"],
+            ["libavfilter/vf_x.c", "libavfilter/vf_x.c", "libavfilter/vf_y.c"],
+        ):
+            with self.subTest(paths=paths):
+                record = self.write_record(
+                    "bad-paths.json",
+                    self.valid_record(commit, head, head_tree, reverted_paths=paths),
+                )
+                step = self.proof_step(record)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("reverted_paths differ from fix source paths", step.output)
+
+    def test_step_accepts_complete_sorted_reverted_source_paths(self) -> None:
+        """The full sorted source set accepts with a resolvable matching head commit."""
+        self.write("libavfilter/vf_y.c", SOURCE)
+        commit, head, head_tree = self.add_fix_commit()
+        record = self.write_record(
+            "proof.json",
+            self.valid_record(
+                commit, head, head_tree, reverted_paths=["libavfilter/vf_x.c", "libavfilter/vf_y.c"]
+            ),
+        )
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
 
 
 if __name__ == "__main__":
