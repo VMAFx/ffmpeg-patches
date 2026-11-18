@@ -35,7 +35,18 @@ BODY = "new body\nline two\n"
 NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset(
-    {"close", "comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap", "reply"}
+    {
+        "close",
+        "comment",
+        "edit-body",
+        "issue",
+        "pr",
+        "push",
+        "fairy-reviews",
+        "overlap",
+        "reply",
+        "landed",
+    }
 )
 
 
@@ -156,7 +167,9 @@ def copy_sweep_validator(scripts: Path) -> None:
     shutil.copyfile(review_classes.CLASS_FILE, config / review_classes.CLASS_FILE.name)
 
 
-def advance_upstream(tmp: Path, upstream: Path, path: str, text: str) -> str:
+def advance_upstream(
+    tmp: Path, upstream: Path, path: str, text: str, *, author: str = "Test"
+) -> str:
     """Clone upstream under tmp, commit text at path on master, and push."""
 
     work = Path(tempfile.mkdtemp(prefix="upstream-work-", dir=tmp))
@@ -168,7 +181,7 @@ def advance_upstream(tmp: Path, upstream: Path, path: str, text: str) -> str:
     git(
         work,
         "-c",
-        "user.name=Test",
+        f"user.name={author}",
         "-c",
         "user.email=test@example.invalid",
         "-c",
@@ -736,6 +749,88 @@ class RunCommandTest(ForgejoTest):
         with self.assertRaises(ValueError):
             self.run_command(stub, "unknown")
         self.assertEqual(stub.requests, [])
+
+
+class LandedTest(ForgejoTest):
+    """Check landed ranges against a real local upstream without outbound writes."""
+
+    def landed(
+        self, *, env_updates: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Check the topic and require cleanup without any API request."""
+        stub = Stub()
+        result = self.run_command(stub, "landed", "topic", env_updates=env_updates)
+        self.assertEqual(stub.requests, [])
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+        return result
+
+    def test_identical_patch_under_another_author_is_landed(self) -> None:
+        """An identical patch under another author names the matching base commit."""
+        base = advance_upstream(
+            self.tmp, self.upstream, OVERLAP_FILE, "topic\n", author="Maintainer"
+        )
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn(base[:12], result.stdout)
+        self.assertIn(git_output(self.repo, "rev-parse", "topic")[:12], result.stdout)
+
+    def test_landed_patch_with_unrelated_base_advance(self) -> None:
+        """A later base change in another file does not hide a landed patch."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        advance_upstream(self.tmp, self.upstream, "other.txt", "later\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn(base[:12], result.stdout)
+
+    def test_different_conflicting_patch_is_not_landed(self) -> None:
+        """A conflicting change with a different stable patch ID remains unlanded."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "different\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "not landed\n")
+
+    def test_unrelated_base_advance_is_not_landed(self) -> None:
+        """An unrelated base commit cannot match the topic patch."""
+        advance_upstream(self.tmp, self.upstream, "other.txt", "other\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "not landed\n")
+
+    def test_partially_landed_two_commit_range_is_not_landed(self) -> None:
+        """A two-commit range remains unlanded when only its first patch matches."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        (self.repo / "second.txt").write_text("second\n", encoding="utf-8")
+        git(self.repo, "add", "second.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "second topic patch",
+        )
+        result = self.landed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "not landed\n")
+
+    def test_unfetchable_base_fails_closed(self) -> None:
+        """An unreachable local base exits one without claiming not landed."""
+        result = self.landed(env_updates={"FFMPEG_FORGEJO_GIT": str(self.tmp / "missing.git")})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot fetch", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_matching_patch_remains_landed_after_conflicting_base_edit(self) -> None:
+        """Stable patch IDs prove landing even when later base edits conflict."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "later base edit\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn(base[:12], result.stdout)
 
 
 class FixtureCleanupTest(unittest.TestCase):
@@ -1772,11 +1867,12 @@ class TestClaimHeadTest(ForgejoTest):
     def comment(
         self, stub: Stub, *args: str, env_updates: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        """Run a comment command with the shared issue and body arguments."""
+        """Use a landing note to isolate claim checks from synthetic head Git history."""
 
         return self.run_command(
             stub,
             "comment",
+            "--landed-note",
             *args,
             "1",
             str(self.tmp / "body.md"),
@@ -1790,11 +1886,12 @@ class TestClaimHeadTest(ForgejoTest):
         path_first: Path | None = None,
         env_updates: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run a tested-head comment with the shared issue and body arguments."""
+        """Use a tested landing note to isolate claim checks from synthetic Git history."""
 
         return self.run_command(
             stub,
             "comment",
+            "--landed-note",
             "--tested-head",
             A,
             "--evidence",
@@ -1819,6 +1916,45 @@ class TestClaimHeadTest(ForgejoTest):
         """Return bodies sent by pull-body PATCH requests."""
 
         return self.sent_bodies(stub, "PATCH")
+
+    def test_landed_tested_head_comment_is_refused(self) -> None:
+        """A tested comment on a landed head exits 82 before any POST."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha])
+        result = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            sha,
+            "--evidence",
+            self.evidence(sha),
+            "1",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("already on the live base", result.stderr)
+        self.assertIn(base[:12], result.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_landed_note_comment_is_posted(self) -> None:
+        """The landed-note option permits a tested comment explaining the landing."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha])
+        result = self.run_command(
+            stub,
+            "comment",
+            "--landed-note",
+            "--tested-head",
+            sha,
+            "--evidence",
+            self.evidence(sha),
+            "1",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
 
     def test_own_duplicate_comment_is_refused(self) -> None:
         """A whitespace-equivalent own reply exits 78 without a POST."""
@@ -3723,6 +3859,9 @@ class SweepTest(ForgejoTest):
         """Refuse push when the swept head conflicts with the live upstream base."""
 
         base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        landed = self.run_command(Stub(), "landed", "topic")
+        self.assertEqual(landed.returncode, 0, landed.stderr)
+        self.assertEqual(landed.stdout, "not landed\n")
         result = self.sweep_command("push", "--sweep", str(self.sweep))
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertIn("does not merge cleanly into live master", result.stderr)
@@ -3730,6 +3869,29 @@ class SweepTest(ForgejoTest):
         self.assertIn(OVERLAP_FILE, result.stderr)
         self.assertFalse((self.tmp / "push-argv.json").exists())
         self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_push_refuses_landed_head_before_sending(self) -> None:
+        """A landed head exits 82 without reaching Git push or API writes."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("already on the live base", result.stderr)
+        self.assertIn(base[:12], result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertFalse(any(method == "POST" for method, _, _ in self.sweep_requests))
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_landed_conflicting_head_precedes_clean_merge_refusal(self) -> None:
+        """Both push and PR report landing before a later base conflict."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "later base edit\n")
+        for command in ("push", "pr"):
+            with self.subTest(command=command):
+                result = self.sweep_command(command, "--sweep", str(self.sweep))
+                self.assertEqual(result.returncode, 82, result.stderr)
+                self.assertIn(base[:12], result.stderr)
+                self.assertFalse((self.tmp / "push-argv.json").exists())
+                self.assertFalse(any(method == "POST" for method, _, _ in self.sweep_requests))
 
     def test_pr_refuses_head_conflicting_with_live_base(self) -> None:
         """Refuse PR creation when the swept head conflicts with the live upstream base."""

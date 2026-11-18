@@ -19,12 +19,17 @@
 #                          exits 3 when Fairy is missing or no human reviewer is requested
 #                          pr/push require a sweep for the local head; every row must be fold, follow-up: <reproducer path> or no-variant: <reason>
 #                          pr/push refuse (exit 73) a swept head that does not merge cleanly into the live $FFMPEG_FORGEJO_BASE fetched from FFMPEG_FORGEJO_GIT
+#                          pr/push first refuse (exit 82) changes already on the live base, naming matching base commits
 #                          pr/push run only as scripts/ffmpeg-forgejo of a Git checkout, directly or through a symlink (exit 74 otherwise)
 #   ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>
 #                          lists every own open pull sharing a file with the branch diff against the fetched base; exit 77 when any, 0 when none, 1 when not proven
+#   ffmpeg-forgejo landed <branch-or-sha>
+#                          exits 82 with matching base commits or "no change left against the base" when landed; otherwise prints "not landed" (exit 0)
+#                          reads at most 256 own commits and 10000 base commits; fetch/Git failure or excess commits exit 1; needs no token
 #   ffmpeg-forgejo issue   <title> <body-file>
-#   ffmpeg-forgejo comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
+#   ffmpeg-forgejo comment [--landed-note] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head;
+#                          with --tested-head, exits 82 when already on the live base; --landed-note permits a note about the landing
 #                          exits 78 when the body equals an own existing comment after whitespace normalization
 #                          with --tested-head, exits 80 when the comment or the live PR body names a base commit other than the live merge base
 #                          the comment posts the body file as read once at start; a head change seen by the base check exits 76
@@ -1106,19 +1111,23 @@ PY
 MERGE_BASE_REF=""
 MERGE_TREE_OUT=""
 MERGE_TREE_MAX_BYTES=1048576
+LANDED_DIR=""
 
-# merge_base_cleanup: remove merge-tree output file and delete live merge-base ref without altering exit status.
+# merge_base_cleanup: remove private state, preserving status unless ref cleanup fails.
 merge_base_cleanup() {
   local save_status=$?
+  if [ -n "$LANDED_DIR" ]; then
+    rm -rf -- "$LANDED_DIR"
+    LANDED_DIR=""
+  fi
   if [ -n "$MERGE_TREE_OUT" ]; then
     rm -f "$MERGE_TREE_OUT"
     MERGE_TREE_OUT=""
   fi
   if [ -n "$MERGE_BASE_REF" ]; then
-    if git rev-parse --quiet --verify "$MERGE_BASE_REF" >/dev/null; then
-      if ! git update-ref -d "$MERGE_BASE_REF"; then
-        printf 'ffmpeg-forgejo: cannot delete %s.\n' "$MERGE_BASE_REF" >&2
-      fi
+    if ! timeout 120 git update-ref -d "$MERGE_BASE_REF"; then
+      printf 'ffmpeg-forgejo: cannot delete %s.\n' "$MERGE_BASE_REF" >&2
+      save_status=1
     fi
     MERGE_BASE_REF=""
   fi
@@ -1128,7 +1137,7 @@ merge_base_cleanup() {
 # merge_info_attributes_neutral: verify repository info/attributes sets no attributes.
 merge_info_attributes_neutral() {
   local attr_path rc
-  if ! attr_path="$(git rev-parse --git-path info/attributes)" || [ -z "$attr_path" ]; then
+  if ! attr_path="$(timeout 120 git rev-parse --git-path info/attributes)" || [ -z "$attr_path" ]; then
     printf 'ffmpeg-forgejo: cannot resolve info/attributes path; merge with the live base not proven.\n' >&2
     return 1
   fi
@@ -1158,9 +1167,9 @@ merge_info_attributes_neutral() {
 
 # merge_settings_neutral: verify local merge config and info/attributes cannot alter merge-tree.
 merge_settings_neutral() {
-  local out rc key
+  local out rc key key_i
   local -a keys=()
-  if out="$(git config --name-only --get-regexp '^merge\.')"; then
+  if out="$(timeout 120 git config --name-only --get-regexp '^merge\.')"; then
     rc=0
   else
     rc=$?
@@ -1172,7 +1181,12 @@ merge_settings_neutral() {
   fi
   if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
     mapfile -t keys <<<"$out"
-    for key in "${keys[@]}"; do
+    if [ "${#keys[@]}" -gt 1000 ]; then
+      printf 'ffmpeg-forgejo: more than 1000 merge settings; merge with the live base not proven.\n' >&2
+      return 1
+    fi
+    for ((key_i = 0; key_i < ${#keys[@]}; key_i++)); do
+      key="${keys[key_i]}"
       case "$(LC_ALL=C; printf '%s' "${key,,}")" in
         merge.conflictstyle|merge.log|merge.branchdesc|merge.stat|merge.ff|merge.verbosity|\
         merge.tool|merge.guitool|merge.autostash|merge.defaulttoupstream|merge.suppressdest|\
@@ -1192,7 +1206,7 @@ merge_settings_neutral() {
 neutral_merge_tree() {
   local ref="$1" sha="$2" empty size
   local -a pipe_status=()
-  if ! empty="$(git hash-object -t tree --stdin </dev/null)" || [ -z "$empty" ]; then
+  if ! empty="$(timeout 120 git hash-object -t tree --stdin </dev/null)" || [ -z "$empty" ]; then
     merge_base_cleanup
     printf 'ffmpeg-forgejo: cannot compute empty tree id; merge with the live base not proven.\n' >&2
     exit 1
@@ -1272,6 +1286,117 @@ require_clean_merge() {
   printf 'ffmpeg-forgejo: merge-tree failed with status %s; merge with the live base not proven.\n' \
     "$rc" >&2
   exit 1
+}
+
+# landed_git ARGS...: run bounded Git without host-local replacement or graft history.
+landed_git() {
+  GIT_GRAFT_FILE=/dev/null timeout 120 git --no-replace-objects "$@"
+}
+
+# landed_commits BASE TIP CAP: print a bounded range, refusing rather than truncating it.
+landed_commits() {
+  local commits cap="$3"
+  local -a rows=()
+  commits="$(landed_git rev-list --max-count="$((cap + 1))" "$1..$2" --)" \
+    || die "cannot list landed-check commits"
+  if [ -n "$commits" ]; then mapfile -t rows <<<"$commits"; fi
+  [ "${#rows[@]}" -le "$cap" ] || die "landed-check range exceeds $cap commits"
+  [ -z "$commits" ] || printf '%s\n' "$commits"
+  return 0
+}
+
+# landed_patch_ids COMMITS: print stable patch IDs with neutral attributes and bounded Git calls.
+landed_patch_ids() {
+  local empty
+  empty="$(landed_git hash-object -t tree --stdin </dev/null)" || die "cannot compute empty tree"
+  GIT_ATTR_NOSYSTEM=1 landed_git -c core.attributesFile=/dev/null --attr-source="$empty" \
+    diff-tree --stdin --root -r -p --no-renames --no-ext-diff --no-textconv --no-color \
+    --src-prefix=a/ --dst-prefix=b/ <"$1" | landed_git patch-id --stable \
+    || die "cannot compute stable patch IDs"
+}
+
+# landed_report SAME-TREE: print all matches, or one not-landed line when any own patch remains.
+landed_report() {
+  python3 -I - "$LANDED_DIR" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+root, same_tree = Path(sys.argv[1]), sys.argv[2] == "1"
+
+def bounded_rows(name, cap):
+    """Read generated rows with an explicit scalar bound."""
+    rows = (root / name).read_text(encoding="ascii").splitlines()
+    if len(rows) > cap:
+        raise ValueError(f"{name} exceeds {cap} rows")
+    return rows
+
+try:
+    own = bounded_rows("own", 256)
+    base_ids = bounded_rows("base.ids", 10000)
+    own_ids = bounded_rows("own.ids", 256)
+    matches = {}
+    for index in range(len(base_ids)):
+        patch, commit = base_ids[index].split()
+        matches.setdefault(patch, commit)
+    patches = {}
+    for index in range(len(own_ids)):
+        patch, commit = own_ids[index].split()
+        patches[commit] = patch
+    found = {}
+    for index in range(len(own)):
+        commit = own[index]
+        found[commit] = matches.get(patches.get(commit))
+    if not same_tree and (not own or not all(found.values())):
+        print("not landed")
+        raise SystemExit(0)
+    for index in range(len(own)):
+        commit = own[index]
+        match = found[commit]
+        detail = match[:12] if match else "no change left against the base"
+        print(f"{commit[:12]}: {detail}")
+    if not own:
+        print("no change left against the base")
+except (OSError, UnicodeError, ValueError) as error:
+    print(f"ffmpeg-forgejo: cannot compare landed patches: {error}", file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(82)
+PY
+}
+
+# check_landed HEAD: prove landed status against a freshly fetched base, cleaning private state on exit.
+check_landed() (
+  local sha ancestor rc tree base_tree same_tree=0
+  MERGE_BASE_REF="refs/ffmpeg-forgejo/landed-base-$$"
+  trap 'merge_base_cleanup || exit $?' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  LANDED_DIR="$(mktemp -d)" || die "cannot create landed-check temporary directory"
+  fetch_base_ref "$MERGE_BASE_REF" \
+    || die "cannot fetch $BASE from $GIT_URL; merge with the live base not proven; landed status not proven"
+  merge_settings_neutral || exit 1
+  sha="$(landed_git rev-parse --verify --end-of-options "$1^{commit}")" || die "cannot resolve landed-check head $1"
+  ancestor="$(landed_git merge-base "$MERGE_BASE_REF" "$sha")" || die "cannot find landed-check merge base"
+  landed_commits "$ancestor" "$sha" 256 >"$LANDED_DIR/own" || exit 1
+  landed_commits "$ancestor" "$MERGE_BASE_REF" 10000 >"$LANDED_DIR/base" || exit 1
+  if neutral_merge_tree "$MERGE_BASE_REF" "$sha"; then rc=0; else rc=$?; fi
+  [ "$rc" -le 1 ] || die "merge-tree failed with status $rc; landed status not proven"
+  if [ "$rc" -eq 0 ]; then
+    read -r tree <"$MERGE_TREE_OUT" || die "cannot read landed-check merge tree"
+    base_tree="$(landed_git rev-parse --verify "$MERGE_BASE_REF^{tree}")" || die "cannot read live base tree"
+    if [ "$tree" = "$base_tree" ]; then same_tree=1; fi
+  fi
+  landed_patch_ids "$LANDED_DIR/own" >"$LANDED_DIR/own.ids" || exit 1
+  landed_patch_ids "$LANDED_DIR/base" >"$LANDED_DIR/base.ids" || exit 1
+  landed_report "$same_tree"
+)
+
+# require_unlanded HEAD: refuse outbound acts on landed heads, retaining the matching base commits.
+require_unlanded() {
+  local report rc
+  if report="$(check_landed "$1")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 82 ]; then
+    printf 'ffmpeg-forgejo: change is already on the live base %s; outbound act refused.\n%s\n' \
+      "$BASE" "$report" >&2
+  fi
+  return "$rc"
 }
 
 # select_promise_pull BRANCH LOGIN: reject malformed rows before selecting an own PR.
@@ -1480,6 +1605,10 @@ require_swept_fork_head() {
 cmd="${1:-}"
 if [ $# -gt 0 ]; then shift; fi
 case "$cmd" in
+  landed)
+    [ $# -eq 1 ] || usage_error 'landed <branch-or-sha>'
+    check_landed "$1"
+    ;;
   whoami)
     login
     ;;
@@ -1553,6 +1682,7 @@ for i in json.load(sys.stdin):
     done
     [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: $usage"
     require_sweep "$sweep" "$1"
+    require_unlanded "$SWEPT_SHA"
     require_clean_merge "$SWEPT_SHA"
     me="$(login)"
     rb="${2:-$1}"
@@ -1582,6 +1712,7 @@ for i in json.load(sys.stdin):
     done
     [ $# -eq 3 ] || usage_error "$usage"
     require_sweep "$sweep" "$1"
+    require_unlanded "$SWEPT_SHA"
     [ -f "$3" ] || die "no body file $3"
     require_forge_text "$3"
     require_clean_merge "$SWEPT_SHA"
@@ -1645,7 +1776,9 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     rm -f "$body"
     ;;
   comment)
-    usage='comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>'
+    usage='comment [--landed-note] (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>'
+    landed_note=0
+    if [ "${1:-}" = "--landed-note" ]; then landed_note=1; shift; fi
     parse_claim_option "$usage" "$@"
     shift "$claim_args"
     [ $# -eq 2 ] || usage_error "$usage"
@@ -1668,6 +1801,9 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
       printf 'ffmpeg-forgejo: tested head %s does not match the head read by the base check.\n' \
         "$tested_head" >&2
       exit 76
+    fi
+    if [ "$claim_mode" = "tested-head" ] && [ "$landed_note" -eq 0 ]; then
+      require_unlanded "$tested_live_head"
     fi
     body="$(mktemp)"
     json_body "body=@$snapshot" >"$body"
