@@ -1948,6 +1948,33 @@ class ReplyTest(ForgejoTest):
             if method == "POST" and "/reviews/" in path and path.endswith("/comments")
         ]
 
+    def test_reply_payload_removal_failure_is_not_retried(self) -> None:
+        """A failed reply payload removal retains its bytes and emits one final diagnostic."""
+
+        control = self.stub()
+        body = str(self.tmp / "body.md")
+        clean = self.reply(control, "85995", body)
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        posts = [
+            control.requests[index][2]
+            for index in range(len(control.requests))
+            if control.requests[index][0] == "POST"
+        ]
+        self.assertEqual(len(posts), 1)
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, posts[0].encode())
+        stub = self.stub()
+        result = self.reply(stub, "85995", body)
+        self.assertTrue(refused.is_file(), "reply payload removal was not attempted")
+        paths = refused.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(paths), 1, "reply payload removal was retried")
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(Path(paths[0]).read_bytes(), posts[0].encode())
+        self.assertEqual(
+            write_request_paths(stub),
+            [("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1/reviews/7/comments")],
+        )
+        self.assertNotIn("replied ", result.stdout)
+
     def test_reply_copies_the_anchor_of_the_answered_comment(self) -> None:
         """Replying to a review comment posts at its file, line, and range."""
 
@@ -2864,9 +2891,10 @@ class TestClaimHeadTest(ForgejoTest):
     def test_edit_body_abbreviated_evidence_same_head_edits(self) -> None:
         """Abbreviated evidence still edits when every read returns the same head."""
 
-        stub = Stub([LIVE, LIVE, LIVE, LIVE], {LIVE: [[label("success")]]})
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head, head, head, head], {head: [[label("success")]]})
         proc = self.edit_body(
-            stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE[:7])
+            stub, "--tested-head", head[:7], "--evidence", self.evidence(head[:7])
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.patches(stub)), 1)
@@ -2920,10 +2948,22 @@ class TestClaimHeadTest(ForgejoTest):
     def test_edit_body_matching_tested_head_is_patched(self) -> None:
         """A matching tested-head prefix authorizes the body PATCH."""
 
-        stub = Stub([A], {A: [[label("success")]]})
-        proc = self.edit_body(stub, "--tested-head", A[:12], "--evidence", self.evidence(A[:12]))
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head], {head: [[label("success")]]})
+        proc = self.edit_body(
+            stub, "--tested-head", head[:12], "--evidence", self.evidence(head[:12])
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.patches(stub), [BODY])
+
+    def test_edit_body_unresolvable_tested_head_is_refused_before_patch(self) -> None:
+        """Matching evidence cannot authorize an edit when the tested head is not a commit."""
+
+        stub = Stub([LIVE], {LIVE: [[label("success")]]})
+        proc = self.edit_body(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"cannot resolve landed-check head {LIVE}", proc.stderr)
+        self.assertEqual(write_request_paths(stub), [])
 
     def test_edit_body_requires_exactly_one_claim_option(self) -> None:
         """Body edits require exactly one claim mode and make no invalid PATCH."""
@@ -5452,8 +5492,31 @@ class TopLevelTrapTest(unittest.TestCase):
             [],
             "top-level EXIT trap expands a function-local name",
         )
-        self.assertEqual(source.count('trap \'rm -f "$reply_snapshot" "$reply_payload"\' EXIT'), 1)
-        self.assertEqual(source.count("trap 'rm -f \"$close_payload\"' EXIT"), 1)
+        # Require both payload traps so deleting them cannot make the safety check vacuous.
+        self.assertIn(
+            'trap \'cleanup_exit "$?" remove_private_files '
+            '"$reply_snapshot" "$reply_payload"\' EXIT',
+            source,
+        )
+        self.assertIn(
+            'trap \'cleanup_exit "$?" remove_private_files "$close_payload"\' EXIT', source
+        )
+
+    def test_wrapped_trap_naming_function_local_is_rejected(self) -> None:
+        """Either payload trap fails the helper safety test when it expands local body."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        names = ("reply_payload", "close_payload")
+        for index in range(len(names)):
+            with self.subTest(name=names[index]):
+                old = f'"${names[index]}"\' EXIT'
+                self.assertIn(old, source, "planted trap site missing")
+                planted = source.replace(old, '"$body"\' EXIT')
+                with (
+                    unittest.mock.patch.object(Path, "read_text", return_value=planted),
+                    self.assertRaisesRegex(AssertionError, "top-level EXIT trap"),
+                ):
+                    self.test_helper_traps_name_no_function_local()
 
     def test_planted_shadowed_trap_is_found(self) -> None:
         """Shadowed top-level EXIT traps in dispatch branches or at column zero are reported."""
@@ -5696,7 +5759,8 @@ class ReplyMutantTest(unittest.TestCase):
             "old_position dropped",
         )
         reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
-        self.assertEqual(reply_branch.count("reply_payload"), 5, "mutation site missing")
+        # Allocation, EXIT trap, payload write, POST, cleanup capture, and binding clear.
+        self.assertEqual(reply_branch.count("reply_payload"), 6, "mutation site missing")
         self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
         assert_mutant_killed(
             self,
@@ -5705,6 +5769,26 @@ class ReplyMutantTest(unittest.TestCase):
             (ReplyTest, "test_moved_head_exit_removes_the_reply_payload"),
             "reply payload trap shadowed by a function local",
         )
+
+    def test_reply_payload_cleanup_mutants_are_caught(self) -> None:
+        """Dropping or reordering the payload clear fails the targeted removal test."""
+
+        source = HELPER.read_text(encoding="utf-8")
+        old = 'cleanup_path="$reply_payload"; reply_payload=""'
+        self.assertEqual(source.count(old), 1, "mutation site missing")
+        mutations = (
+            'cleanup_path="$reply_payload"',
+            'reply_payload=""; cleanup_path="$reply_payload"',
+        )
+        for index in range(len(mutations)):
+            with self.subTest(mutant=mutations[index]):
+                assert_mutant_killed(
+                    self,
+                    source,
+                    (old, mutations[index]),
+                    (ReplyTest, "test_reply_payload_removal_failure_is_not_retried"),
+                    f"reply payload clear mutation: {mutations[index]}",
+                )
 
     def test_reply_snapshot_and_range_mutants_are_caught(self) -> None:
         """Each planted snapshot or range defect fails its targeted reply test case."""
