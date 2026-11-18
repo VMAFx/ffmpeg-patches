@@ -10,16 +10,8 @@
   <!-- README-STANDARD badge block: one group, fixed order (docs/README-STANDARD.md) -->
   <!-- 1 release/version -->
   [![Release](https://img.shields.io/badge/Release-Releases-3b82f6?style=for-the-badge&labelColor=111a35)](https://github.com/VMAFx/ffmpeg-patches/releases)
-  <!-- 2 CI/build -->
-  [![Series](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml)
-  [![Consumers](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml)
-  [![FFmpeg Master](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml)
-  [![Upstream Drift](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml)
-  [![Release](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml/badge.svg)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml)
   <!-- 3 security/scorecard -->
-  [![Scanners](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml)
   [![OpenSSF Scorecard](https://img.shields.io/badge/OpenSSF-Scorecard-06b6d4?style=for-the-badge&labelColor=111a35)](https://scorecard.dev/viewer/?uri=github.com/VMAFx/ffmpeg-patches)
-  [![Codacy](https://app.codacy.com/project/badge/Grade/59284a64ef65425eb779b400aa2b624c)](https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard)
   [![CodeRabbit](https://img.shields.io/badge/Reviews-CodeRabbit-8b5cf6?style=for-the-badge&logo=coderabbit&logoColor=white&labelColor=111a35)](https://coderabbit.ai)
   <!-- 4 standards -->
   [![HISS-21](https://img.shields.io/badge/Standards-HISS--21-06b6d4?style=for-the-badge&logo=nasa&labelColor=111a35)](AGENTS.md)
@@ -43,7 +35,7 @@ are tracked against FFmpeg master ([`series.txt`](series.txt)) and
 feature patches. The name describes the repository's contents: FFmpeg
 patches shared by the VMAFx projects
 ([ADR-0001](docs/adr/0001-shared-fix-series.md)); pronounce it
-“eff-eff-em-peg patches”.
+"eff-eff-em-peg patches".
 
 **[📖 Architectural Decision Records](docs/adr/README.md)** · [ADR-0001: Shared Fix Series](docs/adr/0001-shared-fix-series.md)
 
@@ -373,6 +365,22 @@ Two gaps remain:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding
 standards (HISS-21, NASA JPL Power of 10), and local verification instructions.
+
+Check the Actions pages for
+[Series](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml),
+[Consumers](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml),
+[FFmpeg Master](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml),
+[Upstream Drift](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml),
+[Release](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml),
+[Scanners](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml),
+and the [Codacy dashboard](
+https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard).
 
 ## Support ffmpeg-patches
 
