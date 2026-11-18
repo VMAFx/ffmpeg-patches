@@ -25,11 +25,25 @@ alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
 
-The regression-test step fails when a commit whose subject says fix, fixes or
-fixed changes C, header or assembly sources under lib*/ or fftools/ and no path
+The regression-test step fails when a commit whose subject or body, outside its
+Signed-off-by lines, says fix, fixes or fixed or names a defect (bug,
+regression, misalignment, crash, overflow, overread, leak, wrong, incorrect,
+broken, truncation, past the end, out of bounds, uninitialised, uninitialized,
+use after free, double free, null dereference, null pointer dereference,
+division by zero, divide by zero, undefined behaviour, undefined behavior,
+deadlock, segfault, segmentation fault, memory corruption, heap corruption,
+stack corruption, OOB, also when a line break splits the phrase) changes C,
+header or assembly sources under lib*/ or fftools/ and no path
 under a tests directory changes anywhere in base..head. --no-test-reason TEXT
-waives it and prints the reason; the step does not judge whether a changed test
-covers the fixed path.
+waives it and prints the reason; when test paths do change, each fix commit must
+be reached by name: a changed test path or one of its added lines must contain,
+as a whole word, the stem of a source file the commit changes (a vf_, af_,
+vsrc_, asrc_, avf_, avsrc_, vsink_, asink_ or f_ prefix also stripped) or a
+function name Git prints in one of its source hunk headers. Quoted,
+tab-terminated and binary test paths count, and the range diff forces the a/
+and b/ prefixes whatever diff.noprefix says. The same waiver covers a fix the
+changed tests do not name. A test that names the code without running the fixed
+path is not detected.
 
 The diagnostic-citation step fails a commit whose message names a compiler
 diagnostic flag (-W...) together with workaround wording (workaround, false
@@ -41,20 +55,100 @@ line break, and a flag suffix may contain `#`, uppercase letters, digits, `+`,
 `_`, `=` and `-`.
 
 The claim-scope step fails a commit whose message makes a blanket verification
-claim (passes all tests, all tests pass, fully tested or verified, thoroughly
-tested, no regressions, completely or 100% safe, verified or tested), never
-waivable, and a commit whose message claims several sites (both, all, every or
-each, followed within two words by loops, callers, call sites, branches, paths,
-cases, functions, uses, instances, places, sites or occurrences) while its diff
-changes exactly one hunk in library or fftools sources; --claim-reason TEXT
-waives only the second rule. Signed-off-by lines are ignored; claims worded
-otherwise, and claims that a multi-hunk diff still does not support, are not
-detected.
+claim (passes all tests, all or every test passes, fully or thoroughly tested
+or verified, no regressions or no performance regressions, completely or 100%
+safe, verified or tested), never waivable; a claim directly after not, never,
+cannot, without or an n't contraction, and a safe claim followed by because or
+since, are not claims. It also fails, never waivable, a commit whose message
+claims faster encoding, decoding or transcoding (encoding is faster, faster
+decoding, an encoder speedup, speeds up the encoder, an end-to-end speedup,
+performance or throughput) without an end-to-end figure anywhere in the
+message: an fps or frames/s number, ffmpeg -benchmark, a bench: utime= line,
+speed= followed by a number, or hyperfine. A benchmark of one helper does not
+show that; a claim after not, never, cannot, without, no or an n't contraction
+earlier in its sentence (a decimal point inside a number is not a sentence end)
+is no claim, and speed words other than these, such as time or a bare encoding
+speed, are not detected. It also fails a commit whose message claims several
+sites (both or all followed within two words, line breaks included, by loops,
+callers, call sites, branches, paths, cases, functions, uses, instances,
+places, sites or occurrences; every or each followed the same way by the
+singular or plural of those nouns) while its diff changes exactly one hunk in
+library or fftools sources; renamed files are diffed as renames, a deleted
+source file counts its hunks, and one contiguous hunk counts as one site even
+when it edits two adjacent branches or states an invariant of all callers;
+--claim-reason TEXT waives only that several-sites rule. Signed-off-by lines in
+any letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
+fails with rc 2; claims worded otherwise, and claims that a multi-hunk diff
+still does not support, are not detected.
+
+The doc-terms step fails when base..head adds lines both to library or fftools
+sources and to Texinfo files under doc/, and an added source line shows a
+behaviour whose added description leaves one of its cases out: a test for
+non-RGB input (a comparison against a COLOR_RGB constant, or a negated
+AV_PIX_FMT_FLAG_RGB flag test, in either operand order) while the added
+docs say YUV but never non-RGB, gray or grey, or a colour range comparison
+while the added docs mention range
+or rangein but never unspecified, unknown or untagged. The added source lines
+are read from the head file with comments, string literals and preprocessor
+lines blanked, so a comment that names the behaviour does not count, and
+neither does a macro that tests the flag. --doc-reason TEXT waives it and
+prints the reason. Only these two pairs are checked; any other gap between
+what the code does and what the docs say is not detected.
+
+The doc-wrap step fails an added line of filled prose in a changed doc/*.texi
+file that is shorter than half of both neighbouring prose lines, each at least
+WRAP_MIN_NEIGHBOUR characters, does not end with a sentence mark or @*, and
+leaves room on it for the first word of the next line (a leading inline
+command counts up to its closing brace). Prose is a non-blank line outside
+every block except the filled ones in TEXI_FILLED that starts with text or with
+a TEXI_INLINE command and its brace; block names come from the file's own @end
+lines read outside raw blocks, so lines in an unlisted block are never checked.
+The raw blocks in TEXI_RAW (@verbatim, @ignore, @macro, @rmacro, @linemacro)
+always open, and inside one only a nested opener that texi2any counts there and
+an @end naming the innermost raw block change the open blocks, so an @end line
+shown inside a raw block closes no outer block. --doc-reason TEXT waives it and
+prints the reason.
+
+The test-program step fails when base..head adds a C file directly under a
+lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
+TESTPROGS-$(CONFIG_X) +=) in that library's Makefile at head lists the file's
+stem as a word, which registers a new TESTPROGS program. Continuation
+lines are joined and make comments dropped first, so an OBJS entry or a
+comment that names the stem does not count. Upstream reviewers ask for the
+standard FATE structure instead: an input sample run through ffmpeg or
+ffprobe and compared against a tests/ref reference. --test-program-reason TEXT
+waives it and prints the reason. A program registered in another file or
+through another variable, and a FATE test whose input another custom tool
+builds, are not detected.
+
+The c-rules step runs scripts/semgrep_scan.sh with .semgrep-ffmpeg.yml from
+this repository over added, modified or renamed library and fftools C and
+header sources in base..head, using the FFmpeg checkout at head as the working
+directory, and skips the run when none changed. Results are read through an
+allow-list: exit status 0 or 1, no semgrep_scan: warning line, and a JSON
+output object whose paths.scanned list contains every requested path, whose
+results name requested paths with non-empty rule ids, and whose errors list
+holds only PartialParsing errors. Matches whose line range
+meets a file's rename-aware added lines or deletion positions fail with rc 1,
+untouched matches and PartialParsing errors are reported without failing,
+and any other status, warning, error type or JSON failure gives rc 2.
+--c-rule-reason TEXT waives rc 1 findings and prints the reason, never rc 2.
+
+The docstrings step checks diff-scoped doc-comment coverage across base..head
+in --tree by running the pinned Praetor engine via .config/lefthook/engine.sh
+docstrings check from this repository's root directory, where engine.sh reads
+the workflow pin. Results pass through an allow-list: only exit 0 or 1 whose
+first output line has the exact `Docstring coverage: ...% (... covered,
+counted: ..., covered: ..., threshold: ...%)` form counts as a measured pass
+(rc 0) or finding (rc 1); any other exit status or output, including a timeout
+or an engine.sh refusal, fails with rc 2. --docstring-reason TEXT waives a
+finding and prints the reason, and never waives an rc 2 result.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -103,14 +197,43 @@ GIT_ENVIRONMENT_NAMES = (
     "GIT_WORK_TREE",
 )
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
-DIFF_COMMON = ("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames")
+DIFF_COMMON = (
+    "diff",
+    "--inter-hunk-context=0",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--no-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
+C_RULES_DIFF = (
+    "diff",
+    "--inter-hunk-context=0",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--find-renames",
+    "--diff-filter=AMR",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 MAX_PATHS = 2000
+MAX_CLAIM_COMMITS = 1000
 RUN_TIMEOUT = 1800
+C_RULES_TIMEOUT = 300
+DOCSTRINGS_TIMEOUT = 300
 CLEANUP_TIMEOUT = 30
 REAP_TIMEOUT = 10
+SEMGREP_SCAN = REPO_ROOT / "scripts" / "semgrep_scan.sh"
+SEMGREP_FFMPEG_RULES = REPO_ROOT / ".semgrep-ffmpeg.yml"
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
 CONFIG = ".forgejo/pre-commit/config.yaml"
+ENGINE_SCRIPT = ".config/lefthook/engine.sh"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+HUNK_LENGTHS = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+GIT_QUOTED_ESCAPE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
+GIT_ESCAPE_BYTES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 REFERENCE = re.compile(r"^[^:\n]+?[:-]\d+[:-](.*)$")
 FUNCTION = re.compile(r"^(?:[A-Za-z_]\w*[ *]+)+[A-Za-z_]\w*\([^();{}]*\)\s*\{")
@@ -120,7 +243,19 @@ C_NONCODE = re.compile(
     r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
     re.DOTALL | re.MULTILINE,
 )
-FIX_SUBJECT = re.compile(r"\bfix(es|ed)?\b", re.IGNORECASE)
+FIX_MESSAGE = re.compile(
+    r"\b(?:fix(?:es|ed)?|bugs?|regressions?|misalign(?:s|ed|ment)?|crash(?:es|ed)?"
+    r"|overflow(?:s|ed)?|overreads?|leak(?:s|ed)?|wrong|incorrect(?:ly)?|broken"
+    r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out(?:\s+|\s*-\s*)of(?:\s+|\s*-\s*)bounds"
+    r"|(?<!maybe-)(?<!sometimes-)uninitiali[sz]ed|use(?:\s+|\s*-\s*)after(?:\s+|\s*-\s*)free"
+    r"|double(?:\s+|\s*-\s*)free|null\s+dereferences?|null\s+pointer\s+dereferences?"
+    r"|(?:division|divide)\s+by\s+zero|undefined\s+behaviou?r|deadlock(?:s|ed)?"
+    r"|segfault(?:s|ed)?|segmentation\s+faults?|(?:memory|heap|stack)\s+corruption|oob)\b",
+    re.IGNORECASE,
+)
+LAVFI_PREFIX = re.compile(r"^(?:vf|af|vsrc|asrc|avf|avsrc|vsink|asink|f)_")
+FUNCTION_NAME = re.compile(r"([A-Za-z_]\w*)\s*\(")
+WORD = re.compile(r"[A-Za-z0-9_]+")
 SOURCE_SUFFIXES = (".c", ".h", ".asm", ".S")
 DIAGNOSTIC_FLAG = re.compile(r"(?<![\w-])-W[A-Za-z0-9#][A-Za-z0-9#+=_-]*")
 WORKAROUND_WORDING = re.compile(
@@ -135,16 +270,43 @@ DIAGNOSTIC_CITATION = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 VERIFICATION_CLAIM = re.compile(
-    r"\b(pass(?:es|ed)?\s+all\s+(?:the\s+)?(?:fate\s+)?tests"
-    r"|all\s+(?:the\s+)?(?:fate\s+)?tests\s+pass(?:es|ed)?"
-    r"|fully\s+(?:tested|verified)|thoroughly\s+tested"
-    r"|no\s+regressions?(?!\s+tests?\b)|(?:completely|100%)\s+(?:safe|verified|tested))\b",
+    r"\b(pass(?:es|ed)?\s+all\s+(?:the\s+)?(?:fate\s+|unit\s+)?tests"
+    r"|(?:all|every)\s+(?:the\s+)?(?:fate\s+|unit\s+)?tests?\s+pass(?:es|ed)?"
+    r"|(?:fully|thoroughly)\s+(?:tested|verified)"
+    r"|no\s+(?:performance\s+)?regressions?(?!\s+test(?:s|ing|ed)?\b)"
+    r"|(?:completely|100%)\s+(?:safe|verified|tested))\b",
     re.IGNORECASE,
 )
+NEGATED_CLAIM = re.compile(
+    r"(?:\bnot|\bnever|\bcannot|n't|\bwithout)\s+(?:been\s+|be\s+)?$", re.IGNORECASE
+)
+SAFETY_REASON = re.compile(r"\s+(?:because|since)\b", re.IGNORECASE)
 SCOPE_CLAIM = re.compile(
-    r"\b(?:both|all|every|each)\s+(?:\w+[ -]){0,2}?"
-    r"(?:loops?|callers?|call[ -]sites?|branches|paths|cases"
-    r"|functions|uses|instances|places|sites|occurrences)\b",
+    r"\b(?:(?:both|all)\s+(?:\w+(?:\s+|-)){0,2}?"
+    r"(?:loops?|callers?|call(?:\s+|-)sites?|branches|paths|cases"
+    r"|functions|uses|instances|places|sites|occurrences)"
+    r"|(?:every|each)\s+(?:\w+(?:\s+|-)){0,2}?"
+    r"(?:branch(?:es)?|(?:loop|caller|call(?:\s+|-)site|path|case"
+    r"|function|use|instance|place|site|occurrence)s?))\b",
+    re.IGNORECASE,
+)
+CODING = r"(?:encod|decod|transcod)\w*"
+SPEED_CLAIM = re.compile(
+    rf"\b(?:{CODING}\s+(?:is\s+|runs\s+|gets\s+|becomes\s+)?"
+    r"(?:\d+(?:\.\d+)?\s*(?:x|%|times)\s+)?(?:faster|quicker)"
+    rf"|(?:faster|quicker)\s+{CODING}"
+    rf"|{CODING}\s+speed-?ups?"
+    rf"|speeds?\s+up\s+(?:the\s+)?{CODING}"
+    rf"|end-to-end\s+(?:{CODING}\s+)?(?:speed(?:-?ups?)?|performance|throughput))\b",
+    re.IGNORECASE,
+)
+SPEED_NEGATION = re.compile(
+    r"(?:\bnot|\bnever|\bcannot|\bwithout|\bno|n't)\b(?:[^.;!?]|(?<=\d)\.(?=\d))*$",
+    re.IGNORECASE,
+)
+END_TO_END_MEASURE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:fps|frames/s)\b|(?<![\w-])-benchmark\b|\bbench:\s*utime="
+    r"|\bspeed=\s*\d|\bhyperfine\b",
     re.IGNORECASE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an
@@ -182,6 +344,18 @@ class RunResult:
     args: tuple[str, ...]
     returncode: int
     stdout: str
+
+
+@dataclass(frozen=True)
+class Waivers:
+    """Reasons that waive single upstream checks; a blank reason waives nothing."""
+
+    no_test: str = ""
+    claim: str = ""
+    doc: str = ""
+    test_program: str = ""
+    c_rule: str = ""
+    docstring: str = ""
 
 
 @dataclass
@@ -377,6 +551,16 @@ def _added_lines(patch: str) -> set[int]:
             start, count = int(match[1]), int(match[2] or "1")
             added.update(range(start, start + count))
     return added
+
+
+def _deleted_lines(patch: str) -> set[int]:
+    """Map deletion-only hunks to their preceding new-file line, or 1 at top of file."""
+    deleted = set()
+    for line in patch.splitlines():
+        match = HUNK.match(line)
+        if match and match[2] == "0":
+            deleted.add(max(1, int(match[1])))
+    return deleted
 
 
 def _code_lines(source: str) -> list[str]:
@@ -1099,16 +1283,6 @@ def _fate_macros(source: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def _fate_deleted_lines(patch: str) -> set[int]:
-    """Map deletion-only hunks to their new-file position, including continuations."""
-    deleted = set()
-    for line in patch.splitlines():
-        match = HUNK.match(line)
-        if match and match[2] == "0":
-            deleted.add(max(1, int(match[1])))
-    return deleted
-
-
 def _fate_merge(report: FateReport, result: FateReport) -> None:
     """Accumulate one file's independent diagnostics and all classification totals."""
     report.checked += result.checked
@@ -1142,7 +1316,7 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
             )
             if sources is None and needs_sources:
                 sources = _fate_sources(_git(tree, "show", f"{head}:libavfilter/allfilters.c"))
-            touched = _added_lines(patch) | _fate_deleted_lines(patch)
+            touched = _added_lines(patch) | _deleted_lines(patch)
             old_parsed = _fate_parse(old, macros or frozenset()) if old is not None else None
             _fate_merge(report, _fate_check(name, parsed, touched, sources or {}, old_parsed))
     except (OSError, RuntimeError, ValueError) as error:
@@ -1167,25 +1341,136 @@ def is_source_path(name: str) -> bool:
     )
 
 
-def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
-    """Require a changed test path when a fix commit changes library or tool sources."""
-    records = _git(tree, "log", "-z", "--format=%H%n%s", f"{base}..{head}").split("\0")
-    fixes: list[tuple[str, str]] = []
+def unquote_git_path(text: str) -> str:
+    """Decode a C-style quoted Git path, leaving an unquoted path unchanged."""
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body = text[1:-1]
+    decoded = bytearray()
+    cursor = 0
+    for match in GIT_QUOTED_ESCAPE.finditer(body):
+        decoded.extend(body[cursor : match.start()].encode("utf-8", "surrogateescape"))
+        code = match[1]
+        decoded.append(int(code, 8) if len(code) == 3 else GIT_ESCAPE_BYTES[code])
+        cursor = match.end()
+    decoded.extend(body[cursor:].encode("utf-8", "surrogateescape"))
+    return decoded.decode("utf-8", "surrogateescape")
+
+
+def _header_path(line: str) -> str:
+    """Return the path a --- a/ or +++ b/ file header names, or an empty string."""
+    for marker, prefix in (("--- ", "a/"), ("+++ ", "b/")):
+        if line.startswith(marker):
+            name = unquote_git_path(line[len(marker) :].removesuffix("\t"))
+            return name[len(prefix) :] if name.startswith(prefix) else ""
+    return ""
+
+
+def _patch_files(patch: str) -> list[tuple[str, list[str], list[str]]]:
+    """Split a unified diff into per-file paths, hunk headers and added lines."""
+    entries: list[tuple[str, list[str], list[str]]] = []
+    in_header = False
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            entries.append(("", [], []))
+            in_header = True
+        elif not entries:
+            continue
+        elif HUNK.match(line):
+            in_header = False
+            entries[-1][1].append(line)
+        elif in_header:
+            path = _header_path(line)
+            if path:
+                _, hunks, added = entries[-1]
+                entries[-1] = (path, hunks, added)
+        elif line.startswith("+"):
+            entries[-1][2].append(line[1:])
+    return entries
+
+
+def _hunk_functions(hunks: list[str]) -> list[str]:
+    """Extract the first function name after the second @@ of each hunk header."""
+    found: list[str] = []
+    for line in hunks:
+        parts = line.split("@@", 2)
+        if len(parts) == 3:
+            match = FUNCTION_NAME.search(parts[2])
+            if match:
+                found.append(match[1])
+    return found
+
+
+def reach_names(paths: list[str], patch: str) -> frozenset[str]:
+    """Collect reachable source file stems and hunk-header function names."""
+    names: set[str] = set()
+    for path in paths:
+        if is_source_path(path):
+            stem = PurePosixPath(path).stem
+            names.update((stem, LAVFI_PREFIX.sub("", stem)))
+    for path, hunks, _ in _patch_files(patch):
+        if is_source_path(path):
+            names.update(_hunk_functions(hunks))
+    return frozenset(names)
+
+
+def test_words(patch: str, paths: list[str] | None = None) -> frozenset[str]:
+    """Collect word tokens from changed test paths and their added lines."""
+    words: set[str] = set()
+    for path in paths or []:
+        if is_test_path(path):
+            words.update(WORD.findall(path))
+    for path, _, added in _patch_files(patch):
+        if is_test_path(path):
+            words.update(WORD.findall(path))
+            for line in added:
+                words.update(WORD.findall(line))
+    return frozenset(words)
+
+
+def fix_word(message: str) -> str | None:
+    """Return the first fix or defect word of a commit message outside Signed-off-by lines."""
+    match = FIX_MESSAGE.search(_without_signoff(message))
+    return match[0] if match else None
+
+
+def _fix_commits(tree: Path, base: str, head: str) -> list[tuple[str, str, frozenset[str]]]:
+    """Collect source fix commits in base..head with their reachable names."""
+    records = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}").split("\0")
+    fixes: list[tuple[str, str, frozenset[str]]] = []
     for record in filter(None, records):
-        commit, _, rest = record.partition("\n")
-        subject = rest.rstrip("\r\n")
-        if FIX_SUBJECT.search(subject):
-            paths = _git(
+        commit, _, message = record.partition("\n")
+        subject = message.partition("\n")[0].rstrip("\r")
+        if not fix_word(message):
+            continue
+        paths = [
+            path
+            for path in _git(
                 tree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit
             ).split("\0")
-            if any(is_source_path(path) for path in paths if path):
-                fixes.append((commit, subject))
-    test_paths = [name for name in _changed_paths(tree, base, head) if is_test_path(name)]
-    if not fixes or test_paths:
-        summary = f"{len(fixes)} fix commit(s), {len(test_paths)} test path(s) changed"
-        return Step("regression-test", 0, summary)
-    headed = [f"{commit[:12]}: {subject}" for commit, subject in fixes]
-    reason = waiver.strip()
+            if path
+        ]
+        if any(is_source_path(path) for path in paths):
+            patch = _git(
+                tree,
+                "diff-tree",
+                "--no-commit-id",
+                "-r",
+                "-p",
+                "-U0",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                commit,
+            )
+            fixes.append((commit, subject, reach_names(paths, patch)))
+    return fixes
+
+
+def _no_test_step(fixes: list[tuple[str, str, frozenset[str]]], reason: str) -> Step:
+    """Report or waive source fix commits when no test path changed in the range."""
+    headed = [f"{commit[:12]}: {subject}" for commit, subject, _ in fixes]
     if reason:
         return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
     suffix = (
@@ -1195,9 +1480,38 @@ def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("regression-test", 1, "\n".join(f"{item}: {suffix}" for item in headed))
 
 
+def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Require changed tests that reach each source fix commit by file or function name."""
+    fixes = _fix_commits(tree, base, head)
+    test_paths = [name for name in _changed_paths(tree, base, head) if is_test_path(name)]
+    summary = f"{len(fixes)} fix commit(s), {len(test_paths)} test path(s) changed"
+    if not fixes:
+        return Step("regression-test", 0, summary)
+    reason = waiver.strip()
+    if not test_paths:
+        return _no_test_step(fixes, reason)
+    range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
+    words = test_words(range_patch, test_paths)
+    unreached = [fix for fix in fixes if not fix[2] & words]
+    if not unreached:
+        return Step("regression-test", 0, summary)
+    if reason:
+        headed = [f"{commit[:12]}: {subject}" for commit, subject, _ in unreached]
+        return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
+    lines = [
+        f"{commit[:12]}: {subject}: test paths changed but none names "
+        f"{', '.join(sorted(names))}; name the fixed file or function in a test, "
+        "or pass --no-test-reason"
+        for commit, subject, names in unreached
+    ]
+    return Step("regression-test", 1, "\n".join(lines))
+
+
 def _without_signoff(message: str) -> str:
-    """Return a commit message with Signed-off-by trailer lines removed."""
-    return "\n".join(line for line in message.splitlines() if not line.startswith("Signed-off-by:"))
+    """Return a commit message with Signed-off-by trailer lines removed, in any letter case."""
+    return "\n".join(
+        line for line in message.splitlines() if not line.lower().startswith("signed-off-by:")
+    )
 
 
 def uncited_diagnostic(message: str) -> str | None:
@@ -1231,9 +1545,15 @@ def _diagnostic_citation(tree: Path, base: str, head: str) -> Step:
 
 
 def unverified_claim(message: str) -> str | None:
-    """Return the first blanket verification claim in a commit message."""
-    match = VERIFICATION_CLAIM.search(_without_signoff(message))
-    return match[0] if match else None
+    """Return the first blanket verification claim that is neither negated nor argued."""
+    text = _without_signoff(message)
+    for match in VERIFICATION_CLAIM.finditer(text):
+        if NEGATED_CLAIM.search(text, max(0, match.start() - 24), match.start()):
+            continue
+        if match[0].lower().endswith("safe") and SAFETY_REASON.match(text, match.end()):
+            continue
+        return match[0]
+    return None
 
 
 def scope_claim(message: str) -> str | None:
@@ -1242,29 +1562,83 @@ def scope_claim(message: str) -> str | None:
     return match[0] if match else None
 
 
-def source_hunks(patch: str) -> int:
-    """Count unified-diff hunks belonging to library or fftools source files."""
-    count = 0
-    in_source = False
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
-            in_source = False
-        elif line.startswith("+++ "):
-            in_source = line.startswith("+++ b/") and is_source_path(line.removeprefix("+++ b/"))
-        elif in_source and HUNK.match(line):
-            count += 1
-    return count
+def speed_claim(message: str) -> str | None:
+    """Return the first encode or decode speed claim in a message without an end-to-end figure."""
+    text = _without_signoff(message)
+    if END_TO_END_MEASURE.search(text):
+        return None
+    for match in SPEED_CLAIM.finditer(text):
+        if not SPEED_NEGATION.search(text, max(0, match.start() - 48), match.start()):
+            return match[0]
+    return None
 
 
-def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[str | None, str | None]:
-    """Check one commit's message and diff for unverified or single-hunk scope claims."""
-    unverified_finding = None
+def _unverified_findings(commit: str, message: str) -> list[str]:
+    """Return the never-waivable claim findings of one commit message."""
+    findings: list[str] = []
     blanket = unverified_claim(message)
     if blanket is not None:
-        unverified_finding = (
+        findings.append(
             f'{commit[:12]}: claims "{blanket}"; '
             "name the test command and platform that ran instead"
         )
+    speed = speed_claim(message)
+    if speed is not None:
+        findings.append(
+            f'{commit[:12]}: claims "{speed}" without an end-to-end measurement; '
+            "name an ffmpeg -benchmark or fps result, or drop the claim"
+        )
+    return findings
+
+
+def _source_header(line: str, old_source: bool) -> bool:
+    """Return whether a +++ header line opens a library or fftools source file."""
+    if line == "+++ /dev/null":
+        return old_source
+    return is_source_path(_header_path(line))
+
+
+def _hunk_body(line: str, old_left: int, new_left: int) -> tuple[int, int] | None:
+    """Return the hunk line counts left after one body line, or None when the hunk ended."""
+    tag = line[:1]
+    if not (old_left or new_left) or tag not in ("-", "+", " ", "\\"):
+        return None
+    old_used = tag in ("-", " ") and old_left > 0
+    new_used = tag in ("+", " ") and new_left > 0
+    return old_left - int(old_used), new_left - int(new_used)
+
+
+def source_hunks(patch: str) -> int:
+    """Count hunks of library or fftools source files, deletions included,
+    reading headers only outside hunk bodies.
+    """
+    count = 0
+    in_source = old_source = False
+    left = (0, 0)
+    for line in patch.splitlines():
+        body = _hunk_body(line, *left)
+        if body is not None:
+            left = body
+            continue
+        left = (0, 0)
+        lengths = HUNK_LENGTHS.match(line)
+        if line.startswith("diff --git "):
+            in_source = old_source = False
+        elif lengths:
+            count += int(in_source)
+            left = (int(lengths[1] or "1"), int(lengths[2] or "1"))
+        elif line.startswith("--- "):
+            old_source = is_source_path(_header_path(line))
+        elif line.startswith("+++ "):
+            in_source = _source_header(line, old_source)
+    return count
+
+
+def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[list[str], str | None]:
+    """Check one commit's message and rename-aware diff for unverified or
+    single-hunk scope claims.
+    """
+    unverified_findings = _unverified_findings(commit, message)
     scope_finding = None
     scoped = scope_claim(message)
     if scoped is not None:
@@ -1278,7 +1652,7 @@ def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[str |
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
-            "--no-renames",
+            "-M",
             commit,
         )
         if source_hunks(patch) == 1:
@@ -1286,20 +1660,21 @@ def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[str |
                 f'{commit[:12]}: claims "{scoped}" but changes 1 source hunk; '
                 "show each site or pass --claim-reason"
             )
-    return unverified_finding, scope_finding
+    return unverified_findings, scope_finding
 
 
 def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
     """Reject blanket verification claims and unwaived single-hunk multi-site claims."""
     log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
     records = list(filter(None, log.split("\0")))
+    if len(records) > MAX_CLAIM_COMMITS:
+        raise RuntimeError(f"commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(records)}")
     unverified: list[str] = []
     scoped: list[str] = []
     for record in records:
         commit, _, message = record.partition("\n")
         rule_a, rule_b = _commit_claim_findings(tree, commit, message)
-        if rule_a is not None:
-            unverified.append(rule_a)
+        unverified.extend(rule_a)
         if rule_b is not None:
             scoped.append(rule_b)
     if not (unverified or scoped):
@@ -1311,16 +1686,563 @@ def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
     return Step("claim-scope", 1, "\n".join([*unverified, *scoped]))
 
 
+@dataclass(frozen=True)
+class DocTerm:
+    """A code behaviour whose added description must name one of its cases."""
+
+    name: str
+    code: re.Pattern[str]
+    wording: re.Pattern[str]
+    required: re.Pattern[str]
+    advice: str
+
+
+DOC_TERMS = (
+    DocTerm(
+        "non-RGB input",
+        re.compile(
+            r"!=\s*\w*COLOR_RGB\b|\b\w*COLOR_RGB\s*!="
+            r"|!\s*\(\s*[\w.>-]+flags\s*&\s*AV_PIX_FMT_FLAG_RGB\s*\)"
+            r"|!\s*\(\s*AV_PIX_FMT_FLAG_RGB\s*&\s*[\w.>-]+flags\s*\)"
+        ),
+        re.compile(r"\bYUV\b", re.IGNORECASE),
+        re.compile(r"\bnon-RGB\b|\bgr[ae]y\b", re.IGNORECASE),
+        "the code takes every non-RGB input, gray included; say non-RGB or name gray",
+    ),
+    DocTerm(
+        "unspecified range",
+        re.compile(
+            r"\b(?:color|pixel)_range\s*[!=]=|[!=]=\s*[\w.>-]*\b(?:color|pixel)_range\b"
+            r"|\bAVCOL_RANGE_\w+\s*[!=]=|[!=]=\s*AVCOL_RANGE_\w+"
+        ),
+        re.compile(r"\brange(?:in)?\b", re.IGNORECASE),
+        re.compile(r"\b(?:unspecified|unknown|untagged)\b", re.IGNORECASE),
+        "the code compares a colour range; say how an unspecified range is treated",
+    ),
+)
+
+
+TEXI_INLINE = frozenset((
+    "abbr", "acronym", "b", "code", "command", "dfn", "dots", "email", "emph", "env",
+    "file", "i", "kbd", "key", "math", "option", "pxref", "r", "ref", "samp", "sc",
+    "strong", "t", "tie", "uref", "url", "var", "verb", "w", "xref",
+))  # fmt: skip
+TEXI_FILLED = frozenset((
+    "enumerate", "ftable", "ifclear", "ifhtml", "ifinfo", "ifnothtml", "ifnotinfo",
+    "ifnottex", "ifset", "iftex", "itemize", "quotation", "table", "vtable",
+))  # fmt: skip
+TEXI_COMMAND = re.compile(r"@([A-Za-z]+)")
+TEXI_END = re.compile(r"@end\s+([A-Za-z]+)\s*$")
+# Raw block commands of texi2any 7.3 (Texinfo/Commands.pm, class 'raw'). Inside one,
+# only a nested opener that its pattern matches and an @end naming the innermost raw
+# block count (ParserNonXS.pm _process_raw_block_contents and
+# _process_macro_block_contents); every other line is literal text.
+TEXI_MACROS = re.compile(r"\s*@((?:line|r)?macro)(?:\s|$)")
+TEXI_RAW = {
+    "ignore": re.compile(r"\s*@(ignore)(?:@|\s|$)"),
+    "linemacro": TEXI_MACROS,
+    "macro": TEXI_MACROS,
+    "rmacro": TEXI_MACROS,
+    "verbatim": re.compile(r"\s*@(verbatim)(?:@|\s|$)"),
+}
+TEXI_RAW_END = re.compile(r"\s*@end\s+([A-Za-z][\w-]*)")
+TEXI_FIRST_WORD = re.compile(r"@[A-Za-z]+\{[^}]*\}\S*|\S+")
+WRAP_MIN_NEIGHBOUR = 50
+SENTENCE_END = re.compile(r"(?:[.:;!?]|@\*)\s*$")
+
+
+def is_doc_path(name: str) -> bool:
+    """Return whether a repository path is a Texinfo file under doc/."""
+    parts = PurePosixPath(name).parts
+    return len(parts) > 1 and parts[0] == "doc" and name.endswith(".texi")
+
+
+def doc_term_findings(code: str, docs: str) -> list[str]:
+    """Return a finding per doc term the added code shows and the added docs omit."""
+    findings: list[str] = []
+    for term in DOC_TERMS:
+        behaviour = term.code.search(code)
+        wording = term.wording.search(docs)
+        if behaviour and wording and not term.required.search(docs):
+            findings.append(
+                f'{term.name}: added code has "{behaviour[0].strip()}" and added docs say '
+                f'"{wording[0]}"; {term.advice}'
+            )
+    return findings
+
+
+def _added_code(tree: Path, head: str, path: str, hunks: list[str]) -> list[str]:
+    """Return the added lines of a head source file with comments and literals blanked."""
+    numbers = _added_lines("\n".join(hunks))
+    if not numbers:
+        return []
+    code = _code_lines(_git(tree, "show", f"{head}:{path}"))
+    return [code[number - 1] for number in sorted(numbers) if number <= len(code)]
+
+
+def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Require added docs to name the cases that the added code covers."""
+    range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
+    code: list[str] = []
+    docs: list[str] = []
+    for path, hunks, added in _patch_files(range_patch):
+        if is_source_path(path):
+            code.extend(_added_code(tree, head, path, hunks))
+        elif is_doc_path(path):
+            docs.extend(added)
+    return _waivable_step(
+        "doc-terms",
+        doc_term_findings("\n".join(code), "\n".join(docs)),
+        waiver,
+        f"no omitted doc term in {len(docs)} added doc line(s)",
+        "name the case in the docs, or pass --doc-reason",
+    )
+
+
+def _waivable_step(name: str, findings: list[str], waiver: str, clean: str, advice: str) -> Step:
+    """Pass without findings, pass and list them under a non-blank waiver, else fail with advice."""
+    if not findings:
+        return Step(name, 0, clean)
+    reason = waiver.strip()
+    if reason:
+        return Step(name, 0, "\n".join([f"waived: {reason}", *findings]))
+    return Step(name, 1, "\n".join([*findings, advice]))
+
+
+def _texi_raw_line(line: str, stack: list[str]) -> None:
+    """Track one line inside the raw block on top of the stack the way texi2any reads it."""
+    nested = TEXI_RAW[stack[-1]].match(line)
+    end = TEXI_RAW_END.match(line)
+    if nested:
+        stack.append(nested[1])
+    elif end and end[1] == stack[-1]:
+        stack.pop()
+
+
+def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
+    """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+    if stack and stack[-1] in TEXI_RAW:
+        _texi_raw_line(line, stack)
+        return False
+    end = TEXI_END.match(line)
+    if end:
+        if end[1] in stack:
+            del stack[len(stack) - 1 - stack[::-1].index(end[1]) :]
+        return False
+    command = TEXI_COMMAND.match(line)
+    if command and command[1] in blocks:
+        stack.append(command[1])
+        return False
+    if command and not (command[1] in TEXI_INLINE and line[command.end() :].startswith("{")):
+        return False
+    return bool(line.strip()) and all(name in TEXI_FILLED for name in stack)
+
+
+def _texi_blocks(lines: list[str]) -> frozenset[str]:
+    """Collect Texinfo block names from TEXI_RAW and @end lines read outside raw blocks."""
+    blocks = set(TEXI_RAW)
+    stack: list[str] = []
+    for line in lines:
+        if stack:
+            _texi_raw_line(line, stack)
+        elif end := TEXI_END.match(line):
+            blocks.add(end[1])
+        elif (command := TEXI_COMMAND.match(line)) and command[1] in TEXI_RAW:
+            stack.append(command[1])
+    return frozenset(blocks)
+
+
+def texi_prose(lines: list[str]) -> list[bool]:
+    """Flag each Texinfo line that is filled prose, outside every block not in TEXI_FILLED.
+
+    Block names come from @end lines read outside raw blocks; a raw block in TEXI_RAW
+    always opens.
+    """
+    blocks = _texi_blocks(lines)
+    stack: list[str] = []
+    return [_texi_prose_line(line, blocks, stack) for line in lines]
+
+
+def _unfilled(before: str, line: str, after: str) -> bool:
+    """Return whether a prose line ends under half its neighbours' width with room for a word."""
+    column = min(len(before), len(after))
+    return (
+        column >= WRAP_MIN_NEIGHBOUR
+        and not SENTENCE_END.search(line)
+        and 2 * len(line) < column
+        and len(line) + 1 + len(TEXI_FIRST_WORD.findall(after)[0]) <= len(before)
+    )
+
+
+def wrap_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
+    """Return a finding per added prose line that breaks a filled paragraph early."""
+    prose = texi_prose(lines)
+    findings: list[str] = []
+    for number in sorted(added):
+        index = number - 1
+        if not (0 < index < len(lines) - 1 and all(prose[index - 1 : index + 2])):
+            continue
+        before, line, after = (lines[at].rstrip() for at in (index - 1, index, index + 1))
+        if _unfilled(before, line, after):
+            findings.append(
+                f'{path}:{number}: "{line.strip()}" ends a filled paragraph line early '
+                f"({len(line)} of {len(before)} columns) and the next word fits on it"
+            )
+    return findings
+
+
+def _doc_files(tree: Path, base: str, head: str) -> list[tuple[str, list[str], set[int]]]:
+    """Return each changed doc/*.texi file with its head lines and added line numbers."""
+    files: list[tuple[str, list[str], set[int]]] = []
+    for path, hunks, _ in _patch_files(_git(tree, *DIFF_COMMON, "-U0", base, head)):
+        added = _added_lines("\n".join(hunks))
+        if is_doc_path(path) and added:
+            files.append((path, _git(tree, "show", f"{head}:{path}").splitlines(), added))
+    return files
+
+
+def _doc_wrap(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Fail added doc prose lines that end early inside a filled paragraph."""
+    files = _doc_files(tree, base, head)
+    return _waivable_step(
+        "doc-wrap",
+        [finding for path, lines, added in files for finding in wrap_findings(path, lines, added)],
+        waiver,
+        f"no early line break in {len(files)} changed doc file(s)",
+        "join each line with the next one, or pass --doc-reason",
+    )
+
+
+def is_test_program_path(name: str) -> bool:
+    """Return whether a repository path is a C file directly under a lib*/tests/ directory."""
+    parts = PurePosixPath(name).parts
+    return (
+        len(parts) == 3
+        and parts[0].startswith("lib")
+        and parts[1] == "tests"
+        and parts[2].endswith(".c")
+    )
+
+
+def testprogs_names(makefile: str) -> frozenset[str]:
+    """Return the words that TESTPROGS assignments of a Makefile list."""
+    names: set[str] = set()
+    for line in _fate_lines(makefile):
+        kind, groups = _fate_kind(line)
+        if kind in ("variable", "registration") and groups[0] == "TESTPROGS":
+            names.update(groups[-1].split())
+    return frozenset(names)
+
+
+def registered_test_programs(new_paths: list[str], makefiles: dict[str, str]) -> list[str]:
+    """Return new lib*/tests C files whose stem their library Makefile lists in TESTPROGS."""
+    programs: list[str] = []
+    for path in new_paths:
+        if not is_test_program_path(path):
+            continue
+        makefile = makefiles.get(f"{PurePosixPath(path).parts[0]}/Makefile", "")
+        if PurePosixPath(path).stem in testprogs_names(makefile):
+            programs.append(path)
+    return programs
+
+
+def _head_makefiles(tree: Path, head: str, paths: list[str]) -> dict[str, str]:
+    """Read the head Makefile of each library that owns one of the paths."""
+    names = sorted({f"{PurePosixPath(path).parts[0]}/Makefile" for path in paths})
+    if not names:
+        return {}
+    listed = _git(tree, "ls-tree", "-z", "--name-only", head, "--", *names)
+    return {name: _git(tree, "show", f"{head}:{name}") for name in filter(None, listed.split("\0"))}
+
+
+def _test_program(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Ask for a FATE sample and reference test instead of a new lib*/tests program."""
+    changed = [
+        name
+        for name in _changed_paths(tree, base, head, "lib*/tests/*.c")
+        if is_test_program_path(name)
+    ]
+    existing: set[str] = set()
+    if changed:
+        listed = _git(tree, "ls-tree", "-z", "--name-only", base, "--", *changed)
+        existing = set(filter(None, listed.split("\0")))
+    new_paths = [name for name in changed if name not in existing]
+    programs = registered_test_programs(new_paths, _head_makefiles(tree, head, new_paths))
+    if not programs:
+        return Step(
+            "test-program",
+            0,
+            f"no new registered program in {len(new_paths)} new lib*/tests file(s)",
+        )
+    findings = [
+        f"{name}: new TESTPROGS program; upstream asks for a FATE test that runs an input "
+        "sample and compares the output with a tests/ref reference"
+        for name in programs
+    ]
+    advice = "add a FATE sample test with a tests/ref reference, or pass --test-program-reason"
+    return _waivable_step("test-program", findings, waiver, "", advice)
+
+
+@dataclass(frozen=True, slots=True)
+class SemgrepMatch:
+    """One validated Semgrep finding with its inclusive physical line span."""
+
+    path: str
+    start_line: int
+    end_line: int
+    check_id: str
+    message_line: str
+
+
+def is_c_source_path(name: str) -> bool:
+    """Return whether a repository path is a non-test library or fftools C or header source."""
+    return name.endswith((".c", ".h")) and is_source_path(name)
+
+
+def _semgrep_span(item: dict[str, object]) -> tuple[int, int] | None:
+    """Extract a positive inclusive (start_line, end_line) pair from a Semgrep result."""
+    start, end = item.get("start"), item.get("end")
+    if not (isinstance(start, dict) and isinstance(end, dict)):
+        return None
+    first, last = start.get("line"), end.get("line")
+    if (
+        isinstance(first, int)
+        and not isinstance(first, bool)
+        and isinstance(last, int)
+        and not isinstance(last, bool)
+        and 1 <= first <= last
+    ):
+        return first, last
+    return None
+
+
+def _parse_semgrep_match(item: object) -> SemgrepMatch | None:
+    """Validate one Semgrep JSON result entry against the allow-listed schema."""
+    if not isinstance(item, dict):
+        return None
+    path, check_id, extra = item.get("path"), item.get("check_id"), item.get("extra")
+    span = _semgrep_span(item)
+    # Semgrep prefixes check_id with the dotted rules path; rule ids carry no dot.
+    rule_id = check_id.rpartition(".")[2] if isinstance(check_id, str) else ""
+    message = extra.get("message") if isinstance(extra, dict) else None
+    if (
+        span is None
+        or not (isinstance(path, str) and path)
+        or not rule_id
+        or not isinstance(message, str)
+    ):
+        return None
+    return SemgrepMatch(path, span[0], span[1], rule_id, message.partition("\n")[0])
+
+
+def _partial_parsing_path(error: object) -> str | None:
+    """Return the file path of a PartialParsing error, or None for any other error."""
+    if not isinstance(error, dict):
+        return None
+    error_type = error.get("type")
+    is_partial = error_type == "PartialParsing" or (
+        isinstance(error_type, list) and bool(error_type) and error_type[0] == "PartialParsing"
+    )
+    path = error.get("path")
+    if is_partial and isinstance(path, str) and path:
+        return path
+    return None
+
+
+def _read_semgrep_lists(
+    raw_results: object,
+    raw_errors: object,
+    scanned_paths: frozenset[str] | None = None,
+) -> tuple[list[SemgrepMatch], list[str]] | None:
+    """Validate every result and PartialParsing error in Semgrep's JSON lists."""
+    if not (isinstance(raw_results, list) and isinstance(raw_errors, list)):
+        return None
+    matches: list[SemgrepMatch] = []
+    for raw in raw_results:
+        match = _parse_semgrep_match(raw)
+        if match is None or (scanned_paths is not None and match.path not in scanned_paths):
+            return None
+        matches.append(match)
+    partial_paths: list[str] = []
+    for raw in raw_errors:
+        path = _partial_parsing_path(raw)
+        if path is None:
+            return None
+        partial_paths.append(path)
+    return matches, partial_paths
+
+
+def _read_semgrep_json(
+    json_path: Path, scanned_paths: frozenset[str] | None = None
+) -> tuple[list[SemgrepMatch], list[str]] | None:
+    """Allow-list Semgrep JSON and require paths.scanned to cover every requested path."""
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    paths = payload.get("paths")
+    scanned = paths.get("scanned") if isinstance(paths, dict) else None
+    if not isinstance(scanned, list) or not all(isinstance(path, str) for path in scanned):
+        return None
+    if scanned_paths is not None and not scanned_paths.issubset(scanned):
+        return None
+    raw_results, raw_errors = payload.get("results"), payload.get("errors")
+    return _read_semgrep_lists(raw_results, raw_errors, scanned_paths)
+
+
+def _c_rules_error(result: RunResult) -> Step:
+    """Format an unrecognised semgrep_scan result as a non-waivable rc 2 step."""
+    header = f"command rc: {result.returncode}"
+    output = f"{header}\n{result.stdout}" if result.stdout else header
+    return Step("c-rules", 2, output)
+
+
+def _diff_sections(patch: str) -> list[str]:
+    """Split a unified diff into one section string per diff --git file header."""
+    sections: list[list[str]] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            sections.append([line])
+        elif sections:
+            sections[-1].append(line)
+    return ["\n".join(lines) for lines in sections]
+
+
+def _c_rules_touched(tree: Path, base: str, head: str) -> dict[str, set[int]]:
+    """Pair changed C and header sources with rename-aware added and deletion lines."""
+    raw_names = list(
+        filter(
+            None,
+            _git(tree, *C_RULES_DIFF, "--name-only", "-z", base, head, "--", "*.c", "*.h").split(
+                "\0"
+            ),
+        )
+    )
+    if len(raw_names) > MAX_PATHS:
+        raise RuntimeError(f"changed paths exceed MAX_PATHS={MAX_PATHS}: {len(raw_names)}")
+    paths = [name for name in raw_names if is_c_source_path(name)]
+    if not paths:
+        return {}
+    sections = _diff_sections(_git(tree, *C_RULES_DIFF, "-U0", base, head, "--", "*.c", "*.h"))
+    if len(raw_names) != len(sections):
+        raise RuntimeError(
+            f"git diff path/patch mismatch: {len(raw_names)} paths, {len(sections)} patches"
+        )
+    wanted = frozenset(paths)
+    return {
+        name: _added_lines(section) | _deleted_lines(section)
+        for name, section in zip(raw_names, sections, strict=True)
+        if name in wanted
+    }
+
+
+def _c_rules_report(
+    matches: list[SemgrepMatch],
+    partial_paths: list[str],
+    touched_by_path: dict[str, set[int]],
+    source_count: int,
+    waiver: str,
+) -> Step:
+    """Classify allow-listed Semgrep matches against touched lines and apply any waiver."""
+    findings: list[str] = []
+    notes: list[str] = []
+    for match in matches:
+        if match.path not in touched_by_path:
+            raise ValueError(f"unscanned result path: {match.path}")
+        touched_lines = touched_by_path[match.path]
+        touched = any(match.start_line <= line <= match.end_line for line in touched_lines)
+        detail = f"{match.path}:{match.start_line}: {match.check_id}: {match.message_line}"
+        if touched:
+            findings.append(f"finding: {detail}")
+        else:
+            notes.append(f"pre-existing (untouched): {detail}")
+    notes.extend(f"informational: {path}: PartialParsing" for path in partial_paths)
+    if not findings:
+        summary = f"0 finding(s) in {source_count} changed C/header source(s)"
+        return Step("c-rules", 0, "\n".join([*notes, summary]))
+    reason = waiver.strip()
+    if reason:
+        return Step("c-rules", 0, "\n".join([f"waived: {reason}", *findings, *notes]))
+    advice = "fix the flagged path, or pass --c-rule-reason"
+    return Step("c-rules", 1, "\n".join([*findings, *notes, advice]))
+
+
+def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Scan changed C/header sources and fail closed unless every requested path was scanned."""
+    touched_by_path = _c_rules_touched(tree, base, head)
+    if not touched_by_path:
+        return Step("c-rules", 0, "no added or modified C or header source in the range")
+    paths = list(touched_by_path)
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
+        json_path = Path(directory) / "semgrep.json"
+        argv = [
+            "bash",
+            str(SEMGREP_SCAN),
+            f"--rules={SEMGREP_FFMPEG_RULES}",
+            f"--json-output={json_path}",
+            "--max-target-bytes=0",
+            *paths,
+        ]
+        result = _run(argv, tree, timeout=C_RULES_TIMEOUT)
+        has_warning = any(line.startswith("semgrep_scan:") for line in result.stdout.splitlines())
+        parsed = (
+            _read_semgrep_json(json_path, frozenset(paths))
+            if result.returncode in (0, 1) and not has_warning
+            else None
+        )
+    if parsed is None:
+        return _c_rules_error(result)
+    return _c_rules_report(parsed[0], parsed[1], touched_by_path, len(paths), waiver)
+
+
+DOCSTRING_COVERAGE = re.compile(
+    r"^Docstring coverage: \d+\.\d{2}% "
+    r"\(\d+/\d+ covered, counted: \d+, covered: \d+, threshold: \d+(?:\.\d+)?%\)$"
+)
+
+
+def docstring_result(returncode: int, output: str, waiver: str = "") -> Step:
+    """Classify Praetor docstrings output through the coverage-line allow-list."""
+    first_line = output.partition("\n")[0].removesuffix("\r")
+    body = output.rstrip("\r\n")
+    if returncode in (0, 1) and DOCSTRING_COVERAGE.fullmatch(first_line):
+        if returncode == 0:
+            return Step("docstrings", 0, body)
+        reason = waiver.strip()
+        if reason:
+            return Step("docstrings", 0, f"waived: {reason}\n{body}")
+        advice = "add a doc comment to each listed function, or pass --docstring-reason"
+        return Step("docstrings", 1, f"{body}\n{advice}")
+    header = f"engine exit status: {returncode}"
+    return Step("docstrings", 2, f"{header}\n{body}" if body else header)
+
+
+def _docstrings(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Run the pinned Praetor engine's diff-scoped docstring check on base..head."""
+    argv = [
+        "bash",
+        str(REPO_ROOT / ENGINE_SCRIPT),
+        "docstrings",
+        "check",
+        f"--path={tree}",
+        f"--base={base}",
+        f"--head={head}",
+    ]
+    result = _run(argv, REPO_ROOT, timeout=DOCSTRINGS_TIMEOUT)
+    return docstring_result(result.returncode, result.stdout, waiver)
+
+
 def _collect(name: str, action: Callable[[], Step]) -> Step:
+    """Run one check and capture unexpected tool or I/O errors as rc 2."""
     try:
         return action()
     except (OSError, RuntimeError, ValueError) as error:
         return Step(name, 2, str(error))
 
 
-def _checks(
-    tree: Path, base: str, head: str, waiver: str = "", claim_reason: str = ""
-) -> list[Step]:
+def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
     """Collect every independent check even when another check fails."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-upstream-lint-") as directory:
         scratch = Path(directory)
@@ -1330,14 +2252,21 @@ def _checks(
             _collect("patcheck", lambda: _patcheck(tree, base, head, scratch)),
             _collect("developer.texi", lambda: _mechanical(tree, base, head)),
             _collect("fate-deps", lambda: _fate_deps(tree, base, head)),
-            _collect("regression-test", lambda: _regression_test(tree, base, head, waiver)),
+            _collect(
+                "regression-test", lambda: _regression_test(tree, base, head, waivers.no_test)
+            ),
             _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
-            _collect("claim-scope", lambda: _claim_scope(tree, base, head, claim_reason)),
+            _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
+            _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
+            _collect("doc-wrap", lambda: _doc_wrap(tree, base, head, waivers.doc)),
+            _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
+            _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule)),
+            _collect("docstrings", lambda: _docstrings(tree, base, head, waivers.docstring)),
         ]
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run all upstream checks, print their statuses, and optionally save a report."""
+def _parser() -> argparse.ArgumentParser:
+    """Build the command line parser with the range options and one waiver per step."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--base", required=True)
@@ -1346,7 +2275,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-test-reason",
         default="",
-        help="why the fix commits in the range carry no test; waives the regression-test step",
+        help=(
+            "why the fix commits in the range carry no test, or why the changed tests "
+            "do not name them; waives the regression-test step"
+        ),
     )
     parser.add_argument(
         "--claim-reason",
@@ -1354,12 +2286,49 @@ def main(argv: list[str] | None = None) -> int:
         help="why a multi-site claim is backed by one source hunk; "
         "waives that claim-scope rule only",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--doc-reason",
+        default="",
+        help="why the added docs may leave out a case the doc-terms step names or break a "
+        "line early; waives the doc-terms and doc-wrap steps",
+    )
+    parser.add_argument(
+        "--test-program-reason",
+        default="",
+        help="why a new lib*/tests program cannot be a FATE sample test; waives that step",
+    )
+    parser.add_argument(
+        "--c-rule-reason",
+        default="",
+        help=(
+            "why a finding in .semgrep-ffmpeg.yml does not apply to the touched path; "
+            "waives findings of the c-rules step"
+        ),
+    )
+    parser.add_argument(
+        "--docstring-reason",
+        default="",
+        help="why changed functions fall below the docstring threshold; waives that step",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run all upstream checks, print their statuses, and optionally save a report."""
+    args = _parser().parse_args(argv)
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
         base, head = _prepare(tree, base, head)
-        steps = _checks(tree, base, head, args.no_test_reason, claim_reason=args.claim_reason)
+        waivers = Waivers(
+            no_test=args.no_test_reason,
+            claim=args.claim_reason,
+            doc=args.doc_reason,
+            test_program=args.test_program_reason,
+            c_rule=args.c_rule_reason,
+            docstring=args.docstring_reason,
+        )
+        steps = _checks(tree, base, head, waivers)
         _remaining(0)
     except (OSError, RuntimeError, ValueError) as error:
         steps = [Step("preflight", 2, str(error))]
