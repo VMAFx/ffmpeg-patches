@@ -128,11 +128,15 @@ directory, and skips the run when none changed. Results are read through an
 allow-list: exit status 0 or 1, no semgrep_scan: warning line, and a JSON
 output object whose paths.scanned list contains every requested path, whose
 results name requested paths with non-empty rule ids, and whose errors list
-holds only PartialParsing errors. Matches whose line range
+holds only PartialParsing errors or validated Syntax error entries for requested
+files. Matches whose line range
 meets a file's rename-aware added lines or deletion positions fail with rc 1,
 untouched matches and PartialParsing errors are reported without failing,
-and any other status, warning, error type or JSON failure gives rc 2.
---c-rule-reason TEXT waives rc 1 findings and prints the reason, never rc 2.
+and any other status, warning, error shape or JSON failure gives rc 2.
+A Syntax error for a requested file means the rules could not read it: rc 1
+names the file and requires a check by hand of its touched lines.
+--c-rule-reason TEXT waives rc 1 findings or unread files and prints the reason
+and affected file lines, never rc 2.
 
 The docstrings step checks diff-scoped doc-comment coverage across base..head
 in --tree by running the pinned Praetor engine via .config/lefthook/engine.sh
@@ -2049,33 +2053,63 @@ def _partial_parsing_path(error: object) -> str | None:
     return None
 
 
+def _syntax_error_path(error: object, requested: frozenset[str] | None) -> str | None:
+    """Allow only known Syntax error fields and types for an explicitly requested file."""
+    fields = {"type", "path", "code", "level", "message"}
+    if not isinstance(error, dict) or not error.keys() <= fields:
+        return None
+    path = error.get("path")
+    if (
+        error.get("type") != "Syntax error"
+        or not isinstance(path, str)
+        or not path
+        or requested is None
+        or path not in requested
+        or type(error.get("code", 3)) is not int
+        or error.get("code", 3) != 3
+        or error.get("level", "warn") != "warn"
+        or not isinstance(error.get("message", ""), str)
+    ):
+        return None
+    return path
+
+
 def _read_semgrep_lists(
     raw_results: object,
     raw_errors: object,
     scanned_paths: frozenset[str] | None = None,
+    *,
+    unread_paths: list[str] | None = None,
 ) -> tuple[list[SemgrepMatch], list[str]] | None:
-    """Validate every result and PartialParsing error in Semgrep's JSON lists."""
+    """Validate results and partial errors, collecting unread requested files when supplied."""
     if not (isinstance(raw_results, list) and isinstance(raw_errors, list)):
         return None
     matches: list[SemgrepMatch] = []
-    for raw in raw_results:
-        match = _parse_semgrep_match(raw)
+    for index in range(len(raw_results)):
+        match = _parse_semgrep_match(raw_results[index])
         if match is None or (scanned_paths is not None and match.path not in scanned_paths):
             return None
         matches.append(match)
     partial_paths: list[str] = []
-    for raw in raw_errors:
+    for index in range(len(raw_errors)):
+        raw = raw_errors[index]
         path = _partial_parsing_path(raw)
-        if path is None:
+        if path is not None:
+            partial_paths.append(path)
+        elif unread_paths is not None and (path := _syntax_error_path(raw, scanned_paths)):
+            unread_paths.append(path)
+        else:
             return None
-        partial_paths.append(path)
     return matches, partial_paths
 
 
 def _read_semgrep_json(
-    json_path: Path, scanned_paths: frozenset[str] | None = None
+    json_path: Path,
+    scanned_paths: frozenset[str] | None = None,
+    *,
+    unread_paths: list[str] | None = None,
 ) -> tuple[list[SemgrepMatch], list[str]] | None:
-    """Allow-list Semgrep JSON and require paths.scanned to cover every requested path."""
+    """Require scan coverage and allow-list JSON, collecting unread files when supplied."""
     try:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -2084,12 +2118,14 @@ def _read_semgrep_json(
         return None
     paths = payload.get("paths")
     scanned = paths.get("scanned") if isinstance(paths, dict) else None
-    if not isinstance(scanned, list) or not all(isinstance(path, str) for path in scanned):
+    if not isinstance(scanned, list) or not all(
+        isinstance(scanned[index], str) for index in range(len(scanned))
+    ):
         return None
     if scanned_paths is not None and not scanned_paths.issubset(scanned):
         return None
     raw_results, raw_errors = payload.get("results"), payload.get("errors")
-    return _read_semgrep_lists(raw_results, raw_errors, scanned_paths)
+    return _read_semgrep_lists(raw_results, raw_errors, scanned_paths, unread_paths=unread_paths)
 
 
 def _c_rules_error(result: RunResult) -> Step:
@@ -2142,25 +2178,37 @@ def _c_rules_report(
     matches: list[SemgrepMatch],
     partial_paths: list[str],
     touched_by_path: dict[str, set[int]],
-    source_count: int,
     waiver: str,
+    unread_paths: list[str],
 ) -> Step:
-    """Classify allow-listed Semgrep matches against touched lines and apply any waiver."""
-    findings: list[str] = []
+    """Report touched matches and unread files, applying the same explicit waiver to both."""
+    unread = sorted(set(unread_paths))
+    findings = [
+        f"unread: {unread[index]}: rules could not read this file; "
+        "touched lines need a check by hand"
+        for index in range(len(unread))
+    ]
     notes: list[str] = []
-    for match in matches:
+    for index in range(len(matches)):
+        match = matches[index]
         if match.path not in touched_by_path:
             raise ValueError(f"unscanned result path: {match.path}")
-        touched_lines = touched_by_path[match.path]
-        touched = any(match.start_line <= line <= match.end_line for line in touched_lines)
+        touched_lines = sorted(touched_by_path[match.path])
+        touched = any(
+            match.start_line <= touched_lines[index] <= match.end_line
+            for index in range(len(touched_lines))
+        )
         detail = f"{match.path}:{match.start_line}: {match.check_id}: {match.message_line}"
         if touched:
             findings.append(f"finding: {detail}")
         else:
             notes.append(f"pre-existing (untouched): {detail}")
-    notes.extend(f"informational: {path}: PartialParsing" for path in partial_paths)
+    notes.extend(
+        f"informational: {partial_paths[index]}: PartialParsing"
+        for index in range(len(partial_paths))
+    )
     if not findings:
-        summary = f"0 finding(s) in {source_count} changed C/header source(s)"
+        summary = f"0 finding(s) in {len(touched_by_path)} changed C/header source(s)"
         return Step("c-rules", 0, "\n".join([*notes, summary]))
     reason = waiver.strip()
     if reason:
@@ -2175,6 +2223,7 @@ def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
     if not touched_by_path:
         return Step("c-rules", 0, "no added or modified C or header source in the range")
     paths = list(touched_by_path)
+    unread_paths: list[str] = []
     with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
         json_path = Path(directory) / "semgrep.json"
         argv = [
@@ -2186,15 +2235,16 @@ def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
             *paths,
         ]
         result = _run(argv, tree, timeout=C_RULES_TIMEOUT)
-        has_warning = any(line.startswith("semgrep_scan:") for line in result.stdout.splitlines())
+        lines = result.stdout.splitlines()
+        has_warning = any(lines[index].startswith("semgrep_scan:") for index in range(len(lines)))
         parsed = (
-            _read_semgrep_json(json_path, frozenset(paths))
+            _read_semgrep_json(json_path, frozenset(paths), unread_paths=unread_paths)
             if result.returncode in (0, 1) and not has_warning
             else None
         )
     if parsed is None:
         return _c_rules_error(result)
-    return _c_rules_report(parsed[0], parsed[1], touched_by_path, len(paths), waiver)
+    return _c_rules_report(parsed[0], parsed[1], touched_by_path, waiver, unread_paths)
 
 
 DOCSTRING_COVERAGE = re.compile(

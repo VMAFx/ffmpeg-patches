@@ -3792,8 +3792,181 @@ class CRulesTest(unittest.TestCase):
                 self.assertEqual(step.rc, 0, step.output)
                 self.assertIn("informational: libavformat/rtsp.c: PartialParsing", step.output)
 
+    def syntax_error_payload(self, **changes: object) -> dict[str, object]:
+        """Build the measured unread-file error with allow-listed scalar metadata."""
+        error = {
+            "type": "Syntax error",
+            "path": "libavformat/rtspenc.c",
+            "code": 3,
+            "level": "warn",
+            "message": "the rules could not parse this source",
+        }
+        error.update(changes)
+        return {
+            "paths": {"scanned": ["libavformat/rtspenc.c"]},
+            "results": [],
+            "errors": [error],
+        }
+
+    def assert_unread_reported(self) -> None:
+        """Require a visible unread-file failure before testing a rejected variant."""
+        self.stub_json = json.dumps(self.syntax_error_payload())
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unread: libavformat/rtspenc.c:", step.output)
+
+    def test_unread_requested_file_fails(self) -> None:
+        """An unread requested file fails visibly for scanner exits zero and one."""
+        for status in range(2):
+            with self.subTest(status=status):
+                self.stub_rc = status
+                self.stub_json = json.dumps(self.syntax_error_payload())
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn(
+                    "unread: libavformat/rtspenc.c: rules could not read this file; "
+                    "touched lines need a check by hand",
+                    step.output,
+                )
+                self.assertNotIn("0 finding(s)", step.output)
+                self.assertNotIn("waived:", step.output)
+
+    def test_unread_requested_file_waived_with_reason(self) -> None:
+        """Only a nonblank reason waives an unread file and preserves its review line."""
+        self.stub_json = json.dumps(self.syntax_error_payload())
+        step = self.run_c_rules("  touched lines checked by hand  ")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output.splitlines()[0], "waived: touched lines checked by hand")
+        self.assertIn("unread: libavformat/rtspenc.c:", step.output)
+        self.assertIn("touched lines need a check by hand", step.output)
+        blank = self.run_c_rules("   ")
+        self.assertEqual(blank.rc, 1, blank.output)
+        self.assertIn("unread: libavformat/rtspenc.c:", blank.output)
+        self.assertNotIn("waived:", blank.output)
+
+    def test_unread_file_and_real_finding_both_reported(self) -> None:
+        """Unread files, touched findings and partial notes remain visible together."""
+        self.diff_names += "libavformat/rtsp.c\0"
+        self.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.syntax_error_payload()
+        payload["paths"] = {"scanned": ["libavformat/rtspenc.c", "libavformat/rtsp.c"]}
+        payload["results"] = [
+            {
+                "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                "path": "libavformat/rtsp.c",
+                "start": {"line": 11},
+                "end": {"line": 11},
+                "extra": {"message": "missing ff_network_close()"},
+            }
+        ]
+        payload["errors"].append({"type": "PartialParsing", "path": "libavformat/rtsp.c"})
+        self.stub_rc = 1
+        self.stub_json = json.dumps(payload)
+        reasons = ("", "checked both paths by hand")
+        for index in range(len(reasons)):
+            with self.subTest(reason=reasons[index]):
+                step = self.run_c_rules(reasons[index])
+                self.assertEqual(step.rc, 1 - index, step.output)
+                self.assertIn("unread: libavformat/rtspenc.c:", step.output)
+                self.assertIn("finding: libavformat/rtsp.c:11:", step.output)
+                self.assertIn("missing ff_network_close()", step.output)
+                self.assertIn("informational: libavformat/rtsp.c: PartialParsing", step.output)
+                if index:
+                    self.assertIn("waived: checked both paths by hand", step.output)
+
+    def test_unread_unrequested_path_is_unwaivable(self) -> None:
+        """A syntax error outside the requested paths stays non-waivable rc two."""
+        self.assert_unread_reported()
+        self.stub_json = json.dumps(self.syntax_error_payload(path="libavformat/rtsp.c"))
+        reasons = ("", "checked by hand")
+        for index in range(len(reasons)):
+            step = self.run_c_rules(reasons[index])
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_unread_missing_path_is_unwaivable(self) -> None:
+        """A syntax error without a file path stays non-waivable rc two."""
+        self.assert_unread_reported()
+        payload = self.syntax_error_payload()
+        del payload["errors"][0]["path"]
+        self.stub_json = json.dumps(payload)
+        reasons = ("", "checked by hand")
+        for index in range(len(reasons)):
+            step = self.run_c_rules(reasons[index])
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_unread_unknown_type_is_unwaivable(self) -> None:
+        """An unknown error type on a requested path stays non-waivable rc two."""
+        self.assert_unread_reported()
+        self.stub_json = json.dumps(self.syntax_error_payload(type="FutureError"))
+        reasons = ("", "checked by hand")
+        for index in range(len(reasons)):
+            step = self.run_c_rules(reasons[index])
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_unread_invalid_metadata_is_unwaivable(self) -> None:
+        """Reject empty paths, unknown fields and metadata types outside the allow-list."""
+        self.assert_unread_reported()
+        variants = (
+            {"path": ""},
+            {"path": ["libavformat/rtspenc.c"]},
+            {"type": ["Syntax error"]},
+            {"code": "3"},
+            {"code": True},
+            {"code": 3.0},
+            {"code": 4},
+            {"level": ["warn"]},
+            {"level": "error"},
+            {"message": {"text": "syntax error"}},
+            {"unexpected": "value"},
+            {"unexpected": []},
+        )
+        for index in range(len(variants)):
+            self.stub_json = json.dumps(self.syntax_error_payload(**variants[index]))
+            reasons = ("", "checked by hand")
+            for reason in range(len(reasons)):
+                with self.subTest(variant=variants[index], reason=reasons[reason]):
+                    step = self.run_c_rules(reasons[reason])
+                    self.assertEqual(step.rc, 2, step.output)
+                    self.assertNotIn("waived:", step.output)
+
+    def test_multiple_unread_files_each_reported_once(self) -> None:
+        """Every unread requested file gets one review line despite duplicate errors."""
+        self.diff_names += "libavformat/rtsp.c\0"
+        self.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.syntax_error_payload()
+        payload["paths"] = {"scanned": ["libavformat/rtspenc.c", "libavformat/rtsp.c"]}
+        payload["errors"] += [
+            payload["errors"][0],
+            {"type": "Syntax error", "path": "libavformat/rtsp.c"},
+        ]
+        self.stub_json = json.dumps(payload)
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count("unread: libavformat/rtspenc.c:"), 1)
+        self.assertEqual(step.output.count("unread: libavformat/rtsp.c:"), 1)
+
+    def test_unread_collector_requires_requested_paths(self) -> None:
+        """A reader without requested paths or an unread collector cannot hide unread files."""
+        raw = self.syntax_error_payload()
+        requested = frozenset({"libavformat/rtspenc.c"})
+        unread: list[str] = []
+        parsed = upstream_lint._read_semgrep_lists(
+            raw["results"], raw["errors"], requested, unread_paths=unread
+        )
+        self.assertEqual(parsed, ([], []))
+        self.assertEqual(unread, ["libavformat/rtspenc.c"])
+        self.assertIsNone(
+            upstream_lint._read_semgrep_lists(raw["results"], raw["errors"], requested)
+        )
+        self.assertIsNone(
+            upstream_lint._read_semgrep_lists(raw["results"], raw["errors"], unread_paths=[])
+        )
+
     def test_other_error_type_gives_rc_two(self) -> None:
-        """Any error type other than PartialParsing gives step rc 2 with status and output."""
+        """An unrequested syntax error gives step rc 2 with command status and output."""
         self.stub_stdout = "rule parse error\n"
         self.stub_json = json.dumps(
             {
