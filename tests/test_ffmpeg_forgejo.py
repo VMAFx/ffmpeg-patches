@@ -4079,6 +4079,7 @@ class SweepTest(ForgejoTest):
     ) -> subprocess.CompletedProcess[str]:
         """Attempt a stubbed push with an optional promise-row file."""
 
+        (self.tmp / "push-argv.json").unlink(missing_ok=True)
         options = ["--sweep", str(self.sweep)]
         if path is not None:
             options += ["--promises", str(path)]
@@ -4219,12 +4220,15 @@ class SweepTest(ForgejoTest):
     def test_push_ignores_quote_with_at_most_three_spaces(self) -> None:
         """Zero through three leading spaces preserve quote removal outside fences."""
 
+        push_argv = self.tmp / "push-argv.json"
         for indent in range(4):
             with self.subTest(indent=indent):
+                push_argv.unlink(missing_ok=True)
+                self.assertFalse(push_argv.exists())
                 comment = " " * indent + "> I will fix this in the next push."
                 result = self.promise_push(self.promise_stub(comment=comment))
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertTrue((self.tmp / "push-argv.json").exists())
+                self.assertTrue(push_argv.exists())
 
     def test_push_refuses_own_promise_after_quote(self) -> None:
         """Removing another person's quote keeps the following own promise."""
@@ -4350,18 +4354,25 @@ class SweepTest(ForgejoTest):
 
         endings = ("\n", "\r\n", "\r")
         openers = ("````text", "```text")
+        push_argv = self.tmp / "push-argv.json"
         for index in range(3):
             ending = endings[index]
             for pos in range(2):
                 opener = openers[pos]
                 with self.subTest(ending=repr(ending), opener=opener):
+                    push_argv.unlink(missing_ok=True)
+                    self.assertFalse(push_argv.exists())
                     comment = ending.join((opener, "```", "> I will fix this in the next push."))
                     self.assert_promise_refused(self.promise_stub(comment=comment), None, "81815")
+        for index in range(3):
+            ending = endings[index]
             with self.subTest(ending=repr(ending), quoted=True):
+                push_argv.unlink(missing_ok=True)
+                self.assertFalse(push_argv.exists())
                 comment = ending.join(("> I will fix this in the next push.", "Thanks."))
                 result = self.promise_push(self.promise_stub(comment=comment))
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertTrue((self.tmp / "push-argv.json").exists())
+                self.assertTrue(push_argv.exists())
 
     def test_push_refuses_list_inline_fenced_promise(self) -> None:
         """A bullet list item opening an inline code fence retains its quoted promise line."""
