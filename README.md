@@ -91,6 +91,7 @@ already apply and its added lines are not in the tree:
 | `upstream-contributions.json` | Every upstream pull request with its state; source of the contributions table |
 | `scripts/series.py` | `check`, `apply`, `export`, the `coverage` and `warnings` gates, the `contributions` table and release `notes` |
 | `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
+| `scripts/upstream_links.py` | Fills linked upstream issues and related pulls, and checks open pulls for overlaps |
 | `scripts/consumer_stacks.py` | Applies each consumer's patch stack on top of the applied series |
 | `scripts/graph_check.py` | Reports conversion filters FFmpeg inserted on its own into a filtergraph |
 | `scripts/tonemap_parity.py` | Colour difference, time and VRAM of tone-map filter chains against `vf_libplacebo` (ADR-0002) |
@@ -459,6 +460,21 @@ Changes appear in its job summary and the `upstream-drift` artifact as
 `upstream-drift.patch`; the job fails whenever changes need review or drift
 remains. Apply the downloaded patch with `git apply upstream-drift.patch`,
 review it and submit the update through the usual pull request process.
+
+Each contribution record in `upstream-contributions.json` may also carry two
+optional, append-only lists that do not change the README table:
+`fixes_issues` (sorted positive upstream issue numbers named after `Fixes`,
+`Closes` or `Refs` in the pull body) and `related` (sorted objects with
+`number`, `kind` one of `pull` or `issue`, `author`, `reason` one of
+`same-files`, `same-patch-id` or `same-subject`, `state`, and `seen`
+`YYYY-MM-DD` date). Run `python3 scripts/upstream_links.py fill` (`--dry-run`
+to preview without writing) to populate both fields for open and merged
+manifest records from the forge. Run
+`python3 scripts/upstream_links.py check` (adding `--pull N` for any open pull
+not yet in the manifest) to list newly discovered related pulls and issues;
+it exits 1 when at least one unrecorded related pull by another author is open
+or merged after the own pull was opened, and the daily `upstream.yml` job runs
+this check alongside `upstream_drift.py`.
 
 ### Licence
 

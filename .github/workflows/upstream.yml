@@ -35,6 +35,10 @@ jobs:
       - name: Compare every recorded pull request with the forge
         id: drift
         run: python3 scripts/upstream_drift.py --fix
+      - name: Check open pull requests for upstream overlaps
+        id: links
+        if: success() || failure()
+        run: python3 scripts/upstream_links.py check
       - name: Prepare the drift patch and job summary
         id: patch
         if: success() || failure()
@@ -60,5 +64,5 @@ jobs:
           path: upstream-drift.patch
           if-no-files-found: error
       - name: Fail when drift needs review or could not be checked
-        if: ${{ !cancelled() && (steps.patch.outputs.changed == 'true' || steps.drift.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.patch.outputs.changed == 'true' || steps.drift.outcome == 'failure' || steps.links.outcome == 'failure') }}
         run: exit 1

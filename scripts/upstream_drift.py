@@ -44,6 +44,7 @@ except ModuleNotFoundError:
     from scripts import forge_settings, series
 
 Fetch = Callable[[str], dict]
+REQUEST_TIMEOUT = 30
 MAX_SERIES_ENTRIES = 4096
 MAX_SIDECAR_LINES = 4096
 MAX_REPAIR_PATHS = MAX_SERIES_ENTRIES + 2
@@ -101,6 +102,14 @@ def bounded_series(root: Path, findings: series.Findings, repairs: Repairs | Non
     return names
 
 
+def repo_api_url() -> str:
+    """Return the Forgejo API base URL for the configured repository."""
+    try:
+        return f"{forge_settings.api_base()}/repos/{forge_settings.repo()}"
+    except ValueError as exc:
+        raise DriftError(str(exc)) from exc
+
+
 def api_url(url: str, number: int | None = None) -> str:
     """Return the Forgejo API URL for a pull request."""
     match = series.pull_url_pattern().fullmatch(url) if isinstance(url, str) else None
@@ -110,13 +119,16 @@ def api_url(url: str, number: int | None = None) -> str:
     return f"{host}/api/v1/repos/{owner}/{repository}/pulls/{number}"
 
 
-def fetch_json(url: str) -> dict:
+def fetch_json(url: str, *, allow_list: bool = False) -> dict | list:
+    """Fetch and decode a JSON object, or a list when allow_list is set, from the forge."""
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=30) as answer:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as answer:
             data = json.load(answer)
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         raise DriftError(f"{url}: {exc}") from exc
+    if allow_list and isinstance(data, list):
+        return data
     if not isinstance(data, dict):
         raise DriftError(f"{url}: the answer is not a JSON object")
     return data
