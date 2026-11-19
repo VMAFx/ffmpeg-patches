@@ -152,8 +152,9 @@ def run_cli(
     *args: str,
     today: date | None = TODAY,
     sleep: upstream_links.Sleep | None = None,
+    keep_progress: bool = False,
 ) -> tuple[int, str, str]:
-    """Run upstream_links.main with captured stdout and stderr."""
+    """Capture CLI results, optionally retaining the separately tested progress line."""
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = upstream_links.main(
@@ -162,7 +163,14 @@ def run_cli(
             today=today,
             sleep=sleep if sleep is not None else lambda _: None,
         )
-    return rc, out.getvalue(), err.getvalue()
+    output = out.getvalue()
+    if not keep_progress:
+        output = "".join(
+            line
+            for line in output.splitlines(keepends=True)
+            if not (line.startswith("window ") and "; expected requests " in line)
+        )
+    return rc, output, err.getvalue()
 
 
 class PlantedSceneSadOverlapTest(unittest.TestCase):
@@ -203,12 +211,13 @@ class PlantedSceneSadOverlapTest(unittest.TestCase):
                 self.assertEqual(out.strip(), "25805 25950 bcoudurier same-files merged")
 
     def test_planted_control_same_author_exits_zero(self) -> None:
-        """A candidate by the same author is listed as related but exits 0."""
+        """A same-author candidate needs no file request or new relation."""
         same_author_json = PLANTED_OTHER_25950_JSON.replace('"bcoudurier"', '"lusoris"')
         forge = self.planted_forge(other_json=same_author_json)
         rc, out, err = run_cli(self.root, forge, "check", "--pull", "25805")
         self.assertEqual((rc, err), (0, ""))
-        self.assertEqual(out.strip(), "25805 25950 lusoris same-files merged")
+        self.assertEqual(out, "")
+        self.assertNotIn(f"{API}/pulls/25950/files?limit=50&page=1", forge.read)
 
     def test_planted_control_other_file_exits_zero(self) -> None:
         """A candidate touching another file is not related and exits 0."""
@@ -232,7 +241,8 @@ class PlantedSceneSadOverlapTest(unittest.TestCase):
         forge = self.planted_forge(other_json=merged_before_json)
         rc, out, err = run_cli(self.root, forge, "check", "--pull", "25805")
         self.assertEqual((rc, err), (0, ""))
-        self.assertEqual(out.strip(), "25805 25950 bcoudurier same-files merged")
+        self.assertEqual(out, "")
+        self.assertNotIn(f"{API}/pulls/25950/files?limit=50&page=1", forge.read)
 
     def test_planted_control_forge_error_exits_two(self) -> None:
         """A forge error keeps the diagnostic on stderr and exits 2."""
@@ -516,6 +526,7 @@ class FillAndCheckCommandTest(unittest.TestCase):
             {
                 f"{API}/pulls/10": own,
                 f"{API}/pulls/10/files?limit=1&page=1": [{"filename": "a.c"}],
+                f"{API}/pulls?state=all&sort=recentupdate&limit=1&page=1": [],
             }
         )
         with (
@@ -574,7 +585,7 @@ class RequestCostTest(unittest.TestCase):
     def test_fill_reads_each_address_once(self) -> None:
         """Direct fill shares one candidate scan and file memo across all own pulls."""
         forge = FakeForge(self.answers)
-        with unittest.mock.patch("time.sleep") as pause:
+        with unittest.mock.patch("time.sleep") as pause, contextlib.redirect_stdout(io.StringIO()):
             upstream_links.fill_manifest(self.root, forge, today=TODAY)
         self.assertEqual(len(forge.read), 12)
         self.assertEqual(pause.call_count, 12)
@@ -582,9 +593,9 @@ class RequestCostTest(unittest.TestCase):
         self.assertEqual(len(forge.read), len(set(forge.read)))
         self.assertEqual(forge.read.count(self.page), 1)
         rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"]
-        self.assertTrue(all(len(row["related"]) == 7 for row in rows[:3]))
+        self.assertTrue(all(len(row["related"]) == 5 for row in rows[:3]))
         second = FakeForge(self.answers)
-        with unittest.mock.patch("time.sleep"):
+        with unittest.mock.patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
             upstream_links.fill_manifest(self.root, second, today=TODAY)
         self.assertEqual(second.read, forge.read)
 
@@ -607,7 +618,7 @@ class RequestCostTest(unittest.TestCase):
         before = self.path.read_bytes()
         with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
             forge = FakeForge(answers)
-            with unittest.mock.patch.object(upstream_links, "FILL_REQUEST_CAP", 13):
+            with unittest.mock.patch.object(upstream_links, "request_cap", return_value=13):
                 rc, out, err = run_cli(self.root, forge, "fill")
             self.assertEqual((rc, out), (2, ""))
             self.assertIn("count 14, cap 13", err)
@@ -619,7 +630,7 @@ class RequestCostTest(unittest.TestCase):
 
     def test_check_skips_files_for_already_recorded_candidates(self) -> None:
         """Check leaves recorded candidates unfetched while preserving an unrecorded overlap."""
-        with unittest.mock.patch("time.sleep"):
+        with unittest.mock.patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
             upstream_links.fill_manifest(self.root, FakeForge(self.answers), today=TODAY)
         forge = FakeForge(self.answers)
         self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
@@ -639,7 +650,7 @@ class RequestCostTest(unittest.TestCase):
 
     def test_recorded_for_one_target_still_checks_other_targets(self) -> None:
         """A candidate recorded for one pull still needs files for another pull."""
-        with unittest.mock.patch("time.sleep"):
+        with unittest.mock.patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
             upstream_links.fill_manifest(self.root, FakeForge(self.answers), today=TODAY)
         data = json.loads(self.path.read_text(encoding="utf-8"))
         data["contributions"][1]["related"] = []
@@ -702,9 +713,9 @@ class RequestCostTest(unittest.TestCase):
     def test_budget_error_exits_two_without_writing_or_partial_output(self) -> None:
         """Both commands fail on the next request above their caps without writing results."""
         before = self.path.read_bytes()
-        for command, constant in (("fill", "FILL_REQUEST_CAP"), ("check", "CHECK_REQUEST_CAP")):
+        for command in ("fill", "check"):
             forge, pauses = FakeForge(self.answers), []
-            with unittest.mock.patch.object(upstream_links, constant, 8):
+            with unittest.mock.patch.object(upstream_links, "request_cap", return_value=8):
                 rc, out, err = run_cli(self.root, forge, command, sleep=pauses.append)
             self.assertEqual((rc, out), (2, ""))
             self.assertIn("count 9", err)
@@ -715,13 +726,13 @@ class RequestCostTest(unittest.TestCase):
 
     def test_budget_boundary_and_pause_once_per_request(self) -> None:
         """Exactly the cap succeeds and every fetch receives one injected fixed pause."""
-        for command, constant in (("fill", "FILL_REQUEST_CAP"), ("check", "CHECK_REQUEST_CAP")):
+        for command in ("fill", "check"):
             forge, pauses = FakeForge(self.answers), []
             args = ["--root", str(self.root), command]
             if command == "fill":
                 args.append("--dry-run")
             with (
-                unittest.mock.patch.object(upstream_links, constant, 12),
+                unittest.mock.patch.object(upstream_links, "request_cap", return_value=12),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 rc = upstream_links.main(args, fetch=forge, today=TODAY, sleep=pauses.append)
@@ -761,6 +772,172 @@ class RequestCostTest(unittest.TestCase):
             forge = FakeForge({})
             self.assertEqual(run_cli(self.root, forge, command), (0, "", ""))
             self.assertEqual(forge.read, [])
+
+
+def measured_window_forge() -> FakeForge:
+    """Model the measured 556-row window with 503 possible overlap candidates."""
+    own = [forge_pull(number, "2026-11-05") for number in (10, 20)]
+    candidates = [forge_pull(number, "2026-11-06") for number in range(1000, 1556)]
+    for index, row in enumerate(candidates[:556]):
+        row["created_at"] = "2026-11-01T00:00:00Z"
+        if index < 181 or 356 <= index < 452:
+            row["created_at"] = "2026-11-06T00:00:00Z"
+        if 356 <= index < 533:
+            row.update(state="closed", merged=True, merged_at="2026-11-07T00:00:00Z")
+            if index >= 503:
+                row["merged_at"] = "2026-11-04T00:00:00Z"
+        elif index >= 533:
+            row["state"] = "closed"
+    answers = {f"{API}/pulls/{row['number']}": row for row in own[:2]}
+    for number in (10, 20):
+        answers[f"{API}/pulls/{number}/files?limit=50&page=1"] = [{"filename": "shared.c"}]
+    for row in candidates[:556]:
+        number = row["number"]
+        name = "shared.c" if number == 1000 else f"other/{number}.c"
+        answers[f"{API}/pulls/{number}/files?limit=50&page=1"] = [{"filename": name}]
+    for page in range(1, 13):
+        url = f"{API}/pulls?state=all&sort=recentupdate&limit=50&page={page}"
+        answers[url] = candidates[(page - 1) * 50 : page * 50]
+    return FakeForge(answers)
+
+
+class MeasuredWindowTest(unittest.TestCase):
+    """Exercise real-window request counts and each metadata-only exclusion offline."""
+
+    def setUp(self) -> None:
+        """Create an isolated two-pull manifest with a nightly cutoff matching the window."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.path = write_manifest(self.root, [manifest_entry(10), manifest_entry(20)])
+
+    def test_measured_window_fill_and_check_finish_under_derived_caps(self) -> None:
+        """Finish both 556-row scans with exactly 519 paced requests instead of budget errors."""
+        for command in ("fill", "check"):
+            with self.subTest(command=command):
+                write_manifest(self.root, [manifest_entry(10), manifest_entry(20)])
+                forge, pauses = measured_window_forge(), []
+                rc, out, err = run_cli(self.root, forge, command, sleep=pauses.append)
+                self.assertEqual((rc, err), (int(command == "check"), ""))
+                self.assertEqual(len(forge.read), 2 + 12 + 2 + 503)
+                self.assertEqual(len(forge.read), len(set(forge.read)))
+                self.assertEqual(pauses, [0.5] * 519)
+                self.assertLessEqual(len(forge.read), upstream_links.request_cap(2))
+                self.assertIn("1000", out)
+                self.assertTrue(
+                    all(
+                        f"/pulls/{n}/files?" not in url
+                        for n in range(1503, 1556)
+                        for url in forge.read[:519]
+                    )
+                )
+
+    def test_progress_precedes_first_files_request_and_accounts_for_pages(self) -> None:
+        """Publish candidate count and honest one-page and maximum costs before any files read."""
+        forge = measured_window_forge()
+        output, errors, at_files = io.StringIO(), io.StringIO(), []
+        # A second file page must increase the measured cost without changing the estimate.
+        url = f"{API}/pulls/1001/files?limit=50&page=1"
+        forge.answers[url] = [{"filename": f"other/{n}.c"} for n in range(50)]
+        forge.answers[url.replace("page=1", "page=2")] = [{"filename": "last.c"}]
+
+        def fetch(url: str) -> dict | list:
+            """Record visible progress at each file request before serving the fixture."""
+            if "/files?" in url:
+                at_files.append(output.getvalue())
+            return forge(url)
+
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            rc = upstream_links.main(
+                ["--root", str(self.root), "check"], fetch, TODAY, sleep=lambda _: None
+            )
+        self.assertEqual((rc, errors.getvalue()), (1, ""))
+        expected = (
+            "window 2026-11-05T00:00:00+00:00: candidates 556, file candidates 503; "
+            "expected requests 519 (one page per file listing), at most 10114; cap 20062\n"
+        )
+        self.assertEqual(at_files[0], expected)
+        self.assertEqual(output.getvalue().count("expected requests"), 1)
+        self.assertEqual(len(forge.read), 520)
+
+    def test_metadata_filters_keep_old_open_and_strictly_later_merges(self) -> None:
+        """Skip author, closed, early or equal merge, self and old-update rows before files."""
+        write_manifest(self.root, [manifest_entry(10)])
+        own = forge_pull(10, "2026-11-06")
+        candidates = [forge_pull(n, "2026-11-01") for n in range(101, 108)]
+        candidates[0]["user"] = {"login": "alice"}
+        candidates[1]["state"] = "closed"
+        for index, day in ((2, 5), (3, 6), (4, 7)):
+            candidates[index].update(
+                state="closed", merged=True, merged_at=f"2026-11-{day:02}T00:00:00Z"
+            )
+        candidates[6]["updated_at"] = "2026-11-05T00:00:00Z"
+        answers = {
+            f"{API}/pulls/10": own,
+            f"{API}/pulls/10/files?limit=50&page=1": [{"filename": "shared.c"}],
+            f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1": candidates + [own],
+        }
+        for number in (105, 106):
+            answers[f"{API}/pulls/{number}/files?limit=50&page=1"] = [{"filename": "shared.c"}]
+        forge = FakeForge(answers)
+        rc, out, err = run_cli(self.root, forge, "fill")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(len(forge.read), 5)
+        rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"][0]["related"]
+        self.assertEqual([row["number"] for row in rows], [105, 106])
+        self.assertNotIn('"number": 101', out)
+
+    def test_derived_cap_admits_last_request_and_rejects_one_more_with_context(self) -> None:
+        """Allow exactly the derived bound and reject the next request with window and remedy."""
+        write_manifest(self.root, [manifest_entry(10)])
+        answers = {
+            f"{API}/pulls/10": forge_pull(10, "2026-11-05"),
+            f"{API}/pulls/10/files?limit=50&page=1": [{"filename": "shared.c"}],
+            f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1": [forge_pull(101)],
+            f"{API}/pulls/101/files?limit=50&page=1": [{"filename": "other.c"}],
+        }
+        with (
+            unittest.mock.patch.object(upstream_links, "MAX_PULL_PAGES", 1),
+            unittest.mock.patch.object(upstream_links, "MAX_CANDIDATES", 1),
+            unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
+        ):
+            self.assertEqual(upstream_links.request_cap(1), 4)
+            for command in ("fill", "check"):
+                forge, pauses = FakeForge(answers), []
+                request = upstream_links.RequestBudget(
+                    forge, upstream_links.request_cap(1), pauses.append
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if command == "fill":
+                        upstream_links.fill_manifest(self.root, request, dry_run=True, today=TODAY)
+                    else:
+                        upstream_links.check_overlaps(self.root, [], request, today=TODAY)
+                with self.assertRaises(upstream_links.DriftError) as caught:
+                    request("https://example.invalid/one-too-many")
+                message = str(caught.exception)
+                self.assertIn("count 5, cap 4", message)
+                self.assertIn("window start 2026-11-05T00:00:00+00:00", message)
+                self.assertIn("candidates 1", message)
+                self.assertIn("--pull N" if command == "fill" else "--since YYYY-MM-DD", message)
+                self.assertEqual(len(forge.read), 4)
+                self.assertEqual(pauses, [0.5] * 4)
+
+    def test_fill_preserves_checked_and_recorded_rows_without_replaying_files(self) -> None:
+        """Preserve snapshot and relations while checks fetch only new overlaps."""
+        forge = measured_window_forge()
+        self.assertEqual(run_cli(self.root, forge, "fill", today=date(2026, 11, 19))[0], 0)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(data["checked"], "2026-11-12")
+        self.assertEqual([row["number"] for row in data["contributions"][0]["related"]], [1000])
+        repeated = measured_window_forge()
+        self.assertEqual(run_cli(self.root, repeated, "check"), (0, "", ""))
+        self.assertEqual(len(repeated.read), 2 + 12 + 2 + 502)
+        self.assertNotIn(f"{API}/pulls/1000/files?limit=50&page=1", repeated.read)
+        before = self.path.read_bytes()
+        page = f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1"
+        repeated.answers[page][0]["user"] = {"login": "alice"}
+        self.assertEqual(run_cli(self.root, FakeForge(repeated.answers), "fill")[0], 0)
+        self.assertEqual(self.path.read_bytes(), before)
 
 
 class ForgeFileCountTest(unittest.TestCase):
@@ -824,21 +1001,28 @@ class ForgeFileCountTest(unittest.TestCase):
         self.assertEqual(out.strip(), "10 25879 owner same-files open")
         self.assertEqual(forge.read.count(f"{API}/pulls/25879/files?limit=50&page=1"), 1)
 
-    def test_complete_count_disagreement_is_identified_error(self) -> None:
-        """Reject count mismatches for own and candidate complete endpoint listings."""
+    def test_complete_count_disagreement_finishes(self) -> None:
+        """Accept zero and differing counts beside nonempty own and candidate listings."""
         for candidate in (False, True):
-            answers = self.candidate_answers(changed_files=16) if candidate else self.answers
-            if not candidate:
-                answers[f"{API}/pulls/25879"]["changed_files"] = 16
-            before = self.path.read_bytes()
-            for args in (("fill", "--dry-run"), ("fill",), ("check",)):
-                rc, out, err = run_cli(self.root, FakeForge(answers), *args)
-                self.assertEqual((rc, out), (2, ""))
-                self.assertIn(f"{API}/pulls/25879", err)
-                self.assertIn("changed_files", err)
-                self.assertIn("16", err)
-                self.assertIn("15", err)
-                self.assertEqual(self.path.read_bytes(), before)
+            for count in (0, 16):
+                for args in (("fill", "--dry-run"), ("fill",), ("check",)):
+                    with self.subTest(candidate=candidate, count=count, args=args):
+                        write_manifest(self.root, [manifest_entry(25879)])
+                        answers = (
+                            self.candidate_answers(changed_files=count)
+                            if candidate
+                            else dict(self.answers)
+                        )
+                        if not candidate:
+                            answers[f"{API}/pulls/25879"] = COUNT_PULL | {"changed_files": count}
+                        rc, out, err = run_cli(self.root, FakeForge(answers), *args)
+                        self.assertEqual((rc, err), (int(candidate and args[0] == "check"), ""))
+                        if candidate:
+                            self.assertIn("25879", out)
+                        else:
+                            self.assertEqual(
+                                len(answers[f"{API}/pulls/25879/files?limit=50&page=1"]), 15
+                            )
 
     def test_wrong_count_types_are_not_hidden_by_inline_names(self) -> None:
         """Reject malformed counts even when a valid inline files list is present."""
@@ -889,15 +1073,12 @@ class ForgeFileCountTest(unittest.TestCase):
             self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
             self.assertFalse(any("/files?" in url for url in forge.read[:4]))
 
-    def test_inline_complete_count_disagreement_fails(self) -> None:
-        """Reconcile complete inline names instead of ignoring a contradictory count."""
+    def test_inline_complete_count_disagreement_finishes(self) -> None:
+        """Ignore a differing inline count while retaining the validated names."""
         self.answers[f"{API}/pulls/25879"] = COUNT_PULL | {"files": ["file-0.c"]}
-        rc, out, err = run_cli(self.root, FakeForge(self.answers), "check")
-        self.assertEqual((rc, out), (2, ""))
-        self.assertIn(f"{API}/pulls/25879", err)
-        self.assertIn("changed_files", err)
-        self.assertIn("15", err)
-        self.assertIn("1", err)
+        forge = FakeForge(self.answers)
+        self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
+        self.assertFalse(any("/files?" in url for url in forge.read[:4]))
 
     def test_rename_aliases_do_not_inflate_changed_file_count(self) -> None:
         """Compare changed rows while keeping both rename names for overlap matches."""
@@ -1113,7 +1294,7 @@ class OversizedCandidateTest(unittest.TestCase):
         """Every retained candidate page consumes a paced request from the run budget."""
         for budget, expected in ((24, 1), (23, 2)):
             forge, pauses = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1), []
-            with unittest.mock.patch.object(upstream_links, "CHECK_REQUEST_CAP", budget):
+            with unittest.mock.patch.object(upstream_links, "request_cap", return_value=budget):
                 rc, out, err = run_cli(self.root, forge, "check", sleep=pauses.append)
             self.assertEqual(rc, expected)
             self.assertEqual(len(forge.read), budget)

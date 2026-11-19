@@ -474,24 +474,35 @@ merged manifest rows, for example `fill --pull 25805 --pull 25950`. Candidate
 pulls are scanned once per run from the earliest scoped opening date; each
 pull's changed files are fetched at most once. Run
 `python3 scripts/upstream_links.py check` (adding `--pull N` for any open pull
-not yet in the manifest) to list newly discovered related pulls and issues;
+not yet in the manifest) to list newly discovered potential overlaps;
 it exits 1 when at least one unrecorded related pull by another author is open
 or merged after the own pull was opened, and the daily `upstream.yml` job runs
 this check alongside `upstream_drift.py`. By default, `check` scans updates
 since the manifest's `checked` date minus 7 days; `check --since YYYY-MM-DD`
 overrides that window for a catch-up run. Recorded related rows do not trigger
 candidate file reads. A candidate recorded for one own pull can still need
-files for another. Every candidate remains eligible for a same-files match
-even when its subject and patch IDs differ.
+files for another. Same-author candidates, closed unmerged candidates and
+candidates merged at or before the own pull opened are skipped before file
+reads; older open candidates remain eligible. Every remaining candidate can
+match files even when its subject and patch IDs differ. Existing related
+records are retained; skipped candidates produce no new records.
 When a candidate's file listing is incomplete at the 1000-name or 20-page limit without a proven shared file, `fill --dry-run`, `fill` and `check` print its pull number, the number of files read and `same-files undecided`; it is not recorded as a relation, and `check` exits 1 for the undecided comparison.
 
 Each run pauses 0.5 seconds before every request, including the first, and
-retains the shared 30-second request deadline. `fill` permits 500 requests;
-`check` permits 100. The next request above the cap exits 2 with its count and
-cap; it produces no partial result and `fill` leaves the manifest unchanged.
-Use `fill --pull N` to process smaller parts. The week-long margin revisits
-recent updates around the drift snapshot; the smaller daily cap bounds load
-on the public forge.
+retains the shared 30-second request deadline. A first fill costs `N + P + F`
+requests for `N` own pulls, `P` list pages and `F` total fetched file pages
+across distinct own and eligible candidate pulls (with one file page per
+pull, the measured two-pull, 12-page window needs at most 519 requests and
+259.5 seconds of pauses plus network time, before author and memo savings). Both commands derive their request cap as
+`N + 20 + (N + 1000) * 20` from the own-pull count, 20 list pages, 1000
+candidate rows and 20 file pages per pull. Before reading files, a progress
+line gives the candidate count, expected requests assuming one file page per
+pull and a file-page upper bound. A request above the cap exits 2 with its
+count, cap, window start, candidate count and narrowing option; `fill` writes
+nothing on error. Select a later-opening `fill --pull N`, or narrow a check
+with `check --since YYYY-MM-DD`. The week-long margin revisits recent updates
+around the drift snapshot, which can advance independently of the link scan;
+fill preserves that snapshot date.
 
 ### Licence
 

@@ -39,10 +39,6 @@ Fetch = Callable[[str], dict | list]
 Sleep = Callable[[float], None]
 DriftError = upstream_drift.DriftError
 REQUEST_TIMEOUT = upstream_drift.REQUEST_TIMEOUT
-# At two requests per second, a full fill spends at most 250 seconds pacing;
-# the daily check spends at most 50. Larger histories require explicit fill parts.
-FILL_REQUEST_CAP = 500
-CHECK_REQUEST_CAP = 100
 REQUEST_PAUSE_SECONDS = 0.5
 # Revisit a week around the drift snapshot to cover date granularity and late updates.
 CHECK_MARGIN_DAYS = 7
@@ -72,12 +68,19 @@ class RequestBudget:
         self.fetch = fetch
         self.cap = cap
         self.count = 0
+        self.window_start = "not yet read"
+        self.candidates = 0
+        self.narrow_option = "--pull N or check --since YYYY-MM-DD"
         self.sleep = sleep if sleep is not None else time.sleep
 
     def __call__(self, url: str) -> dict | list:
         """Pause once per admitted request and preserve the underlying fetch deadline."""
         if self.count >= self.cap:
-            raise DriftError(f"request budget exceeded: count {self.count + 1}, cap {self.cap}")
+            raise DriftError(
+                f"request budget exceeded: count {self.count + 1}, cap {self.cap}; "
+                f"window start {self.window_start}; candidates {self.candidates}; "
+                f"narrow the window with {self.narrow_option}"
+            )
         self.count += 1
         self.sleep(REQUEST_PAUSE_SECONDS)
         return self.fetch(url)
@@ -85,7 +88,10 @@ class RequestBudget:
 
 def _budgeted(fetch: Fetch, cap: int) -> RequestBudget:
     """Reuse the CLI run counter or create one for a direct fill or check call."""
-    return fetch if isinstance(fetch, RequestBudget) else RequestBudget(fetch, cap)
+    if isinstance(fetch, RequestBudget):
+        fetch.cap = min(fetch.cap, cap)
+        return fetch
+    return RequestBudget(fetch, cap)
 
 
 class RelatedRow(dict):
@@ -474,6 +480,8 @@ def read_candidate_pulls(since: str, fetch: Fetch) -> list[dict[str, object]]:
                 raise DriftError(f"{repo_url}/pulls: candidate pulls exceed {MAX_PULL_ROWS}")
             seen_numbers.add(num)
             candidates.append(item)
+            if isinstance(fetch, RequestBudget):
+                fetch.candidates = len(candidates)
         if len(batch) < PAGE_SIZE or reached_older:
             return candidates
     raise DriftError(f"{repo_url}/pulls: exceeds {MAX_PULL_PAGES} pages")
@@ -491,39 +499,89 @@ def memoized_files(
 def _resolved_files(
     item: dict, fetch: Fetch, files: dict[int, FileNames], *, partial: bool = False
 ) -> FileNames:
-    """Resolve names once and reconcile complete listings against forge row counts."""
+    """Resolve file names once without trusting the forge's separate count."""
     number = int(item["number"])
     if item["inline_files"]:
         files.setdefault(number, item["files"])
-    names = memoized_files(number, fetch, files, partial=partial)
-    count = item["changed_files"]
-    if names.complete and count is not None and count != names.file_count:
-        raise DriftError(
-            f"{pull_api_url(number)}: changed_files count {count} disagrees with "
-            f"complete listing of {names.file_count} files"
+    return memoized_files(number, fetch, files, partial=partial)
+
+
+def request_cap(own_pulls: int) -> int:
+    """Bound metadata, list pages and all accepted own and candidate file pages."""
+    return own_pulls + MAX_PULL_PAGES + (own_pulls + MAX_CANDIDATES) * MAX_FILE_PAGES
+
+
+def _candidate_eligible(own: dict, candidate: dict, recorded: set[int]) -> bool:
+    """Apply the existing overlap predicate and per-target exclusions before file I/O."""
+    number = int(candidate["number"])
+    if number == own["number"] or number in recorded:
+        return False
+    opened = parse_timestamp(own["created_at"], "created_at")
+    if parse_timestamp(candidate["updated_at"], "updated_at") < opened:
+        return False
+    row = candidate | {"own_author": own["author"], "own_opened": own["created_at"]}
+    return bool(overlaps([row]))
+
+
+def _print_request_plan(
+    own: list[dict],
+    candidates: list[dict],
+    targets: list[tuple[int, str, set[int]]],
+    fetch: Fetch,
+    cutoff: datetime,
+) -> None:
+    """Print one-page cost and a file-page upper bound before the first files request."""
+    needed = {int(pull["number"]): pull for pull in own[: upstream_drift.MAX_SERIES_ENTRIES]}
+    eligible: set[int] = set()
+    for pull, (_, _, recorded) in zip(
+        own[: upstream_drift.MAX_SERIES_ENTRIES],
+        targets[: upstream_drift.MAX_SERIES_ENTRIES],
+        strict=True,
+    ):
+        for candidate in candidates[:MAX_CANDIDATES]:
+            if _candidate_eligible(pull, candidate, recorded):
+                number = int(candidate["number"])
+                needed.setdefault(number, candidate)
+                eligible.add(number)
+    listings = sum(
+        not item["inline_files"]
+        for item in list(needed.values())[: MAX_CANDIDATES + upstream_drift.MAX_SERIES_ENTRIES]
+    )
+    if isinstance(fetch, RequestBudget):
+        fetch.candidates = len(candidates)
+        print(
+            f"window {cutoff.isoformat()}: candidates {len(candidates)}, "
+            f"file candidates {len(eligible)}; expected requests {fetch.count + listings} "
+            f"(one page per file listing), at most {fetch.count + listings * MAX_FILE_PAGES}; "
+            f"cap {fetch.cap}"
         )
-    return names
 
 
 def inspect_own_pull(
-    number: int, url: str, fetch: Fetch, files: dict[int, FileNames]
+    number: int,
+    url: str,
+    fetch: Fetch,
+    files: dict[int, FileNames],
+    *,
+    metadata_only: bool = False,
 ) -> dict[str, object]:
-    """Read one own pull and memoize its changed files for reuse as a candidate."""
+    """Read an own pull, optionally deferring file resolution until after run planning."""
     p_url = pull_api_url(number, url)
     own = parse_forge_pull(fetch(p_url), source=p_url)
     if own["number"] != number:
         raise DriftError(f"{p_url}: pull number {own['number']} disagrees with {number}")
-    own["files"] = _resolved_files(own, fetch, files)
+    if not metadata_only:
+        own["files"] = _resolved_files(own, fetch, files)
     return own
 
 
 def read_run_pulls(
     targets: list[tuple[int, str, set[int]]], fetch: Fetch, since: datetime | None = None
 ) -> tuple[list[dict], list[dict], dict[int, FileNames]]:
-    """Read scoped own pulls and one shared candidate window with a fresh file memo."""
+    """Plan one bounded metadata window before reading and memoizing own file names."""
     files: dict[int, FileNames] = {}
     own = [
-        inspect_own_pull(number, url, fetch, files)
+        inspect_own_pull(number, url, fetch, files, metadata_only=True)
         for number, url, _ in targets[: upstream_drift.MAX_SERIES_ENTRIES]
     ]
     if not own:
@@ -533,7 +591,12 @@ def read_run_pulls(
         for pull in own[: upstream_drift.MAX_SERIES_ENTRIES]
     )
     cutoff = max(earliest, since) if since is not None else earliest
+    if isinstance(fetch, RequestBudget):
+        fetch.window_start = cutoff.isoformat()
     candidates = read_candidate_pulls(cutoff.isoformat(), fetch)
+    _print_request_plan(own, candidates, targets, fetch, cutoff)
+    for pull in own[: upstream_drift.MAX_SERIES_ENTRIES]:
+        pull["files"] = _resolved_files(pull, fetch, files)
     return own, candidates, files
 
 
@@ -544,14 +607,10 @@ def inspect_candidates(
     files: dict[int, FileNames],
     fetch: Fetch,
 ) -> list[dict]:
-    """Filter updates per own opening date and fetch only unrecorded candidates' files."""
-    opened = parse_timestamp(own["created_at"], "created_at")
+    """Read files only for unrecorded candidates that can overlap this own pull."""
     eligible: list[dict] = []
     for candidate in candidates[:MAX_CANDIDATES]:
-        number = int(candidate["number"])
-        if number == own["number"] or number in recorded:
-            continue
-        if parse_timestamp(candidate["updated_at"], "updated_at") < opened:
+        if not _candidate_eligible(own, candidate, recorded):
             continue
         candidate["files"] = _resolved_files(candidate, fetch, files, partial=True)
         eligible.append(candidate)
@@ -657,7 +716,8 @@ def fill_manifest(
     original = path.read_bytes() if path.is_file() else b""
     data = _checked_manifest(root)
     targets = _fill_targets(data["contributions"], pulls or [])
-    request = _budgeted(fetch, FILL_REQUEST_CAP)
+    request = _budgeted(fetch, request_cap(len(targets)))
+    request.narrow_option = "--pull N (select a later-opening own pull)"
     own_pulls, candidates, files = read_run_pulls(targets, request)
     by_number = {e["number"]: e for e in data["contributions"][: upstream_drift.MAX_SERIES_ENTRIES]}
     changes: list[str] = []
@@ -735,7 +795,9 @@ def check_overlaps(
     targets = _check_targets(data["contributions"], extra_pulls)
     if len(targets) > upstream_drift.MAX_SERIES_ENTRIES:
         raise DriftError(f"check targets exceed {upstream_drift.MAX_SERIES_ENTRIES}")
-    request = _budgeted(fetch, CHECK_REQUEST_CAP)
+    request = _budgeted(fetch, request_cap(len(targets)))
+    request.window_start = cutoff.isoformat()
+    request.narrow_option = "check --since YYYY-MM-DD"
     own_pulls, candidates, files = read_run_pulls(targets, request, cutoff)
     lines: list[str] = []
     loud: list[dict] = []
@@ -806,8 +868,7 @@ def main(
         return 2 if exc.code else 0
     try:
         series.pull_url_pattern()
-        cap = FILL_REQUEST_CAP if args.command == "fill" else CHECK_REQUEST_CAP
-        request = RequestBudget(fetch, cap, sleep)
+        request = RequestBudget(fetch, request_cap(upstream_drift.MAX_SERIES_ENTRIES), sleep)
         if args.command == "fill":
             changes = fill_manifest(
                 args.root, request, dry_run=args.dry_run, today=today, pulls=args.pull
