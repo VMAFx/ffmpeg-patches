@@ -771,13 +771,14 @@ class FateShapeTest(unittest.TestCase):
                 self.assertEqual(self.findings(source), [])
 
     def test_graph_self_replacements_keep_registration(self) -> None:
-        """Self names inside functions, substitutions and suffixes retain old edges."""
-        for destination, value in (
-            ("FATE_FFMPEG", "$(if $(CONFIG_X), $(FATE_FFMPEG))"),
-            ("FATE_FFMPEG", "$(FATE_FFMPEG:%=fate-%)"),
-            ("FATE_FFMPEG-yes", "$(FATE_FFMPEG:%=fate-%)"),
-            ("FATE_FFMPEG-$(CONFIG_X)", "$(if $(CONFIG_X), $(FATE_FFMPEG-yes))"),
-            ("FATE_FFMPEG", "prefix_FATE_FFMPEG_suffix"),
+        """Actual self references inside functions, substitutions and braces retain old edges."""
+        for destination, value, retained in (
+            ("FATE_FFMPEG", "$(if $(CONFIG_X), $(FATE_FFMPEG))", True),
+            ("FATE_FFMPEG", "$(FATE_FFMPEG:%=fate-%)", True),
+            ("FATE_FFMPEG-yes", "$(FATE_FFMPEG-yes:%=fate-%)", True),
+            ("FATE_FFMPEG-$(CONFIG_X)", "$(if $(CONFIG_X), $(FATE_FFMPEG-yes))", True),
+            ("FATE_FFMPEG", "${FATE_FFMPEG} more", True),
+            ("FATE_FFMPEG", "prefix_FATE_FFMPEG_suffix", False),
         ):
             with self.subTest(destination=destination, value=value):
                 source = (
@@ -788,7 +789,56 @@ class FateShapeTest(unittest.TestCase):
                 ffmpeg = {upstream_lint._fate_shape_normalize(destination)}
                 self.assertEqual(
                     [f.rule for f in self.findings(source, graph=graph, ffmpeg=ffmpeg)],
-                    ["registration"],
+                    ["registration"] if retained else [],
+                )
+
+    def test_graph_literal_self_name_replaces_edges(self) -> None:
+        """Literal destination names replace old edges while actual self references retain them."""
+        for value, retained in (
+            ("fate-real-FATE_FFMPEG", False),
+            ("prefix_FATE_FFMPEG_suffix", False),
+            ("$(FATE_FFMPEG_OTHER)", False),
+            ("$(FATE_FFMPEG) more", True),
+            ("${FATE_FFMPEG} more", True),
+        ):
+            with self.subTest(value=value):
+                source = f"FATE_FFMPEG += $(OLD)\nFATE_FFMPEG := {value}\n"
+                graph = upstream_lint._fate_shape_graph([source])
+                self.assertEqual("FATE_FFMPEG" in graph.get("OLD", set()), retained)
+
+    def test_registration_replacements_drop_old_appends(self) -> None:
+        """Replacements discard old literal registrations and keep later append provenance."""
+        for variable in ("FATE_FFMPEG", "FATE_FFMPEG-yes", "FATE_FFMPEG-$(CONFIG_X)"):
+            for value in ("fate-real", f"fate-real-{variable.split('-', 1)[0]}"):
+                with self.subTest(variable=variable, value=value):
+                    source = (
+                        f"{variable} += fate-x\n{variable} = {value}\n"
+                        "fate-x: CMD = run libavutil/tests/x\n"
+                    )
+                    roots = {upstream_lint._fate_shape_normalize(variable)}
+                    self.assertEqual(self.findings(source, ffmpeg=roots), [])
+                    source += f"{variable} += fate-x\n"
+                    findings = self.findings(source, ffmpeg=roots)
+                    self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 4)])
+
+    def test_registration_self_reference_and_scope_preserve_appends(self) -> None:
+        """Only actual self references or scoped replacements preserve prior literal appends."""
+        for replacement, retained in (
+            ("FATE_FFMPEG = $(FATE_FFMPEG) more\n", True),
+            ("FATE_FFMPEG = ${FATE_FFMPEG} more\n", True),
+            ("ifdef CONFIG_X\nFATE_FFMPEG = fate-real\nendif\n", True),
+            ("define RESET\nFATE_FFMPEG = fate-real\nendef\n", True),
+            ("FATE_FFMPEG = fate-real-FATE_FFMPEG\n", False),
+        ):
+            with self.subTest(replacement=replacement):
+                source = (
+                    "FATE_FFMPEG += fate-x\n"
+                    + replacement
+                    + "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source)],
+                    [("registration", 1)] if retained else [],
                 )
 
     def test_graph_define_replacements_keep_registration(self) -> None:
@@ -928,6 +978,27 @@ class FateShapeTest(unittest.TestCase):
             with self.subTest(command=command):
                 findings = self.findings(f"fate-bt2408: CMD = {command}\n")
                 self.assertEqual([item.rule for item in findings], [rule])
+
+    def test_grep_command_positions_ignore_data(self) -> None:
+        """Grep assertions require command position rather than metadata or other arguments."""
+        for command, expected in (
+            ("framecrc -metadata title=grep -f lavfi -i testsrc2", []),
+            ("run x grep", []),
+            ("printf '%s' 'grep'", []),
+            ("grep x", ["grep"]),
+            ("run grep x", ["grep"]),
+            ("cmd | grep x", ["pipe", "grep"]),
+            ("cmd;grep x", ["grep"]),
+            ("cmd && grep x", ["grep"]),
+            ("cmd || grep x", ["grep"]),
+            ('sh -c "run x && ! grep -q failed $(errfile)"', ["grep"]),
+            ('sh -c "printf grep"', []),
+            ('run x "data | grep x"', []),
+            ('"grep data"', []),
+            ("'grep data'", []),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual([f.rule for f in self.findings(f"CMD = {command}\n")], expected)
 
     def test_pipeline_boundaries_pass(self) -> None:
         """Quoted, escaped and expansion pipes, OR lists and data generators pass."""
@@ -1124,8 +1195,26 @@ class FateShapeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no ffmpeg"):
             upstream_lint._fate_shape_ffmpeg(makefile)
 
+    def test_shell_escaped_space_and_operator_comments(self) -> None:
+        """Escaped spaces keep hashes in words while control operators start comments."""
+        for command, rules in (
+            (r"run x foo\ #bar | sort", ["helper-pipe"]),
+            ("run x;# run y | sort", []),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)], rules
+                )
+        for operator in (";", "&", "|", "(", ")", "&&", "||", ";;", "|&"):
+            with self.subTest(operator=operator):
+                command = f"printf x{operator}# run y | sort"
+                self.assertEqual(self.findings(command, shell_grammar=True), [])
+                self.assertEqual(
+                    upstream_lint._fate_shell_uncomment(command), f"printf x{operator}"
+                )
+
     def test_shell_quoted_hash_continuation_provenance(self) -> None:
-        """Shell comment handling retains both endpoints of joined physical lines."""
+        """Real shell continuations retain endpoints while comment backslashes end at newline."""
         source = "ffmpeg -metadata title='#' \\\n    -i input | sort\n"
         for added in ({1}, {2}):
             with self.subTest(added=added):
@@ -1133,7 +1222,34 @@ class FateShapeTest(unittest.TestCase):
                 self.assertEqual([f.rule for f in findings], ["helper-pipe"])
                 self.assertEqual([f.line for f in findings], list(added))
         self.assertEqual(self.findings(source, {3}, shell_grammar=True), [])
-        self.assertEqual(self.findings("ffmpeg x # comment \\\n | sort\n", shell_grammar=True), [])
+        source = "ffmpeg x # comment \\\nrun y | sort\n"
+        self.assertEqual(self.findings(source, {1}, shell_grammar=True), [])
+        findings = self.findings(source, {2}, shell_grammar=True)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("helper-pipe", 2)])
+        self.assertEqual(self.findings("CMD = " + source), [])
+        source = 'run x "quoted # \\\ntext" | sort\n'
+        for added in ({1}, {2}):
+            with self.subTest(added=added):
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source, added, shell_grammar=True)],
+                    [("helper-pipe", min(added))],
+                )
+
+    def test_endian_quoted_and_escaped_graph_delimiters(self) -> None:
+        """Quoted or escaped graph delimiters cannot invent endian filters or consumers."""
+        for option in ("-lavfi", "-vf", "-filter_complex", "-filter:v"):
+            for graph in (
+                "drawtext=text='sample,format=gray16le,null,end'",
+                r"drawtext=text=sample\,format=gray16le,null",
+                "drawtext=text='sample;format=gray16le,null'",
+                r"drawtext=text=sample\;format=gray16le,null",
+            ):
+                with self.subTest(option=option, graph=graph):
+                    self.assertEqual(self.findings(f'CMD = framecrc {option} "{graph}"\n'), [])
+            for graph in ("format=gray16le,null", "drawtext=text='sample\\',format=gray16le,null"):
+                with self.subTest(option=option, graph=graph):
+                    findings = self.findings(f'CMD = framecrc {option} "{graph}"\n')
+                    self.assertEqual([f.rule for f in findings], ["endian"])
 
     def test_endian_graph_fails(self) -> None:
         """Explicit endian format filters fail for each supported graph option."""
@@ -1256,7 +1372,7 @@ class FateShapeTest(unittest.TestCase):
                     self.assertIn("pass --fate-shape-reason", step.output)
 
     def test_range_aggregation_uses_all_revision_files(self) -> None:
-        """An unchanged sibling and Makefile connect a changed registration to ffmpeg."""
+        """Sibling aggregation survives column and fixed-pattern Git configuration overrides."""
         fixture = self.fixture()
         fixture.write(
             "tests/Makefile", "$(CUSTOM): ffmpeg$(PROGSSUF)$(EXESUF)\nCUSTOM += $(MIDDLE)\n"
@@ -1270,11 +1386,51 @@ class FateShapeTest(unittest.TestCase):
         )
         fixture.commit()
         fixture.write("tests/Makefile", "$(IGNORED): ffmpeg$(PROGSSUF)$(EXESUF)\n")
-        with unittest.mock.patch.object(upstream_lint, "_git", wraps=upstream_lint._git) as git:
-            step = upstream_lint._fate_shape(fixture.root, base, "HEAD", "")
-        self.assertEqual(step.rc, 1, step.output)
-        self.assertIn("FATE_FILTER-yes -> MIDDLE -> CUSTOM", step.output)
-        self.assertLessEqual(len(git.call_args_list), 5)
+        expected = None
+        for column, pattern in (("false", "basic"), ("true", "basic"), ("false", "fixed")):
+            with self.subTest(column=column, pattern=pattern):
+                fixture.git("config", "grep.column", column)
+                fixture.git("config", "grep.patternType", pattern)
+                with unittest.mock.patch.object(
+                    upstream_lint, "_git", wraps=upstream_lint._git
+                ) as git:
+                    step = upstream_lint._fate_shape(fixture.root, base, "HEAD", "")
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("FATE_FILTER-yes -> MIDDLE -> CUSTOM", step.output)
+                self.assertLessEqual(len(git.call_args_list), 5)
+                if expected is None:
+                    expected = step.output
+                self.assertEqual(step.output, expected)
+
+    def test_revision_comment_separators_and_malformed_records(self) -> None:
+        """Only newlines delimit Git records; Unicode or control comment separators remain data."""
+        for separator in ("\u2028", "\f"):
+            with self.subTest(separator=repr(separator)):
+                fixture = self.fixture()
+                fixture.write(
+                    "tests/fate/aggregate.mak",
+                    f"# before{separator}after\nFATE_FFMPEG += $(FATE_LIBAVUTIL)\n",
+                )
+                fixture.commit()
+                base = fixture.git("rev-parse", "HEAD").strip()
+                fixture.write(
+                    "tests/fate/shape.mak",
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n",
+                )
+                fixture.commit()
+                step = upstream_lint._fate_shape(fixture.root, base, "HEAD", "")
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("registration=1", step.output)
+        for listing in ("missing separator\n", "HEAD:tests/fate/x.mak\0# ok\n\n"):
+            with (
+                self.subTest(listing=listing),
+                unittest.mock.patch.object(
+                    upstream_lint, "_fate_makefile", return_value=FATE_FFMPEG_RULE
+                ),
+                unittest.mock.patch.object(upstream_lint, "_git", return_value=listing),
+                self.assertRaisesRegex(ValueError, "malformed git grep record"),
+            ):
+                upstream_lint._fate_shape_revision(Path("."), "HEAD")
 
     def test_range_missing_makefile_is_unwaivable(self) -> None:
         """A missing revision Makefile returns rc 2 even with a waiver."""
