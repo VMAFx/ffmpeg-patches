@@ -28,7 +28,7 @@ It reports both unit-test wall time and job elapsed time against that budget and
 Job elapsed time starts at the workflow's first step in CI, before checkout and tool installation; locally it starts when `make test` enters, before `dev-deps`, `build` and `lint`.
 `SERIES_JOB_STARTED_AT` carries that epoch timestamp; a missing or malformed value fails explicitly instead of falling back to unit time.
 The same budget applies on a developer host and in the workflow, so a loaded host can fail it while the workflow would pass.
-The unit run reports the ten slowest scheduled class or singleton tasks (all tasks for smaller runs), their durations and shares of summed suite time, plus the sum and suite count; summed parallel suite time differs from wall time.
+The unit run reports the ten slowest scheduled class or singleton tasks (all tasks for smaller runs), their durations and shares of summed suite time, plus the sum and suite count; summed parallel suite time differs from wall time. It then reports the test count, unit wall time and aggregate result, including skips and other result counts.
 
 Pins live in `requirements-dev.in`; after editing it, recompile from the repository root with `uv pip compile --universal --generate-hashes --python-version=3.12 requirements-dev.in --output-file=requirements-dev.txt`.
 

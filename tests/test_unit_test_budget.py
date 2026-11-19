@@ -44,6 +44,24 @@ POOL_WRAPPER_CODE = (
     "):\n"
     "    sys.exit(unit_test_budget.main(sys.argv[2:]))\n"
 )
+SUMMARY_POOL_SOURCE = (
+    "import unittest\n"
+    "from scripts import unit_test_budget\n"
+    "class SummaryCase(unittest.TestCase):\n"
+    "    def test_one(self):\n"
+    '        """Pass the first summary case."""\n'
+    "        self.assertTrue(True)\n"
+    "    def test_two(self):\n"
+    '        """Pass the second summary case."""\n'
+    "        self.assertTrue(True)\n"
+    "    @unittest.skip('planted skip')\n"
+    "    def test_three(self):\n"
+    '        """Skip the third summary case."""\n'
+    "        self.fail('skipped body must not run')\n"
+    "def load_tests(loader, tests, pattern):\n"
+    '    """Schedule each summary case independently."""\n'
+    "    return unit_test_budget.individual_test_suites(tests)\n"
+)
 
 
 class UnitTestBudgetTest(unittest.TestCase):
@@ -123,6 +141,8 @@ class UnitTestBudgetTest(unittest.TestCase):
             with self.subTest(status=rc):
                 result, output = self.run_timed(1, rc)
                 self.assertEqual(result, rc)
+                self.assertIn("\n\nFAILED\n", output)
+                self.assertNotIn("\nOK", output)
                 self.assertNotIn("FAIL wall-time budget exceeded", output)
                 result, output = self.run_timed(361, rc)
                 self.assertEqual(result, rc)
@@ -493,6 +513,67 @@ class UnitTestBudgetTest(unittest.TestCase):
         tree = ast.parse(source)
         names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
         self.assertEqual(names & forbidden, set(), "shared fixtures require coarser tasks")
+
+
+class RunSummaryTest(unittest.TestCase):
+    """Restore aggregate counts and status after the parallel runner hook's timings."""
+
+    def test_real_pool_reports_three_tests_and_one_skip(self) -> None:
+        """Three bounded singleton tasks retain their aggregate count and skip summary."""
+        result = UnitTestBudgetTest().run_pool_fixture(SUMMARY_POOL_SOURCE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ran 3 tests in ", result.stderr)
+        self.assertIn("\n\nOK (skipped=1)\n", result.stderr)
+        self.assertLess(result.stderr.index("unit suites:"), result.stderr.index("Ran 3 tests"))
+
+    def test_real_pool_reports_failure_and_preserves_nonzero_status(self) -> None:
+        """A bounded planted failure prints its aggregate failure count and fails the wrapper."""
+        source = SINGLETON_POOL_SOURCE.replace("self.assertTrue(True)", "self.fail('planted')", 1)
+        result = UnitTestBudgetTest().run_pool_fixture(source)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("\n\nFAILED (failures=1", result.stderr)
+        self.assertNotIn("\nOK", result.stderr)
+
+    def test_real_pool_reports_singular_test(self) -> None:
+        """Exactly one bounded test uses the parallel runner's singular summary wording."""
+        source = SINGLETON_POOL_SOURCE.split("    def test_two(", 1)[0]
+        result = UnitTestBudgetTest().run_pool_fixture(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ran 1 test in ", result.stderr)
+        self.assertIn("\n\nOK\n", result.stderr)
+
+    def test_real_pool_reports_all_result_counts_in_parallel_order(self) -> None:
+        """Failures, errors, skips and expected outcomes retain the upstream info order."""
+        source = (
+            "import unittest\n"
+            "class OutcomesCase(unittest.TestCase):\n"
+            "    def test_failure(self):\n"
+            '        """Fail the planted assertion."""\n'
+            "        self.fail('planted failure')\n"
+            "    def test_error(self):\n"
+            '        """Raise the planted error."""\n'
+            "        raise ValueError('planted error')\n"
+            "    @unittest.skip('planted skip')\n"
+            "    def test_skip(self):\n"
+            '        """Skip the planted case."""\n'
+            "        self.fail('must not run')\n"
+            "    @unittest.expectedFailure\n"
+            "    def test_expected_failure(self):\n"
+            '        """Fail as expected."""\n'
+            "        self.fail('expected failure')\n"
+            "    @unittest.expectedFailure\n"
+            "    def test_unexpected_success(self):\n"
+            '        """Pass unexpectedly."""\n'
+            "        self.assertTrue(True)\n"
+        )
+        result = UnitTestBudgetTest().run_pool_fixture(source)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("Ran 5 tests in ", result.stderr)
+        self.assertIn(
+            "\n\nFAILED (failures=1, errors=1, skipped=1, "
+            "expected failures=1, unexpected successes=1)\n",
+            result.stderr,
+        )
 
 
 class JobElapsedBudgetTest(unittest.TestCase):

@@ -16,6 +16,7 @@ import time
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -30,6 +31,19 @@ UNIT_BUDGET_SHARE = 0.60
 JOB_START_VARIABLE = "SERIES_JOB_STARTED_AT"
 TIMING_DIRECTORY_VARIABLE = "UNIT_SUITE_TIMINGS"
 SLOWEST_SUITE_COUNT = 10
+
+
+class SuiteRecord(NamedTuple):
+    """Carry one scheduled task's timing and the parent runner's result counts."""
+
+    name: str
+    duration: float
+    tests_run: int
+    failures: int
+    errors: int
+    skipped: int
+    expected_failures: int
+    unexpected_successes: int
 
 
 def individual_test_suites(tests: unittest.TestSuite) -> unittest.TestSuite:
@@ -58,7 +72,7 @@ def job_timeout_seconds(workflow: Path = WORKFLOW) -> int:
 
 
 class TimedSuiteRunner(unittest.TextTestRunner):
-    """Record one duration per scheduled task using unittest_parallel's runner hook."""
+    """Record duration and result counts per task through unittest_parallel's runner hook."""
 
     def __init__(self, **kwargs: object) -> None:
         """Keep the parallel result's progress while suppressing per-task summaries."""
@@ -66,21 +80,35 @@ class TimedSuiteRunner(unittest.TextTestRunner):
         super().__init__(**kwargs)
 
     def run(self, test: unittest.TestSuite) -> unittest.TestResult:
-        """Time the complete task including its class and module fixtures."""
+        """Time the complete task and record its result including class and module fixtures."""
         first = next(iter(test), None)
         name = first.id() if first is not None else "empty suite"
         if test.countTestCases() > 1 and first is not None:
             name = name.rsplit(".", 1)[0]
         started = time.perf_counter()
+        result = unittest.TestResult()
         try:
-            return super().run(test)
+            result = super().run(test)
+            return result
         finally:
             elapsed = time.perf_counter() - started
             directory = os.environ[TIMING_DIRECTORY_VARIABLE]
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", suffix=".tmp", dir=directory, delete=False
             ) as record:
-                json.dump([name, elapsed], record)
+                json.dump(
+                    SuiteRecord(
+                        name,
+                        elapsed,
+                        result.testsRun,
+                        len(result.failures),
+                        len(result.errors),
+                        len(result.skipped),
+                        len(result.expectedFailures),
+                        len(result.unexpectedSuccesses),
+                    ),
+                    record,
+                )
             path = Path(record.name)
             path.replace(path.with_suffix(".json"))
 
@@ -96,10 +124,35 @@ def print_suite_timings(records: Sequence[tuple[str, float]]) -> None:
         print(f"  {duration:.3f} s ({share:.1%}) {name}", file=sys.stderr)
 
 
+def print_run_summary(records: Sequence[SuiteRecord], elapsed: float, rc: int) -> None:
+    """Restore unittest_parallel's aggregate wording and result-info order after timings."""
+    tests_run = sum(records[index].tests_run for index in range(len(records)))
+    fields = ("failures", "errors", "skipped", "expected_failures", "unexpected_successes")
+    infos = []
+    for index in range(len(fields)):
+        field = fields[index]
+        count = sum(getattr(records[row], field) for row in range(len(records)))
+        if count:
+            infos.append(f"{field.replace('_', ' ')}={count}")
+    # Only the child knows the scheduled task count; records cover completed tasks.
+    # A nonzero child status must forbid OK even when missing records hide failures.
+    success = rc == 0 and not any(
+        records[index].failures or records[index].errors or records[index].unexpected_successes
+        for index in range(len(records))
+    )
+    print(unittest.TextTestResult.separator2, file=sys.stderr)
+    print(
+        f"Ran {tests_run} {'tests' if tests_run > 1 else 'test'} in {elapsed:.3f}s", file=sys.stderr
+    )
+    print(file=sys.stderr)
+    info = f" ({', '.join(infos)})" if infos else ""
+    print(f"{'OK' if success else 'FAILED'}{info}", file=sys.stderr)
+
+
 def run_with_timings(
     cmd: str, args: Sequence[str], budget: float, outcome: tmp_leak_guard.GuardOutcome
-) -> int:
-    """Keep worker timing records outside the guarded temporary directory and clean both."""
+) -> tuple[int, list[SuiteRecord]]:
+    """Collect timings and counts outside the guarded temporary directory and clean both."""
     previous = os.environ.get(TIMING_DIRECTORY_VARIABLE)
     with tempfile.TemporaryDirectory(prefix="unit-suite-timings-") as directory:
         os.environ[TIMING_DIRECTORY_VARIABLE] = directory
@@ -107,11 +160,13 @@ def run_with_timings(
             rc = tmp_leak_guard.run_guard(cmd, args, budget, outcome=outcome)
             paths = sorted(Path(directory).glob("*.json"))
             records = [
-                json.loads(paths[index].read_text(encoding="utf-8")) for index in range(len(paths))
+                SuiteRecord(*json.loads(paths[index].read_text(encoding="utf-8")))
+                for index in range(len(paths))
             ]
-            print_suite_timings(records)
-            print(f"unit tests: exit status {rc}", file=sys.stderr, flush=True)
-            return rc
+            print_suite_timings(
+                [(records[index].name, records[index].duration) for index in range(len(records))]
+            )
+            return rc, records
         finally:
             if previous is None:
                 os.environ.pop(TIMING_DIRECTORY_VARIABLE, None)
@@ -152,11 +207,13 @@ def run_unit_tests(cmd: str, args: Sequence[str], job_timeout: int) -> int:
     budget = job_timeout * UNIT_BUDGET_SHARE
     outcome = tmp_leak_guard.GuardOutcome()
     started = time.perf_counter()
-    rc = run_with_timings(cmd, args, budget, outcome)
+    rc, records = run_with_timings(cmd, args, budget, outcome)
     elapsed = time.perf_counter() - started
     job_elapsed = time.time() - job_start
     exceeded = elapsed > budget or outcome.timed_out
     job_exceeded = job_elapsed > budget
+    print_run_summary(records, elapsed, rc)
+    print(f"unit tests: exit status {rc}", file=sys.stderr, flush=True)
     report_budget("wall time", elapsed, budget, job_timeout)
     report_budget("job elapsed", job_elapsed, budget, job_timeout)
     if exceeded:
