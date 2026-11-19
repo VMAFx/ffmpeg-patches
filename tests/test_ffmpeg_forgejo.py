@@ -654,6 +654,8 @@ class ForgejoTest(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.tmp = Path(scratch.name)
+        self.helper_tmp = self.tmp / "helper-tmp"
+        self.helper_tmp.mkdir()
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
         tool = bin_dir / "secret-tool"
@@ -704,6 +706,7 @@ class ForgejoTest(unittest.TestCase):
             FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
             FFMPEG_FORGEJO_GIT=str(self.upstream),
             FFMPEG_FORGEJO_POLL="0",
+            TMPDIR=str(self.helper_tmp),
         )
         env.update(env_updates or {})
         return env
@@ -5693,31 +5696,20 @@ class TopLevelTrapTest(unittest.TestCase):
             [],
             "top-level EXIT trap expands a function-local name",
         )
-        # Require both payload traps so deleting them cannot make the safety check vacuous.
-        self.assertIn(
-            'trap \'cleanup_exit "$?" remove_private_files '
-            '"$reply_snapshot" "$reply_payload"\' EXIT',
-            source,
-        )
-        self.assertIn(
-            'trap \'cleanup_exit "$?" remove_private_files "$close_payload"\' EXIT', source
-        )
+        # Registry entries, rather than dispatch-local names, own both payloads.
+        self.assertIn("private_temp reply_payload || exit 1", source)
+        self.assertIn("private_temp close_payload || exit 1", source)
+        self.assertIn("trap 'cleanup_exit \"$?\"' EXIT", source)
 
     def test_wrapped_trap_naming_function_local_is_rejected(self) -> None:
-        """Either payload trap fails the helper safety test when it expands local body."""
-
+        """A replacement top-level trap expanding local body still fails the safety test."""
         source = HELPER.read_text(encoding="utf-8")
-        names = ("reply_payload", "close_payload")
-        for index in range(len(names)):
-            with self.subTest(name=names[index]):
-                old = f'"${names[index]}"\' EXIT'
-                self.assertIn(old, source, "planted trap site missing")
-                planted = source.replace(old, '"$body"\' EXIT')
-                with (
-                    unittest.mock.patch.object(Path, "read_text", return_value=planted),
-                    self.assertRaisesRegex(AssertionError, "top-level EXIT trap"),
-                ):
-                    self.test_helper_traps_name_no_function_local()
+        planted = source + "\ntrap 'cleanup_exit \"$body\"' EXIT\n"
+        with (
+            unittest.mock.patch.object(Path, "read_text", return_value=planted),
+            self.assertRaisesRegex(AssertionError, "top-level EXIT trap"),
+        ):
+            self.test_helper_traps_name_no_function_local()
 
     def test_planted_shadowed_trap_is_found(self) -> None:
         """Shadowed top-level EXIT traps in dispatch branches or at column zero are reported."""
@@ -5932,8 +5924,7 @@ class CloseMutantTest(unittest.TestCase):
 
 
 class ReplyMutantTest(unittest.TestCase):
-    """Reply mutants dropping the anchor copy, range read-back or body snapshot,
-    or shadowing the payload trap, are caught."""
+    """Catch reply mutants dropping anchor, range, snapshot or registry ownership."""
 
     def test_reply_mutants_are_caught(self) -> None:
         """Each planted anchor-copy defect fails its targeted reply test case."""
@@ -5960,35 +5951,36 @@ class ReplyMutantTest(unittest.TestCase):
             "old_position dropped",
         )
         reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
-        # Allocation, EXIT trap, payload write, POST, cleanup capture, and binding clear.
-        self.assertEqual(reply_branch.count("reply_payload"), 6, "mutation site missing")
+        # Allocation, payload write, POST, cleanup capture, and binding clear.
+        self.assertEqual(reply_branch.count("reply_payload"), 5, "mutation site missing")
         self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
         assert_mutant_killed(
             self,
             source,
-            (reply_branch, reply_branch.replace("reply_payload", "body")),
+            (
+                "private_temp reply_payload || exit 1",
+                'private_temp reply_payload || exit 1; PRIVATE_FILES["$reply_payload"]=0',
+            ),
             (ReplyTest, "test_moved_head_exit_removes_the_reply_payload"),
-            "reply payload trap shadowed by a function local",
+            "reply payload registration dropped",
         )
 
     def test_reply_payload_cleanup_mutants_are_caught(self) -> None:
-        """Dropping or reordering the payload clear fails the targeted removal test."""
-
+        """Retrying a failed removal or dropping registration fails its targeted test."""
         source = HELPER.read_text(encoding="utf-8")
-        old = 'cleanup_path="$reply_payload"; reply_payload=""'
-        self.assertEqual(source.count(old), 1, "mutation site missing")
         mutations = (
-            'cleanup_path="$reply_payload"',
-            'reply_payload=""; cleanup_path="$reply_payload"',
+            ('PRIVATE_FILES["$path"]=0', 'PRIVATE_FILES["$path"]=1'),
+            ('PRIVATE_FILES["$path"]=0', ":"),
         )
         for index in range(len(mutations)):
             with self.subTest(mutant=mutations[index]):
+                self.assertEqual(source.count(mutations[index][0]), 1, "mutation site missing")
                 assert_mutant_killed(
                     self,
                     source,
-                    (old, mutations[index]),
+                    mutations[index],
                     (ReplyTest, "test_reply_payload_removal_failure_is_not_retried"),
-                    f"reply payload clear mutation: {mutations[index]}",
+                    "failed removal kept in registry",
                 )
 
     def test_reply_snapshot_and_range_mutants_are_caught(self) -> None:
@@ -6033,6 +6025,274 @@ class ReplyMutantTest(unittest.TestCase):
             (ReplyTest, "test_reply_stored_with_another_range_fails_read_back"),
             "reply read-back ignores the line range",
         )
+
+
+class PrivateTempOwnershipTest(unittest.TestCase):
+    """Keep intentional removal failures inside the fixture that owns their cleanup."""
+
+    helper: Path = HELPER
+
+    def run_fixture_cases(self, cases: tuple[tuple[type[ForgejoTest], str], ...]) -> None:
+        """Run success and failed-removal commands and require empty TMPDIR after teardown."""
+        with tempfile.TemporaryDirectory(prefix="forgejo-leak-check-") as scratch:
+            root = Path(scratch)
+            for index in range(len(cases)):
+                base, name = cases[index]
+                with self.subTest(case=name):
+                    with (
+                        unittest.mock.patch.dict(os.environ, {"TMPDIR": str(root)}),
+                        unittest.mock.patch.object(tempfile, "tempdir", str(root)),
+                    ):
+                        case = base(name)
+                        case.helper = self.helper
+                        result = unittest.TestResult()
+                        case.run(result)
+                    self.assertTrue(result.wasSuccessful(), (result.failures, result.errors))
+                    self.assertEqual(list(root.iterdir()), [], "fixture leaked private files")
+
+    def test_review_payload_success_and_failure_leave_no_files(self) -> None:
+        """The 132-byte review payload is removed after successful and failed-removal replies."""
+        self.run_fixture_cases(
+            (
+                (ReplyTest, "test_reply_copies_the_anchor_of_the_answered_comment"),
+                (ReplyTest, "test_reply_payload_removal_failure_is_not_retried"),
+            )
+        )
+
+    def test_body_snapshot_success_and_failure_leave_no_files(self) -> None:
+        """The 18-byte body snapshot stays owned through successful and failing comments."""
+        self.run_fixture_cases(
+            (
+                (TestClaimHeadTest, "test_landed_no_test_claims_comment_is_posted"),
+                (PrivateRemovalTest, "test_exit_cleanup_failure_changes_success_to_one"),
+            )
+        )
+
+    def test_header_success_and_failure_leave_no_files(self) -> None:
+        """Authorization headers never outlive successful reads or injected deletion failures."""
+        self.run_fixture_cases(
+            (
+                (OverlapVerbTest, "test_no_overlap_reports_none"),
+                (
+                    PrivateRemovalTest,
+                    "test_pull_reader_cleanup_failure_stops_tested_comment_before_post",
+                ),
+            )
+        )
+
+    def test_merge_output_success_and_failure_leave_no_files(self) -> None:
+        """The 41-byte merge output stays owned on normal completion and failed removal."""
+        self.run_fixture_cases(
+            (
+                (LandedTest, "test_unrelated_base_advance_is_not_landed"),
+                (PrivateRemovalTest, "test_merge_cleanup_stops_main_flow_before_any_write"),
+            )
+        )
+
+    def test_candidates_success_and_failure_leave_no_files(self) -> None:
+        """The 27-byte candidate list stays owned on normal overlap checks and failed removal."""
+        self.run_fixture_cases(
+            (
+                (OverlapVerbTest, "test_no_overlap_reports_none"),
+                (
+                    PrivateRemovalTest,
+                    "test_overlap_cleanup_failure_stops_conditional_pr_before_post",
+                ),
+            )
+        )
+
+    def test_pr_payload_success_and_failure_leave_no_files(self) -> None:
+        """The 93-byte PR payload stays owned through successful writes and failed removal."""
+        self.run_fixture_cases(
+            (
+                (PullRequestOverlapTest, "test_nonoverlapping_open_pull_allows_creation"),
+                (
+                    PrivateRemovalTest,
+                    "test_main_payload_cleanup_stops_after_pr_post_before_reviewer_post",
+                ),
+            )
+        )
+
+    def test_empty_payload_success_and_failure_leave_no_files(self) -> None:
+        """Empty reply payloads are cleaned after normal replies and duplicate refusals."""
+        self.run_fixture_cases(
+            (
+                (ReplyTest, "test_reply_copies_the_anchor_of_the_answered_comment"),
+                (PrivateRemovalTest, "test_exit_cleanup_tries_both_private_reply_paths"),
+            )
+        )
+
+
+def reject_private_write(handler: Handler) -> None:
+    """Record a request body and reject its write without accessing external services."""
+    data = handler.rfile.read(int(handler.headers["Content-Length"])).decode()
+    handler.stub().requests.append(("POST", handler.path, data))
+    handler.reply(500, {"message": "planted write failure"})
+
+
+class PrivateTempExitTest(ForgejoTest):
+    """Require the helper itself to clean state before returning from failed writes."""
+
+    def test_comment_http_failure_and_success_remove_snapshot_and_json(self) -> None:
+        """Comment snapshots and JSON bodies disappear on success and HTTP failure."""
+        for index in range(2):
+            stub = Stub()
+            clean_tmp = self.tmp / f"comment-tmp-{index}"
+            clean_tmp.mkdir()
+            patch = (
+                unittest.mock.patch.object(Handler, "do_POST", reject_private_write)
+                if index
+                else contextlib.nullcontext()
+            )
+            with patch:
+                result = self.run_command(
+                    stub,
+                    "comment",
+                    "--no-test-claims",
+                    "1",
+                    str(self.tmp / "body.md"),
+                    env_updates={"TMPDIR": str(clean_tmp)},
+                )
+            self.assertEqual(result.returncode, 1 if index else 0, result.stderr)
+            self.assertEqual(self.sent_bodies(stub, "POST"), [BODY])
+            self.assertEqual(list(clean_tmp.iterdir()), [])
+
+    def test_second_reply_allocation_failure_removes_the_empty_snapshot(self) -> None:
+        """Remove empty reply state on success and second-allocation failure."""
+        real_mktemp = shutil.which("mktemp")
+        self.assertIsNotNone(real_mktemp)
+        marker = self.tmp / "allocated"
+        for index in range(2):
+            clean_tmp = self.tmp / f"allocation-tmp-{index}"
+            clean_tmp.mkdir()
+            if index:
+                wrapper = self.bin_dir / "mktemp"
+                wrapper.write_text(
+                    "#!/bin/sh\n"
+                    f"if [ -s {shlex.quote(str(marker))} ]; then exit 1; fi\n"
+                    f"printf x >{shlex.quote(str(marker))}\n"
+                    f'exec {shlex.quote(str(real_mktemp))} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+            stub = Stub()
+            stub.review_comments[7] = copy.deepcopy(THREAD)
+            result = self.run_command(
+                stub,
+                "reply",
+                "--no-test-claims",
+                "1",
+                "7",
+                "85995",
+                str(self.tmp / "body.md"),
+                env_updates={"TMPDIR": str(clean_tmp)},
+            )
+            self.assertEqual(result.returncode, 1 if index else 0, result.stderr)
+            self.assertEqual(list(clean_tmp.iterdir()), [])
+
+    def test_pull_reader_signal_removes_headers_and_responses(self) -> None:
+        """Pull-reader headers and response files are cleaned on success and all three signals."""
+        real_curl = shutil.which("curl")
+        self.assertIsNotNone(real_curl)
+        sha = git_output(self.repo, "rev-parse", "topic")
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate head={sha} tree=/w\n", encoding="utf-8")
+        signals = (None, "HUP", "INT", "TERM")
+        for index in range(len(signals)):
+            clean_tmp = self.tmp / f"pull-tmp-{index}"
+            clean_tmp.mkdir()
+            if signals[index]:
+                wrapper = self.bin_dir / "curl"
+                wrapper.write_text(
+                    "#!/bin/bash\n"
+                    'case " $* " in *" -o "*) '
+                    f'kill -{signals[index]} "$PPID"; exit 22;; esac\n'
+                    f'exec {shlex.quote(str(real_curl))} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+            result = self.run_command(
+                Stub(heads=[sha]),
+                "comment",
+                "--tested-head",
+                sha,
+                "--evidence",
+                str(evidence),
+                "1",
+                str(self.tmp / "body.md"),
+                env_updates={"TMPDIR": str(clean_tmp)},
+            )
+            self.assertEqual(result.returncode, 1 if index else 0, result.stderr)
+            self.assertEqual(list(clean_tmp.iterdir()), [])
+
+
+def private_temp_violations(source: str) -> list[int]:
+    """Return direct temporary allocations and trap changes outside their canonical functions."""
+    masked = source
+    expected = (("private_temp", "mktemp", 1), ("private_cleanup_scope", "trap", 4))
+    for index in range(len(expected)):
+        name, command, count = expected[index]
+        functions = list(re.finditer(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", masked))
+        if len(functions) != 1:
+            raise ValueError(f"exactly one {name} function required")
+        function = functions[0]
+        if len(re.findall(rf"\b{command}\b", function.group())) != count:
+            raise ValueError(f"{name} must contain {count} {command} commands")
+        masked = (
+            masked[: function.start()]
+            + re.sub(r"[^\n]", " ", function.group())
+            + masked[function.end() :]
+        )
+    lines = masked.splitlines()
+    return [
+        index + 1
+        for index in range(len(lines))
+        if not lines[index].lstrip().startswith("#")
+        and re.search(r"\b(?:mktemp|trap)\b", lines[index])
+    ]
+
+
+class PrivateTempSourceTest(unittest.TestCase):
+    """Reject unregistered temporary state and replacement exit or signal handlers."""
+
+    def test_only_registry_allocates_temporary_state_and_installs_handlers(self) -> None:
+        """All allocations and EXIT, HUP, INT and TERM traps belong to the registry."""
+        source = HELPER.read_text(encoding="utf-8")
+        self.assertEqual(private_temp_violations(source), [])
+        self.assertEqual(len(re.findall(r"\btrap\s+'[^']*'\s+EXIT\b", source)), 1)
+        signals = ("HUP", "INT", "TERM")
+        for index in range(len(signals)):
+            pattern = rf"\btrap\s+'[^']*'\s+{signals[index]}\b"
+            self.assertEqual(len(re.findall(pattern, source)), 1)
+
+    def test_planted_allocations_and_handler_replacements_are_rejected(self) -> None:
+        """Bare or wrapped allocations and trap resets cannot bypass registry ownership."""
+        source = HELPER.read_text(encoding="utf-8")
+        planted = (
+            'body="$(mktemp)"',
+            "/usr/bin/mktemp -d",
+            "command mktemp",
+            "trap - EXIT",
+            "trap 'exit 1' EXIT",
+            "trap - INT TERM HUP",
+        )
+        for index in range(len(planted)):
+            with self.subTest(command=planted[index]):
+                self.assertEqual(
+                    private_temp_violations(source + planted[index] + "\n"),
+                    [len(source.splitlines()) + 1],
+                )
+
+    def test_missing_or_duplicate_registry_functions_fail_closed(self) -> None:
+        """Deleting or duplicating either canonical function cannot make the count vacuous."""
+        source = HELPER.read_text(encoding="utf-8")
+        names = ("private_temp", "private_cleanup_scope")
+        for index in range(len(names)):
+            with self.subTest(function=names[index]):
+                with self.assertRaises(ValueError):
+                    private_temp_violations(source.replace(f"{names[index]}() {{", "other() {"))
+                with self.assertRaises(ValueError):
+                    private_temp_violations(source + f"{names[index]}() {{\n  :\n}}\n")
 
 
 if __name__ == "__main__":
