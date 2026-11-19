@@ -1304,6 +1304,24 @@ class RunCommandTest(ForgejoTest):
             self.run_command(stub, "unknown")
         self.assertEqual(stub.requests, [])
 
+    def test_usage_documents_landed_note_comment_path(self) -> None:
+        """Printed usage routes landed-head notes through comments without test claims."""
+        result = subprocess.run(
+            ["bash", str(self.helper)],
+            cwd=self.repo,
+            env=isolated_git_environment(preserve_config=True),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "post a note about a landed head with comment --no-test-claims; "
+            "there is no separate note option",
+            result.stdout,
+        )
+
 
 class LandedTest(ForgejoTest):
     """Check landed ranges against a real local upstream without outbound writes."""

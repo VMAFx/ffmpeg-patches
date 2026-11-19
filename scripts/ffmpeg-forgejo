@@ -26,6 +26,7 @@
 #   ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>
 #                          lists every own open pull sharing a file with the branch diff against the fetched base; exit 77 when any, 0 when none, 1 when not proven
 #   ffmpeg-forgejo landed <branch-or-sha>
+#                          post a note about a landed head with comment --no-test-claims; there is no separate note option
 #                          exits 82 when all own stable patch IDs are found in the base or the merged tree is unchanged ("no change left against the base"); otherwise prints "not landed" (exit 0)
 #                          reads at most 256 own commits and 10000 base commits; fetch/Git failure or excess commits exit 1; needs no token
 #   ffmpeg-forgejo issue   <title> <body-file>
