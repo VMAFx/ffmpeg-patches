@@ -151,8 +151,9 @@ A patch whose release form has no single master form (for example, one split
 into several upstream pull requests) records
 `release_only = "<reason>"`; it excludes `master_form` and `upstream_commit`.
 For a PR against a release branch, record `release_only` with a reason.
-Once the PR is merged and the fix is on master, replace `release_only` with
-`upstream_commit` naming that master commit.
+Once the PR is merged and the fix is on master as one commit, replace
+`release_only` by hand with `upstream_commit` naming that commit. Otherwise,
+keep `release_only`, for example if the fix spans several master pull requests.
 The daily upstream drift check fails when a recorded `master_form` no longer
 matches the PR's head or merge base on the forge. An `unsubmitted` patch whose
 fix travels in another author's PR records it as
