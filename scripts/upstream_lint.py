@@ -232,6 +232,10 @@ C_RULES_DIFF = (
     "--dst-prefix=b/",
 )
 MAX_PATHS = 2000
+# 160 displayed characters keep a bad value readable in a terminal diagnostic.
+MAX_WAIVER_ECHO_CHARS = 160
+# Fits 4096 path + 1024 reason characters even at 12 JSON characters each.
+MAX_UNREAD_WAIVER_CHARS = 65536
 MAX_CLAIM_COMMITS = 1000
 RUN_TIMEOUT = 1800
 C_RULES_TIMEOUT = 300
@@ -2196,13 +2200,26 @@ def _c_rules_touched(tree: Path, base: str, head: str) -> dict[str, set[int]]:
     }
 
 
+def _waiver_text(value: str) -> str:
+    """Escape controls and non-ASCII text without changing exact-path matching."""
+    return json.dumps(value, ensure_ascii=True)[1:-1]
+
+
+def _waiver_echo(value: str) -> str:
+    """Limit escaped diagnostic values to 160 characters, including a cut mark."""
+    escaped = _waiver_text(value)
+    if len(escaped) > MAX_WAIVER_ECHO_CHARS:
+        return escaped[: MAX_WAIVER_ECHO_CHARS - 3] + "..."
+    return escaped
+
+
 def _waiver_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     """Reject repeated JSON fields rather than silently replacing them."""
     entry: dict[str, object] = {}
     for index in range(len(pairs)):
         key, value = pairs[index]
         if key in entry:
-            raise ValueError(f"duplicate field: {key}")
+            raise ValueError(f"duplicate field: {_waiver_echo(key)}")
         entry[key] = value
     return entry
 
@@ -2236,6 +2253,8 @@ def _unread_waiver_dates(entry: dict[str, str], today: date) -> tuple[date, date
 
 def _unread_waiver_object(value: str) -> dict[str, str]:
     """Validate the JSON object against the exact unread-waiver field allow-list."""
+    if len(value) > MAX_UNREAD_WAIVER_CHARS:
+        raise ValueError(f"JSON: waiver exceeds {MAX_UNREAD_WAIVER_CHARS} characters")
     required = {"path", "rule", "reason", "category", "entered"}
     try:
         raw = json.loads(value, object_pairs_hook=_waiver_object)
@@ -2246,7 +2265,7 @@ def _unread_waiver_object(value: str) -> dict[str, str]:
     unknown = set(raw) - (required | {"expires"})
     missing = required - set(raw)
     if unknown:
-        raise ValueError(f"unknown field: {sorted(unknown)[0]}")
+        raise ValueError(f"unknown field: {_waiver_echo(sorted(unknown)[0])}")
     if missing:
         raise ValueError(f"missing field: {sorted(missing)[0]}")
     keys = sorted(raw)
@@ -2267,7 +2286,7 @@ def _parse_unread_waivers(values: list[str], today: date) -> tuple[UnreadWaiver,
     for index in range(len(values)):
         raw = _unread_waiver_object(values[index])
         if raw["path"] in entries:
-            raise ValueError(f"path: duplicate waiver for {raw['path']}")
+            raise ValueError(f"path: duplicate waiver for {_waiver_echo(raw['path'])}")
         _, expires = _unread_waiver_dates(raw, today)
         entries[raw["path"]] = UnreadWaiver(
             raw["path"], raw["reason"].strip(), raw["category"], expires, expires < today
@@ -2277,31 +2296,33 @@ def _parse_unread_waivers(values: list[str], today: date) -> tuple[UnreadWaiver,
 
 def _unread_report(unread_paths: list[str], waivers: tuple[UnreadWaiver, ...]) -> Step:
     """Require one live dated waiver per unread path and reject unused waivers."""
-    unread = sorted(set(unread_paths))
+    unread = set(unread_paths)
     entries = {waivers[index].path: waivers[index] for index in range(len(waivers))}
+    paths = sorted(unread | entries.keys())
     lines: list[str] = []
     failed = False
-    for index in range(len(unread)):
-        path = unread[index]
+    for index in range(len(paths)):
+        path = paths[index]
+        display = _waiver_text(path)
+        if path not in unread:
+            failed = True
+            lines.append(f"unused waiver: {display}")
+            continue
         lines.append(
-            f"unread: {path}: rules could not read this file; touched lines need a check by hand"
+            f"unread: {display}: rules could not read this file; touched lines need a check by hand"
         )
         entry = entries.get(path)
         if entry is None:
             failed = True
-            lines.append(f"no waiver: {path}: pass --c-rule-unread-waiver")
+            lines.append(f"no waiver: {display}: pass --c-rule-unread-waiver")
         elif entry.expired:
             failed = True
-            lines.append(f"expired: {path}: category {entry.category}, expired {entry.expires}")
+            lines.append(f"expired: {display}: category {entry.category}, expired {entry.expires}")
         else:
             lines.append(
-                f"waived: {path}: category {entry.category}, "
-                f"expires {entry.expires}: {entry.reason}"
+                f"waived: {display}: category {entry.category}, "
+                f"expires {entry.expires}: {_waiver_text(entry.reason)}"
             )
-    for index in range(len(waivers)):
-        if waivers[index].path not in unread:
-            failed = True
-            lines.append(f"unused waiver: {waivers[index].path}")
     return Step("c-rules", int(failed), "\n".join(lines))
 
 

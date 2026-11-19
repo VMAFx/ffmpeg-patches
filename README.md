@@ -123,7 +123,7 @@ daily check fails once that PR merges or closes.
 
 ## Guides and reference
 
-For `scripts/upstream_lint.py`, `--c-rule-reason` waives findings only; unread files need repeatable `--c-rule-unread-waiver '{"path":"libavformat/rtspenc.c","rule":"c-rules-unread","reason":"touched lines checked by hand","category":"C","entered":"2026-11-19"}'` JSON objects with exactly `path`, `rule`, `reason`, `category`, `entered` and optional `expires` dates in YYYY-MM-DD form (required for A at 1-90 days; B/C/D expire after 3/10/120 days), each naming one exact unread path, live through its expiry day, with unused waivers failing.
+For `scripts/upstream_lint.py`, `--c-rule-reason` waives findings only; unread files need repeatable `--c-rule-unread-waiver '{"path":"libavformat/rtspenc.c","rule":"c-rules-unread","reason":"touched lines checked by hand","category":"C","entered":"2026-11-19"}'` JSON objects with exactly `path`, `rule`, `reason`, `category`, `entered` and optional `expires` dates in YYYY-MM-DD form (required for A at 1-90 days; B/C/D expire after 3/10/120 days), each naming one exact unread path, live through its expiry day, with unused waivers failing, all unread statuses sorted by exact path and path/reason controls escaped on one physical line per status, usage-error values escaped and limited to 160 displayed characters including a visible `...` cut mark for readable diagnostics, and each JSON argument limited to 65536 characters before parsing (enough for a 4096-character path and 1024-character reason even at 12 JSON characters per character, plus metadata).
 
 ### Pre-PR variant sweep
 

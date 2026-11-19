@@ -4197,10 +4197,24 @@ class UnreadWaiverTest(unittest.TestCase):
         unread: bool = True,
     ) -> upstream_lint.Step:
         """Parse CLI waivers and collect only the c-rules step with scanner fixtures."""
-        values = [json.dumps(entry) for entry in (entries if entries is not None else [self.entry])]
+        entries = entries if entries is not None else [self.entry]
+        values = [json.dumps(entries[index]) for index in range(len(entries))]
+        return self.run_values(values, reason=reason, unread=unread)
+
+    def run_values(
+        self,
+        values: list[str],
+        *,
+        reason: str = "",
+        unread: bool = True,
+        report: Path | None = None,
+    ) -> upstream_lint.Step:
+        """Capture CLI output, exit status and preparation with raw waiver arguments."""
         argv = ["--tree", ".", "--base", "base", "--c-rule-reason", reason]
         for index in range(len(values)):
             argv.extend(["--c-rule-unread-waiver", values[index]])
+        if report is not None:
+            argv.extend(["--report", str(report)])
         if unread:
             self.fixture.stub_json = json.dumps(self.fixture.syntax_error_payload())
         captured: list[upstream_lint.Step] = []
@@ -4213,13 +4227,16 @@ class UnreadWaiverTest(unittest.TestCase):
             return captured
 
         self.clock = unittest.mock.Mock(return_value=self.today)
+        self.preparation = unittest.mock.Mock(return_value=("base", "head"))
+        output = io.StringIO()
         with (
-            unittest.mock.patch.object(upstream_lint, "_prepare", return_value=("base", "head")),
+            unittest.mock.patch.object(upstream_lint, "_prepare", self.preparation),
             unittest.mock.patch.object(upstream_lint, "_checks", side_effect=checks),
             unittest.mock.patch.object(upstream_lint, "_TODAY", self.clock, create=True),
-            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stdout(output),
         ):
-            upstream_lint.main(argv)
+            self.process_rc = upstream_lint.main(argv)
+        self.output = output.getvalue()
         return captured[0]
 
     def assert_usage(self, entries: list[dict[str, object]], field: str) -> None:
@@ -4231,6 +4248,26 @@ class UnreadWaiverTest(unittest.TestCase):
         self.assertIn(field, output.getvalue())
         self.assertNotIn("unrecognized arguments", output.getvalue())
         self.assertEqual(self.fixture.calls, [])
+
+    def assert_value_usage(self, values: list[str], expected: str) -> str:
+        """Require a bounded usage error before preparation or scanner execution."""
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.object(sys, "argv", ["upstream_lint.py"]),
+            contextlib.redirect_stderr(output),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            usage = upstream_lint._parser().format_usage()
+            self.run_values(values)
+        self.assertEqual(caught.exception.code, 2)
+        message = output.getvalue().splitlines()[-1]
+        self.assertIn(expected, message)
+        self.assertLessEqual(len(message), 256)
+        self.assertLessEqual(len(output.getvalue()), len(usage) + 257)
+        self.assertEqual(output.getvalue().count("error:"), 1)
+        self.preparation.assert_not_called()
+        self.assertEqual(self.fixture.calls, [])
+        return message
 
     def test_date_source_called_once(self) -> None:
         """All waivers use exactly one reading of the injectable date source."""
@@ -4314,6 +4351,37 @@ class UnreadWaiverTest(unittest.TestCase):
         self.assertIn("unused waiver: libavformat/rtspenc.c", step.output)
         self.assertEqual(self.fixture.calls, [])
 
+    def test_unused_order_with_sources(self) -> None:
+        """Unused and unread statuses sort by exact path in either argument order."""
+        paths = ("a.c", "z.c")
+        entries = [{**self.entry, "path": paths[index]} for index in range(len(paths))]
+        expected = [
+            "unused waiver: a.c",
+            "unread: libavformat/rtspenc.c: rules could not read this file; "
+            "touched lines need a check by hand",
+            "no waiver: libavformat/rtspenc.c: pass --c-rule-unread-waiver",
+            "unused waiver: z.c",
+        ]
+        for index in range(2):
+            with self.subTest(reverse=index):
+                step = self.run_case(entries[:: 1 if index == 0 else -1])
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(step.output.splitlines(), expected)
+
+    def test_unused_order_without_sources(self) -> None:
+        """Unused statuses sort identically without sources in either argument order."""
+        self.fixture.diff_names = ""
+        paths = ("a.c", "z.c")
+        entries = [{**self.entry, "path": paths[index]} for index in range(len(paths))]
+        for index in range(2):
+            with self.subTest(reverse=index):
+                step = self.run_case(entries[:: 1 if index == 0 else -1], unread=False)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(
+                    step.output.splitlines(), ["unused waiver: a.c", "unused waiver: z.c"]
+                )
+        self.assertEqual(self.fixture.calls, [])
+
     def test_path_is_exact(self) -> None:
         """A different spelling waives no unread path and is reported unused."""
         step = self.run_case([{**self.entry, "path": "./libavformat/rtspenc.c"}])
@@ -4344,6 +4412,196 @@ class UnreadWaiverTest(unittest.TestCase):
     def test_usage_unknown_field(self) -> None:
         """Unknown fields cannot silently extend the waiver schema."""
         self.assert_usage([{**self.entry, "extra": "typo"}], "extra")
+
+    def test_usage_long_unknown_key(self) -> None:
+        """A ten-thousand-character unknown key produces a bounded cut diagnostic."""
+        value = json.dumps({**self.entry, "x" * 10000: "typo"})
+        message = self.assert_value_usage([value], "unknown field: " + "x" * 157 + "...")
+        self.assertTrue(message.endswith("x" * 157 + "..."))
+
+    def test_usage_long_duplicate_path(self) -> None:
+        """A ten-thousand-character duplicate path is bounded before scanning."""
+        value = json.dumps({**self.entry, "path": "x" * 10000})
+        self.assert_value_usage([value, value], "duplicate waiver for " + "x" * 157 + "...")
+
+    def test_usage_long_duplicate_key(self) -> None:
+        """Duplicate JSON keys share the escaped 160-character diagnostic limit."""
+        key = json.dumps("x" * 10000)
+        value = "{" + key + ":1," + key + ":2}"
+        self.assert_value_usage([value], "duplicate field: " + "x" * 157 + "...")
+
+    def test_usage_control_values_are_escaped(self) -> None:
+        """Unknown keys, duplicate keys and duplicate paths escape control characters."""
+        key = "line\n\r\t\x1b\x00"
+        encoded = json.dumps(key)
+        values = (
+            json.dumps({**self.entry, key: "typo"}),
+            "{" + encoded + ":1," + encoded + ":2}",
+            json.dumps({**self.entry, "path": key}),
+        )
+        for index in range(len(values)):
+            with self.subTest(kind=index):
+                arguments = [values[index]] * (2 if index == 2 else 1)
+                self.assert_value_usage(arguments, r"line\n\r\t\u001b\u0000")
+
+    def test_usage_oversize_argument_before_json(self) -> None:
+        """Arguments above 65536 characters fail before JSON decoding or scanning."""
+        with unittest.mock.patch.object(upstream_lint.json, "loads") as decode:
+            self.assert_value_usage([" " * 65537], "waiver exceeds 65536 characters")
+        decode.assert_not_called()
+
+    def test_argument_length_boundary(self) -> None:
+        """An exactly 65536-character legitimate waiver remains accepted."""
+        entry = {**self.entry, "reason": ""}
+        entry["reason"] = "x" * (65536 - len(json.dumps(entry)))
+        value = json.dumps(entry)
+        self.assertEqual(len(value), 65536)
+        step = self.run_values([value])
+        self.assertEqual(self.process_rc, 0, self.output)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("expires 2026-11-19: " + entry["reason"], step.output)
+
+    def test_argument_capacity_for_long_path_and_reason(self) -> None:
+        """The input budget fits a 4096-character path and 1024-character reason."""
+        entry = {
+            **self.entry,
+            "path": "\U00010000" * 4096,
+            "reason": "\U00010000" * 1024,
+            "expires": "2026-11-19",
+        }
+        value = json.dumps(entry)
+        self.assertLessEqual(len(value), 65536)
+        step = self.run_values([value])
+        self.assertEqual(self.process_rc, 1, self.output)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unused waiver: " + r"\ud800\udc00" * 4096, step.output)
+
+    def test_reason_control_text_stays_on_one_line(self) -> None:
+        """Accepted multiline reasons appear escaped on one physical waiver line."""
+        step = self.run_case([{**self.entry, "reason": "checked\nnext\r\t\x1b line"}])
+        self.assertEqual(self.process_rc, 0, self.output)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(len(step.output.splitlines()), 2)
+        self.assertTrue(step.output.endswith(r"checked\nnext\r\t\u001b line"))
+
+    def test_path_control_text_stays_on_one_line(self) -> None:
+        """Exact multiline paths stay escaped for live, expired, missing and unused statuses."""
+        path = "dir/line\nnext\r\t\x1b.c"
+        display = r"dir/line\nnext\r\t\u001b.c"
+        entries = upstream_lint._parse_unread_waivers(
+            [json.dumps({**self.entry, "path": path})], self.today
+        )
+        live = upstream_lint._unread_report([path], entries)
+        self.assertEqual(live.rc, 0, live.output)
+        self.assertEqual(len(live.output.splitlines()), 2)
+        self.assertIn(f"waived: {display}: category C", live.output)
+        missing = upstream_lint._unread_report([path], ())
+        self.assertEqual(missing.rc, 1, missing.output)
+        self.assertEqual(len(missing.output.splitlines()), 2)
+        self.assertIn(f"no waiver: {display}:", missing.output)
+        expired_entries = upstream_lint._parse_unread_waivers(
+            [json.dumps({**self.entry, "path": path})], date(2026, 11, 20)
+        )
+        expired = upstream_lint._unread_report([path], expired_entries)
+        self.assertEqual(expired.rc, 1, expired.output)
+        self.assertEqual(len(expired.output.splitlines()), 2)
+        self.assertIn(f"expired: {display}: category C", expired.output)
+        step = self.run_case([{**self.entry, "path": path}])
+        self.assertEqual(self.process_rc, 1, self.output)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(len(step.output.splitlines()), 3)
+        self.assertIn(f"unused waiver: {display}", step.output)
+
+    def two_source_payload(self) -> dict[str, object]:
+        """Add a second changed C source beside the default unread source."""
+        self.fixture.diff_names += "libavformat/rtsp.c\0"
+        self.fixture.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.fixture.syntax_error_payload()
+        payload["paths"] = {"scanned": [self.entry["path"], "libavformat/rtsp.c"]}
+        return payload
+
+    def test_mixed_expired_and_live_waivers(self) -> None:
+        """A live waiver beside an expired waiver cannot clear the run's failure."""
+        self.today = date(2026, 11, 20)
+        payload = self.two_source_payload()
+        payload["errors"].append({"type": "Syntax error", "path": "libavformat/rtsp.c"})
+        self.fixture.stub_json = json.dumps(payload)
+        live = {**self.entry, "path": "libavformat/rtsp.c", "entered": "2026-11-19"}
+        step = self.run_case([self.entry, live], unread=False)
+        self.assertEqual(self.process_rc, 1, self.output)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(
+            step.output.splitlines(),
+            [
+                "unread: libavformat/rtsp.c: rules could not read this file; "
+                "touched lines need a check by hand",
+                "waived: libavformat/rtsp.c: category C, expires 2026-11-29: "
+                "touched lines checked by hand",
+                "unread: libavformat/rtspenc.c: rules could not read this file; "
+                "touched lines need a check by hand",
+                "expired: libavformat/rtspenc.c: category C, expired 2026-11-19",
+            ],
+        )
+
+    def test_readable_finding_beside_unread_waiver(self) -> None:
+        """A dated unread waiver leaves readable findings needing their own free reason."""
+        payload = self.two_source_payload()
+        payload["results"] = [
+            {
+                "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                "path": "libavformat/rtsp.c",
+                "start": {"line": 11},
+                "end": {"line": 11},
+                "extra": {"message": "missing ff_network_close()"},
+            }
+        ]
+        self.fixture.stub_rc = 1
+        self.fixture.stub_json = json.dumps(payload)
+        reasons = ("", "checked finding by hand")
+        for index in range(len(reasons)):
+            with self.subTest(reason=reasons[index]):
+                step = self.run_case(reason=reasons[index], unread=False)
+                self.assertEqual(self.process_rc, 1 - index, self.output)
+                self.assertEqual(step.rc, 1 - index, step.output)
+                expected = [
+                    "finding: libavformat/rtsp.c:11: "
+                    "ffmpeg-rtsp-connect-failure-without-network-close: missing ff_network_close()",
+                    "unread: libavformat/rtspenc.c: rules could not read this file; "
+                    "touched lines need a check by hand",
+                    "waived: libavformat/rtspenc.c: category C, expires 2026-11-19: "
+                    "touched lines checked by hand",
+                ]
+                if index:
+                    expected.insert(0, "waived: checked finding by hand")
+                else:
+                    expected.append("fix the flagged path, or pass --c-rule-reason")
+                self.assertEqual(step.output.splitlines(), expected)
+
+    def test_unread_report_matches_stdout(self) -> None:
+        """The report option saves exactly the unread and unused statuses on stdout."""
+        values = [json.dumps(self.entry), json.dumps({**self.entry, "path": "z.c"})]
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.txt"
+            step = self.run_values(values, report=report)
+            self.assertEqual(self.process_rc, 1, self.output)
+            self.assertEqual(step.rc, 1, step.output)
+            self.assertEqual(report.read_text(encoding="utf-8"), self.output)
+        self.assertEqual(
+            step.output.splitlines(),
+            [
+                "unread: libavformat/rtspenc.c: rules could not read this file; "
+                "touched lines need a check by hand",
+                "waived: libavformat/rtspenc.c: category C, expires 2026-11-19: "
+                "touched lines checked by hand",
+                "unused waiver: z.c",
+            ],
+        )
+
+    def test_usage_waiver_count_limit(self) -> None:
+        """More than 2000 waivers fail usage before parsing, preparation or scanning."""
+        with unittest.mock.patch.object(upstream_lint.json, "loads") as decode:
+            self.assert_value_usage([json.dumps(self.entry)] * 2001, "at most 2000 waivers")
+        decode.assert_not_called()
 
     def test_usage_missing_fields(self) -> None:
         """Every required field is named when missing from a waiver."""
