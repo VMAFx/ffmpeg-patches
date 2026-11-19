@@ -2167,6 +2167,46 @@ class FailClosedForgeTest(unittest.TestCase):
         """A staging unlink error after replacement cannot report an unchanged manifest."""
         self.assert_published_with_leftover(".tmp")
 
+    def assert_staging_deadline(self, remaining: float, expected: int) -> None:
+        """Advance a fake clock during sync and inspect publication and sibling cleanup."""
+        self.path.write_bytes(self.before)
+        now = [0.0]
+        fsync, replace = upstream_links.os.fsync, upstream_links.os.replace
+
+        def sync(fd: int) -> None:
+            """Finish real sync before moving the clock to the requested budget boundary."""
+            fsync(fd)
+            now[0] = upstream_links.SCAN_BUDGET_SECONDS - remaining
+
+        with (
+            unittest.mock.patch.object(
+                upstream_links.time, "monotonic", side_effect=lambda: now[0]
+            ),
+            unittest.mock.patch.object(upstream_links.os, "fsync", side_effect=sync),
+            unittest.mock.patch.object(upstream_links.os, "replace", wraps=replace) as publish,
+        ):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, expected, err)
+        self.assertEqual(list(self.root.iterdir()), [self.path])
+        if expected == 2:
+            self.assertIn("incomplete scan", err)
+            self.assertEqual(self.path.read_bytes(), self.before)
+            publish.assert_not_called()
+        else:
+            self.assertEqual(err, "")
+            self.assertNotEqual(self.path.read_bytes(), self.before)
+            publish.assert_called_once()
+
+    def test_deadline_expiring_during_staging_refuses_publication(self) -> None:
+        """Sync reaching or passing the deadline leaves original bytes and no siblings."""
+        for remaining in (0.0, -1.0):
+            with self.subTest(remaining=remaining):
+                self.assert_staging_deadline(remaining, 2)
+
+    def test_staging_inside_deadline_publishes(self) -> None:
+        """A completed sync inside the budget still publishes once with status zero."""
+        self.assert_staging_deadline(1.0, 0)
+
     def test_lock_cleanup_failure_reports_published(self) -> None:
         """A lock unlink error after replacement leaves new bytes and reports the lock."""
         lock = self.assert_published_with_leftover(".lock")
@@ -2946,3 +2986,64 @@ class PaginationLimitTest(unittest.TestCase):
             fetch = unittest.mock.Mock(return_value=HeaderPage([forge_pull(101)], headers))
             self.assertEqual(len(upstream_links.read_candidate_pulls("2026-11-01", fetch)), 1)
             self.assertEqual(fetch.call_count, 1)
+
+    def assert_link_pages(self, link: str, *, continues: bool = False) -> None:
+        """Exercise both readers at their page limit with no total-count evidence."""
+        for candidates in (False, True):
+            with self.subTest(candidates=candidates):
+                batch = [forge_pull(101)] if candidates else [{"filename": "a.c"}]
+                fetch = unittest.mock.Mock(side_effect=[HeaderPage(batch, {"Link": link}), []])
+                cap = 2 if continues else 1
+                with (
+                    unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 1),
+                    unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", cap),
+                    unittest.mock.patch.object(upstream_links, "MAX_PULL_PAGES", cap),
+                ):
+                    if candidates:
+                        rows = upstream_links.read_candidate_pulls("2026-11-01", fetch)
+                        self.assertEqual([row["number"] for row in rows], [101])
+                    else:
+                        rows = upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+                        self.assertEqual(rows, ["a.c"])
+                        self.assertTrue(rows.complete)
+                self.assertEqual(fetch.call_count, cap)
+
+    def test_terminal_relation_parameters_ignore_order_case_and_quotes(self) -> None:
+        """A relation after other parameters proves completion on the last allowed page."""
+        for parameters in (
+            'type="application/json"; rel="prev"',
+            'type="application/json"; ReL=PREV; title="last page"',
+            'title="a,b; rel=next"; rel="prev last"',
+            'title="quoted \\"text\\""; rel="prev"',
+        ):
+            with self.subTest(parameters=parameters):
+                self.assert_link_pages(f"<https://example.invalid/page1>; {parameters}")
+
+    def test_next_relation_after_parameters_continues_both_readers(self) -> None:
+        """Extra parameters and relation lists cannot hide the next page from either reader."""
+        for parameters in (
+            'type="application/json"; rel="next"',
+            'type="application/json"; ReL=NeXt; title="more"',
+            'type="application/json"; rel="prev NeXt"',
+            'rel="prev", <https://example.invalid/page2>; type="application/json"; rel=next',
+        ):
+            with self.subTest(parameters=parameters):
+                self.assert_link_pages(
+                    f"<https://example.invalid/page1>; {parameters}", continues=True
+                )
+
+    def test_unknown_relation_still_proves_completion(self) -> None:
+        """Unknown relations prove completion, including a name containing the word next."""
+        for relation in ("unknown", "next-page"):
+            with self.subTest(relation=relation):
+                self.assert_link_pages(f'<https://example.invalid/page1>; rel="{relation}"')
+
+    def test_parameters_without_relation_do_not_prove_completion(self) -> None:
+        """A relation-looking title or address alone supplies no pagination relation."""
+        for link in (
+            '<https://example.invalid/page1>; type="application/json"',
+            '<https://example.invalid/page1>; title="example; rel=prev"',
+            "<https://example.invalid/rel=prev>",
+        ):
+            with self.subTest(link=link):
+                self.assert_link_pages(link, continues=True)

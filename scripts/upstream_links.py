@@ -17,12 +17,18 @@
 Exit status: 0 on success or non-overlapping check, 1 on an overlap by
 another author or undecided file comparison in check, 2 on a read, input or incomplete-scan error,
 3 when fill published the manifest but cleanup left a staging file or lock.
-SCAN_BUDGET_SECONDS bounds a scan to 300 seconds, checked with a monotonic
-clock before pacing, before network I/O and after each fetch; requests reserve
-a full per-operation timeout. Waiting for a fetch also ends at the scan deadline,
-even if its blocking operations keep renewing their timeout. CI gives the
-overlap job twice this budget.
+SCAN_BUDGET_SECONDS gives network waits a 300-second monotonic budget;
+requests reserve pacing and a full per-operation timeout. Waiting for a fetch
+ends at the deadline even if its blocking operations keep renewing their timeout.
+Fill checks the same deadline during preparation and immediately before atomic
+replacement; detected expiry refuses publication with status 2 and attempts
+staging-file and lock cleanup, reporting every failed path. Local CPU work and
+file operations are not interrupted, so the budget is not a hard whole-run time limit.
+CI gives the overlap job twice this budget.
 REQUEST_TIMEOUT is the 30-second timeout of each blocking network operation.
+Pagination reads each Link entry's rel parameter regardless of parameter order,
+case or quoting, splitting space-separated relation values. Only an exact next
+relation continues; other relations prove completion, and no rel supplies no evidence.
 MAX_RELATED_AUTHOR_CHARS (series) allows at most 256 printable account characters;
 forge and manifest authors share that allow-list, excluding controls and line separators.
 """
@@ -583,6 +589,21 @@ def _file_result(
     )
 
 
+def _link_relations(link: str) -> set[str]:
+    """Read bounded Link entries and their parameters without splitting quoted delimiters."""
+    entries = re.findall(r'<([^>]+)>((?:[^"<>,]|"(?:[^"\\]|\\.)*")*)', link)
+    relations: set[str] = set()
+    for _address, parameters in entries[:MAX_PATH_CHARS]:
+        pairs = re.findall(r';\s*([^\s=;]+)(?:\s*=\s*("(?:[^"\\]|\\.)*"|[^;\s]+))?', parameters)
+        for name, raw_value in pairs[:MAX_PATH_CHARS]:
+            if name.lower() == "rel":
+                value = raw_value
+                if raw_value.startswith('"'):
+                    value = re.sub(r"\\(.)", r"\1", raw_value[1:-1])
+                relations.update(value.lower().split())
+    return relations
+
+
 def _listing_complete(batch: list, read_count: int, url: str) -> bool:
     """Require an empty page or server pagination evidence, never shortness alone."""
     if not batch:
@@ -591,13 +612,10 @@ def _listing_complete(batch: list, read_count: int, url: str) -> bool:
     link = headers.get("Link")
     if link:
         _bounded_text(link, f"{url} Link header", MAX_PATH_CHARS)
-        if re.search(
-            r'\brel\s*=\s*(?:"[^"]*\bnext\b[^"]*"|next)(?:\s*[;,]|\s*$)',
-            link,
-            re.IGNORECASE,
-        ):
+        relations = _link_relations(link)
+        if "next" in relations:
             return False
-        if re.search(r"<[^>]+>\s*;\s*rel\s*=", link, re.IGNORECASE):
+        if relations:
             return True
     total = headers.get("X-Total-Count")
     if total is not None:
@@ -1065,12 +1083,15 @@ def _raise_write_failure(error: BaseException, leftovers: list[str]) -> None:
     raise error
 
 
-def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> list[str]:
-    """Sync a sibling temporary file and compare again immediately before replacement."""
+def _write_manifest_temp(
+    path: Path, original: bytes, rendered: bytes, request: RequestBudget
+) -> list[str]:
+    """Sync a sibling file and check original bytes and deadline before replacement."""
     staging: Path | None = None
     leftovers: list[str] = []
     failure: BaseException | None = None
     try:
+        request.ensure_time()
         with tempfile.NamedTemporaryFile(
             mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
         ) as stream:
@@ -1081,6 +1102,7 @@ def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> list[s
             staging.chmod(path.stat().st_mode & 0o777)
         if path.read_bytes() != original:
             raise DriftError(f"{path}: changed since read; no changes written")
+        request.ensure_time()
         os.replace(staging, path)
     except BaseException as exc:
         failure = exc
@@ -1092,8 +1114,11 @@ def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> list[s
     return leftovers
 
 
-def _replace_manifest(path: Path, original: bytes, rendered: bytes) -> list[str]:
-    """Serialize cooperating fills and reject changed content before atomic publication."""
+def _replace_manifest(
+    path: Path, original: bytes, rendered: bytes, request: RequestBudget
+) -> list[str]:
+    """Serialize cooperating fills within the scan deadline and reject changed content."""
+    request.ensure_time()
     lock = path.with_name(f".{path.name}.lock")
     try:
         stream = lock.open("xb")
@@ -1110,7 +1135,7 @@ def _replace_manifest(path: Path, original: bytes, rendered: bytes) -> list[str]
         with stream:
             if path.read_bytes() != original:
                 raise DriftError(f"{path}: changed since read; no changes written")
-        leftovers.extend(_write_manifest_temp(path, original, rendered))
+        leftovers.extend(_write_manifest_temp(path, original, rendered, request))
         published = True
     except BaseException as exc:
         failure = exc
@@ -1162,7 +1187,7 @@ def _fill_records(root: Path, fetch: Fetch, options: _FillOptions) -> _FillChang
         rendered = (json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n").encode(
             "utf-8"
         )
-        leftovers = _replace_manifest(path, original, rendered)
+        leftovers = _replace_manifest(path, original, rendered, request)
         changes.cleanup_incomplete = bool(leftovers)
         changes.extend(leftovers)
     return changes
