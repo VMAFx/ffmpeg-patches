@@ -11,7 +11,9 @@
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
 #   ffmpeg-forgejo push    --sweep <file> [--promises <file>] [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#                          --promises maps own next-push comment IDs to literal fragments, compared after collapsing whitespace runs to one space, in commit messages or PR body;
+#                          --promises maps own comment IDs naming the/my next push/revision/version/iteration/round anywhere in their bodies to literal fragments in whitespace-normalized commit messages or PR body;
+#                          A question that names the next push is refused too; the author answers through the unchanged promise file.
+#                          A comment quoting a reviewer sentence naming the marker is refused on purpose; the author answers through the promise file.
 #                          missing or unfulfilled promises exit 79 before Git push
 #   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
@@ -1319,21 +1321,23 @@ import stat
 import subprocess
 import sys
 
-PATTERN = re.compile(r"\bI(?: will|['\u2019]ll)\b[^.!?\n]{0,300}?\b(?:with|in|into|on|for) (?:the|my) next (?:push|revision|version|iteration|round)\b", re.I)
+PATTERN = re.compile(r"\b(?:the|my)\s+next\s+(?:push|revision|version|iteration|round)\b", re.I)
 
 
 def refuse(message: str) -> None:
     """Exit with the documented promise rejection status."""
     print(f"ffmpeg-forgejo: promise: {message}", file=sys.stderr)
     raise SystemExit(79)
+
 PY
 }
 
 # promise_python_comments: emit bounded own-comment extraction.
+# A question that names the next push is refused too; the author answers through the unchanged promise file.
 promise_python_comments() {
   cat <<'PY'
 def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
-    """Find the first next-push promise sentence in each own comment."""
+    """Record a bounded window around the first marker anywhere in each own comment."""
     if len(comments) > 1000:
         refuse("too many issue comments")
     found = {}
@@ -1345,18 +1349,21 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
         body = row.get("body")
         if not isinstance(body, str):
             refuse("malformed own issue comment")
-        body = re.sub(r"(?m)^[^\S\n]*>[^\n]*", "", body)
+        ident = row.get("id")
+        if len(body) > 65536 or len(body.encode("utf-8")) > 65536:
+            refuse(f"comment {ident}: body exceeds 65536-byte cap")
+        body = body.replace("\r\n", "\n").replace("\r", "\n").removeprefix("\ufeff")
+        if body.count("\n") >= 65536:
+            refuse(f"comment {ident}: body exceeds 65536-line cap")
+        body = " ".join(body.split())
         match = PATTERN.search(body)
         if match is None:
             continue
-        start = max(body.rfind(mark, 0, match.start()) for mark in ".!?\n") + 1
-        ends = [body.find(mark, match.end()) for mark in ".!?\n"]
-        end = min((pos for pos in ends if pos >= 0), default=len(body))
-        sentence = body[start : end + (end < len(body))].strip()
+        window = body[max(0, match.start() - 150) : match.end() + 150]
         ident, url = row.get("id"), row.get("html_url")
         if isinstance(ident, bool) or not isinstance(ident, int) or ident < 1 or not isinstance(url, str):
             refuse("malformed own promise comment")
-        found[ident] = (url, sentence)
+        found[ident] = (url, window)
     return found
 PY
 }

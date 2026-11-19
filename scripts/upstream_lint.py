@@ -42,11 +42,14 @@ missing CONFIG gates, phony alias targets and pipes inside quoted strings.
 --fate-shape-reason TEXT waives findings, never Git or read errors.
 
 The regression-test step fails when a commit whose subject or body, outside its
-Signed-off-by lines, says fix, fixes or fixed or names a defect (bug, regression,
-misalignment, crash, overflow, overread, leak, wrong, incorrect, broken,
-truncation, past the end, out of bounds, also when a line break splits the
-phrase) changes C, header or assembly sources
-under lib*/ or fftools/ and no path
+Signed-off-by lines, says fix, fixes or fixed or names a defect (bug,
+regression, misalignment, crash, overflow, overread, leak, wrong, incorrect,
+broken, truncation, past the end, out of bounds, uninitialised, uninitialized,
+use after free, double free, null dereference, null pointer dereference,
+division by zero, divide by zero, undefined behaviour, undefined behavior,
+deadlock, segfault, segmentation fault, memory corruption, heap corruption,
+stack corruption, OOB, also when a line break splits the phrase) changes C,
+header or assembly sources under lib*/ or fftools/ and no path
 under a tests directory changes anywhere in base..head. --no-test-reason TEXT
 waives it and prints the reason; when test paths do change, each fix commit must
 be reached by name: a changed test path or one of its added lines must contain,
@@ -259,7 +262,11 @@ C_NONCODE = re.compile(
 FIX_MESSAGE = re.compile(
     r"\b(?:fix(?:es|ed)?|bugs?|regressions?|misalign(?:s|ed|ment)?|crash(?:es|ed)?"
     r"|overflow(?:s|ed)?|overreads?|leak(?:s|ed)?|wrong|incorrect(?:ly)?|broken"
-    r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out(?:\s+|\s*-\s*)of(?:\s+|\s*-\s*)bounds)\b",
+    r"|truncat(?:e|es|ed|ion)|past\s+the\s+end|out(?:\s+|\s*-\s*)of(?:\s+|\s*-\s*)bounds"
+    r"|(?<!maybe-)(?<!sometimes-)uninitiali[sz]ed|use(?:\s+|\s*-\s*)after(?:\s+|\s*-\s*)free"
+    r"|double(?:\s+|\s*-\s*)free|null\s+dereferences?|null\s+pointer\s+dereferences?"
+    r"|(?:division|divide)\s+by\s+zero|undefined\s+behaviou?r|deadlock(?:s|ed)?"
+    r"|segfault(?:s|ed)?|segmentation\s+faults?|(?:memory|heap|stack)\s+corruption|oob)\b",
     re.IGNORECASE,
 )
 LAVFI_PREFIX = re.compile(r"^(?:vf|af|vsrc|asrc|avf|avsrc|vsink|asink|f)_")
