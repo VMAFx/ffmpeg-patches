@@ -233,3 +233,19 @@ class RevertProofFixture(unittest.TestCase):
         """Commit a source fix without adding caller-only fixture files."""
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         return self.commit("avfilter/vf_x: fix return value")
+
+    def named_source_fix(self, raw_name: bytes) -> tuple[str, str, str]:
+        """Create distinct byte-name and replacement-name fixes, skipping refused names."""
+        try:
+            name = os.fsdecode(raw_name)
+            self.write(name, BASE_SOURCE)
+        except (OSError, UnicodeError) as error:
+            self.skipTest(f"temporary filesystem refuses filename {raw_name!r}: {error}")
+        self.assertEqual(os.fsencode(name), raw_name)
+        self.write("libavfilter/vf_\ufffd.c", BASE_SOURCE)
+        self.commit("avfilter: add filename fixtures")
+        self.write("libavfilter/vf_\ufffd.c", FIXED_SOURCE)
+        sibling_fix = self.commit("avfilter: fix replacement-name sibling")
+        self.write(name, FIXED_SOURCE)
+        fix = self.commit("avfilter: fix byte-name source")
+        return name, sibling_fix, fix

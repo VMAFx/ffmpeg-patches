@@ -76,6 +76,8 @@ command, rc_head, rc_reverted and reverted_paths. The step checks that each
 fix commit has a valid record whose head_tree matches head, whose rc_head is 0
 and whose rc_reverted is a nonzero integer. The head must resolve to a commit
 with head_tree, and reverted_paths must equal the sorted source paths of the fix.
+Non-UTF-8 filenames round-trip through filesystem surrogate escapes, stored as
+JSON escapes in UTF-8 records and restored unchanged by the reader.
 Raw commit and path lists above MAX_PATHS fail before classification; neither
 list is silently truncated. Command environments have a separate
 MAX_ENV_ENTRIES bound of 16384, leaving ample room for environments with
@@ -478,8 +480,17 @@ def _command_environment(source: Mapping[str, str], cwd: Path) -> dict[str, str]
     return environment
 
 
-def _run_output(output: bytes, errors: bytes | None, returncode: int) -> str:
+def decode_git_output(output: bytes) -> str:
+    """Decode Git stdout with filesystem escaping so filename bytes round-trip in argv."""
+    return os.fsdecode(output)
+
+
+def _run_output(
+    output: bytes, errors: bytes | None, returncode: int, *, git_stdout: bool = False
+) -> str:
     """Decode machine stdout alone on success and include separate stderr on failure."""
+    if returncode == 0 and git_stdout:
+        return decode_git_output(output)
     if returncode and errors:
         output += errors
     return output.decode("utf-8", errors="replace")
@@ -519,12 +530,14 @@ def _run(
     ) as process:
         try:
             output, errors = process.communicate(
-                data.encode("utf-8") if isinstance(data, str) else data, timeout=timeout
+                os.fsencode(data) if isinstance(data, str) else data, timeout=timeout
             )
             return RunResult(
                 tuple(argv),
                 process.returncode,
-                _run_output(output, errors, process.returncode),
+                _run_output(
+                    output, errors, process.returncode, git_stdout=Path(argv[0]).name == "git"
+                ),
                 stdout_bytes=output,
             )
         except subprocess.TimeoutExpired as error:

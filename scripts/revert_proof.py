@@ -24,6 +24,8 @@ Parents hidden by shallow history, grafts or replace refs cause exit 2 before
 scratch work or old-record removal; fetch missing history or restore the parents.
 Commands above upstream_lint.MAX_COMMAND_ARGS are refused with exit 2 before
 scratch work; commands at the cap are accepted.
+Non-UTF-8 filenames round-trip through filesystem surrogate escapes, stored as
+JSON escapes in UTF-8 records and restored unchanged by the reader.
 """
 
 from __future__ import annotations

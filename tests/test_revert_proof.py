@@ -81,6 +81,80 @@ class RevertProofTest(RevertProofFixture):
         record = json.loads(self.record_path.read_text(encoding="utf-8"))
         self.assertEqual(record["rc_reverted"], 17)
 
+    def test_reverse_patch_preserves_non_utf8_filename_and_sibling(self) -> None:
+        """Reverse the byte-name source, leaving its replacement-character sibling fixed."""
+        source, sibling_fix, fix = self.named_source_fix(b"libavfilter/vf_\xff.c")
+        script = (
+            "from pathlib import Path; import sys; "
+            "assert 'return 2;' in Path('libavfilter/vf_\\ufffd.c').read_text(); "
+            f"sys.exit(0 if 'return 2;' in Path({source!r}).read_text() else 17)"
+        )
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 0, error)
+        text = self.record_path.read_bytes().decode("utf-8", errors="strict")
+        self.assertIn("\\udcff", text)
+        record = json.loads(text)
+        self.assertEqual(record["reverted_paths"], [source])
+        self.assertEqual(os.fsencode(record["reverted_paths"][0]), b"libavfilter/vf_\xff.c")
+        self.assertEqual(record["rc_reverted"], 17)
+        step = upstream_lint._revert_proof(self.tree, sibling_fix, fix, (self.record_path,))
+        self.assertEqual(step.rc, 0, step.output)
+
+    def test_git_text_input_preserves_decoded_filename_bytes(self) -> None:
+        """Feeding decoded Git names back through stdin preserves their original bytes."""
+        source, _, fix = self.named_source_fix(b"libavfilter/vf_\xff.c")
+        names = revert_proof.git_out(
+            self.tree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", fix
+        )
+        self.assertEqual(names, source + "\0")
+        command = ["git", "hash-object", "--stdin"]
+        text_result = upstream_lint._run(command, self.tree, data=names)
+        byte_result = upstream_lint._run(command, self.tree, data=os.fsencode(names))
+        self.assertEqual(text_result.returncode, 0, text_result.stdout)
+        self.assertEqual(byte_result.returncode, 0, byte_result.stdout)
+        self.assertEqual(text_result.stdout, byte_result.stdout)
+
+    def test_consumer_binds_non_utf8_record_to_exact_commit_paths(self) -> None:
+        """Accept byte-name evidence and reject rebinding it to the sibling-only commit."""
+        source, sibling_fix, fix = self.named_source_fix(b"libavfilter/vf_\xff.c")
+        record = self.valid_record(fix)
+        record["reverted_paths"] = [source]
+        self.record_path.write_text(json.dumps(record), encoding="utf-8")
+        step = upstream_lint._revert_proof(self.tree, sibling_fix, fix, (self.record_path,))
+        self.assertEqual(step.rc, 0, step.output)
+        record["commit"] = sibling_fix
+        self.record_path.write_text(json.dumps(record), encoding="utf-8")
+        step = upstream_lint._revert_proof(self.tree, self.base, fix, (self.record_path,))
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(sibling_fix[:12], step.output)
+        self.assertIn("reverted_paths differ from fix source paths", step.output)
+
+    def test_consumer_refuses_replacement_sibling_for_non_utf8_commit(self) -> None:
+        """A replacement-character path cannot stand in for the byte-name source fix."""
+        _, sibling_fix, fix = self.named_source_fix(b"libavfilter/vf_\xff.c")
+        record = self.valid_record(fix)
+        record["reverted_paths"] = ["libavfilter/vf_\ufffd.c"]
+        self.record_path.write_text(json.dumps(record), encoding="utf-8")
+        step = upstream_lint._revert_proof(self.tree, sibling_fix, fix, (self.record_path,))
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("reverted_paths differ from fix source paths", step.output)
+
+    def test_reverse_patch_preserves_multibyte_utf8_filename(self) -> None:
+        """A valid multibyte filename retains its spelling, measured reversal and binding."""
+        source, sibling_fix, fix = self.named_source_fix(b"libavfilter/vf_\xc3\xa9.c")
+        self.assertEqual(source, "libavfilter/vf_\u00e9.c")
+        script = (
+            "from pathlib import Path; import sys; "
+            f"sys.exit(0 if 'return 2;' in Path({source!r}).read_text() else 17)"
+        )
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 0, error)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["reverted_paths"], [source])
+        self.assertEqual(record["rc_reverted"], 17)
+        step = upstream_lint._revert_proof(self.tree, sibling_fix, fix, (self.record_path,))
+        self.assertEqual(step.rc, 0, step.output)
+
     @unittest.skipUnless(os.name == "posix", "fixture requires a literal star in a path")
     def test_reverse_patch_matches_source_path_literally(self) -> None:
         """A glob character in a source path cannot pull a matching test sibling into reversal."""
