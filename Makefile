@@ -54,14 +54,16 @@ semgrep:
 build:
 	@sh .config/lefthook/python.sh scripts/series.py check
 
-# Unit tests run in UNIT_JOBS worker processes, one test module per task, so the series.yml check job stays under its
-# 10-minute limit on 4-vCPU GitHub-hosted runners; set UNIT_JOBS on the make command line to change it.
+# Unit tests run class tasks in UNIT_JOBS worker processes; the independent forgejo
+# methods use singleton tasks so its large classes cannot serialize the run.
+# series.yml jobs.check.timeout-minutes supplies the limit; fail at 60% with wall time.
+# Set UNIT_JOBS on the make command line to change the worker count.
 UNIT_JOBS ?= 4
 
 # The temporary leak guard fails a run that leaves files in its temporary directory.
 # Unit tests ignore the host git configuration, as on CI, so a test that needs a git identity fails locally too.
 test: dev-deps build lint
-	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh .config/lefthook/python.sh scripts/tmp_leak_guard.py -- sh .config/lefthook/python.sh -m unittest_parallel -j $(UNIT_JOBS) --level module -s tests
+	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh .config/lefthook/python.sh scripts/unit_test_budget.py -- sh .config/lefthook/python.sh -m unittest_parallel -j $(UNIT_JOBS) --level class -s tests
 
 lint: lint-mutable-defaults
 	@sh .config/lefthook/python.sh -m ruff check scripts tests
