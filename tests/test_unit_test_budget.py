@@ -23,10 +23,14 @@ from scripts import unit_test_budget
 class UnitTestBudgetTest(unittest.TestCase):
     """Keep overruns visible and preserve failures, cleanup and test identifiers."""
 
-    def run_timed(self, elapsed: float, rc: int = 0) -> tuple[int, str]:
+    def run_timed(self, elapsed: float, rc: int = 0, *, timed_out: bool = False) -> tuple[int, str]:
         """Simulate elapsed wall time while capturing the actual budget diagnostic."""
         output = io.StringIO()
+        outcome = unit_test_budget.tmp_leak_guard.GuardOutcome(timed_out=timed_out)
         with (
+            unittest.mock.patch.object(
+                unit_test_budget.tmp_leak_guard, "GuardOutcome", return_value=outcome
+            ),
             unittest.mock.patch.object(
                 unit_test_budget.time, "perf_counter", side_effect=[0, elapsed]
             ),
@@ -67,18 +71,91 @@ class UnitTestBudgetTest(unittest.TestCase):
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(unit_test_budget.run_unit_tests("runner", ["arg"], 500), 0)
-        guard.assert_called_once_with("runner", ["arg"], 300)
+        guard.assert_called_once_with(
+            "runner", ["arg"], 300, outcome=unit_test_budget.tmp_leak_guard.GuardOutcome()
+        )
 
     def test_deadline_failure_names_budget(self) -> None:
         """A killed runner preserves its timeout status and reports the budget failure."""
-        rc, output = self.run_timed(360, 124)
+        rc, output = self.run_timed(360, 124, timed_out=True)
         self.assertEqual(rc, 124)
         self.assertIn("FAIL wall-time budget exceeded", output)
 
     def test_nonzero_status_is_preserved(self) -> None:
-        """Child failures remain nonzero both within and beyond the time budget."""
-        self.assertEqual(self.run_timed(1, 7)[0], 7)
-        self.assertEqual(self.run_timed(361, 7)[0], 7)
+        """Reserved-looking child statuses remain statuses rather than inferred causes."""
+        statuses = (1, 2, 7, 124, 127)
+        for index in range(len(statuses)):
+            rc = statuses[index]
+            with self.subTest(status=rc):
+                result, output = self.run_timed(1, rc)
+                self.assertEqual(result, rc)
+                self.assertNotIn("FAIL wall-time budget exceeded", output)
+                result, output = self.run_timed(361, rc)
+                self.assertEqual(result, rc)
+                self.assertIn("FAIL wall-time budget exceeded", output)
+
+    def test_fast_child_status_124_is_not_a_deadline(self) -> None:
+        """A fast child exit 124 keeps its status without a false overrun diagnostic."""
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            rc = unit_test_budget.run_unit_tests(
+                sys.executable, ["-B", "-c", "import sys; sys.exit(124)"], 600
+            )
+        self.assertEqual(rc, 124)
+        self.assertIn("unit tests: wall time", output.getvalue())
+        self.assertNotIn("FAIL wall-time budget exceeded", output.getvalue())
+        self.assertNotIn("exceeded the", output.getvalue())
+
+    def assert_workflow_refused(self, workflow: Path) -> None:
+        """Refuse a bad workflow with one contextual line before starting the test run."""
+        reader = unit_test_budget.job_timeout_seconds
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                unit_test_budget, "job_timeout_seconds", side_effect=lambda: reader(workflow)
+            ),
+            unittest.mock.patch.object(unit_test_budget, "run_unit_tests") as run,
+            contextlib.redirect_stderr(output),
+        ):
+            self.assertEqual(unit_test_budget.main(["runner"]), 1)
+        run.assert_not_called()
+        self.assertIn(str(workflow), output.getvalue())
+        self.assertIn("jobs.check.timeout-minutes", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+
+    def test_unreadable_workflow_is_refused(self) -> None:
+        """An unreadable workflow names its file and key path without starting tests."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "unreadable.yml"
+            with unittest.mock.patch.object(
+                Path, "read_text", side_effect=PermissionError("permission denied")
+            ):
+                self.assert_workflow_refused(workflow)
+
+    def test_missing_workflow_job_is_refused(self) -> None:
+        """A missing check job names its file and key path without starting tests."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "missing-job.yml"
+            workflow.write_text("jobs:\n  other: {}\n", encoding="utf-8")
+            self.assert_workflow_refused(workflow)
+
+    def test_missing_workflow_timeout_is_refused(self) -> None:
+        """A missing timeout key names its file and key path without starting tests."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "missing-timeout.yml"
+            workflow.write_text("jobs:\n  check: {}\n", encoding="utf-8")
+            self.assert_workflow_refused(workflow)
+
+    def test_positive_integer_yaml_anchor_is_accepted(self) -> None:
+        """A resolved positive integer YAML anchor supplies the workflow timeout."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "anchored.yml"
+            workflow.write_text(
+                "limit: &limit 7\njobs:\n  check:\n    timeout-minutes: *limit\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(unit_test_budget.job_timeout_seconds(workflow), 420)
 
     def test_workflow_is_single_timeout_source(self) -> None:
         """The reader follows the live check job rather than a second timeout constant."""
@@ -137,11 +214,14 @@ class UnitTestBudgetTest(unittest.TestCase):
         self.assertIn("unit tests: wall time", output.getvalue())
 
     def test_real_guard_timeout_cleans_and_reports(self) -> None:
-        """A real sleeping child is terminated at the budget before the job limit."""
+        """A real timeout reports failure even when measured elapsed time is below budget."""
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as scratch:
             with (
                 unittest.mock.patch.object(tempfile, "tempdir", scratch),
+                unittest.mock.patch.object(
+                    unit_test_budget.time, "perf_counter", side_effect=[0, 0.1]
+                ),
                 contextlib.redirect_stderr(output),
             ):
                 rc = unit_test_budget.run_unit_tests(
@@ -149,6 +229,8 @@ class UnitTestBudgetTest(unittest.TestCase):
                 )
             self.assertEqual(list(Path(scratch).iterdir()), [])
         self.assertEqual(rc, 124)
+        self.assertIn("exceeded the 0.6 s deadline", output.getvalue())
+        self.assertIn("wall time 0.100 s", output.getvalue())
         self.assertIn("FAIL wall-time budget exceeded", output.getvalue())
 
     def test_singletons_preserve_ids_and_class_scheduling(self) -> None:

@@ -3,8 +3,6 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Run a command in an isolated temporary directory and fail on file leaks."""
 
-from __future__ import annotations
-
 import argparse
 import os
 import shutil
@@ -12,6 +10,7 @@ import subprocess  # nosec B404 - bounded local tool execution without a shell.
 import sys
 import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 # Ensure repository root is on sys.path for test/tool imports
@@ -25,6 +24,14 @@ MAX_SCANNED_ENTRIES = 1000
 MAX_REPORTED_ENTRIES = 20
 DEFAULT_TIMEOUT = 3600.0
 REAP_TIMEOUT_S = 10
+
+
+# String annotations make Python 3.14 dataclasses require a sys.modules entry.
+@dataclass
+class GuardOutcome:
+    """Carry deadline provenance independently of the guarded command's exit status."""
+
+    timed_out: bool = False
 
 
 def scan_entries(root: Path, limit: int = MAX_SCANNED_ENTRIES) -> list[str]:
@@ -85,11 +92,15 @@ def _reap_command(cmd: str, process: subprocess.Popen[bytes]) -> None:
         )
 
 
-def _wait_command(cmd: str, process: subprocess.Popen[bytes], timeout: float) -> int:
+def _wait_command(
+    cmd: str, process: subprocess.Popen[bytes], timeout: float, outcome: GuardOutcome | None = None
+) -> int:
     """Wait with a deadline and kill and reap the command group on timeout or interruption."""
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        if outcome is not None:
+            outcome.timed_out = True
         _kill_command(process)
         _reap_command(cmd, process)
         limit_s = int(timeout) if int(timeout) == timeout else timeout
@@ -102,13 +113,17 @@ def _wait_command(cmd: str, process: subprocess.Popen[bytes], timeout: float) ->
     return process.returncode
 
 
-def run_guard(cmd: str, args: Sequence[str], timeout: float) -> int:
+def run_guard(
+    cmd: str, args: Sequence[str], timeout: float, *, outcome: GuardOutcome | None = None
+) -> int:
     """Execute command in an isolated temporary directory and report leaked entries."""
     root = Path(tempfile.mkdtemp(prefix="tmp-leak-guard-"))
     cmd_rc = 0
     clean_rc = 0
     entries: list[str] = []
     scan_error = False
+    if outcome is not None:
+        outcome.timed_out = False
     try:
         env = os.environ.copy()
         env["TMPDIR"] = str(root)
@@ -125,7 +140,7 @@ def run_guard(cmd: str, args: Sequence[str], timeout: float) -> int:
             print(f"tmp leak guard: {exc}", file=sys.stderr)
             cmd_rc = 127
         else:
-            cmd_rc = _wait_command(cmd, process, timeout)
+            cmd_rc = _wait_command(cmd, process, timeout, outcome)
         try:
             entries = scan_entries(root)
         except OSError as exc:

@@ -37,20 +37,26 @@ def individual_test_suites(tests: unittest.TestSuite) -> unittest.TestSuite:
 
 def job_timeout_seconds(workflow: Path = WORKFLOW) -> int:
     """Read the check job's single authoritative timeout from the workflow."""
-    document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
-    minutes = document["jobs"]["check"]["timeout-minutes"]
+    key = "jobs.check.timeout-minutes"
+    try:
+        document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        minutes = document["jobs"]["check"]["timeout-minutes"]
+    except (OSError, UnicodeError, yaml.YAMLError, KeyError, TypeError) as exc:
+        detail = " ".join(str(exc).split())
+        raise ValueError(f"{workflow}: cannot read {key}: {detail}") from exc
     if type(minutes) is not int or minutes <= 0:
-        raise ValueError("jobs.check.timeout-minutes must be a positive integer")
+        raise ValueError(f"{workflow}: {key} must be a positive integer")
     return minutes * 60
 
 
 def run_unit_tests(cmd: str, args: Sequence[str], job_timeout: int) -> int:
-    """Run the entire suite under the leak guard and fail at its wall-time budget."""
+    """Run the entire suite under the leak guard and fail above its wall-time budget."""
     budget = job_timeout * UNIT_BUDGET_SHARE
+    outcome = tmp_leak_guard.GuardOutcome()
     started = time.perf_counter()
-    rc = tmp_leak_guard.run_guard(cmd, args, budget)
+    rc = tmp_leak_guard.run_guard(cmd, args, budget, outcome=outcome)
     elapsed = time.perf_counter() - started
-    exceeded = elapsed > budget or rc == 124
+    exceeded = elapsed > budget or outcome.timed_out
     print(
         f"unit tests: wall time {elapsed:.3f} s; budget {budget:g} s "
         f"({UNIT_BUDGET_SHARE:.0%} of series.yml check job's {job_timeout:g} s limit)",
@@ -73,7 +79,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("cmd", metavar="CMD", help="unit-test executable to run")
     parser.add_argument("args", nargs="*", metavar="ARG", help="arguments passed to CMD")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
-    return run_unit_tests(args.cmd, args.args, job_timeout_seconds())
+    try:
+        job_timeout = job_timeout_seconds()
+    except ValueError as exc:
+        print(f"unit tests: {exc}", file=sys.stderr)
+        return 1
+    return run_unit_tests(args.cmd, args.args, job_timeout)
 
 
 if __name__ == "__main__":

@@ -103,7 +103,7 @@ jobs:
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       # make test uses UNIT_JOBS=4 processes, class tasks and singleton forgejo methods.
       # unit_test_budget.py reads this job's timeout-minutes as the sole limit source,
-      # reports unit wall time and fails at 60%; the leak guard wraps the entire run.
+      # reports unit wall time and fails above 60%; the leak guard wraps the entire run.
       - name: Series check, lint and unit tests
         if: github.event.pull_request.draft != true
         run: make test

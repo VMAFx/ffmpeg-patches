@@ -56,7 +56,7 @@ build:
 
 # Unit tests run class tasks in UNIT_JOBS worker processes; the independent forgejo
 # methods use singleton tasks so its large classes cannot serialize the run.
-# series.yml jobs.check.timeout-minutes supplies the limit; fail at 60% with wall time.
+# series.yml jobs.check.timeout-minutes supplies the limit; fail above 60% with wall time.
 # Set UNIT_JOBS on the make command line to change the worker count.
 UNIT_JOBS ?= 4
 
