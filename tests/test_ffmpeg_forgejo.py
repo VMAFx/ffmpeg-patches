@@ -5951,14 +5951,15 @@ class ReplyMutantTest(unittest.TestCase):
             "old_position dropped",
         )
         reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
-        # Allocation, payload write, POST, cleanup capture, and binding clear.
-        self.assertEqual(reply_branch.count("reply_payload"), 5, "mutation site missing")
-        self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
+        # Guard the exact replacement site independently of declarations and other uses.
+        payload_old = "private_temp reply_payload || exit 1"
+        self.assertEqual(reply_branch.count(payload_old), 1, "mutation site missing")
+        self.assertEqual(source.count(payload_old), 1, "mutation site missing")
         assert_mutant_killed(
             self,
             source,
             (
-                "private_temp reply_payload || exit 1",
+                payload_old,
                 'private_temp reply_payload || exit 1; PRIVATE_FILES["$reply_payload"]=0',
             ),
             (ReplyTest, "test_moved_head_exit_removes_the_reply_payload"),
