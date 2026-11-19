@@ -7,6 +7,9 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import os
+import signal
+import socket
 import subprocess  # nosec B404 - synthetic tests only, bounded local runner.
 import sys
 import tempfile
@@ -18,6 +21,29 @@ import unittest_parallel.main
 import yaml
 
 from scripts import unit_test_budget
+
+SINGLETON_POOL_SOURCE = (
+    "import unittest\n"
+    "from scripts import unit_test_budget\n"
+    "class IndependentCase(unittest.TestCase):\n"
+    "    def test_one(self):\n"
+    '        """Pass the first independent case."""\n'
+    "        self.assertTrue(True)\n"
+    "    def test_two(self):\n"
+    '        """Pass the second independent case."""\n'
+    "        self.assertTrue(True)\n"
+    "def load_tests(loader, tests, pattern):\n"
+    '    """Expose each synthetic case as a task."""\n'
+    "    return unit_test_budget.individual_test_suites(tests)\n"
+)
+POOL_WRAPPER_CODE = (
+    "import sys, unittest.mock\n"
+    "from scripts import unit_test_budget\n"
+    "with unittest.mock.patch.object(\n"
+    "    unit_test_budget, 'job_timeout_seconds', return_value=float(sys.argv[1])\n"
+    "):\n"
+    "    sys.exit(unit_test_budget.main(sys.argv[2:]))\n"
+)
 
 
 class UnitTestBudgetTest(unittest.TestCase):
@@ -265,30 +291,32 @@ class UnitTestBudgetTest(unittest.TestCase):
         self.assertIn("-m unittest_parallel -j $(UNIT_JOBS) --level class -s tests", recipe)
         self.assertNotIn("--level module", recipe)
 
-    def test_singletons_run_in_real_process_pool(self) -> None:
-        """A synthetic adapted module produces two tasks and runs both tests in workers."""
-        source = (
-            "import unittest\n"
-            "from scripts import unit_test_budget\n"
-            "class IndependentCase(unittest.TestCase):\n"
-            "    def test_one(self):\n"
-            '        """Pass the first independent case."""\n'
-            "        self.assertTrue(True)\n"
-            "    def test_two(self):\n"
-            '        """Pass the second independent case."""\n'
-            "        self.assertTrue(True)\n"
-            "def load_tests(loader, tests, pattern):\n"
-            '    """Expose each synthetic case as a task."""\n'
-            "    return unit_test_budget.individual_test_suites(tests)\n"
-        )
+    def run_pool_fixture(
+        self,
+        source: str = SINGLETON_POOL_SOURCE,
+        timeout: float = 15.0,
+        *,
+        fixture_paths: list[Path] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a synthetic fixture under the budget wrapper with an inner deadline below timeout."""
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
         with tempfile.TemporaryDirectory() as scratch:
-            fixture = Path(scratch) / "test_synthetic.py"
-            fixture.write_text(source, encoding="utf-8")
+            root = Path(scratch)
+            fixture_dir = root / "fixture"
+            guard_dir = root / "tmp"
+            fixture_dir.mkdir()
+            guard_dir.mkdir()
+            if fixture_paths is not None:
+                fixture_paths.append(fixture_dir)
+            (fixture_dir / "test_synthetic.py").write_text(source, encoding="utf-8")
             result = subprocess.run(  # nosec B603 - fixed runner and fixture-only tests.
                 [
                     sys.executable,
                     "-B",
-                    str(unit_test_budget.ROOT / "scripts/unit_test_budget.py"),
+                    "-c",
+                    POOL_WRAPPER_CODE,
+                    f"{timeout:g}",
                     "--",
                     sys.executable,
                     "-B",
@@ -299,16 +327,147 @@ class UnitTestBudgetTest(unittest.TestCase):
                     "--level",
                     "class",
                     "-s",
-                    scratch,
+                    str(fixture_dir),
                 ],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                env={**os.environ, "TMPDIR": str(guard_dir)},
+                timeout=timeout,
                 check=False,
             )
+            self.assertEqual(list(guard_dir.iterdir()), [])
+        self.assertFalse(root.exists())
+        return result
+
+    def _pool_listener(self) -> tuple[socket.socket, int]:
+        """Bind a localhost TCP listener with a bounded timeout and registered cleanup."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(5.0)
+        self.addCleanup(listener.close)
+        return listener, int(listener.getsockname()[1])
+
+    @staticmethod
+    def _kill_worker_group(pid: int) -> None:
+        """Terminate a surviving worker process and its process group if still running."""
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                pgid = os.getpgid(pid)
+                if pgid > 1 and pgid != os.getpgrp():
+                    os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.kill(pid, signal.SIGKILL)
+
+    @staticmethod
+    def _worker_probe_source(port: int, body: str, *, second_case: bool = True) -> str:
+        """Build a synthetic adapted module whose first worker reports its PID over TCP."""
+        second = (
+            "    def test_two(self):\n"
+            '        """Pass the second independent case."""\n'
+            "        self.assertTrue(True)\n"
+            if second_case
+            else ""
+        )
+        return (
+            "import os, socket, time, unittest\n"
+            "from scripts import unit_test_budget\n"
+            "class IndependentCase(unittest.TestCase):\n"
+            "    def test_one(self):\n"
+            '        """Report the worker PID and execute the requested probe body."""\n'
+            f"        sock = socket.create_connection(('127.0.0.1', {port}), timeout=5.0)\n"
+            "        sock.sendall(f'{os.getpid()}\\n'.encode('ascii'))\n"
+            f"        {body}\n"
+            "        sock.close()\n"
+            f"{second}"
+            "def load_tests(loader, tests, pattern):\n"
+            '    """Expose each synthetic case as a task."""\n'
+            "    return unit_test_budget.individual_test_suites(tests)\n"
+        )
+
+    def _accept_worker_pid(self, listener: socket.socket) -> tuple[int, socket.socket]:
+        """Accept one worker probe connection, register process cleanup and return its PID."""
+        conn, _ = listener.accept()
+        self.addCleanup(conn.close)
+        conn.settimeout(1.0)
+        data = bytearray()
+        for _ in range(64):
+            chunk = conn.recv(64)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if b"\n" in chunk:
+                break
+        pid = int(data.decode("ascii").strip())
+        self.addCleanup(self._kill_worker_group, pid)
+        return pid, conn
+
+    def test_singletons_run_in_real_process_pool(self) -> None:
+        """A synthetic adapted module produces two tasks and runs both tests in workers."""
+        result = self.run_pool_fixture()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Running 2 test suites (2 total tests) across 2 workers", result.stderr)
         self.assertIn("unit tests: wall time", result.stderr)
+
+    def test_singleton_pool_timeout_kills_descendants_and_cleans_fixture(self) -> None:
+        """A timed-out pool run kills worker descendants and removes fixture directories."""
+        listener, port = self._pool_listener()
+        source = self._worker_probe_source(port, "time.sleep(30)")
+        fixture_paths: list[Path] = []
+        exc: subprocess.TimeoutExpired | None = None
+        result: subprocess.CompletedProcess[str] | None = None
+        try:
+            result = self.run_pool_fixture(source, timeout=2.5, fixture_paths=fixture_paths)
+        except subprocess.TimeoutExpired as caught:
+            exc = caught
+        worker_pid, conn = self._accept_worker_pid(listener)
+        self.assertEqual(len(fixture_paths), 1)
+        self.assertFalse(fixture_paths[0].exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+        self.assertEqual(conn.recv(64), b"")
+        self.assertIsNone(exc)
+        if result is not None:
+            self.assertEqual(result.returncode, 124, result.stderr)
+            self.assertIn("exceeded the 1.5 s deadline", result.stderr)
+            self.assertIn("FAIL wall-time budget exceeded", result.stderr)
+
+    def test_singleton_pool_failing_worker_cleans_descendants_and_fixture(self) -> None:
+        """A failing worker case preserves failure status without a false timeout or leak."""
+        invalid_timeouts = (0, -1)
+        for index in range(len(invalid_timeouts)):
+            invalid_timeout = invalid_timeouts[index]
+            with self.subTest(timeout=invalid_timeout), self.assertRaises(ValueError):
+                self.run_pool_fixture(timeout=invalid_timeout)
+        listener, port = self._pool_listener()
+        source = self._worker_probe_source(port, "sock.close(); self.fail('planted failure')")
+        fixture_paths: list[Path] = []
+        result = self.run_pool_fixture(source, timeout=10.0, fixture_paths=fixture_paths)
+        worker_pid, conn = self._accept_worker_pid(listener)
+        self.assertEqual(len(fixture_paths), 1)
+        self.assertFalse(fixture_paths[0].exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+        self.assertEqual(conn.recv(64), b"")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("FAIL wall-time budget exceeded", result.stderr)
+
+    def test_singleton_pool_single_case_boundary_within_deadline_passes(self) -> None:
+        """A single-case fixture completing within a short deadline cleans up and passes."""
+        listener, port = self._pool_listener()
+        source = self._worker_probe_source(port, "time.sleep(0.1)", second_case=False)
+        fixture_paths: list[Path] = []
+        result = self.run_pool_fixture(source, timeout=5.0, fixture_paths=fixture_paths)
+        worker_pid, conn = self._accept_worker_pid(listener)
+        self.assertEqual(len(fixture_paths), 1)
+        self.assertFalse(fixture_paths[0].exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+        self.assertEqual(conn.recv(64), b"")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("budget 3 s (60% of series.yml check job's 5 s limit)", result.stderr)
+        self.assertNotIn("FAIL", result.stderr)
 
     def test_forgejo_adapter_has_no_shared_fixtures(self) -> None:
         """Method tasks remain valid only while the adapted module has no shared fixtures."""
