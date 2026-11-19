@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from scripts import review_classes
+from scripts.raw_configure_body import bash_parser
 from tests.helpers import isolated_git_environment
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +47,7 @@ HELPER_SUBCOMMANDS = frozenset(
         "overlap",
         "reply",
         "landed",
+        "fork",
     }
 )
 
@@ -789,6 +791,133 @@ def write_request_paths(stub: Stub) -> list[tuple[str, str]]:
         for index in range(len(stub.requests))
         if stub.requests[index][0] in {"POST", "PATCH"}
     ]
+
+
+class ForkStub(Stub):
+    """Script repository existence reads without changing the shared forge stub."""
+
+    def __init__(self, repository_status: int) -> None:
+        """Keep the repository response status alongside the shared request history."""
+        super().__init__()
+        self.repository_status = repository_status
+
+
+class ForkHandler(Handler):
+    """Extend the shared HTTP handler with repository reads and fork creation."""
+
+    def _dispatch_get(
+        self, stub: ForkStub, url: urllib.parse.SplitResult, parts: list[str]
+    ) -> bool:
+        """Serve the scripted repository status and delegate all other existing routes."""
+        if url.path == f"/api/v1/repos/{stub.login}/FFmpeg":
+            self.reply(stub.repository_status, {"message": "repository read"})
+            return True
+        return super()._dispatch_get(stub, url, parts)
+
+    def do_POST(self) -> None:
+        """Record a fork creation and preserve the shared handler for other writes."""
+        if self.path == "/api/v1/repos/FFmpeg/FFmpeg/forks":
+            data = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
+            self.stub().requests.append(("POST", self.path, data))
+            self.reply(201, {})
+            return
+        super().do_POST()
+
+
+class ForkExistenceTest(ForgejoTest):
+    """Permit fork creation only after a successful request proves HTTP not-found."""
+
+    def fork_command(self, stub: ForkStub) -> subprocess.CompletedProcess[str]:
+        """Run fork through the shared fixture with a fixed login and local temporary files."""
+        with unittest.mock.patch(__name__ + ".Handler", ForkHandler):
+            return self.run_command(
+                stub,
+                "fork",
+                env_updates={"FFMPEG_FORGEJO_LOGIN": "tester", "TMPDIR": str(self.tmp)},
+            )
+
+    def test_not_found_creates_fork(self) -> None:
+        """A clean HTTP 404 permits exactly the expected fork POST and success message."""
+        stub = ForkStub(404)
+        result = self.fork_command(stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            stub.requests,
+            [
+                ("GET", "/api/v1/repos/tester/FFmpeg", ""),
+                ("POST", "/api/v1/repos/FFmpeg/FFmpeg/forks", "{}\n"),
+            ],
+        )
+        self.assertIn("forked FFmpeg/FFmpeg to ", result.stdout)
+
+    def test_existing_repository_does_not_write(self) -> None:
+        """An existing repository still succeeds without sending a create request."""
+        stub = ForkStub(200)
+        result = self.fork_command(stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(stub.requests, [("GET", "/api/v1/repos/tester/FFmpeg", "")])
+        self.assertTrue(result.stdout.rstrip().endswith("/tester/FFmpeg exists"))
+
+    def test_other_http_statuses_stop_before_create(self) -> None:
+        """Authorization, server, and redirect responses cannot stand in for absence."""
+        statuses = (401, 403, 500, 302)
+        for index in range(len(statuses)):
+            with self.subTest(status=statuses[index]):
+                stub = ForkStub(statuses[index])
+                result = self.fork_command(stub)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"unexpected HTTP status {statuses[index]}", result.stderr)
+                self.assertIn("/repos/tester/FFmpeg", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(stub.requests, [("GET", "/api/v1/repos/tester/FFmpeg", "")])
+
+    def test_transport_failures_keep_diagnostic_and_never_attempt_create(self) -> None:
+        """Transport statuses, including 44, never authorize even an attempted POST."""
+        statuses = (7, 44)
+        log = self.tmp / "curl-requests.txt"
+        curl = self.bin_dir / "curl"
+        for index in range(len(statuses)):
+            with self.subTest(status=statuses[index]):
+                log.write_text("", encoding="utf-8")
+                curl.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s\\n' \"$*\" >>{shlex.quote(str(log))}\n"
+                    "printf 'curl: planted transport failure\\n' >&2\n"
+                    f"exit {statuses[index]}\n",
+                    encoding="utf-8",
+                )
+                curl.chmod(0o755)
+                stub = ForkStub(404)
+                result = self.fork_command(stub)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("curl: planted transport failure", result.stderr)
+                self.assertEqual(result.stdout, "")
+                requests = log.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(requests), 1, requests)
+                self.assertIn("-X GET", requests[0])
+                self.assertEqual(stub.requests, [])
+
+    def test_read_cleanup_failure_never_authorizes_create(self) -> None:
+        """Header cleanup failure overrides both a successful read and HTTP not-found."""
+        statuses = (200, 404)
+        refused = plant_content_removal_failure(
+            self.bin_dir, self.tmp, b"Authorization: token testtoken\n"
+        )
+        for index in range(len(statuses)):
+            with self.subTest(status=statuses[index]):
+                refused.write_text("", encoding="utf-8")
+                stub = ForkStub(statuses[index])
+                result = self.fork_command(stub)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                paths = refused.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(paths), 1)
+                message = f"ffmpeg-forgejo: cannot delete {paths[0]}."
+                self.assertEqual(result.stderr.splitlines().count(message), 1)
+                self.assertTrue(Path(paths[0]).exists())
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(stub.requests, [("GET", "/api/v1/repos/tester/FFmpeg", "")])
 
 
 class PrivateRemovalTest(ForgejoTest):
@@ -5325,6 +5454,78 @@ MUTANTS = {
         "test_a_failing_seq_does_not_skip_the_guard",
     ),
 }
+
+
+def api_read_diagnostic_violations(source: str) -> list[int]:
+    """Reject suppressed API read diagnostics before callers can mistake failure for absence."""
+    parser = bash_parser()
+    if isinstance(parser, str):
+        raise ValueError(parser)
+    raw = source.encode("utf-8")
+    root = parser.parse(raw).root_node
+    if root.has_error:
+        raise ValueError("cannot inspect API reads in malformed Bash")
+    pending = [(root, False)]
+    violations = []
+    for _ in range(4 * len(raw) + 1):
+        if not pending:
+            return violations
+        node, hidden = pending.pop()
+        children = node.named_children
+        hidden = hidden or any(
+            children[index].type == "file_redirect"
+            and re.match(rb"(?:2\s*>|&>)", children[index].text)
+            for index in range(len(children))
+        )
+        if hidden and node.type == "command":
+            name = node.child_by_field_name("name")
+            arguments = node.children_by_field_name("argument")
+            if name is not None and (
+                name.text == b"api_exists"
+                or (name.text == b"api" and arguments and arguments[0].text.strip(b"\"'") == b"GET")
+            ):
+                violations.append(node.start_point.row + 1)
+        if node.type not in {"comment", "heredoc_body", "raw_string"}:
+            pending.extend((children[index], hidden) for index in range(len(children)))
+    raise ValueError("API read inspection exceeded its numeric node bound")
+
+
+class ApiReadSourceTest(unittest.TestCase):
+    """Guard every API read against discarded failure diagnostics, including planted callers."""
+
+    def test_helper_api_reads_keep_failure_diagnostics(self) -> None:
+        """No API read may discard stderr, regardless of its caller's write path or spelling."""
+        self.assertEqual(api_read_diagnostic_violations(HELPER.read_text(encoding="utf-8")), [])
+
+    def test_planted_absence_on_any_failure_callers_are_rejected(self) -> None:
+        """New paths, negation, substitutions, and grouped redirects cannot hide read failures."""
+        source = HELPER.read_text(encoding="utf-8")
+        callers = (
+            "if api GET /other >/dev/null 2>&1; then :; else api POST /create; fi",
+            "if ! api GET /other 2>/dev/null; then api POST /create; fi",
+            "api GET /other &>/dev/null || api POST /create",
+            'if out="$(api GET /other 2>/dev/null)"; then :; else api POST /create; fi',
+            "if api \\\nGET /other 2>&1 >/dev/null; then :; else api POST /create; fi",
+            "{ if api GET /other; then :; else api POST /create; fi; } 2>/dev/null",
+            "if api_exists /other 2>/dev/null; then :; else api POST /create; fi",
+        )
+        for index in range(len(callers)):
+            with self.subTest(caller=callers[index]):
+                self.assertTrue(api_read_diagnostic_violations(source + "\n" + callers[index]))
+
+    def test_api_read_guard_allows_stdout_discard_and_literal_examples(self) -> None:
+        """Discarding JSON stdout and quoting or commenting examples keeps stderr available."""
+        source = (
+            "# if api GET /other 2>/dev/null; then :; else api POST /create; fi\n"
+            "printf '%s' 'api GET /other 2>/dev/null'\n"
+            "if api GET /other >/dev/null; then :; else exit 1; fi\n"
+        )
+        self.assertEqual(api_read_diagnostic_violations(source), [])
+
+    def test_api_read_guard_rejects_unparseable_source(self) -> None:
+        """Malformed shell input cannot silently remove a caller from the source check."""
+        with self.assertRaisesRegex(ValueError, "malformed Bash"):
+            api_read_diagnostic_violations("if api GET /other 2>/dev/null; then")
 
 
 def private_removal_violations(source: str) -> list[int]:

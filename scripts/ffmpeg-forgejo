@@ -24,7 +24,7 @@
 #   ffmpeg-forgejo overlap [--overlap-ok <number>]... <branch>
 #                          lists every own open pull sharing a file with the branch diff against the fetched base; exit 77 when any, 0 when none, 1 when not proven
 #   ffmpeg-forgejo landed <branch-or-sha>
-#                          exits 82 when every own commit matches a stable base patch ID or merging leaves the base tree unchanged ("no change left against the base"); otherwise prints "not landed" (exit 0)
+#                          exits 82 when all own stable patch IDs are found in the base or the merged tree is unchanged ("no change left against the base"); otherwise prints "not landed" (exit 0)
 #                          reads at most 256 own commits and 10000 base commits; fetch/Git failure or excess commits exit 1; needs no token
 #   ffmpeg-forgejo issue   <title> <body-file>
 #   ffmpeg-forgejo comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
@@ -123,22 +123,41 @@ token() {
   printf '%s' "$t"
 }
 
-# api METHOD PATH [JSON-BODY-FILE]; the token goes through a header file, not argv.
+# api METHOD PATH [JSON-BODY-FILE] [--status]: send one request; --status prints only the HTTP code.
+# The token goes through a private header file, not argv.
 # The subshell keeps header cleanup local even when a function calls api directly.
 api() (
-  local method="$1" path="$2" body="${3:-}" hdr tok
+  local method="$1" path="$2" body="${3:-}" mode="${4:-}" hdr tok
+  local -a args=(-fsS -X "$method")
   tok="$(token)" || exit 1
-  hdr="$(mktemp)"
+  hdr="$(mktemp)" || exit 1
   trap 'cleanup_exit "$?" remove_private_files "$hdr"' EXIT
-  chmod 600 "$hdr"
-  printf 'Authorization: token %s\n' "$tok" >"$hdr"
-  if [ -n "$body" ]; then
-    curl -fsS --max-time 60 -X "$method" -H @"$hdr" -H 'Content-Type: application/json' \
-      --data-binary @"$body" "$API$path"
-  else
-    curl -fsS --max-time 60 -X "$method" -H @"$hdr" "$API$path"
+  chmod 600 "$hdr" || exit 1
+  printf 'Authorization: token %s\n' "$tok" >"$hdr" || exit 1
+  args+=(-H @"$hdr")
+  if [ "$mode" = --status ]; then
+    args+=(--no-fail -o /dev/null -w '%{http_code}')
   fi
+  if [ -n "$body" ]; then
+    args+=(-H 'Content-Type: application/json' --data-binary @"$body")
+  fi
+  curl --max-time 60 "${args[@]}" "$API$path"
 )
+
+# api_exists PATH: return 0 for an answer, 44 for proven absence, 1 for any other failure.
+api_exists() {
+  local code rc
+  if code="$(api GET "$1" "" --status)"; then :; else
+    rc=$?
+    printf 'ffmpeg-forgejo: cannot check repository %s (request rc %s).\n' "$1" "$rc" >&2
+    return 1
+  fi
+  case "$code" in
+    2[0-9][0-9]) return 0 ;;
+    404) return 44 ;;
+    *) printf 'ffmpeg-forgejo: unexpected HTTP status %s checking repository %s.\n' "$code" "$1" >&2; return 1 ;;
+  esac
+}
 
 # is_login VALUE: return 0 when VALUE is a valid Forgejo login, 1 otherwise.
 is_login() {
@@ -1378,7 +1397,7 @@ landed_patch_ids() {
     || die "cannot compute stable patch IDs"
 }
 
-# landed_report SAME-TREE: report landed when all own patch IDs match or merging leaves the base tree unchanged.
+# landed_report SAME-TREE: report landed when all own stable patch IDs are found in the base or the merged tree is unchanged.
 landed_report() {
   python3 -I - "$LANDED_DIR" "$1" <<'PY'
 import sys
@@ -1435,7 +1454,7 @@ finish_landed() {
   exit "$report_status"
 }
 
-# check_landed HEAD: every own commit matches a stable base patch ID or merging leaves the base tree unchanged; clean private state on exit.
+# check_landed HEAD: all own stable patch IDs are found in the base or the merged tree is unchanged; clean private state on exit.
 check_landed() (
   local sha ancestor rc tree base_tree same_tree=0
   MERGE_BASE_REF="refs/ffmpeg-forgejo/landed-base-$$"
@@ -1723,9 +1742,11 @@ for i in json.load(sys.stdin):
     ;;
   fork)
     me="$(login)"
-    if api GET "/repos/$me/${REPO#*/}" >/dev/null 2>&1; then
+    if api_exists "/repos/$me/${REPO#*/}"; then
       echo "$HOST/$me/${REPO#*/} exists"
     else
+      rc=$?
+      [ "$rc" -eq 44 ] || exit "$rc"
       body="$(mktemp)"; echo '{}' >"$body"
       api POST "/repos/$REPO/forks" "$body" >/dev/null
       remove_private_files "$body" || exit 1
