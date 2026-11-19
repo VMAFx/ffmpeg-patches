@@ -9,7 +9,7 @@ import contextlib
 import io
 import os
 import select
-import subprocess
+import subprocess  # nosec B404 - fixture-controlled Python argv, no shell.
 import sys
 import tempfile
 import unittest
@@ -287,7 +287,7 @@ class ProcessOutputFixture(unittest.TestCase):
                 reader, writer = os.pipe()
                 os.close(reader)
                 destinations[closed] = resources.enter_context(os.fdopen(writer, "wb", buffering=0))
-            process = subprocess.Popen(
+            process = subprocess.Popen(  # nosec B603 - fixture-controlled Python argv, no shell.
                 [sys.executable, "-B", *arguments],
                 cwd=upstream_lint.REPO_ROOT,
                 env=environment,
