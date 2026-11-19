@@ -123,6 +123,8 @@ daily check fails once that PR merges or closes.
 
 ## Guides and reference
 
+For `scripts/upstream_lint.py`, `--c-rule-reason` waives findings only; unread files need repeatable `--c-rule-unread-waiver '{"path":"libavformat/rtspenc.c","rule":"c-rules-unread","reason":"touched lines checked by hand","category":"C","entered":"2026-11-19"}'` JSON objects with exactly `path`, `rule`, `reason`, `category`, `entered` and optional `expires` dates in YYYY-MM-DD form (required for A at 1-90 days; B/C/D expire after 3/10/120 days), each naming one exact unread path, live through its expiry day, with unused waivers failing.
+
 ### Pre-PR variant sweep
 
 Before pushing or opening a pull request, scan the committed fix and callers of its targets:

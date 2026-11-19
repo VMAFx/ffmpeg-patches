@@ -21,6 +21,7 @@ import tempfile
 import unittest
 import unittest.mock
 from dataclasses import FrozenInstanceError
+from datetime import date
 from pathlib import Path
 
 from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
@@ -3554,7 +3555,9 @@ class CRulesTest(unittest.TestCase):
             )
         return upstream_lint.RunResult(tuple(argv), self.stub_rc, self.stub_stdout)
 
-    def run_c_rules(self, waiver: str = "") -> upstream_lint.Step:
+    def run_c_rules(
+        self, waiver: str = "", unread: tuple[upstream_lint.UnreadWaiver, ...] = ()
+    ) -> upstream_lint.Step:
         """Execute _c_rules through _collect with _git and _run stubbed."""
         with (
             unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
@@ -3562,7 +3565,11 @@ class CRulesTest(unittest.TestCase):
         ):
             return upstream_lint._collect(
                 "c-rules",
-                lambda: upstream_lint._c_rules(self.tree, "base", "head", waiver),
+                lambda: (
+                    upstream_lint._c_rules(self.tree, "base", "head", waiver, unread)
+                    if unread
+                    else upstream_lint._c_rules(self.tree, "base", "head", waiver)
+                ),
             )
 
     def inter_hunk_fixture(self) -> FixtureTest:
@@ -3832,17 +3839,15 @@ class CRulesTest(unittest.TestCase):
                 self.assertNotIn("waived:", step.output)
 
     def test_unread_requested_file_waived_with_reason(self) -> None:
-        """Only a nonblank reason waives an unread file and preserves its review line."""
+        """A free reason no longer waives an unread file; blank reasons also fail."""
         self.stub_json = json.dumps(self.syntax_error_payload())
-        step = self.run_c_rules("  touched lines checked by hand  ")
-        self.assertEqual(step.rc, 0, step.output)
-        self.assertEqual(step.output.splitlines()[0], "waived: touched lines checked by hand")
-        self.assertIn("unread: libavformat/rtspenc.c:", step.output)
-        self.assertIn("touched lines need a check by hand", step.output)
-        blank = self.run_c_rules("   ")
-        self.assertEqual(blank.rc, 1, blank.output)
-        self.assertIn("unread: libavformat/rtspenc.c:", blank.output)
-        self.assertNotIn("waived:", blank.output)
+        reasons = ("  touched lines checked by hand  ", "   ")
+        for index in range(len(reasons)):
+            step = self.run_c_rules(reasons[index])
+            self.assertEqual(step.rc, 1, step.output)
+            self.assertIn("unread: libavformat/rtspenc.c:", step.output)
+            self.assertIn("no waiver: libavformat/rtspenc.c:", step.output)
+            self.assertNotIn("waived:", step.output)
 
     def test_unread_file_and_real_finding_both_reported(self) -> None:
         """Unread files, touched findings and partial notes remain visible together."""
@@ -3866,7 +3871,7 @@ class CRulesTest(unittest.TestCase):
         for index in range(len(reasons)):
             with self.subTest(reason=reasons[index]):
                 step = self.run_c_rules(reasons[index])
-                self.assertEqual(step.rc, 1 - index, step.output)
+                self.assertEqual(step.rc, 1, step.output)
                 self.assertIn("unread: libavformat/rtspenc.c:", step.output)
                 self.assertIn("finding: libavformat/rtsp.c:11:", step.output)
                 self.assertIn("missing ff_network_close()", step.output)
@@ -4166,6 +4171,278 @@ class CRulesTest(unittest.TestCase):
                 )
                 step = self.run_c_rules()
                 self.assertEqual(step.rc, 2, step.output)
+
+
+class UnreadWaiverTest(unittest.TestCase):
+    """Fixture-only dated unread-file waivers with a fixed injected run date."""
+
+    def setUp(self) -> None:
+        """Create the scanner stub and a category C waiver entered on November 9."""
+        self.fixture = CRulesTest()
+        self.fixture.setUp()
+        self.entry = {
+            "path": "libavformat/rtspenc.c",
+            "rule": "c-rules-unread",
+            "reason": "touched lines checked by hand",
+            "category": "C",
+            "entered": "2026-11-09",
+        }
+        self.today = date(2026, 11, 18)
+
+    def run_case(
+        self,
+        entries: list[dict[str, object]] | None = None,
+        *,
+        reason: str = "",
+        unread: bool = True,
+    ) -> upstream_lint.Step:
+        """Parse CLI waivers and collect only the c-rules step with scanner fixtures."""
+        values = [json.dumps(entry) for entry in (entries if entries is not None else [self.entry])]
+        argv = ["--tree", ".", "--base", "base", "--c-rule-reason", reason]
+        for index in range(len(values)):
+            argv.extend(["--c-rule-unread-waiver", values[index]])
+        if unread:
+            self.fixture.stub_json = json.dumps(self.fixture.syntax_error_payload())
+        captured: list[upstream_lint.Step] = []
+
+        def checks(tree, base, head, waivers):
+            """Capture one c-rules result without running any other pipeline step."""
+            captured.append(
+                self.fixture.run_c_rules(waivers.c_rule, getattr(waivers, "unread", ()))
+            )
+            return captured
+
+        self.clock = unittest.mock.Mock(return_value=self.today)
+        with (
+            unittest.mock.patch.object(upstream_lint, "_prepare", return_value=("base", "head")),
+            unittest.mock.patch.object(upstream_lint, "_checks", side_effect=checks),
+            unittest.mock.patch.object(upstream_lint, "_TODAY", self.clock, create=True),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            upstream_lint.main(argv)
+        return captured[0]
+
+    def assert_usage(self, entries: list[dict[str, object]], field: str) -> None:
+        """Require field-specific exit two before any preparation or scanner call."""
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(SystemExit) as caught:
+            self.run_case(entries)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn(field, output.getvalue())
+        self.assertNotIn("unrecognized arguments", output.getvalue())
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_date_source_called_once(self) -> None:
+        """All waivers use exactly one reading of the injectable date source."""
+        self.run_case([])
+        self.clock.assert_called_once_with()
+
+    def test_live_waiver(self) -> None:
+        """One exact live waiver passes and prints its category, expiry and reason."""
+        step = self.run_case()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("waived: libavformat/rtspenc.c: category C, expires 2026-11-19", step.output)
+        self.assertIn(self.entry["reason"], step.output)
+
+    def test_expired_waiver(self) -> None:
+        """An expired exception fails even with the legacy free reason supplied."""
+        self.today = date(2026, 11, 20)
+        step = self.run_case(reason="checked by hand")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("expired: libavformat/rtspenc.c: category C, expired 2026-11-19", step.output)
+        self.assertNotIn("waived:", step.output)
+
+    def test_expiry_day_and_day_after(self) -> None:
+        """Expiry day passes; the following day fails with the same expiry date."""
+        for day in range(19, 21):
+            with self.subTest(day=day):
+                self.today = date(2026, 11, day)
+                step = self.run_case()
+                self.assertEqual(step.rc, day - 19, step.output)
+                self.assertIn("2026-11-19", step.output)
+
+    def test_no_waiver(self) -> None:
+        """An unread file needs an exact dated waiver and names the missing path."""
+        step = self.run_case([])
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("no waiver: libavformat/rtspenc.c", step.output)
+
+    def test_free_reason_alone(self) -> None:
+        """The free finding reason cannot excuse an unread file."""
+        step = self.run_case([], reason="checked by hand")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("no waiver: libavformat/rtspenc.c", step.output)
+
+    def test_two_unread_files_one_waiver(self) -> None:
+        """One waiver leaves the second unread path failing and explicitly unwaived."""
+        self.fixture.diff_names += "libavformat/rtsp.c\0"
+        self.fixture.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.fixture.syntax_error_payload()
+        payload["paths"] = {"scanned": [self.entry["path"], "libavformat/rtsp.c"]}
+        payload["errors"].append({"type": "Syntax error", "path": "libavformat/rtsp.c"})
+        self.fixture.stub_json = json.dumps(payload)
+        step = self.run_case(unread=False)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("waived: libavformat/rtspenc.c: category C", step.output)
+        self.assertIn("no waiver: libavformat/rtsp.c:", step.output)
+
+    def test_two_live_waivers(self) -> None:
+        """Repeating the option grants a separate live waiver to each unread file."""
+        self.fixture.diff_names += "libavformat/rtsp.c\0"
+        self.fixture.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.fixture.syntax_error_payload()
+        payload["paths"] = {"scanned": [self.entry["path"], "libavformat/rtsp.c"]}
+        payload["errors"].append({"type": "Syntax error", "path": "libavformat/rtsp.c"})
+        self.fixture.stub_json = json.dumps(payload)
+        step = self.run_case(
+            [self.entry, {**self.entry, "path": "libavformat/rtsp.c"}], unread=False
+        )
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output.count("waived:"), 2)
+
+    def test_unused_waiver(self) -> None:
+        """A waiver for a readable file fails rather than silently accumulating."""
+        step = self.run_case(unread=False)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unused waiver: libavformat/rtspenc.c", step.output)
+
+    def test_unused_waiver_without_sources(self) -> None:
+        """A waiver is unused even when no changed C sources trigger a scanner run."""
+        self.fixture.diff_names = ""
+        step = self.run_case(unread=False)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unused waiver: libavformat/rtspenc.c", step.output)
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_path_is_exact(self) -> None:
+        """A different spelling waives no unread path and is reported unused."""
+        step = self.run_case([{**self.entry, "path": "./libavformat/rtspenc.c"}])
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("no waiver: libavformat/rtspenc.c", step.output)
+        self.assertIn("unused waiver: ./libavformat/rtspenc.c", step.output)
+
+    def test_categories_and_a_boundaries(self) -> None:
+        """Fixed categories and A's one-day and ninety-day limits share date validation."""
+        cases = (
+            ("B", None, "2026-11-12"),
+            ("C", None, "2026-11-19"),
+            ("D", None, "2027-03-09"),
+            ("A", "2026-11-10", "2026-11-10"),
+            ("A", "2027-02-07", "2027-02-07"),
+        )
+        self.today = date(2026, 11, 9)
+        for index in range(len(cases)):
+            category, expires, expected = cases[index]
+            with self.subTest(category=category, expires=expires):
+                entry = {**self.entry, "category": category}
+                if expires:
+                    entry["expires"] = expires
+                step = self.run_case([entry])
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertIn(f"category {category}, expires {expected}", step.output)
+
+    def test_usage_unknown_field(self) -> None:
+        """Unknown fields cannot silently extend the waiver schema."""
+        self.assert_usage([{**self.entry, "extra": "typo"}], "extra")
+
+    def test_usage_missing_fields(self) -> None:
+        """Every required field is named when missing from a waiver."""
+        fields = sorted(self.entry)
+        for index in range(len(fields)):
+            entry = self.entry.copy()
+            del entry[fields[index]]
+            self.assert_usage([entry], fields[index])
+
+    def test_usage_empty_reason_and_field_types(self) -> None:
+        """Empty or non-string fields fail usage validation before scanning."""
+        cases = (
+            ("reason", ""),
+            ("reason", "   "),
+            ("reason", None),
+            ("path", ""),
+            ("path", []),
+            ("entered", 20261109),
+            ("expires", ""),
+        )
+        for index in range(len(cases)):
+            field, value = cases[index]
+            self.assert_usage([{**self.entry, field: value}], field)
+
+    def test_usage_category(self) -> None:
+        """Unknown categories fail instead of acquiring an arbitrary interval."""
+        self.assert_usage([{**self.entry, "category": "E"}], "category")
+
+    def test_usage_rule(self) -> None:
+        """Only the unread result class accepts this waiver."""
+        self.assert_usage([{**self.entry, "rule": "PartialParsing"}], "rule")
+
+    def test_usage_invalid_dates(self) -> None:
+        """Invalid calendar dates and non-ISO spellings name the date field."""
+        cases = (
+            ("entered", "2026-02-30"),
+            ("entered", "20261109"),
+            ("entered", "2026-1-09"),
+            ("expires", "2026-02-30"),
+            ("expires", "20261119"),
+            ("expires", "2026-11-19T00:00:00"),
+        )
+        for index in range(len(cases)):
+            field, value = cases[index]
+            self.assert_usage([{**self.entry, field: value}], field)
+
+    def test_usage_future_entered(self) -> None:
+        """An exception cannot be recorded after the run's injected day."""
+        self.assert_usage([{**self.entry, "entered": "2026-11-19"}], "entered")
+
+    def test_usage_category_intervals(self) -> None:
+        """Fixed interval mismatches and A's missing or out-of-range expiry fail."""
+        cases = (
+            ("B", "2026-11-13"),
+            ("C", "2026-11-18"),
+            ("D", "2027-03-08"),
+            ("A", None),
+            ("A", "2026-11-09"),
+            ("A", "2027-02-08"),
+            ("A", "2026-11-08"),
+        )
+        for index in range(len(cases)):
+            category, expires = cases[index]
+            entry = {**self.entry, "category": category}
+            if expires:
+                entry["expires"] = expires
+            self.assert_usage([entry], "expires")
+
+    def test_usage_duplicate_file(self) -> None:
+        """Repeated paths are usage errors even when the supplied reasons differ."""
+        self.assert_usage([self.entry, {**self.entry, "reason": "second review"}], "path")
+
+    def test_usage_json_and_duplicate_fields(self) -> None:
+        """Malformed JSON, non-objects and repeated fields are explicit usage errors."""
+        values = ("{", "[]", "null", '{"path":"one","path":"two"}')
+        for index in range(len(values)):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output), self.assertRaises(SystemExit) as caught:
+                upstream_lint.main(
+                    ["--tree", ".", "--base", "base", "--c-rule-unread-waiver", values[index]]
+                )
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("JSON" if index < 3 else "path", output.getvalue())
+            self.assertNotIn("unrecognized arguments", output.getvalue())
+
+    def test_unread_waiver_cannot_waive_tool_errors(self) -> None:
+        """Valid dated waivers leave tool, warning and JSON failures at rc two."""
+        cases = (
+            (127, "", self.fixture.syntax_error_payload()),
+            (0, "semgrep_scan: warning", self.fixture.syntax_error_payload()),
+            (0, "", {"paths": {"scanned": []}, "results": [], "errors": []}),
+            (0, "", {**self.fixture.syntax_error_payload(), "errors": [{"type": "Other"}]}),
+        )
+        for index in range(len(cases)):
+            self.fixture.stub_rc, self.fixture.stub_stdout, payload = cases[index]
+            self.fixture.stub_json = json.dumps(payload)
+            step = self.run_case(reason="manual review", unread=False)
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
 
 
 if __name__ == "__main__":

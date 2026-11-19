@@ -135,8 +135,11 @@ untouched matches and PartialParsing errors are reported without failing,
 and any other status, warning, error shape or JSON failure gives rc 2.
 A Syntax error for a requested file means the rules could not read it: rc 1
 names the file and requires a check by hand of its touched lines.
---c-rule-reason TEXT waives rc 1 findings or unread files and prints the reason
-and affected file lines, never rc 2.
+--c-rule-reason TEXT waives findings only, never unread files or rc 2.
+--c-rule-unread-waiver JSON is repeatable, one exact path per dated exception;
+fields: path, rule=c-rules-unread, reason, category, entered (YYYY-MM-DD),
+and expires (required for A, optional for B/C/D). B/C/D expire after 3/10/120
+days; A requires 1-90 days. Expiry day is live; unused waivers fail.
 
 The docstrings step checks diff-scoped doc-comment coverage across base..head
 in --tree by running the pinned Praetor engine via .config/lefthook/engine.sh
@@ -165,7 +168,13 @@ import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path, PurePosixPath
+
+try:
+    import series
+except ModuleNotFoundError:
+    from scripts import series
 
 # Ensure repository root is on sys.path for test/tool imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -232,6 +241,7 @@ REAP_TIMEOUT = 10
 SEMGREP_SCAN = REPO_ROOT / "scripts" / "semgrep_scan.sh"
 SEMGREP_FFMPEG_RULES = REPO_ROOT / ".semgrep-ffmpeg.yml"
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
+_TODAY: Callable[[], date] = date.today
 CONFIG = ".forgejo/pre-commit/config.yaml"
 ENGINE_SCRIPT = ".config/lefthook/engine.sh"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -351,6 +361,17 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class UnreadWaiver:
+    """One exact-path unread-file exception evaluated against the run's date."""
+
+    path: str
+    reason: str
+    category: str
+    expires: date
+    expired: bool
+
+
+@dataclass(frozen=True)
 class Waivers:
     """Reasons that waive single upstream checks; a blank reason waives nothing."""
 
@@ -360,6 +381,7 @@ class Waivers:
     test_program: str = ""
     c_rule: str = ""
     docstring: str = ""
+    unread: tuple[UnreadWaiver, ...] = ()
 
 
 @dataclass
@@ -2174,20 +2196,125 @@ def _c_rules_touched(tree: Path, base: str, head: str) -> dict[str, set[int]]:
     }
 
 
+def _waiver_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject repeated JSON fields rather than silently replacing them."""
+    entry: dict[str, object] = {}
+    for index in range(len(pairs)):
+        key, value = pairs[index]
+        if key in entry:
+            raise ValueError(f"duplicate field: {key}")
+        entry[key] = value
+    return entry
+
+
+def _unread_waiver_dates(entry: dict[str, str], today: date) -> tuple[date, date]:
+    """Reuse series date and interval validation, classifying expiration separately."""
+    category = entry["category"]
+    if category not in series.VALID_CATEGORIES:
+        raise ValueError("category: expected A, B, C or D")
+    try:
+        entered = date.fromisoformat(entry["entered"])
+    except ValueError as error:
+        raise ValueError("entered: invalid YYYY-MM-DD date") from error
+    if category == "A" and "expires" not in entry:
+        raise ValueError("missing field: expires (category A)")
+    try:
+        expires = (
+            entry.get("expires")
+            or (entered + timedelta(days=series.CATEGORY_INTERVALS[category])).isoformat()
+        )
+    except OverflowError as error:
+        raise ValueError("expires: date out of range") from error
+    findings = series.Findings()
+    series.check_exception_dates({**entry, "expires": expires}, "waiver", findings, date.min)
+    if findings.errors:
+        raise ValueError("; ".join(findings.errors))
+    if entered > today:
+        raise ValueError("entered: date is in the future")
+    return entered, date.fromisoformat(expires)
+
+
+def _unread_waiver_object(value: str) -> dict[str, str]:
+    """Validate the JSON object against the exact unread-waiver field allow-list."""
+    required = {"path", "rule", "reason", "category", "entered"}
+    try:
+        raw = json.loads(value, object_pairs_hook=_waiver_object)
+    except json.JSONDecodeError as error:
+        raise ValueError("JSON: invalid waiver object") from error
+    if not isinstance(raw, dict):
+        raise ValueError("JSON: expected waiver object")
+    unknown = set(raw) - (required | {"expires"})
+    missing = required - set(raw)
+    if unknown:
+        raise ValueError(f"unknown field: {sorted(unknown)[0]}")
+    if missing:
+        raise ValueError(f"missing field: {sorted(missing)[0]}")
+    keys = sorted(raw)
+    for index in range(len(keys)):
+        key = keys[index]
+        if not isinstance(raw[key], str) or not raw[key].strip():
+            raise ValueError(f"{key}: expected non-empty string")
+    if raw["rule"] != "c-rules-unread":
+        raise ValueError("rule: expected c-rules-unread")
+    return raw
+
+
+def _parse_unread_waivers(values: list[str], today: date) -> tuple[UnreadWaiver, ...]:
+    """Parse validated dated waivers and reject duplicate paths as usage errors."""
+    entries: dict[str, UnreadWaiver] = {}
+    if len(values) > MAX_PATHS:
+        raise ValueError(f"path: at most {MAX_PATHS} waivers allowed")
+    for index in range(len(values)):
+        raw = _unread_waiver_object(values[index])
+        if raw["path"] in entries:
+            raise ValueError(f"path: duplicate waiver for {raw['path']}")
+        _, expires = _unread_waiver_dates(raw, today)
+        entries[raw["path"]] = UnreadWaiver(
+            raw["path"], raw["reason"].strip(), raw["category"], expires, expires < today
+        )
+    return tuple(entries.values())
+
+
+def _unread_report(unread_paths: list[str], waivers: tuple[UnreadWaiver, ...]) -> Step:
+    """Require one live dated waiver per unread path and reject unused waivers."""
+    unread = sorted(set(unread_paths))
+    entries = {waivers[index].path: waivers[index] for index in range(len(waivers))}
+    lines: list[str] = []
+    failed = False
+    for index in range(len(unread)):
+        path = unread[index]
+        lines.append(
+            f"unread: {path}: rules could not read this file; touched lines need a check by hand"
+        )
+        entry = entries.get(path)
+        if entry is None:
+            failed = True
+            lines.append(f"no waiver: {path}: pass --c-rule-unread-waiver")
+        elif entry.expired:
+            failed = True
+            lines.append(f"expired: {path}: category {entry.category}, expired {entry.expires}")
+        else:
+            lines.append(
+                f"waived: {path}: category {entry.category}, "
+                f"expires {entry.expires}: {entry.reason}"
+            )
+    for index in range(len(waivers)):
+        if waivers[index].path not in unread:
+            failed = True
+            lines.append(f"unused waiver: {waivers[index].path}")
+    return Step("c-rules", int(failed), "\n".join(lines))
+
+
 def _c_rules_report(
     matches: list[SemgrepMatch],
     partial_paths: list[str],
     touched_by_path: dict[str, set[int]],
-    waiver: str,
+    waivers: Waivers,
     unread_paths: list[str],
 ) -> Step:
-    """Report touched matches and unread files, applying the same explicit waiver to both."""
-    unread = sorted(set(unread_paths))
-    findings = [
-        f"unread: {unread[index]}: rules could not read this file; "
-        "touched lines need a check by hand"
-        for index in range(len(unread))
-    ]
+    """Report findings separately from exact-path dated unread-file waivers."""
+    unread = _unread_report(unread_paths, waivers.unread)
+    findings: list[str] = []
     notes: list[str] = []
     for index in range(len(matches)):
         match = matches[index]
@@ -2207,21 +2334,29 @@ def _c_rules_report(
         f"informational: {partial_paths[index]}: PartialParsing"
         for index in range(len(partial_paths))
     )
-    if not findings:
-        summary = f"0 finding(s) in {len(touched_by_path)} changed C/header source(s)"
-        return Step("c-rules", 0, "\n".join([*notes, summary]))
-    reason = waiver.strip()
-    if reason:
-        return Step("c-rules", 0, "\n".join([f"waived: {reason}", *findings, *notes]))
-    advice = "fix the flagged path, or pass --c-rule-reason"
-    return Step("c-rules", 1, "\n".join([*findings, *notes, advice]))
+    reason = waivers.c_rule.strip()
+    lines = ([f"waived: {reason}"] if findings and reason else []) + findings + notes
+    if unread.output:
+        lines.append(unread.output)
+    if findings and not reason:
+        lines.append("fix the flagged path, or pass --c-rule-reason")
+    elif not findings and not unread_paths:
+        lines.append(f"0 finding(s) in {len(touched_by_path)} changed C/header source(s)")
+    return Step("c-rules", int(bool(unread.rc or (findings and not reason))), "\n".join(lines))
 
 
-def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
+def _c_rules(
+    tree: Path, base: str, head: str, waiver: str, unread_waivers: tuple[UnreadWaiver, ...] = ()
+) -> Step:
     """Scan changed C/header sources and fail closed unless every requested path was scanned."""
     touched_by_path = _c_rules_touched(tree, base, head)
     if not touched_by_path:
-        return Step("c-rules", 0, "no added or modified C or header source in the range")
+        unused = _unread_report([], unread_waivers)
+        return Step(
+            "c-rules",
+            unused.rc,
+            unused.output or "no added or modified C or header source in the range",
+        )
     paths = list(touched_by_path)
     unread_paths: list[str] = []
     with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
@@ -2244,7 +2379,13 @@ def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
         )
     if parsed is None:
         return _c_rules_error(result)
-    return _c_rules_report(parsed[0], parsed[1], touched_by_path, waiver, unread_paths)
+    return _c_rules_report(
+        parsed[0],
+        parsed[1],
+        touched_by_path,
+        Waivers(c_rule=waiver, unread=unread_waivers),
+        unread_paths,
+    )
 
 
 DOCSTRING_COVERAGE = re.compile(
@@ -2310,7 +2451,7 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
             _collect("doc-wrap", lambda: _doc_wrap(tree, base, head, waivers.doc)),
             _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
-            _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule)),
+            _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule, waivers.unread)),
             _collect("docstrings", lambda: _docstrings(tree, base, head, waivers.docstring)),
         ]
 
@@ -2352,8 +2493,19 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "why a finding in .semgrep-ffmpeg.yml does not apply to the touched path; "
-            "waives findings of the c-rules step"
+            "waives findings only, never unread files or tool errors"
         ),
+    )
+    parser.add_argument(
+        "--c-rule-unread-waiver",
+        action="append",
+        default=[],
+        metavar="JSON",
+        help='repeat per unread file: {"path":"libavutil/x.c","rule":"c-rules-unread",'
+        '"reason":"manual review","category":"C","entered":"2026-11-19"}; '
+        "exact fields path, rule, reason, category, entered, optional expires (YYYY-MM-DD); "
+        "A requires expires at entered + 1..90 days; B/C/D use 3/10/120 days; "
+        "expiry day is live; unused waivers fail",
     )
     parser.add_argument(
         "--docstring-reason",
@@ -2365,7 +2517,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Run all upstream checks, print their statuses, and optionally save a report."""
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        unread = _parse_unread_waivers(args.c_rule_unread_waiver, _TODAY())
+    except ValueError as error:
+        parser.error(f"--c-rule-unread-waiver: {error}")
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
@@ -2377,6 +2534,7 @@ def main(argv: list[str] | None = None) -> int:
             test_program=args.test_program_reason,
             c_rule=args.c_rule_reason,
             docstring=args.docstring_reason,
+            unread=unread,
         )
         steps = _checks(tree, base, head, waivers)
         _remaining(0)
