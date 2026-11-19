@@ -1799,6 +1799,7 @@ SECTION_DESCRIPTION_WORDS = (
     "options",
 )
 TEXI_REF = re.compile(r"@(?:ref|xref|pxref)\{")
+TEXI_COMMENT = re.compile(r"(?<!@)@(?:c|comment)(?=\s|$)")
 DEFER_WORDING = re.compile(
     r"\b(?:(?:described|documented|defined|specified|explained)\s+(?:for|in|under|by|with)"
     r"|(?:same|identical)\s+(?:format|syntax)\s+as)\b(?:(?![.!?]\s)[^;])*$",
@@ -1806,6 +1807,7 @@ DEFER_WORDING = re.compile(
 )
 ANCHOR_ITEM_LIMIT = 400
 REFERENCE_CONTEXT_LINES = 6
+REFERENCE_LOOKAHEAD_LINES = 3
 
 
 def is_doc_path(name: str) -> bool:
@@ -1973,19 +1975,23 @@ def section_names(title: str) -> frozenset[str]:
     )
 
 
+def _anchor_boundary(line: str, stack: list[str]) -> bool:
+    """Stop at unmatched block ends or peer item boundaries outside raw blocks."""
+    if stack and stack[-1] in TEXI_RAW:
+        return False
+    end = TEXI_END.match(line)
+    return bool(end and end[1] not in stack) or (not stack and bool(TEXI_ITEM_END.match(line)))
+
+
 def _anchor_body(lines: list[str]) -> list[str]:
-    """Collect a bounded item body through matching nested Texinfo block ends."""
+    """Collect a bounded nested item body until a peer boundary or unmatched end."""
+    blocks = _texi_blocks(lines) | frozenset(TEXI_ITEM_BLOCKS)
     body: list[str] = []
     stack: list[str] = []
     for line in lines[:ANCHOR_ITEM_LIMIT]:
-        command = TEXI_COMMAND.match(line)
-        end = TEXI_END.match(line)
-        if command and command[1] in TEXI_ITEM_BLOCKS:
-            stack.append(command[1])
-        elif end and stack and end[1] == stack[-1]:
-            stack.pop()
-        elif not stack and TEXI_ITEM_END.match(line):
+        if _anchor_boundary(line, stack):
             break
+        _texi_prose_line(line, blocks, stack)
         body.append(line)
     return body
 
@@ -2035,32 +2041,95 @@ def _reference_context(lines: list[str], index: int) -> str:
     return " ".join(reversed(before))
 
 
+def _reference_lines(lines: list[str]) -> list[str]:
+    """Blank raw blocks and trim unescaped Texinfo comments, preserving line numbers."""
+    visible: list[str] = []
+    stack: list[str] = []
+    for line in lines:
+        if stack:
+            _texi_raw_line(line, stack)
+            visible.append("")
+            continue
+        prose = TEXI_COMMENT.split(line, maxsplit=1)[0]
+        command = TEXI_COMMAND.match(prose)
+        if command and command[1] in TEXI_RAW:
+            stack.append(command[1])
+            prose = ""
+        visible.append(prose)
+    return visible
+
+
+def _table_anchors(lines: list[str]) -> dict[str, int]:
+    """Index anchors whose innermost non-conditional block is an option table."""
+    blocks = _texi_blocks(lines)
+    stack: list[str] = []
+    anchors: dict[str, int] = {}
+    for index, line in enumerate(lines):
+        containers = [name for name in stack if not name.startswith("if")]
+        if (
+            containers
+            and containers[-1] in ("table", "ftable", "vtable")
+            and (match := TEXI_ANCHOR.match(line))
+        ):
+            anchors.setdefault(match[1].strip(), index)
+        _texi_prose_line(line, blocks, stack)
+    return anchors
+
+
+def _reference_arguments(lines: list[str], index: int, start: int) -> tuple[list[str], int]:
+    """Parse reference arguments within three following lines and return the last line."""
+    text = lines[index][start:]
+    for stop in range(index, min(len(lines), index + REFERENCE_LOOKAHEAD_LINES + 1)):
+        args, closed = _texi_ref_arguments(" ".join([text, *lines[index + 1 : stop + 1]]))
+        if closed:
+            return args, stop + 1
+    args[0] = re.split(r"[,}]", text, maxsplit=1)[0].strip()
+    return args, stop + 1
+
+
+def _item_libraries(lines: list[str], sections: list[str], source: int, target: int) -> list[str]:
+    """Return other section library names mentioned in the referenced item's body."""
+    body = "\n".join(_anchor_item(lines, target))
+    others = section_names(sections[target]) - section_names(sections[source])
+    return sorted(name for name in others if re.search(rf"(?<![\w-]){re.escape(name)}\b", body))
+
+
+def _added_references(lines: list[str], added: set[int]) -> list[tuple[int, int, list[str]]]:
+    """Collect each reference with an added line in its bounded span once."""
+    numbers = {
+        start
+        for number in added
+        for start in range(max(1, number - REFERENCE_LOOKAHEAD_LINES), min(number, len(lines)) + 1)
+    }
+    references: list[tuple[int, int, list[str]]] = []
+    for number in sorted(numbers):
+        for ref in TEXI_REF.finditer(lines[number - 1]):
+            args, last = _reference_arguments(lines, number - 1, ref.end())
+            if not added.isdisjoint(range(number, last + 1)):
+                references.append((number, ref.start(), args))
+    return references
+
+
 def _reference_finding(
-    path: str, lines: list[str], sections: list[str], anchors: dict[str, int], number: int
+    path: str,
+    lines: list[str],
+    sections: list[str],
+    anchors: dict[str, int],
+    added: set[int],
 ) -> list[str]:
-    """Find deferred local references, skipping known external manuals even when unclosed."""
-    index = number - 1
-    before = _reference_context(lines, index)
+    """Find deferred local references whose bounded span includes an added line."""
     findings: list[str] = []
-    for ref in TEXI_REF.finditer(lines[index]):
-        text = lines[index][ref.end() :]
-        args, closed = _texi_ref_arguments(text)
-        if not closed:
-            args, closed = _texi_ref_arguments(" ".join([text, *lines[index + 1 : index + 4]]))
+    for number, column, args in _added_references(lines, added):
+        index = number - 1
+        before = _reference_context(lines, index)
         if len(args) > 3 and args[3]:
             continue
-        if not closed:
-            args[0] = re.split(r"[,}]", text, maxsplit=1)[0].strip()
         target = anchors.get(args[0])
         if target is None or not sections[index]:
             continue
-        if not DEFER_WORDING.search(f"{before} {lines[index][: ref.start()]}"):
+        if not DEFER_WORDING.search(f"{before} {lines[index][:column]}"):
             continue
-        body = "\n".join(_anchor_item(lines, target))
-        others = section_names(sections[target]) - section_names(sections[index])
-        named = sorted(
-            name for name in others if re.search(rf"(?<![\w-]){re.escape(name)}\b", body)
-        )
+        named = _item_libraries(lines, sections, index, target)
         if named:
             findings.append(
                 f"{path}:{number}: the {sections[index]} text defers to @ref{{{args[0]}}}, "
@@ -2070,17 +2139,11 @@ def _reference_finding(
 
 
 def reference_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
-    """Return a finding per added reference deferring to an item that names another library."""
+    """Find visible deferred item references with any added line in their bounded span."""
+    lines = _reference_lines(lines)
     sections = texi_sections(lines)
-    anchors: dict[str, int] = {}
-    for index, line in enumerate(lines):
-        if match := TEXI_ANCHOR.match(line):
-            anchors.setdefault(match[1].strip(), index)
-    findings: list[str] = []
-    for number in sorted(added):
-        if 0 < number <= len(lines):
-            findings.extend(_reference_finding(path, lines, sections, anchors, number))
-    return findings
+    anchors = _table_anchors(lines)
+    return _reference_finding(path, lines, sections, anchors, added)
 
 
 def _doc_files(tree: Path, base: str, head: str) -> list[tuple[str, list[str], set[int]]]:

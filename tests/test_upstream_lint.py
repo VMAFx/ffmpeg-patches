@@ -1837,6 +1837,95 @@ class DocReferenceTest(unittest.TestCase):
             with self.subTest(new=new):
                 self.assertEqual(len(self.findings(REFERENCE_TEXT.replace(old, new))), 1)
 
+    def test_prose_anchor_outside_table_passes(self) -> None:
+        """Plain prose anchors pass while anchors within table items remain eligible."""
+        lines = [
+            "@section libaom-av1",
+            "@anchor{format-overview}",
+            "libaom uses one offset per line.",
+            "@section libsvtav1",
+            "The format is described in @ref{format-overview}.",
+        ]
+        self.assertEqual(self.findings("\n".join(lines), {5}), [])
+
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n@item qpfile @var{filename}",
+            "@item qpfile @var{filename}\n@anchor{libaom-av1-qpfile}",
+        )
+        self.assertEqual(len(self.findings(text)), 1)
+
+    def test_anchor_table_depth_skips_conditionals(self) -> None:
+        """Conditional wrappers preserve table ownership but other inner blocks do not."""
+        for table in ("table", "ftable", "vtable"):
+            for block, expected in (("ifset extra", 1), ("example", 0)):
+                with self.subTest(table=table, block=block):
+                    text = REFERENCE_TEXT.replace("@table", f"@{table}", 1)
+                    text = text.replace("@end table", f"@end {table}", 1)
+                    text = text.replace(
+                        "@anchor{libaom-av1-qpfile}",
+                        f"@{block}\n@anchor{{libaom-av1-qpfile}}",
+                    )
+                    text = text.replace(
+                        f"@end {table}", f"@end {block.split()[0]}\n@end {table}", 1
+                    )
+                    self.assertEqual(len(self.findings(text, {13})), expected)
+
+    def test_reference_in_comment_passes(self) -> None:
+        """Whole-line and inline comments hide references while escaped commands do not."""
+        for prefix in ("@c ", "@comment ", "Earlier prose. @c ", "Earlier prose. @comment "):
+            with self.subTest(prefix=prefix):
+                lines = REFERENCE_TEXT.splitlines()
+                lines[10] = prefix + "The format is described in @ref{libaom-av1-qpfile}."
+                self.assertEqual(self.findings("\n".join(lines)), [])
+
+        for prefix in ("@code{@@c}", "@code{@@comment}", "@caption", "@cword"):
+            with self.subTest(prefix=prefix):
+                lines = REFERENCE_TEXT.splitlines()
+                lines[10] = prefix + " The format is described in @ref{libaom-av1-qpfile}."
+                self.assertEqual(len(self.findings("\n".join(lines))), 1)
+
+    def test_reference_in_raw_block_passes(self) -> None:
+        """Raw blocks hide references while examples and table item text remain eligible."""
+        for block in ("ignore", "verbatim", "macro f", "rmacro f", "linemacro f"):
+            with self.subTest(block=block):
+                lines = REFERENCE_TEXT.splitlines()
+                lines[10:11] = [
+                    f"@{block}",
+                    f"  @{block}",
+                    "@end table",
+                    f"@end {block.split()[0]}",
+                    "The format is described in @ref{libaom-av1-qpfile}.",
+                    f"@end {block.split()[0]}",
+                ]
+                self.assertEqual(self.findings("\n".join(lines), {15}), [])
+
+        for prefix, suffix, added in (
+            ("@example\n", "\n@end example", {12}),
+            ("@item ", "", {11}),
+        ):
+            with self.subTest(prefix=prefix):
+                lines = REFERENCE_TEXT.splitlines()
+                lines[10] = prefix + "The format is described in @ref{libaom-av1-qpfile}." + suffix
+                self.assertEqual(len(self.findings("\n".join(lines), added)), 1)
+
+    def test_reference_with_added_continuation_is_found_once(self) -> None:
+        """Only added reference spans are checked once and retain their opening line."""
+        text = REFERENCE_TEXT.replace("the @ref{", "the @ref{\n")
+        for added in ({12}, {11, 12}, {11}):
+            with self.subTest(added=added):
+                self.assertEqual(self.findings(text, added), self.findings(REFERENCE_TEXT))
+
+        for added in ({10}, {13}):
+            with self.subTest(added=added):
+                self.assertEqual(self.findings(text, added), [])
+
+    def test_reference_continuation_lookahead_boundary(self) -> None:
+        """The third following line is eligible but the fourth is outside lookahead."""
+        for gap, expected in ((3, 1), (4, 0)):
+            with self.subTest(gap=gap):
+                text = REFERENCE_TEXT.replace("the @ref{", "the @ref{" + "\n" * gap)
+                self.assertEqual(len(self.findings(text, {11 + gap})), expected)
+
     def test_reference_without_defer_wording_passes(self) -> None:
         """A reference not worded as a deferral, or after a sentence end, passes."""
         for old, new in (
@@ -2047,6 +2136,42 @@ class DocReferenceTest(unittest.TestCase):
                 )
                 self.assertEqual(len(self.findings(text, {17})), 1)
 
+    def test_item_library_after_conditional_is_found(self) -> None:
+        """Conditional ends preserve item prose while the enclosing table end stops it."""
+        for block in ("ifset extra", "ifclear extra", "ifhtml", "ifnottex", "ifdocbook"):
+            with self.subTest(block=block):
+                text = REFERENCE_TEXT.replace(
+                    "Read per-frame offsets;",
+                    f"@{block}\nOptional text.\n@end {block.split()[0]}\nRead per-frame offsets;",
+                )
+                self.assertEqual(len(self.findings(text, {14})), 1)
+
+        text = REFERENCE_TEXT.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.\n@end table",
+            "Read per-frame offsets.\n@end table\nlibaom reads a missing offset as 0.",
+        )
+        self.assertEqual(self.findings(text, {12}), [])
+
+    def test_item_library_after_raw_block_is_found(self) -> None:
+        """Raw block ends and literal commands preserve the enclosing item."""
+        for block in ("ignore", "verbatim", "macro f", "rmacro f", "linemacro f"):
+            with self.subTest(block=block):
+                raw = [f"@{block}", "@end table", f"@end {block.split()[0]}"]
+                body = [*raw, "libaom reads a missing offset as 0."]
+                self.assertEqual(upstream_lint._anchor_body(body), body)
+                text = REFERENCE_TEXT.replace(
+                    "Read per-frame offsets;", "\n".join(raw) + "\nRead per-frame offsets;"
+                )
+                self.assertEqual(len(self.findings(text, {14})), 1)
+
+    def test_item_unmatched_end_stops_nested_block(self) -> None:
+        """An end not opened in the item stops it even within a non-raw block."""
+        text = REFERENCE_TEXT.replace(
+            "Read per-frame offsets;",
+            "@example\n0 1\n@end table\nRead per-frame offsets;",
+        )
+        self.assertEqual(self.findings(text, {14}), [])
+
     def test_item_block_ends_remain_in_body(self) -> None:
         """Matching nested ends stay in the body before a peer item or heading."""
         for block in (
@@ -2068,7 +2193,7 @@ class DocReferenceTest(unittest.TestCase):
                 "@anchor{next}",
             ):
                 with self.subTest(block=block, boundary=boundary):
-                    body = [f"@{block}", "@end other", f"@end {block}", "prose"]
+                    body = [f"@{block}", "nested text", f"@end {block}", "prose"]
                     lines = ["@anchor{option}", "@item option", *body, boundary, "libaom"]
                     self.assertEqual(upstream_lint._anchor_item(lines, 0), body)
 
