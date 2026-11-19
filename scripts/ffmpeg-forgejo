@@ -68,33 +68,55 @@ die() { printf 'ffmpeg-forgejo: %s\n' "$*" >&2; exit 1; }
 usage_error() { printf 'ffmpeg-forgejo: usage: %s\n' "$*" >&2; exit 64; }
 
 PRIVATE_OWNER=""
+PRIVATE_BUSY=0
+PRIVATE_SIGNAL=0
 declare -a PRIVATE_ORDER=()
 declare -A PRIVATE_FILES=()
+
+# private_signal STATUS: defer the first signal until owned state can be cleaned safely.
+private_signal() {
+  if [ "$1" -ne 0 ] && [ "$PRIVATE_SIGNAL" -eq 0 ]; then PRIVATE_SIGNAL="$1"; fi
+  if [ "$PRIVATE_BUSY" -eq 0 ] && [ "$PRIVATE_SIGNAL" -ne 0 ]; then cleanup_exit "$PRIVATE_SIGNAL"; fi
+  return 0
+}
 
 # private_cleanup_scope: install one cleanup handler per shell without owning its parent's state.
 private_cleanup_scope() {
   [ "$PRIVATE_OWNER" != "$BASHPID" ] || return 0
   PRIVATE_OWNER="$BASHPID"
+  PRIVATE_BUSY=0; PRIVATE_SIGNAL=0
   PRIVATE_ORDER=(); PRIVATE_FILES=()
   OVERLAP_CANDIDATES=""; OVERLAP_REF=""
   LANDED_DIR=""; MERGE_TREE_OUT=""; MERGE_BASE_REF=""
   trap 'cleanup_exit "$?"' EXIT
-  trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  trap 'private_signal 130' INT; trap 'private_signal 143' TERM; trap 'private_signal 129' HUP
 }
 
 # private_temp VARIABLE [OPTIONS...]: create private state and register it in the calling shell.
+# Bash runs a pending signal handler after the substitution, before registration.
+# Hold signals through registration; likewise hold them through removal and EXIT cleanup.
+# Idle signal handlers clean directly, including a signal before EXIT's first cleanup command.
+# If mktemp itself dies after creation but before reporting its name, that unknown path
+# cannot be registered by this shell. SIGKILL and failed filesystem removals also remain outside cleanup guarantees.
 private_temp() {
-  local private_target="$1" private_path
+  local private_target="$1" private_path private_rc=0
   shift
   private_cleanup_scope
-  private_path="$(mktemp "$@")" || return 1
-  PRIVATE_ORDER+=("$private_path")
-  PRIVATE_FILES["$private_path"]=1
-  printf -v "$private_target" '%s' "$private_path"
+  PRIVATE_BUSY=1
+  private_path="$(mktemp "$@")" || private_rc=$?
+  if [ "$private_rc" -eq 0 ]; then
+    PRIVATE_ORDER+=("$private_path")
+    PRIVATE_FILES["$private_path"]=1
+    printf -v "$private_target" '%s' "$private_path" || private_rc=$?
+  fi
+  PRIVATE_BUSY=0
+  private_signal 0
+  return "$private_rc"
 }
 
 # remove_private_files PATH...: try every path once and report each failed removal.
 remove_private_files() {
+  PRIVATE_BUSY=$((PRIVATE_BUSY + 1))
   local path option failed=0 count=$# index
   local -A seen=()
   for ((index = 0; index < count; index++)); do
@@ -102,6 +124,8 @@ remove_private_files() {
     [ -n "$path" ] || continue
     [ -z "${seen[$path]+set}" ] || continue
     seen["$path"]=1
+    # EXIT may run before a caller clears its named binding after removal.
+    [ "${PRIVATE_FILES[$path]:-1}" != 0 ] || continue
     PRIVATE_FILES["$path"]=0
     option=-f
     if [ -d "$path" ] && [ ! -L "$path" ]; then option=-rf; fi
@@ -110,11 +134,14 @@ remove_private_files() {
       failed=1
     fi
   done
+  PRIVATE_BUSY=$((PRIVATE_BUSY - 1))
+  if [ "$PRIVATE_BUSY" -eq 0 ] && [ "$PRIVATE_SIGNAL" -ne 0 ]; then exit "$PRIVATE_SIGNAL"; fi
   return "$failed"
 }
 
 # cleanup_exit STATUS: try all owned state once, preserving an earlier failure.
 cleanup_exit() {
+  PRIVATE_BUSY=1
   local exit_status="$1" failed=0 private_index private_path
   local private_count=${#PRIVATE_ORDER[@]}
   overlap_cleanup || failed=1
@@ -125,6 +152,7 @@ cleanup_exit() {
     remove_private_files "$private_path" || failed=1
   done
   if [ "$exit_status" -eq 0 ] && [ "$failed" -ne 0 ]; then exit_status=1; fi
+  if [ "$exit_status" -eq 0 ] && [ "$PRIVATE_SIGNAL" -ne 0 ]; then exit_status="$PRIVATE_SIGNAL"; fi
   exit "$exit_status"
 }
 
@@ -1296,11 +1324,11 @@ neutral_merge_tree() {
     printf 'ffmpeg-forgejo: cannot compute empty tree id; merge with the live base not proven.\n' >&2
     exit 1
   fi
-  if ! private_temp MERGE_TREE_OUT; then
+  private_temp MERGE_TREE_OUT || {
     merge_base_cleanup || exit 1
     printf 'ffmpeg-forgejo: cannot create temporary file; merge with the live base not proven.\n' >&2
     exit 1
-  fi
+  }
   # Pin rename detection to git's documented defaults so a local diff.renames or diff.renameLimit cannot change the result.
   # System gitattributes, replace refs and grafts are host-local state the forge never applies, so the check ignores them.
   if GIT_ATTR_NOSYSTEM=1 GIT_GRAFT_FILE=/dev/null timeout 120 git -c core.attributesFile=/dev/null -c merge.renames=true -c merge.renameLimit=7000 \
@@ -1778,7 +1806,9 @@ for i in json.load(sys.stdin):
     else
       rc=$?
       [ "$rc" -eq 44 ] || exit "$rc"
-      private_temp body || exit 1; echo '{}' >"$body"
+      declare body
+      private_temp body || exit 1
+      echo '{}' >"$body"
       api POST "/repos/$REPO/forks" "$body" >/dev/null
       remove_private_files "$body" || exit 1
       echo "forked $REPO to $HOST/$me/${REPO#*/}"
@@ -1849,6 +1879,7 @@ for i in json.load(sys.stdin):
     fi
     require_swept_fork_head "$me" "$1"
     require_sendable_head "$SWEPT_SHA"
+    declare body
     private_temp body || exit 1
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
     out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
@@ -1896,6 +1927,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ $# -eq 2 ] || die "usage: issue <title> <body-file>"
     [ -f "$2" ] || die "no body file $2"
     require_forge_text "$2"
+    declare body
     private_temp body || exit 1
     json_body "title=$1" "body=@$2" >"$body"
     api POST "/repos/$REPO/issues" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
@@ -1908,6 +1940,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: $1"
     [ -f "$2" ] || die "no body file $2"
+    declare snapshot body
     private_temp snapshot || exit 1
     chmod 600 "$snapshot"
     cat -- "$2" >"$snapshot" || die "cannot read body file $2"
@@ -1942,6 +1975,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [[ "$2" =~ ^[0-9]+$ ]] || die "not a review id: $2"
     [[ "$3" =~ ^[0-9]+$ ]] || die "not a comment id: $3"
     [ -f "$4" ] || die "no body file $4"
+    declare reply_snapshot reply_payload
     private_temp reply_snapshot || exit 1
     private_temp reply_payload || exit 1
     chmod 600 "$reply_snapshot"
@@ -1973,6 +2007,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ $# -eq 2 ] || usage_error "$usage"
     [[ "$1" =~ ^[0-9]+$ ]] || die "not a PR number: $1"
     [ -f "$2" ] || die "no body file $2"
+    declare snapshot body
     private_temp snapshot || exit 1
     chmod 600 "$snapshot"
     cat -- "$2" >"$snapshot" || die "cannot read body file $2"
@@ -2025,6 +2060,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     out="$(api_list "/repos/$REPO/issues/$1/comments?" 200)" || exit 1
     check_comment_duplicate "$1" "$2" "$me" <<<"$out"
     require_own_open_pull "$1" "$me"
+    declare close_payload
     private_temp close_payload || exit 1
     json_body "body=@$2" >"$close_payload"
     api POST "/repos/$REPO/issues/$1/comments" "$close_payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])'
@@ -2040,6 +2076,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     n="$1"; shift
     if [ $# -gt 0 ]; then
       for u in "$@"; do is_login "$u" || die "not a login: $u"; done
+      declare body
       private_temp body || exit 1
       python3 -c 'import json,sys; print(json.dumps({"reviewers": sys.argv[1:]}))' "$@" >"$body"
       api POST "/repos/$REPO/pulls/$n/requested_reviewers" "$body" >/dev/null

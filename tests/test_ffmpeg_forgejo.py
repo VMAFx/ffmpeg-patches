@@ -6133,6 +6133,115 @@ def reject_private_write(handler: Handler) -> None:
 class PrivateTempExitTest(ForgejoTest):
     """Require the helper itself to clean state before returning from failed writes."""
 
+    def install_allocation_signal(self, signal: str, withhold_path: bool = False) -> None:
+        """Signal the allocating shell after real creation and before returning the path."""
+        real_mktemp = shutil.which("mktemp")
+        self.assertIsNotNone(real_mktemp)
+        wrapper = self.bin_dir / "mktemp"
+        tail = 'kill -KILL "$BASHPID"' if withhold_path else 'printf "%s\\n" "$path"'
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            f'path="$({shlex.quote(str(real_mktemp))} "$@")" || exit 1\n'
+            f'kill -{signal} "$PPID" || exit 1\n'
+            f"{tail}\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+
+    def test_creation_signals_remove_files_and_directories_before_return(self) -> None:
+        """All three creation-time signals preserve their status and leave live TMPDIR empty."""
+        signals = (("HUP", 129), ("INT", 130), ("TERM", 143))
+        commands = (
+            ("reply", "--no-test-claims", "1", "7", "85995", str(self.tmp / "body.md")),
+            ("landed", "topic"),
+        )
+        for index in range(len(signals) * len(commands)):
+            signal, status = signals[index % len(signals)]
+            command = commands[index // len(signals)]
+            with self.subTest(signal=signal, command=command[0]):
+                clean_tmp = self.tmp / f"creation-tmp-{index}"
+                clean_tmp.mkdir()
+                self.install_allocation_signal(signal)
+                stub = Stub()
+                result = self.run_command(stub, *command, env_updates={"TMPDIR": str(clean_tmp)})
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(stub.requests, [])
+                self.assertTrue(self.tmp.is_dir())
+                self.assertTrue(clean_tmp.is_dir())
+                self.assertEqual(list(clean_tmp.iterdir()), [])
+
+    def test_killed_allocator_cannot_register_an_unreported_name(self) -> None:
+        """An allocator killed before printing its name leaves an undiscoverable empty file."""
+        self.install_allocation_signal("TERM", withhold_path=True)
+        result = self.run_command(
+            Stub(), "reply", "--no-test-claims", "1", "7", "85995", str(self.tmp / "body.md")
+        )
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertTrue(self.tmp.is_dir())
+        self.assertTrue(self.helper_tmp.is_dir())
+        retained = list(self.helper_tmp.iterdir())
+        self.assertEqual(len(retained), 1)
+        self.assertTrue(retained[0].is_file())
+        self.assertEqual(retained[0].read_bytes(), b"")
+
+    def test_signals_during_exit_cleanup_finish_all_removals(self) -> None:
+        """Signals during failed-reply cleanup cannot interrupt removal of either owned file."""
+        real_rm = shutil.which("rm")
+        self.assertIsNotNone(real_rm)
+        (self.tmp / "body.md").write_text("", encoding="utf-8")
+        signals = ("HUP", "INT", "TERM")
+        for index in range(len(signals)):
+            with self.subTest(signal=signals[index]):
+                clean_tmp = self.tmp / f"exit-signal-tmp-{index}"
+                clean_tmp.mkdir()
+                wrapper = self.bin_dir / "rm"
+                wrapper.write_text(
+                    "#!/bin/bash\n"
+                    f'kill -{signals[index]} "$PPID" || exit 1\n'
+                    f'exec {shlex.quote(str(real_rm))} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+                result = self.run_command(
+                    Stub(),
+                    "reply",
+                    "--no-test-claims",
+                    "1",
+                    "7",
+                    "85995",
+                    str(self.tmp / "body.md"),
+                    env_updates={"TMPDIR": str(clean_tmp)},
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("empty body file", result.stderr)
+                self.assertTrue(clean_tmp.is_dir())
+                self.assertEqual(list(clean_tmp.iterdir()), [])
+
+    def test_signal_before_first_exit_cleanup_command_removes_both_files(self) -> None:
+        """A signal on EXIT entry must clean directly before the original cleanup starts."""
+        source = self.helper.read_text(encoding="utf-8")
+        old = "  trap 'cleanup_exit \"$?\"' EXIT"
+        new = '  trap \'kill -TERM "$BASHPID"; cleanup_exit "$?"\' EXIT'
+        self.assertEqual(source.count(old), 1)
+        (self.tmp / "body.md").write_text("", encoding="utf-8")
+        with (
+            mutant_case(source, old, new, ForgejoTest, "ExitEntry") as case,
+            unittest.mock.patch.object(self, "helper", case.helper),
+        ):
+            result = self.run_command(
+                Stub(),
+                "reply",
+                "--no-test-claims",
+                "1",
+                "7",
+                "85995",
+                str(self.tmp / "body.md"),
+            )
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertIn("empty body file", result.stderr)
+        self.assertTrue(self.helper_tmp.is_dir())
+        self.assertEqual(list(self.helper_tmp.iterdir()), [])
+
     def test_comment_http_failure_and_success_remove_snapshot_and_json(self) -> None:
         """Comment snapshots and JSON bodies disappear on success and HTTP failure."""
         for index in range(2):
@@ -6226,8 +6335,63 @@ class PrivateTempExitTest(ForgejoTest):
             self.assertEqual(list(clean_tmp.iterdir()), [])
 
 
+def require_private_allocator_contract(function: str) -> None:
+    """Require the one approved allocation form with signal deferral and both registrations."""
+    protected = (
+        "  private_cleanup_scope\n"
+        "  PRIVATE_BUSY=1\n"
+        '  private_path="$(mktemp "$@")" || private_rc=$?\n'
+        '  if [ "$private_rc" -eq 0 ]; then\n'
+        '    PRIVATE_ORDER+=("$private_path")\n'
+        '    PRIVATE_FILES["$private_path"]=1\n'
+        '    printf -v "$private_target" \'%s\' "$private_path" || private_rc=$?\n'
+        "  fi\n"
+        "  PRIVATE_BUSY=0\n"
+        "  private_signal 0\n"
+        '  return "$private_rc"\n'
+    )
+    if function.count(protected) != 1:
+        raise ValueError("allocator must defer signals through registration and assignment")
+
+
+def captured_private_allocator_calls(source: str) -> list[int]:
+    """Reject allocator calls whose registry would be isolated in a captured or piped shell."""
+    parser = bash_parser()
+    if isinstance(parser, str):
+        raise ValueError(parser)
+    raw = source.encode("utf-8")
+    root = parser.parse(raw).root_node
+    if root.has_error:
+        raise ValueError("cannot inspect private allocations in malformed Bash")
+    pending = [(root, False)]
+    violations = []
+    for _ in range(4 * len(raw) + 1):
+        if not pending:
+            return violations
+        node, captured = pending.pop()
+        if node.type == "function_definition":
+            captured = False
+        captured = (
+            captured
+            or node.type in {"command_substitution", "process_substitution", "pipeline"}
+            or (
+                node.type == "subshell"
+                and node.parent is not None
+                and node.parent.type != "function_definition"
+            )
+        )
+        if captured and node.type == "command":
+            name = node.child_by_field_name("name")
+            if name is not None and name.text == b"private_temp":
+                violations.append(node.start_point.row + 1)
+        if node.type not in {"comment", "heredoc_body", "raw_string"}:
+            children = node.named_children
+            pending.extend((children[index], captured) for index in range(len(children)))
+    raise ValueError("private allocation inspection exceeded its numeric node bound")
+
+
 def private_temp_violations(source: str) -> list[int]:
-    """Return direct temporary allocations and trap changes outside their canonical functions."""
+    """Allow only direct allocator calls and the canonical allocation and handler forms."""
     masked = source
     expected = (("private_temp", "mktemp", 1), ("private_cleanup_scope", "trap", 4))
     for index in range(len(expected)):
@@ -6236,6 +6400,8 @@ def private_temp_violations(source: str) -> list[int]:
         if len(functions) != 1:
             raise ValueError(f"exactly one {name} function required")
         function = functions[0]
+        if name == "private_temp":
+            require_private_allocator_contract(function.group())
         if len(re.findall(rf"\b{command}\b", function.group())) != count:
             raise ValueError(f"{name} must contain {count} {command} commands")
         masked = (
@@ -6244,20 +6410,28 @@ def private_temp_violations(source: str) -> list[int]:
             + masked[function.end() :]
         )
     lines = masked.splitlines()
-    return [
+    approved_call = re.compile(
+        r"\s*private_temp [A-Za-z_][A-Za-z0-9_]*(?: -d)? \|\| "
+        r'(?:exit 1|return 1|die "[^"\n]*"|\{)'
+    )
+    violations = [
         index + 1
         for index in range(len(lines))
         if not lines[index].lstrip().startswith("#")
-        and re.search(r"\b(?:mktemp|trap)\b", lines[index])
+        and re.search(r"\b(?:mktemp|trap|private_temp)\b", lines[index])
+        and not approved_call.fullmatch(lines[index])
     ]
+    return sorted(set(violations + captured_private_allocator_calls(masked)))
 
 
 class PrivateTempSourceTest(unittest.TestCase):
     """Reject unregistered temporary state and replacement exit or signal handlers."""
 
+    helper: Path = HELPER
+
     def test_only_registry_allocates_temporary_state_and_installs_handlers(self) -> None:
         """All allocations and EXIT, HUP, INT and TERM traps belong to the registry."""
-        source = HELPER.read_text(encoding="utf-8")
+        source = self.helper.read_text(encoding="utf-8")
         self.assertEqual(private_temp_violations(source), [])
         self.assertEqual(len(re.findall(r"\btrap\s+'[^']*'\s+EXIT\b", source)), 1)
         signals = ("HUP", "INT", "TERM")
@@ -6267,7 +6441,7 @@ class PrivateTempSourceTest(unittest.TestCase):
 
     def test_planted_allocations_and_handler_replacements_are_rejected(self) -> None:
         """Bare or wrapped allocations and trap resets cannot bypass registry ownership."""
-        source = HELPER.read_text(encoding="utf-8")
+        source = self.helper.read_text(encoding="utf-8")
         planted = (
             'body="$(mktemp)"',
             "/usr/bin/mktemp -d",
@@ -6285,7 +6459,7 @@ class PrivateTempSourceTest(unittest.TestCase):
 
     def test_missing_or_duplicate_registry_functions_fail_closed(self) -> None:
         """Deleting or duplicating either canonical function cannot make the count vacuous."""
-        source = HELPER.read_text(encoding="utf-8")
+        source = self.helper.read_text(encoding="utf-8")
         names = ("private_temp", "private_cleanup_scope")
         for index in range(len(names)):
             with self.subTest(function=names[index]):
@@ -6293,6 +6467,76 @@ class PrivateTempSourceTest(unittest.TestCase):
                     private_temp_violations(source.replace(f"{names[index]}() {{", "other() {"))
                 with self.assertRaises(ValueError):
                     private_temp_violations(source + f"{names[index]}() {{\n  :\n}}\n")
+
+    def test_dropped_allocator_registrations_are_caught_by_source_guard(self) -> None:
+        """Removing either allocator registration must fail the real source check on a copy."""
+        source = self.helper.read_text(encoding="utf-8")
+        registrations = (
+            '    PRIVATE_ORDER+=("$private_path")\n',
+            '    PRIVATE_FILES["$private_path"]=1\n',
+        )
+        for index in range(len(registrations)):
+            with self.subTest(registration=registrations[index]):
+                self.assertEqual(source.count(registrations[index]), 1)
+                assert_mutant_killed(
+                    self,
+                    source,
+                    (registrations[index], ""),
+                    (
+                        PrivateTempSourceTest,
+                        "test_only_registry_allocates_temporary_state_and_installs_handlers",
+                    ),
+                    "allocator registration removed",
+                )
+
+    def test_substitution_allocator_is_caught_by_source_guard(self) -> None:
+        """Moving a caller into a substitution must fail the source check on a mutated copy."""
+        source = self.helper.read_text(encoding="utf-8")
+        old = "    private_temp reply_snapshot || exit 1"
+        self.assertEqual(source.count(old), 1)
+        replacements = (
+            '    reply_snapshot="$(private_temp reply_snapshot)" || exit 1',
+            '    reply_snapshot="$(\n    private_temp reply_snapshot || exit 1\n    )"',
+        )
+        for index in range(len(replacements)):
+            with self.subTest(replacement=replacements[index]):
+                assert_mutant_killed(
+                    self,
+                    source,
+                    (old, replacements[index]),
+                    (
+                        PrivateTempSourceTest,
+                        "test_only_registry_allocates_temporary_state_and_installs_handlers",
+                    ),
+                    "allocator in command substitution loses parent ownership",
+                )
+
+    def test_other_allocator_call_forms_are_rejected(self) -> None:
+        """Wrappers, unchecked calls, pipelines and grouped substitutions fail the allow-list."""
+        source = self.helper.read_text(encoding="utf-8")
+        planted = (
+            "private_temp body",
+            "command private_temp body || exit 1",
+            "private_temp body || exit 1; echo bypass",
+            'body="$(\nprivate_temp body || exit 1\n)"',
+            "private_temp body || exit 1\n",
+            "(\nprivate_temp body || exit 1\n)",
+            "private_temp body || exit 1 | cat",
+            "cat <(\nprivate_temp body || exit 1\n)",
+        )
+        for index in range(len(planted)):
+            with self.subTest(command=planted[index]):
+                findings = private_temp_violations(source + planted[index] + "\n")
+                if index == 4:
+                    self.assertEqual(findings, [])
+                else:
+                    self.assertTrue(findings)
+
+    def test_allocator_guard_rejects_malformed_shell(self) -> None:
+        """Malformed shell cannot hide an allocator from the parent-ownership check."""
+        source = self.helper.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "malformed Bash"):
+            private_temp_violations(source + "if true; then\n")
 
 
 if __name__ == "__main__":
