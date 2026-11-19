@@ -363,12 +363,12 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
         self.assertEqual([r["number"] for r in upstream_links.overlaps(related)], [14])
 
     def test_body_issues_extracts_fixes_closes_and_refs(self) -> None:
-        """Read issue numbers after Fixes, Closes or Refs in hash, plain and URL forms."""
+        """Read complete hash and configured URL items after closing keywords."""
         body = (
             "Summary of change.\n\n"
             "Fixes #25052, #25010\n"
-            "Closes: FFmpeg issue 24900\n"
-            "Refs https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/24800 and 25052.\n"
+            "Closes: #24900\n"
+            "Refs https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/24800 and #25052.\n"
         )
         self.assertEqual(upstream_links.body_issues(body), [24800, 24900, 25010, 25052])
         self.assertEqual(upstream_links.body_issues(None), [])
@@ -422,7 +422,7 @@ class FillAndCheckCommandTest(unittest.TestCase):
             "created_at": "2026-11-07T00:00:00Z",
             "updated_at": "2026-11-10T00:00:00Z",
             "merged_at": "2026-11-10T00:00:00Z",
-            "body": "Closes issue 77",
+            "body": "Closes #77",
         }
         pull_25 = {
             "number": 25,
@@ -1669,7 +1669,7 @@ class FailClosedForgeTest(unittest.TestCase):
             self.candidate[field] = original
 
     def test_forge_only_normalized_extras_are_ignored(self) -> None:
-        """Forge author, kind, patch IDs and seen cannot override trusted normalization."""
+        """Forge author, kind and seen cannot override trusted normalization."""
         self.candidate.update(author="alice", kind="issue", seen="not-a-date")
         rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
         self.assertEqual((rc, err), (0, ""))
@@ -1681,18 +1681,183 @@ class FailClosedForgeTest(unittest.TestCase):
         )
 
     def test_live_patch_ids_are_not_claimed(self) -> None:
-        """Unverified supplied patch IDs cannot create a live same-patch-id record."""
-        self.own["patch_ids"] = self.candidate["patch_ids"] = ["forged-id"]
+        """Neither supplied patch-ID field can create a live same-patch-id record."""
         self.answers[f"{API}/pulls/101/files?limit=50&page=1"] = [{"filename": "other.c"}]
-        rc, out, err = run_cli(self.root, FakeForge(self.answers), "check", keep_progress=True)
-        self.assertEqual((rc, err), (0, ""))
-        self.assertIn("same-patch-id not checked live", out)
-        self.assertEqual(self.path.read_bytes(), self.before)
+        for field in ("patch_ids", "stable_patch_ids"):
+            with self.subTest(field=field):
+                self.own[field] = self.candidate[field] = ["forged-id"]
+                rc, out, err = run_cli(
+                    self.root, FakeForge(self.answers), "check", keep_progress=True
+                )
+                self.assertEqual((rc, err), (0, ""))
+                self.assertIn("same-patch-id not checked live", out)
+                self.assertEqual(self.path.read_bytes(), self.before)
+                del self.own[field], self.candidate[field]
 
     def test_issue_clause_cap_is_not_silent(self) -> None:
         """Clause 65 aborts without recording a partial issue list."""
         self.own["body"] = "\n".join(f"Fixes #{n}" for n in range(1, 66))
         self.assert_rejected("65", 10)
+
+    def assert_issue_items(self, body: str, expected: list[int], ignored: int = 0) -> None:
+        """Fill a real fixture manifest and verify complete local items and one count line."""
+        self.path.write_bytes(self.before)
+        self.own["body"] = body
+        rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        entry = json.loads(self.path.read_bytes())["contributions"][0]
+        self.assertEqual(entry.get("fixes_issues", []), expected)
+        self.assertEqual(out.count("foreign issue addresses"), int(bool(ignored)))
+        if ignored:
+            self.assertIn(f"10: ignored {ignored} foreign issue addresses", out.splitlines())
+
+    def test_prose_input_output_counts_are_not_issues(self) -> None:
+        """A prose conjunction cannot turn output counts into issue references."""
+        self.assert_issue_items("Fixes a crash with 10 inputs and 20 outputs", [])
+
+    def test_comma_separated_complete_hash_items_are_recorded(self) -> None:
+        """A closing clause records both complete comma-separated hash items."""
+        self.assert_issue_items("Fixes #10, #20", [10, 20])
+
+    def test_comma_and_conjunction_keep_complete_hash_items(self) -> None:
+        """A comma followed by a conjunction separates complete issue items."""
+        self.assert_issue_items("Fixes #10, #20, and #30 or #40", [10, 20, 30, 40])
+
+    def test_closing_keyword_does_not_cross_a_line_boundary(self) -> None:
+        """A closing keyword cannot borrow a hash from a different line."""
+        for body in ("Fixes\n#10", "Refs:\r\n#20", "Closes \n #30"):
+            with self.subTest(body=body):
+                self.assert_issue_items(body, [])
+
+    def test_prose_after_hash_ends_issue_list(self) -> None:
+        """An unhashed output count after a valid hash ends the issue list."""
+        self.assert_issue_items("Fixes #10 and 20 outputs, #30", [10])
+
+    def test_foreign_qualified_hash_is_counted_not_recorded(self) -> None:
+        """A hash glued to another repository cannot be reinterpreted as a local hash."""
+        self.assert_issue_items("Fixes Other/Repo#123", [], 1)
+
+    def test_exact_repository_url_and_foreign_host_in_fill(self) -> None:
+        """A matching repository path is local only on the configured host."""
+        self.assert_issue_items(
+            "Fixes https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/10, "
+            "https://other.invalid/FFmpeg/FFmpeg/issues/20",
+            [10],
+            1,
+        )
+
+    def test_version_after_keyword_is_not_an_issue(self) -> None:
+        """A dotted version after a keyword cannot contribute its major number."""
+        self.assert_issue_items("Fixes 1.30", [])
+
+    def test_word_embedded_hash_and_number_are_not_issues(self) -> None:
+        """A number inside a word or a glued hash ends the item list."""
+        for body in ("Refs build20", "Refs word#20", "Refs #20suffix"):
+            with self.subTest(body=body):
+                self.assert_issue_items(body, [])
+
+    def test_configured_repository_shorthand_is_counted_not_recorded(self) -> None:
+        """Even local repository shorthand requires a full URL or standalone hash."""
+        self.assert_issue_items("Refs FFmpeg/FFmpeg#20", [], 1)
+
+    def test_keyboard_interrupt_during_write_cleans_staging(self) -> None:
+        """KeyboardInterrupt inside a partial write preserves old bytes and cleans siblings."""
+        factory = tempfile.NamedTemporaryFile
+
+        def interrupt(*args: object, **kwargs: object) -> object:
+            """Interrupt after staging partial bytes rather than before opening the file."""
+            stream = factory(*args, **kwargs)
+
+            def write(data: bytes) -> None:
+                """Write a prefix before raising the actual interrupt exception."""
+                stream.file.write(data[:7])
+                raise KeyboardInterrupt("planted keyboard interrupt")
+
+            stream.write = write
+            return stream
+
+        with (
+            unittest.mock.patch.object(tempfile, "NamedTemporaryFile", side_effect=interrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(list(self.root.iterdir()), [self.path])
+
+    def assert_published_with_leftover(self, suffix: str) -> Path:
+        """Fail a real post-replace unlink and require a successful publication result."""
+        unlink = Path.unlink
+        replace = upstream_links.os.replace
+        failed: list[Path] = []
+
+        def publish(source: Path, target: Path) -> None:
+            """Replace for real and plant an actual staging leftover for its cleanup test."""
+            replace(source, target)
+            if suffix == ".tmp":
+                source.write_bytes(b"planted leftover staging")
+
+        def fail_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+            """Raise only after new manifest bytes are already visible at the destination."""
+            if path.name.endswith(suffix) and self.path.read_bytes() != self.before:
+                failed.append(path)
+                raise OSError("planted cleanup failure")
+            unlink(path, *args, **kwargs)
+
+        with (
+            unittest.mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_cleanup),
+            unittest.mock.patch.object(upstream_links.os, "replace", side_effect=publish),
+        ):
+            rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(failed[0].is_file())
+        self.assertNotEqual(self.path.read_bytes(), self.before)
+        entry = json.loads(self.path.read_bytes())["contributions"][0]
+        self.assertEqual(entry["fixes_issues"], [99])
+        self.assertIn(f"published {self.path}; cleanup incomplete", out)
+        self.assertEqual(out.count("leftover: "), 1)
+        self.assertIn(
+            f"leftover: {failed[0]}: cleanup failed: planted cleanup failure", out.splitlines()
+        )
+        return failed[0]
+
+    def test_staging_cleanup_failure_reports_published(self) -> None:
+        """A staging unlink error after replacement cannot report an unchanged manifest."""
+        self.assert_published_with_leftover(".tmp")
+
+    def test_lock_cleanup_failure_reports_published(self) -> None:
+        """A lock unlink error after replacement leaves new bytes and reports the lock."""
+        lock = self.assert_published_with_leftover(".lock")
+        self.assertTrue(lock.is_file())
+
+    def test_published_state_survives_bounded_change_output(self) -> None:
+        """Publication status remains visible when ordinary change lines fill their cap."""
+        self.own["created_at"] = "2020-01-01T00:00:00Z"
+        with (
+            unittest.mock.patch.object(upstream_links.upstream_drift, "MAX_SERIES_ENTRIES", 1),
+            unittest.mock.patch.object(upstream_links, "MAX_CANDIDATES", 1),
+        ):
+            self.assert_published_with_leftover(".lock")
+
+    def test_later_fill_names_leftover_lock_and_stale_rule(self) -> None:
+        """A subsequent writing fill names its leftover lock and manual stale criterion."""
+        lock = self.assert_published_with_leftover(".lock")
+        self.own["body"] = "Fixes #100"
+        published = self.path.read_bytes()
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, 2, err)
+        self.assertIn(str(lock), err)
+        self.assertIn("stale", err)
+        self.assertIn("confirm no fill is running", err)
+        self.assertIn("remove", err)
+        self.assertEqual(self.path.read_bytes(), published)
+
+    def test_atomic_replacement_preserves_manifest_file_mode(self) -> None:
+        """Atomic publication keeps the existing manifest permission bits."""
+        self.path.chmod(0o640)
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(self.path.stat().st_mode & 0o7777, 0o640)
 
     def test_issue_clause_cap_boundary_is_accepted(self) -> None:
         """All 64 allowed clauses reach the stored issue list."""
@@ -1703,7 +1868,7 @@ class FailClosedForgeTest(unittest.TestCase):
         self.assertEqual(entry["fixes_issues"], list(range(1, 65)))
 
     def test_foreign_issue_namespace_is_counted_not_recorded(self) -> None:
-        """Foreign hosts, repos, URL suffixes and prose digits cannot become local issues."""
+        """Foreign issue URLs are counted once while bare prose numbers end the list."""
         self.own["body"] = (
             "Fixes https://foreign.invalid/FFmpeg/FFmpeg/issues/123, "
             "https://code.ffmpeg.org/Other/FFmpeg/issues/124, "
@@ -1714,7 +1879,7 @@ class FailClosedForgeTest(unittest.TestCase):
         rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill")
         self.assertEqual((rc, err), (0, ""))
         entry = json.loads(self.path.read_bytes())["contributions"][0]
-        self.assertEqual(entry["fixes_issues"], [127, 128, 129])
+        self.assertEqual(entry["fixes_issues"], [127, 128])
         self.assertIn("10: ignored 4 foreign issue addresses", out)
         self.assertEqual(out.count("foreign issue addresses"), 1)
 
@@ -1753,8 +1918,8 @@ class FailClosedForgeTest(unittest.TestCase):
             with self.subTest(field=field):
                 self.assert_rejected(field)
 
-    def test_interrupted_manifest_write_keeps_original_and_cleans_temp(self) -> None:
-        """An interrupted sync cannot truncate the destination or leave a staging file."""
+    def test_failed_manifest_sync_keeps_original_and_cleans_temp(self) -> None:
+        """An fsync OSError cannot truncate the destination or leave a staging file."""
         with unittest.mock.patch("os.fsync", side_effect=OSError("planted interrupted sync")):
             rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
         self.assertEqual(rc, 2, err)

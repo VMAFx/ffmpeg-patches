@@ -518,19 +518,27 @@ Both commands derive their request cap as
 candidate rows and 20 file pages per pull. Before reading files, a progress
 line gives the candidate count, expected requests assuming one file page per
 pull and a file-page upper bound. A request above the cap exits 2 with its
-count, cap, window start, candidate count and narrowing option; `fill` writes
-nothing on error. Fill syncs a sibling temporary file before atomic
+count, cap, window start, candidate count and narrowing option. A failure
+before publication leaves the manifest unchanged. After replacement, cleanup
+failure exits 0 with `published ...; cleanup incomplete; exit 0` and one
+`leftover:` line per failed cleanup path; the published manifest stays in place.
+Fill syncs a sibling temporary file before atomic
 replacement and refuses content changed since the initial read; concurrent
-fills use an exclusive sibling lock. A stopped process may leave a lock that
-must be reviewed before another fill can write. Other writers must coordinate
+fills use an exclusive sibling lock. A leftover lock blocks writing fills with
+its full path and a stale-lock rule: confirm no fill is running for that
+manifest, then review and remove the lock before retrying. No automatic lock
+removal occurs. Other writers must coordinate
 with that lock to exclude edits during the final compare-and-replace step.
 Missing or malformed decision fields, responses over 16 MiB, titles or paths
 over 4096 characters, names over 256 characters, bodies over 256 Ki characters,
 inline file lists over 2000 names, duplicate JSON keys, and JSON objects over
 1024 keys fail with exit 2. Issue parsing permits
 at most 64 clauses and 1024 references, including repeats; excess is an error.
-Only bare issue numbers and exact configured repository issue URLs are local;
-foreign issue addresses are ignored and counted in one line per pull.
+Each closing clause starts a comma-, `and`- or `or`-separated item list.
+Only whole `#N` items and exact configured repository issue URLs are local.
+Repository-prefixed hashes (including the configured repository) and foreign
+issue URLs are ignored and counted in one line per pull. Prose, unhashed
+numbers, versions and hashes glued to words end the list.
 Shorten a fill with `fill --max-age-days N`, select a
 later-opening `fill --pull N`, or narrow a check
 with `check --since YYYY-MM-DD`. The week-long margin revisits recent updates

@@ -30,7 +30,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from itertools import islice
 from pathlib import Path
 
 try:
@@ -75,15 +74,12 @@ MAX_TIMESTAMP_CHARS = 64
 # Validate all inline names before retaining the documented 1000-name prefix.
 MAX_INLINE_FILE_ROWS = 2 * MAX_FILE_ROWS
 ISSUE_CLAUSE = re.compile(
-    r"\b(?:fixes|closes|refs)\b\s*:?\s*([^\r\n;]+?)"
+    r"\b(?:fixes|closes|refs)\b[ \t]*:?[ \t]*([^\r\n;]+?)"
     r"(?=\b(?:fixes|closes|refs)\b|[\r\n;]|$)",
     re.IGNORECASE,
 )
-ISSUE_REF = re.compile(
-    r"https?://[^\s,;]+|(?:#|\bissues?\s+#?)([1-9][0-9]*)\b"
-    r"|(?:^|,\s*|\band\s+|\bor\s+)([1-9][0-9]*)\b",
-    re.IGNORECASE,
-)
+ISSUE_ITEM = re.compile(r"(#[1-9][0-9]*|https?://[^\s,;]+|[\w.-]+/[\w.-]+#[1-9][0-9]*)")
+ISSUE_LIST_ITEM = re.compile(r"\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+)([^\s,]+)", re.IGNORECASE)
 
 
 class RequestBudget:
@@ -367,16 +363,14 @@ def overlaps(related: list[dict]) -> list[dict]:
     return loud
 
 
-def _issue_reference(match: re.Match[str], local_url: re.Pattern[str]) -> tuple[int | None, bool]:
-    """Accept bare issue numbers or exact configured issue URLs without URL digit leakage."""
-    token = match.group(1) or match.group(2)
-    if token is not None:
-        return _issue_number(token), False
-    address = match.group(0).rstrip(".")
-    local = local_url.fullmatch(address)
+def _issue_reference(token: str, local_url: re.Pattern[str]) -> tuple[int | None, bool]:
+    """Accept whole standalone hashes or exact configured issue URLs only."""
+    if token.startswith("#"):
+        return _issue_number(token[1:]), False
+    local = local_url.fullmatch(token)
     if local is not None:
         return _issue_number(local.group(1)), False
-    return None, "/issues/" in address
+    return None, "/issues/" in token or "#" in token
 
 
 def _issue_number(token: str) -> int:
@@ -386,17 +380,33 @@ def _issue_number(token: str) -> int:
     return int(token)
 
 
-def _issue_matches(body: str, number: int | None) -> list[re.Match[str]]:
+def _clause_items(clause: str, remaining: int) -> list[str]:
+    """Read a closed item list from its start, stopping at the first prose item."""
+    first = re.match(r"\s*([^\s,]+)", clause)
+    items: list[str] = []
+    match = first
+    for _ in range(remaining + 1):
+        if match is None:
+            break
+        token = match.group(1).removesuffix(".")
+        if ISSUE_ITEM.fullmatch(token) is None:
+            break
+        items.append(token)
+        match = ISSUE_LIST_ITEM.match(clause, match.end())
+    return items
+
+
+def _issue_matches(body: str, number: int | None) -> list[str]:
     """Bound both clause traversal and total reference traversal before recording issues."""
     clauses = ISSUE_CLAUSE.findall(body)
     if len(clauses) > MAX_ISSUE_MATCHES:
         raise DriftError(
             f"pull {number} body issue clauses: {len(clauses)} exceeds {MAX_ISSUE_MATCHES}"
         )
-    matches: list[re.Match[str]] = []
+    matches: list[str] = []
     for clause in clauses[:MAX_ISSUE_MATCHES]:
         remaining = MAX_ISSUE_REFERENCES - len(matches)
-        matches.extend(islice(ISSUE_REF.finditer(clause.strip()), remaining + 1))
+        matches.extend(_clause_items(clause, remaining))
         if len(matches) > MAX_ISSUE_REFERENCES:
             raise DriftError(
                 f"pull {number} body issue references: {len(matches)} "
@@ -406,7 +416,7 @@ def _issue_matches(body: str, number: int | None) -> list[re.Match[str]]:
 
 
 def body_issues(body: object, *, number: int | None = None) -> list[int]:
-    """Extract local issues and print one foreign-address count without storing those URLs."""
+    """Extract whole local issue items and print one ignored-reference count per pull."""
     if body is None:
         return []
     _bounded_text(body, f"pull {number} body", MAX_BODY_CHARS)
@@ -909,39 +919,64 @@ def _fill_window_lines(own_pulls: list[dict], cutoff: datetime) -> list[str]:
     ]
 
 
-def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> None:
+def _cleanup_manifest_path(path: Path, published: bool, leftovers: list[str]) -> None:
+    """Keep post-publication cleanup errors separate from failed writes."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        if not published:
+            raise
+        leftovers.append(f"leftover: {path}: cleanup failed: {exc}")
+
+
+def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> list[str]:
     """Sync a sibling temporary file and compare again immediately before replacement."""
     staging: Path | None = None
+    published = False
+    leftovers: list[str] = []
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
         ) as stream:
             staging = Path(stream.name)
+            staging.chmod(path.stat().st_mode & 0o7777)
             stream.write(rendered)
             stream.flush()
             os.fsync(stream.fileno())
         if path.read_bytes() != original:
             raise DriftError(f"{path}: changed since read; no changes written")
         os.replace(staging, path)
+        published = True
     finally:
         if staging is not None:
-            staging.unlink(missing_ok=True)
+            _cleanup_manifest_path(staging, published, leftovers)
+    return leftovers
 
 
-def _replace_manifest(path: Path, original: bytes, rendered: bytes) -> None:
+def _replace_manifest(path: Path, original: bytes, rendered: bytes) -> list[str]:
     """Serialize cooperating fills and reject changed content before atomic publication."""
     lock = path.with_name(f".{path.name}.lock")
     try:
         stream = lock.open("xb")
     except FileExistsError as exc:
-        raise DriftError(f"{path}: another fill holds {lock.name}; no changes written") from exc
+        raise DriftError(
+            f"{path}: another fill holds {lock}; no changes written; "
+            f"stale only after you confirm no fill is running for this manifest; "
+            f"then review and remove {lock} before retrying"
+        ) from exc
+    published = False
+    leftovers: list[str] = []
     try:
         with stream:
             if path.read_bytes() != original:
                 raise DriftError(f"{path}: changed since read; no changes written")
-            _write_manifest_temp(path, original, rendered)
+        leftovers.extend(_write_manifest_temp(path, original, rendered))
+        published = True
     finally:
-        lock.unlink()
+        _cleanup_manifest_path(lock, published, leftovers)
+    if leftovers:
+        leftovers.append(f"published {path}; cleanup incomplete; exit 0")
+    return leftovers
 
 
 def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]:
@@ -971,7 +1006,7 @@ def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]
         rendered = (json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n").encode(
             "utf-8"
         )
-        _replace_manifest(path, original, rendered)
+        changes.extend(_replace_manifest(path, original, rendered))
     return changes
 
 
@@ -1141,7 +1176,8 @@ def main(
                     max_age_days=args.max_age_days,
                 ),
             )
-            for line in changes[: upstream_drift.MAX_SERIES_ENTRIES * (MAX_CANDIDATES + 2)]:
+            # Reserve two cleanup paths and the final publication state beyond change lines.
+            for line in changes[: upstream_drift.MAX_SERIES_ENTRIES * (MAX_CANDIDATES + 2) + 3]:
                 print(line)
             return 0
         lines, loud = check_overlaps(args.root, args.pull, request, today=today, since=args.since)
