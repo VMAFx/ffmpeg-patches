@@ -197,7 +197,7 @@ api() (
   printf 'Authorization: token %s\n' "$tok" >"$hdr" || exit 1
   args+=(-H @"$hdr")
   if [ "$mode" = --status ]; then
-    args+=(--no-fail -o /dev/null -w '%{http_code}')
+    args+=(--no-fail --no-location -o /dev/null -w '%{http_code}')
   fi
   if [ -n "$body" ]; then
     args+=(-H 'Content-Type: application/json' --data-binary @"$body")
@@ -1411,23 +1411,17 @@ require_clean_merge() {
 # prepare_clean_merge SHA: keep existing merge errors, deferring only conflicts until landed status is known.
 prepare_clean_merge() {
   local report rc
-  MERGE_CONFLICT=""
   if report="$(require_clean_merge "$1" 2>&1)"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 73 ]; then
-    MERGE_CONFLICT="$report"
     return 0
   fi
   [ -z "$report" ] || printf '%s\n' "$report" >&2
   [ "$rc" -eq 0 ] || exit "$rc"
 }
 
-# require_sendable_head SHA: refuse landed changes, then any deferred live-base conflict before a write.
+# require_sendable_head SHA: refuse landed changes, then conflicts against the same final fetched base.
 require_sendable_head() {
-  require_unlanded "$1"
-  if [ -n "$MERGE_CONFLICT" ]; then
-    printf '%s\n' "$MERGE_CONFLICT" >&2
-    exit 73
-  fi
+  require_unlanded "$1" sendable
 }
 
 # landed_git ARGS...: run bounded Git without host-local replacement or graft history.
@@ -1505,17 +1499,20 @@ raise SystemExit(82)
 PY
 }
 
-# finish_landed SAME-TREE: print the result before cleanup, then prefer cleanup failure to the result.
+# finish_landed SAME-TREE [CONFLICT-SHA]: report landing before conflict on the same fetched base.
 finish_landed() {
   local report_status
   if landed_report "$1"; then report_status=0; else report_status=$?; fi
+  if [ "$report_status" -eq 0 ] && [ -n "${2:-}" ]; then
+    refuse_merge_conflict "$2" "$MERGE_BASE_REF"
+  fi
   merge_base_cleanup || exit 1
   exit "$report_status"
 }
 
-# check_landed HEAD: all own stable patch IDs are found in the base or the merged tree is unchanged; clean private state on exit.
+# check_landed HEAD [sendable]: check landed patches and optional conflict against one fetched base.
 check_landed() (
-  local sha ancestor rc tree base_tree same_tree=0
+  local sha rc tree base_tree same_tree=0 conflict_sha=""
   private_cleanup_scope
   MERGE_BASE_REF="refs/ffmpeg-forgejo/landed-base-$$"
   private_temp LANDED_DIR -d || die "cannot create landed-check temporary directory"
@@ -1523,9 +1520,9 @@ check_landed() (
     || die "cannot fetch $BASE from $GIT_URL; merge with the live base not proven; landed status not proven"
   merge_settings_neutral || exit 1
   sha="$(landed_git rev-parse --verify --end-of-options "$1^{commit}")" || die "cannot resolve landed-check head $1"
-  ancestor="$(landed_git merge-base "$MERGE_BASE_REF" "$sha")" || die "cannot find landed-check merge base"
-  landed_commits "$ancestor" "$sha" 256 >"$LANDED_DIR/own" || exit 1
-  landed_commits "$ancestor" "$MERGE_BASE_REF" 10000 >"$LANDED_DIR/base" || exit 1
+  landed_git merge-base "$MERGE_BASE_REF" "$sha" >/dev/null || die "cannot find landed-check merge base"
+  landed_commits "$MERGE_BASE_REF" "$sha" 256 >"$LANDED_DIR/own" || exit 1
+  landed_commits "$sha" "$MERGE_BASE_REF" 10000 >"$LANDED_DIR/base" || exit 1
   if neutral_merge_tree "$MERGE_BASE_REF" "$sha"; then rc=0; else rc=$?; fi
   [ "$rc" -le 1 ] || die "merge-tree failed with status $rc; landed status not proven"
   if [ "$rc" -eq 0 ]; then
@@ -1535,13 +1532,14 @@ check_landed() (
   fi
   landed_patch_ids "$LANDED_DIR/own" >"$LANDED_DIR/own.ids" || exit 1
   landed_patch_ids "$LANDED_DIR/base" >"$LANDED_DIR/base.ids" || exit 1
-  finish_landed "$same_tree"
+  if [ "${2:-}" = sendable ] && [ "$rc" -eq 1 ]; then conflict_sha="$sha"; fi
+  finish_landed "$same_tree" "$conflict_sha"
 )
 
-# require_unlanded HEAD: refuse outbound acts on landed heads, retaining the matching base commits.
+# require_unlanded HEAD [sendable]: refuse landed heads and optionally conflicts from the same base.
 require_unlanded() {
   local report rc
-  if report="$(check_landed "$1")"; then rc=0; else rc=$?; fi
+  if report="$(check_landed "$@")"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 82 ]; then
     printf 'ffmpeg-forgejo: change is already on the live base %s; outbound act refused.\n%s\n' \
       "$BASE" "$report" >&2
@@ -1890,8 +1888,8 @@ for i in json.load(sys.stdin):
     private_temp body || exit 1
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
     out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
-    remove_private_files "$body" || exit 1
     python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])' <<<"$out"
+    remove_private_files "$body" || exit 1
     n="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])' <<<"$out")"
     request_bot_review "$n"
     # CODEOWNERS may cover no touched paths; Fairy alone does not request human review.
@@ -2021,10 +2019,9 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     require_forge_text "$snapshot"
     [ "$claim_mode" != "tested-head" ] || require_claim_evidence "$evidence_file" "$tested_head"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
-    # The head re-read after the status check is the base check's pull read: a push in between
-    # starts a new Autolabel run, and the finished statuses of the old head must not clear the
-    # edit. Forgejo's PR edit takes no expected head, so a push landing between this last read
-    # and the PATCH still races.
+    # The base check's pull read must still name the head whose statuses finished.
+    # A push in between starts a new Autolabel run and cannot be cleared by old statuses.
+    # Tested-head mode also rechecks after the landed check before PATCH.
     for ((i = 1; i <= 80; i++)); do
       sha="$(head_sha "$1")"
       state="$(autolabel_state "$sha")"
@@ -2039,7 +2036,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
       sleep "${FFMPEG_FORGEJO_POLL:-15}"
     done
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
-    # The final read must name the same full head as the checked loop head, since
+    # The post-status read must name the same full head as the checked loop head, since
     # evidence and the tested head may be abbreviated prefixes.
     if [ "$claim_mode" = "tested-head" ] && [ "$tested_live_head" != "${sha,,}" ]; then
       printf 'ffmpeg-forgejo: live head %s differs from head %s the Autolabel and base checks used; retry the edit.\n' \
@@ -2048,6 +2045,9 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     fi
     if [ "$claim_mode" = "tested-head" ]; then
       require_unlanded "$tested_live_head"
+      # Compare the full checked hash after the landed check, even for abbreviated evidence.
+      # A push between this final read and PATCH remains a race without an API head precondition.
+      require_tested_head "$1" "$tested_live_head" "$evidence_file"
     fi
     private_temp body || exit 1
     json_body "body=@$snapshot" >"$body"

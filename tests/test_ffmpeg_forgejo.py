@@ -131,6 +131,28 @@ def git_output(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def commit_tree(repo: Path, tree: str, message: str, *parents: str) -> str:
+    """Create one fixture commit with explicit identity, tree, parents, and signing disabled."""
+    args = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid"]
+    args.extend(["-c", "commit.gpgSign=false", "commit-tree", tree, "-m", message])
+    for index in range(len(parents)):
+        args.extend(["-p", parents[index]])
+    return git_output(repo, *args)
+
+
+def shared_merge_tips(repo: Path, shared_count: int) -> tuple[str, str]:
+    """Create independent merge tips sharing two long lines with two best merge bases."""
+    tree = git_output(repo, "rev-parse", "master^{tree}")
+    root = git_output(repo, "rev-parse", "master")
+    tips = [root, root]
+    for side in range(2):
+        for number in range(shared_count):
+            tips[side] = commit_tree(repo, tree, f"shared {side} {number}", tips[side])
+    head = commit_tree(repo, tree, "head merge", tips[0], tips[1])
+    base = commit_tree(repo, tree, "base merge", tips[1], tips[0])
+    return head, base
+
+
 def full_sweep_report(sha: str) -> str:
     """Build reviewed sweep tables and all recurring class answers at one head."""
 
@@ -813,6 +835,11 @@ class ForkHandler(Handler):
     ) -> bool:
         """Serve the scripted repository status and delegate all other existing routes."""
         if url.path == f"/api/v1/repos/{stub.login}/FFmpeg":
+            if stub.repository_status == 302:
+                self.send_response(302)
+                self.send_header("Location", "/api/v1/missing-repository")
+                self.end_headers()
+                return True
             self.reply(stub.repository_status, {"message": "repository read"})
             return True
         return super()._dispatch_get(stub, url, parts)
@@ -853,6 +880,31 @@ class ForkExistenceTest(ForgejoTest):
             ],
         )
         self.assertIn("forked FFmpeg/FFmpeg to ", result.stdout)
+
+    def test_curl_redirect_config_cannot_turn_redirect_into_absence(self) -> None:
+        """Configured redirect following cannot turn a redirected 404 into fork permission."""
+        real_curl = shutil.which("curl")
+        self.assertIsNotNone(real_curl)
+        config = self.tmp / "curlrc"
+        config.write_text("location\n", encoding="utf-8")
+        wrapper = self.bin_dir / "curl"
+        wrapper.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(str(real_curl))} -q "
+            f'--config {shlex.quote(str(config))} "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        statuses = (302, 404)
+        for index in range(len(statuses)):
+            with self.subTest(status=statuses[index]):
+                stub = ForkStub(statuses[index])
+                result = self.fork_command(stub)
+                self.assertEqual(result.returncode, 1 if index == 0 else 0, result.stderr)
+                paths = [stub.requests[n][1] for n in range(len(stub.requests))]
+                self.assertNotIn("/api/v1/missing-repository", paths)
+                self.assertEqual(len(write_request_paths(stub)), index)
+                if index == 0:
+                    self.assertIn("unexpected HTTP status 302", result.stderr)
 
     def test_existing_repository_does_not_write(self) -> None:
         """An existing repository still succeeds without sending a create request."""
@@ -1012,7 +1064,7 @@ class PrivateRemovalTest(ForgejoTest):
         self.assertEqual(write_request_paths(stub), [])
 
     def test_main_payload_cleanup_stops_after_pr_post_before_reviewer_post(self) -> None:
-        """A failed PR payload removal exits 1 after creation and before reviewer writes."""
+        """A failed payload removal prints the created pull URL and stops before reviewer writes."""
         content = json.dumps(
             {"head": "tester:topic", "base": "master", "title": "title", "body": BODY}
         )
@@ -1023,6 +1075,7 @@ class PrivateRemovalTest(ForgejoTest):
         )
         assert_private_removal_failed(self, result, refused)
         self.assertEqual(write_request_paths(stub), [("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls")])
+        self.assertEqual(result.stdout, "stub/pulls/1\n")
         self.assertEqual(stub.requested_users, [])
 
     def test_standalone_landed_explains_before_failed_cleanup(self) -> None:
@@ -1178,6 +1231,39 @@ class LandedTest(ForgejoTest):
         result = self.landed()
         self.assertEqual(result.returncode, 82, result.stderr)
         self.assertEqual(result.stdout, "no change left against the base\n")
+
+    def crisscross_head(self) -> tuple[str, str]:
+        """Install two independently merged shared histories as the live base and topic."""
+        head, base = shared_merge_tips(self.repo, 257)
+        self.assertEqual(
+            len(git_output(self.repo, "merge-base", "--all", head, base).splitlines()), 2
+        )
+        git(self.upstream, "fetch", "-q", str(self.repo), base)
+        git(self.upstream, "update-ref", "refs/heads/master", base)
+        git(self.repo, "update-ref", "refs/heads/topic", head)
+        return head, base
+
+    def test_shared_crisscross_commits_do_not_exhaust_own_cap(self) -> None:
+        """Shared commits behind two merge bases do not prevent equal trees from landing."""
+        head, base = self.crisscross_head()
+        self.assertEqual(git_output(self.repo, "rev-list", "--count", f"{base}..{head}"), "1")
+        self.assertEqual(git_output(self.repo, "rev-list", "--count", f"{head}..{base}"), "1")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("no change left against the base", result.stdout)
+
+    def test_crisscross_own_commits_still_obey_cap(self) -> None:
+        """One more genuinely head-only commit than the cap remains refused with shared history."""
+        head, base = self.crisscross_head()
+        tree = git_output(self.repo, "rev-parse", f"{head}^{{tree}}")
+        for number in range(256):
+            head = commit_tree(self.repo, tree, f"own {number}", head)
+        git(self.repo, "update-ref", "refs/heads/topic", head)
+        self.assertEqual(git_output(self.repo, "rev-list", "--count", f"{base}..{head}"), "257")
+        result = self.landed()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("landed-check range exceeds 256 commits", result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_own_range_over_commit_cap_is_refused(self) -> None:
         """A range of 257 own commits exceeds the documented 256 cap and exits one."""
@@ -2328,6 +2414,29 @@ class TestClaimHeadTest(ForgejoTest):
         result = self.edit_body(stub, "--tested-head", sha, "--evidence", self.evidence(sha))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.patches(stub), [BODY])
+
+    def test_head_change_during_landed_check_refuses_body_edit(self) -> None:
+        """A new full head sharing the tested prefix after landed checking cannot reach PATCH."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        suffix = "0" if sha[-1] != "0" else "1"
+        changed = sha[:-1] + suffix
+        stub = Stub([sha] * 4 + [changed], {sha: [[label("success")]]})
+        prefix = sha[:12]
+        result = self.edit_body(stub, "--tested-head", prefix, "--evidence", self.evidence(prefix))
+        self.assertEqual(result.returncode, 76, result.stderr)
+        self.assertIn(f"tested head {sha} does not match live head {changed}", result.stderr)
+        self.assertEqual(stub.head_reads, 5)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_failed_head_read_after_landed_check_refuses_body_edit(self) -> None:
+        """A malformed final head read fails closed after a successful landed check."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha] * 4 + [None], {sha: [[label("success")]]})
+        result = self.edit_body(stub, "--tested-head", sha, "--evidence", self.evidence(sha))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot read the head", result.stderr)
+        self.assertEqual(stub.head_reads, 5)
+        self.assertEqual(self.patches(stub), [])
 
     def test_landed_tested_head_body_edit_is_refused_before_patch(self) -> None:
         """A tested PR body edit on a landed head exits 82 before its PATCH."""
@@ -4410,6 +4519,60 @@ class SweepTest(ForgejoTest):
         self.sweep_requests = stub.requests
         return result
 
+    def final_base_command(self, command: str, outcome: str) -> subprocess.CompletedProcess[str]:
+        """Move upstream during validation and check the final fetched base before any write."""
+        original = git_output(self.repo, "rev-parse", "master")
+        git(self.upstream, "update-ref", "refs/heads/master", original)
+        if outcome == "clean":
+            advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "early conflict\n")
+        stub = Stub(reviewers=[["alice"]])
+        pulls = stub.pulls
+        moved = []
+
+        def move_base(query: dict[str, list[str]]) -> list[dict]:
+            """Advance the base once after the early merge check and before the final fetch."""
+            if not moved:
+                git(self.upstream, "update-ref", "refs/heads/master", original)
+                if outcome == "landed":
+                    advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+                path = "other.txt" if outcome == "clean" else OVERLAP_FILE
+                moved.append(advance_upstream(self.tmp, self.upstream, path, "final base\n"))
+            return pulls(query)
+
+        with unittest.mock.patch.object(stub, "pulls", side_effect=move_base):
+            result = self.sweep_command(command, "--sweep", str(self.sweep), stub=stub)
+        self.assertEqual(len(moved), 1, result.stderr)
+        if outcome != "clean":
+            self.assertFalse((self.tmp / "push-argv.json").exists())
+            self.assertEqual(write_request_paths(stub), [])
+        return result
+
+    def test_final_base_conflict_stops_push_and_pr(self) -> None:
+        """A base that starts clean and becomes conflicting exits 73 before either write."""
+        commands = ("push", "pr")
+        for index in range(len(commands)):
+            with self.subTest(command=commands[index]):
+                result = self.final_base_command(commands[index], "conflict")
+                self.assertEqual(result.returncode, 73, result.stderr)
+                self.assertIn("does not merge cleanly", result.stderr)
+
+    def test_final_base_landing_precedes_conflict(self) -> None:
+        """Landing on the final base takes status 82 even when that same base conflicts."""
+        commands = ("push", "pr")
+        for index in range(len(commands)):
+            with self.subTest(command=commands[index]):
+                result = self.final_base_command(commands[index], "landed")
+                self.assertEqual(result.returncode, 82, result.stderr)
+                self.assertIn("already on the live base", result.stderr)
+
+    def test_final_clean_base_clears_earlier_conflict(self) -> None:
+        """A clean final base allows both writes despite a conflict in the early snapshot."""
+        commands = ("push", "pr")
+        for index in range(len(commands)):
+            with self.subTest(command=commands[index]):
+                result = self.final_base_command(commands[index], "clean")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_push_refuses_head_conflicting_with_live_base(self) -> None:
         """Refuse push when the swept head conflicts with the live upstream base."""
 
@@ -5956,8 +6119,63 @@ MUTANTS = {
 }
 
 
+def api_read_redirect_streams(node, streams: tuple[bool, bool]) -> tuple[bool, bool]:
+    """Track stdout and stderr concealment in the shell's left-to-right redirect order."""
+    destinations = list(streams)
+    children = node.named_children
+    for index in range(len(children)):
+        if children[index].type != "file_redirect":
+            continue
+        redirect = re.fullmatch(rb"([0-9]*)\s*(&>>?|>&|>>?)\s*(.*)", children[index].text)
+        if redirect is None:
+            continue
+        descriptor, operator, target = redirect.groups()
+        target = target.strip()
+        if operator.startswith(b"&") or (operator == b">&" and not target.isdigit()):
+            destinations = [True, True]
+        elif (descriptor or b"1") in {b"1", b"2"}:
+            hidden = True
+            if operator == b">&" and target in {b"1", b"2"}:
+                hidden = destinations[int(target) - 1]
+            destinations[int(descriptor or b"1") - 1] = hidden
+    return destinations[0], destinations[1]
+
+
+def api_read_pipeline_children(node, streams: tuple[bool, bool]) -> list | None:
+    """Route pipeline stages and apply trailing redirects only to the final stage."""
+    pipeline = node
+    if node.type == "redirected_statement" and node.named_children[0].type == "pipeline":
+        pipeline = node.named_children[0]
+    if pipeline.type != "pipeline":
+        return None
+    pending = []
+    children = pipeline.named_children
+    for index in range(len(children)):
+        child = children[index]
+        following = child.next_sibling
+        last = index == len(children) - 1
+        destinations = streams if last else (True, streams[1])
+        if last and pipeline != node:
+            destinations = api_read_redirect_streams(node, destinations)
+        combined = following is not None and following.text == b"|&"
+        pending.append((child, destinations, combined))
+    return pending
+
+
+def api_read_command(node) -> bool:
+    """Recognize repository existence checks and GET calls without interpreting literal data."""
+    if node.type != "command":
+        return False
+    name = node.child_by_field_name("name")
+    arguments = node.children_by_field_name("argument")
+    return name is not None and (
+        name.text == b"api_exists"
+        or (name.text == b"api" and bool(arguments) and arguments[0].text.strip(b"\"'") == b"GET")
+    )
+
+
 def api_read_diagnostic_violations(source: str) -> list[int]:
-    """Reject suppressed API read diagnostics before callers can mistake failure for absence."""
+    """Reject concealed API read diagnostics while preserving shell descriptor ordering."""
     parser = bash_parser()
     if isinstance(parser, str):
         raise ValueError(parser)
@@ -5965,28 +6183,26 @@ def api_read_diagnostic_violations(source: str) -> list[int]:
     root = parser.parse(raw).root_node
     if root.has_error:
         raise ValueError("cannot inspect API reads in malformed Bash")
-    pending = [(root, False)]
+    pending = [(root, (False, False), False)]
     violations = []
     for _ in range(4 * len(raw) + 1):
         if not pending:
             return violations
-        node, hidden = pending.pop()
-        children = node.named_children
-        hidden = hidden or any(
-            children[index].type == "file_redirect"
-            and re.match(rb"(?:2\s*>|&>)", children[index].text)
-            for index in range(len(children))
-        )
-        if hidden and node.type == "command":
-            name = node.child_by_field_name("name")
-            arguments = node.children_by_field_name("argument")
-            if name is not None and (
-                name.text == b"api_exists"
-                or (name.text == b"api" and arguments and arguments[0].text.strip(b"\"'") == b"GET")
-            ):
-                violations.append(node.start_point.row + 1)
+        node, streams, combined = pending.pop()
+        pipeline = api_read_pipeline_children(node, streams)
+        if pipeline is not None:
+            pending.extend(pipeline)
+            continue
+        if node.type == "command_substitution":
+            streams = (True, streams[1])
+        streams = api_read_redirect_streams(node, streams)
+        if combined:
+            streams = (streams[0], streams[0])
+        if streams[1] and api_read_command(node):
+            violations.append(node.start_point.row + 1)
         if node.type not in {"comment", "heredoc_body", "raw_string"}:
-            pending.extend((children[index], hidden) for index in range(len(children)))
+            children = node.named_children
+            pending.extend((children[index], streams, False) for index in range(len(children)))
     raise ValueError("API read inspection exceeded its numeric node bound")
 
 
@@ -6005,7 +6221,7 @@ class ApiReadSourceTest(unittest.TestCase):
             "if ! api GET /other 2>/dev/null; then api POST /create; fi",
             "api GET /other &>/dev/null || api POST /create",
             'if out="$(api GET /other 2>/dev/null)"; then :; else api POST /create; fi',
-            "if api \\\nGET /other 2>&1 >/dev/null; then :; else api POST /create; fi",
+            "if api \\\nGET /other >/dev/null 2>&1; then :; else api POST /create; fi",
             "{ if api GET /other; then :; else api POST /create; fi; } 2>/dev/null",
             "if api_exists /other 2>/dev/null; then :; else api POST /create; fi",
         )
@@ -6021,6 +6237,30 @@ class ApiReadSourceTest(unittest.TestCase):
             "if api GET /other >/dev/null; then :; else exit 1; fi\n"
         )
         self.assertEqual(api_read_diagnostic_violations(source), [])
+
+    def test_combined_pipe_to_discarding_sink_is_rejected(self) -> None:
+        """Piping both output streams to a discarding consumer hides the API diagnostic."""
+        source = "api GET /other |& cat >/dev/null\n"
+        self.assertEqual(api_read_diagnostic_violations(source), [1])
+
+    def test_plain_pipe_to_discarding_sink_keeps_stderr(self) -> None:
+        """A plain stdout pipe leaves the API diagnostic on inherited standard error."""
+        source = "api GET /other | cat >/dev/null\n"
+        self.assertEqual(api_read_diagnostic_violations(source), [])
+
+    def test_redirect_order_keeps_inherited_stdout_available(self) -> None:
+        """Duplicating inherited stdout before discarding stdout leaves the diagnostic visible."""
+        visible = "api GET /other 2>&1 >/dev/null\n"
+        discarded = "api GET /other >/dev/null 2>&1\n"
+        self.assertEqual(api_read_diagnostic_violations(visible), [])
+        self.assertEqual(api_read_diagnostic_violations(discarded), [1])
+
+    def test_last_pipe_stage_redirect_does_not_hide_first_stderr(self) -> None:
+        """Redirects on a pipeline's sink leave the first stage's inherited stderr visible."""
+        visible = "api GET /other | cat >/dev/null 2>&1\n"
+        discarded = "api GET /other 2>&1 | cat >/dev/null\n"
+        self.assertEqual(api_read_diagnostic_violations(visible), [])
+        self.assertEqual(api_read_diagnostic_violations(discarded), [1])
 
     def test_api_read_guard_rejects_unparseable_source(self) -> None:
         """Malformed shell input cannot silently remove a caller from the source check."""
