@@ -111,11 +111,20 @@ class DisplayBoundaryTest(RevertProofFixture):
     """Exercise CLI display boundaries without requiring byte-named filesystem entries."""
 
     def setUp(self) -> None:
-        """Pin parser text comparisons to one width and untranslated messages."""
+        """Expose colour detection and pin parser width and untranslated messages."""
         super().setUp()
-        columns = unittest.mock.patch.dict(os.environ, {"COLUMNS": "80"})
-        columns.start()
-        self.addCleanup(columns.stop)
+        environment = unittest.mock.patch.dict(
+            os.environ,
+            {
+                "COLUMNS": "80",
+                "TERM": "xterm-256color",
+                "NO_COLOR": "",
+                "FORCE_COLOR": "",
+                "PYTHON_COLORS": "",
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
         language = unittest.mock.patch.object(argparse, "_", lambda message: message)
         language.start()
         self.addCleanup(language.stop)

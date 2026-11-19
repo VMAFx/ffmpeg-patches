@@ -211,6 +211,7 @@ finding and prints the reason, and never waives an rc 2 result.
 from __future__ import annotations
 
 import argparse
+import functools
 import inspect
 import json
 import os
@@ -535,9 +536,12 @@ class DisplayArgumentParser(argparse.ArgumentParser):
     """Keep parser formatting plain and escape text at the shared output boundary."""
 
     def __init__(self, *args, **kwargs) -> None:
-        """Disable colour through the documented switch when the interpreter provides it."""
+        """Disable parser and formatter colour through their available constructor switches."""
         if "color" in inspect.signature(argparse.ArgumentParser).parameters:
             kwargs["color"] = False
+            formatter = kwargs.get("formatter_class", argparse.HelpFormatter)
+            if "color" in inspect.signature(formatter).parameters:
+                kwargs["formatter_class"] = functools.partial(formatter, color=False)
         super().__init__(*args, **kwargs)
 
     def _print_message(self, message: str | None, file=None) -> None:
