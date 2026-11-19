@@ -931,13 +931,14 @@ class RevertProofTest(RevertProofFixture):
         """Exactly the shared argument cap produces a consumer-valid command record."""
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         commit = self.commit("avfilter/vf_x: fix return value")
+        program = (
+            "from pathlib import Path; import sys; sys.exit(0 if 'return 2;' in "
+            "Path('libavfilter/vf_x.c').read_text(encoding='utf-8') else 1)"
+        )
         command = [
             sys.executable,
             "-c",
-            (
-                "from pathlib import Path; import sys; sys.exit(0 if 'return 2;' in "
-                "Path('libavfilter/vf_x.c').read_text(encoding='utf-8') else 1)"
-            ),
+            program,
         ] + ["arg"] * (upstream_lint.MAX_COMMAND_ARGS - 3)
         rc, _, err = self.run_cli(commit, command)
         self.assertEqual(rc, 0, err)

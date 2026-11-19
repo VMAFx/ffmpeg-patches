@@ -36,13 +36,14 @@ class RevertProofHistoryTest(RevertProofFixture):
         self.assertEqual(missing.rc, 1, missing.output)
         self.assertIn(commit[:12], missing.output)
         self.assertIn("no revert-proof record", missing.output)
+        program = (
+            "from pathlib import Path; import sys; "
+            "sys.exit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 17)"
+        )
         command = [
             sys.executable,
             "-c",
-            (
-                "from pathlib import Path; import sys; "
-                "sys.exit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 17)"
-            ),
+            program,
         ]
         rc, _, error = self.run_cli(commit, command)
         self.assertEqual(rc, 0, error)
@@ -62,13 +63,14 @@ class RevertProofHistoryTest(RevertProofFixture):
         commit = self.commit("avfilter/vf_x: fix value")
         self.write(".git/info/grafts", f"{self.base}\n")
         run_git(self.tree, "config", "advice.graftFileDeprecated", "true", preserve_config=True)
+        program = (
+            "from pathlib import Path; import sys; "
+            "sys.exit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 17)"
+        )
         command = [
             sys.executable,
             "-c",
-            (
-                "from pathlib import Path; import sys; "
-                "sys.exit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 17)"
-            ),
+            program,
         ]
         rc, _, error = self.run_cli(commit, command)
         self.assertEqual(rc, 0, error)
@@ -144,13 +146,14 @@ class RevertProofHistoryTest(RevertProofFixture):
         missing = upstream_lint._revert_proof(self.tree, self.base, head, ())
         self.assertEqual(missing.rc, 1, missing.output)
         self.assertIn("no revert-proof record", missing.output)
+        program = (
+            "from pathlib import Path; import sys; "
+            "sys.exit(0 if Path('libavfilter/vf_root.c').exists() else 17)"
+        )
         command = [
             sys.executable,
             "-c",
-            (
-                "from pathlib import Path; import sys; "
-                "sys.exit(0 if Path('libavfilter/vf_root.c').exists() else 17)"
-            ),
+            program,
         ]
         rc, _, err = self.run_cli(commit, command)
         self.assertEqual(rc, 0, err)
@@ -286,13 +289,14 @@ class RevertProofHistoryTest(RevertProofFixture):
             preserve_config=True,
         )
         self.tree = clone
+        program = (
+            "from pathlib import Path; import sys; "
+            "sys.exit(0 if Path('libavfilter/vf_root.c').exists() else 17)"
+        )
         command = [
             sys.executable,
             "-c",
-            (
-                "from pathlib import Path; import sys; "
-                "sys.exit(0 if Path('libavfilter/vf_root.c').exists() else 17)"
-            ),
+            program,
         ]
         rc, _, error = self.run_cli(commit, command)
         self.assertEqual(rc, 0, error)

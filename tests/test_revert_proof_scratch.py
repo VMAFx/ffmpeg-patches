@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -63,16 +64,30 @@ class RevertProofScratchTest(RevertProofFixture):
     def test_started_exit_two_is_a_verdict(self) -> None:
         """A real reverted child exiting two keeps its measured status in the record."""
         fix = self.make_fix()
+        program = (
+            "from pathlib import Path; "
+            "raise SystemExit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 2)"
+        )
         command = [
             sys.executable,
             "-c",
-            "from pathlib import Path; "
-            "raise SystemExit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 2)",
+            program,
         ]
         rc, _, error = self.run_cli(fix, command)
         self.assertEqual(rc, 0, error)
         record = json.loads(self.record_path.read_text(encoding="utf-8"))
         self.assertEqual(record["rc_reverted"], 2)
+
+    def test_record_write_is_owner_only_with_zero_umask(self) -> None:
+        """Record publication stays owner-readable and owner-writable with umask zero."""
+        fix = self.make_fix()
+        previous_umask = os.umask(0)
+        try:
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(rc, 0, error)
+        self.assertEqual(stat.S_IMODE(os.stat(self.record_path).st_mode), 0o600)
 
     def test_record_parent_swap_cannot_write_inside_caller(self) -> None:
         """Swapping the checked parent to a caller symlink keeps publication on its handle."""
@@ -130,13 +145,16 @@ class RevertProofScratchTest(RevertProofFixture):
         parent_blob = revert_proof.git_result(
             self.tree, "show", f"{parent}:libavfilter/vf_x.c"
         ).stdout_bytes
-        command = [
-            sys.executable,
-            "-c",
+        program = (
             "from pathlib import Path; "
             "data = Path('libavfilter/vf_x.c').read_bytes(); "
             "fixed = b'return 2;' in data; "
-            f"assert fixed or data == {parent_blob!r}; raise SystemExit(0 if fixed else 7)",
+            f"assert fixed or data == {parent_blob!r}; raise SystemExit(0 if fixed else 7)"
+        )
+        command = [
+            sys.executable,
+            "-c",
+            program,
         ]
         rc, _, error = self.run_cli(fix, command)
         self.assertEqual(rc, 0, error)
@@ -232,12 +250,15 @@ class RevertProofScratchTest(RevertProofFixture):
     def test_accept_fix_commit_fails_when_reverted_in_scratch(self) -> None:
         """A fix commit whose test fails after reverse apply records nonzero rc_reverted."""
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
-        self.write(
-            "tests/check_x.py",
+        program = (
             "from pathlib import Path\n"
             "import sys\n"
             "text = Path('libavfilter/vf_x.c').read_text(encoding='utf-8')\n"
-            "sys.exit(0 if 'return 2;' in text else 1)\n",
+            "sys.exit(0 if 'return 2;' in text else 1)\n"
+        )
+        self.write(
+            "tests/check_x.py",
+            program,
         )
         fix_sha = self.commit("avfilter/vf_x: fix return value")
         head_tree = run_git(self.tree, "rev-parse", "HEAD^{tree}", preserve_config=True)
@@ -427,16 +448,17 @@ class RevertProofScratchTest(RevertProofFixture):
             with self.subTest(flag=flag):
                 run_git(self.tree, "update-index", flag, "libavfilter/vf_x.c", preserve_config=True)
                 self.write("libavfilter/vf_x.c", CONFLICT_SOURCE)
+                program = (
+                    "from pathlib import Path; import sys; "
+                    "text = Path('libavfilter/vf_x.c').read_text(encoding='utf-8'); "
+                    "sys.exit(0 if 'return 2;' in text else 1)"
+                )
                 rc, _, err = self.run_cli(
                     fix,
                     [
                         sys.executable,
                         "-c",
-                        (
-                            "from pathlib import Path; import sys; "
-                            "text = Path('libavfilter/vf_x.c').read_text(encoding='utf-8'); "
-                            "sys.exit(0 if 'return 2;' in text else 1)"
-                        ),
+                        program,
                     ],
                 )
                 self.assertEqual(rc, 0, err)

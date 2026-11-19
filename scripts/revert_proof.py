@@ -339,10 +339,10 @@ def _open_record_directory(config: ProofConfig) -> int:
 
 
 def _write_record(descriptor: int, name: str, payload: dict[str, object]) -> None:
-    """Publish JSON atomically through the pinned directory and remove failed writes."""
+    """Publish owner-only JSON atomically through the pinned directory; remove failed writes."""
     temporary = f".revert-proof-{uuid.uuid4().hex}.tmp"
     file_descriptor = os.open(
-        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=descriptor
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=descriptor
     )
     try:
         with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:

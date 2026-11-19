@@ -1295,10 +1295,13 @@ class ClaimScopeTest(unittest.TestCase):
 
     def test_speed_claim_detected(self) -> None:
         """An encode or decode speed claim without an end-to-end figure returns its phrase."""
+        benchmark_message = (
+            "avcodec/x: paint maps once\n\nThe map painter benchmark ran seven rounds, "
+            "so encoding is 10x faster.\n"
+        )
         cases = (
             (
-                "avcodec/x: paint maps once\n\nThe map painter benchmark ran seven rounds, "
-                "so encoding is 10x faster.\n",
+                benchmark_message,
                 "encoding is 10x faster",
             ),
             ("avcodec/x: cache maps\n\nThis gives faster encoding.\n", "faster encoding"),
@@ -1399,12 +1402,13 @@ class ClaimScopeTest(unittest.TestCase):
         findings = upstream_lint._unverified_findings(
             "0123456789abcdef", "avcodec/x: cache maps\n\nEncoding is faster.\n"
         )
+        expected_finding = (
+            '0123456789ab: claims "Encoding is faster" without an end-to-end measurement; '
+            "name an ffmpeg -benchmark or fps result, or drop the claim"
+        )
         self.assertEqual(
             findings,
-            [
-                '0123456789ab: claims "Encoding is faster" without an end-to-end measurement; '
-                "name an ffmpeg -benchmark or fps result, or drop the claim"
-            ],
+            [expected_finding],
         )
 
     def test_source_hunks_reads_headers_outside_hunk_bodies(self) -> None:
@@ -1800,11 +1804,14 @@ class TestProgramTest(unittest.TestCase):
 
     def test_registered_new_program_is_found(self) -> None:
         """A new lib*/tests C file listed by a TESTPROGS assignment of its Makefile is found."""
-        for makefile in (
-            "TESTPROGS-$(CONFIG_ITUT_T35)              += aom_film_grain\n",
+        multiline_makefile = (
             "TESTPROGS = avcodec                                    \\\n"
             "            aom_film_grain                             \\\n"
-            "            golomb\n",
+            "            golomb\n"
+        )
+        for makefile in (
+            "TESTPROGS-$(CONFIG_ITUT_T35)              += aom_film_grain\n",
+            multiline_makefile,
             "TESTPROGS += aom_film_grain # needs a sample\n",
             "TESTPROGS-yes += golomb aom_film_grain\n",
             "TESTPROGS := golomb aom_film_grain\n",
@@ -2157,10 +2164,13 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: c-rules rc: 1", output)
-        self.assertIn(
+        expected_finding = (
             "finding: libavfilter/vf_x.c:3: "
             "ffmpeg-rtsp-connect-failure-without-network-close: "
-            "call ff_network_close() before returning",
+            "call ff_network_close() before returning"
+        )
+        self.assertIn(
+            expected_finding,
             output,
         )
         self.assertIn("fix the flagged path, or pass --c-rule-reason", output)
@@ -2542,10 +2552,11 @@ class PipelineTest(FixtureTest):
     def test_cited_diagnostic_workaround_passes(self) -> None:
         """A compiler-diagnostic workaround with an upstream bug URL passes."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
-        self.commit(
+        message = (
             "avfilter/vf_x: silence -Wmaybe-uninitialized false positive\n\n"
             "https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109999"
         )
+        self.commit(message)
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: diagnostic-citation rc: 0", output)
@@ -2690,10 +2701,11 @@ class PipelineTest(FixtureTest):
     def test_speed_claim_fails(self) -> None:
         """An encode speed claim without an end-to-end figure fails claim-scope."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
-        self.commit(
+        message = (
             "avfilter/vf_x: paint maps once\n\n"
             "The map painter benchmark ran seven rounds, so encoding is faster."
         )
+        self.commit(message)
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: claim-scope rc: 1", output)
@@ -2957,15 +2969,21 @@ class PipelineTest(FixtureTest):
     def test_fate_macro_catalog_and_missing_file(self) -> None:
         """Head macro definitions grant only ALLYES wrappers and missing catalogs fail."""
         self.write("tests/Makefile", "ALLYES = $(strip $(1))\nVIDEO = $(call ALLYES, $(1))\n")
+        video_makefile = (
+            "FATE_X-$(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER) += fate-x\n"
+            "fate-x: CMD = -f lavfi -i testsrc2\n"
+        )
         self.write(
             "tests/fate/filter-video.mak",
-            "FATE_X-$(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER) += fate-x\n"
-            "fate-x: CMD = -f lavfi -i testsrc2\n",
+            video_makefile,
+        )
+        indirect_makefile = (
+            "GUARD = $(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER)\n"
+            "FATE_Y-$(GUARD) += fate-y\nfate-y: CMD = -f lavfi -i testsrc2\n"
         )
         self.write(
             "tests/fate/other.mak",
-            "GUARD = $(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER)\n"
-            "FATE_Y-$(GUARD) += fate-y\nfate-y: CMD = -f lavfi -i testsrc2\n",
+            indirect_makefile,
         )
         self.commit()
         with unittest.mock.patch.object(upstream_lint, "_git", wraps=upstream_lint._git) as git:
@@ -3049,10 +3067,12 @@ class PipelineTest(FixtureTest):
 
     def test_patcheck_zero_exit_with_added_hint_fails(self):
         """A zero process exit cannot hide an allow-listed double semicolon."""
+        program = (
+            "#!/bin/sh\ncat > patcheck.stdout\nprintf 'double ;\\npatcheck.stdout:23:+bad();;\\n'\n"
+        )
         self.write(
             "tools/patcheck",
-            "#!/bin/sh\ncat > patcheck.stdout\n"
-            "printf 'double ;\\npatcheck.stdout:23:+bad();;\\n'\n",
+            program,
         )
         self.commit()
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -3066,10 +3086,13 @@ class PipelineTest(FixtureTest):
 
     def test_patcheck_zero_exit_with_printf_hint_passes(self):
         """Added printf output stays a review hint in the complete report."""
+        program = (
+            "#!/bin/sh\ncat > patcheck.stdout\n"
+            "printf 'Please use av_log\\npatcheck.stdout:23:+printf(\"hello\");\\n'\n"
+        )
         self.write(
             "tools/patcheck",
-            "#!/bin/sh\ncat > patcheck.stdout\n"
-            "printf 'Please use av_log\\npatcheck.stdout:23:+printf(\"hello\");\\n'\n",
+            program,
         )
         self.commit()
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -3827,9 +3850,12 @@ class CRulesTest(unittest.TestCase):
         )
         step = self.run_c_rules()
         self.assertEqual(step.rc, 1, step.output)
-        self.assertIn(
+        expected_finding = (
             "finding: libavformat/rtspenc.c:10: "
-            "ffmpeg-rtsp-connect-failure-without-network-close: first message line",
+            "ffmpeg-rtsp-connect-failure-without-network-close: first message line"
+        )
+        self.assertIn(
+            expected_finding,
             step.output,
         )
         self.assertNotIn("second detail line", step.output)
@@ -3881,9 +3907,12 @@ class CRulesTest(unittest.TestCase):
         )
         step = self.run_c_rules()
         self.assertEqual(step.rc, 0, step.output)
-        self.assertIn(
+        expected_finding = (
             "pre-existing (untouched): libavformat/rtspenc.c:3: "
-            "ffmpeg-rtsp-connect-failure-without-network-close: missing ff_network_close()",
+            "ffmpeg-rtsp-connect-failure-without-network-close: missing ff_network_close()"
+        )
+        self.assertIn(
+            expected_finding,
             step.output,
         )
         self.assertNotIn("finding:", step.output)
@@ -4402,7 +4431,7 @@ class RevertProofStepTest(FixtureTest):
         """A record JSON file containing a duplicate key is refused by the JSON reader."""
         commit, head, head_tree = self.add_fix_commit()
         dup_path = self.root.parent / "dup.json"
-        dup_path.write_text(
+        duplicate_record = (
             "{\n"
             f'  "commit": "{commit}",\n'
             f'  "head": "{head}",\n'
@@ -4412,7 +4441,10 @@ class RevertProofStepTest(FixtureTest):
             '  "rc_head": 0,\n'
             '  "rc_reverted": 1,\n'
             '  "reverted_paths": ["libavfilter/vf_x.c"]\n'
-            "}\n",
+            "}\n"
+        )
+        dup_path.write_text(
+            duplicate_record,
             encoding="utf-8",
         )
         rc, output = self.check("--revert-proof", str(dup_path))
