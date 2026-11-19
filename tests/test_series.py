@@ -2074,6 +2074,14 @@ class ContributionsTest(SeriesTestCase):
                 entries = [self.fx.record(1, related=value), self.fx.record(2)]
                 self.assert_error(self.check_with(entries, render=False), expected)
 
+    def test_undecided_relation_cannot_masquerade_as_manifest_evidence(self) -> None:
+        """Keep undecided file comparisons outside the proven-relation manifest schema."""
+        entry = self.fx.record(1, related=[self.related_item(10, reason="same-files-undecided")])
+        self.assert_error(
+            self.check_with([entry, self.fx.record(2)], render=False),
+            "entry 1: 'related' field 'reason' must be",
+        )
+
     def test_related_item_field_and_order_rules_fail_with_position_and_field(self) -> None:
         """Reject invalid related field values, duplicate numbers and unsorted related lists."""
         cases = (

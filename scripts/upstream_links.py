@@ -15,7 +15,7 @@
         manifest's checked date minus CHECK_MARGIN_DAYS, or --since DATE.
 
 Exit status: 0 on success or non-overlapping check, 1 on an overlap by
-another author in check, 2 on a read or input error.
+another author or undecided file comparison in check, 2 on a read or input error.
 """
 
 from __future__ import annotations
@@ -96,6 +96,22 @@ class RelatedRow(dict):
     merged_at: str = ""
 
 
+class FileNames(list[str]):
+    """Bounded file names retaining completeness and the count before deduplication."""
+
+    def __init__(
+        self,
+        names: list[str] | tuple[str, ...],
+        *,
+        complete: bool = True,
+        read_count: int | None = None,
+    ) -> None:
+        """Keep file evidence and its read limit together across the run memo."""
+        super().__init__(names)
+        self.complete = complete
+        self.read_count = len(names) if read_count is None else read_count
+
+
 def fetch_forge(url: str) -> dict | list:
     """Fetch a JSON object or list from the forge with the shared request deadline."""
     return upstream_drift.fetch_json(url, allow_list=True)
@@ -135,6 +151,20 @@ def _string_tuple(raw: object, label: str, cap: int) -> tuple[str, ...]:
     return tuple(items)
 
 
+def _item_files(raw: object, number: int, partial: bool) -> FileNames:
+    """Validate inline file names, allowing only external candidates a bounded prefix."""
+    label = f"pull {number} files"
+    if isinstance(raw, FileNames):
+        _string_tuple(raw, label, MAX_FILE_ROWS)
+        if not partial and not raw.complete:
+            raise DriftError(f"{label}: incomplete own pull listing")
+        return raw
+    if partial and isinstance(raw, (list, tuple, set)):
+        names = _string_tuple(list(raw)[:MAX_FILE_ROWS], label, MAX_FILE_ROWS)
+        return FileNames(names, complete=len(raw) <= MAX_FILE_ROWS)
+    return FileNames(_string_tuple(raw, label, MAX_FILE_ROWS))
+
+
 def _extract_author(raw: dict) -> str:
     """Read and validate the pull or issue author from author or user.login."""
     if "author" in raw:
@@ -160,7 +190,9 @@ def _extract_state(raw: dict, default_state: str) -> str:
     return state
 
 
-def normalize_item(raw: object, *, default_state: str = "open") -> dict[str, object]:
+def normalize_item(
+    raw: object, *, default_state: str = "open", partial_files: bool = False
+) -> dict[str, object]:
     """Validate and normalize an own pull or candidate pull or issue mapping."""
     if not isinstance(raw, dict):
         raise DriftError("pull or candidate is not an object")
@@ -186,9 +218,11 @@ def normalize_item(raw: object, *, default_state: str = "open") -> dict[str, obj
         "author": _extract_author(raw),
         "title": title,
         "state": state,
-        "files": _string_tuple(raw.get("files", raw.get("changed_files")), "files", MAX_FILE_ROWS),
+        "files": _item_files(raw.get("files", raw.get("changed_files")), number, partial_files),
         "patch_ids": _string_tuple(
-            raw.get("patch_ids", raw.get("stable_patch_ids")), "patch_ids", MAX_FILE_ROWS
+            raw.get("patch_ids", raw.get("stable_patch_ids")),
+            f"pull {number} patch_ids",
+            MAX_FILE_ROWS,
         ),
         "created_at": created_at,
         "merged_at": merged_at,
@@ -220,7 +254,7 @@ def related_for(
     seen_day = (today or datetime.now(UTC).date()).isoformat()
     by_number: dict[int, RelatedRow] = {}
     for raw in candidates[:MAX_CANDIDATES]:
-        cand = normalize_item(raw)
+        cand = normalize_item(raw, partial_files=True)
         reason = match_reason(own, cand)
         if reason is None:
             continue
@@ -314,21 +348,35 @@ def _file_names_from_row(row: object, url: str) -> list[str]:
     return names
 
 
-def read_pull_files(pull_url: str, fetch: Fetch) -> list[str]:
-    """Read and validate the paged changed file names of a pull request from the forge."""
+def _file_result(
+    files: list[str], complete: bool, partial: bool, pull_url: str, error: str
+) -> FileNames:
+    """Preserve partial external evidence while rejecting incomplete own listings."""
+    if not complete and not partial:
+        raise DriftError(f"{pull_url}/files: {error}")
+    return FileNames(sorted(set(files)), complete=complete, read_count=len(files))
+
+
+def read_pull_files(pull_url: str, fetch: Fetch, *, partial: bool = False) -> FileNames:
+    """Read bounded file pages, retaining a partial prefix only for external candidates."""
     files: list[str] = []
     for page in range(1, MAX_FILE_PAGES + 1):
         url = f"{pull_url}/files?limit={PAGE_SIZE}&page={page}"
         batch = fetch(url)
         if not isinstance(batch, list) or len(batch) > PAGE_SIZE:
             raise DriftError(f"{url}: expected a JSON list of at most {PAGE_SIZE} file entries")
-        for row in batch[:PAGE_SIZE]:
-            files.extend(_file_names_from_row(row, url))
-            if len(files) > MAX_FILE_ROWS:
-                raise DriftError(f"{pull_url}/files: file entries exceed {MAX_FILE_ROWS}")
+        names = [name for row in batch[:PAGE_SIZE] for name in _file_names_from_row(row, url)[:2]]
+        remaining = MAX_FILE_ROWS - len(files)
+        files.extend(names[:remaining])
+        if len(names) > remaining:
+            return _file_result(
+                files, False, partial, pull_url, f"file entries exceed {MAX_FILE_ROWS}"
+            )
         if len(batch) < PAGE_SIZE:
-            return sorted(set(files))
-    raise DriftError(f"{pull_url}/files: exceeds {MAX_FILE_PAGES} pages")
+            return _file_result(files, True, partial, pull_url, "")
+        if len(files) == MAX_FILE_ROWS:
+            break
+    return _file_result(files, False, partial, pull_url, f"exceeds {MAX_FILE_PAGES} pages")
 
 
 def _require_forge_envelope(raw: object) -> dict:
@@ -345,10 +393,10 @@ def _require_forge_envelope(raw: object) -> dict:
     return raw
 
 
-def parse_forge_pull(raw: object) -> dict[str, object]:
-    """Validate a Forgejo pull request JSON object and return its normalized fields."""
+def _parse_forge_pull(raw: object, partial_files: bool) -> dict[str, object]:
+    """Validate a forge envelope and its normalized metadata with the selected file policy."""
     checked = _require_forge_envelope(raw)
-    item = normalize_item(checked)
+    item = normalize_item(checked, partial_files=partial_files)
     if not item["created_at"]:
         raise DriftError(f"pull request {item['number']}: missing created_at")
     if item["state"] == "merged" and not item["merged_at"]:
@@ -365,6 +413,19 @@ def parse_forge_pull(raw: object) -> dict[str, object]:
     return item
 
 
+def parse_forge_pull(
+    raw: object, *, partial_files: bool = False, source: str = ""
+) -> dict[str, object]:
+    """Validate forge metadata and identify its pull or source address on any error."""
+    try:
+        return _parse_forge_pull(raw, partial_files)
+    except DriftError as exc:
+        where = source
+        if not where and isinstance(raw, dict):
+            where = f"pull {raw.get('number', '?')}"
+        raise DriftError(f"{where or 'pull request'}: {exc}") from exc
+
+
 def read_candidate_pulls(since: str, fetch: Fetch) -> list[dict[str, object]]:
     """Read candidate metadata once, stopping at updates older than the run window."""
     since_dt = parse_timestamp(since, "created_at")
@@ -378,7 +439,7 @@ def read_candidate_pulls(since: str, fetch: Fetch) -> list[dict[str, object]]:
             raise DriftError(f"{url}: expected a JSON list of at most {PAGE_SIZE} pull requests")
         reached_older = False
         for raw in batch[:PAGE_SIZE]:
-            item = parse_forge_pull(raw)
+            item = parse_forge_pull(raw, partial_files=True, source=url)
             if parse_timestamp(item["updated_at"], "updated_at") < since_dt:
                 reached_older = True
                 continue
@@ -394,19 +455,21 @@ def read_candidate_pulls(since: str, fetch: Fetch) -> list[dict[str, object]]:
     raise DriftError(f"{repo_url}/pulls: exceeds {MAX_PULL_PAGES} pages")
 
 
-def memoized_files(number: int, fetch: Fetch, files: dict[int, tuple[str, ...]]) -> tuple[str, ...]:
-    """Read each pull's changed-file pages at most once using an explicit run memo."""
+def memoized_files(
+    number: int, fetch: Fetch, files: dict[int, FileNames], *, partial: bool = False
+) -> FileNames:
+    """Memoize bounded names together with completeness without repeating file-page reads."""
     if number not in files:
-        files[number] = tuple(read_pull_files(pull_api_url(number), fetch))
-    return files[number]
+        files[number] = read_pull_files(pull_api_url(number), fetch, partial=partial)
+    return _item_files(files[number], number, partial)
 
 
 def inspect_own_pull(
-    number: int, url: str, fetch: Fetch, files: dict[int, tuple[str, ...]]
+    number: int, url: str, fetch: Fetch, files: dict[int, FileNames]
 ) -> dict[str, object]:
     """Read one own pull and memoize its changed files for reuse as a candidate."""
     p_url = pull_api_url(number, url)
-    own = parse_forge_pull(fetch(p_url))
+    own = parse_forge_pull(fetch(p_url), source=p_url)
     if own["number"] != number:
         raise DriftError(f"{p_url}: pull number {own['number']} disagrees with {number}")
     own["files"] = memoized_files(number, fetch, files)
@@ -415,9 +478,9 @@ def inspect_own_pull(
 
 def read_run_pulls(
     targets: list[tuple[int, str, set[int]]], fetch: Fetch, since: datetime | None = None
-) -> tuple[list[dict], list[dict], dict[int, tuple[str, ...]]]:
+) -> tuple[list[dict], list[dict], dict[int, FileNames]]:
     """Read scoped own pulls and one shared candidate window with a fresh file memo."""
-    files: dict[int, tuple[str, ...]] = {}
+    files: dict[int, FileNames] = {}
     own = [
         inspect_own_pull(number, url, fetch, files)
         for number, url, _ in targets[: upstream_drift.MAX_SERIES_ENTRIES]
@@ -437,7 +500,7 @@ def inspect_candidates(
     own: dict,
     candidates: list[dict],
     recorded: set[int],
-    files: dict[int, tuple[str, ...]],
+    files: dict[int, FileNames],
     fetch: Fetch,
 ) -> list[dict]:
     """Filter updates per own opening date and fetch only unrecorded candidates' files."""
@@ -449,9 +512,37 @@ def inspect_candidates(
             continue
         if parse_timestamp(candidate["updated_at"], "updated_at") < opened:
             continue
-        candidate["files"] = memoized_files(number, fetch, files)
+        if candidate["files"]:
+            files.setdefault(number, candidate["files"])
+        candidate["files"] = memoized_files(number, fetch, files, partial=True)
         eligible.append(candidate)
     return eligible
+
+
+def _undecided_for(own: dict, candidates: list[dict]) -> list[dict]:
+    """Keep partial file nonmatches visible without asserting a manifest relationship."""
+    undecided: list[dict] = []
+    for candidate in candidates[:MAX_CANDIDATES]:
+        names = candidate["files"]
+        if names.complete or set(own["files"]) & set(names):
+            continue
+        undecided.append(
+            {
+                "number": candidate["number"],
+                "author": candidate["author"],
+                "files_read": names.read_count,
+            }
+        )
+    return undecided
+
+
+def _undecided_lines(own: dict, undecided: list[dict]) -> list[str]:
+    """Format one diagnostic per partial nonmatch, identifying both pulls and the read count."""
+    return [
+        f"{own['number']} {row['number']} {row['author']} same-files undecided: "
+        f"{row['files_read']} files read"
+        for row in undecided[:MAX_CANDIDATES]
+    ]
 
 
 def _checked_manifest(root: Path) -> dict:
@@ -534,6 +625,7 @@ def fill_manifest(
     for own in own_pulls[: upstream_drift.MAX_SERIES_ENTRIES]:
         eligible = inspect_candidates(own, candidates, set(), files, request)
         related = related_for(own, eligible, today=today)
+        changes.extend(_undecided_lines(own, _undecided_for(own, eligible)))
         line = _fill_entry(by_number[own["number"]], own, related)
         if line:
             changes.append(line)
@@ -598,7 +690,7 @@ def check_overlaps(
     today: date | None = None,
     since: str | None = None,
 ) -> tuple[list[str], list[dict]]:
-    """Check new updates in one bounded window without rereading recorded relations' files."""
+    """Report new relations and undecided file comparisons using one bounded run memo."""
     data = _checked_manifest(root)
     cutoff = check_window(data["checked"], since)
     targets = _check_targets(data["contributions"], extra_pulls)
@@ -615,6 +707,9 @@ def check_overlaps(
     ):
         eligible = inspect_candidates(own, candidates, recorded, files, request)
         new_rows = related_for(own, eligible, today=today)
+        undecided = _undecided_for(own, eligible)
+        lines.extend(_undecided_lines(own, undecided))
+        loud.extend(undecided)
         for row in new_rows[: series.MAX_RELATED]:
             lines.append(
                 f"{own['number']} {row['number']} {row['author']} {row['reason']} {row['state']}"
@@ -665,7 +760,7 @@ def main(
     *,
     sleep: Sleep | None = None,
 ) -> int:
-    """Run fill or check; exit 0 when clean, 1 on overlaps, 2 on read or input error."""
+    """Run fill or check; exit 1 on overlaps or undecided checks, 2 on read or input errors."""
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
@@ -678,14 +773,14 @@ def main(
             changes = fill_manifest(
                 args.root, request, dry_run=args.dry_run, today=today, pulls=args.pull
             )
-            for line in changes[: upstream_drift.MAX_SERIES_ENTRIES]:
+            for line in changes[: upstream_drift.MAX_SERIES_ENTRIES * (MAX_CANDIDATES + 1)]:
                 print(line)
             return 0
         lines, loud = check_overlaps(args.root, args.pull, request, today=today, since=args.since)
     except _caught_errors() as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    for line in lines[: upstream_drift.MAX_SERIES_ENTRIES * series.MAX_RELATED]:
+    for line in lines[: upstream_drift.MAX_SERIES_ENTRIES * (MAX_CANDIDATES + series.MAX_RELATED)]:
         print(line)
     return 1 if loud else 0
 

@@ -720,5 +720,223 @@ class RequestCostTest(unittest.TestCase):
             self.assertEqual(forge.read, [])
 
 
+class OversizedCandidateTest(unittest.TestCase):
+    """Keep partial external file evidence without hiding other candidates or errors."""
+
+    def setUp(self) -> None:
+        """Create a one-pull manifest for bounded, network-free candidate listings."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.path = write_manifest(self.root, [manifest_entry(10)])
+
+    def forge_with_files(
+        self, count: int, *, shared: bool = False, inline: bool = False, number: int = 101
+    ) -> FakeForge:
+        """Plant a long file listing followed by an independent overlapping candidate."""
+        names = [f"other/{index}.c" for index in range(count)]
+        if shared:
+            names[min(count, upstream_links.MAX_FILE_ROWS) - 1] = "shared.c"
+        pulls = [forge_pull(101), forge_pull(102)]
+        own = forge_pull(10)
+        if inline:
+            target = own if number == 10 else pulls[0]
+            target["files"] = names
+        answers = {
+            f"{API}/pulls/10": own,
+            f"{API}/pulls/10/files?limit=50&page=1": [{"filename": "shared.c"}],
+            f"{API}/pulls/102/files?limit=50&page=1": [{"filename": "shared.c"}],
+            f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1": pulls,
+        }
+        for page in range(1, count // 50 + 2):
+            part = names[(page - 1) * 50 : page * 50]
+            answers[f"{API}/pulls/{number}/files?limit=50&page={page}"] = [
+                {"filename": name} for name in part[:50]
+            ]
+        return FakeForge(answers)
+
+    def test_oversized_paged_candidate_reports_overlap_in_read_prefix(self) -> None:
+        """A cap-plus-one candidate still reports a shared file in its read prefix."""
+        forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1, shared=True)
+        rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("10 101 bob same-files open", out)
+        self.assertIn("10 102 bob same-files open", out)
+        self.assertNotIn("undecided", out)
+
+    def test_oversized_inline_candidate_reports_overlap_in_read_prefix(self) -> None:
+        """The metadata string reader also accepts bounded external file evidence."""
+        forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1, shared=True, inline=True)
+        rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("10 101 bob same-files open", out)
+        self.assertNotIn("undecided", out)
+
+    def test_oversized_candidate_is_undecided_and_keeps_other_overlap(self) -> None:
+        """An unread possible overlap stays visible and does not hide later candidates."""
+        forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1)
+        last_page = f"{API}/pulls/101/files?limit=50&page=21"
+        forge.answers[last_page] = [{"filename": "shared.c"}]
+        rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        line = next(line for line in out.splitlines()[:3] if "undecided" in line)
+        self.assertIn("10 101", line)
+        self.assertIn("1000 files read", line)
+        self.assertIn("same-files", line)
+        self.assertIn("10 102 bob same-files open", out)
+        self.assertNotIn("10 101 bob same-files open", out)
+        self.assertNotIn(last_page, forge.read)
+
+    def test_inline_nonmatch_is_undecided_without_extra_pages(self) -> None:
+        """An oversized inline list is bounded and cannot become a silent nonmatch."""
+        forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1, inline=True)
+        rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("10 101", out)
+        self.assertIn("1000 files read", out)
+        self.assertIn("undecided", out)
+        self.assertIn("10 102 bob same-files open", out)
+        self.assertFalse(any("/pulls/101/files?" in url for url in forge.read[:24]))
+
+    def test_undecided_alone_stays_loud_on_repeated_checks(self) -> None:
+        """An undecided candidate cannot pass check or disappear on the next sighting."""
+        before = self.path.read_bytes()
+        for _ in range(2):
+            forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1)
+            forge.answers[f"{API}/pulls/102/files?limit=50&page=1"] = []
+            rc, out, err = run_cli(self.root, forge, "check")
+            self.assertEqual((rc, err), (1, ""))
+            self.assertEqual(len(out.splitlines()), 1)
+            self.assertIn("undecided", out)
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_fill_and_dry_run_report_undecided_without_recording_false_relation(self) -> None:
+        """Both fill modes expose partial nonmatches and store only proven relations."""
+        before = self.path.read_bytes()
+        for flags in (("--dry-run",), ()):
+            forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1)
+            rc, out, err = run_cli(self.root, forge, "fill", *flags)
+            self.assertEqual((rc, err), (0, ""))
+            self.assertIn("10 101", out)
+            self.assertIn("1000 files read", out)
+            self.assertIn("undecided", out)
+            self.assertIn('"number": 102', out)
+            if flags:
+                self.assertEqual(self.path.read_bytes(), before)
+        rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"]
+        self.assertEqual([row["number"] for row in rows[0]["related"]], [102])
+        rc, out, err = run_cli(
+            self.root, self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1), "check"
+        )
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("undecided", out)
+        self.assertNotIn("10 102", out)
+
+    def test_exact_cap_inline_candidate_uses_normal_path(self) -> None:
+        """A complete inline list exactly at the cap is a decided nonmatch or overlap."""
+        for shared in (False, True):
+            forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS, inline=True, shared=shared)
+            rc, out, err = run_cli(self.root, forge, "check")
+            self.assertEqual((rc, err), (1, ""))
+            self.assertNotIn("undecided", out)
+            self.assertEqual("10 101 bob same-files open" in out, shared)
+
+    def test_exact_cap_short_final_page_uses_normal_path(self) -> None:
+        """Exactly the name cap on a terminating page is not marked incomplete."""
+        forge = self.forge_with_files(0)
+        for page in range(1, 11):
+            start = (page - 1) * 50
+            forge.answers[f"{API}/pulls/101/files?limit=50&page={page}"] = [
+                {"filename": f"new/{n}", "previous_filename": f"old/{n}"}
+                for n in range(start, start + 50)
+            ]
+        # The final page supplies the last two names while remaining shorter than PAGE_SIZE.
+        with unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 902):
+            forge.answers[f"{API}/pulls/101/files?limit=50&page=10"] = [
+                {"filename": "last.c", "previous_filename": "last-old.c"}
+            ]
+            rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertNotIn("undecided", out)
+        self.assertIn("10 102 bob same-files open", out)
+
+    def test_own_pull_above_cap_remains_identified_hard_error(self) -> None:
+        """Oversized own inline and paged lists still exit 2 and identify pull 10."""
+        before = self.path.read_bytes()
+        for inline in (False, True):
+            forge = self.forge_with_files(
+                upstream_links.MAX_FILE_ROWS + 1, number=10, inline=inline
+            )
+            rc, out, err = run_cli(self.root, forge, "fill")
+            self.assertEqual((rc, out), (2, ""))
+            self.assertIn(f"{API}/pulls/10/files" if not inline else f"{API}/pulls/10:", err)
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_page_cap_is_partial_for_candidate_but_hard_for_own(self) -> None:
+        """A full last permitted page is undecided only for an external pull."""
+        with unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1):
+            forge = self.forge_with_files(51)
+            rc, out, err = run_cli(self.root, forge, "check")
+            self.assertEqual((rc, err), (1, ""))
+            self.assertIn("50 files read", out)
+            self.assertIn("undecided", out)
+            own = self.forge_with_files(51, number=10)
+            rc, out, err = run_cli(self.root, own, "check")
+            self.assertEqual((rc, out), (2, ""))
+            self.assertIn(f"{API}/pulls/10/files", err)
+
+    def test_oversized_requests_are_bounded_paced_and_budgeted(self) -> None:
+        """Every retained candidate page consumes a paced request from the run budget."""
+        for budget, expected in ((24, 1), (23, 2)):
+            forge, pauses = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1), []
+            with unittest.mock.patch.object(upstream_links, "CHECK_REQUEST_CAP", budget):
+                rc, out, err = run_cli(self.root, forge, "check", sleep=pauses.append)
+            self.assertEqual(rc, expected)
+            self.assertEqual(len(forge.read), budget)
+            self.assertEqual(pauses, [upstream_links.REQUEST_PAUSE_SECONDS] * budget)
+            file_pages = [url for url in forge.read[:24] if "/pulls/101/files?" in url]
+            self.assertEqual(len(file_pages), upstream_links.MAX_FILE_PAGES)
+            if expected == 2:
+                self.assertEqual(out, "")
+                self.assertIn("count 24, cap 23", err)
+
+    def test_malformed_candidate_listings_stay_identified_hard_errors(self) -> None:
+        """Malformed inline strings and file rows remain fatal with a source identifier."""
+        malformed = (
+            {},
+            [None],
+            [{}],
+            [{"filename": " "}],
+            [{"filename": 9}],
+            [{"filename": "a.c", "previous_filename": 9}],
+            [{"filename": "a.c"}] * 51,
+        )
+        for batch in malformed[:7]:
+            forge = self.forge_with_files(1)
+            forge.answers[f"{API}/pulls/101/files?limit=50&page=1"] = batch
+            rc, out, err = run_cli(self.root, forge, "fill")
+            self.assertEqual((rc, out), (2, ""))
+            self.assertIn("101", err)
+        forge = self.forge_with_files(1, inline=True)
+        forge.answers[f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1"][0]["files"] = [
+            None
+        ]
+        rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("101", err)
+
+    def test_rename_names_cannot_overrun_candidate_cap(self) -> None:
+        """Rename aliases count toward the name cap without aborting the candidate scan."""
+        forge = self.forge_with_files(0)
+        forge.answers[f"{API}/pulls/101/files?limit=50&page=1"] = [
+            {"filename": "a.c", "previous_filename": "shared.c"},
+            {"filename": "b.c", "previous_filename": "old-b.c"},
+        ]
+        with unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 3):
+            rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("10 101 bob same-files open", out)
+
+
 if __name__ == "__main__":
     unittest.main()

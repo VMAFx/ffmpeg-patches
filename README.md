@@ -483,6 +483,7 @@ overrides that window for a catch-up run. Recorded related rows do not trigger
 candidate file reads. A candidate recorded for one own pull can still need
 files for another. Every candidate remains eligible for a same-files match
 even when its subject and patch IDs differ.
+When a candidate's file listing is incomplete at the 1000-name or 20-page limit without a proven shared file, `fill --dry-run`, `fill` and `check` print its pull number, the number of files read and `same-files undecided`; it is not recorded as a relation, and `check` exits 1 for the undecided comparison.
 
 Each run pauses 0.5 seconds before every request, including the first, and
 retains the shared 30-second request deadline. `fill` permits 500 requests;
