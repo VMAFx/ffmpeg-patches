@@ -469,12 +469,28 @@ optional, append-only lists that do not change the README table:
 `same-files`, `same-patch-id` or `same-subject`, `state`, and `seen`
 `YYYY-MM-DD` date). Run `python3 scripts/upstream_links.py fill` (`--dry-run`
 to preview without writing) to populate both fields for open and merged
-manifest records from the forge. Run
+manifest records from the forge. Repeat `--pull N` to fill only named open or
+merged manifest rows, for example `fill --pull 25805 --pull 25950`. Candidate
+pulls are scanned once per run from the earliest scoped opening date; each
+pull's changed files are fetched at most once. Run
 `python3 scripts/upstream_links.py check` (adding `--pull N` for any open pull
 not yet in the manifest) to list newly discovered related pulls and issues;
 it exits 1 when at least one unrecorded related pull by another author is open
 or merged after the own pull was opened, and the daily `upstream.yml` job runs
-this check alongside `upstream_drift.py`.
+this check alongside `upstream_drift.py`. By default, `check` scans updates
+since the manifest's `checked` date minus 7 days; `check --since YYYY-MM-DD`
+overrides that window for a catch-up run. Recorded related rows do not trigger
+candidate file reads. A candidate recorded for one own pull can still need
+files for another. Every candidate remains eligible for a same-files match
+even when its subject and patch IDs differ.
+
+Each run pauses 0.5 seconds before every request, including the first, and
+retains the shared 30-second request deadline. `fill` permits 500 requests;
+`check` permits 100. The next request above the cap exits 2 with its count and
+cap; it produces no partial result and `fill` leaves the manifest unchanged.
+Use `fill --pull N` to process smaller parts. The week-long margin revisits
+recent updates around the drift snapshot; the smaller daily cap bounds load
+on the public forge.
 
 ### Licence
 

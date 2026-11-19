@@ -3,15 +3,16 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Fill linked upstream issues and related pulls, and check open pulls for overlaps.
 
-    upstream_links.py [--root DIR] fill [--dry-run]
-        For every manifest row in state open or merged, read the pull, its
-        changed files and candidate pulls updated since the pull was opened,
-        extract issue numbers after Fixes, Closes or Refs in the pull body,
+    upstream_links.py [--root DIR] fill [--dry-run] [--pull N]...
+        Fill open or merged manifest rows, optionally limited by --pull N.
+        Share one candidate scan and changed-file memo across the selected
+        pulls, extract issue numbers after Fixes, Closes or Refs in each body,
         and write fixes_issues and related into upstream-contributions.json.
-    upstream_links.py [--root DIR] check [--pull N]...
+    upstream_links.py [--root DIR] check [--pull N]... [--since DATE]
         For every open manifest pull and each --pull N, list new related
         pulls and issues not yet recorded in the manifest and exit 1 when at
-        least one is an overlap by another author.
+        least one is an overlap by another author. Scan updates since the
+        manifest's checked date minus CHECK_MARGIN_DAYS, or --since DATE.
 
 Exit status: 0 on success or non-overlapping check, 1 on an overlap by
 another author in check, 2 on a read or input error.
@@ -23,8 +24,9 @@ import argparse
 import json
 import re
 import sys
+import time
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 try:
@@ -34,8 +36,16 @@ except ModuleNotFoundError:
     from scripts import series, upstream_drift
 
 Fetch = Callable[[str], dict | list]
+Sleep = Callable[[float], None]
 DriftError = upstream_drift.DriftError
 REQUEST_TIMEOUT = upstream_drift.REQUEST_TIMEOUT
+# At two requests per second, a full fill spends at most 250 seconds pacing;
+# the daily check spends at most 50. Larger histories require explicit fill parts.
+FILL_REQUEST_CAP = 500
+CHECK_REQUEST_CAP = 100
+REQUEST_PAUSE_SECONDS = 0.5
+# Revisit a week around the drift snapshot to cover date granularity and late updates.
+CHECK_MARGIN_DAYS = 7
 PAGE_SIZE = 50
 MAX_PULL_PAGES = 20
 MAX_PULL_ROWS = PAGE_SIZE * MAX_PULL_PAGES
@@ -52,6 +62,30 @@ ISSUE_REF = re.compile(
     r"|(?<!/)\b([1-9][0-9]*)\b",
     re.IGNORECASE,
 )
+
+
+class RequestBudget:
+    """Count and pace every injected fetch, failing before a request above the cap."""
+
+    def __init__(self, fetch: Fetch, cap: int, sleep: Sleep | None = None) -> None:
+        """Create a fresh run counter with an injectable pause function."""
+        self.fetch = fetch
+        self.cap = cap
+        self.count = 0
+        self.sleep = sleep if sleep is not None else time.sleep
+
+    def __call__(self, url: str) -> dict | list:
+        """Pause once per admitted request and preserve the underlying fetch deadline."""
+        if self.count >= self.cap:
+            raise DriftError(f"request budget exceeded: count {self.count + 1}, cap {self.cap}")
+        self.count += 1
+        self.sleep(REQUEST_PAUSE_SECONDS)
+        return self.fetch(url)
+
+
+def _budgeted(fetch: Fetch, cap: int) -> RequestBudget:
+    """Reuse the CLI run counter or create one for a direct fill or check call."""
+    return fetch if isinstance(fetch, RequestBudget) else RequestBudget(fetch, cap)
 
 
 class RelatedRow(dict):
@@ -331,8 +365,8 @@ def parse_forge_pull(raw: object) -> dict[str, object]:
     return item
 
 
-def read_candidate_pulls(since: str, own_number: int, fetch: Fetch) -> list[dict[str, object]]:
-    """Read paged candidate pulls updated since the own pull was opened, with changed files."""
+def read_candidate_pulls(since: str, fetch: Fetch) -> list[dict[str, object]]:
+    """Read candidate metadata once, stopping at updates older than the run window."""
     since_dt = parse_timestamp(since, "created_at")
     repo_url = upstream_drift.repo_api_url()
     candidates: list[dict[str, object]] = []
@@ -349,11 +383,10 @@ def read_candidate_pulls(since: str, own_number: int, fetch: Fetch) -> list[dict
                 reached_older = True
                 continue
             num = int(item["number"])
-            if num == own_number or num in seen_numbers:
+            if num in seen_numbers:
                 continue
             if len(candidates) >= MAX_PULL_ROWS:
                 raise DriftError(f"{repo_url}/pulls: candidate pulls exceed {MAX_PULL_ROWS}")
-            item["files"] = tuple(read_pull_files(f"{repo_url}/pulls/{num}", fetch))
             seen_numbers.add(num)
             candidates.append(item)
         if len(batch) < PAGE_SIZE or reached_older:
@@ -361,19 +394,64 @@ def read_candidate_pulls(since: str, own_number: int, fetch: Fetch) -> list[dict
     raise DriftError(f"{repo_url}/pulls: exceeds {MAX_PULL_PAGES} pages")
 
 
+def memoized_files(number: int, fetch: Fetch, files: dict[int, tuple[str, ...]]) -> tuple[str, ...]:
+    """Read each pull's changed-file pages at most once using an explicit run memo."""
+    if number not in files:
+        files[number] = tuple(read_pull_files(pull_api_url(number), fetch))
+    return files[number]
+
+
 def inspect_own_pull(
-    number: int, url: str, fetch: Fetch, today: date | None
-) -> tuple[dict[str, object], list[int], list[RelatedRow]]:
-    """Read one own pull, its files and candidate pulls; return pull, issues and related."""
+    number: int, url: str, fetch: Fetch, files: dict[int, tuple[str, ...]]
+) -> dict[str, object]:
+    """Read one own pull and memoize its changed files for reuse as a candidate."""
     p_url = pull_api_url(number, url)
     own = parse_forge_pull(fetch(p_url))
     if own["number"] != number:
         raise DriftError(f"{p_url}: pull number {own['number']} disagrees with {number}")
-    own["files"] = tuple(read_pull_files(p_url, fetch))
-    issues = body_issues(own["body"])
-    candidates = read_candidate_pulls(str(own["created_at"]), number, fetch)
-    related = related_for(own, candidates, today=today)
-    return own, issues, related
+    own["files"] = memoized_files(number, fetch, files)
+    return own
+
+
+def read_run_pulls(
+    targets: list[tuple[int, str, set[int]]], fetch: Fetch, since: datetime | None = None
+) -> tuple[list[dict], list[dict], dict[int, tuple[str, ...]]]:
+    """Read scoped own pulls and one shared candidate window with a fresh file memo."""
+    files: dict[int, tuple[str, ...]] = {}
+    own = [
+        inspect_own_pull(number, url, fetch, files)
+        for number, url, _ in targets[: upstream_drift.MAX_SERIES_ENTRIES]
+    ]
+    if not own:
+        return [], [], files
+    earliest = min(
+        parse_timestamp(pull["created_at"], "created_at")
+        for pull in own[: upstream_drift.MAX_SERIES_ENTRIES]
+    )
+    cutoff = max(earliest, since) if since is not None else earliest
+    candidates = read_candidate_pulls(cutoff.isoformat(), fetch)
+    return own, candidates, files
+
+
+def inspect_candidates(
+    own: dict,
+    candidates: list[dict],
+    recorded: set[int],
+    files: dict[int, tuple[str, ...]],
+    fetch: Fetch,
+) -> list[dict]:
+    """Filter updates per own opening date and fetch only unrecorded candidates' files."""
+    opened = parse_timestamp(own["created_at"], "created_at")
+    eligible: list[dict] = []
+    for candidate in candidates[:MAX_CANDIDATES]:
+        number = int(candidate["number"])
+        if number == own["number"] or number in recorded:
+            continue
+        if parse_timestamp(candidate["updated_at"], "updated_at") < opened:
+            continue
+        candidate["files"] = memoized_files(number, fetch, files)
+        eligible.append(candidate)
+    return eligible
 
 
 def _checked_manifest(root: Path) -> dict:
@@ -407,29 +485,58 @@ def merge_related(existing: list[dict], fresh: list[RelatedRow]) -> list[dict]:
     return [by_number[num] for num in sorted(by_number)]
 
 
+def _fill_targets(entries: list[dict], pulls: list[int]) -> list[tuple[int, str, set[int]]]:
+    """Limit fill to eligible manifest rows and reject invalid selections before fetching."""
+    cap = upstream_drift.MAX_SERIES_ENTRIES
+    if len(pulls) > cap or any(type(num) is not int or num <= 0 for num in pulls[:cap]):
+        raise DriftError(f"--pull requires at most {cap} positive numbers")
+    eligible = {int(e["number"]): e for e in entries[:cap] if e["state"] in ("open", "merged")}
+    requested = set(pulls) or set(eligible)
+    missing = requested - set(eligible)
+    if missing:
+        raise DriftError(f"--pull not an open or merged manifest row: {sorted(missing)}")
+    return [(num, eligible[num]["url"], set()) for num in sorted(requested)[:cap]]
+
+
+def _fill_entry(entry: dict, own: dict, related: list[RelatedRow]) -> str:
+    """Merge discovered links into an entry and return a diagnostic only when changed."""
+    merged_issues = sorted(set(entry.get("fixes_issues", [])) | set(body_issues(own["body"])))
+    if len(merged_issues) > series.MAX_FIXES_ISSUES:
+        raise DriftError(f"fixes_issues entries exceed {series.MAX_FIXES_ISSUES}")
+    merged_rel = merge_related(entry.get("related", []), related)
+    if entry.get("fixes_issues") == merged_issues and entry.get("related") == merged_rel:
+        return ""
+    entry["fixes_issues"] = merged_issues
+    entry["related"] = merged_rel
+    return (
+        f"{entry['number']}: fixes_issues={json.dumps(merged_issues)} "
+        f"related={json.dumps(merged_rel)}"
+    )
+
+
 def fill_manifest(
-    root: Path, fetch: Fetch, *, dry_run: bool = False, today: date | None = None
+    root: Path,
+    fetch: Fetch,
+    *,
+    dry_run: bool = False,
+    today: date | None = None,
+    pulls: list[int] | None = None,
 ) -> list[str]:
-    """Fill fixes_issues and related for open and merged manifest rows; write unless dry_run."""
+    """Fill selected open and merged rows within a run budget, writing only after success."""
     path = root / series.CONTRIBUTIONS
     original = path.read_bytes() if path.is_file() else b""
     data = _checked_manifest(root)
+    targets = _fill_targets(data["contributions"], pulls or [])
+    request = _budgeted(fetch, FILL_REQUEST_CAP)
+    own_pulls, candidates, files = read_run_pulls(targets, request)
+    by_number = {e["number"]: e for e in data["contributions"][: upstream_drift.MAX_SERIES_ENTRIES]}
     changes: list[str] = []
-    for entry in data["contributions"][: upstream_drift.MAX_SERIES_ENTRIES]:
-        if entry["state"] not in ("open", "merged"):
-            continue
-        _, issues, related = inspect_own_pull(entry["number"], entry["url"], fetch, today)
-        merged_issues = sorted(set(entry.get("fixes_issues", [])) | set(issues))
-        if len(merged_issues) > series.MAX_FIXES_ISSUES:
-            raise DriftError(f"fixes_issues entries exceed {series.MAX_FIXES_ISSUES}")
-        merged_rel = merge_related(entry.get("related", []), related)
-        if entry.get("fixes_issues") != merged_issues or entry.get("related") != merged_rel:
-            entry["fixes_issues"] = merged_issues
-            entry["related"] = merged_rel
-            changes.append(
-                f"{entry['number']}: fixes_issues={json.dumps(merged_issues)} "
-                f"related={json.dumps(merged_rel)}"
-            )
+    for own in own_pulls[: upstream_drift.MAX_SERIES_ENTRIES]:
+        eligible = inspect_candidates(own, candidates, set(), files, request)
+        related = related_for(own, eligible, today=today)
+        line = _fill_entry(by_number[own["number"]], own, related)
+        if line:
+            changes.append(line)
     if changes and not dry_run:
         if path.read_bytes() != original:
             raise DriftError(f"{path}: changed since read; no changes written")
@@ -471,19 +578,47 @@ def _check_targets(entries: list[dict], extra_pulls: list[int]) -> list[tuple[in
     return targets
 
 
+def check_window(checked: str, since: str | None) -> datetime:
+    """Resolve a calendar-date override or the manifest snapshot minus the fixed margin."""
+    raw = since if since is not None else checked
+    if not isinstance(raw, str) or not series.DAY.fullmatch(raw):
+        raise DriftError(f"invalid {'--since' if since is not None else 'checked'} date: {raw!r}")
+    cutoff = parse_timestamp(raw, "check window")
+    try:
+        return cutoff if since is not None else cutoff - timedelta(days=CHECK_MARGIN_DAYS)
+    except OverflowError as exc:
+        raise DriftError(f"{checked}: check window exceeds calendar range") from exc
+
+
 def check_overlaps(
-    root: Path, extra_pulls: list[int], fetch: Fetch, *, today: date | None = None
+    root: Path,
+    extra_pulls: list[int],
+    fetch: Fetch,
+    *,
+    today: date | None = None,
+    since: str | None = None,
 ) -> tuple[list[str], list[dict]]:
-    """Check open manifest pulls and --pull numbers; return new related lines and loud overlaps."""
+    """Check new updates in one bounded window without rereading recorded relations' files."""
     data = _checked_manifest(root)
+    cutoff = check_window(data["checked"], since)
     targets = _check_targets(data["contributions"], extra_pulls)
+    if len(targets) > upstream_drift.MAX_SERIES_ENTRIES:
+        raise DriftError(f"check targets exceed {upstream_drift.MAX_SERIES_ENTRIES}")
+    request = _budgeted(fetch, CHECK_REQUEST_CAP)
+    own_pulls, candidates, files = read_run_pulls(targets, request, cutoff)
     lines: list[str] = []
     loud: list[dict] = []
-    for num, url, recorded in targets[: upstream_drift.MAX_SERIES_ENTRIES]:
-        _, _, related = inspect_own_pull(num, url, fetch, today)
-        new_rows = [row for row in related if row["number"] not in recorded]
+    for own, (_, _, recorded) in zip(
+        own_pulls[: upstream_drift.MAX_SERIES_ENTRIES],
+        targets[: upstream_drift.MAX_SERIES_ENTRIES],
+        strict=True,
+    ):
+        eligible = inspect_candidates(own, candidates, recorded, files, request)
+        new_rows = related_for(own, eligible, today=today)
         for row in new_rows[: series.MAX_RELATED]:
-            lines.append(f"{num} {row['number']} {row['author']} {row['reason']} {row['state']}")
+            lines.append(
+                f"{own['number']} {row['number']} {row['author']} {row['reason']} {row['state']}"
+            )
         loud.extend(overlaps(new_rows))
     return lines, loud
 
@@ -497,9 +632,13 @@ def build_parser() -> argparse.ArgumentParser:
     fill_p = sub.add_parser("fill", help="fill fixes_issues and related into the manifest")
     fill_p.add_argument("--root", type=Path, default=argparse.SUPPRESS)
     fill_p.add_argument("--dry-run", action="store_true", help="print changes without writing")
+    fill_p.add_argument("--pull", type=int, action="append", default=[], metavar="N")
     check_p = sub.add_parser("check", help="list new related items and fail on overlaps")
     check_p.add_argument("--root", type=Path, default=argparse.SUPPRESS)
     check_p.add_argument("--pull", type=int, action="append", default=[], metavar="N")
+    check_p.add_argument(
+        "--since", metavar="DATE", help="override the checked-date window (YYYY-MM-DD)"
+    )
     return parser
 
 
@@ -519,30 +658,34 @@ def _caught_errors() -> tuple[type[Exception], ...]:
     return tuple(classes)
 
 
-def main(argv: list[str], fetch: Fetch = fetch_forge, today: date | None = None) -> int:
+def main(
+    argv: list[str],
+    fetch: Fetch = fetch_forge,
+    today: date | None = None,
+    *,
+    sleep: Sleep | None = None,
+) -> int:
     """Run fill or check; exit 0 when clean, 1 on overlaps, 2 on read or input error."""
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
         return 2 if exc.code else 0
-    cache: dict[str, dict | list] = {}
-
-    def cached_fetch(url: str) -> dict | list:
-        if url not in cache:
-            cache[url] = fetch(url)
-        return cache[url]
-
     try:
         series.pull_url_pattern()
+        cap = FILL_REQUEST_CAP if args.command == "fill" else CHECK_REQUEST_CAP
+        request = RequestBudget(fetch, cap, sleep)
         if args.command == "fill":
-            for line in fill_manifest(args.root, cached_fetch, dry_run=args.dry_run, today=today):
+            changes = fill_manifest(
+                args.root, request, dry_run=args.dry_run, today=today, pulls=args.pull
+            )
+            for line in changes[: upstream_drift.MAX_SERIES_ENTRIES]:
                 print(line)
             return 0
-        lines, loud = check_overlaps(args.root, args.pull, cached_fetch, today=today)
+        lines, loud = check_overlaps(args.root, args.pull, request, today=today, since=args.since)
     except _caught_errors() as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    for line in lines:
+    for line in lines[: upstream_drift.MAX_SERIES_ENTRIES * series.MAX_RELATED]:
         print(line)
     return 1 if loud else 0
 
