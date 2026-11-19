@@ -520,13 +520,22 @@ line gives the candidate count, expected requests assuming one file page per
 pull and a file-page upper bound. A request above the cap exits 2 with its
 count, cap, window start, candidate count and narrowing option. A failure
 before publication leaves the manifest unchanged. After replacement, cleanup
-failure exits 0 with `published ...; cleanup incomplete; exit 0` and one
+failure exits 3 with `published ...; cleanup incomplete; exit 3` and one
 `leftover:` line per failed cleanup path; the published manifest stays in place.
-Fill syncs a sibling temporary file before atomic
-replacement and refuses content changed since the initial read; concurrent
+Status 3 is exclusive to this published-with-leftovers state; clean fills exit 0.
+Check exits 0 without overlaps, 1 for overlaps or undecided file comparisons,
+and both commands exit 2 for read or input errors. Check writes nothing and
+cannot reach status 3. Treat status 3 as a visible failure requiring cleanup
+review before another writing fill; do not roll back the published bytes.
+Fill keeps its sibling temporary file private until content is written and
+synced, then copies only the manifest's user/group/other read, write and execute
+bits before atomic replacement. Set-id and sticky bits are not copied; a mode
+change failure aborts before publication with exit 2.
+Fill refuses content changed since the initial read; concurrent
 fills use an exclusive sibling lock. A leftover lock blocks writing fills with
-its full path and a stale-lock rule: confirm no fill is running for that
-manifest, then review and remove the lock before retrying. No automatic lock
+its path (relative to the working directory when `--root` is relative) and a
+stale-lock rule: confirm no fill is running for that manifest, then review and
+remove the lock before retrying. No automatic lock
 removal occurs. Other writers must coordinate
 with that lock to exclude edits during the final compare-and-replace step.
 Missing or malformed decision fields, responses over 16 MiB, titles or paths

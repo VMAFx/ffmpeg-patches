@@ -15,7 +15,8 @@
         manifest's checked date minus CHECK_MARGIN_DAYS, or --since DATE.
 
 Exit status: 0 on success or non-overlapping check, 1 on an overlap by
-another author or undecided file comparison in check, 2 on a read or input error.
+another author or undecided file comparison in check, 2 on a read or input error,
+3 when fill published the manifest but cleanup left a staging file or lock.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ Sleep = Callable[[float], None]
 DriftError = upstream_drift.DriftError
 REQUEST_TIMEOUT = upstream_drift.REQUEST_TIMEOUT
 REQUEST_PAUSE_SECONDS = 0.5
+PUBLISHED_WITH_LEFTOVERS = 3
 # Revisit a week around the drift snapshot to cover date granularity and late updates.
 CHECK_MARGIN_DAYS = 7
 # Bound first-fill history even when the manifest contains months-old own pulls.
@@ -80,6 +82,12 @@ ISSUE_CLAUSE = re.compile(
 )
 ISSUE_ITEM = re.compile(r"(#[1-9][0-9]*|https?://[^\s,;]+|[\w.-]+/[\w.-]+#[1-9][0-9]*)")
 ISSUE_LIST_ITEM = re.compile(r"\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+)([^\s,]+)", re.IGNORECASE)
+
+
+class _FillChanges(list[str]):
+    """Carry publication cleanup state without changing the public list interface."""
+
+    cleanup_incomplete: bool = False
 
 
 class RequestBudget:
@@ -939,10 +947,10 @@ def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> list[s
             mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
         ) as stream:
             staging = Path(stream.name)
-            staging.chmod(path.stat().st_mode & 0o7777)
             stream.write(rendered)
             stream.flush()
             os.fsync(stream.fileno())
+            staging.chmod(path.stat().st_mode & 0o777)
         if path.read_bytes() != original:
             raise DriftError(f"{path}: changed since read; no changes written")
         os.replace(staging, path)
@@ -975,11 +983,11 @@ def _replace_manifest(path: Path, original: bytes, rendered: bytes) -> list[str]
     finally:
         _cleanup_manifest_path(lock, published, leftovers)
     if leftovers:
-        leftovers.append(f"published {path}; cleanup incomplete; exit 0")
+        leftovers.append(f"published {path}; cleanup incomplete; exit {PUBLISHED_WITH_LEFTOVERS}")
     return leftovers
 
 
-def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]:
+def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> _FillChanges:
     """Fill selected rows within an age and request budget, naming unread older history."""
     run_day = _run_day(options.today)
     cutoff = fill_window(options.max_age_days, run_day)
@@ -991,7 +999,7 @@ def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]
     request.narrow_option = "fill --max-age-days N (shorten the window) or --pull N"
     own_pulls, candidates, files = read_run_pulls(targets, request, cutoff)
     by_number = {e["number"]: e for e in data["contributions"][: upstream_drift.MAX_SERIES_ENTRIES]}
-    changes = _fill_window_lines(own_pulls, cutoff)
+    changes = _FillChanges(_fill_window_lines(own_pulls, cutoff))
     for own in own_pulls[: upstream_drift.MAX_SERIES_ENTRIES]:
         eligible = inspect_candidates(own, candidates, set(), files, request)
         related = related_for(own, eligible, today=run_day)
@@ -1006,7 +1014,9 @@ def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]
         rendered = (json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n").encode(
             "utf-8"
         )
-        changes.extend(_replace_manifest(path, original, rendered))
+        leftovers = _replace_manifest(path, original, rendered)
+        changes.cleanup_incomplete = bool(leftovers)
+        changes.extend(leftovers)
     return changes
 
 
@@ -1157,7 +1167,7 @@ def main(
     *,
     sleep: Sleep | None = None,
 ) -> int:
-    """Run fill or check; exit 1 on overlaps or undecided checks, 2 on read or input errors."""
+    """Run fill/check; return 1 for overlaps, 2 for errors or 3 for published leftovers."""
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
@@ -1179,7 +1189,7 @@ def main(
             # Reserve two cleanup paths and the final publication state beyond change lines.
             for line in changes[: upstream_drift.MAX_SERIES_ENTRIES * (MAX_CANDIDATES + 2) + 3]:
                 print(line)
-            return 0
+            return PUBLISHED_WITH_LEFTOVERS if changes.cleanup_incomplete else 0
         lines, loud = check_overlaps(args.root, args.pull, request, today=today, since=args.since)
     except _caught_errors() as exc:
         print(f"error: {exc}", file=sys.stderr)

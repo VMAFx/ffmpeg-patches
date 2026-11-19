@@ -1760,6 +1760,89 @@ class FailClosedForgeTest(unittest.TestCase):
         """Even local repository shorthand requires a full URL or standalone hash."""
         self.assert_issue_items("Refs FFmpeg/FFmpeg#20", [], 1)
 
+    def test_keyword_horizontal_spacing_table(self) -> None:
+        """Tabs and several spaces after each closing keyword preserve complete items."""
+        cases = (
+            "Fixes\t#10, #20",
+            "Closes\t#10, #20",
+            "Refs\t#10, #20",
+            "Fixes    #10, #20",
+            "Closes    #10, #20",
+            "Refs    #10, #20",
+        )
+        for body in cases[:6]:
+            with self.subTest(body=body):
+                self.assert_issue_items(body, [10, 20])
+
+    def test_keyword_inside_longer_word_table(self) -> None:
+        """Embedded keywords never start a closing clause."""
+        cases = ("prefixFixes #10", "FixesSuffix #10", "_Closes #10", "Refs2 #10")
+        for body in cases[:4]:
+            with self.subTest(body=body):
+                self.assert_issue_items(body, [])
+
+    def test_keyword_and_conjunction_case_table(self) -> None:
+        """Upper and lower case keywords and conjunctions keep both complete items."""
+        cases = (
+            "FIXES #10 AND #20",
+            "fixes #10 and #20",
+            "CLOSES #10 OR #20",
+            "closes #10 or #20",
+            "REFS #10 AND #20",
+            "refs #10 or #20",
+        )
+        for body in cases[:6]:
+            with self.subTest(body=body):
+                self.assert_issue_items(body, [10, 20])
+
+    def test_hash_bracket_or_colon_suffix_table(self) -> None:
+        """A bracket or colon glued to a hash ends the list without later salvage."""
+        cases = (
+            ("Fixes #10], #20", []),
+            ("Fixes #10:, #20", []),
+            ("Fixes #10, #20], #30", [10]),
+            ("Fixes #10, #20:, #30", [10]),
+        )
+        for body, expected in cases[:4]:
+            with self.subTest(body=body):
+                self.assert_issue_items(body, expected)
+
+    def test_uppercase_issue_scheme_or_host_table(self) -> None:
+        """Uppercase schemes stop the list while uppercase hosts are ignored and counted."""
+        cases = (
+            ("HTTPS://code.ffmpeg.org", [10], 0),
+            ("HTTP://code.ffmpeg.org", [10], 0),
+            ("https://CODE.FFMPEG.ORG", [10, 30], 1),
+            ("https://Code.ffmpeg.org", [10, 30], 1),
+        )
+        for origin, expected, ignored in cases[:4]:
+            with self.subTest(origin=origin):
+                self.assert_issue_items(
+                    f"Fixes #10, {origin}/FFmpeg/FFmpeg/issues/20, #30", expected, ignored
+                )
+
+    def test_issue_address_user_or_port_table(self) -> None:
+        """User parts and ports fail literal origin matching without losing later valid items."""
+        origins = (
+            "https://user@code.ffmpeg.org",
+            "https://code.ffmpeg.org:443",
+            "https://code.ffmpeg.org:8443",
+        )
+        for origin in origins[:3]:
+            with self.subTest(origin=origin):
+                self.assert_issue_items(
+                    f"Fixes #10, {origin}/FFmpeg/FFmpeg/issues/20, #30", [10, 30], 1
+                )
+
+    def test_pull_address_between_valid_items_table(self) -> None:
+        """Pull addresses are neither recorded nor counted and later hashes remain readable."""
+        for scheme in ("https", "http"):
+            with self.subTest(scheme=scheme):
+                self.assert_issue_items(
+                    f"Fixes #10, {scheme}://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/20, #30",
+                    [10, 30],
+                )
+
     def test_keyboard_interrupt_during_write_cleans_staging(self) -> None:
         """KeyboardInterrupt inside a partial write preserves old bytes and cleans siblings."""
         factory = tempfile.NamedTemporaryFile
@@ -1784,8 +1867,8 @@ class FailClosedForgeTest(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), self.before)
         self.assertEqual(list(self.root.iterdir()), [self.path])
 
-    def assert_published_with_leftover(self, suffix: str) -> Path:
-        """Fail a real post-replace unlink and require a successful publication result."""
+    def assert_published_with_leftover(self, suffix: str, *, both: bool = False) -> Path:
+        """Require published bytes, every cleanup leftover and the distinct failure status."""
         unlink = Path.unlink
         replace = upstream_links.os.replace
         failed: list[Path] = []
@@ -1793,12 +1876,13 @@ class FailClosedForgeTest(unittest.TestCase):
         def publish(source: Path, target: Path) -> None:
             """Replace for real and plant an actual staging leftover for its cleanup test."""
             replace(source, target)
-            if suffix == ".tmp":
+            if suffix == ".tmp" or both:
                 source.write_bytes(b"planted leftover staging")
 
         def fail_cleanup(path: Path, *args: object, **kwargs: object) -> None:
             """Raise only after new manifest bytes are already visible at the destination."""
-            if path.name.endswith(suffix) and self.path.read_bytes() != self.before:
+            suffixes = (".tmp", ".lock") if both else (suffix,)
+            if path.name.endswith(suffixes) and self.path.read_bytes() != self.before:
                 failed.append(path)
                 raise OSError("planted cleanup failure")
             unlink(path, *args, **kwargs)
@@ -1808,17 +1892,18 @@ class FailClosedForgeTest(unittest.TestCase):
             unittest.mock.patch.object(upstream_links.os, "replace", side_effect=publish),
         ):
             rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill")
-        self.assertEqual((rc, err), (0, ""))
-        self.assertEqual(len(failed), 1)
-        self.assertTrue(failed[0].is_file())
+        self.assertEqual((rc, err), (3, ""))
+        self.assertEqual(len(failed), 2 if both else 1)
+        for leftover in failed[:2]:
+            self.assertTrue(leftover.is_file())
+            self.assertIn(
+                f"leftover: {leftover}: cleanup failed: planted cleanup failure", out.splitlines()
+            )
         self.assertNotEqual(self.path.read_bytes(), self.before)
         entry = json.loads(self.path.read_bytes())["contributions"][0]
         self.assertEqual(entry["fixes_issues"], [99])
-        self.assertIn(f"published {self.path}; cleanup incomplete", out)
-        self.assertEqual(out.count("leftover: "), 1)
-        self.assertIn(
-            f"leftover: {failed[0]}: cleanup failed: planted cleanup failure", out.splitlines()
-        )
+        self.assertIn(f"published {self.path}; cleanup incomplete; exit 3", out.splitlines())
+        self.assertEqual(out.count("leftover: "), len(failed))
         return failed[0]
 
     def test_staging_cleanup_failure_reports_published(self) -> None:
@@ -1830,8 +1915,23 @@ class FailClosedForgeTest(unittest.TestCase):
         lock = self.assert_published_with_leftover(".lock")
         self.assertTrue(lock.is_file())
 
+    def test_combined_cleanup_failure_reports_both_leftovers(self) -> None:
+        """Both post-publication cleanup failures retain new bytes and report every path."""
+        self.assert_published_with_leftover(".tmp", both=True)
+
+    def test_clean_publication_returns_zero_without_leftover_lines(self) -> None:
+        """Clean publication returns zero, writes the new issues and removes both siblings."""
+        rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(
+            json.loads(self.path.read_bytes())["contributions"][0]["fixes_issues"], [99]
+        )
+        self.assertNotIn("leftover:", out)
+        self.assertNotIn("cleanup incomplete", out)
+        self.assertEqual(list(self.root.iterdir()), [self.path])
+
     def test_published_state_survives_bounded_change_output(self) -> None:
-        """Publication status remains visible when ordinary change lines fill their cap."""
+        """Two ordinary lines and one leftover leave state visible with an ordinary cap of three."""
         self.own["created_at"] = "2020-01-01T00:00:00Z"
         with (
             unittest.mock.patch.object(upstream_links.upstream_drift, "MAX_SERIES_ENTRIES", 1),
@@ -1854,10 +1954,90 @@ class FailClosedForgeTest(unittest.TestCase):
 
     def test_atomic_replacement_preserves_manifest_file_mode(self) -> None:
         """Atomic publication keeps the existing manifest permission bits."""
+        for mode in (0o640, 0o600):
+            with self.subTest(mode=oct(mode)):
+                self.path.write_bytes(self.before)
+                self.path.chmod(mode)
+                rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+                self.assertEqual((rc, err), (0, ""))
+                self.assertEqual(self.path.stat().st_mode & 0o7777, mode)
+
+    def test_atomic_replacement_drops_special_mode_bits(self) -> None:
+        """Publication copies ordinary permissions without set-id or sticky bits."""
+        for special in (0o4000, 0o2000, 0o1000, 0o7000):
+            with self.subTest(special=oct(special)):
+                self.path.write_bytes(self.before)
+                self.path.chmod(special | 0o750)
+                self.assertEqual(self.path.stat().st_mode & 0o7777, special | 0o750)
+                rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+                self.assertEqual((rc, err), (0, ""))
+                self.assertEqual(self.path.stat().st_mode & 0o7777, 0o750)
+
+    def test_failed_mode_change_aborts_before_publication(self) -> None:
+        """A chmod failure returns the existing error status and never publishes bytes."""
+        with (
+            unittest.mock.patch.object(Path, "chmod", side_effect=OSError("planted chmod failure")),
+            unittest.mock.patch.object(upstream_links.os, "replace") as replace,
+        ):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("planted chmod failure", err)
+        replace.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(list(self.root.iterdir()), [self.path])
+
+    def test_staging_stays_private_until_written_and_synced(self) -> None:
+        """Staging stays private through writing and sync, then chmod precedes replacement."""
+        factory, fsync = tempfile.NamedTemporaryFile, upstream_links.os.fsync
+        chmod, replace = Path.chmod, upstream_links.os.replace
+        events: list[str] = []
         self.path.chmod(0o640)
-        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+
+        def prepare(*args: object, **kwargs: object) -> object:
+            """Observe the actual staging permissions before the first write."""
+            stream = factory(*args, **kwargs)
+            write = stream.write
+
+            def observe(data: bytes) -> int:
+                """Require private staging while content is still incomplete."""
+                self.assertEqual(Path(stream.name).stat().st_mode & 0o7777, 0o600)
+                events.append("write")
+                return write(data)
+
+            stream.write = observe
+            return stream
+
+        def sync(fd: int) -> None:
+            """Complete real sync before any permission change is allowed."""
+            self.assertEqual(events, ["write"])
+            fsync(fd)
+            events.append("sync")
+
+        def set_mode(path: Path, mode: int) -> None:
+            """Require complete synced content before widening staging permissions."""
+            self.assertEqual(events, ["write", "sync"])
+            self.assertEqual(
+                json.loads(path.read_bytes())["contributions"][0]["fixes_issues"], [99]
+            )
+            chmod(path, mode)
+            events.append("mode")
+
+        def publish(source: Path, target: Path) -> None:
+            """Require the final ordinary mode before replacing the manifest."""
+            self.assertEqual(events, ["write", "sync", "mode"])
+            self.assertEqual(source.stat().st_mode & 0o7777, 0o640)
+            replace(source, target)
+            events.append("replace")
+
+        with (
+            unittest.mock.patch.object(tempfile, "NamedTemporaryFile", side_effect=prepare),
+            unittest.mock.patch.object(upstream_links.os, "fsync", side_effect=sync),
+            unittest.mock.patch.object(Path, "chmod", autospec=True, side_effect=set_mode),
+            unittest.mock.patch.object(upstream_links.os, "replace", side_effect=publish),
+        ):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
         self.assertEqual((rc, err), (0, ""))
-        self.assertEqual(self.path.stat().st_mode & 0o7777, 0o640)
+        self.assertEqual(events, ["write", "sync", "mode", "replace"])
 
     def test_issue_clause_cap_boundary_is_accepted(self) -> None:
         """All 64 allowed clauses reach the stored issue list."""
