@@ -185,12 +185,22 @@ token() {
   printf '%s' "$t"
 }
 
-# api_write_result PATH CURL-ARGS...: expose an accepted write before private-header cleanup.
+# api_write_result PATH MODE CURL-ARGS...: check status before exposing a write or receipt.
 api_write_result() {
-  local path="$1" response
-  shift
-  response="$(curl --max-time 60 "$@" "$API$path")" || return $?
-  printf '%s\n' "$response"
+  local path="$1" mode="$2" response=/dev/null code
+  shift 2
+  if [ "$mode" != --status ]; then
+    private_temp response || return 1
+  fi
+  code="$(curl --max-time 60 "$@" --no-fail --no-location -o "$response" \
+    -w '%{http_code}' "$API$path")" || return $?
+  if [ "$mode" = --status ]; then printf '%s' "$code"; return; fi
+  case "$code" in
+    2[0-9][0-9]) ;;
+    *) printf 'ffmpeg-forgejo: unexpected HTTP status %s writing %s.\n' "$code" "$path" >&2; return 1 ;;
+  esac
+  cat -- "$response" || return 1
+  [ "$mode" = --receipt ] || return 0
   python3 -c 'import json,sys
 try:
     data = json.load(sys.stdin)
@@ -200,7 +210,7 @@ if not isinstance(data, dict):
     data = {}
 address = data.get("html_url") or data.get("number") or sys.argv[1]
 print(f"ffmpeg-forgejo: write accepted: {address} (read-back not verified).", file=sys.stderr)' \
-    "$path" <<<"$response"
+    "$path" <"$response"
 }
 
 # api METHOD PATH [JSON-BODY-FILE] [--status|--receipt]: send one request with optional status or receipt.
@@ -214,17 +224,13 @@ api() (
   chmod 600 "$hdr" || exit 1
   printf 'Authorization: token %s\n' "$tok" >"$hdr" || exit 1
   args+=(-H @"$hdr")
-  if [ "$mode" = --status ]; then
-    args+=(--no-fail --no-location -o /dev/null -w '%{http_code}')
-  fi
   if [ -n "$body" ]; then
     args+=(-H 'Content-Type: application/json' --data-binary @"$body")
   fi
-  if [ "$mode" = --receipt ]; then
-    api_write_result "$path" "${args[@]}"
-  else
-    curl --max-time 60 "${args[@]}" "$API$path"
-  fi
+  case "$method:$mode" in
+    *:--status|POST:*|PATCH:*|PUT:*|DELETE:*) api_write_result "$path" "$mode" "${args[@]}" ;;
+    *) curl --max-time 60 "${args[@]}" "$API$path" ;;
+  esac
 )
 
 # api_exists PATH: return 0 for an answer, 44 for proven absence, 1 for any other failure.

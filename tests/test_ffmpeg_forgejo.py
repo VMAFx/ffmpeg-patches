@@ -46,6 +46,7 @@ HELPER_SUBCOMMANDS = frozenset(
         "fairy-reviews",
         "overlap",
         "reply",
+        "reviewers",
         "landed",
         "fork",
     }
@@ -850,9 +851,11 @@ def write_request_paths(stub: Stub) -> list[tuple[str, str]]:
 class ForkStub(Stub):
     """Script repository existence reads without changing the shared forge stub."""
 
-    def __init__(self, repository_status: int) -> None:
+    def __init__(
+        self, repository_status: int, polls: dict[str, list[list[dict]]] | None = None
+    ) -> None:
         """Keep the repository response status alongside the shared request history."""
-        super().__init__()
+        super().__init__(polls=polls)
         self.repository_status = repository_status
 
 
@@ -2265,6 +2268,208 @@ THREAD = [
         "html_url": "stub/pulls/1#issuecomment-85995",
     },
 ]
+
+
+class WriteResponseHandler(ForkHandler):
+    """Override selected write responses without persisting or following them."""
+
+    def scripted_write(self, method: str) -> bool:
+        """Record a selected write and return its exact HTTP status and response bytes."""
+        stub = self.stub()
+        scripted = getattr(stub, "write_responses", {}).get((method, self.path))
+        if scripted is None:
+            return False
+        data = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
+        stub.requests.append((method, self.path, data))
+        callback = getattr(stub, "on_write", None)
+        if callback is not None:
+            callback(self.path)
+        code, body = scripted
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        if code == 302:
+            self.send_header("Location", "/api/v1/unexpected-redirect")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def do_POST(self) -> None:
+        """Use a scripted POST response or the shared fixture's ordinary behavior."""
+        if not self.scripted_write("POST"):
+            super().do_POST()
+
+    def do_PATCH(self) -> None:
+        """Use a scripted PATCH response or the shared fixture's ordinary behavior."""
+        if not self.scripted_write("PATCH"):
+            super().do_PATCH()
+
+
+class WriteStatusTest(ForgejoTest):
+    """Require an HTTP success before receipts, addresses, or subsequent writes."""
+
+    def write_case(self, verb: str) -> tuple[ForkStub, list[str], tuple[str, str]]:
+        """Prepare the existing fork, pull, and review fixtures for one write verb."""
+        stub = ForkStub(404, polls={A: [[label("success")]]} if verb == "edit-body" else None)
+        stub.reviewers = [["alice"]]
+        stub.review_comments[7] = copy.deepcopy(THREAD)
+        body = str(self.tmp / "body.md")
+        cases = {
+            "fork": (["fork"], "POST", "forks"),
+            "pr": (["pr", "--sweep", str(self.sweep), "topic", "title", body], "POST", "pulls"),
+            "reply": (
+                ["reply", "--no-test-claims", "1", "7", "85995", body],
+                "POST",
+                "pulls/1/reviews/7/comments",
+            ),
+            "issue": (["issue", "title", body], "POST", "issues"),
+            "comment": (["comment", "--no-test-claims", "1", body], "POST", "issues/1/comments"),
+            "edit-body": (["edit-body", "--no-test-claims", "1", body], "PATCH", "pulls/1"),
+            "close": (["close", "1", body], "POST", "issues/1/comments"),
+            "reviewers": (["reviewers", "1", "bob"], "POST", "pulls/1/requested_reviewers"),
+        }
+        args, method, suffix = cases[verb]
+        return stub, args, (method, "/api/v1/repos/FFmpeg/FFmpeg/" + suffix)
+
+    def run_write_case(
+        self,
+        verb: str,
+        status: int | None = None,
+        data: bytes = b"",
+        cleanup: bool = False,
+        target: tuple[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], ForkStub, Path | None]:
+        """Run one write with an optional raw response and write-armed header refusal."""
+        stub, args, default_target = self.write_case(verb)
+        if status is not None:
+            stub.write_responses = {target or default_target: (status, data)}
+        refused = None
+        if cleanup:
+            marker, refused = plant_accepted_header_failure(self.bin_dir, self.tmp)
+
+            def arm_failure(path: str) -> None:
+                """Refuse header removal only after the selected write reaches the server."""
+                marker.touch()
+
+            stub.on_write = arm_failure
+        with unittest.mock.patch(__name__ + ".Handler", WriteResponseHandler):
+            result = self.run_command(stub, *args)
+        return result, stub, refused
+
+    def assert_redirect_refused(self, verb: str, cleanup: bool = False) -> None:
+        """Require a rejected empty redirect, one attempted write, and checked cleanup."""
+        result, stub, refused = self.run_write_case(verb, 302, cleanup=cleanup)
+        _, _, target = self.write_case(verb)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("write accepted:", result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing " + target[1][7:], result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(write_request_paths(stub), [target])
+        self.assertEqual(stub.requests[-1][:2], target)
+        if cleanup:
+            self.assertIsNotNone(refused)
+            assert_private_removal_failed(self, result, refused)
+
+    def assert_one_receipt(self, verb: str) -> None:
+        """Require the native 2xx response to expose exactly one acceptance receipt."""
+        result, stub, _ = self.run_write_case(verb)
+        _, _, target = self.write_case(verb)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("write accepted:"), 1, result.stderr)
+        self.assertEqual(write_request_paths(stub)[0], target)
+
+    def assert_empty_success_receipted(self, verb: str, status: int) -> None:
+        """A 204 still records HTTP acceptance while JSON consumers may refuse later."""
+        result, stub, _ = self.run_write_case(verb, 204)
+        _, _, target = self.write_case(verb)
+        self.assertEqual(result.returncode, status, result.stderr)
+        self.assertEqual(result.stderr.count("write accepted:"), 1, result.stderr)
+        self.assertIn("write accepted: " + target[1][7:], result.stderr)
+        self.assertEqual(write_request_paths(stub), [target])
+
+    def test_fork_redirect_refused_and_2xx_receipted_once(self) -> None:
+        """An empty fork redirect refuses while a created fork is receipted exactly once."""
+        self.assert_redirect_refused("fork")
+        self.assert_one_receipt("fork")
+        self.assert_empty_success_receipted("fork", 0)
+
+    def test_pr_redirect_refused_and_2xx_receipted_once(self) -> None:
+        """An empty pull redirect stops reviewers while a created pull has one receipt."""
+        self.assert_redirect_refused("pr")
+        self.assert_one_receipt("pr")
+        self.assert_empty_success_receipted("pr", 1)
+
+    def test_reply_redirect_refused_and_2xx_receipted_once(self) -> None:
+        """An empty reply redirect stops read-back while a stored reply has one receipt."""
+        self.assert_redirect_refused("reply")
+        self.assert_one_receipt("reply")
+        self.assert_empty_success_receipted("reply", 1)
+
+    def test_fork_redirect_with_header_cleanup_refusal_has_no_receipt(self) -> None:
+        """A redirected fork cannot print acceptance even when header cleanup refuses."""
+        self.assert_redirect_refused("fork", cleanup=True)
+
+    def test_pr_redirect_with_header_cleanup_refusal_has_no_receipt(self) -> None:
+        """A redirected pull cannot print acceptance even when header cleanup refuses."""
+        self.assert_redirect_refused("pr", cleanup=True)
+
+    def test_reply_redirect_with_header_cleanup_refusal_has_no_receipt(self) -> None:
+        """A redirected reply cannot print acceptance even when header cleanup refuses."""
+        self.assert_redirect_refused("reply", cleanup=True)
+
+    def assert_address_redirect_refused(self, verb: str) -> None:
+        """Reject a redirect's valid JSON address while retaining its 2xx control."""
+        data = b'{"html_url":"stub/address","number":1}'
+        result, stub, _ = self.run_write_case(verb, 302, data)
+        _, _, target = self.write_case(verb)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing " + target[1][7:], result.stderr)
+        self.assertNotIn("stub/address", result.stdout)
+        self.assertEqual(write_request_paths(stub), [target])
+        self.assertEqual(stub.requests[-1][:2], target)
+        control, _, _ = self.run_write_case(verb, 200, data)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertIn("stub/address", control.stdout)
+
+    def test_issue_redirect_cannot_print_address(self) -> None:
+        """Issue creation prints an address only after a successful HTTP response."""
+        self.assert_address_redirect_refused("issue")
+
+    def test_comment_redirect_cannot_print_address(self) -> None:
+        """Comment creation prints an address only after a successful HTTP response."""
+        self.assert_address_redirect_refused("comment")
+
+    def test_body_edit_redirect_cannot_print_address(self) -> None:
+        """A pull body edit prints an address only after a successful HTTP response."""
+        self.assert_address_redirect_refused("edit-body")
+
+    def test_close_comment_redirect_cannot_send_close(self) -> None:
+        """A redirected close comment cannot expose its address or send the close PATCH."""
+        self.assert_address_redirect_refused("close")
+
+    def test_reviewer_redirect_stops_readback(self) -> None:
+        """A redirected reviewer request stops before the success listing is read."""
+        result, stub, _ = self.run_write_case("reviewers", 302)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing /repos/", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(stub.requests[-1][0], "POST")
+
+    def test_bot_reviewer_redirect_stops_readback(self) -> None:
+        """A redirected bot reviewer request stops before reviewer confirmation reads."""
+        target = ("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1/requested_reviewers")
+        result, stub, _ = self.run_write_case("pr", 302, target=target)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing " + target[1][7:], result.stderr)
+        self.assertEqual(result.stderr.count("write accepted:"), 1)
+        self.assertEqual(stub.requests[-1][:2], target)
+
+    def test_close_patch_redirect_stops_confirmation(self) -> None:
+        """A redirected close PATCH stops before the closed-state confirmation read."""
+        target = ("PATCH", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1")
+        result, stub, _ = self.run_write_case("close", 302, target=target)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing " + target[1][7:], result.stderr)
+        self.assertEqual(stub.requests[-1][:2], target)
 
 
 class ReplyTest(ForgejoTest):
