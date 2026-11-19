@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Fill linked upstream issues and related pulls, and check open pulls for overlaps.
 
-    upstream_links.py [--root DIR] fill [--dry-run] [--pull N]...
+    upstream_links.py [--root DIR] fill [--dry-run] [--pull N]... [--max-age-days N]
         Fill open or merged manifest rows, optionally limited by --pull N.
         Share one candidate scan and changed-file memo across the selected
         pulls, extract issue numbers after Fixes, Closes or Refs in each body,
@@ -26,6 +26,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -42,6 +43,10 @@ REQUEST_TIMEOUT = upstream_drift.REQUEST_TIMEOUT
 REQUEST_PAUSE_SECONDS = 0.5
 # Revisit a week around the drift snapshot to cover date granularity and late updates.
 CHECK_MARGIN_DAYS = 7
+# Bound first-fill history even when the manifest contains months-old own pulls.
+DEFAULT_FILL_MAX_AGE_DAYS = 14
+MIN_FILL_MAX_AGE_DAYS = 1
+MAX_FILL_MAX_AGE_DAYS = 365
 PAGE_SIZE = 50
 MAX_PULL_PAGES = 20
 MAX_PULL_ROWS = PAGE_SIZE * MAX_PULL_PAGES
@@ -118,6 +123,16 @@ class FileNames(list[str]):
         self.complete = complete
         self.read_count = len(names) if read_count is None else read_count
         self.file_count = len(names) if file_count is None else file_count
+
+
+@dataclass(frozen=True)
+class _FillOptions:
+    """Keep fill-only options together without changing the existing public entry point."""
+
+    dry_run: bool = False
+    today: date | None = None
+    pulls: list[int] | None = None
+    max_age_days: int = DEFAULT_FILL_MAX_AGE_DAYS
 
 
 def fetch_forge(url: str) -> dict | list:
@@ -703,6 +718,60 @@ def _fill_entry(entry: dict, own: dict, related: list[RelatedRow]) -> str:
     )
 
 
+def fill_window(max_age_days: int, today: date | None = None) -> datetime:
+    """Resolve the bounded fill age to UTC midnight, rejecting invalid ages and underflow."""
+    if type(max_age_days) is not int or not (
+        MIN_FILL_MAX_AGE_DAYS <= max_age_days <= MAX_FILL_MAX_AGE_DAYS
+    ):
+        raise DriftError(
+            f"--max-age-days must be an integer from {MIN_FILL_MAX_AGE_DAYS} "
+            f"through {MAX_FILL_MAX_AGE_DAYS}: {max_age_days!r}"
+        )
+    day = today or datetime.now(UTC).date()
+    try:
+        return parse_timestamp(day.isoformat(), "fill date") - timedelta(days=max_age_days)
+    except OverflowError as exc:
+        raise DriftError(f"{day}: fill window exceeds calendar range") from exc
+
+
+def _fill_window_lines(own_pulls: list[dict], cutoff: datetime) -> list[str]:
+    """Name each old own pull whose potentially eligible history was not fully read."""
+    return [
+        f"{own['number']}: candidates updated before {cutoff.isoformat()} not read (fill age limit)"
+        for own in own_pulls[: upstream_drift.MAX_SERIES_ENTRIES]
+        if parse_timestamp(own["created_at"], "created_at") < cutoff
+    ]
+
+
+def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]:
+    """Fill selected rows within an age and request budget, naming unread older history."""
+    cutoff = fill_window(options.max_age_days, options.today)
+    path = root / series.CONTRIBUTIONS
+    original = path.read_bytes() if path.is_file() else b""
+    data = _checked_manifest(root)
+    targets = _fill_targets(data["contributions"], options.pulls or [])
+    request = _budgeted(fetch, request_cap(len(targets)))
+    request.narrow_option = "fill --max-age-days N (shorten the window) or --pull N"
+    own_pulls, candidates, files = read_run_pulls(targets, request, cutoff)
+    by_number = {e["number"]: e for e in data["contributions"][: upstream_drift.MAX_SERIES_ENTRIES]}
+    changes = _fill_window_lines(own_pulls, cutoff)
+    for own in own_pulls[: upstream_drift.MAX_SERIES_ENTRIES]:
+        eligible = inspect_candidates(own, candidates, set(), files, request)
+        related = related_for(own, eligible, today=options.today)
+        changes.extend(_undecided_lines(own, _undecided_for(own, eligible)))
+        line = _fill_entry(by_number[own["number"]], own, related)
+        if line:
+            changes.append(line)
+    if changes and not options.dry_run:
+        if path.read_bytes() != original:
+            raise DriftError(f"{path}: changed since read; no changes written")
+        rendered = (json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n").encode(
+            "utf-8"
+        )
+        path.write_bytes(rendered)
+    return changes
+
+
 def fill_manifest(
     root: Path,
     fetch: Fetch,
@@ -711,31 +780,8 @@ def fill_manifest(
     today: date | None = None,
     pulls: list[int] | None = None,
 ) -> list[str]:
-    """Fill selected open and merged rows within a run budget, writing only after success."""
-    path = root / series.CONTRIBUTIONS
-    original = path.read_bytes() if path.is_file() else b""
-    data = _checked_manifest(root)
-    targets = _fill_targets(data["contributions"], pulls or [])
-    request = _budgeted(fetch, request_cap(len(targets)))
-    request.narrow_option = "--pull N (select a later-opening own pull)"
-    own_pulls, candidates, files = read_run_pulls(targets, request)
-    by_number = {e["number"]: e for e in data["contributions"][: upstream_drift.MAX_SERIES_ENTRIES]}
-    changes: list[str] = []
-    for own in own_pulls[: upstream_drift.MAX_SERIES_ENTRIES]:
-        eligible = inspect_candidates(own, candidates, set(), files, request)
-        related = related_for(own, eligible, today=today)
-        changes.extend(_undecided_lines(own, _undecided_for(own, eligible)))
-        line = _fill_entry(by_number[own["number"]], own, related)
-        if line:
-            changes.append(line)
-    if changes and not dry_run:
-        if path.read_bytes() != original:
-            raise DriftError(f"{path}: changed since read; no changes written")
-        rendered = (json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n").encode(
-            "utf-8"
-        )
-        path.write_bytes(rendered)
-    return changes
+    """Fill selected rows using the default age limit, preserving the public call signature."""
+    return _fill_manifest(root, fetch, _FillOptions(dry_run=dry_run, today=today, pulls=pulls))
 
 
 def _check_targets(entries: list[dict], extra_pulls: list[int]) -> list[tuple[int, str, set[int]]]:
@@ -829,6 +875,16 @@ def build_parser() -> argparse.ArgumentParser:
     fill_p.add_argument("--root", type=Path, default=argparse.SUPPRESS)
     fill_p.add_argument("--dry-run", action="store_true", help="print changes without writing")
     fill_p.add_argument("--pull", type=int, action="append", default=[], metavar="N")
+    fill_p.add_argument(
+        "--max-age-days",
+        type=int,
+        default=DEFAULT_FILL_MAX_AGE_DAYS,
+        metavar="N",
+        help=(
+            f"read at most N days of candidate updates ({MIN_FILL_MAX_AGE_DAYS}-"
+            f"{MAX_FILL_MAX_AGE_DAYS}; default {DEFAULT_FILL_MAX_AGE_DAYS})"
+        ),
+    )
     check_p = sub.add_parser("check", help="list new related items and fail on overlaps")
     check_p.add_argument("--root", type=Path, default=argparse.SUPPRESS)
     check_p.add_argument("--pull", type=int, action="append", default=[], metavar="N")
@@ -870,10 +926,17 @@ def main(
         series.pull_url_pattern()
         request = RequestBudget(fetch, request_cap(upstream_drift.MAX_SERIES_ENTRIES), sleep)
         if args.command == "fill":
-            changes = fill_manifest(
-                args.root, request, dry_run=args.dry_run, today=today, pulls=args.pull
+            changes = _fill_manifest(
+                args.root,
+                request,
+                _FillOptions(
+                    dry_run=args.dry_run,
+                    today=today,
+                    pulls=args.pull,
+                    max_age_days=args.max_age_days,
+                ),
             )
-            for line in changes[: upstream_drift.MAX_SERIES_ENTRIES * (MAX_CANDIDATES + 1)]:
+            for line in changes[: upstream_drift.MAX_SERIES_ENTRIES * (MAX_CANDIDATES + 2)]:
                 print(line)
             return 0
         lines, loud = check_overlaps(args.root, args.pull, request, today=today, since=args.since)

@@ -940,6 +940,231 @@ class MeasuredWindowTest(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
 
+class FillAgeWindowTest(unittest.TestCase):
+    """Bound fill history independently of old own pulls and the nightly snapshot."""
+
+    def setUp(self) -> None:
+        """Create old and recent own pulls with candidates on both sides of the age boundary."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.path = write_manifest(self.root, [manifest_entry(10), manifest_entry(20)])
+        self.before = self.path.read_bytes()
+        self.page = f"{API}/pulls?state=all&sort=recentupdate&limit=2&page="
+        self.answers = {
+            f"{API}/pulls/10": forge_pull(10, "2026-06-01"),
+            f"{API}/pulls/20": forge_pull(20, "2026-11-10"),
+            self.page + "1": [forge_pull(101), forge_pull(102, updated="2026-10-29")],
+        }
+        for page in range(2, 21):
+            self.answers[self.page + str(page)] = [
+                forge_pull(103, updated="2026-10-28"),
+                forge_pull(104, updated="2026-10-28"),
+            ]
+        for number in (10, 20, 101, 102, 103):
+            self.answers[f"{API}/pulls/{number}/files?limit=2&page=1"] = [{"filename": "shared.c"}]
+
+    def test_old_and_recent_fill_finishes_with_exact_cost_and_honest_notice(self) -> None:
+        """Stop before old updates, warn only for the old own pull and persist proven links."""
+        for flags in (("--dry-run",), ()):
+            forge, pauses = FakeForge(self.answers), []
+            with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+                rc, out, err = run_cli(
+                    self.root, forge, "fill", *flags, sleep=pauses.append, keep_progress=True
+                )
+            self.assertEqual((rc, err), (0, ""))
+            self.assertEqual(len(forge.read), 8)
+            self.assertEqual(len(set(forge.read)), 8)
+            self.assertEqual(pauses, [0.5] * 8)
+            self.assertEqual(
+                out.splitlines()[0],
+                "window 2026-10-29T00:00:00+00:00: candidates 2, file candidates 2; "
+                "expected requests 8 (one page per file listing), at most 84; cap 20062",
+            )
+            self.assertEqual(
+                [line for line in out.splitlines()[:4] if "not read" in line],
+                [
+                    "10: candidates updated before 2026-10-29T00:00:00+00:00 "
+                    "not read (fill age limit)"
+                ],
+            )
+            self.assertEqual(out.count("not read"), 1)
+            self.assertNotIn(self.page + "3", forge.read)
+            self.assertFalse(any("/pulls/103/files?" in url for url in forge.read[:8]))
+            if flags:
+                self.assertEqual(self.path.read_bytes(), self.before)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertNotEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(data["checked"], "2026-11-12")
+        self.assertEqual(
+            [
+                [row["number"] for row in entry["related"][:2]]
+                for entry in data["contributions"][:2]
+            ],
+            [[101, 102], [101]],
+        )
+        self.assertEqual(set(data), {"checked", "contributions"})
+        for entry in data["contributions"][:2]:
+            self.assertEqual(set(entry), set(manifest_entry(10)) | {"fixes_issues", "related"})
+
+    def test_single_old_pull_uses_same_age_boundary(self) -> None:
+        """Selecting only an old pull still terminates at the bounded fill window."""
+        forge = FakeForge(self.answers)
+        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+            rc, out, err = run_cli(self.root, forge, "fill", "--pull", "10", keep_progress=True)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(len(forge.read), 6)
+        self.assertIn("expected requests 6 (one page per file listing), at most 63; cap 20041", out)
+        self.assertEqual(out.count("not read"), 1)
+        self.assertNotIn(f"{API}/pulls/20", forge.read)
+        rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"]
+        self.assertNotIn("related", rows[1])
+
+    def test_direct_fill_preserves_old_record_without_claiming_coverage(self) -> None:
+        """Direct fill uses the age bound and retains prior relations outside that window."""
+        previous = {
+            "number": 103,
+            "kind": "pull",
+            "author": "bob",
+            "reason": "same-files",
+            "state": "open",
+            "seen": "2026-06-02",
+        }
+        write_manifest(self.root, [manifest_entry(10, related=[previous]), manifest_entry(20)])
+        forge = FakeForge(self.answers)
+        with (
+            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+            unittest.mock.patch("time.sleep"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            lines = upstream_links.fill_manifest(self.root, forge, today=TODAY)
+        self.assertEqual(len(forge.read), 8)
+        self.assertEqual(sum("not read" in line for line in lines[:3]), 1)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(data["checked"], "2026-11-12")
+        self.assertEqual(data["contributions"][0]["related"][-1], previous)
+        self.assertFalse(any("/pulls/103/files?" in url for url in forge.read[:8]))
+
+    def test_own_opened_exactly_at_boundary_needs_no_notice(self) -> None:
+        """An own opening equal to the cutoff has no omitted eligible update interval."""
+        self.answers[f"{API}/pulls/10"] = forge_pull(10, "2026-10-29")
+        forge = FakeForge(self.answers)
+        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+            rc, out, err = run_cli(self.root, forge, "fill")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertNotIn("not read", out)
+        self.assertEqual(len(forge.read), 8)
+
+    def test_notice_and_undecided_do_not_truncate_fill_change_line(self) -> None:
+        """The bounded output includes the new notice alongside undecided and changed rows."""
+        write_manifest(self.root, [manifest_entry(10)])
+        self.answers[self.page + "1"] = [forge_pull(101) | {"files": ["other.c", "extra.c"]}]
+        forge = FakeForge(self.answers)
+        with (
+            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+            unittest.mock.patch.object(upstream_links, "MAX_CANDIDATES", 1),
+            unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 1),
+            unittest.mock.patch.object(upstream_links.upstream_drift, "MAX_SERIES_ENTRIES", 1),
+        ):
+            rc, out, err = run_cli(self.root, forge, "fill")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(len(out.splitlines()), 3)
+        self.assertIn("not read", out.splitlines()[0])
+        self.assertIn("same-files undecided: 1 files read", out.splitlines()[1])
+        self.assertEqual(out.splitlines()[2], "10: fixes_issues=[99] related=[]")
+        self.assertEqual(len(forge.read), 3)
+
+    def test_widened_fill_reads_older_candidates_and_reports_new_boundary(self) -> None:
+        """Widening the option admits additional old updates without implying full coverage."""
+        self.answers[self.page + "2"] = [forge_pull(103, updated="2026-10-20")]
+        forge = FakeForge(self.answers)
+        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+            rc, out, err = run_cli(
+                self.root, forge, "fill", "--max-age-days", "30", keep_progress=True
+            )
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(len(forge.read), 9)
+        self.assertIn(
+            "expected requests 9 (one page per file listing), at most 104; cap 20062", out
+        )
+        self.assertIn("10: candidates updated before 2026-10-13T00:00:00+00:00 not read", out)
+        rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"]
+        self.assertEqual([row["number"] for row in rows[0]["related"][:3]], [101, 102, 103])
+
+    def test_page_cap_inside_age_boundary_aborts_without_writing(self) -> None:
+        """A full last permitted recent page remains a hard failure with no partial writes."""
+        self.answers[self.page + "1"] = [forge_pull(101), forge_pull(102)]
+        self.answers[self.page + "2"] = [forge_pull(103), forge_pull(104)]
+        forge = FakeForge(self.answers)
+        with (
+            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+            unittest.mock.patch.object(upstream_links, "MAX_PULL_PAGES", 2),
+        ):
+            rc, out, err = run_cli(self.root, forge, "fill")
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn(f"{API}/pulls: exceeds 2 pages", err)
+        self.assertEqual(
+            forge.read,
+            [f"{API}/pulls/10", f"{API}/pulls/20", self.page + "1", self.page + "2"],
+        )
+        self.assertEqual(self.path.read_bytes(), self.before)
+
+    def test_age_option_rejects_out_of_range_before_requests(self) -> None:
+        """Reject invalid ages without fetching or writing, including an empty scope."""
+        for entries in ([manifest_entry(10)], []):
+            write_manifest(self.root, entries)
+            before = self.path.read_bytes()
+            for value in ("0", "-1", "366", "1.5", "unknown"):
+                forge = FakeForge({})
+                rc, out, err = run_cli(self.root, forge, "fill", "--max-age-days", value)
+                self.assertEqual((rc, out), (2, ""))
+                self.assertIn("--max-age-days", err)
+                self.assertEqual(forge.read, [])
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_age_range_endpoints_and_calendar_underflow(self) -> None:
+        """Admit both age endpoints but reject unrepresentable dates and non-integer calls."""
+        write_manifest(self.root, [])
+        for value in ("1", "365"):
+            self.assertEqual(
+                run_cli(self.root, FakeForge({}), "fill", "--max-age-days", value), (0, "", "")
+            )
+        forge = FakeForge({})
+        rc, out, err = run_cli(self.root, forge, "fill", today=date.min)
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("calendar range", err)
+        self.assertEqual(forge.read, [])
+        for value in (True, 1.5, "14", None):
+            with self.assertRaises(upstream_links.DriftError):
+                upstream_links.fill_window(value, TODAY)
+        self.assertEqual(forge.read, [])
+
+    def test_nightly_old_snapshot_keeps_its_window_and_does_not_write(self) -> None:
+        """Nightly scans can extend beyond the fill age and retain the seven-day margin."""
+        data = json.loads(self.before)
+        data["checked"] = "2026-07-01"
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        before = self.path.read_bytes()
+        self.answers[self.page + "1"] = [
+            forge_pull(101, "2026-06-01", "2026-06-24"),
+            forge_pull(102, "2026-06-01", "2026-06-23"),
+        ]
+        forge = FakeForge(self.answers)
+        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+            rc, out, err = run_cli(self.root, forge, "check", keep_progress=True)
+        self.assertEqual((rc, err), (1, ""))
+        self.assertEqual(
+            out.splitlines()[0],
+            "window 2026-06-24T00:00:00+00:00: candidates 1, file candidates 1; "
+            "expected requests 6 (one page per file listing), at most 63; cap 20062",
+        )
+        self.assertEqual(len(forge.read), 6)
+        self.assertIn("10 101 bob same-files open", out)
+        self.assertNotIn("not read", out)
+        self.assertNotIn("10 102", out)
+        self.assertEqual(self.path.read_bytes(), before)
+
+
 class ForgeFileCountTest(unittest.TestCase):
     """Separate forge file counts from inline names with literal offline answers."""
 
