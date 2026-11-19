@@ -105,11 +105,13 @@ class FileNames(list[str]):
         *,
         complete: bool = True,
         read_count: int | None = None,
+        file_count: int | None = None,
     ) -> None:
         """Keep file evidence and its read limit together across the run memo."""
         super().__init__(names)
         self.complete = complete
         self.read_count = len(names) if read_count is None else read_count
+        self.file_count = len(names) if file_count is None else file_count
 
 
 def fetch_forge(url: str) -> dict | list:
@@ -218,7 +220,7 @@ def normalize_item(
         "author": _extract_author(raw),
         "title": title,
         "state": state,
-        "files": _item_files(raw.get("files", raw.get("changed_files")), number, partial_files),
+        "files": _item_files(raw.get("files"), number, partial_files),
         "patch_ids": _string_tuple(
             raw.get("patch_ids", raw.get("stable_patch_ids")),
             f"pull {number} patch_ids",
@@ -349,23 +351,26 @@ def _file_names_from_row(row: object, url: str) -> list[str]:
 
 
 def _file_result(
-    files: list[str], complete: bool, partial: bool, pull_url: str, error: str
+    files: FileNames, complete: bool, partial: bool, pull_url: str, error: str
 ) -> FileNames:
     """Preserve partial external evidence while rejecting incomplete own listings."""
     if not complete and not partial:
         raise DriftError(f"{pull_url}/files: {error}")
-    return FileNames(sorted(set(files)), complete=complete, read_count=len(files))
+    return FileNames(
+        sorted(set(files)), complete=complete, read_count=len(files), file_count=files.file_count
+    )
 
 
 def read_pull_files(pull_url: str, fetch: Fetch, *, partial: bool = False) -> FileNames:
     """Read bounded file pages, retaining a partial prefix only for external candidates."""
-    files: list[str] = []
+    files = FileNames([])
     for page in range(1, MAX_FILE_PAGES + 1):
         url = f"{pull_url}/files?limit={PAGE_SIZE}&page={page}"
         batch = fetch(url)
         if not isinstance(batch, list) or len(batch) > PAGE_SIZE:
             raise DriftError(f"{url}: expected a JSON list of at most {PAGE_SIZE} file entries")
         names = [name for row in batch[:PAGE_SIZE] for name in _file_names_from_row(row, url)[:2]]
+        files.file_count += len(batch)
         remaining = MAX_FILE_ROWS - len(files)
         files.extend(names[:remaining])
         if len(names) > remaining:
@@ -393,10 +398,26 @@ def _require_forge_envelope(raw: object) -> dict:
     return raw
 
 
+def _forge_files(raw: dict, partial: bool) -> FileNames:
+    """Read forge names only from a list and validate the separate changed-file count."""
+    count = raw.get("changed_files")
+    if "changed_files" in raw and (type(count) is not int or count < 0):
+        raise DriftError(
+            f"invalid changed_files: found {type(count).__name__}; expected nonnegative integer"
+        )
+    names = raw.get("files")
+    if "files" in raw and not isinstance(names, list):
+        raise DriftError(f"invalid files: found {type(names).__name__}; expected list")
+    return _item_files(names, raw.get("number", "?"), partial)
+
+
 def _parse_forge_pull(raw: object, partial_files: bool) -> dict[str, object]:
     """Validate a forge envelope and its normalized metadata with the selected file policy."""
     checked = _require_forge_envelope(raw)
-    item = normalize_item(checked, partial_files=partial_files)
+    names = _forge_files(checked, partial_files)
+    item = normalize_item(checked | {"files": names}, partial_files=partial_files)
+    item["inline_files"] = "files" in checked
+    item["changed_files"] = checked.get("changed_files")
     if not item["created_at"]:
         raise DriftError(f"pull request {item['number']}: missing created_at")
     if item["state"] == "merged" and not item["merged_at"]:
@@ -421,8 +442,11 @@ def parse_forge_pull(
         return _parse_forge_pull(raw, partial_files)
     except DriftError as exc:
         where = source
-        if not where and isinstance(raw, dict):
-            where = f"pull {raw.get('number', '?')}"
+        if isinstance(raw, dict):
+            number = raw.get("number")
+            if type(number) is int and number > 0:
+                address = pull_api_url(number)
+                where = f"{where}: {address}" if where and where != address else address
         raise DriftError(f"{where or 'pull request'}: {exc}") from exc
 
 
@@ -464,6 +488,23 @@ def memoized_files(
     return _item_files(files[number], number, partial)
 
 
+def _resolved_files(
+    item: dict, fetch: Fetch, files: dict[int, FileNames], *, partial: bool = False
+) -> FileNames:
+    """Resolve names once and reconcile complete listings against forge row counts."""
+    number = int(item["number"])
+    if item["inline_files"]:
+        files.setdefault(number, item["files"])
+    names = memoized_files(number, fetch, files, partial=partial)
+    count = item["changed_files"]
+    if names.complete and count is not None and count != names.file_count:
+        raise DriftError(
+            f"{pull_api_url(number)}: changed_files count {count} disagrees with "
+            f"complete listing of {names.file_count} files"
+        )
+    return names
+
+
 def inspect_own_pull(
     number: int, url: str, fetch: Fetch, files: dict[int, FileNames]
 ) -> dict[str, object]:
@@ -472,7 +513,7 @@ def inspect_own_pull(
     own = parse_forge_pull(fetch(p_url), source=p_url)
     if own["number"] != number:
         raise DriftError(f"{p_url}: pull number {own['number']} disagrees with {number}")
-    own["files"] = memoized_files(number, fetch, files)
+    own["files"] = _resolved_files(own, fetch, files)
     return own
 
 
@@ -512,9 +553,7 @@ def inspect_candidates(
             continue
         if parse_timestamp(candidate["updated_at"], "updated_at") < opened:
             continue
-        if candidate["files"]:
-            files.setdefault(number, candidate["files"])
-        candidate["files"] = memoized_files(number, fetch, files, partial=True)
+        candidate["files"] = _resolved_files(candidate, fetch, files, partial=True)
         eligible.append(candidate)
     return eligible
 

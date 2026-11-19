@@ -21,6 +21,49 @@ FORGE = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/"
 API = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg"
 TODAY = date(2026, 11, 12)
 
+# Handwritten top-level key/type match for the supplied pull.json; neutral values.
+COUNT_PULL = {
+    "additions": 1,
+    "allow_maintainer_edit": False,
+    "assignee": None,
+    "assignees": None,
+    "base": {"ref": "master"},
+    "body": "Fixes #99",
+    "changed_files": 15,
+    "closed_at": None,
+    "comments": 0,
+    "created_at": "2026-11-01T00:00:00Z",
+    "deletions": 0,
+    "diff_url": "https://example.invalid/change.diff",
+    "draft": False,
+    "due_date": None,
+    "flow": 0,
+    "head": {"sha": "a" * 40},
+    "html_url": f"{FORGE}25879",
+    "id": 1,
+    "is_locked": False,
+    "labels": [],
+    "merge_base": "b" * 40,
+    "merge_commit_sha": None,
+    "mergeable": True,
+    "merged": False,
+    "merged_at": None,
+    "merged_by": None,
+    "milestone": None,
+    "number": 25879,
+    "patch_url": "https://example.invalid/change.patch",
+    "pin_order": 0,
+    "requested_reviewers": [],
+    "requested_reviewers_teams": [],
+    "review_comments": 0,
+    "state": "open",
+    "title": "component: neutral change",
+    "updated_at": "2026-11-11T00:00:00Z",
+    "url": f"{API}/pulls/25879",
+    "user": {"login": "owner"},
+}
+
+
 PLANTED_OWN_25805_JSON = """{
   "number": 25805,
   "user": {"login": "lusoris"},
@@ -718,6 +761,187 @@ class RequestCostTest(unittest.TestCase):
             forge = FakeForge({})
             self.assertEqual(run_cli(self.root, forge, command), (0, "", ""))
             self.assertEqual(forge.read, [])
+
+
+class ForgeFileCountTest(unittest.TestCase):
+    """Separate forge file counts from inline names with literal offline answers."""
+
+    def setUp(self) -> None:
+        """Create one own pull with the measured top-level payload shape."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.path = write_manifest(self.root, [manifest_entry(25879)])
+        self.page = f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1"
+        self.rows = [
+            {
+                "additions": 1,
+                "changes": 1,
+                "contents_url": "https://example.invalid/file",
+                "deletions": 0,
+                "filename": f"file-{n}.c",
+                "html_url": "https://example.invalid/file",
+                "raw_url": "https://example.invalid/raw",
+                "status": "changed",
+            }
+            for n in range(15)
+        ]
+        self.answers = {
+            f"{API}/pulls/25879": dict(COUNT_PULL),
+            f"{API}/pulls/25879/files?limit=50&page=1": self.rows,
+            self.page: [],
+        }
+
+    def test_count_payload_fill_dry_run_and_check(self) -> None:
+        """Accept the measured integer count through both complete CLI paths."""
+        before = self.path.read_bytes()
+        for args in (("fill", "--dry-run"), ("check",)):
+            forge = FakeForge(self.answers)
+            rc, out, err = run_cli(self.root, forge, *args)
+            self.assertEqual((rc, err), (0, ""))
+            self.assertEqual(forge.read.count(f"{API}/pulls/25879/files?limit=50&page=1"), 1)
+            self.assertEqual(self.path.read_bytes(), before)
+            if args[0] == "fill":
+                self.assertIn("25879: fixes_issues=[99]", out)
+            else:
+                self.assertEqual(out, "")
+
+    def candidate_answers(self, **changes: object) -> dict:
+        """Move the measured count payload to a list row beside a minimal own pull."""
+        write_manifest(self.root, [manifest_entry(10)])
+        return {
+            f"{API}/pulls/10": forge_pull(10),
+            f"{API}/pulls/10/files?limit=50&page=1": [{"filename": "file-0.c"}],
+            self.page: [COUNT_PULL | changes],
+            f"{API}/pulls/25879/files?limit=50&page=1": self.rows,
+        }
+
+    def test_candidate_integer_count_reads_endpoint_and_reports_overlap(self) -> None:
+        """Read integer-count candidate names from the endpoint and preserve overlap."""
+        forge = FakeForge(self.candidate_answers())
+        rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertEqual(out.strip(), "10 25879 owner same-files open")
+        self.assertEqual(forge.read.count(f"{API}/pulls/25879/files?limit=50&page=1"), 1)
+
+    def test_complete_count_disagreement_is_identified_error(self) -> None:
+        """Reject count mismatches for own and candidate complete endpoint listings."""
+        for candidate in (False, True):
+            answers = self.candidate_answers(changed_files=16) if candidate else self.answers
+            if not candidate:
+                answers[f"{API}/pulls/25879"]["changed_files"] = 16
+            before = self.path.read_bytes()
+            for args in (("fill", "--dry-run"), ("fill",), ("check",)):
+                rc, out, err = run_cli(self.root, FakeForge(answers), *args)
+                self.assertEqual((rc, out), (2, ""))
+                self.assertIn(f"{API}/pulls/25879", err)
+                self.assertIn("changed_files", err)
+                self.assertIn("16", err)
+                self.assertIn("15", err)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_wrong_count_types_are_not_hidden_by_inline_names(self) -> None:
+        """Reject malformed counts even when a valid inline files list is present."""
+        for candidate in (False, True):
+            for value in ("15", True, -1, {}, [], None, 1.5):
+                with self.subTest(candidate=candidate, value=value):
+                    raw = COUNT_PULL | {"changed_files": value, "files": ["file-0.c"]}
+                    answers = self.candidate_answers() if candidate else dict(self.answers)
+                    if candidate:
+                        answers[self.page] = [raw]
+                    else:
+                        answers[f"{API}/pulls/25879"] = raw
+                    rc, out, err = run_cli(self.root, FakeForge(answers), "check")
+                    self.assertEqual((rc, out), (2, ""))
+                    self.assertIn(f"{API}/pulls/25879", err)
+                    self.assertIn("changed_files", err)
+                    self.assertIn(type(value).__name__, err)
+                    self.assertNotIn("at most", err)
+
+    def test_wrong_files_types_name_key_type_and_pull(self) -> None:
+        """Reject malformed inline files with type diagnostics instead of size errors."""
+        for candidate in (False, True):
+            for value in ("file.c", True, -1, {}, None, (), set(), 15):
+                with self.subTest(candidate=candidate, value=value):
+                    raw = COUNT_PULL | {"files": value}
+                    answers = self.candidate_answers() if candidate else dict(self.answers)
+                    if candidate:
+                        answers[self.page] = [raw]
+                    else:
+                        answers[f"{API}/pulls/25879"] = raw
+                    rc, out, err = run_cli(self.root, FakeForge(answers), "check")
+                    self.assertEqual((rc, out), (2, ""))
+                    self.assertIn(f"{API}/pulls/25879", err)
+                    self.assertIn("files", err)
+                    self.assertIn(type(value).__name__, err)
+                    self.assertNotIn("at most", err)
+
+    def test_inline_names_include_empty_without_endpoint_reads(self) -> None:
+        """Use present inline lists including empty lists without an endpoint fallback."""
+        for names in ([], ["file-0.c"]):
+            answers = dict(self.answers)
+            answers[f"{API}/pulls/25879"] = COUNT_PULL | {
+                "files": names,
+                "changed_files": len(names),
+            }
+            del answers[f"{API}/pulls/25879/files?limit=50&page=1"]
+            forge = FakeForge(answers)
+            self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
+            self.assertFalse(any("/files?" in url for url in forge.read[:4]))
+
+    def test_inline_complete_count_disagreement_fails(self) -> None:
+        """Reconcile complete inline names instead of ignoring a contradictory count."""
+        self.answers[f"{API}/pulls/25879"] = COUNT_PULL | {"files": ["file-0.c"]}
+        rc, out, err = run_cli(self.root, FakeForge(self.answers), "check")
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn(f"{API}/pulls/25879", err)
+        self.assertIn("changed_files", err)
+        self.assertIn("15", err)
+        self.assertIn("1", err)
+
+    def test_rename_aliases_do_not_inflate_changed_file_count(self) -> None:
+        """Compare changed rows while keeping both rename names for overlap matches."""
+        answers = self.candidate_answers(changed_files=1)
+        answers[f"{API}/pulls/25879/files?limit=50&page=1"] = [
+            {"filename": "new.c", "status": "renamed", "previous_filename": "file-0.c"}
+        ]
+        rc, out, err = run_cli(self.root, FakeForge(answers), "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("10 25879 owner same-files open", out)
+
+    def test_incomplete_candidate_does_not_reconcile_count(self) -> None:
+        """Preserve bounded candidate evidence when its count exceeds the read prefix."""
+        for inline in (False, True):
+            answers = self.candidate_answers(changed_files=15)
+            if inline:
+                answers[self.page][0]["files"] = ["other.c"] * 3
+            else:
+                answers[f"{API}/pulls/25879/files?limit=50&page=1"] = self.rows[:2]
+            for number in (10, 25879):
+                answers[f"{API}/pulls/{number}/files?limit=2&page=1"] = answers.pop(
+                    f"{API}/pulls/{number}/files?limit=50&page=1"
+                )
+            answers[self.page.replace("limit=50", "limit=2")] = answers.pop(self.page)
+            with (
+                unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+                unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 2),
+                unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
+            ):
+                rc, out, err = run_cli(self.root, FakeForge(answers), "check")
+            self.assertEqual((rc, err), (1, ""))
+            self.assertIn("undecided" if inline else "same-files open", out)
+
+    def test_zero_count_complete_empty_endpoint_succeeds(self) -> None:
+        """Accept zero changed files when the complete endpoint is empty."""
+        self.answers[f"{API}/pulls/25879"]["changed_files"] = 0
+        self.answers[f"{API}/pulls/25879/files?limit=50&page=1"] = []
+        self.assertEqual(run_cli(self.root, FakeForge(self.answers), "check"), (0, "", ""))
+
+    def test_internal_names_remain_separate_from_forge_counts(self) -> None:
+        """Keep internal files fixtures usable without interpreting changed_files as names."""
+        raw = {"number": 10, "author": "owner", "title": "component: change"}
+        self.assertEqual(upstream_links.normalize_item(raw | {"files": ["a.c"]})["files"], ["a.c"])
+        self.assertEqual(upstream_links.normalize_item(raw | {"changed_files": 15})["files"], [])
 
 
 class OversizedCandidateTest(unittest.TestCase):
