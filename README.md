@@ -140,15 +140,19 @@ Metadata keys:
 
 The series carries one form of each patch: the one for the pinned release.
 The `upstream` link records the submission, which may target master or a
-release branch. For a `submitted` patch, optional
-`master_form = { base = "<40-hex>", head = "<40-hex>" }` records the PR API's
-current `merge_base` as `base` and `head.sha` as `head`.
+release branch. For a `submitted` patch, record optional
+`master_form = { base = "<40-hex>", head = "<40-hex>" }` only if the PR's
+base branch is master, using the PR API's current `merge_base` as `base` and
+`head.sha` as `head`.
 Update these ids whenever the PR is pushed again. For a `merged` patch,
 optional `upstream_commit = "<40-hex>"` must name the commit carrying the fix
 on FFmpeg master. All ids must be full lowercase commit hashes.
 A patch whose release form has no single master form (for example, one split
 into several upstream pull requests) records
 `release_only = "<reason>"`; it excludes `master_form` and `upstream_commit`.
+For a PR against a release branch, record `release_only` with a reason.
+Once the PR is merged and the fix is on master, replace `release_only` with
+`upstream_commit` naming that master commit.
 The daily upstream drift check fails when a recorded `master_form` no longer
 matches the PR's head or merge base on the forge. An `unsubmitted` patch whose
 fix travels in another author's PR records it as
