@@ -206,11 +206,18 @@ class RevertProofTest(unittest.TestCase):
         """Both Git wrappers retain the real fatal diagnostic for an invalid revision."""
         with self.assertRaises(RuntimeError) as consumer:
             upstream_lint._git(self.tree, "rev-parse", "--verify", "missing-fixture-ref")
-        self.assertIn("rc=128", str(consumer.exception))
-        self.assertIn("fatal: Needed a single revision", str(consumer.exception))
+        status_line, separator, diagnostic = str(consumer.exception).partition("\n")
+        self.assertEqual(status_line, "git rev-parse --verify missing-fixture-ref: rc=128")
+        self.assertEqual(separator, "\n")
+        diagnostic_line = diagnostic.strip()
+        self.assertTrue(diagnostic_line)
+        self.assertNotEqual(diagnostic_line, "rc=128")
         with self.assertRaises(revert_proof._PreflightError) as producer:
             revert_proof.git_out(self.tree, "rev-parse", "--verify", "missing-fixture-ref")
-        self.assertIn("fatal: Needed a single revision", str(producer.exception))
+        self.assertEqual(
+            str(producer.exception),
+            f"git rev-parse --verify missing-fixture-ref: {diagnostic_line}",
+        )
 
     def test_git_timeout_retains_stderr_through_bounded_reap(self) -> None:
         """Git timeout diagnostics survive both a completed reap and an exhausted drain."""
