@@ -1317,9 +1317,13 @@ class RunCommandTest(ForgejoTest):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "post a note about a landed head with comment --no-test-claims; "
+            "a note about a landed head goes through comment --no-test-claims; "
             "there is no separate note option",
             result.stdout,
+        )
+        self.assertLess(
+            result.stdout.index("needs no token"),
+            result.stdout.index("a note about a landed head goes through comment --no-test-claims"),
         )
 
 
