@@ -1391,8 +1391,10 @@ static int unbraced_inner_loop_break(void)
         """Report a macro assertion before the ternary because macros are not earlier ifs."""
         source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
             "static int null_checked(void)",
-            "#define av_assert0(condition) do { if (!(condition)) return -1; } while (0)\n"
-            "static int null_checked(void)",
+            (
+                "#define av_assert0(condition) do { if (!(condition)) return -1; } while (0)\n"
+                "static int null_checked(void)"
+            ),
         ).replace("    if (buffer == NULL)\n        return -1;", "    av_assert0(buffer);", 1)
         self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
 
@@ -1663,9 +1665,12 @@ static int earlier_derived_check(uint8_t *dst)
         """Suppress a checked-earlier ternary with an adjacent rule ID and reason."""
         source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
             "    uint8_t *dst = buffer ?",
-            "    // semgrep-reason (expires 2026-12-19): preserve the optional-buffer interface\n"
-            "    // nosemgrep: ffmpeg-null-ternary-after-allocation\n"
-            "    uint8_t *dst = buffer ?",
+            (
+                "    // semgrep-reason (expires 2026-12-19): "
+                "preserve the optional-buffer interface\n"
+                "    // nosemgrep: ffmpeg-null-ternary-after-allocation\n"
+                "    uint8_t *dst = buffer ?"
+            ),
         )
         self.assertEqual(_ternary_finding_lines(source), [])
         control = source.replace("    // nosemgrep: ffmpeg-null-ternary-after-allocation\n", "")

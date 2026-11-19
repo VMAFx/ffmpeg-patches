@@ -3831,8 +3831,10 @@ class CRulesTest(unittest.TestCase):
                 step = self.run_c_rules()
                 self.assertEqual(step.rc, 1, step.output)
                 self.assertIn(
-                    "unread: libavformat/rtspenc.c: rules could not read this file; "
-                    "touched lines need a check by hand",
+                    (
+                        "unread: libavformat/rtspenc.c: rules could not read this file; "
+                        "touched lines need a check by hand"
+                    ),
                     step.output,
                 )
                 self.assertNotIn("0 finding(s)", step.output)
@@ -3936,6 +3938,34 @@ class CRulesTest(unittest.TestCase):
                     step = self.run_c_rules(reasons[reason])
                     self.assertEqual(step.rc, 2, step.output)
                     self.assertNotIn("waived:", step.output)
+
+    def test_unread_error_code_exact_integer_boundary(self) -> None:
+        """Accept only built-in integer code three, preserving the missing-key default."""
+
+        class IntegerSubclass(int):
+            """Represent an ordinary integer subclass at the metadata boundary."""
+
+        path = "libavformat/rtspenc.c"
+        requested = frozenset({path})
+        cases = (
+            ("int three", 3, path),
+            ("true", True, None),
+            ("false", False, None),
+            ("float", 3.0, None),
+            ("string", "3", None),
+            ("none", None, None),
+            ("other int", 4, None),
+            ("subclass three", IntegerSubclass(3), None),
+            ("subclass other", IntegerSubclass(4), None),
+        )
+        for index in range(len(cases)):
+            label, code, expected = cases[index]
+            with self.subTest(case=label):
+                error = self.syntax_error_payload(code=code)["errors"][0]
+                self.assertEqual(upstream_lint._syntax_error_path(error, requested), expected)
+        error = self.syntax_error_payload()["errors"][0]
+        del error["code"]
+        self.assertEqual(upstream_lint._syntax_error_path(error, requested), path)
 
     def test_multiple_unread_files_each_reported_once(self) -> None:
         """Every unread requested file gets one review line despite duplicate errors."""

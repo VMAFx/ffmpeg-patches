@@ -2083,14 +2083,14 @@ def _syntax_error_path(error: object, requested: frozenset[str] | None) -> str |
         return None
     path = error.get("path")
     code = error.get("code", 3)
+    code_type = type(code)
     if (
         error.get("type") != "Syntax error"
         or not isinstance(path, str)
         or not path
         or requested is None
         or path not in requested
-        or not isinstance(code, int)
-        or isinstance(code, bool)
+        or code_type is not int
         or code != 3
         or error.get("level", "warn") != "warn"
         or not isinstance(error.get("message", ""), str)
