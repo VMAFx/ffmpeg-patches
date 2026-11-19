@@ -49,6 +49,14 @@ POOL_WRAPPER_CODE = (
 class UnitTestBudgetTest(unittest.TestCase):
     """Keep overruns visible and preserve failures, cleanup and test identifiers."""
 
+    def setUp(self) -> None:
+        """Give existing unit-only fixtures a valid job start without host dependencies."""
+        patcher = unittest.mock.patch.dict(
+            os.environ, {"SERIES_JOB_STARTED_AT": str(unit_test_budget.time.time())}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_timed(self, elapsed: float, rc: int = 0, *, timed_out: bool = False) -> tuple[int, str]:
         """Simulate elapsed wall time while capturing the actual budget diagnostic."""
         output = io.StringIO()
@@ -285,11 +293,12 @@ class UnitTestBudgetTest(unittest.TestCase):
     def test_make_target_uses_budget_and_fine_tasks(self) -> None:
         """The actual target retains Git isolation and selects guarded class scheduling."""
         makefile = (unit_test_budget.ROOT / "Makefile").read_text(encoding="utf-8")
-        recipe = makefile.split("test: dev-deps build lint\n", 1)[1].split("\n\n", 1)[0]
+        recipe = makefile.split("test-budgeted: dev-deps build lint\n", 1)[1].split("\n\n", 1)[0]
         self.assertIn("GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1", recipe)
         self.assertIn("scripts/unit_test_budget.py --", recipe)
         self.assertIn("-m unittest_parallel -j $(UNIT_JOBS) --level class -s tests", recipe)
         self.assertNotIn("--level module", recipe)
+        self.assertIn("--runner scripts.unit_test_budget.TimedSuiteRunner", recipe)
 
     def run_pool_fixture(
         self,
@@ -328,10 +337,16 @@ class UnitTestBudgetTest(unittest.TestCase):
                     "class",
                     "-s",
                     str(fixture_dir),
+                    "--runner",
+                    "scripts.unit_test_budget.TimedSuiteRunner",
                 ],
                 capture_output=True,
                 text=True,
-                env={**os.environ, "TMPDIR": str(guard_dir)},
+                env={
+                    **os.environ,
+                    "TMPDIR": str(guard_dir),
+                    "SERIES_JOB_STARTED_AT": str(unit_test_budget.time.time()),
+                },
                 timeout=timeout,
                 check=False,
             )
@@ -478,3 +493,136 @@ class UnitTestBudgetTest(unittest.TestCase):
         tree = ast.parse(source)
         names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
         self.assertEqual(names & forbidden, set(), "shared fixtures require coarser tasks")
+
+
+class JobElapsedBudgetTest(unittest.TestCase):
+    """Account for setup and prerequisites without changing unit statuses."""
+
+    def run_job(self, start: str | None, status: int = 0) -> tuple[int, str]:
+        """Measure one synthetic second of units after an arbitrary job setup delay."""
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.dict(os.environ),
+            unittest.mock.patch.object(unit_test_budget.time, "time", return_value=1000),
+            unittest.mock.patch.object(unit_test_budget.time, "perf_counter", side_effect=[0, 1]),
+            unittest.mock.patch.object(
+                unit_test_budget.tmp_leak_guard, "run_guard", return_value=status
+            ) as guard,
+            contextlib.redirect_stderr(output),
+        ):
+            if start is None:
+                os.environ.pop("SERIES_JOB_STARTED_AT", None)
+            else:
+                os.environ["SERIES_JOB_STARTED_AT"] = start
+            rc = unit_test_budget.run_unit_tests("runner", [], 600)
+            valid = start in {"600", "639", "640"}
+            if not valid:
+                guard.assert_not_called()
+        return rc, output.getvalue()
+
+    def test_planted_setup_overrun_fails_fast_units(self) -> None:
+        """Setup time alone can exhaust the budget despite a passing unit command."""
+        rc, output = self.run_job("600")
+        self.assertEqual(rc, 1)
+        self.assertIn("wall time 1.000 s; budget 360 s", output)
+        self.assertIn("job elapsed 400.000 s; budget 360 s (60%", output)
+        self.assertIn("FAIL job elapsed budget exceeded", output)
+        self.assertNotIn("FAIL wall-time budget exceeded", output)
+
+    def test_job_elapsed_exact_budget_passes(self) -> None:
+        """The job elapsed check includes its exact budget boundary."""
+        rc, output = self.run_job("640")
+        self.assertEqual(rc, 0)
+        self.assertIn("job elapsed 360.000 s; budget 360 s", output)
+
+    def test_job_elapsed_one_second_above_budget_fails(self) -> None:
+        """One second beyond the job budget fails even with fast passing units."""
+        self.assertEqual(self.run_job("639")[0], 1)
+
+    def test_missing_job_start_fails_by_name(self) -> None:
+        """A missing start variable cannot silently reduce coverage to unit time."""
+        rc, output = self.run_job(None)
+        self.assertEqual(rc, 1)
+        self.assertIn("SERIES_JOB_STARTED_AT", output)
+
+    def test_malformed_job_start_fails_by_name(self) -> None:
+        """Empty, nonfinite, nonpositive and future starts fail explicitly."""
+        values = ("", "oops", "nan", "inf", "-inf", "0", "-1", "1001")
+        for index in range(len(values)):
+            with self.subTest(start=values[index]):
+                rc, output = self.run_job(values[index])
+                self.assertEqual(rc, 1)
+                self.assertIn("SERIES_JOB_STARTED_AT", output)
+
+    def test_job_overrun_preserves_nonzero_unit_status(self) -> None:
+        """An elapsed job overrun preserves the guarded command's failure status."""
+        self.assertEqual(self.run_job("600", 7)[0], 7)
+
+    def test_first_ci_step_records_job_start(self) -> None:
+        """The first check step records time before checkout and dependency setup."""
+        workflow = yaml.safe_load(unit_test_budget.WORKFLOW.read_text(encoding="utf-8"))
+        first = workflow["jobs"]["check"]["steps"][0]
+        self.assertIn("SERIES_JOB_STARTED_AT=", first.get("run", ""))
+        self.assertIn('"$GITHUB_ENV"', first["run"])
+
+    def test_make_starts_clock_before_prerequisites(self) -> None:
+        """The outer target starts the clock before entering prerequisite work."""
+        makefile = (unit_test_budget.ROOT / "Makefile").read_text(encoding="utf-8")
+        recipe = makefile.split("\ntest:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('SERIES_JOB_STARTED_AT="$${SERIES_JOB_STARTED_AT-$$(date +%s)}"', recipe)
+        self.assertIn("$(MAKE) test-budgeted", recipe)
+        self.assertIn("test-budgeted: dev-deps build lint", makefile)
+
+
+class SuiteTimingReportTest(unittest.TestCase):
+    """Expose task costs and their contribution to summed parallel suite time."""
+
+    def report(self, records: list[tuple[str, float]]) -> str:
+        """Capture deterministic suite durations without a real test process."""
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            unit_test_budget.print_suite_timings(records)
+        return output.getvalue()
+
+    def test_slowest_ten_include_duration_share_sum_and_count(self) -> None:
+        """Twelve tasks report the ten slowest and shares of all twelve durations."""
+        records = [(f"suite-{index:02d}", float(index)) for index in range(1, 13)]
+        output = self.report(records)
+        self.assertIn("12 suites; summed time 78.000 s", output)
+        lines = output.splitlines()
+        rows = [lines[index] for index in range(len(lines)) if "suite-" in lines[index]]
+        self.assertEqual(len(rows), 10)
+        self.assertIn("12.000 s (15.4%) suite-12", rows[0])
+        self.assertIn("3.000 s (3.8%) suite-03", rows[-1])
+        self.assertNotIn("suite-02", output)
+
+    def test_fewer_than_ten_suites_prints_all(self) -> None:
+        """A short run prints every suite with its share of the summed time."""
+        output = self.report([("fast", 1.0), ("slow", 3.0)])
+        self.assertIn("2 suites; summed time 4.000 s", output)
+        self.assertIn("3.000 s (75.0%) slow", output)
+        self.assertIn("1.000 s (25.0%) fast", output)
+
+    def test_zero_time_and_empty_suites_have_defined_output(self) -> None:
+        """Empty or sub-clock-resolution tasks cannot divide by zero."""
+        self.assertIn("0 suites; summed time 0.000 s", self.report([]))
+        self.assertIn("0.000 s (0.0%) zero", self.report([("zero", 0.0)]))
+
+    def test_real_pool_reports_each_scheduled_singleton(self) -> None:
+        """A bounded synthetic process pool reports both singleton tasks by test ID."""
+        fixture = UnitTestBudgetTest()
+        result = fixture.run_pool_fixture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 suites; summed time", result.stderr)
+        self.assertIn("test_synthetic.IndependentCase.test_one", result.stderr)
+        self.assertIn("test_synthetic.IndependentCase.test_two", result.stderr)
+
+    def test_real_pool_reports_one_task_per_ordinary_class(self) -> None:
+        """Two methods without adaptation produce one class timing rather than method timings."""
+        source = SINGLETON_POOL_SOURCE.split("def load_tests(", 1)[0]
+        result = UnitTestBudgetTest().run_pool_fixture(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Running 1 test suites (2 total tests) across 1 workers", result.stderr)
+        self.assertIn("1 suites; summed time", result.stderr)
+        self.assertIn("test_synthetic.IndependentCase", result.stderr)
+        self.assertNotIn("IndependentCase.test_", result.stderr)

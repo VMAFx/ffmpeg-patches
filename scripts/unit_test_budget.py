@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Bound unit-test wall time while retaining temporary-file leak detection."""
+"""Report suite timings and bound job elapsed and unit wall time under the leak guard."""
 
 from __future__ import annotations
 
 import argparse
+import io
+import json
+import math
+import os
 import sys
+import tempfile
 import time
 import unittest
 from collections.abc import Sequence
@@ -22,6 +27,9 @@ from scripts import tmp_leak_guard  # noqa: E402
 
 WORKFLOW = ROOT / ".github" / "workflows" / "series.yml"
 UNIT_BUDGET_SHARE = 0.60
+JOB_START_VARIABLE = "SERIES_JOB_STARTED_AT"
+TIMING_DIRECTORY_VARIABLE = "UNIT_SUITE_TIMINGS"
+SLOWEST_SUITE_COUNT = 10
 
 
 def individual_test_suites(tests: unittest.TestSuite) -> unittest.TestSuite:
@@ -49,20 +57,108 @@ def job_timeout_seconds(workflow: Path = WORKFLOW) -> int:
     return minutes * 60
 
 
-def run_unit_tests(cmd: str, args: Sequence[str], job_timeout: int) -> int:
-    """Run the entire suite under the leak guard and fail above its wall-time budget."""
-    budget = job_timeout * UNIT_BUDGET_SHARE
-    outcome = tmp_leak_guard.GuardOutcome()
-    started = time.perf_counter()
-    rc = tmp_leak_guard.run_guard(cmd, args, budget, outcome=outcome)
-    elapsed = time.perf_counter() - started
-    exceeded = elapsed > budget or outcome.timed_out
+class TimedSuiteRunner(unittest.TextTestRunner):
+    """Record one duration per scheduled task using unittest_parallel's runner hook."""
+
+    def __init__(self, **kwargs: object) -> None:
+        """Keep the parallel result's progress while suppressing per-task summaries."""
+        kwargs["stream"] = io.StringIO()
+        super().__init__(**kwargs)
+
+    def run(self, test: unittest.TestSuite) -> unittest.TestResult:
+        """Time the complete task including its class and module fixtures."""
+        first = next(iter(test), None)
+        name = first.id() if first is not None else "empty suite"
+        if test.countTestCases() > 1 and first is not None:
+            name = name.rsplit(".", 1)[0]
+        started = time.perf_counter()
+        try:
+            return super().run(test)
+        finally:
+            elapsed = time.perf_counter() - started
+            directory = os.environ[TIMING_DIRECTORY_VARIABLE]
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".tmp", dir=directory, delete=False
+            ) as record:
+                json.dump([name, elapsed], record)
+            path = Path(record.name)
+            path.replace(path.with_suffix(".json"))
+
+
+def print_suite_timings(records: Sequence[tuple[str, float]]) -> None:
+    """Print the slowest tasks and their shares of all recorded suite time."""
+    total = sum(records[index][1] for index in range(len(records)))
+    print(f"unit suites: {len(records)} suites; summed time {total:.3f} s", file=sys.stderr)
+    slowest = sorted(records, key=lambda row: (-row[1], row[0]))[:SLOWEST_SUITE_COUNT]
+    for index in range(len(slowest)):
+        name, duration = slowest[index]
+        share = duration / total if total else 0.0
+        print(f"  {duration:.3f} s ({share:.1%}) {name}", file=sys.stderr)
+
+
+def run_with_timings(
+    cmd: str, args: Sequence[str], budget: float, outcome: tmp_leak_guard.GuardOutcome
+) -> int:
+    """Keep worker timing records outside the guarded temporary directory and clean both."""
+    previous = os.environ.get(TIMING_DIRECTORY_VARIABLE)
+    with tempfile.TemporaryDirectory(prefix="unit-suite-timings-") as directory:
+        os.environ[TIMING_DIRECTORY_VARIABLE] = directory
+        try:
+            rc = tmp_leak_guard.run_guard(cmd, args, budget, outcome=outcome)
+            paths = sorted(Path(directory).glob("*.json"))
+            records = [
+                json.loads(paths[index].read_text(encoding="utf-8")) for index in range(len(paths))
+            ]
+            print_suite_timings(records)
+            print(f"unit tests: exit status {rc}", file=sys.stderr, flush=True)
+            return rc
+        finally:
+            if previous is None:
+                os.environ.pop(TIMING_DIRECTORY_VARIABLE, None)
+            else:
+                os.environ[TIMING_DIRECTORY_VARIABLE] = previous
+
+
+def job_started_at(now: float) -> float:
+    """Require a finite positive job epoch timestamp that is no later than now."""
+    try:
+        started = float(os.environ[JOB_START_VARIABLE])
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"{JOB_START_VARIABLE} must contain a job start epoch timestamp") from exc
+    if not math.isfinite(started) or started <= 0 or started > now:
+        raise ValueError(
+            f"{JOB_START_VARIABLE} must be a finite positive timestamp at or before now"
+        )
+    return started
+
+
+def report_budget(label: str, elapsed: float, budget: float, job_timeout: int) -> None:
+    """Print either measured clock against the one shared budget and workflow limit."""
     print(
-        f"unit tests: wall time {elapsed:.3f} s; budget {budget:g} s "
+        f"unit tests: {label} {elapsed:.3f} s; budget {budget:g} s "
         f"({UNIT_BUDGET_SHARE:.0%} of series.yml check job's {job_timeout:g} s limit)",
         file=sys.stderr,
         flush=True,
     )
+
+
+def run_unit_tests(cmd: str, args: Sequence[str], job_timeout: int) -> int:
+    """Preserve unit deadlines and statuses while also failing elapsed job overruns."""
+    try:
+        job_start = job_started_at(time.time())
+    except ValueError as exc:
+        print(f"unit tests: {exc}", file=sys.stderr, flush=True)
+        return 1
+    budget = job_timeout * UNIT_BUDGET_SHARE
+    outcome = tmp_leak_guard.GuardOutcome()
+    started = time.perf_counter()
+    rc = run_with_timings(cmd, args, budget, outcome)
+    elapsed = time.perf_counter() - started
+    job_elapsed = time.time() - job_start
+    exceeded = elapsed > budget or outcome.timed_out
+    job_exceeded = job_elapsed > budget
+    report_budget("wall time", elapsed, budget, job_timeout)
+    report_budget("job elapsed", job_elapsed, budget, job_timeout)
     if exceeded:
         print(
             "unit tests: FAIL wall-time budget exceeded; investigate task balance "
@@ -70,7 +166,13 @@ def run_unit_tests(cmd: str, args: Sequence[str], job_timeout: int) -> int:
             file=sys.stderr,
             flush=True,
         )
-    return rc or int(exceeded)
+    if job_exceeded:
+        print(
+            "unit tests: FAIL job elapsed budget exceeded; include setup and prerequisites",
+            file=sys.stderr,
+            flush=True,
+        )
+    return rc or int(exceeded or job_exceeded)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
