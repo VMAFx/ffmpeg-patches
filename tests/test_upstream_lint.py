@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess  # nosec B404 - fixed commands in disposable Git repositories.
 import sys
@@ -2010,6 +2011,7 @@ class FixtureTest(unittest.TestCase):
         self.write("tools/check_commit_msg.sh", FAKE_MESSAGE)
         self.write("tools/patcheck", FAKE_PATCHECK)
         self.write("libavfilter/vf_x.c", SOURCE)
+        self.write("libavutil/attributes.h", "#define av_fixture_tag\n")
         self.write("libavfilter/allfilters.c", FILTER_DECLARATIONS)
         self.commit("avfilter/vf_x: initial fixture")
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -3515,6 +3517,141 @@ class PreCommitResolutionTest(unittest.TestCase):
         upstream_lint._validate_executable([executable, "run"])
 
 
+@unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed")
+class CRulesScratchTest(FixtureTest):
+    """Exercise scratch preparation and real scanner results on synthetic sources."""
+
+    def scan_source(self, source: str) -> upstream_lint.Step:
+        """Commit one synthetic source and run only the real c-rules step."""
+        self.write("libavfilter/vf_x.c", source)
+        self.commit()
+        return upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+
+    def test_attribute_parser_failure_is_blanked(self) -> None:
+        """A discovered attribute cannot make an otherwise clean step exit two."""
+        source = (
+            "av_fixture_tag SampleContext *make_sample(void) { return NULL; }\n"
+            "void trigger(void) { av_malloc(8); }\n"
+        )
+        step = self.scan_source(source)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 finding(s)", step.output)
+        self.assertEqual((self.root / "libavfilter/vf_x.c").read_text(encoding="utf-8"), source)
+
+    def test_missing_attributes_header_is_reported(self) -> None:
+        """An absent attributes header is named even when the scan has no findings."""
+        (self.root / "libavutil/attributes.h").unlink()
+        step = self.scan_source("void trigger(void) { av_malloc(8); }\n")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("missing libavutil/attributes.h", step.output)
+
+    def test_finding_after_attribute_keeps_original_coordinates(self) -> None:
+        """Blanking preserves the byte offset, line and column of a later ternary."""
+        line = "    av_fixture_tag unsigned char *dst = buffer ? buffer + 4 : NULL;"
+        source = (
+            "void fixture(void) {\n    unsigned char *buffer = av_malloc(8);\n"
+            + line
+            + "\n    if (!buffer) { fail(); }\n}\n"
+        )
+        self.write("libavfilter/vf_x.c", source)
+        self.commit()
+        captured = []
+
+        def capture(argv, cwd, data=None, timeout=60):
+            """Retain scanner JSON before the scratch directory is removed."""
+            result = self.real_run(argv, cwd, data, timeout)
+            if argv[:2] != ["bash", str(upstream_lint.SEMGREP_SCAN)]:
+                return result
+            path = next(
+                arg.removeprefix("--json-output=")
+                for arg in argv
+                if arg.startswith("--json-output=")
+            )
+            captured.extend(json.loads(Path(path).read_text(encoding="utf-8"))["results"])
+            return result
+
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=capture):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(len(captured), 1)
+        start = captured[0]["start"]
+        self.assertEqual(start["line"], 3)
+        self.assertEqual(start["col"], line.index("buffer ?") + 1)
+        self.assertEqual(start["offset"], source.index("buffer ?"))
+
+
+class CRulesBlankingTest(unittest.TestCase):
+    """Pin discovery, lexical boundaries, scope and unread-source preservation."""
+
+    def test_attribute_discovery_and_byte_preservation(self) -> None:
+        """Only discovered object macros are blanked outside directive lines."""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            (tree / "libavutil").mkdir()
+            header = (
+                b"# define av_mark\n#define attribute_hint 1\n"
+                b"#define av_call(x) x\n#define other 1\n"
+            )
+            (tree / "libavutil/attributes.h").write_bytes(header)
+            names, notices = upstream_lint._c_rules_attributes(tree)
+        self.assertEqual(names, {b"av_mark", b"attribute_hint"})
+        self.assertEqual(notices, [])
+        source = b"#define KEEP av_mark\r\n\xff av_mark av_mark_extra attribute_hint av_call(1)\r\n"
+        expected = (
+            b"#define KEEP av_mark\r\n\xff         av_mark_extra                av_call(1)\r\n"
+        )
+        blanked = upstream_lint._c_rules_blank(source, names)
+        self.assertEqual(blanked, expected)
+        self.assertEqual(len(blanked), len(source))
+
+    def test_only_standalone_file_scope_macro_calls_are_blanked(self) -> None:
+        """Local macro discovery requires balanced calls and leaves directives and bodies intact."""
+        removed = ["  BUILD(alpha, nested(1))", 'BUILD("(", beta)']
+        retained = [
+            "#define BUILD(name, arg) int name(void) { return arg; }",
+            "#define KEEP BUILD(directive, 1)",
+            "BUILD(with_semicolon, 1);",
+            "UNKNOWN(1)",
+            "BUILD(1)(2)",
+            "BUILD(unbalanced, (1)",
+            "BUILD(comment, 1) /* tail */",
+            "/* prefix */ BUILD(comment, 1)",
+            "void fixture(void) {",
+            "  BUILD(local, 1)",
+            "}",
+        ]
+        source = "\n".join(retained[:2] + removed + retained[2:]) + "\n"
+        expected = (
+            "\n".join(retained[:2] + [" " * len(line) for line in removed] + retained[2:]) + "\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(source.encode(), set()), expected.encode())
+
+    def test_unread_requested_path_remains_original_link(self) -> None:
+        """A read failure preserves the original inaccessible path for the scanner."""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "tree"
+            (tree / "libavutil").mkdir(parents=True)
+            (tree / "libavutil/attributes.h").write_bytes(b"#define av_mark\n")
+            source = tree / "libavutil/unread.c"
+            real_read = Path.read_bytes
+
+            def read(path):
+                """Plant an inaccessible requested source without affecting the header."""
+                if path == source:
+                    raise PermissionError("fixture unread source")
+                return real_read(path)
+
+            with unittest.mock.patch.object(Path, "read_bytes", read):
+                root, notices = upstream_lint._c_rules_scan_root(
+                    tree, ["libavutil/unread.c"], directory
+                )
+            target = root / "libavutil/unread.c"
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(target.readlink(), source)
+            self.assertFalse(target.exists())
+            self.assertEqual(notices, [])
+
+
 class CRulesTest(unittest.TestCase):
     """Unit coverage of the c-rules allow-list, argv, working directory and waiver."""
 
@@ -3558,8 +3695,13 @@ class CRulesTest(unittest.TestCase):
     def run_c_rules(
         self, waiver: str = "", unread: tuple[upstream_lint.UnreadWaiver, ...] = ()
     ) -> upstream_lint.Step:
-        """Execute _c_rules through _collect with _git and _run stubbed."""
+        """Execute _c_rules with identity scan-root, Git and scanner fixtures."""
         with (
+            unittest.mock.patch.object(
+                upstream_lint,
+                "_c_rules_scan_root",
+                side_effect=lambda tree, paths, directory: (tree, []),
+            ),
             unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
             unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
         ):
@@ -3571,6 +3713,22 @@ class CRulesTest(unittest.TestCase):
                     else upstream_lint._c_rules(self.tree, "base", "head", waiver)
                 ),
             )
+
+    def test_scan_root_controls_scanner_cwd(self) -> None:
+        """The scanner uses the helper root while keeping requested paths relative."""
+        sentinel = Path("/fixture/scratch-sources")
+        with (
+            unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_scan_root", return_value=(sentinel, [])
+            ) as prepare,
+        ):
+            step = upstream_lint._c_rules(self.tree, "base", "head", "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(self.calls[0][1], sentinel)
+        self.assertEqual(self.calls[0][0][5:], ["libavformat/rtspenc.c"])
+        self.assertEqual(prepare.call_args.args[:2], (self.tree, ["libavformat/rtspenc.c"]))
 
     def inter_hunk_fixture(self) -> FixtureTest:
         """Create real Git hunks around an unchanged defect with context fusion enabled."""

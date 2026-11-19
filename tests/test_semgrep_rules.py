@@ -1019,6 +1019,19 @@ class FfmpegRuleIdTest(unittest.TestCase):
 class FfmpegSemgrepRulesTest(unittest.TestCase):
     """Verify .semgrep-ffmpeg.yml C rules against synthetic FFmpeg call fixtures."""
 
+    def test_many_allocations_without_ternaries_do_not_timeout(self) -> None:
+        """A 272-line allocation/check fixture finishes within Semgrep's default timeout."""
+        source = (
+            "void fixture(void) {\n"
+            + "".join(
+                f"    value{i} = av_malloc(8);\n    target{i} = next();\n"
+                f"    if (!value{i}) {{ fail(); }}\n"
+                for i in range(90)
+            )
+            + "}\n"
+        )
+        self.assertEqual(_scan_ffmpeg_c(source), [])
+
     def test_planted_allocation_ternary_declarations_flagged(self) -> None:
         """Flag both reviewed pointer declarations on their ternary lines."""
         results = _scan_ffmpeg_c(FFMPEG_PLANTED_ALLOCATION_TERNARY_DECLARATIONS)

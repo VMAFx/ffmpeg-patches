@@ -123,8 +123,12 @@ builds, are not detected.
 
 The c-rules step runs scripts/semgrep_scan.sh with .semgrep-ffmpeg.yml from
 this repository over added, modified or renamed library and fftools C and
-header sources in base..head, using the FFmpeg checkout at head as the working
-directory, and skips the run when none changed. Results are read through an
+header sources in base..head, reading a blanked scratch copy, and skips the run
+when none changed. Object-like attribute macros discovered in libavutil/attributes.h
+and standalone file-scope invocations of locally defined function-like macros
+are replaced with spaces, preserving byte offsets and newlines. Preprocessor
+directive lines remain unchanged; a missing attributes header is reported.
+Results are read through an
 allow-list: exit status 0 or 1, no semgrep_scan: warning line, and a JSON
 output object whose paths.scanned list contains every requested path, whose
 results name requested paths with non-empty rule ids, and whose errors list
@@ -2365,10 +2369,79 @@ def _c_rules_report(
     return Step("c-rules", int(bool(unread.rc or (findings and not reason))), "\n".join(lines))
 
 
+def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
+    """Discover object-like attribute names or report the missing attributes header."""
+    header = tree / "libavutil/attributes.h"
+    try:
+        source = header.read_bytes()
+    except FileNotFoundError:
+        return set(), ["informational: missing libavutil/attributes.h; attribute blanking skipped"]
+    names = re.findall(
+        rb"(?m)^[ \t]*#[ \t]*define[ \t]+((?:av_|attribute_)[A-Za-z0-9_]+)\b(?!\()",
+        source,
+    )
+    return set(names), []
+
+
+def _c_rules_macro_call(line: str, names: set[str]) -> bool:
+    """Recognize one balanced invocation of a known macro occupying an entire line."""
+    match = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*(\(.*\))\s*", line, re.ASCII)
+    if match is None or match[1] not in names:
+        return False
+    arguments = match[2]
+    depth = 0
+    for index in range(len(arguments)):
+        char = arguments[index]
+        depth += (char == "(") - (char == ")")
+        if depth <= 0 and index != len(arguments) - 1:
+            return False
+    return depth == 0
+
+
+def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
+    """Blank attribute words and file-scope macro invocations without moving any byte."""
+    names = set(
+        name.decode("ascii")
+        for name in re.findall(rb"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(", source)
+    )
+    words = re.compile(rb"\b(?:" + b"|".join(sorted(attributes)) + rb")\b") if attributes else None
+    lines = source.split(b"\n")
+    code = _code_lines(source.decode("latin-1"))
+    depth = 0
+    for index in range(len(lines)):
+        raw, clean = lines[index], code[index]
+        if raw.lstrip().startswith(b"#"):
+            continue
+        invocation = re.fullmatch(rb"[ \t]*[A-Za-z_]\w*[ \t]*\(.*\)[ \t\r]*", raw)
+        if depth == 0 and invocation and _c_rules_macro_call(clean, names):
+            lines[index] = re.sub(rb"[^\r]", b" ", raw)
+        elif words is not None:
+            lines[index] = words.sub(lambda match: b" " * len(match[0]), raw)
+        depth += clean.count("{") - clean.count("}")
+    return b"\n".join(lines)
+
+
+def _c_rules_scan_root(tree: Path, paths: list[str], directory: str) -> tuple[Path, list[str]]:
+    """Copy requested sources for blanking and preserve unread paths as original-file links."""
+    attributes, notices = _c_rules_attributes(tree)
+    root = Path(directory) / "sources"
+    root.mkdir()
+    for index in range(len(paths)):
+        source, target = tree / paths[index], root / paths[index]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            content = source.read_bytes()
+        except OSError:
+            target.symlink_to(source.absolute())
+        else:
+            target.write_bytes(_c_rules_blank(content, attributes))
+    return root, notices
+
+
 def _c_rules(
     tree: Path, base: str, head: str, waiver: str, unread_waivers: tuple[UnreadWaiver, ...] = ()
 ) -> Step:
-    """Scan changed C/header sources and fail closed unless every requested path was scanned."""
+    """Scan scratch sources with attributes and file-scope macro calls blanked; require coverage."""
     touched_by_path = _c_rules_touched(tree, base, head)
     if not touched_by_path:
         unused = _unread_report([], unread_waivers)
@@ -2380,6 +2453,7 @@ def _c_rules(
     paths = list(touched_by_path)
     unread_paths: list[str] = []
     with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
+        scan_root, notices = _c_rules_scan_root(tree, paths, directory)
         json_path = Path(directory) / "semgrep.json"
         argv = [
             "bash",
@@ -2389,7 +2463,7 @@ def _c_rules(
             "--max-target-bytes=0",
             *paths,
         ]
-        result = _run(argv, tree, timeout=C_RULES_TIMEOUT)
+        result = _run(argv, scan_root, timeout=C_RULES_TIMEOUT)
         lines = result.stdout.splitlines()
         has_warning = any(lines[index].startswith("semgrep_scan:") for index in range(len(lines)))
         parsed = (
@@ -2398,14 +2472,16 @@ def _c_rules(
             else None
         )
     if parsed is None:
-        return _c_rules_error(result)
-    return _c_rules_report(
-        parsed[0],
-        parsed[1],
-        touched_by_path,
-        Waivers(c_rule=waiver, unread=unread_waivers),
-        unread_paths,
-    )
+        step = _c_rules_error(result)
+    else:
+        step = _c_rules_report(
+            parsed[0],
+            parsed[1],
+            touched_by_path,
+            Waivers(c_rule=waiver, unread=unread_waivers),
+            unread_paths,
+        )
+    return Step(step.name, step.rc, "\n".join([*notices, step.output]))
 
 
 DOCSTRING_COVERAGE = re.compile(
