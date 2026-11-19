@@ -47,6 +47,7 @@ class DisplayBoundaryTest(RevertProofFixture):
         report: Path | None = None,
         stdout_errors: str = "strict",
         stdout_encoding: str = "utf-8",
+        stderr_encoding: str = "utf-8",
     ) -> tuple[int, str, str]:
         """Render one supplied step through real CLI output and strict stderr."""
         output_bytes, error_bytes = io.BytesIO(), io.BytesIO()
@@ -57,7 +58,7 @@ class DisplayBoundaryTest(RevertProofFixture):
             io.TextIOWrapper(
                 output_bytes, encoding=stdout_encoding, errors=stdout_errors
             ) as output,
-            io.TextIOWrapper(error_bytes, encoding="utf-8", errors="strict") as errors,
+            io.TextIOWrapper(error_bytes, encoding=stderr_encoding, errors="strict") as errors,
             unittest.mock.patch.object(upstream_lint, "_prepare", return_value=("base", "head")),
             unittest.mock.patch.object(upstream_lint, "_checks", return_value=[step]),
             unittest.mock.patch.object(sys, "stdout", output),
@@ -69,7 +70,48 @@ class DisplayBoundaryTest(RevertProofFixture):
             return (
                 rc,
                 output_bytes.getvalue().decode(stdout_encoding, errors=stdout_errors),
-                error_bytes.getvalue().decode("utf-8"),
+                error_bytes.getvalue().decode(stderr_encoding),
+            )
+
+    def test_accented_report_parent_error_keeps_status_on_ascii_stderr(self) -> None:
+        """A real accented blocking file yields an escaped diagnostic and exit two."""
+        blocker = self.root / "caf\u00e9"
+        blocker.write_text("blocked", encoding="utf-8")
+        result = self.render_step(
+            upstream_lint.Step("fixture", 0, "ok"),
+            blocker / "report.txt",
+            stderr_encoding="ascii",
+        )
+        self.assertEqual(result[0], 2, result)
+        escaped = str(blocker).replace("\u00e9", r"\xe9")
+        self.assertEqual(result[2], f"report: [Errno 17] {os.strerror(17)}: '{escaped}'\n")
+
+    def test_accented_missing_tree_keeps_status_on_ascii_stderr(self) -> None:
+        """An actual missing accented tree yields an escaped diagnostic and exit two."""
+        missing = self.root / "caf\u00e9"
+        argv = [
+            "--tree",
+            str(missing),
+            "--commit",
+            "HEAD",
+            "--record",
+            str(self.record_path),
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        ]
+        buffer = io.BytesIO()
+        with (
+            io.TextIOWrapper(buffer, encoding="ascii", errors="strict") as errors,
+            unittest.mock.patch.object(sys, "stderr", errors),
+        ):
+            self.assertEqual(revert_proof.main(argv), 2)
+            errors.flush()
+            escaped = str(missing).replace("\u00e9", r"\xe9")
+            self.assertEqual(
+                buffer.getvalue().decode("ascii"),
+                f"revert_proof: work tree not found: {escaped}\n",
             )
 
     def mechanical_step(self, name: str) -> upstream_lint.Step:
@@ -78,14 +120,202 @@ class DisplayBoundaryTest(RevertProofFixture):
         self.assertEqual(count, 1)
         return upstream_lint.Step("developer.texi", 1, "\n".join(findings))
 
+    def expected_report(self, step: upstream_lint.Step) -> str:
+        """Spell out the entire one-step fixture report independently of its renderer."""
+        return (
+            f"tree: {self.tree}\nbase: base\nhead: head\n\n"
+            f"step: {step.name} rc: {step.rc}\n{step.output}\n"
+        )
+
+    def test_accented_finding_keeps_status_on_ascii_stdout(self) -> None:
+        """A real accented source finding preserves ordinary exit one on ASCII stdout."""
+        name = "libavfilter/vf_caf\u00e9.c"
+        self.write(name, "\treturn 1;\n")
+        ordinary = self.render_step(self.mechanical_step("libavfilter/vf_x.c"))
+        step = self.mechanical_step(name)
+        result = self.render_step(step, stdout_encoding="ascii")
+        self.assertEqual(ordinary[0], 1, ordinary)
+        self.assertEqual(
+            result, (ordinary[0], self.expected_report(step).replace("\u00e9", r"\xe9"), "")
+        )
+
+    def parser_output(self, parser, argv: list[str]) -> tuple[int, str, str]:
+        """Capture the complete parser result through strict ASCII output streams."""
+        output_bytes, error_bytes = io.BytesIO(), io.BytesIO()
+        with (
+            io.TextIOWrapper(output_bytes, encoding="ascii", errors="strict") as output,
+            io.TextIOWrapper(error_bytes, encoding="ascii", errors="strict") as errors,
+            unittest.mock.patch.object(sys, "stdout", output),
+            unittest.mock.patch.object(sys, "stderr", errors),
+        ):
+            with self.assertRaises(SystemExit) as caught:
+                parser.parse_args(argv)
+            output.flush()
+            errors.flush()
+            return (
+                caught.exception.code,
+                output_bytes.getvalue().decode("ascii"),
+                error_bytes.getvalue().decode("ascii"),
+            )
+
+    def test_both_parsers_emit_accented_help_on_ascii_stdout(self) -> None:
+        """Both help paths preserve complete escaped help and status zero on ASCII."""
+        parsers = (upstream_lint._parser(), revert_proof.build_parser())
+        for parser in parsers[:2]:
+            with self.subTest(parser=parser):
+                parser.prog = "caf\u00e9"
+                expected = parser.format_help().replace("\u00e9", r"\xe9")
+                self.assertEqual(self.parser_output(parser, ["--help"]), (0, expected, ""))
+
+    def test_both_parsers_emit_accented_errors_on_ascii_stderr(self) -> None:
+        """Both error paths preserve complete escaped usage and status two on ASCII."""
+        producer = ["--tree", str(self.tree), "--commit", "HEAD", "--record", str(self.record_path)]
+        cases = (
+            (upstream_lint._parser(), ["--tree", str(self.tree), "--base", "base"]),
+            (revert_proof.build_parser(), producer),
+        )
+        for parser, argv in cases[:2]:
+            with self.subTest(parser=parser):
+                parser.prog = "caf\u00e9"
+                expected = (
+                    (
+                        parser.format_usage()
+                        + "caf\u00e9: error: unrecognized arguments: --bad\u00e9\udcff\n"
+                    )
+                    .replace("\u00e9", r"\xe9")
+                    .replace("\udcff", r"\udcff")
+                )
+                self.assertEqual(
+                    self.parser_output(parser, [*argv, "--bad\u00e9\udcff"]), (2, "", expected)
+                )
+
     def test_byte_name_finding_completes_through_strict_stdout(self) -> None:
         """Byte-name and ordinary-name findings both finish with exit one on strict stdout."""
         ordinary = self.render_step(self.mechanical_step("libavfilter/vf_x.c"))
         escaped = self.render_step(self.mechanical_step("libavfilter/vf_\udcff.c"))
         self.assertEqual(ordinary[0], 1, ordinary)
         self.assertEqual(escaped[0], ordinary[0], escaped)
-        self.assertIn(r"libavfilter/vf_\udcff.c:1: TAB character", escaped[1])
-        self.assertEqual(escaped[2], "")
+        expected = self.expected_report(self.mechanical_step(r"libavfilter/vf_\udcff.c"))
+        self.assertEqual(escaped, (1, expected, ""))
+
+    def test_utf8_report_preserves_accents_independently_of_stdout(self) -> None:
+        """UTF-8 reports retain accents and escape byte names through either stdout codec."""
+        name = "libavfilter/vf_caf\u00e9.c"
+        self.write(name, "\treturn 1;\n")
+        accent = self.mechanical_step(name)
+        byte_name = self.mechanical_step("libavfilter/vf_\udcff.c")
+        step = upstream_lint.Step("developer.texi", 1, accent.output + "\n" + byte_name.output)
+        expected = self.expected_report(step).replace("\udcff", r"\udcff")
+        target = self.root / "caf\u00e9.txt"
+        for encoding in ("utf-8", "ascii"):
+            with self.subTest(encoding=encoding):
+                result = self.render_step(step, target, stdout_encoding=encoding)
+                shown = expected if encoding == "utf-8" else expected.replace("\u00e9", r"\xe9")
+                self.assertEqual(result, (1, shown, ""))
+                self.assertEqual(target.read_bytes(), expected.encode("utf-8"))
+
+    def broken_stream(self, operation: str = "write", error: Exception | None = None):
+        """Return a stream object that raises an operating-system error on emission."""
+        stream = unittest.mock.Mock(encoding="ascii")
+        getattr(stream, operation).side_effect = error or BrokenPipeError("planted closed pipe")
+        return stream
+
+    def test_lint_diagnostic_write_failure_keeps_exit_two(self) -> None:
+        """A broken stderr cannot replace a real report failure's tool-error status."""
+        blocker = self.root / "caf\u00e9"
+        blocker.write_text("blocked", encoding="utf-8")
+        errors = self.broken_stream()
+        with (
+            unittest.mock.patch.object(upstream_lint, "_prepare", return_value=("base", "head")),
+            unittest.mock.patch.object(
+                upstream_lint, "_checks", return_value=[upstream_lint.Step("fixture", 0, "ok")]
+            ),
+            unittest.mock.patch.object(sys, "stdout", io.StringIO()),
+            unittest.mock.patch.object(sys, "stderr", errors),
+        ):
+            argv = ["--tree", str(self.tree), "--base", "base", "--report", str(blocker / "x")]
+            self.assertEqual(upstream_lint.main(argv), 2)
+        escaped = str(blocker).replace("\u00e9", r"\xe9")
+        errors.write.assert_called_once_with(f"report: [Errno 17] {os.strerror(17)}: '{escaped}'\n")
+
+    def test_producer_diagnostic_emission_failure_keeps_all_statuses(self) -> None:
+        """Broken writes and flushes retain each of the producer's four failure statuses."""
+        cases = (
+            (revert_proof._PreflightError, 2),
+            (revert_proof._HeadTestError, 3),
+            (revert_proof._ReverseApplyError, 4),
+            (revert_proof._ScratchRemovalError, 5),
+        )
+        argv = [
+            "--tree",
+            str(self.tree),
+            "--commit",
+            "HEAD",
+            "--record",
+            str(self.record_path),
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        ]
+        for operation in ("write", "flush"):
+            for error_type, expected in cases[:4]:
+                with self.subTest(operation=operation, error_type=error_type):
+                    errors = self.broken_stream(operation)
+                    with (
+                        unittest.mock.patch.object(sys, "stderr", errors),
+                        unittest.mock.patch.object(
+                            revert_proof, "run_proof", side_effect=error_type("caf\u00e9")
+                        ),
+                    ):
+                        self.assertEqual(revert_proof.main(argv), expected)
+                    errors.write.assert_called_once_with("revert_proof: caf\\xe9\n")
+                    self.assertEqual(errors.flush.call_count, int(operation == "flush"))
+
+    def test_stdout_emission_failure_keeps_finding_status_and_utf8_report(self) -> None:
+        """A failed stdout write or flush retains the finding and still saves the report."""
+        step = self.mechanical_step("libavfilter/vf_x.c")
+        for operation in ("write", "flush"):
+            with self.subTest(operation=operation):
+                output = self.broken_stream(operation)
+                errors = io.StringIO()
+                with (
+                    unittest.mock.patch.object(
+                        upstream_lint, "_prepare", return_value=("base", "head")
+                    ),
+                    unittest.mock.patch.object(upstream_lint, "_checks", return_value=[step]),
+                    unittest.mock.patch.object(sys, "stdout", output),
+                    unittest.mock.patch.object(sys, "stderr", errors),
+                ):
+                    argv = [
+                        "--tree",
+                        str(self.tree),
+                        "--base",
+                        "base",
+                        "--report",
+                        str(self.record_path),
+                    ]
+                    self.assertEqual(upstream_lint.main(argv), 1)
+                expected = self.expected_report(step)
+                self.assertEqual(self.record_path.read_bytes(), expected.encode("utf-8"))
+                output.write.assert_called_once_with(expected)
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_both_parsers_keep_exit_codes_when_stream_writes_fail(self) -> None:
+        """Broken and closed help or diagnostic streams retain argparse's exit statuses."""
+        for parser in (upstream_lint._parser(), revert_proof.build_parser()):
+            for argv, expected in ((["--help"], 0), ([], 2)):
+                for error in (BrokenPipeError("broken pipe"), ValueError("closed stream")):
+                    with self.subTest(parser=parser, argv=argv, error=error):
+                        stream = self.broken_stream(error=error)
+                        with (
+                            unittest.mock.patch.object(sys, "stdout", stream),
+                            unittest.mock.patch.object(sys, "stderr", stream),
+                        ):
+                            with self.assertRaises(SystemExit) as caught:
+                                parser.parse_args(argv)
+                            self.assertEqual(caught.exception.code, expected)
+                        self.assertEqual(stream.write.call_count, 1 if expected == 0 else 2)
 
     def test_byte_name_finding_completes_through_utf8_report(self) -> None:
         """The strict UTF-8 report retains the finding independently of stdout encoding."""
@@ -96,23 +326,23 @@ class DisplayBoundaryTest(RevertProofFixture):
         )
         self.assertEqual(result[0], ordinary[0], result)
         text = target.read_bytes().decode("utf-8", errors="strict")
-        self.assertIn(r"libavfilter/vf_\udcff.c:1: TAB character", text)
+        expected = self.expected_report(self.mechanical_step(r"libavfilter/vf_\udcff.c"))
+        self.assertEqual(text, expected)
         self.assertEqual(text, result[1])
         self.assertEqual(result[2], "")
 
     def test_arbitrary_step_fields_are_safe_at_output_boundary(self) -> None:
         """Future finding and step-name producers cannot bypass boundary escaping."""
         result = self.render_step(upstream_lint.Step("future\ud800", 0, "reason \udc01"))
-        self.assertEqual(result[0], 0, result)
-        self.assertIn(r"step: future\ud800 rc: 0", result[1])
-        self.assertIn(r"reason \udc01", result[1])
+        expected = self.expected_report(upstream_lint.Step(r"future\ud800", 0, r"reason \udc01"))
+        self.assertEqual(result, (0, expected, ""))
 
     def test_report_oserror_with_byte_name_is_safe_on_strict_stderr(self) -> None:
         """A failed report write names its escaped path and returns the tool-error status."""
         with unittest.mock.patch.object(Path, "write_text", side_effect=OSError("blocked \udcff")):
             result = self.render_step(upstream_lint.Step("fixture", 0, "ok"), self.record_path)
-        self.assertEqual(result[0], 2, result)
-        self.assertIn(r"report: blocked \udcff", result[2])
+        expected = self.expected_report(upstream_lint.Step("fixture", 0, "ok"))
+        self.assertEqual(result, (2, expected, "report: blocked \\udcff\n"))
 
     def test_producer_errors_escape_byte_names_on_strict_stderr(self) -> None:
         """All producer failure classes preserve their exit code on strict stderr."""
@@ -146,7 +376,9 @@ class DisplayBoundaryTest(RevertProofFixture):
                 ):
                     self.assertEqual(revert_proof.main(argv), expected)
                     errors.flush()
-                    self.assertIn(r"revert_proof: bad \udcff", buffer.getvalue().decode("utf-8"))
+                    self.assertEqual(
+                        buffer.getvalue().decode("utf-8"), "revert_proof: bad \\udcff\n"
+                    )
 
     def test_both_parsers_escape_invalid_argument_diagnostics(self) -> None:
         """Argparse diagnostics also escape surrogate-bearing command-line arguments."""
@@ -171,7 +403,11 @@ class DisplayBoundaryTest(RevertProofFixture):
                     with self.assertRaises(SystemExit) as caught:
                         parser.parse_args(arguments)
                     errors.flush()
-                    self.assertIn(r"--bad\udcff", buffer.getvalue().decode("utf-8"))
+                    expected = (
+                        parser.format_usage()
+                        + f"{parser.prog}: error: unrecognized arguments: --bad\\udcff\n"
+                    )
+                    self.assertEqual(buffer.getvalue().decode("utf-8"), expected)
                     self.assertEqual(caught.exception.code, 2)
 
     def test_report_encoding_failure_is_a_tool_error(self) -> None:
@@ -179,18 +415,18 @@ class DisplayBoundaryTest(RevertProofFixture):
         error = UnicodeEncodeError("utf-8", "\udcff", 0, 1, "planted report failure")
         with unittest.mock.patch.object(Path, "write_text", side_effect=error):
             result = self.render_step(upstream_lint.Step("fixture", 0, "ok"), self.record_path)
-        self.assertEqual(result[0], 2, result)
-        self.assertIn("report:", result[2])
-        self.assertIn("planted report failure", result[2])
+        expected = self.expected_report(upstream_lint.Step("fixture", 0, "ok"))
+        self.assertEqual(result, (2, expected, f"report: {error}\n"))
 
-    def test_stdout_encoding_failure_is_a_tool_error(self) -> None:
-        """An incompatible stdout codec returns two with a diagnostic even for a passing step."""
+    def test_stdout_encoding_fallback_preserves_passing_status(self) -> None:
+        """An incompatible stdout codec escapes text and retains a passing step's status."""
         result = self.render_step(
             upstream_lint.Step("fixture", 0, "caf\u00e9"), stdout_encoding="ascii"
         )
-        self.assertEqual(result[0], 2, result)
-        self.assertIn("report:", result[2])
-        self.assertIn("ascii", result[2])
+        self.assertEqual(
+            result,
+            (0, self.expected_report(upstream_lint.Step("fixture", 0, r"caf\xe9")), ""),
+        )
 
     def test_producer_record_encoding_failure_is_a_tool_error(self) -> None:
         """Residual record-write encoding errors produce a message and exit two."""
@@ -215,8 +451,7 @@ class DisplayBoundaryTest(RevertProofFixture):
             ]
             with unittest.mock.patch.object(sys, "stderr", buffer):
                 self.assertEqual(revert_proof.main(argv), 2)
-        self.assertIn("revert_proof:", buffer.getvalue())
-        self.assertIn("planted record failure", buffer.getvalue())
+        self.assertEqual(buffer.getvalue(), f"revert_proof: {error}\n")
 
     def test_base_file_preserves_non_utf8_blob_bytes(self) -> None:
         """Base scripts keep every original byte for consumers such as bash that read bytes."""

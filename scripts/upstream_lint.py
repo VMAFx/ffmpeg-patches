@@ -81,6 +81,11 @@ JSON escapes in UTF-8 records and restored unchanged by the reader.
 Human output renders lone surrogates as visible backslash-u escapes without
 changing Git arguments, stdin or stored records; literal escape spellings can
 look identical, so distinguish them using stored JSON or raw Git path bytes.
+Terminal findings, diagnostics and parser messages escape characters outside the
+destination stream's encoding as visible backslash escapes. Emission failures
+retain the caller's decided status, even when a stream is closed or broken.
+Optional human reports use UTF-8, retaining valid Unicode and escaping lone
+surrogates; terminal codec fallback does not alter the report file or JSON records.
 End-to-end filename support is claimed only for UTF-8 filesystem encodings;
 other filesystem encodings retain native decode/encode behavior but are unverified.
 Base configuration and script files are extracted as their original blob bytes.
@@ -496,13 +501,25 @@ def display_text(text: str) -> str:
     return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
+def emit_text(text: str, stream) -> None:
+    """Emit display text in the stream's codec without changing the caller's status."""
+    try:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        text = display_text(text).encode(encoding, errors="backslashreplace").decode(encoding)
+        stream.write(text)
+        stream.flush()
+    except Exception:
+        # Emission is best effort; even a broken stream must retain the decided status.
+        return
+
+
 class DisplayArgumentParser(argparse.ArgumentParser):
     """Escape parser help and error text at argparse's shared output boundary."""
 
     def _print_message(self, message: str | None, file=None) -> None:
         """Render parser messages without changing the arguments being parsed."""
         if message:
-            super()._print_message(display_text(message), file)
+            emit_text(message, sys.stderr if file is None else file)
 
 
 def _run_output(
@@ -2821,12 +2838,12 @@ def _write_report(report: str, target: Path | None) -> bool:
     """Render a report safely at the terminal and optional UTF-8 file boundary."""
     try:
         report = display_text(report)
-        print(report, end="", flush=True)
+        emit_text(report, sys.stdout)
         if target:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(report, encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        print(display_text(f"report: {error}"), file=sys.stderr)
+        emit_text(f"report: {error}\n", sys.stderr)
         return False
     return True
 
