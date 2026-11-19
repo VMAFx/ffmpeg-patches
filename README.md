@@ -32,6 +32,7 @@ ffmpeg-patches tracks FFmpeg master ([`series.txt`](series.txt)). Its name
 describes the repository's contents: FFmpeg patches shared by the VMAFx
 projects ([ADR-0001](docs/adr/0001-shared-fix-series.md)); pronounce it
 "eff-eff-em-peg patches".
+Each patch's state is recorded in the `.toml` sidecar beside it.
 
 **[📖 Architectural Decision Records](docs/adr/README.md)** · [ADR-0001: Shared Fix Series](docs/adr/0001-shared-fix-series.md)
 
@@ -210,9 +211,12 @@ The forge helper scripts share configuration through environment variables, impl
 4. Write or update `patches/NNNN-slug.toml` and run `make test`, then
    `make lengths FFMPEG_TREE=ffmpeg` to catch a function grown past the
    60-line cap (HISS-04) before it reaches CI.
-5. When a patch file is renamed, or its `status` or `upstream` link
-   changes, update its record in `upstream-contributions.json` and
-   regenerate the table; `check` names a record that no longer fits.
+5. When a patch file is renamed, update `series.txt` and rename its `.toml`
+   sidecar to match. If it has an upstream contribution record, update that
+   record in `upstream-contributions.json` and regenerate the table.
+   Add a record when submitting a patch upstream; keep existing records in
+   sync when its `status` or `upstream` link changes, then regenerate the
+   table. `check` names a record that no longer fits.
 
 ### Checks
 
@@ -481,9 +485,10 @@ base with the first release cut from that branch after the merge.
 
 The same facts are in
 [`upstream-contributions.json`](upstream-contributions.json), one object
-per pull request, for other pages to read. Its `patch` field is a string of patch
-filenames separated by a comma and a space, or an empty string when the series carries
-none. Every named patch must link to that pull request and match its state.
+per pull request, for other pages to read. Its `patch` field is a string of
+patch filenames separated by a comma and a space, or an empty string when
+the series carries none. Every named patch must link to that pull request
+and match its state.
 The table lists all their series numbers and is generated from that file:
 edit the file, then run `python3 scripts/series.py contributions --write`.
 The pre-commit hook also regenerates and stages `README.md` whenever
