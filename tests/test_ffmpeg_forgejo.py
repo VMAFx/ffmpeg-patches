@@ -557,6 +557,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Return the scripted fork branch commit or a failed read."""
 
         if len(parts) > 3 and parts[-2] == "branches":
+            callback = getattr(stub, "on_branch", None)
+            if callback is not None:
+                callback()
             self.reply(stub.branch_status, {"commit": {"id": stub.branch_head}})
             return True
         return False
@@ -623,6 +626,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         data = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
         self.stub().requests.append(("POST", self.path, data))
+        callback = getattr(self.stub(), "on_post", None)
+        if callback is not None:
+            callback(self.path)
         if self.path.endswith("/pulls"):
             self.reply(201, {"number": 1, "html_url": "stub/pulls/1"})
         elif self.path.endswith("/pulls/1/requested_reviewers"):
@@ -809,6 +815,29 @@ def assert_private_removal_failed(
     case.assertTrue(path.exists())
 
 
+def plant_accepted_header_failure(bin_dir: Path, scratch: Path) -> tuple[Path, Path]:
+    """Fail removal of a fixture header only after the selected successful write."""
+    real_rm = shutil.which("rm")
+    if real_rm is None:
+        raise RuntimeError("rm missing")
+    marker = scratch / "write-accepted"
+    refused = scratch / "refused-removal.txt"
+    wrapper = bin_dir / "rm"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+        "path = Path(sys.argv[-1])\n"
+        f"if Path({str(marker)!r}).exists() and path.is_file() "
+        "and path.read_bytes() == b'Authorization: token testtoken\\n':\n"
+        f"    with Path({str(refused)!r}).open('a', encoding='utf-8') as record:\n"
+        "        record.write(str(path) + '\\n')\n"
+        "    raise SystemExit(1)\n"
+        f"os.execv({real_rm!r}, [{real_rm!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return marker, refused
+
+
 def write_request_paths(stub: Stub) -> list[tuple[str, str]]:
     """Return write methods and paths with an explicit request-count bound."""
     return [
@@ -867,11 +896,11 @@ class ForkExistenceTest(ForgejoTest):
             )
 
     def test_not_found_creates_fork(self) -> None:
-        """A clean HTTP 404 permits exactly the expected fork POST and success message."""
+        """A clean HTTP 404 permits one fork POST and exposes its acceptance and success."""
         stub = ForkStub(404)
         result = self.fork_command(stub)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr, "")
+        self.assertIn("write accepted: /repos/FFmpeg/FFmpeg/forks", result.stderr)
         self.assertEqual(
             stub.requests,
             [
@@ -977,6 +1006,36 @@ class ForkExistenceTest(ForgejoTest):
 
 class PrivateRemovalTest(ForgejoTest):
     """Exercise cleanup failures across main flow, conditional calls, and EXIT traps."""
+
+    def test_create_header_cleanup_failure_exposes_accepted_pull(self) -> None:
+        """An accepted create remains visible when only its private-header removal fails."""
+        marker, refused = plant_accepted_header_failure(self.bin_dir, self.tmp)
+        stub = Stub(reviewers=[["alice"]])
+
+        def accepted(path: str) -> None:
+            """Arm header removal failure only on the successful pull create endpoint."""
+            if path.endswith("/pulls"):
+                marker.touch()
+
+        stub.on_post = accepted
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertIn("write accepted: stub/pulls/1", result.stderr)
+        self.assertEqual(write_request_paths(stub), [("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls")])
+        self.assertEqual(stub.requested_users, [])
+
+    def test_fork_payload_cleanup_failure_exposes_accepted_fork(self) -> None:
+        """A failed fork payload removal retains both the accepted and forked messages."""
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, b"{}\n")
+        stub = ForkStub(404)
+        with unittest.mock.patch(__name__ + ".Handler", ForkHandler):
+            result = self.run_command(stub, "fork")
+        assert_private_removal_failed(self, result, refused)
+        self.assertIn("write accepted:", result.stderr)
+        self.assertIn("forked FFmpeg/FFmpeg to", result.stdout)
+        self.assertEqual(write_request_paths(stub), [("POST", "/api/v1/repos/FFmpeg/FFmpeg/forks")])
 
     def test_merge_cleanup_stops_main_flow_before_any_write(self) -> None:
         """A private merge-output removal failure stops PR before any write reaches the stub."""
@@ -1110,6 +1169,127 @@ class PrivateRemovalTest(ForgejoTest):
             self.assertEqual(lines.count(f"ffmpeg-forgejo: cannot delete {paths[index]}."), 1)
         self.assertEqual(lines[-1], f"ffmpeg-forgejo: cannot delete {paths[-1]}.")
         self.assertEqual(write_request_paths(stub), [])
+
+
+def plant_landed_fetch_marker(bin_dir: Path, scratch: Path) -> Path:
+    """Mark the real final landed fetch without replacing any Git proof or isolation."""
+    real_git = shutil.which("git")
+    if real_git is None:
+        raise RuntimeError("git missing")
+    marker = scratch / "landed-fetch"
+    wrapper = bin_dir / "git"
+    wrapper.write_text(
+        '#!/bin/sh\ncase " $* " in *refs/ffmpeg-forgejo/landed-base-*) '
+        f": >{shlex.quote(str(marker))};; esac\n"
+        f'exec {shlex.quote(real_git)} "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return marker
+
+
+class PostLandedHeadTest(ForgejoTest):
+    """Recheck every mutable outbound head after the real landed fetch."""
+
+    def final_head_command(
+        self, verb: str, outcome: str
+    ) -> tuple[subprocess.CompletedProcess[str], Stub, list[bool]]:
+        """Change or fail only reads after the real landed fetch for one outbound verb."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        changed = sha[:-1] + ("0" if sha[-1] != "0" else "1")
+        marker = plant_landed_fetch_marker(self.bin_dir, self.tmp)
+        reads: list[bool] = []
+        stub = Stub(heads=[sha], reviewers=[["alice"]], branch_head=sha)
+        stub.review_comments[7] = copy.deepcopy(THREAD)
+
+        def refresh() -> None:
+            """Record the fetch boundary and inject only the selected late response."""
+            if write_request_paths(stub):
+                return
+            landed = marker.exists()
+            reads.append(landed)
+            if landed and outcome == "changed":
+                stub.heads = [changed]
+                stub.branch_head = changed
+            if landed and outcome == "failed":
+                stub.pull_status = 500
+                stub.branch_status = 500
+
+        stub.on_pull = refresh
+        stub.on_branch = refresh
+        if verb == "pr":
+            args = ["pr", "--sweep", str(self.sweep), "topic", "title"]
+        else:
+            evidence = self.tmp / "evidence.md"
+            evidence.write_text(f"- test: fate tree=/w head={sha[:12]}\n", encoding="utf-8")
+            args = [verb, "--tested-head", sha[:12], "--evidence", str(evidence), "1"]
+            if verb == "reply":
+                args.extend(["7", "85995"])
+        result = self.run_command(stub, *args, str(self.tmp / "body.md"))
+        self.assertTrue(marker.exists(), result.stderr)
+        return result, stub, reads
+
+    def assert_final_head_result(self, verb: str, outcome: str) -> None:
+        """Pin the last full-head read, exact refusal status, and absence of writes."""
+        result, stub, reads = self.final_head_command(verb, outcome)
+        expected = 0 if outcome == "unchanged" else 1 if verb == "pr" or outcome == "failed" else 76
+        self.assertEqual(result.returncode, expected, result.stderr)
+        self.assertEqual(reads, [False] * {"pr": 1, "comment": 3, "reply": 2}[verb] + [True])
+        writes = write_request_paths(stub)
+        if outcome == "unchanged":
+            paths = {
+                "pr": "pulls",
+                "comment": "issues/1/comments",
+                "reply": "pulls/1/reviews/7/comments",
+            }
+            path = paths[verb]
+            self.assertIn(("POST", f"/api/v1/repos/FFmpeg/FFmpeg/{path}"), writes)
+        else:
+            message = (
+                "fork branch"
+                if verb == "pr"
+                else "cannot read the head"
+                if outcome == "failed"
+                else "does not match live head"
+            )
+            self.assertIn(message, result.stderr)
+            self.assertEqual(writes, [])
+
+    def test_changed_head_during_landed_check_refuses_pr(self) -> None:
+        """A fork head changed during final fetching cannot create a pull."""
+        self.assert_final_head_result("pr", "changed")
+
+    def test_failed_head_read_after_landed_check_refuses_pr(self) -> None:
+        """A failed final fork read cannot create a pull."""
+        self.assert_final_head_result("pr", "failed")
+
+    def test_unchanged_head_after_landed_check_creates_pr(self) -> None:
+        """An unchanged final fork head still creates a pull."""
+        self.assert_final_head_result("pr", "unchanged")
+
+    def test_changed_head_during_landed_check_refuses_comment(self) -> None:
+        """A changed full head sharing the tested prefix cannot receive a comment."""
+        self.assert_final_head_result("comment", "changed")
+
+    def test_failed_head_read_after_landed_check_refuses_comment(self) -> None:
+        """A failed final pull read cannot receive a tested comment."""
+        self.assert_final_head_result("comment", "failed")
+
+    def test_unchanged_head_after_landed_check_posts_comment(self) -> None:
+        """An unchanged final full head still receives a tested comment."""
+        self.assert_final_head_result("comment", "unchanged")
+
+    def test_changed_head_during_landed_check_refuses_reply(self) -> None:
+        """A changed full head sharing the tested prefix cannot receive a reply."""
+        self.assert_final_head_result("reply", "changed")
+
+    def test_failed_head_read_after_landed_check_refuses_reply(self) -> None:
+        """A failed final pull read cannot receive a tested reply."""
+        self.assert_final_head_result("reply", "failed")
+
+    def test_unchanged_head_after_landed_check_posts_reply(self) -> None:
+        """An unchanged final full head still receives a tested reply."""
+        self.assert_final_head_result("reply", "unchanged")
 
 
 class RunCommandTest(ForgejoTest):
@@ -2167,7 +2347,7 @@ class ReplyTest(ForgejoTest):
         ]
 
     def test_reply_payload_removal_failure_is_not_retried(self) -> None:
-        """A failed reply payload removal retains its bytes and emits one final diagnostic."""
+        """A failed payload removal exposes acceptance without claiming verified read-back."""
 
         control = self.stub()
         body = str(self.tmp / "body.md")
@@ -2192,6 +2372,16 @@ class ReplyTest(ForgejoTest):
             [("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1/reviews/7/comments")],
         )
         self.assertNotIn("replied ", result.stdout)
+        self.assertIn("write accepted:", result.stderr)
+        self.assertIn("read-back not verified", result.stderr)
+        self.assertEqual(
+            sum(
+                stub.requests[index][0] == "GET"
+                and "/reviews/7/comments" in stub.requests[index][1]
+                for index in range(len(stub.requests))
+            ),
+            1,
+        )
 
     def test_reply_copies_the_anchor_of_the_answered_comment(self) -> None:
         """Replying to a review comment posts at its file, line, and range."""
@@ -6204,6 +6394,71 @@ def api_read_diagnostic_violations(source: str) -> list[int]:
             children = node.named_children
             pending.extend((children[index], streams, False) for index in range(len(children)))
     raise ValueError("API read inspection exceeded its numeric node bound")
+
+
+def shell_function_measurements(source: str) -> dict[str, tuple[int, int]]:
+    """Count physical lines and command, test, assignment, and control nodes per function."""
+    parser = bash_parser()
+    if isinstance(parser, str):
+        raise ValueError(parser)
+    raw = source.encode("ascii")
+    root = parser.parse(raw).root_node
+    if root.has_error:
+        raise ValueError("cannot measure malformed Bash")
+    kinds = {"command", "test_command", "variable_assignment", "if_statement"}
+    kinds.update({"for_statement", "while_statement", "case_statement"})
+    measurements = {}
+    children = root.named_children
+    for index in range(len(children)):
+        function = children[index]
+        if function.type != "function_definition":
+            continue
+        pending = [function]
+        statements = 0
+        for _ in range(4 * len(function.text) + 1):
+            if not pending:
+                break
+            node = pending.pop()
+            if node.type in {"declaration_command", "heredoc_body"}:
+                continue
+            statements += node.type in kinds
+            pending.extend(node.named_children)
+        if pending:
+            raise ValueError("function measurement exceeded its numeric node bound")
+        name = function.child_by_field_name("name").text.decode("ascii")
+        measurements[name] = (function.end_point.row - function.start_point.row + 1, statements)
+    return measurements
+
+
+class ShellFunctionSizeTest(unittest.TestCase):
+    """Keep the refactored proof and receipt helpers within the review's size limits."""
+
+    def test_refactored_functions_fit_limits(self) -> None:
+        """Every round-13 shell function fits sixty lines and forty counted statements."""
+        names = (
+            "api_write_result",
+            "api",
+            "check_overlap_snapshot",
+            "check_pr_overlap_result",
+            "check_merge_tree_capture",
+            "neutral_merge_tree",
+            "landed_merge_result",
+            "check_landed",
+        )
+        sizes = shell_function_measurements(HELPER.read_text(encoding="ascii"))
+        for index in range(len(names)):
+            with self.subTest(function=names[index]):
+                lines, statements = sizes[names[index]]
+                self.assertLessEqual(lines, 60)
+                self.assertLessEqual(statements, 40)
+
+    def test_statement_boundary_counts_commands_but_not_local_or_heredoc(self) -> None:
+        """Forty statements fit and one additional command exceeds the review ceiling."""
+        body = "local ignored=1\ncat <<'PY'\nliteral text\nPY\n" + ":\n" * 39
+        boundary = shell_function_measurements("fixture() {\n" + body + "}\n")
+        planted = shell_function_measurements("fixture() {\n" + body + ":\n}\n")
+        self.assertEqual(boundary["fixture"][1], 40)
+        self.assertEqual(planted["fixture"][1], 41)
 
 
 class ApiReadSourceTest(unittest.TestCase):

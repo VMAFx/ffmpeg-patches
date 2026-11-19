@@ -185,7 +185,25 @@ token() {
   printf '%s' "$t"
 }
 
-# api METHOD PATH [JSON-BODY-FILE] [--status]: send one request; --status prints only the HTTP code.
+# api_write_result PATH CURL-ARGS...: expose an accepted write before private-header cleanup.
+api_write_result() {
+  local path="$1" response
+  shift
+  response="$(curl --max-time 60 "$@" "$API$path")" || return $?
+  printf '%s\n' "$response"
+  python3 -c 'import json,sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+address = data.get("html_url") or data.get("number") or sys.argv[1]
+print(f"ffmpeg-forgejo: write accepted: {address} (read-back not verified).", file=sys.stderr)' \
+    "$path" <<<"$response"
+}
+
+# api METHOD PATH [JSON-BODY-FILE] [--status|--receipt]: send one request with optional status or receipt.
 # The token goes through a private header file, not argv.
 # The subshell keeps header cleanup local even when a function calls api directly.
 api() (
@@ -202,7 +220,11 @@ api() (
   if [ -n "$body" ]; then
     args+=(-H 'Content-Type: application/json' --data-binary @"$body")
   fi
-  curl --max-time 60 "${args[@]}" "$API$path"
+  if [ "$mode" = --receipt ]; then
+    api_write_result "$path" "${args[@]}"
+  else
+    curl --max-time 60 "${args[@]}" "$API$path"
+  fi
 )
 
 # api_exists PATH: return 0 for an answer, 44 for proven absence, 1 for any other failure.
@@ -683,38 +705,45 @@ prepare_overlap_candidates() {
   fi
 }
 
+# check_overlap_snapshot SNAPSHOT ALLOWED-NUMBERS MODE: collect or refuse shared files in one listing.
+check_overlap_snapshot() {
+  local snapshot_a="$1" allowed="$2" mode="$3" line line_i number shared rc
+  local -a lines=()
+  if [ -n "$snapshot_a" ]; then
+    mapfile -t lines <<<"$snapshot_a"
+    for ((line_i = 0; line_i < ${#lines[@]}; line_i++)); do
+      line="${lines[line_i]}"
+      [ -n "$line" ] || continue
+      number="${line%% *}"
+      [[ " $allowed " == *" $number "* ]] && continue
+      if shared="$(check_pull_files "$number" "$OVERLAP_CANDIDATES")"; then rc=0; else rc=$?; fi
+      if [ "$rc" -eq 77 ]; then
+        if [ "$mode" = "first" ]; then
+          printf 'ffmpeg-forgejo: own open pull #%s shares files with this branch: %s; use --overlap-ok %s only for a deliberate stack.\n' \
+            "$number" "$shared" "$number" >&2
+          return 77
+        fi
+        overlapping_records+=("$number $shared")
+        continue
+      elif [ "$rc" -ne 0 ]; then
+        return 1
+      fi
+    done
+  fi
+}
+
 # check_pr_overlap_result BRANCH LOGIN ALLOWED-NUMBERS [MODE]: compute the normal overlap result.
 check_pr_overlap_result() {
   local branch="$1" me="$2" allowed="$3" mode="${4:-first}"
-  local round line line_i number shared rc snapshot_a snapshot_b
-  local -a lines=() overlapping_records=()
+  local round rc snapshot_a snapshot_b
+  local -a overlapping_records=()
   prepare_overlap_candidates "$branch" || return $?
   for ((round = 1; round <= 3; round++)); do
     if ! snapshot_a="$(list_open_pulls "$me")"; then
       return 1
     fi
     overlapping_records=()
-    if [ -n "$snapshot_a" ]; then
-      mapfile -t lines <<<"$snapshot_a"
-      for ((line_i = 0; line_i < ${#lines[@]}; line_i++)); do
-        line="${lines[line_i]}"
-        [ -n "$line" ] || continue
-        number="${line%% *}"
-        [[ " $allowed " == *" $number "* ]] && continue
-        if shared="$(check_pull_files "$number" "$OVERLAP_CANDIDATES")"; then rc=0; else rc=$?; fi
-        if [ "$rc" -eq 77 ]; then
-          if [ "$mode" = "first" ]; then
-            printf 'ffmpeg-forgejo: own open pull #%s shares files with this branch: %s; use --overlap-ok %s only for a deliberate stack.\n' \
-              "$number" "$shared" "$number" >&2
-            return 77
-          fi
-          overlapping_records+=("$number $shared")
-          continue
-        elif [ "$rc" -ne 0 ]; then
-          return 1
-        fi
-      done
-    fi
+    check_overlap_snapshot "$snapshot_a" "$allowed" "$mode" || return $?
     if ! snapshot_b="$(list_open_pulls "$me")"; then
       return 1
     fi
@@ -1317,9 +1346,34 @@ merge_settings_neutral() {
   merge_info_attributes_neutral
 }
 
+# check_merge_tree_capture STATUS...: validate bounded output before returning the producer status.
+check_merge_tree_capture() {
+  local size
+  local -a pipe_status=("$@")
+  if ! size="$(wc -c <"$MERGE_TREE_OUT")"; then
+    merge_base_cleanup || exit 1
+    printf 'ffmpeg-forgejo: cannot measure merge-tree output; merge with the live base not proven.\n' >&2
+    exit 1
+  fi
+  size="${size//[[:space:]]/}"
+  if [ "$size" -gt "$MERGE_TREE_MAX_BYTES" ]; then
+    merge_base_cleanup || exit 1
+    printf 'ffmpeg-forgejo: merge-tree output exceeds %s bytes; merge with the live base not proven.\n' \
+      "$MERGE_TREE_MAX_BYTES" >&2
+    exit 1
+  fi
+  if [ "${pipe_status[1]:-1}" -ne 0 ]; then
+    merge_base_cleanup || exit 1
+    printf 'ffmpeg-forgejo: merge-tree output capture failed with status %s; merge with the live base not proven.\n' \
+      "${pipe_status[1]:-1}" >&2
+    exit 1
+  fi
+  return "${pipe_status[0]}"
+}
+
 # neutral_merge_tree REF SHA: run merge-tree into MERGE_TREE_OUT with a byte cap, ignoring local attributes, rename settings, replace refs and grafts.
 neutral_merge_tree() {
-  local ref="$1" sha="$2" empty size
+  local ref="$1" sha="$2" empty
   local -a pipe_status=()
   if ! empty="$(timeout 120 git hash-object -t tree --stdin </dev/null)" || [ -z "$empty" ]; then
     merge_base_cleanup || exit 1
@@ -1340,25 +1394,7 @@ neutral_merge_tree() {
   else
     pipe_status=("${PIPESTATUS[@]}")
   fi
-  if ! size="$(wc -c <"$MERGE_TREE_OUT")"; then
-    merge_base_cleanup || exit 1
-    printf 'ffmpeg-forgejo: cannot measure merge-tree output; merge with the live base not proven.\n' >&2
-    exit 1
-  fi
-  size="${size//[[:space:]]/}"
-  if [ "$size" -gt "$MERGE_TREE_MAX_BYTES" ]; then
-    merge_base_cleanup || exit 1
-    printf 'ffmpeg-forgejo: merge-tree output exceeds %s bytes; merge with the live base not proven.\n' \
-      "$MERGE_TREE_MAX_BYTES" >&2
-    exit 1
-  fi
-  if [ "${pipe_status[1]:-1}" -ne 0 ]; then
-    merge_base_cleanup || exit 1
-    printf 'ffmpeg-forgejo: merge-tree output capture failed with status %s; merge with the live base not proven.\n' \
-      "${pipe_status[1]:-1}" >&2
-    exit 1
-  fi
-  return "${pipe_status[0]}"
+  check_merge_tree_capture "${pipe_status[@]}"
 }
 
 # refuse_merge_conflict SHA REF: report conflicting paths after removing private merge state.
@@ -1510,9 +1546,21 @@ finish_landed() {
   exit "$report_status"
 }
 
+# landed_merge_result SHA: set the caller's rc and same_tree from the fetched-base merge.
+landed_merge_result() {
+  local sha="$1" tree base_tree
+  if neutral_merge_tree "$MERGE_BASE_REF" "$sha"; then rc=0; else rc=$?; fi
+  [ "$rc" -le 1 ] || die "merge-tree failed with status $rc; landed status not proven"
+  if [ "$rc" -eq 0 ]; then
+    read -r tree <"$MERGE_TREE_OUT" || die "cannot read landed-check merge tree"
+    base_tree="$(landed_git rev-parse --verify "$MERGE_BASE_REF^{tree}")" || die "cannot read live base tree"
+    if [ "$tree" = "$base_tree" ]; then same_tree=1; fi
+  fi
+}
+
 # check_landed HEAD [sendable]: check landed patches and optional conflict against one fetched base.
 check_landed() (
-  local sha rc tree base_tree same_tree=0 conflict_sha=""
+  local sha rc same_tree=0 conflict_sha=""
   private_cleanup_scope
   MERGE_BASE_REF="refs/ffmpeg-forgejo/landed-base-$$"
   private_temp LANDED_DIR -d || die "cannot create landed-check temporary directory"
@@ -1523,13 +1571,7 @@ check_landed() (
   landed_git merge-base "$MERGE_BASE_REF" "$sha" >/dev/null || die "cannot find landed-check merge base"
   landed_commits "$MERGE_BASE_REF" "$sha" 256 >"$LANDED_DIR/own" || exit 1
   landed_commits "$sha" "$MERGE_BASE_REF" 10000 >"$LANDED_DIR/base" || exit 1
-  if neutral_merge_tree "$MERGE_BASE_REF" "$sha"; then rc=0; else rc=$?; fi
-  [ "$rc" -le 1 ] || die "merge-tree failed with status $rc; landed status not proven"
-  if [ "$rc" -eq 0 ]; then
-    read -r tree <"$MERGE_TREE_OUT" || die "cannot read landed-check merge tree"
-    base_tree="$(landed_git rev-parse --verify "$MERGE_BASE_REF^{tree}")" || die "cannot read live base tree"
-    if [ "$tree" = "$base_tree" ]; then same_tree=1; fi
-  fi
+  landed_merge_result "$sha"
   landed_patch_ids "$LANDED_DIR/own" >"$LANDED_DIR/own.ids" || exit 1
   landed_patch_ids "$LANDED_DIR/base" >"$LANDED_DIR/base.ids" || exit 1
   if [ "${2:-}" = sendable ] && [ "$rc" -eq 1 ]; then conflict_sha="$sha"; fi
@@ -1814,9 +1856,9 @@ for i in json.load(sys.stdin):
       declare body
       private_temp body || exit 1
       echo '{}' >"$body"
-      api POST "/repos/$REPO/forks" "$body" >/dev/null
-      remove_private_files "$body" || exit 1
+      api POST "/repos/$REPO/forks" "$body" --receipt >/dev/null
       echo "forked $REPO to $HOST/$me/${REPO#*/}"
+      remove_private_files "$body" || exit 1
     fi
     ;;
   push)
@@ -1884,10 +1926,11 @@ for i in json.load(sys.stdin):
     fi
     require_swept_fork_head "$me" "$1"
     require_sendable_head "$SWEPT_SHA"
+    require_swept_fork_head "$me" "$1"
     declare body
     private_temp body || exit 1
     json_body "head=$me:$1" "base=$BASE" "title=$2" "body=@$3" >"$body"
-    out="$(api POST "/repos/$REPO/pulls" "$body")" || exit 1
+    out="$(api POST "/repos/$REPO/pulls" "$body" --receipt)" || exit 1
     python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])' <<<"$out"
     remove_private_files "$body" || exit 1
     n="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])' <<<"$out")"
@@ -1965,6 +2008,7 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     fi
     if [ "$claim_mode" = "tested-head" ]; then
       require_unlanded "$tested_live_head"
+      require_tested_head "$1" "$tested_live_head" "$evidence_file"
     fi
     private_temp body || exit 1
     json_body "body=@$snapshot" >"$body"
@@ -1996,8 +2040,9 @@ print(" ".join(users + teams))' "$BOT_REVIEWER")"
     [ "$claim_mode" != "tested-head" ] || require_tested_head "$1" "$tested_head" "$evidence_file"
     if [ "$claim_mode" = "tested-head" ]; then
       require_unlanded "$tested_live_head"
+      require_tested_head "$1" "$tested_live_head" "$evidence_file"
     fi
-    api POST "/repos/$REPO/pulls/$1/reviews/$2/comments" "$reply_payload" >/dev/null
+    api POST "/repos/$REPO/pulls/$1/reviews/$2/comments" "$reply_payload" --receipt >/dev/null
     cleanup_path="$reply_payload"; reply_payload=""
     remove_private_files "$cleanup_path" || exit 1
     out="$(api GET "/repos/$REPO/pulls/$1/reviews/$2/comments")" || die "cannot read back review $2 on #$1"
