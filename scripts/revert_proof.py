@@ -43,12 +43,15 @@ other filesystem encodings retain native decode/encode behavior but are unverifi
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
+import os
 import shlex
 import shutil
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -164,7 +167,7 @@ def worktree_root(tree: Path) -> Path:
     tree = tree.resolve()
     if not tree.is_dir():
         raise _PreflightError(f"work tree not found: {tree}")
-    root = Path(git_out(tree, "rev-parse", "--show-toplevel").strip()).resolve()
+    root = Path(git_out(tree, "rev-parse", "--show-toplevel").removesuffix("\n")).resolve()
     if tree != root:
         raise _PreflightError(f"--tree must name the work tree root {root}: {tree}")
     return root
@@ -230,6 +233,8 @@ def run_test_command(command: list[str], tree: Path, timeout: float) -> int | st
         result = upstream_lint._run(command, tree, timeout=timeout, allow_any_executable=True)
     except OSError:
         return "launch-error"
+    if not result.started:
+        return "launch-error"
     if result.timed_out:
         return "timeout"
     return result.returncode
@@ -290,22 +295,64 @@ def remove_scratch(tree: Path, scratch: Path) -> None:
         raise _ScratchRemovalError(f"scratch removal failed for {scratch}: {'; '.join(failures)}")
 
 
-def clear_record(config: ProofConfig) -> None:
-    """Exclude caller work tree and Git administration before removing an old record."""
-    path = config.record
+def _check_record_location(config: ProofConfig, path: Path) -> None:
+    """Exclude exact caller and Git paths for both the record and its open directory."""
     directories = [config.tree]
     for option in ("--absolute-git-dir", "--git-common-dir"):
-        directory = Path(git_out(config.tree, "rev-parse", option).strip())
+        directory = Path(git_out(config.tree, "rev-parse", option).removesuffix("\n"))
         directories.append((config.tree / directory).resolve())
     for directory in directories[:3]:
         if path.absolute().is_relative_to(directory) or path.resolve().is_relative_to(directory):
             raise _PreflightError(
                 f"--record must be outside the caller tree and Git administration: {path}"
             )
+
+
+def clear_record(config: ProofConfig) -> None:
+    """Exclude caller work tree and Git administration before removing an old record."""
+    path = config.record
+    _check_record_location(config, path)
     try:
         path.unlink(missing_ok=True)
     except OSError as error:
         raise _PreflightError(f"cannot remove old record {path}: {error}") from error
+
+
+def _open_record_directory(config: ProofConfig) -> int:
+    """Pin and validate the output directory before either measurement starts."""
+    # CPython lists rename rather than its replace alias in supports_dir_fd.
+    if os.open not in os.supports_dir_fd or not ({os.rename, os.replace} & os.supports_dir_fd):
+        raise _PreflightError("record write requires dir_fd support for os.open and os.replace")
+    config.record.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(config.record.parent, flags)
+    try:
+        resolved = Path(os.path.realpath(config.record.parent))
+        opened, named = os.fstat(descriptor), os.stat(resolved)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise _PreflightError("record directory changed while opening")
+        _check_record_location(config, resolved)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_record(descriptor: int, name: str, payload: dict[str, object]) -> None:
+    """Publish JSON atomically through the pinned directory and remove failed writes."""
+    temporary = f".revert-proof-{uuid.uuid4().hex}.tmp"
+    file_descriptor = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=descriptor
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, indent=2) + "\n")
+        os.replace(temporary, name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+    except NotImplementedError as error:
+        raise _PreflightError("record write requires dir_fd support for os.replace") from error
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=descriptor)
 
 
 def measure_reverted(
@@ -333,7 +380,10 @@ def measure_reverted(
         *(f":(literal){path}" for path in source_paths[: upstream_lint.MAX_PATHS]),
     )
     applied = upstream_lint._run(
-        ["git", "apply", "-R", "-"], config.tree, data=patch.stdout_bytes, timeout=GIT_TIMEOUT
+        ["git", "apply", "--whitespace=nowarn", "--no-ignore-whitespace", "-R", "-"],
+        config.tree,
+        data=patch.stdout_bytes,
+        timeout=GIT_TIMEOUT,
     )
     if applied.returncode != 0 or applied.timed_out:
         raise _ReverseApplyError(f"reverse apply failed for {commit}: {applied.stdout.strip()}")
@@ -386,20 +436,23 @@ def run_proof(config: ProofConfig) -> None:
     commit, head, head_tree, source_paths, head_ref = prepare_tree(config.tree, config.commit)
     scratch_parent(config.tree)
     clear_record(config)
-    rc_head = measure_scratch(config, head)
-    rc_reverted = measure_scratch(config, head, commit, source_paths)
-    verify_caller_head(config.tree, head, head_ref)
-    payload = {
-        "commit": commit,
-        "head": head,
-        "head_tree": head_tree,
-        "command": config.command,
-        "rc_head": rc_head,
-        "rc_reverted": rc_reverted,
-        "reverted_paths": source_paths,
-    }
-    config.record.parent.mkdir(parents=True, exist_ok=True)
-    config.record.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    descriptor = _open_record_directory(config)
+    try:
+        rc_head = measure_scratch(config, head)
+        rc_reverted = measure_scratch(config, head, commit, source_paths)
+        verify_caller_head(config.tree, head, head_ref)
+        payload = {
+            "commit": commit,
+            "head": head,
+            "head_tree": head_tree,
+            "command": config.command,
+            "rc_head": rc_head,
+            "rc_reverted": rc_reverted,
+            "reverted_paths": source_paths,
+        }
+        _write_record(descriptor, config.record.name, payload)
+    finally:
+        os.close(descriptor)
 
 
 def _error_exit(error: Exception, status: int) -> int:

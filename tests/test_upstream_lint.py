@@ -2341,7 +2341,8 @@ class PipelineTest(FixtureTest):
         )
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
-        self.assertIn("waived: needs a live RTSP server", output)
+        self.assertIn("step: regression-test rc: 0\nwaived: needs a live RTSP server\n", output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: needs a live RTSP server\n", output)
         self.git("commit", "--amend", "-qm", f"{subject}\n\nRename the reply helper.")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
@@ -2362,7 +2363,12 @@ class PipelineTest(FixtureTest):
         )
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
-        self.assertIn("waived: reproducer requires MemorySanitizer", output)
+        self.assertIn(
+            "step: regression-test rc: 0\nwaived: reproducer requires MemorySanitizer\n", output
+        )
+        self.assertIn(
+            "step: revert-proof rc: 0\nwaived: reproducer requires MemorySanitizer\n", output
+        )
         self.git("commit", "--amend", "-qm", "avformat/x: clear keybuffer")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
@@ -2395,7 +2401,8 @@ class PipelineTest(FixtureTest):
             "hardware-only path",
         )
         self.assertEqual(rc, 0, output)
-        self.assertIn("waived: hardware-only path", output)
+        self.assertIn("step: regression-test rc: 0\nwaived: hardware-only path\n", output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: hardware-only path\n", output)
 
     def test_fix_waiver_passes(self) -> None:
         """A non-blank --no-test-reason waives a source fix without a test path."""
@@ -2408,7 +2415,8 @@ class PipelineTest(FixtureTest):
             "hardware-only path",
         )
         self.assertEqual(rc, 0, output)
-        self.assertIn("waived: hardware-only path", output)
+        self.assertIn("step: regression-test rc: 0\nwaived: hardware-only path\n", output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: hardware-only path\n", output)
 
     def test_blank_waiver_fails(self) -> None:
         """Whitespace-only --no-test-reason does not waive a missing regression test."""
@@ -2460,7 +2468,14 @@ class PipelineTest(FixtureTest):
             "the parser runs only behind a hardware decoder",
         )
         self.assertEqual(rc, 0, output)
-        self.assertIn("waived: the parser runs only behind a hardware decoder", output)
+        self.assertIn(
+            "step: regression-test rc: 0\nwaived: the parser runs only behind a hardware decoder\n",
+            output,
+        )
+        self.assertIn(
+            "step: revert-proof rc: 0\nwaived: the parser runs only behind a hardware decoder\n",
+            output,
+        )
 
     def test_unreached_fix_blank_waiver_fails(self) -> None:
         """Whitespace-only --no-test-reason does not waive an unreached source fix."""
@@ -3315,12 +3330,22 @@ class RealToolsTest(FixtureTest):
 class RunnerTest(unittest.TestCase):
     """Exercise real subprocess deadlines and byte-preserving Git output."""
 
+    def test_git_result_rejects_timeout_with_zero_exit(self) -> None:
+        """A timed-out Git result is refused even if the child raced to exit zero."""
+        result = upstream_lint.RunResult(("git", "show"), 0, "partial", timed_out=True)
+        with (
+            unittest.mock.patch.object(upstream_lint, "_run", return_value=result),
+            self.assertRaisesRegex(RuntimeError, r"rc=0.*timed out"),
+        ):
+            upstream_lint._git_result(Path.cwd(), "show", "HEAD:config")
+
     def test_non_allow_listed_executable_refused(self) -> None:
         """Unknown executable basenames return rc 2 without invoking Popen."""
         with unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen:
             popen.return_value.__enter__.return_value.communicate.return_value = (b"", None)
             result = upstream_lint._run(["/unused/not-allowed"], Path.cwd())
         self.assertEqual(result.returncode, 2)
+        self.assertFalse(result.started)
         self.assertIn("executable refused", result.stdout)
         popen.assert_not_called()
         self.assertIsInstance(result, upstream_lint.RunResult)
@@ -4291,6 +4316,31 @@ class RevertProofStepTest(FixtureTest):
         rc, output = self.check("--revert-proof", str(record_file))
         self.assertEqual(rc, 0, output)
         self.assertIn("step: revert-proof rc: 0", output)
+
+    def test_unmatched_record_error_does_not_suppress_missing_proof(self) -> None:
+        """An unbound parse error stays at step scope beside the commit's missing proof."""
+        commit, _, _ = self.add_fix_commit()
+        record = self.root.parent / "invalid-record.json"
+        record.write_text("not JSON", encoding="utf-8")
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y: no revert-proof record", step.output)
+        error = f"{record}: not valid JSON"
+        self.assertEqual(step.output.splitlines().count(error), 1, step.output)
+        self.assertEqual(step.output.count(error), 1, step.output)
+
+    def test_message_only_replace_ref_cannot_hide_fix(self) -> None:
+        """A replacement with identical parents cannot hide a stored fix by renaming it."""
+        commit, _, _ = self.add_fix_commit()
+        self.git("commit", "--amend", "-qm", "avfilter/vf_x: rename helper")
+        replacement = self.git("rev-parse", "HEAD").strip()
+        self.git("reset", "--hard", commit)
+        self.git("replace", commit, replacement)
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn("replace refs", step.output)
+        self.assertNotIn("no revert-proof record", step.output)
 
     def test_step_refuses_missing_record(self) -> None:
         """A fix commit with no revert-proof record fails and names the commit and subject."""

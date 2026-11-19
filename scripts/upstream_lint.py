@@ -416,6 +416,7 @@ class RunResult:
     stdout: str
     timed_out: bool = False
     stdout_bytes: bytes = b""
+    started: bool = True
 
 
 @dataclass(frozen=True)
@@ -574,7 +575,7 @@ def _run(
         try:
             _validate_executable(argv)
         except ValueError as error:
-            return RunResult(tuple(argv), 2, str(error))
+            return RunResult(tuple(argv), 2, str(error), started=False)
     if _DEADLINE.get() is not None:
         timeout = min(timeout, _remaining(timeout + REAP_TIMEOUT) - REAP_TIMEOUT)
         if timeout <= 0:
@@ -582,7 +583,7 @@ def _run(
     try:
         environment = _command_environment(os.environ, cwd)
     except ValueError as error:
-        return RunResult(tuple(argv), 2, str(error))
+        return RunResult(tuple(argv), 2, str(error), started=False)
     with subprocess.Popen(  # nosec B603 - _validate_executable enforces the tool allow-list.
         argv,
         cwd=cwd,
@@ -615,8 +616,11 @@ def _run(
 def _git_result(tree: Path, *args: str) -> RunResult:
     """Return checked Git bytes and text or raise with the captured failure."""
     result: RunResult = _run(["git", *args], tree)
-    if result.returncode:
-        raise RuntimeError(f"git {shlex.join(args)}: rc={result.returncode}\n{result.stdout}")
+    if result.returncode or result.timed_out:
+        timeout = " (timed out)" if result.timed_out else ""
+        raise RuntimeError(
+            f"git {shlex.join(args)}: rc={result.returncode}{timeout}\n{result.stdout}"
+        )
     return result
 
 
@@ -1638,7 +1642,7 @@ def _commit_paths(tree: Path, commit: str) -> list[str]:
 
 
 def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -> str | None:
-    """Compare stored and visible parents to distinguish real roots from hidden ancestry."""
+    """Reject hidden ancestry and replace refs that change stored commit content."""
     raw = _git(
         tree,
         "-c",
@@ -1658,6 +1662,8 @@ def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -
             f"{commit}: history is incomplete; fetch missing parents with git fetch --unshallow "
             "or git fetch --deepen=<commits>, or restore parents hidden by grafts/replace refs"
         )
+    if raw != _git(tree, "cat-file", "commit", commit):
+        return f"{commit}: history content changed by replace refs; restore stored commit content"
     return None
 
 
@@ -1961,10 +1967,9 @@ def _commit_revert_findings(
 ) -> list[str]:
     """Return the revert-proof findings for one source fix commit."""
     commit, subject, names = fix
-    by_commit, errors_by_commit, unmatched_errors = loaded
+    by_commit, errors_by_commit, _ = loaded
     prefix = f"{commit[:12]}: {subject}"
-    raw_errors = [*errors_by_commit.get(commit, ()), *unmatched_errors]
-    unmatched_errors.clear()
+    raw_errors = errors_by_commit.get(commit, [])
     findings = [f"{prefix}: {err}" for err in raw_errors[:MAX_PATHS]]
     if not names:
         findings.append(
@@ -2012,8 +2017,8 @@ def _revert_proof(
     head_tree = _git(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
     fix_ids = frozenset(commit for commit, _, _ in fixes[:MAX_CLAIM_COMMITS])
     loaded = _load_revert_proofs(tuple(records), fix_ids)
-    findings: list[str] = list(history_errors)
-    unproved: list[str] = list(history_errors)
+    findings: list[str] = [*history_errors, *loaded[2]]
+    unproved: list[str] = list(findings)
     for fix in fixes[:MAX_CLAIM_COMMITS]:
         commit, subject, _ = fix
         commit_findings = _commit_revert_findings(tree, fix, head_tree, loaded)

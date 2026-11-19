@@ -593,7 +593,7 @@ class DisplayBoundaryTest(RevertProofFixture):
         fix = self.make_fix()
         error = UnicodeEncodeError("utf-8", "\udcff", 0, 1, "planted record failure")
         with (
-            unittest.mock.patch.object(Path, "write_text", side_effect=error),
+            unittest.mock.patch.object(json, "dumps", side_effect=error),
             unittest.mock.patch.object(revert_proof, "measure_scratch", return_value=0),
         ):
             buffer = io.StringIO()
@@ -612,6 +612,9 @@ class DisplayBoundaryTest(RevertProofFixture):
             with unittest.mock.patch.object(sys, "stderr", buffer):
                 self.assertEqual(revert_proof.main(argv), 2)
         self.assertEqual(buffer.getvalue(), f"revert_proof: {error}\n")
+
+        self.assertFalse(self.record_path.exists())
+        self.assertEqual(list(self.root.glob(".revert-proof-*.tmp")), [])
 
     def test_base_file_preserves_non_utf8_blob_bytes(self) -> None:
         """Base scripts keep every original byte for consumers such as bash that read bytes."""

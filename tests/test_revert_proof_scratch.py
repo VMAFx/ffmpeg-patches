@@ -30,6 +30,140 @@ from tests.revert_proof_helpers import (
 class RevertProofScratchTest(RevertProofFixture):
     """Check revert-proof scratch behavior using isolated Git fixtures."""
 
+    def test_environment_refusal_is_no_verdict(self) -> None:
+        """An environment refusal in either phase cannot publish a test verdict."""
+        fix = self.make_fix()
+        real_command = revert_proof.run_test_command
+        for refused_phase in (1, 2):
+            calls = 0
+
+            def refuse_environment(command, tree, timeout, phase=refused_phase):
+                """Refuse only the selected test launch without affecting Git commands."""
+                nonlocal calls
+                calls += 1
+                if calls == phase:
+                    with unittest.mock.patch.object(
+                        upstream_lint, "_command_environment", side_effect=ValueError("refused")
+                    ):
+                        result = real_command(command, tree, timeout)
+                    self.assertEqual(result, "launch-error")
+                    return result
+                return real_command(command, tree, timeout)
+
+            with unittest.mock.patch.object(
+                revert_proof, "run_test_command", side_effect=refuse_environment
+            ):
+                rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+            self.assertEqual(rc, 3, error)
+            self.assertIn("launch-error", error)
+            if refused_phase == 2:
+                self.assertIn("no verdict", error)
+            self.assertFalse(self.record_path.exists())
+
+    def test_started_exit_two_is_a_verdict(self) -> None:
+        """A real reverted child exiting two keeps its measured status in the record."""
+        fix = self.make_fix()
+        command = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; "
+            "raise SystemExit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 2)",
+        ]
+        rc, _, error = self.run_cli(fix, command)
+        self.assertEqual(rc, 0, error)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["rc_reverted"], 2)
+
+    def test_record_parent_swap_cannot_write_inside_caller(self) -> None:
+        """Swapping the checked parent to a caller symlink keeps publication on its handle."""
+        fix = self.make_fix()
+        parent, held = self.root / "records", self.root / "held-records"
+        self.record_path = parent / "record.json"
+        parent.mkdir()
+        real_measure = revert_proof.measure_scratch
+
+        def swap_after_head(config, head, commit=None, source_paths=None):
+            """Move the checked directory after the first measurement and plant a symlink."""
+            result = real_measure(config, head, commit, source_paths)
+            if commit is None:
+                parent.rename(held)
+                parent.symlink_to(self.tree, target_is_directory=True)
+            return result
+
+        with unittest.mock.patch.object(
+            revert_proof, "measure_scratch", side_effect=swap_after_head
+        ):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, error)
+        self.assertFalse((self.tree / "record.json").exists())
+        payload = json.loads((held / "record.json").read_text(encoding="utf-8"))
+        expected = self.valid_record(fix, rc_reverted=0)
+        self.assertEqual(payload, expected)
+        self.assertEqual(list(held.iterdir()), [held / "record.json"])
+
+    def test_failed_record_replace_removes_temporary_file(self) -> None:
+        """A failed atomic publication leaves no record or temporary file behind."""
+        fix = self.make_fix()
+        self.record_path = self.root / "records" / "record.json"
+        with unittest.mock.patch.object(os, "replace", side_effect=OSError("publish failed")):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 2, error)
+        self.assertIn("publish failed", error)
+        self.assertEqual(list(self.record_path.parent.iterdir()), [])
+
+    def test_record_write_requires_directory_fd_support(self) -> None:
+        """Unsupported directory-relative writes fail explicitly before measurements."""
+        fix = self.make_fix()
+        with unittest.mock.patch.object(os, "supports_dir_fd", set()):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("dir_fd support for os.open and os.replace", error)
+        self.assertFalse(self.record_path.exists())
+
+    def test_reverse_apply_preserves_parent_whitespace_despite_git_config(self) -> None:
+        """Reverse apply restores exact parent bytes despite apply.whitespace=fix."""
+        parent_source = BASE_SOURCE.replace("return 1;", "return 1; ")
+        self.write("libavfilter/vf_x.c", parent_source)
+        parent = self.commit("avfilter/vf_x: initial whitespace fixture")
+        fix = self.make_fix()
+        run_git(self.tree, "config", "apply.whitespace", "fix", preserve_config=True)
+        parent_blob = revert_proof.git_result(
+            self.tree, "show", f"{parent}:libavfilter/vf_x.c"
+        ).stdout_bytes
+        command = [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; "
+            "data = Path('libavfilter/vf_x.c').read_bytes(); "
+            "fixed = b'return 2;' in data; "
+            f"assert fixed or data == {parent_blob!r}; raise SystemExit(0 if fixed else 7)",
+        ]
+        rc, _, error = self.run_cli(fix, command)
+        self.assertEqual(rc, 0, error)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["rc_reverted"], 7)
+
+    def test_worktree_root_preserves_trailing_space(self) -> None:
+        """Only Git's terminating newline is removed from a caller path."""
+        tree = self.root / "caller "
+        tree.mkdir()
+        with unittest.mock.patch.object(revert_proof, "git_out", return_value=f"{tree}\n"):
+            self.assertEqual(revert_proof.worktree_root(tree), tree)
+
+    def test_record_check_preserves_git_directory_trailing_space(self) -> None:
+        """A Git administration path ending in a space remains excluded from record writes."""
+        administration = self.root / "git admin "
+        administration.mkdir()
+        record = administration / "record.json"
+        record.write_text("old record", encoding="utf-8")
+        config = revert_proof.ProofConfig(self.tree, self.base, record, 1, ["unused"])
+        with (
+            unittest.mock.patch.object(revert_proof, "git_out", return_value=f"{administration}\n"),
+            self.assertRaisesRegex(ValueError, "outside the caller tree"),
+        ):
+            revert_proof.clear_record(config)
+        self.assertEqual(record.read_text(encoding="utf-8"), "old record")
+
     def test_reverted_run_starts_without_head_build_artifacts(self) -> None:
         """Both runs start fresh even when HEAD creates ignored and untracked build files."""
         self.write(".gitignore", "build/\nignored-user.txt\n")
@@ -359,7 +493,7 @@ class RevertProofScratchTest(RevertProofFixture):
         def interrupt_apply(argv: list[str], cwd: Path, *args: object, **kwargs: object):
             """Apply the actual patch before raising an interrupt at the return boundary."""
             result = real_run(argv, cwd, *args, **kwargs)
-            if argv[:3] == ["git", "apply", "-R"]:
+            if argv[:2] == ["git", "apply"] and "-R" in argv:
                 self.assertEqual(result.returncode, 0)
                 self.assertTrue((cwd / "libavfilter/old.c").exists())
                 raise KeyboardInterrupt
@@ -485,10 +619,11 @@ class RevertProofScratchTest(RevertProofFixture):
         self.record_path.write_text("old proof\n", encoding="utf-8")
         script = (
             "from pathlib import Path; "
-            f"assert not Path({str(self.record_path)!r}).exists(); raise SystemExit(1)"
+            f"assert not Path({str(self.record_path)!r}).exists(); raise SystemExit(7)"
         )
         rc, _, err = self.run_cli(fix, [sys.executable, "-c", script])
         self.assertEqual(rc, 3, err)
+        self.assertIn("rc=7", err)
         self.assertFalse(self.record_path.exists())
 
     def test_unremovable_old_record_refuses_before_runs(self) -> None:
