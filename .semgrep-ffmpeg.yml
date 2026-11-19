@@ -31,33 +31,36 @@ rules:
           return ...;
 
   # Derive pointers after checking allocation results (review of upstream FFmpeg pull request 25480, November 2026):
-  # in one function, a pointer from an allocation call feeds a NULL-fallback ternary with no
-  # earlier if directly testing the allocated pointer for NULL or non-NULL (bare, negated,
-  # double-negated, or compared with NULL or 0, with no cast), including
-  # a direct test as a whole AND/OR operand, followed by a NULL check of the pointer or destination.
+  # in one function, an allocated pointer feeds a NULL-fallback ternary followed by a
+  # NULL check of the pointer or destination. Earlier checks never exclude a match.
+  # Unchecked allocation: add a failure check and return the error before deriving pointers.
+  # Checked earlier: the ternary null test is redundant; remove it, or retain it with
+  # an adjacent rule-specific suppression comment and a semgrep-reason explaining why.
+  # No control flow, data flow, macro expansion, alias tracking, or struct-member tracking.
+  # Original eight scope pins (syntactic matches, not proof of safety or reachability):
   # - use-before-check: reported by plain shape
   # - log-only-later-check: reported by plain shape
   # - stale-later-check: reported by plain shape
-  # - macro-assertion-before-ternary: reported by plain shape
-  # - reassigned-buffer-before-ternary: reported by plain shape
-  # - earlier-destination-check: reported by plain shape
-  # - cast-in-earlier-check: reported by plain shape
   # - second-ternary: reported by plain shape
-  # - conditional-early-check: not seen
-  # - earlier-allocation-check: not seen
-  # - goto-into-ternary: not seen
-  # - unbraced-inner-loop-break: not seen
+  # - conditional-early-check: now reported, redundant reading
+  # - earlier-allocation-check: now reported, without data flow
+  # - goto-into-ternary: now reported, without control flow
+  # - unbraced-inner-loop-break: now reported, without control flow
+  # Additional pins: macro-assertion-before-ternary, reassigned-buffer-before-ternary,
+  # earlier-destination-check, and cast-in-earlier-check are reported by plain shape.
+  # Outside the shape: no later check, other function/variable, non-allocator call,
+  # no ternary, non-NULL fallback, wrapped ternary, alias-only or member-only checks.
   # Pinned in tests/test_semgrep_rules.py.
   - id: ffmpeg-null-ternary-after-allocation
     languages: [c]
     severity: ERROR
     message: >-
-      The allocation is checked anyway; check it first and derive the pointer
-      after the check instead of using a ternary with a NULL fallback. This
-      rule reports only functions with no earlier if directly testing the allocated
-      pointer for NULL/non-NULL (bare, negated, double-negated, or compared with
-      NULL or 0, without casts) before the ternary and does not follow control or
-      data flow, see casts in earlier checks, or expand assertion macros.
+      An allocated buffer feeds a NULL-fallback ternary before a later NULL check.
+      If the allocation has no failure check, add one and return the error before
+      deriving the pointer. If the buffer was checked earlier, the ternary null
+      test is redundant: remove it, or keep it with a rule-specific suppression
+      comment and a semgrep-reason stating why. This syntactic rule does not see
+      control flow, data flow, macro expansion, aliases, or struct members.
     patterns:
       - pattern-either:
           - pattern-inside: |
@@ -123,145 +126,4 @@ rules:
           - pattern: '$DST = $BUF == NULL ? NULL : $VALUE;'
           - pattern: '$DST_TYPE *$DST = NULL == $BUF ? NULL : $VALUE;'
           - pattern: '$DST = NULL == $BUF ? NULL : $VALUE;'
-      # Bind allocation and whole if condition in the same pattern, including nested ifs.
-      - pattern-not-inside:
-          patterns:
-            - pattern-either:
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (!$BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (!!$BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF == NULL) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (NULL == $BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF != NULL) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (NULL != $BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF == 0) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (0 == $BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF != 0) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (0 != $BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && !$BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && !!$BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF == NULL && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && NULL == $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF != NULL && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && NULL != $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF == 0 && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && 0 == $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF != 0 && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && 0 != $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || !$BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || !!$BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF == NULL || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || NULL == $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF != NULL || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || NULL != $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF == 0 || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || 0 == $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF != 0 || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || 0 != $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (!$BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (!!$BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF == NULL) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (NULL == $BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF != NULL) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (NULL != $BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF == 0) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (0 == $BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if ($BUF != 0) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (0 != $BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && !$BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && !!$BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF == NULL && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && NULL == $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF != NULL && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && NULL != $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF == 0 && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && 0 == $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && $BUF != 0 && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... && 0 != $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || !$BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || !!$BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF == NULL || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || NULL == $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF != NULL || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || NULL != $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF == 0 || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || 0 == $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || $BUF != 0 || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$EARLY_TYPE *$BUF = ...; ... if (... || 0 != $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (!$BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (!!$BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF == NULL) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (NULL == $BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF != NULL) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (NULL != $BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF == 0) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (0 == $BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF != 0) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (0 != $BUF) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && !$BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && !!$BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF == NULL && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && NULL == $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF != NULL && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && NULL != $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF == 0 && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && 0 == $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF != 0 && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && 0 != $BUF && ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || !$BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || !!$BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF == NULL || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || NULL == $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF != NULL || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || NULL != $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF == 0 || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || 0 == $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF != 0 || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || 0 != $BUF || ...) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (!$BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (!!$BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF == NULL) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (NULL == $BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF != NULL) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (NULL != $BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF == 0) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (0 == $BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if ($BUF != 0) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (0 != $BUF) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && !$BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && !!$BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF == NULL && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && NULL == $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF != NULL && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && NULL != $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF == 0 && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && 0 == $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && $BUF != 0 && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... && 0 != $BUF && ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || !$BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || !!$BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF == NULL || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || NULL == $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF != NULL || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || NULL != $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF == 0 || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || 0 == $BUF || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || $BUF != 0 || ...) { ... } ... $DST = $TERNARY;'
-                - pattern: '$BUF = ...; ... if (... || 0 != $BUF || ...) { ... } ... $DST = $TERNARY;'
-            # No cast of any type inside an accepted earlier check.
-            - pattern-not: '$EARLY_TYPE *$BUF = ...; ... if (<... ($CAST_TYPE)<... $BUF ...> ...>) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-            - pattern-not: '$EARLY_TYPE *$BUF = ...; ... if (<... ($CAST_TYPE)<... $BUF ...> ...>) { ... } ... $DST = $TERNARY;'
-            - pattern-not: '$BUF = ...; ... if (<... ($CAST_TYPE)<... $BUF ...> ...>) { ... } ... $DST_TYPE *$DST = $TERNARY;'
-            - pattern-not: '$BUF = ...; ... if (<... ($CAST_TYPE)<... $BUF ...> ...>) { ... } ... $DST = $TERNARY;'
       - focus-metavariable: $TERNARY
