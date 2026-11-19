@@ -141,11 +141,10 @@ Metadata keys:
 The series carries one form of each patch: the one for the pinned release.
 The `upstream` link records the submission, which may target master or a
 release branch. For a `submitted` patch, optional
-`master_form = { base = "<40-hex>", head = "<40-hex>" }` records the merge
-base the forge reports for the PR against the branch it targets, and the PR's
-head commit.
+`master_form = { base = "<40-hex>", head = "<40-hex>" }` records the PR API's
+current `merge_base` as `base` and `head.sha` as `head`.
 Update these ids whenever the PR is pushed again. For a `merged` patch,
-optional `upstream_commit = "<40-hex>"` records the commit carrying the fix
+optional `upstream_commit = "<40-hex>"` must name the commit carrying the fix
 on FFmpeg master. All ids must be full lowercase commit hashes.
 A patch whose release form has no single master form (for example, one split
 into several upstream pull requests) records
@@ -509,6 +508,10 @@ fields, set the checked date to today in UTC and regenerate the table.
 `--fix` also moves the status of each linked patch sidecar to the repaired
 state (submitted, merged with `upstream_commit`, rejected) and drops a
 `master_form` that the new status no longer allows.
+The inserted `upstream_commit` is the forge's merge commit, which is the
+master commit only when the PR targets master. For a release-targeted PR,
+replace it by hand with the master commit, or use `release_only` without
+`upstream_commit` if no single master form exists.
 Unchanged files keep their bytes and checked date. The README table is checked
 even when the forge records match; `--fix` repairs a stale table without changing
 the checked date. Concurrent edits detected before writing abort the repair
