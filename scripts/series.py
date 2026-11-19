@@ -694,7 +694,7 @@ def check_fixes_issues(entry: dict, where: str, findings: Findings) -> None:
         findings.error(where, f"'fixes_issues' exceeds cap of {MAX_FIXES_ISSUES}")
         return
     for item in issues[:MAX_FIXES_ISSUES]:
-        if type(item) is not int or item <= 0:
+        if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
             findings.error(where, "'fixes_issues' items must be positive integers")
             return
     if len(set(issues)) != len(issues):
@@ -746,10 +746,12 @@ def check_related_item(item: object, where: str, findings: Findings) -> int | No
     if len(findings.errors) != before:
         return None
     number = item["number"]
-    if type(number) is not int or number <= 0:
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
         findings.error(where, "'related' field 'number' must be a positive integer")
     _check_related_fields(item, where, findings)
-    return number if type(number) is int and number > 0 else None
+    return (
+        number if isinstance(number, int) and not isinstance(number, bool) and number > 0 else None
+    )
 
 
 def check_related(entry: dict, where: str, findings: Findings) -> None:

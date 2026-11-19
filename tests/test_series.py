@@ -2045,6 +2045,9 @@ class ContributionsTest(SeriesTestCase):
             ([-3], "entry 1: 'fixes_issues' items must be positive integers"),
             (["1"], "entry 1: 'fixes_issues' items must be positive integers"),
             ([True], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([False], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([1.0], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([None], "entry 1: 'fixes_issues' items must be positive integers"),
             ([5, 5], "entry 1: 'fixes_issues' must not contain duplicates"),
             ([9, 4], "entry 1: 'fixes_issues' must be sorted by number"),
             (
@@ -2056,6 +2059,24 @@ class ContributionsTest(SeriesTestCase):
             with self.subTest(value=value):
                 entries = [self.fx.record(1, fixes_issues=value), self.fx.record(2)]
                 self.assert_error(self.check_with(entries, render=False), expected)
+
+    def test_related_number_rejects_nonintegers_without_returning_them(self) -> None:
+        """Invalid related numbers report an error and return None independently."""
+        for value in (True, False, 1.0, None, 0, -1):
+            with self.subTest(value=value):
+                findings = series.Findings()
+                result = series.check_related_item(
+                    self.related_item(1) | {"number": value}, "entry 1", findings
+                )
+                self.assert_error(findings, "'number' must be a positive integer")
+                self.assertIsNone(result)
+
+    def test_related_number_accepts_positive_integer(self) -> None:
+        """The smallest positive related number returns unchanged without findings."""
+        findings = series.Findings()
+        result = series.check_related_item(self.related_item(1), "entry 1", findings)
+        self.assertEqual(findings.errors, [])
+        self.assertEqual(result, 1)
 
     def test_related_list_and_key_rules_fail_with_position_and_field(self) -> None:
         """Reject non-list related fields, non-object items, unknown keys, missing keys and cap."""

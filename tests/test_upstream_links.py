@@ -277,6 +277,104 @@ class PlantedSceneSadOverlapTest(unittest.TestCase):
         self.assertIn("25805", err)
 
 
+class IntegerContractTest(unittest.TestCase):
+    """Keep JSON booleans outside every integer decision in the watcher."""
+
+    def test_normalize_number_rejects_nonintegers(self) -> None:
+        """Both booleans, a float and null fail the normalized number check."""
+        for value in (True, False, 1.0, None, 0, -1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(upstream_links.DriftError, "invalid number"),
+            ):
+                upstream_links.normalize_item({"number": value})
+
+    def test_normalize_number_accepts_positive_integer(self) -> None:
+        """The smallest positive integer remains a normalized pull number."""
+        self.assertEqual(upstream_links.normalize_item(forge_pull(1))["number"], 1)
+
+    def test_pull_api_number_rejects_nonintegers(self) -> None:
+        """Both booleans, a float and null fail before building a pull URL."""
+        for value in (True, False, 1.0, None, 0, -1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(upstream_links.DriftError, "positive integer"),
+            ):
+                upstream_links.pull_api_url(value)
+
+    def test_pull_api_number_accepts_positive_integer(self) -> None:
+        """The smallest positive integer still builds the configured pull URL."""
+        self.assertEqual(upstream_links.pull_api_url(1), f"{API}/pulls/1")
+
+    def test_error_context_rejects_noninteger_numbers(self) -> None:
+        """Invalid numbers never become pull URLs while reporting envelope errors."""
+        for value in (True, False, 1.0, None, 0, -1):
+            with (
+                self.subTest(value=value),
+                unittest.mock.patch.object(upstream_links, "pull_api_url") as address,
+            ):
+                with self.assertRaises(upstream_links.DriftError):
+                    upstream_links.parse_forge_pull({"number": value}, source="listing")
+                address.assert_not_called()
+
+    def test_error_context_accepts_positive_integer(self) -> None:
+        """An otherwise invalid envelope still identifies its positive pull number."""
+        with unittest.mock.patch.object(
+            upstream_links, "pull_api_url", return_value=f"{API}/pulls/1"
+        ) as address:
+            with self.assertRaises(upstream_links.DriftError) as caught:
+                upstream_links.parse_forge_pull({"number": 1}, source="listing")
+            address.assert_called_once_with(1)
+            self.assertIn(f"{API}/pulls/1", str(caught.exception))
+
+    def test_fill_targets_reject_nonintegers(self) -> None:
+        """Boolean aliases of eligible rows cannot bypass fill selection checks."""
+        for value in (True, False, 1.0, None, 0, -1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(upstream_links.DriftError, "positive numbers"),
+            ):
+                upstream_links._fill_targets([manifest_entry(1)], [value])
+
+    def test_fill_targets_accept_positive_integer(self) -> None:
+        """A positive integer selects its eligible manifest row for fill."""
+        self.assertEqual(
+            upstream_links._fill_targets([manifest_entry(1)], [1]),
+            [(1, f"{FORGE}1", set())],
+        )
+
+    def test_fill_window_rejects_nonintegers(self) -> None:
+        """Booleans, a float, null and out-of-range integers cannot select an age."""
+        for value in (True, False, 1.0, None, 0, 366):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(upstream_links.DriftError, "--max-age-days"),
+            ):
+                upstream_links.fill_window(value, TODAY)
+
+    def test_fill_window_accepts_integer_endpoints(self) -> None:
+        """Both inclusive integer endpoints preserve their UTC cutoff dates."""
+        for value, day in ((1, "2026-11-11"), (365, "2025-11-12")):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    upstream_links.fill_window(value, TODAY).isoformat(),
+                    f"{day}T00:00:00+00:00",
+                )
+
+    def test_check_targets_reject_nonintegers(self) -> None:
+        """Both booleans, a float and null cannot add extra check targets."""
+        for value in (True, False, 1.0, None, 0, -1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(upstream_links.DriftError, "invalid --pull number"),
+            ):
+                upstream_links._check_targets([], [value])
+
+    def test_check_targets_accept_positive_integer(self) -> None:
+        """The smallest positive integer remains an extra check target."""
+        self.assertEqual(upstream_links._check_targets([], [1]), [(1, "", set())])
+
+
 class RelatedAndOverlapsPureTest(unittest.TestCase):
     """Pure unit tests for related_for, overlaps and body_issues."""
 
@@ -1508,7 +1606,7 @@ class ForgeFileCountTest(unittest.TestCase):
     def test_wrong_count_types_are_not_hidden_by_inline_names(self) -> None:
         """Reject malformed counts even when a valid inline files list is present."""
         for candidate in (False, True):
-            for value in ("15", True, -1, {}, [], None, 1.5):
+            for value in ("15", True, False, -1, {}, [], None, 1.5):
                 with self.subTest(candidate=candidate, value=value):
                     raw = COUNT_PULL | {"changed_files": value, "files": ["file-0.c"]}
                     answers = self.candidate_answers() if candidate else dict(self.answers)

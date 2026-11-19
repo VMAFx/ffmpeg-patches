@@ -364,7 +364,7 @@ def normalize_item(
     if not isinstance(raw, dict):
         raise DriftError("pull or candidate is not an object")
     number = raw.get("number")
-    if type(number) is not int or number <= 0:
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
         raise DriftError(f"invalid number: {number!r}")
     title = raw.get("title")
     if not isinstance(title, str) or not title.strip():
@@ -552,7 +552,7 @@ def body_issues(body: object, *, number: int | None = None) -> list[int]:
 
 def pull_api_url(number: int, url: str = "") -> str:
     """Return the Forgejo API URL for pull request number, validating url when given."""
-    if type(number) is not int or number <= 0:
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
         raise DriftError(f"pull request number must be a positive integer: {number!r}")
     if url:
         return upstream_drift.api_url(url, number)
@@ -710,7 +710,9 @@ def _require_forge_envelope(raw: object) -> dict:
 def _forge_files(raw: dict, partial: bool) -> FileNames:
     """Read forge names only from a list and validate the separate changed-file count."""
     count = raw.get("changed_files")
-    if "changed_files" in raw and (type(count) is not int or count < 0):
+    if "changed_files" in raw and (
+        not isinstance(count, int) or isinstance(count, bool) or count < 0
+    ):
         raise DriftError(
             f"invalid changed_files: found {type(count).__name__}; expected nonnegative integer"
         )
@@ -752,7 +754,7 @@ def parse_forge_pull(
         where = source
         if isinstance(raw, dict):
             number = raw.get("number")
-            if type(number) is int and number > 0:
+            if isinstance(number, int) and not isinstance(number, bool) and number > 0:
                 address = pull_api_url(number)
                 where = f"{where}: {address}" if where and where != address else address
         raise DriftError(f"{where or 'pull request'}: {exc}") from exc
@@ -1012,7 +1014,9 @@ def merge_related(existing: list[dict], fresh: list[RelatedRow]) -> list[dict]:
 def _fill_targets(entries: list[dict], pulls: list[int]) -> list[tuple[int, str, set[int]]]:
     """Limit fill to eligible manifest rows and reject invalid selections before fetching."""
     cap = upstream_drift.MAX_SERIES_ENTRIES
-    if len(pulls) > cap or any(type(num) is not int or num <= 0 for num in pulls[:cap]):
+    if len(pulls) > cap or any(
+        not isinstance(num, int) or isinstance(num, bool) or num <= 0 for num in pulls[:cap]
+    ):
         raise DriftError(f"--pull requires at most {cap} positive numbers")
     eligible = {int(e["number"]): e for e in entries[:cap] if e["state"] in ("open", "merged")}
     requested = set(pulls) or set(eligible)
@@ -1043,8 +1047,10 @@ def _fill_entry(entry: dict, own: dict, related: list[RelatedRow]) -> str:
 
 def fill_window(max_age_days: int, today: date | None = None) -> datetime:
     """Resolve the bounded fill age to UTC midnight, rejecting invalid ages and underflow."""
-    if type(max_age_days) is not int or not (
-        MIN_FILL_MAX_AGE_DAYS <= max_age_days <= MAX_FILL_MAX_AGE_DAYS
+    if (
+        not isinstance(max_age_days, int)
+        or isinstance(max_age_days, bool)
+        or not (MIN_FILL_MAX_AGE_DAYS <= max_age_days <= MAX_FILL_MAX_AGE_DAYS)
     ):
         raise DriftError(
             f"--max-age-days must be an integer from {MIN_FILL_MAX_AGE_DAYS} "
@@ -1220,7 +1226,7 @@ def _check_targets(entries: list[dict], extra_pulls: list[int]) -> list[tuple[in
             targets.append((num, entry["url"], recorded))
             seen.add(num)
     for num in extra_pulls[:cap]:
-        if type(num) is not int or num <= 0:
+        if not isinstance(num, int) or isinstance(num, bool) or num <= 0:
             raise DriftError(f"invalid --pull number: {num!r}")
         if num in seen:
             continue

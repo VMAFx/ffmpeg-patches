@@ -119,6 +119,38 @@ class Fixture:
 class ResponseReadTest(unittest.TestCase):
     """Pin bounded transport failures with in-memory response objects."""
 
+    def test_non_https_urls_are_refused_before_request_or_open(self) -> None:
+        """File, plain HTTP and FTP URLs fail before request construction or opening."""
+        for url in (
+            "file:///unused.json",
+            "http://example.invalid/data",
+            "ftp://example.invalid/data",
+        ):
+            with (
+                self.subTest(url=url),
+                patch.object(upstream_drift.urllib.request, "urlopen") as opener,
+                patch.object(upstream_drift.urllib.request, "Request") as request,
+            ):
+                with self.assertRaises(upstream_drift.DriftError) as caught:
+                    upstream_drift.fetch_json(url)
+                opener.assert_not_called()
+                request.assert_not_called()
+                self.assertIn(url, str(caught.exception))
+                self.assertIn("https", str(caught.exception))
+
+    def test_https_url_reaches_opener(self) -> None:
+        """An HTTPS URL still opens with the JSON Accept header and timeout."""
+        url = f"{API}1"
+        with patch.object(
+            upstream_drift.urllib.request, "urlopen", return_value=io.BytesIO(b"{}")
+        ) as opener:
+            self.assertEqual(upstream_drift.fetch_json(url), {})
+        opener.assert_called_once()
+        args, kwargs = opener.call_args
+        self.assertEqual(args[0].full_url, url)
+        self.assertEqual(args[0].get_header("Accept"), "application/json")
+        self.assertEqual(kwargs, {"timeout": upstream_drift.REQUEST_TIMEOUT})
+
     def test_declared_response_length_rejects_a_short_valid_json_body(self) -> None:
         """Valid JSON is still incomplete when fewer than the declared bytes arrive."""
         answer = io.BytesIO(b"{}")

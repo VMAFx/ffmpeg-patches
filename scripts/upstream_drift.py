@@ -31,6 +31,7 @@ import json
 import re
 import sys
 import tomllib
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -151,10 +152,12 @@ def read_response(answer: object, url: str) -> bytes:
 def fetch_json(
     url: str, *, allow_list: bool = False, response_headers: dict[str, str] | None = None
 ) -> dict | list:
-    """Fetch and decode a JSON object, or a list when allow_list is set, from the forge."""
+    """Fetch HTTPS JSON as an object, or a list when allow_list is set."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise DriftError(f"{url}: URL scheme must be https")
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as answer:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as answer:  # nosec B310 - https scheme checked above.
             if response_headers is not None:
                 response_headers.clear()
                 for key in ("Link", "X-Total-Count"):
