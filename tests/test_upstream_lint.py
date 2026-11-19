@@ -24,7 +24,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
-from tests.test_revert_proof import clone_shallow_side_fix
+from tests.revert_proof_helpers import clone_shallow_side_fix
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402

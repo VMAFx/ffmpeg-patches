@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Measure whether a regression test fails when a fix commit's source paths are reverted.
 
-Both commands run in a clean checkout of captured HEAD in detached scratch outside
+Each command runs in its own clean checkout of captured HEAD in detached scratch outside
 the caller; PWD names scratch, absolute paths to tools are allowed, and missing
 caller-only ignored or untracked inputs cause exit 3 without a record.
 The module itself never writes to the caller work tree or index; the test command
@@ -13,7 +13,8 @@ Afterwards the module detects only a moved head commit of the recorded ref or
 current HEAD; a record binds content (commit and tree), not provenance.
 Tracked changes that Git status shows are refused, and cleanup is attempted after
 every outcome the module survives; input errors mean exit 2, HEAD failure or
-movement means exit 3, reverse-apply failure means exit 4, and scratch removal
+movement or a command launch failure means exit 3 without a record,
+reverse-apply failure means exit 4, and scratch removal
 failure means exit 5 and names its path; an older record is removed before runs
 start, output must be outside the caller work tree and Git administration, and
 the temporary parent must be outside the caller work tree.
@@ -77,10 +78,10 @@ class ProofConfig:
     command: list[str]
 
 
-def git_out(tree: Path, *args: str) -> str:
-    """Run bounded Git, suppressing advice in machine reads, or raise _PreflightError."""
+def git_result(tree: Path, *args: str) -> upstream_lint.RunResult:
+    """Return a checked Git result with both raw stdout and decoded diagnostics."""
     options = (
-        ["--no-advice"]
+        ["-c", "advice.graftFileDeprecated=false"]
         if args and args[0] in ("rev-parse", "diff-tree", "--no-optional-locks")
         else []
     )
@@ -88,7 +89,12 @@ def git_out(tree: Path, *args: str) -> str:
     if result.returncode != 0 or result.timed_out:
         detail = result.stdout.strip() or f"rc={result.returncode}"
         raise _PreflightError(f"git {shlex.join(args)}: {detail}")
-    return result.stdout
+    return result
+
+
+def git_out(tree: Path, *args: str) -> str:
+    """Run bounded Git and return decoded stdout or raise _PreflightError."""
+    return git_result(tree, *args).stdout
 
 
 def tracked_status(tree: Path) -> str:
@@ -205,11 +211,11 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
 
 
 def run_test_command(command: list[str], tree: Path, timeout: float) -> int | str:
-    """Run the test command without a shell and return its exit code or 'timeout'."""
+    """Return a started process exit code, timeout, or a distinct launch-error sentinel."""
     try:
         result = upstream_lint._run(command, tree, timeout=timeout, allow_any_executable=True)
-    except OSError as error:
-        return 127 if error.errno else 1
+    except OSError:
+        return "launch-error"
     if result.timed_out:
         return "timeout"
     return result.returncode
@@ -246,10 +252,22 @@ def cleanup_git(tree: Path, failures: list[str], *args: str) -> None:
         failures.append(f"git {shlex.join(args)}: {error}")
 
 
+def scratch_registered(tree: Path, scratch: Path) -> bool:
+    """Check exact owned scratch registration with unambiguous porcelain paths."""
+    fields = git_out(tree, "worktree", "list", "--porcelain", "-z").split("\0")
+    if len(fields) > upstream_lint.MAX_PATHS:
+        raise _PreflightError("worktree listing exceeds MAX_PATHS")
+    return f"worktree {scratch}" in fields[: upstream_lint.MAX_PATHS]
+
+
 def remove_scratch(tree: Path, scratch: Path) -> None:
     """Remove only owned scratch and its directory, mapping cleanup failures to 5."""
     failures: list[str] = []
-    cleanup_git(tree, failures, "worktree", "remove", "--force", str(scratch))
+    try:
+        if scratch_registered(tree, scratch):
+            cleanup_git(tree, failures, "worktree", "remove", "--force", str(scratch))
+    except (_PreflightError, OSError, RuntimeError, KeyboardInterrupt) as error:
+        failures.append(f"scratch registration lookup: {error}")
     try:
         shutil.rmtree(scratch.parent)
     except (OSError, KeyboardInterrupt) as error:
@@ -282,7 +300,7 @@ def measure_reverted(
     source_paths: list[str],
 ) -> int | str:
     """Reverse-apply only fix source paths in scratch and run the same test command."""
-    patch = git_out(
+    patch = git_result(
         config.tree,
         "diff-tree",
         "--root",
@@ -298,14 +316,17 @@ def measure_reverted(
         "--dst-prefix=b/",
         commit,
         "--",
-        *source_paths,
+        *(f":(literal){path}" for path in source_paths[: upstream_lint.MAX_PATHS]),
     )
     applied = upstream_lint._run(
-        ["git", "apply", "-R", "-"], config.tree, data=patch, timeout=GIT_TIMEOUT
+        ["git", "apply", "-R", "-"], config.tree, data=patch.stdout_bytes, timeout=GIT_TIMEOUT
     )
     if applied.returncode != 0 or applied.timed_out:
         raise _ReverseApplyError(f"reverse apply failed for {commit}: {applied.stdout.strip()}")
-    return run_test_command(config.command, config.tree, config.timeout)
+    result = run_test_command(config.command, config.tree, config.timeout)
+    if result == "launch-error":
+        raise _HeadTestError("test launch-error on reverted checkout (no verdict)")
+    return result
 
 
 def verify_caller_head(tree: Path, head: str, head_ref: str) -> None:
@@ -319,24 +340,40 @@ def verify_caller_head(tree: Path, head: str, head_ref: str) -> None:
             raise _HeadTestError(f"HEAD moved from {head} to {current} ({reference}) in {tree}")
 
 
+def measure_scratch(
+    config: ProofConfig,
+    head: str,
+    commit: str | None = None,
+    source_paths: list[str] | None = None,
+) -> int | str:
+    """Measure one command in its own fresh checkout and always clean its scratch."""
+    directory = Path(
+        tempfile.mkdtemp(prefix="ffmpeg-revert-proof-", dir=scratch_parent(config.tree))
+    )
+    scratch = directory / "tree"
+    scratch_config = ProofConfig(
+        scratch, config.commit, config.record, config.timeout, config.command
+    )
+    try:
+        git_out(config.tree, "worktree", "add", "--detach", str(scratch), head)
+        if commit is not None:
+            return measure_reverted(scratch_config, commit, source_paths or [])
+        result = run_test_command(config.command, scratch, config.timeout)
+        return verify_head_run(scratch, result, head)
+    finally:
+        remove_scratch(config.tree, scratch)
+
+
 def run_proof(config: ProofConfig) -> None:
     """Run both measurements in detached scratch, remove it, then publish the record."""
     config = ProofConfig(
         worktree_root(config.tree), config.commit, config.record, config.timeout, config.command
     )
     commit, head, head_tree, source_paths, head_ref = prepare_tree(config.tree, config.commit)
-    parent = scratch_parent(config.tree)
+    scratch_parent(config.tree)
     clear_record(config)
-    directory = Path(tempfile.mkdtemp(prefix="ffmpeg-revert-proof-", dir=parent))
-    scratch = directory / "tree"
-    scratch_config = ProofConfig(scratch, commit, config.record, config.timeout, config.command)
-    try:
-        git_out(config.tree, "worktree", "add", "--detach", str(scratch), head)
-        raw_head = run_test_command(config.command, scratch, config.timeout)
-        rc_head = verify_head_run(scratch, raw_head, head)
-        rc_reverted = measure_reverted(scratch_config, commit, source_paths)
-    finally:
-        remove_scratch(config.tree, scratch)
+    rc_head = measure_scratch(config, head)
+    rc_reverted = measure_scratch(config, head, commit, source_paths)
     verify_caller_head(config.tree, head, head_ref)
     payload = {
         "commit": commit,
