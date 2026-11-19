@@ -141,8 +141,9 @@ Metadata keys:
 The series carries one form of each patch: the one for the pinned release.
 The `upstream` link records the submission, which may target master or a
 release branch. For a `submitted` patch, optional
-`master_form = { base = "<40-hex>", head = "<40-hex>" }` records the PR's merge
-base with master at submission and its head commit.
+`master_form = { base = "<40-hex>", head = "<40-hex>" }` records the merge
+base the forge reports for the PR against the branch it targets, and the PR's
+head commit.
 Update these ids whenever the PR is pushed again. For a `merged` patch,
 optional `upstream_commit = "<40-hex>"` records the commit carrying the fix
 on FFmpeg master. All ids must be full lowercase commit hashes.
