@@ -211,12 +211,20 @@ The forge helper scripts share configuration through environment variables, impl
 4. Write or update `patches/NNNN-slug.toml` and run `make test`, then
    `make lengths FFMPEG_TREE=ffmpeg` to catch a function grown past the
    60-line cap (HISS-04) before it reaches CI.
-5. When a patch file is renamed, update `series.txt` and rename its `.toml`
-   sidecar to match. If it has an upstream contribution record, update that
-   record in `upstream-contributions.json` and regenerate the table.
+5. If a patch name or number changes, rename any old `.toml` sidecar that
+   export left behind after a slug change to match. Update matching paths
+   and comments in `REUSE.toml`, if present, and any existing record in
+   `upstream-contributions.json`. Update current-series references in
+   sidecar text, `README.md`, `docs/`, `tests/` (including numbered patch
+   lookups), and `.github/workflows/`; preserve historical references and
+   synthetic fixture names. Regenerate the table with
+   `python3 scripts/series.py contributions --write`, then run
+   `python3 scripts/series.py check`. It reports sidecar, contribution
+   record and libplacebo credit mismatches; review other REUSE paths and
+   references by hand.
    Add a record when submitting a patch upstream; keep existing records in
    sync when its `status` or `upstream` link changes, then regenerate the
-   table. `check` names a record that no longer fits.
+   table.
 
 ### Checks
 
