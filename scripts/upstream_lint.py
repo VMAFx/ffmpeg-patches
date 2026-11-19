@@ -84,6 +84,8 @@ look identical, so distinguish them using stored JSON or raw Git path bytes.
 Terminal findings, diagnostics and parser messages escape characters outside the
 destination stream's encoding as visible backslash escapes. Emission failures
 retain the caller's decided status, even when a stream is closed or broken.
+Parser help, usage and errors always use plain text, including on colour terminals;
+formatting never queries the destination stream's file descriptor for colour.
 Optional human reports use UTF-8, retaining valid Unicode and escaping lone
 surrogates; terminal codec fallback does not alter the report file or JSON records.
 End-to-end filename support is claimed only for UTF-8 filesystem encodings;
@@ -207,6 +209,7 @@ finding and prints the reason, and never waives an rc 2 result.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -514,7 +517,13 @@ def emit_text(text: str, stream) -> None:
 
 
 class DisplayArgumentParser(argparse.ArgumentParser):
-    """Escape parser help and error text at argparse's shared output boundary."""
+    """Keep parser formatting plain and escape text at the shared output boundary."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        """Disable colour through the documented switch when the interpreter provides it."""
+        if "color" in inspect.signature(argparse.ArgumentParser).parameters:
+            kwargs["color"] = False
+        super().__init__(*args, **kwargs)
 
     def _print_message(self, message: str | None, file=None) -> None:
         """Render parser messages without changing the arguments being parsed."""

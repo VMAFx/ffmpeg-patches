@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import os
@@ -40,6 +41,16 @@ class DisplayTextTest(unittest.TestCase):
 
 class DisplayBoundaryTest(RevertProofFixture):
     """Exercise CLI display boundaries without requiring byte-named filesystem entries."""
+
+    def setUp(self) -> None:
+        """Pin parser text comparisons to one width and untranslated messages."""
+        super().setUp()
+        columns = unittest.mock.patch.dict(os.environ, {"COLUMNS": "80"})
+        columns.start()
+        self.addCleanup(columns.stop)
+        language = unittest.mock.patch.object(argparse, "_", lambda message: message)
+        language.start()
+        self.addCleanup(language.stop)
 
     def render_step(
         self,
@@ -316,6 +327,78 @@ class DisplayBoundaryTest(RevertProofFixture):
                                 parser.parse_args(argv)
                             self.assertEqual(caught.exception.code, expected)
                         self.assertEqual(stream.write.call_count, 1 if expected == 0 else 2)
+
+    def assert_parser_stream_statuses(self, stream) -> None:
+        """Check formatting, explicit printing and both parser exits on a supplied stream."""
+        for parser in (upstream_lint._parser(), revert_proof.build_parser()):
+            with (
+                unittest.mock.patch.object(sys, "stdout", stream),
+                unittest.mock.patch.object(sys, "stderr", stream),
+            ):
+                self.assertNotIn("\x1b[", parser.format_help())
+                self.assertNotIn("\x1b[", parser.format_usage())
+                parser.print_help()
+                parser.print_usage()
+                for argv, expected in ((["--help"], 0), ([], 2)):
+                    with self.subTest(parser=parser, argv=argv):
+                        with self.assertRaises(SystemExit) as caught:
+                            parser.parse_args(argv)
+                        self.assertEqual(caught.exception.code, expected)
+
+    def test_both_parsers_never_consult_stream_descriptors(self) -> None:
+        """Invalid and raising descriptors cannot affect parser formatting or exit status."""
+        for error in (None, ValueError("closed stream"), io.UnsupportedOperation("fileno")):
+            with self.subTest(error=error):
+                stream = unittest.mock.Mock(encoding="utf-8")
+                stream.fileno.side_effect = error
+                self.assert_parser_stream_statuses(stream)
+                stream.fileno.assert_not_called()
+
+    def test_both_parsers_keep_statuses_with_real_closed_stream(self) -> None:
+        """A real closed file cannot turn help or a usage error into a traceback."""
+        with (self.root / "closed-output.txt").open("w", encoding="utf-8") as stream:
+            self.assertIsInstance(stream.fileno(), int)
+        with self.assertRaises(ValueError):
+            stream.fileno()
+        self.assert_parser_stream_statuses(stream)
+
+    def test_both_parsers_keep_statuses_with_real_detached_stream(self) -> None:
+        """A detached text wrapper cannot replace either parser's decided status."""
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+        buffer = stream.detach()
+        self.addCleanup(buffer.close)
+        with self.assertRaises(ValueError):
+            stream.fileno()
+        self.assert_parser_stream_statuses(stream)
+
+    def test_both_parsers_keep_statuses_without_stream_descriptor(self) -> None:
+        """Writable streams without a descriptor keep plain parser text and both exits."""
+        stream = unittest.mock.Mock(spec=("encoding", "write", "flush"), encoding="utf-8")
+        self.assert_parser_stream_statuses(stream)
+        self.assertTrue(stream.write.called)
+
+    def test_both_parsers_stay_plain_when_color_is_forced(self) -> None:
+        """Even forced terminal colour leaves both tools' help and usage plain."""
+        with unittest.mock.patch.dict(os.environ, {"FORCE_COLOR": "1", "NO_COLOR": ""}):
+            self.assert_parser_stream_statuses(io.StringIO())
+
+    def test_shared_parser_accepts_constructor_without_color_switch(self) -> None:
+        """Interpreters without the colour keyword still construct the shared parser."""
+        descriptions = []
+
+        def legacy_init(parser, *, description):
+            """Model the older constructor's rejection of unknown keyword arguments."""
+            descriptions.append(description)
+
+        with unittest.mock.patch.object(argparse.ArgumentParser, "__init__", legacy_init):
+            upstream_lint.DisplayArgumentParser(description="legacy parser")
+        self.assertEqual(descriptions, ["legacy parser"])
+
+    def test_exact_parser_text_uses_fixed_fixture_width(self) -> None:
+        """Exact parser comparisons use the fixture width despite inherited COLUMNS."""
+        for parser in (upstream_lint._parser(), revert_proof.build_parser()):
+            with self.subTest(parser=parser):
+                self.assertEqual(parser._get_formatter()._width, 78)
 
     def test_byte_name_finding_completes_through_utf8_report(self) -> None:
         """The strict UTF-8 report retains the finding independently of stdout encoding."""
