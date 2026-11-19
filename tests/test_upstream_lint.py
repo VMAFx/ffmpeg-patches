@@ -4404,8 +4404,16 @@ class RevertProofStepTest(FixtureTest):
                 {"head_tree": "Z" * 40},
                 {"command": "pytest"},
                 {"rc_head": True},
+                {"rc_head": False},
+                {"rc_head": 0.0},
+                {"rc_head": None},
+                {"rc_head": []},
                 {"rc_reverted": "other"},
+                {"rc_reverted": True},
                 {"rc_reverted": False},
+                {"rc_reverted": 0.0},
+                {"rc_reverted": None},
+                {"rc_reverted": []},
                 {"reverted_paths": ["b.c", "a.c"]},
             )
         ):
@@ -4418,6 +4426,18 @@ class RevertProofStepTest(FixtureTest):
                 self.assertIn("step: revert-proof rc: 1", output)
                 self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
                 self.assertIn("wrong value type", output)
+
+    def test_record_accepts_return_code_values(self) -> None:
+        """Integer return codes and recognized outcome strings pass record validation."""
+        for rc_head in (0, 1):
+            for rc_reverted in (0, 1, "timeout", "launch-error"):
+                with self.subTest(rc_head=rc_head, rc_reverted=rc_reverted):
+                    payload = self.valid_record(
+                        "a" * 40, "b" * 40, "c" * 40, rc_head=rc_head, rc_reverted=rc_reverted
+                    )
+                    record = self.write_record("proof.json", payload)
+                    result = upstream_lint._read_revert_proof(record)
+                    self.assertEqual(result, (payload, "a" * 40, None))
 
     def test_step_refuses_file_that_is_not_json(self) -> None:
         """A record file that is not valid JSON fails and names the commit and subject."""

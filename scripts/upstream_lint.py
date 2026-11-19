@@ -1846,10 +1846,12 @@ def _revert_proof_type_error(payload: dict[str, object]) -> str | None:
     if not _is_command_list(payload["command"]):
         return "wrong value type for command"
     rc_head = payload["rc_head"]
-    if type(rc_head) is not int:
+    if not isinstance(rc_head, int) or isinstance(rc_head, bool):
         return "wrong value type for rc_head"
     rc_reverted = payload["rc_reverted"]
-    if type(rc_reverted) is not int and rc_reverted not in ("timeout", "launch-error"):
+    if isinstance(rc_reverted, bool) or (
+        not isinstance(rc_reverted, int) and rc_reverted not in ("timeout", "launch-error")
+    ):
         return "wrong value type for rc_reverted"
     paths = payload["reverted_paths"]
     if not _is_nonempty_str_list(paths, MAX_PATHS) or paths != sorted(paths):
