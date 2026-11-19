@@ -11,9 +11,9 @@
 #   ffmpeg-forgejo fork                              ensure <you>/FFmpeg exists
 #   ffmpeg-forgejo push    --sweep <file> [--promises <file>] [--lease <sha>] <local-branch> [<remote-branch>]   push to <you>/FFmpeg (run inside an FFmpeg clone);
 #                          --lease force-pushes only while the remote branch is still <sha>
-#                          --promises maps own comment IDs naming the/my next push/revision/version/iteration/round outside quoted lines to literal fragments in whitespace-normalized commit messages or PR body;
+#                          --promises maps own comment IDs naming the/my next push/revision/version/iteration/round anywhere in their bodies to literal fragments in whitespace-normalized commit messages or PR body;
 #                          A question that names the next push is refused too; the author answers through the unchanged promise file.
-#                          A comment with an own code block and a quoted reviewer sentence naming the marker is refused on purpose; the author answers through the promise file.
+#                          A comment quoting a reviewer sentence naming the marker is refused on purpose; the author answers through the promise file.
 #                          missing or unfulfilled promises exit 79 before Git push
 #   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
@@ -1329,23 +1329,6 @@ def refuse(message: str) -> None:
     print(f"ffmpeg-forgejo: promise: {message}", file=sys.stderr)
     raise SystemExit(79)
 
-
-# No container parsing: drop quoted lines only when unquoted lines lack code fences and HTML starters.
-# A comment with an own code block and a quoted reviewer sentence naming the marker is refused on purpose; the author answers through the promise file.
-def promise_author_text(body: str) -> str:
-    """Drop quoted lines only when unquoted lines lack code fences and HTML starters."""
-    normalized = body.replace("\r\n", "\n").replace("\r", "\n").removeprefix("\ufeff")
-    lines = normalized.split("\n")
-    if len(lines) > 65536:
-        return normalized
-    kept = []
-    for line in lines[:65536]:
-        if re.match(r" {0,3}>", line):
-            continue
-        if "```" in line or "~~~" in line or line.lstrip(" \t").startswith("<"):
-            return normalized
-        kept.append(line)
-    return "\n".join(kept)
 PY
 }
 
@@ -1354,7 +1337,7 @@ PY
 promise_python_comments() {
   cat <<'PY'
 def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
-    """Record a bounded window around the first next-push marker in each own comment."""
+    """Record a bounded window around the first marker anywhere in each own comment."""
     if len(comments) > 1000:
         refuse("too many issue comments")
     found = {}
@@ -1369,7 +1352,9 @@ def promise_rows(comments: list[dict], me: str) -> dict[int, tuple[str, str]]:
         ident = row.get("id")
         if len(body) > 65536 or len(body.encode("utf-8")) > 65536:
             refuse(f"comment {ident}: body exceeds 65536-byte cap")
-        body = promise_author_text(body)
+        body = body.replace("\r\n", "\n").replace("\r", "\n").removeprefix("\ufeff")
+        if body.count("\n") >= 65536:
+            refuse(f"comment {ident}: body exceeds 65536-line cap")
         body = " ".join(body.split())
         match = PATTERN.search(body)
         if match is None:
