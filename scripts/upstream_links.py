@@ -15,18 +15,29 @@
         manifest's checked date minus CHECK_MARGIN_DAYS, or --since DATE.
 
 Exit status: 0 on success or non-overlapping check, 1 on an overlap by
-another author or undecided file comparison in check, 2 on a read or input error,
+another author or undecided file comparison in check, 2 on a read, input or incomplete-scan error,
 3 when fill published the manifest but cleanup left a staging file or lock.
+SCAN_BUDGET_SECONDS bounds a scan to 300 seconds, checked with a monotonic
+clock before pacing, before network I/O and after each fetch; requests reserve
+a full per-operation timeout. Waiting for a fetch also ends at the scan deadline,
+even if its blocking operations keep renewing their timeout. CI gives the
+overlap job twice this budget.
+REQUEST_TIMEOUT is the 30-second timeout of each blocking network operation.
+MAX_RELATED_AUTHOR_CHARS (series) allows at most 256 printable account characters;
+forge and manifest authors share that allow-list, excluding controls and line separators.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import queue
 import re
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,6 +55,8 @@ Sleep = Callable[[float], None]
 DriftError = upstream_drift.DriftError
 REQUEST_TIMEOUT = upstream_drift.REQUEST_TIMEOUT
 REQUEST_PAUSE_SECONDS = 0.5
+# Reserve a complete network timeout before each request; CI allows twice this budget.
+SCAN_BUDGET_SECONDS = 300
 PUBLISHED_WITH_LEFTOVERS = 3
 # Revisit a week around the drift snapshot to cover date granularity and late updates.
 CHECK_MARGIN_DAYS = 7
@@ -68,7 +81,7 @@ MAX_TITLE_CHARS = 4096
 # Cover practical source paths, including rename aliases, without unbounded strings.
 MAX_PATH_CHARS = 4096
 # Account and branch names need much less space than source paths.
-MAX_NAME_CHARS = 256
+MAX_NAME_CHARS = series.MAX_RELATED_AUTHOR_CHARS
 # Permit substantial pull descriptions while bounding regular-expression work.
 MAX_BODY_CHARS = 256 * 1024
 # ISO timestamps with fractional seconds and offsets fit well below this ceiling.
@@ -90,12 +103,69 @@ class _FillChanges(list[str]):
     cleanup_incomplete: bool = False
 
 
+class _ScanReader:
+    """Own one daemon fetch worker and two single-entry queues for a bounded scan."""
+
+    def __init__(self, fetch: Fetch, cap: int) -> None:
+        """Start one worker, retaining no reference from that worker to its owner."""
+        self.tasks: queue.Queue = queue.Queue(maxsize=1)
+        self.answers: queue.Queue = queue.Queue(maxsize=1)
+        self.closed = threading.Event()
+        threading.Thread(
+            target=_fetch_worker,
+            args=(fetch, cap, self.tasks, self.answers, self.closed),
+            daemon=True,
+        ).start()
+
+    def read(self, url: str, remaining: float) -> dict | list:
+        """Wait for this response only until the scan's remaining elapsed budget."""
+        self.tasks.put_nowait(url)
+        try:
+            answer = self.answers.get(timeout=remaining)
+        except queue.Empty as exc:
+            raise DriftError(
+                f"incomplete scan: {SCAN_BUDGET_SECONDS}-second elapsed-time budget exhausted "
+                f"during {url}"
+            ) from exc
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    def close(self) -> None:
+        """Stop an idle worker or let the sole outstanding read finish before stopping."""
+        self.closed.set()
+        # A full queue already wakes the worker, which discards its task when closed.
+        with contextlib.suppress(queue.Full):
+            self.tasks.put_nowait(None)
+
+
+def _fetch_worker(
+    fetch: Fetch, cap: int, tasks: queue.Queue, answers: queue.Queue, closed: threading.Event
+) -> None:
+    """Serve at most the admitted request count, stopping on closure or bounded idle time."""
+    for _ in range(cap):
+        if closed.is_set():
+            return
+        try:
+            url = tasks.get(timeout=SCAN_BUDGET_SECONDS)
+        except queue.Empty:
+            return
+        if url is None or closed.is_set():
+            return
+        try:
+            answer = fetch(url)
+        except BaseException as exc:
+            answer = exc
+        answers.put_nowait(answer)
+
+
 class RequestBudget:
     """Count and pace every injected fetch, failing before a request above the cap."""
 
     def __init__(self, fetch: Fetch, cap: int, sleep: Sleep | None = None) -> None:
         """Create a fresh run counter with an injectable pause function."""
-        self.fetch = fetch
+        self.deadline = time.monotonic() + SCAN_BUDGET_SECONDS
+        self.reader = _ScanReader(fetch, cap)
         self.cap = cap
         self.count = 0
         self.window_start = "not yet read"
@@ -104,16 +174,30 @@ class RequestBudget:
         self.sleep = sleep if sleep is not None else time.sleep
 
     def __call__(self, url: str) -> dict | list:
-        """Pause once per admitted request and preserve the underlying fetch deadline."""
+        """Pause once per admitted request and preserve the underlying per-operation timeout."""
         if self.count >= self.cap:
             raise DriftError(
                 f"request budget exceeded: count {self.count + 1}, cap {self.cap}; "
                 f"window start {self.window_start}; candidates {self.candidates}; "
                 f"narrow the window with {self.narrow_option}"
             )
+        self.ensure_time(REQUEST_TIMEOUT + REQUEST_PAUSE_SECONDS)
         self.count += 1
         self.sleep(REQUEST_PAUSE_SECONDS)
-        return self.fetch(url)
+        remaining = self.ensure_time(REQUEST_TIMEOUT)
+        result = self.reader.read(url, remaining)
+        self.ensure_time()
+        return result
+
+    def ensure_time(self, reserve: float = 0) -> float:
+        """Fail an incomplete scan before its monotonic budget or reserved operation expires."""
+        remaining = self.deadline - time.monotonic()
+        if remaining <= reserve:
+            raise DriftError(
+                f"incomplete scan: {SCAN_BUDGET_SECONDS}-second elapsed-time budget exhausted; "
+                f"requests {self.count}; narrow with {self.narrow_option}"
+            )
+        return remaining
 
 
 def _budgeted(fetch: Fetch, cap: int) -> RequestBudget:
@@ -130,6 +214,15 @@ class RelatedRow(dict):
     own_author: str = ""
     own_opened: str = ""
     merged_at: str = ""
+
+
+class _ForgePage(list):
+    """Keep selected pagination headers with a JSON list without changing its list interface."""
+
+    def __init__(self, rows: list, headers: dict[str, str]) -> None:
+        """Retain server evidence for the listing readers only."""
+        super().__init__(rows)
+        self.headers = headers
 
 
 class FileNames(list[str]):
@@ -166,8 +259,10 @@ def _run_day(today: date | None) -> date:
 
 
 def fetch_forge(url: str) -> dict | list:
-    """Fetch a JSON object or list from the forge with the shared request deadline."""
-    return upstream_drift.fetch_json(url, allow_list=True)
+    """Fetch a JSON object or list from the forge with the shared per-operation timeout."""
+    headers: dict[str, str] = {}
+    data = upstream_drift.fetch_json(url, allow_list=True, response_headers=headers)
+    return _ForgePage(data, headers) if isinstance(data, list) else data
 
 
 def _bounded_text(raw: object, field: str, limit: int) -> str:
@@ -187,11 +282,11 @@ def parse_timestamp(raw: object, field: str = "timestamp") -> datetime:
     text = f"{raw}T00:00:00+00:00" if series.DAY.fullmatch(raw) else raw
     try:
         parsed = datetime.fromisoformat(text)
-    except ValueError as exc:
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except (ValueError, OverflowError) as exc:
         raise DriftError(f"invalid {field}: {raw!r}") from exc
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
 
 
 def subject_key(title: str) -> str:
@@ -237,9 +332,9 @@ def _extract_author(raw: dict) -> str:
     else:
         user = raw.get("user")
         author = user.get("login") if isinstance(user, dict) else None
-    if not isinstance(author, str) or not author.strip() or "\n" in author:
+    _bounded_text(author, "pull author (user.login)", MAX_NAME_CHARS)
+    if not series.valid_related_author(author):
         raise DriftError("missing or invalid pull author")
-    _bounded_text(author, "user.login", MAX_NAME_CHARS)
     return author
 
 
@@ -305,6 +400,8 @@ def match_reason(own: dict[str, object], candidate: dict[str, object]) -> str | 
         return "same-patch-id"
     if set(own["files"]) & set(candidate["files"]):
         return "same-files"
+    if not getattr(candidate["files"], "complete", True):
+        return None
     own_subject = subject_key(str(own["title"]))
     if own_subject and own_subject == subject_key(str(candidate["title"])):
         return "same-subject"
@@ -486,6 +583,30 @@ def _file_result(
     )
 
 
+def _listing_complete(batch: list, read_count: int, url: str) -> bool:
+    """Require an empty page or server pagination evidence, never shortness alone."""
+    if not batch:
+        return True
+    headers = getattr(batch, "headers", {})
+    link = headers.get("Link")
+    if link:
+        _bounded_text(link, f"{url} Link header", MAX_PATH_CHARS)
+        if re.search(
+            r'\brel\s*=\s*(?:"[^"]*\bnext\b[^"]*"|next)(?:\s*[;,]|\s*$)',
+            link,
+            re.IGNORECASE,
+        ):
+            return False
+        if re.search(r"<[^>]+>\s*;\s*rel\s*=", link, re.IGNORECASE):
+            return True
+    total = headers.get("X-Total-Count")
+    if total is not None:
+        if not isinstance(total, str) or not re.fullmatch(r"[0-9]{1,20}", total):
+            raise DriftError(f"{url}: invalid X-Total-Count header")
+        return read_count >= int(total)
+    return False
+
+
 def read_pull_files(pull_url: str, fetch: Fetch, *, partial: bool = False) -> FileNames:
     """Read bounded file pages, retaining a partial prefix only for external candidates."""
     files = FileNames([])
@@ -502,10 +623,8 @@ def read_pull_files(pull_url: str, fetch: Fetch, *, partial: bool = False) -> Fi
             return _file_result(
                 files, False, partial, pull_url, f"file entries exceed {MAX_FILE_ROWS}"
             )
-        if len(batch) < PAGE_SIZE:
+        if _listing_complete(batch, files.file_count, url):
             return _file_result(files, True, partial, pull_url, "")
-        if len(files) == MAX_FILE_ROWS:
-            break
     return _file_result(files, False, partial, pull_url, f"exceeds {MAX_FILE_PAGES} pages")
 
 
@@ -627,11 +746,13 @@ def read_candidate_pulls(since: str, fetch: Fetch) -> list[dict[str, object]]:
     repo_url = upstream_drift.repo_api_url()
     candidates: list[dict[str, object]] = []
     seen_numbers: set[int] = set()
+    read_count = 0
     for page in range(1, MAX_PULL_PAGES + 1):
         url = f"{repo_url}/pulls?state=all&sort=recentupdate&limit={PAGE_SIZE}&page={page}"
         batch = fetch(url)
         if not isinstance(batch, list) or len(batch) > PAGE_SIZE:
             raise DriftError(f"{url}: expected a JSON list of at most {PAGE_SIZE} pull requests")
+        read_count += len(batch)
         reached_older = False
         for raw in batch[:PAGE_SIZE]:
             item = parse_forge_pull(raw, partial_files=True, source=url)
@@ -647,7 +768,7 @@ def read_candidate_pulls(since: str, fetch: Fetch) -> list[dict[str, object]]:
             candidates.append(item)
             if isinstance(fetch, RequestBudget):
                 fetch.candidates = len(candidates)
-        if len(batch) < PAGE_SIZE or reached_older:
+        if reached_older or _listing_complete(batch, read_count, url):
             return candidates
     raise DriftError(f"{repo_url}/pulls: exceeds {MAX_PULL_PAGES} pages")
 
@@ -927,21 +1048,28 @@ def _fill_window_lines(own_pulls: list[dict], cutoff: datetime) -> list[str]:
     ]
 
 
-def _cleanup_manifest_path(path: Path, published: bool, leftovers: list[str]) -> None:
-    """Keep post-publication cleanup errors separate from failed writes."""
+def _cleanup_manifest_path(path: Path, leftovers: list[str]) -> None:
+    """Collect every cleanup failure without replacing the error that caused cleanup."""
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        if not published:
-            raise
         leftovers.append(f"leftover: {path}: cleanup failed: {exc}")
+
+
+def _raise_write_failure(error: BaseException, leftovers: list[str]) -> None:
+    """Report the original failure with all cleanup paths, preserving interrupts."""
+    if isinstance(error, (OSError, DriftError)):
+        raise DriftError("; ".join([str(error), *leftovers])) from error
+    for line in leftovers[:2]:
+        error.add_note(line)
+    raise error
 
 
 def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> list[str]:
     """Sync a sibling temporary file and compare again immediately before replacement."""
     staging: Path | None = None
-    published = False
     leftovers: list[str] = []
+    failure: BaseException | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
@@ -954,10 +1082,13 @@ def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> list[s
         if path.read_bytes() != original:
             raise DriftError(f"{path}: changed since read; no changes written")
         os.replace(staging, path)
-        published = True
+    except BaseException as exc:
+        failure = exc
     finally:
         if staging is not None:
-            _cleanup_manifest_path(staging, published, leftovers)
+            _cleanup_manifest_path(staging, leftovers)
+    if failure is not None:
+        _raise_write_failure(failure, leftovers)
     return leftovers
 
 
@@ -974,20 +1105,34 @@ def _replace_manifest(path: Path, original: bytes, rendered: bytes) -> list[str]
         ) from exc
     published = False
     leftovers: list[str] = []
+    failure: BaseException | None = None
     try:
         with stream:
             if path.read_bytes() != original:
                 raise DriftError(f"{path}: changed since read; no changes written")
         leftovers.extend(_write_manifest_temp(path, original, rendered))
         published = True
+    except BaseException as exc:
+        failure = exc
     finally:
-        _cleanup_manifest_path(lock, published, leftovers)
-    if leftovers:
+        _cleanup_manifest_path(lock, leftovers)
+    if failure is not None:
+        _raise_write_failure(failure, leftovers)
+    if published and leftovers:
         leftovers.append(f"published {path}; cleanup incomplete; exit {PUBLISHED_WITH_LEFTOVERS}")
     return leftovers
 
 
 def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> _FillChanges:
+    """Close the single scan worker after a successful fill or any failure."""
+    request = _budgeted(fetch, request_cap(upstream_drift.MAX_SERIES_ENTRIES))
+    try:
+        return _fill_records(root, request, options)
+    finally:
+        request.reader.close()
+
+
+def _fill_records(root: Path, fetch: Fetch, options: _FillOptions) -> _FillChanges:
     """Fill selected rows within an age and request budget, naming unread older history."""
     run_day = _run_day(options.today)
     cutoff = fill_window(options.max_age_days, run_day)
@@ -1000,6 +1145,7 @@ def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> _FillChan
     own_pulls, candidates, files = read_run_pulls(targets, request, cutoff)
     by_number = {e["number"]: e for e in data["contributions"][: upstream_drift.MAX_SERIES_ENTRIES]}
     changes = _FillChanges(_fill_window_lines(own_pulls, cutoff))
+    records_changed = False
     for own in own_pulls[: upstream_drift.MAX_SERIES_ENTRIES]:
         eligible = inspect_candidates(own, candidates, set(), files, request)
         related = related_for(own, eligible, today=run_day)
@@ -1008,7 +1154,9 @@ def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> _FillChan
         line = _fill_entry(by_number[own["number"]], own, related)
         if line:
             changes.append(line)
-    if changes and not options.dry_run:
+            records_changed = True
+    request.ensure_time()
+    if records_changed and not options.dry_run:
         if path.read_bytes() != original:
             raise DriftError(f"{path}: changed since read; no changes written")
         rendered = (json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n").encode(
@@ -1083,6 +1231,22 @@ def check_overlaps(
     today: date | None = None,
     since: str | None = None,
 ) -> tuple[list[str], list[dict]]:
+    """Close the single scan worker after overlap checks or any read failure."""
+    request = _budgeted(fetch, request_cap(upstream_drift.MAX_SERIES_ENTRIES))
+    try:
+        return _check_overlaps(root, extra_pulls, request, today=today, since=since)
+    finally:
+        request.reader.close()
+
+
+def _check_overlaps(
+    root: Path,
+    extra_pulls: list[int],
+    fetch: Fetch,
+    *,
+    today: date | None = None,
+    since: str | None = None,
+) -> tuple[list[str], list[dict]]:
     """Report new relations and undecided file comparisons using one bounded run memo."""
     run_day = _run_day(today)
     data = _checked_manifest(root)
@@ -1112,6 +1276,7 @@ def check_overlaps(
                 f"{own['number']} {row['number']} {row['author']} {row['reason']} {row['state']}"
             )
         loud.extend(overlaps(new_rows))
+    request.ensure_time()
     return lines, loud
 
 

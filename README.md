@@ -474,7 +474,7 @@ nothing and need no credentials. Live matching checks shared files and subjects;
 same-patch-id is not checked live, and forge-supplied patch IDs are ignored.
 The schema retains that reason for separately supplied evidence. Repeat
 `--pull N` to fill only named open or merged manifest rows, for example
-`fill --pull 25805 --pull 25950`. Candidate
+`python3 scripts/upstream_links.py fill --dry-run --pull 24970 --pull 24973`. Candidate
 pulls are scanned once per run from the later of the earliest scoped opening
 and UTC midnight 14 days before the run date (`DEFAULT_FILL_MAX_AGE_DAYS`);
 each pull's changed files are fetched at most once. For every own pull opened
@@ -506,9 +506,17 @@ its pull number, the number of files read and `same-files undecided`; it is
 not recorded as a relation, and `check` exits 1 for the undecided comparison.
 A proven shared file in a partial prefix remains a relation, with an explicit
 incomplete-files diagnostic. Same-files matching remains a broad signal.
+File and candidate pagination stops on an empty page, a server `Link` header
+without a next relation, or a reached `X-Total-Count`. A short nonempty page
+alone never proves completion; the next page is read within the 20-page budget.
+At exactly the name cap, an available extra page is read without retaining more
+names: empty proves completion and more names prove overflow. If all file pages
+are used without completion evidence, external candidates remain undecided and
+own pull listings fail with exit 2.
 
 Each run pauses 0.5 seconds before every request, including the first, and
-retains the shared 30-second request deadline. A first fill costs `N + P + F`
+retains the 30-second timeout of each blocking network operation
+(`REQUEST_TIMEOUT`). A first fill costs `N + P + F`
 requests for `N` own pulls, `P` list pages and `F` total fetched file pages
 across distinct own and eligible candidate pulls (with one file page per
 pull, the measured two-pull, 12-page window needs at most 519 requests and
@@ -517,22 +525,36 @@ Both commands derive their request cap as
 `N + 20 + (N + 1000) * 20` from the own-pull count, 20 list pages, 1000
 candidate rows and 20 file pages per pull. Before reading files, a progress
 line gives the candidate count, expected requests assuming one file page per
-pull and a file-page upper bound. A request above the cap exits 2 with its
+pull and a file-page upper bound. The monotonic `SCAN_BUDGET_SECONDS` budget is 300 seconds for either command;
+exhaustion prints `incomplete scan` and exits 2 before publishing. Admission
+reserves pacing and a full network-operation timeout, and elapsed time is checked
+again after pacing and each fetch. A single read-only daemon worker performs
+each fetch; waiting ends at the remaining scan budget even if the socket keeps
+making progress. On expiry the scan aborts with no further fetch or publication;
+the process can exit while that one read finishes. Overlaps run in a separate workflow job,
+independent of drift, with a timeout of twice that budget (10 minutes); a workflow
+test pins this relationship. The maximum 4096 own pulls admit 106036 requests:
+53018 seconds of pacing, or 3234098 seconds including one 30-second blocking
+operation per request, so the request cap alone cannot bound job time.
+A request above the cap exits 2 with its
 count, cap, window start, candidate count and narrowing option. A failure
-before publication leaves the manifest unchanged. After replacement, cleanup
+before publication leaves the manifest unchanged and reports the original error
+together with every failed staging-file or lock cleanup path (exit 2). After replacement, cleanup
 failure exits 3 with `published ...; cleanup incomplete; exit 3` and one
 `leftover:` line per failed cleanup path; the published manifest stays in place.
 Status 3 is exclusive to this published-with-leftovers state; clean fills exit 0.
 Check exits 0 without overlaps, 1 for overlaps or undecided file comparisons,
-and both commands exit 2 for read or input errors. Check writes nothing and
+and both commands exit 2 for read, input or incomplete-scan errors. Check writes nothing and
 cannot reach status 3. Treat status 3 as a visible failure requiring cleanup
 review before another writing fill; do not roll back the published bytes.
 Fill keeps its sibling temporary file private until content is written and
 synced, then copies only the manifest's user/group/other read, write and execute
 bits before atomic replacement. Set-id and sticky bits are not copied; a mode
 change failure aborts before publication with exit 2.
-Fill refuses content changed since the initial read; concurrent
-fills use an exclusive sibling lock. A leftover lock blocks writing fills with
+Age and incomplete-file notices print independently of record changes on both
+dry-run and writing paths. When records are unchanged, fill preserves the exact
+manifest bytes and takes no lock. Fill refuses content changed since the initial
+read; concurrent writing fills use an exclusive sibling lock. A leftover lock blocks writing fills with
 its path (relative to the working directory when `--root` is relative) and a
 stale-lock rule: confirm no fill is running for that manifest, then review and
 remove the lock before retrying. No automatic lock
@@ -541,7 +563,9 @@ with that lock to exclude edits during the final compare-and-replace step.
 Missing or malformed decision fields, responses over 16 MiB, titles or paths
 over 4096 characters, names over 256 characters, bodies over 256 Ki characters,
 inline file lists over 2000 names, duplicate JSON keys, and JSON objects over
-1024 keys fail with exit 2. Issue parsing permits
+1024 keys fail with exit 2. Related authors use the shared `MAX_RELATED_AUTHOR_CHARS` limit of 256;
+only nonblank printable text is accepted, excluding every control character and
+line separator before diagnostics. Issue parsing permits
 at most 64 clauses and 1024 references, including repeats; excess is an error.
 Each closing clause starts a comma-, `and`- or `or`-separated item list.
 Only whole `#N` items and exact configured repository issue URLs are local.

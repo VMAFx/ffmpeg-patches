@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import io
 import json
+import re
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from datetime import date
@@ -109,6 +112,15 @@ PLANTED_OTHER_25950_JSON = """{
 PLANTED_SCENE_SAD_FILES_JSON = '[{"filename": "tests/checkasm/scene_sad.c"}]'
 
 
+class HeaderPage(list):
+    """A fixture listing with explicit server pagination evidence."""
+
+    def __init__(self, rows: list, headers: dict[str, str]) -> None:
+        """Retain fixture headers independently of the listing's row count."""
+        super().__init__(rows)
+        self.headers = headers
+
+
 class FakeForge:
     """Serve literal JSON or pre-decoded answers keyed by Forgejo API URL."""
 
@@ -123,7 +135,12 @@ class FakeForge:
         if url not in self.answers:
             raise upstream_links.DriftError(f"{url}: HTTP Error 404: Not Found")
         raw = self.answers[url]
-        return json.loads(raw) if isinstance(raw, str) else raw
+        answer = json.loads(raw) if isinstance(raw, str) else raw
+        if type(answer) is list and len(answer) < upstream_links.PAGE_SIZE and "page=" in url:
+            page = int(url.rsplit("page=", 1)[1])
+            total = (page - 1) * upstream_links.PAGE_SIZE + len(answer)
+            return HeaderPage(answer, {"X-Total-Count": str(total)})
+        return answer
 
 
 def write_manifest(root: Path, entries: list[dict]) -> Path:
@@ -262,6 +279,45 @@ class PlantedSceneSadOverlapTest(unittest.TestCase):
 
 class RelatedAndOverlapsPureTest(unittest.TestCase):
     """Pure unit tests for related_for, overlaps and body_issues."""
+
+    def test_utc_conversion_rejects_calendar_overflow_with_value(self) -> None:
+        """Offset conversions outside either calendar boundary are identified errors."""
+        for value in ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"):
+            with self.subTest(value=value):
+                with self.assertRaises(upstream_links.DriftError) as caught:
+                    upstream_links.parse_timestamp(value, "created_at")
+                self.assertIn(value, str(caught.exception))
+                self.assertIn("created_at", str(caught.exception))
+        for value, expected in (
+            ("0001-01-01T01:00:00+01:00", "0001-01-01T00:00:00+00:00"),
+            ("9999-12-31T22:59:59-01:00", "9999-12-31T23:59:59+00:00"),
+            ("2026-11-19T12:30:00+02:00", "2026-11-19T10:30:00+00:00"),
+        ):
+            self.assertEqual(upstream_links.parse_timestamp(value).isoformat(), expected)
+
+    def test_author_validators_agree_on_controls_and_line_separators(self) -> None:
+        """Forge and manifest validators reject every control and line separator alike."""
+        invalid = [chr(value) for value in range(32)] + [chr(value) for value in range(127, 160)]
+        invalid += ["\u2028", "\u2029", "\u200b", "\ufeff"]
+        for separator in invalid[:69]:
+            author = f"alice{separator}bob"
+            with self.subTest(code=ord(separator)):
+                with self.assertRaisesRegex(upstream_links.DriftError, "author"):
+                    upstream_links.normalize_item(forge_pull(101) | {"user": {"login": author}})
+                row = {
+                    "number": 101,
+                    "kind": "pull",
+                    "author": author,
+                    "reason": "same-files",
+                    "state": "open",
+                    "seen": TODAY.isoformat(),
+                }
+                findings = upstream_links.series.Findings()
+                upstream_links.series.check_related_item(row, "entry 1", findings)
+                self.assertTrue(any("author" in error for error in findings.errors))
+        for author in ("alice", "Forgejo_Fairy", "a.b-c_9", "x" * 256):
+            item = upstream_links.normalize_item(forge_pull(101) | {"user": {"login": author}})
+            self.assertEqual(item["author"], author)
 
     def test_related_for_matches_files_patch_id_and_subject(self) -> None:
         """Classify same-patch-id, same-files and same-subject and sort by number."""
@@ -452,6 +508,76 @@ class FillAndCheckCommandTest(unittest.TestCase):
             }
         )
 
+    def test_partial_same_subject_stays_undecided_after_fill(self) -> None:
+        """Fill cannot record a subject match that hides undecided file evidence."""
+        forge = self.forge_for_fill()
+        page = f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1"
+        candidate = forge.answers[page][0]
+        candidate["title"] = forge.answers[f"{API}/pulls/10"]["title"]
+        candidate["files"] = [f"other-{n}.c" for n in range(upstream_links.MAX_FILE_ROWS + 1)]
+        self.assertEqual(run_cli(self.root, forge, "check")[0], 1)
+        rc, out, err = run_cli(self.root, forge, "fill")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("undecided", out)
+        rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"]
+        self.assertEqual(rows[0]["related"], [])
+        for _ in range(2):
+            rc, out, err = run_cli(self.root, forge, "check")
+            self.assertEqual((rc, err), (1, ""))
+            self.assertIn("10 25 bob same-files undecided", out)
+        candidate["files"][0] = "libavutil/a.c"
+        self.assertEqual(run_cli(self.root, forge, "fill")[0], 0)
+        rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"]
+        self.assertEqual(rows[0]["related"][0]["reason"], "same-files")
+
+    def test_readme_scoped_fill_command_parses_offline_with_eligible_rows(self) -> None:
+        """The complete dry-run example selects two real open or merged manifest rows."""
+        root = Path(__file__).resolve().parent.parent
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        match = re.search(
+            r"`((?:python3 scripts/upstream_links[.]py )?fill (?:--dry-run )?"
+            r"--pull [0-9]+ --pull [0-9]+)`",
+            readme,
+        )
+        self.assertIsNotNone(match, "missing complete scoped dry-run example")
+        args = upstream_links.build_parser().parse_args(
+            match.group(1).removeprefix("python3 scripts/upstream_links.py ").split()
+        )
+        entries = json.loads((root / "upstream-contributions.json").read_text(encoding="utf-8"))[
+            "contributions"
+        ]
+        targets = upstream_links._fill_targets(entries, args.pull)
+        self.assertTrue(args.dry_run)
+        self.assertTrue(match.group(1).startswith("python3 scripts/upstream_links.py "))
+        self.assertEqual(len(targets), 2)
+        self.assertEqual({target[0] for target in targets}, set(args.pull))
+
+    def test_docs_distinguish_network_operation_timeout_from_scan_budget(self) -> None:
+        """Document the per-operation timeout separately from the elapsed scan bound."""
+        root = Path(__file__).resolve().parent.parent
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("30-second timeout of each blocking network operation", readme)
+        self.assertNotIn("shared 30-second request deadline", readme)
+        self.assertIn("`SCAN_BUDGET_SECONDS` budget is 300 seconds", readme)
+        self.assertIn("REQUEST_TIMEOUT", upstream_links.__doc__)
+
+    def test_protocol_error_exits_two_for_fill_and_check(self) -> None:
+        """Both link commands wrap client protocol failures at the shared fetch boundary."""
+        drift = upstream_links.upstream_drift
+        before = self.path.read_bytes()
+        for command in ("fill", "check"):
+            with unittest.mock.patch.object(
+                drift.urllib.request,
+                "urlopen",
+                side_effect=http.client.HTTPException("planted protocol error"),
+            ):
+                rc, out, err = run_cli(self.root, upstream_links.fetch_forge, command)
+            self.assertEqual((rc, out), (2, ""))
+            self.assertIn(f"{API}/pulls/10", err)
+            self.assertIn("planted protocol error", err)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(self.path.read_bytes(), before)
+
     def test_fill_dry_run_prints_changes_and_writes_nothing(self) -> None:
         """Print pending fixes_issues and related updates without touching disk on --dry-run."""
         before = self.path.read_bytes()
@@ -516,21 +642,39 @@ class FillAndCheckCommandTest(unittest.TestCase):
             FakeForge(
                 {
                     f"{API}/pulls/10": PLANTED_OWN_25805_JSON.replace("25805", "10"),
+                    f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1": [],
                     f"{API}/pulls/10/files?limit=50&page=1": '{"not": "a list"}',
                 }
             ),
             FakeForge(
                 {
                     f"{API}/pulls/10": PLANTED_OWN_25805_JSON.replace("25805", "10"),
+                    f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1": [],
                     f"{API}/pulls/10/files?limit=50&page=1": "[{}]",
                 }
             ),
         )
-        for forge in bad_forges:
+        expected_errors = (
+            "not a JSON object",
+            "missing title",
+            "expected a JSON list",
+            "valid filename",
+        )
+        for forge, expected_error in zip(bad_forges, expected_errors, strict=True):
             with self.subTest(forge=forge.answers):
                 rc, out, err = run_cli(self.root, forge, "check")
                 self.assertEqual((rc, out), (2, ""))
-                self.assertIn("error:", err)
+                self.assertIn(expected_error, err)
+                file_urls = [url for url in forge.answers if "/files?" in url]
+                if file_urls:
+                    self.assertIn(file_urls[0], forge.read)
+                    expected = (
+                        "valid filename"
+                        if forge.answers[file_urls[0]] == "[{}]"
+                        else "expected a JSON list"
+                    )
+                    self.assertIn(expected, err)
+                    self.assertNotIn("404", err)
 
     def test_page_cap_overflow_exits_two(self) -> None:
         """Refuse a pull file listing that fills every permitted page without terminating."""
@@ -555,12 +699,10 @@ class FillAndCheckCommandTest(unittest.TestCase):
         """Verify upstream.yml runs upstream_links.py check and fails the job on overlap."""
         path = Path(__file__).resolve().parent.parent / ".github/workflows/upstream.yml"
         workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
-        steps = workflow["jobs"]["drift"]["steps"]
+        steps = workflow["jobs"]["links"]["steps"]
         links = next(step for step in steps if step.get("id") == "links")
-        fail = steps[-1]
         self.assertEqual(links["run"], "python3 scripts/upstream_links.py check")
-        self.assertIn("failure()", links["if"])
-        self.assertIn("steps.links.outcome == 'failure'", fail["if"])
+        self.assertFalse(links.get("continue-on-error", False))
         self.assertEqual(workflow["permissions"], {"contents": "read"})
 
 
@@ -716,14 +858,16 @@ class RequestCostTest(unittest.TestCase):
             forge = FakeForge(self.answers)
             rc, out, err = run_cli(self.root, forge, "check", "--since", value)
             self.assertEqual((rc, out), (2, ""))
-            self.assertIn("error:", err)
+            self.assertIn(value, err)
             self.assertEqual(forge.read, [])
         data = json.loads(self.path.read_text(encoding="utf-8"))
         for checked in ("2026-02-30", "0001-01-01"):
             data["checked"] = checked
             self.path.write_text(json.dumps(data), encoding="utf-8")
             forge = FakeForge(self.answers)
-            self.assertEqual(run_cli(self.root, forge, "check")[0], 2)
+            rc, _, err = run_cli(self.root, forge, "check")
+            self.assertEqual(rc, 2)
+            self.assertIn(checked, err)
             self.assertEqual(forge.read, [])
 
     def test_budget_error_exits_two_without_writing_or_partial_output(self) -> None:
@@ -738,6 +882,78 @@ class RequestCostTest(unittest.TestCase):
             self.assertIn("cap 8", err)
             self.assertEqual(len(forge.read), 8)
             self.assertEqual(pauses, [upstream_links.REQUEST_PAUSE_SECONDS] * 8)
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_elapsed_budget_stops_before_and_after_slow_requests(self) -> None:
+        """Elapsed time exhaustion is explicit and never admits another request."""
+        for elapsed in (270.0, 301.0):
+            clock = unittest.mock.Mock(side_effect=[0.0, elapsed, elapsed, elapsed])
+            fetch, pause = unittest.mock.Mock(return_value=[]), unittest.mock.Mock()
+            with unittest.mock.patch.object(upstream_links.time, "monotonic", clock):
+                request = upstream_links.RequestBudget(fetch, 10, pause)
+                with self.assertRaisesRegex(upstream_links.DriftError, "incomplete scan.*300"):
+                    request("https://example.invalid/slow")
+            fetch.assert_not_called()
+            pause.assert_not_called()
+        with unittest.mock.patch.object(
+            upstream_links.time, "monotonic", side_effect=[0.0, 0.0, 0.5, 301.0]
+        ):
+            request = upstream_links.RequestBudget(fetch, 10, pause)
+            with self.assertRaisesRegex(upstream_links.DriftError, "incomplete scan"):
+                request("https://example.invalid/slow")
+        fetch.assert_called_once()
+        pause.assert_called_once_with(upstream_links.REQUEST_PAUSE_SECONDS)
+
+    def test_elapsed_budget_interrupts_a_fetch_that_never_returns(self) -> None:
+        """A blocked injected fetch cannot keep the scan alive past its elapsed budget."""
+        release = threading.Event()
+        entered = threading.Event()
+
+        def blocked(url: str) -> list:
+            """Model repeated blocking operations inside a single response read."""
+            entered.set()
+            release.wait(2)
+            return []
+
+        try:
+            with (
+                unittest.mock.patch.object(upstream_links, "SCAN_BUDGET_SECONDS", 0.05),
+                unittest.mock.patch.object(upstream_links, "REQUEST_TIMEOUT", 0),
+                unittest.mock.patch.object(upstream_links, "REQUEST_PAUSE_SECONDS", 0),
+            ):
+                request = upstream_links.RequestBudget(blocked, 2, lambda _: None)
+                start = upstream_links.time.monotonic()
+                with self.assertRaisesRegex(upstream_links.DriftError, "incomplete scan"):
+                    request("https://example.invalid/blocked")
+                self.assertLess(upstream_links.time.monotonic() - start, 1)
+                self.assertTrue(entered.is_set())
+        finally:
+            release.set()
+
+    def test_worker_cleanup_preserves_timeout_before_worker_starts(self) -> None:
+        """A queued request at expiry cannot replace the incomplete-scan error during cleanup."""
+        forge = FakeForge(self.answers)
+        with (
+            unittest.mock.patch.object(upstream_links.threading.Thread, "start"),
+            unittest.mock.patch.object(upstream_links, "SCAN_BUDGET_SECONDS", 0.05),
+            unittest.mock.patch.object(upstream_links, "REQUEST_TIMEOUT", 0),
+            unittest.mock.patch.object(upstream_links, "REQUEST_PAUSE_SECONDS", 0),
+        ):
+            rc, _, err = run_cli(self.root, forge, "check")
+        self.assertEqual(rc, 2)
+        self.assertIn("incomplete scan", err)
+        self.assertEqual(forge.read, [])
+
+    def test_elapsed_budget_cli_exits_two_without_publishing(self) -> None:
+        """Both commands identify incomplete scans and leave manifest bytes intact."""
+        before = self.path.read_bytes()
+        for command in ("fill", "check"):
+            forge = FakeForge(self.answers)
+            with unittest.mock.patch.object(upstream_links.time, "monotonic", side_effect=[0, 301]):
+                rc, _, err = run_cli(self.root, forge, command)
+            self.assertEqual(rc, 2)
+            self.assertIn("incomplete scan", err)
+            self.assertEqual(forge.read, [])
             self.assertEqual(self.path.read_bytes(), before)
 
     def test_budget_boundary_and_pause_once_per_request(self) -> None:
@@ -1024,6 +1240,27 @@ class FillAgeWindowTest(unittest.TestCase):
         self.assertEqual(set(data), {"checked", "contributions"})
         for entry in data["contributions"][:2]:
             self.assertEqual(set(entry), set(manifest_entry(10)) | {"fixes_issues", "related"})
+
+    def test_age_notice_alone_preserves_bytes_without_taking_a_lock(self) -> None:
+        """Diagnostics alone cannot rewrite an unchanged manifest or fail on a stale lock."""
+        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+            self.assertEqual(run_cli(self.root, FakeForge(self.answers), "fill")[0], 0)
+        data = json.loads(self.path.read_bytes())
+        self.path.write_text(json.dumps(data, separators=(",", ":")) + "\n", encoding="utf-8")
+        before = self.path.read_bytes()
+        lock = self.path.with_name(f".{self.path.name}.lock")
+        lock.write_bytes(b"existing lock")
+        for flags in (("--dry-run",), ()):
+            with (
+                unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+                unittest.mock.patch.object(upstream_links.os, "replace") as replace,
+            ):
+                rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill", *flags)
+            self.assertEqual((rc, err), (0, ""))
+            self.assertIn("fill age limit", out)
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertEqual(lock.read_bytes(), b"existing lock")
+            replace.assert_not_called()
 
     def test_single_old_pull_uses_same_age_boundary(self) -> None:
         """Selecting only an old pull still terminates at the bounded fill window."""
@@ -1519,6 +1756,10 @@ class OversizedCandidateTest(unittest.TestCase):
             rc, out, err = run_cli(self.root, forge, "fill")
             self.assertEqual((rc, out), (2, ""))
             self.assertIn(f"{API}/pulls/10/files" if not inline else f"{API}/pulls/10:", err)
+            self.assertIn("at most 1000" if inline else "exceeds 20 pages", err)
+            if not inline:
+                self.assertIn(f"{API}/pulls/10/files?limit=50&page=20", forge.read)
+            self.assertNotIn("404", err)
             self.assertEqual(self.path.read_bytes(), before)
 
     def test_page_cap_is_partial_for_candidate_but_hard_for_own(self) -> None:
@@ -1533,6 +1774,9 @@ class OversizedCandidateTest(unittest.TestCase):
             rc, out, err = run_cli(self.root, own, "check")
             self.assertEqual((rc, out), (2, ""))
             self.assertIn(f"{API}/pulls/10/files", err)
+            self.assertIn("exceeds 1 pages", err)
+            self.assertIn(f"{API}/pulls/10/files?limit=50&page=1", own.read)
+            self.assertNotIn("404", err)
 
     def test_oversized_requests_are_bounded_paced_and_budgeted(self) -> None:
         """Every retained candidate page consumes a paced request from the run budget."""
@@ -1560,12 +1804,23 @@ class OversizedCandidateTest(unittest.TestCase):
             [{"filename": "a.c", "previous_filename": 9}],
             [{"filename": "a.c"}] * 51,
         )
-        for batch in malformed[:7]:
+        expected_errors = (
+            "expected a JSON list",
+            "file entry is not an object",
+            "valid filename",
+            "valid filename",
+            "valid filename",
+            "invalid previous_filename",
+            "expected a JSON list",
+        )
+        for batch, expected in zip(malformed[:7], expected_errors[:7], strict=True):
             forge = self.forge_with_files(1)
             forge.answers[f"{API}/pulls/101/files?limit=50&page=1"] = batch
             rc, out, err = run_cli(self.root, forge, "fill")
             self.assertEqual((rc, out), (2, ""))
-            self.assertIn("101", err)
+            self.assertIn(f"{API}/pulls/101/files?limit=50&page=1", forge.read)
+            self.assertIn(expected, err)
+            self.assertNotIn("404", err)
         forge = self.forge_with_files(1, inline=True)
         forge.answers[f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1"][0]["files"] = [
             None
@@ -1573,6 +1828,8 @@ class OversizedCandidateTest(unittest.TestCase):
         rc, out, err = run_cli(self.root, forge, "check")
         self.assertEqual((rc, out), (2, ""))
         self.assertIn("101", err)
+        self.assertIn("files entry", err)
+        self.assertNotIn("404", err)
 
     def test_rename_names_cannot_overrun_candidate_cap(self) -> None:
         """Rename aliases count toward the name cap without aborting the candidate scan."""
@@ -2098,19 +2355,54 @@ class FailClosedForgeTest(unittest.TestCase):
             with self.subTest(field=field):
                 self.assert_rejected(field)
 
+    def test_sync_and_cleanup_failures_report_primary_and_every_leftover(self) -> None:
+        """A sync failure stays visible alongside both failed cleanup paths before publication."""
+        unlink = Path.unlink
+
+        def fail_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+            """Fail both manifest sibling cleanups after the primary write failure."""
+            if path.name.endswith((".tmp", ".lock")):
+                raise OSError(f"planted cleanup {path.suffix}")
+            unlink(path, *args, **kwargs)
+
+        with (
+            unittest.mock.patch.object(
+                upstream_links.os, "fsync", side_effect=OSError("planted sync")
+            ),
+            unittest.mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_cleanup),
+        ):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, 2)
+        self.assertIn("planted sync", err)
+        self.assertIn("planted cleanup .tmp", err)
+        self.assertIn("planted cleanup .lock", err)
+        leftovers = [path for path in self.root.iterdir() if path != self.path]
+        self.assertEqual(len(leftovers), 2)
+        for path in leftovers[:2]:
+            self.assertIn(str(path), err)
+        self.assertEqual(self.path.read_bytes(), self.before)
+
     def test_failed_manifest_sync_keeps_original_and_cleans_temp(self) -> None:
         """An fsync OSError cannot truncate the destination or leave a staging file."""
-        with unittest.mock.patch("os.fsync", side_effect=OSError("planted interrupted sync")):
+        with unittest.mock.patch(
+            "os.fsync", side_effect=OSError("planted interrupted sync")
+        ) as sync:
             rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        sync.assert_called_once()
         self.assertEqual(rc, 2, err)
+        self.assertIn("planted interrupted sync", err)
         self.assertEqual(self.path.read_bytes(), self.before)
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), [self.path.name])
 
     def test_failed_replace_keeps_original_and_cleans_temp(self) -> None:
         """A failed atomic replacement preserves the old bytes and removes the sibling."""
-        with unittest.mock.patch("os.replace", side_effect=OSError("planted replacement failure")):
+        with unittest.mock.patch(
+            "os.replace", side_effect=OSError("planted replacement failure")
+        ) as replace:
             rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        replace.assert_called_once()
         self.assertEqual(rc, 2, err)
+        self.assertIn("planted replacement failure", err)
         self.assertEqual(self.path.read_bytes(), self.before)
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), [self.path.name])
 
@@ -2501,3 +2793,156 @@ class BoundedMatcherInputTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaginationBoundaryTest(unittest.TestCase):
+    """Exercise exact file-name limits with a bounded completion read."""
+
+    def test_exact_name_cap_reads_one_more_page_when_budget_allows(self) -> None:
+        """An empty lookahead proves completeness without storing overflow names."""
+        url = f"{API}/pulls/10"
+        first = [
+            {"filename": "a", "previous_filename": "b"},
+            {"filename": "c", "previous_filename": "d"},
+        ]
+        for tail in ([], [{"filename": "e"}]):
+            forge = FakeForge(
+                {f"{url}/files?limit=2&page=1": first, f"{url}/files?limit=2&page=2": tail}
+            )
+            with (
+                unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+                unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 4),
+                unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 2),
+            ):
+                files = upstream_links.read_pull_files(url, forge, partial=True)
+            self.assertEqual(files, ["a", "b", "c", "d"])
+            self.assertEqual(files.complete, not tail)
+            self.assertEqual(len(forge.read), 2)
+
+    def test_exact_name_cap_at_page_limit_stays_undecided(self) -> None:
+        """Exhausting pages cannot claim an unseen empty page or read beyond the cap."""
+        url = f"{API}/pulls/10"
+        forge = FakeForge({f"{url}/files?limit=2&page=1": [{"filename": "a"}, {"filename": "b"}]})
+        with (
+            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+            unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 2),
+            unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
+        ):
+            files = upstream_links.read_pull_files(url, forge, partial=True)
+        self.assertFalse(files.complete)
+        self.assertEqual(len(forge.read), 1)
+
+
+class ServerPaginationTest(unittest.TestCase):
+    """Model a forge that caps pages below the client's requested page size."""
+
+    def test_short_file_pages_without_headers_continue_to_empty(self) -> None:
+        """Later changed files remain visible after a nonempty short first page."""
+        batches = [[{"filename": "a.c"}], [{"filename": "shared.c"}], []]
+        fetch = unittest.mock.Mock(side_effect=batches)
+        files = upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+        self.assertEqual(files, ["a.c", "shared.c"])
+        self.assertTrue(files.complete)
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_short_pull_pages_without_headers_continue_to_empty(self) -> None:
+        """Later candidate metadata remains visible after the server caps page size."""
+        fetch = unittest.mock.Mock(side_effect=[[forge_pull(101)], [forge_pull(102)], []])
+        rows = upstream_links.read_candidate_pulls("2026-11-01", fetch)
+        self.assertEqual([row["number"] for row in rows], [101, 102])
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_headers_prove_completion_or_require_a_next_page(self) -> None:
+        """Both listing readers respect next links and total row counts."""
+        for headers in (
+            {"Link": '<https://example.invalid/page2>; rel="next"'},
+            {"X-Total-Count": "2"},
+        ):
+            for candidates in (False, True):
+                batches = (
+                    ([forge_pull(101)], [forge_pull(102)])
+                    if candidates
+                    else ([{"filename": "a.c"}], [{"filename": "b.c"}])
+                )
+                pages = [
+                    HeaderPage(batches[0], headers),
+                    HeaderPage(batches[1], {"X-Total-Count": "2"}),
+                ]
+                fetch = unittest.mock.Mock(side_effect=pages)
+                if candidates:
+                    rows = upstream_links.read_candidate_pulls("2026-11-01", fetch)
+                else:
+                    rows = upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(fetch.call_count, 2)
+
+    def test_next_link_relation_case_cannot_turn_into_completion(self) -> None:
+        """A mixed-case next relation must continue both listings rather than hide rows."""
+        for relation in ("NEXT", "nExT"):
+            headers = {"Link": f'<https://example.invalid/page2>; rel="{relation}"'}
+            for candidates in (False, True):
+                batches = (
+                    ([forge_pull(101)], [forge_pull(102)])
+                    if candidates
+                    else ([{"filename": "a.c"}], [{"filename": "b.c"}])
+                )
+                fetch = unittest.mock.Mock(
+                    side_effect=[
+                        HeaderPage(batches[0], headers),
+                        HeaderPage(batches[1], {"X-Total-Count": "2"}),
+                    ]
+                )
+                if candidates:
+                    rows = upstream_links.read_candidate_pulls("2026-11-01", fetch)
+                else:
+                    rows = upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(fetch.call_count, 2)
+
+    def test_fetch_forge_preserves_listing_headers_without_changing_json_callers(self) -> None:
+        """The shared fetcher exposes headers only through its optional output mapping."""
+        drift = upstream_links.upstream_drift
+        answer = io.BytesIO(b"[]")
+        answer.headers = {
+            "Link": '<https://example.invalid/page2>; rel="next"',
+            "X-Total-Count": "2",
+            "Unrelated": "ignored",
+        }
+        with unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer):
+            page = upstream_links.fetch_forge(f"{API}/pulls")
+        self.assertEqual(page, [])
+        self.assertEqual(
+            page.headers, {key: answer.headers[key] for key in ("Link", "X-Total-Count")}
+        )
+
+
+class PaginationLimitTest(unittest.TestCase):
+    """Retain uncertainty when short pages consume the complete page budget."""
+
+    def test_short_last_page_without_headers_is_incomplete(self) -> None:
+        """Neither file nor candidate readers infer completion from a short final page."""
+        with (
+            unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
+            unittest.mock.patch.object(upstream_links, "MAX_PULL_PAGES", 1),
+        ):
+            fetch = unittest.mock.Mock(return_value=[{"filename": "a.c"}])
+            files = upstream_links.read_pull_files(f"{API}/pulls/10", fetch, partial=True)
+            self.assertFalse(files.complete)
+            self.assertEqual(fetch.call_count, 1)
+            with self.assertRaisesRegex(upstream_links.DriftError, "exceeds 1 pages"):
+                upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+            fetch = unittest.mock.Mock(return_value=[forge_pull(101)])
+            with self.assertRaisesRegex(upstream_links.DriftError, "exceeds 1 pages"):
+                upstream_links.read_candidate_pulls("2026-11-01", fetch)
+            self.assertEqual(fetch.call_count, 1)
+
+    def test_link_without_next_proves_completion_on_a_full_page(self) -> None:
+        """A server's previous-only link ends either listing without another request."""
+        headers = {"Link": '<https://example.invalid/page1>; rel="prev"'}
+        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 1):
+            fetch = unittest.mock.Mock(return_value=HeaderPage([{"filename": "a.c"}], headers))
+            self.assertTrue(upstream_links.read_pull_files(f"{API}/pulls/10", fetch).complete)
+            self.assertEqual(fetch.call_count, 1)
+            fetch = unittest.mock.Mock(return_value=HeaderPage([forge_pull(101)], headers))
+            self.assertEqual(len(upstream_links.read_candidate_pulls("2026-11-01", fetch)), 1)
+            self.assertEqual(fetch.call_count, 1)

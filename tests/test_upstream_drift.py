@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -115,6 +116,47 @@ class Fixture:
         return self.root / "patches" / self.names[number - 1]
 
 
+class ResponseReadTest(unittest.TestCase):
+    """Pin bounded transport failures with in-memory response objects."""
+
+    def test_declared_response_length_rejects_a_short_valid_json_body(self) -> None:
+        """Valid JSON is still incomplete when fewer than the declared bytes arrive."""
+        answer = io.BytesIO(b"{}")
+        answer.headers = {"Content-Length": "10"}
+        with (
+            patch.object(upstream_drift.urllib.request, "urlopen", return_value=answer),
+            self.assertRaisesRegex(upstream_drift.DriftError, "short response.*2.*10") as caught,
+        ):
+            upstream_drift.fetch_json(f"{API}1")
+        self.assertIn(f"{API}1", str(caught.exception))
+
+    def test_http_protocol_failure_is_wrapped_with_request_address(self) -> None:
+        """Malformed chunk framing becomes an identified DriftError with its cause."""
+
+        class BrokenResponse(io.BytesIO):
+            """Raise an HTTP client protocol error from a bounded body read."""
+
+            def read(self, size: int = -1) -> bytes:
+                """Model a chunk ending before its declared byte count."""
+                raise http.client.IncompleteRead(b"{", 4)
+
+        with (
+            patch.object(upstream_drift.urllib.request, "urlopen", return_value=BrokenResponse()),
+            self.assertRaisesRegex(upstream_drift.DriftError, "IncompleteRead") as caught,
+        ):
+            upstream_drift.fetch_json(f"{API}1")
+        self.assertIn(f"{API}1", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, http.client.HTTPException)
+
+    def test_complete_and_undeclared_response_lengths_remain_accepted(self) -> None:
+        """Exact declared lengths and absent lengths accept complete bounded JSON."""
+        for headers in ({"Content-Length": "2"}, {}):
+            answer = io.BytesIO(b"{}")
+            answer.headers = headers
+            with patch.object(upstream_drift.urllib.request, "urlopen", return_value=answer):
+                self.assertEqual(upstream_drift.fetch_json(f"{API}1"), {})
+
+
 class Utf8ReadTest(unittest.TestCase):
     """Invalid UTF-8 includes the input path and preserves the decode cause."""
 
@@ -161,6 +203,19 @@ class DriftTest(unittest.TestCase):
     def write(self, *entries: dict[str, object]) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
             self.fx.write_records(list(entries))
+
+    def test_protocol_error_exits_two_without_a_traceback(self) -> None:
+        """The drift command reports protocol errors as read failures with their address."""
+        with patch.object(
+            upstream_drift.urllib.request,
+            "urlopen",
+            side_effect=http.client.HTTPException("planted protocol error"),
+        ):
+            rc, out, err = self.run_main(upstream_drift.fetch_json)
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn(f"{API}1", err)
+        self.assertIn("planted protocol error", err)
+        self.assertNotIn("Traceback", err)
 
     def run_main(self, forge: FakeForge) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()

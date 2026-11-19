@@ -45,6 +45,9 @@
 Exit status: 0 on success, 1 on findings or a failed apply, 2 when the
 tool cannot run (unreadable series files, unusable checkout).
 
+MAX_RELATED_AUTHOR_CHARS bounds related authors to 256 nonblank printable
+characters; controls and line separators are rejected.
+
 Every git call runs without global or system configuration, so user
 settings (apply.whitespace, am.keepcr, format.*, hooks) cannot change what
 is applied or exported.
@@ -134,6 +137,7 @@ RELATED_KEYS = ("number", "kind", "author", "reason", "state", "seen")
 RELATED_KINDS = ("pull", "issue")
 RELATED_REASONS = ("same-files", "same-patch-id", "same-subject")
 MAX_FIXES_ISSUES = 64
+MAX_RELATED_AUTHOR_CHARS = 256
 MAX_RELATED = 256
 # Patch status in the metadata -> state of its pull request on the forge.
 FORGE_STATES = {"submitted": "open", "merged": "merged", "rejected": "closed"}
@@ -699,6 +703,16 @@ def check_fixes_issues(entry: dict, where: str, findings: Findings) -> None:
         findings.error(where, "'fixes_issues' must be sorted by number")
 
 
+def valid_related_author(raw: object) -> bool:
+    """Allow bounded nonblank printable account text, excluding controls and line separators."""
+    return (
+        isinstance(raw, str)
+        and 0 < len(raw) <= MAX_RELATED_AUTHOR_CHARS
+        and bool(raw.strip())
+        and all(char.isprintable() for char in raw[:MAX_RELATED_AUTHOR_CHARS])
+    )
+
+
 def _check_related_fields(item: dict, where: str, findings: Findings) -> None:
     """Validate the field values of a related object whose required keys are present."""
     for field_name, allowed in (
@@ -712,7 +726,7 @@ def _check_related_fields(item: dict, where: str, findings: Findings) -> None:
                 where, f"'related' field {field_name!r} must be one of {', '.join(allowed)}"
             )
     author = item["author"]
-    if not isinstance(author, str) or not author.strip() or "\n" in author:
+    if not valid_related_author(author):
         findings.error(where, "'related' field 'author' must be a non-empty string")
     if not _valid_day(item["seen"]):
         findings.error(where, "'related' field 'seen' must be a YYYY-MM-DD date")

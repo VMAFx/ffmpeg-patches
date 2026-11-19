@@ -26,6 +26,7 @@ cannot run (unsound data file, forge unreachable, unexpected answer).
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
 import sys
@@ -139,16 +140,29 @@ def read_response(answer: object, url: str) -> bytes:
     content = answer.read(MAX_RESPONSE_BYTES + 1)
     if len(content) > MAX_RESPONSE_BYTES:
         raise DriftError(f"{url}: response exceeds {MAX_RESPONSE_BYTES} bytes")
+    declared = getattr(answer, "headers", {}).get("Content-Length")
+    if declared is not None and len(content) < int(declared):
+        raise DriftError(
+            f"{url}: short response: received {len(content)} of {declared} declared bytes"
+        )
     return content
 
 
-def fetch_json(url: str, *, allow_list: bool = False) -> dict | list:
+def fetch_json(
+    url: str, *, allow_list: bool = False, response_headers: dict[str, str] | None = None
+) -> dict | list:
     """Fetch and decode a JSON object, or a list when allow_list is set, from the forge."""
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as answer:
+            if response_headers is not None:
+                response_headers.clear()
+                for key in ("Link", "X-Total-Count"):
+                    value = getattr(answer, "headers", {}).get(key)
+                    if value is not None:
+                        response_headers[key] = value
             data = json.loads(read_response(answer, url), object_pairs_hook=response_object)
-    except (OSError, ValueError, RecursionError) as exc:
+    except (OSError, ValueError, RecursionError, http.client.HTTPException) as exc:
         raise DriftError(f"{url}: {exc}") from exc
     if allow_list and isinstance(data, list):
         return data

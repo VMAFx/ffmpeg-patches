@@ -35,10 +35,6 @@ jobs:
       - name: Compare every recorded pull request with the forge
         id: drift
         run: python3 scripts/upstream_drift.py --fix
-      - name: Check open pull requests for upstream overlaps
-        id: links
-        if: success() || failure()
-        run: python3 scripts/upstream_links.py check
       - name: Prepare the drift patch and job summary
         id: patch
         if: success() || failure()
@@ -64,5 +60,18 @@ jobs:
           path: upstream-drift.patch
           if-no-files-found: error
       - name: Fail when drift needs review or could not be checked
-        if: ${{ !cancelled() && (steps.patch.outputs.changed == 'true' || steps.drift.outcome == 'failure' || steps.links.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.patch.outputs.changed == 'true' || steps.drift.outcome == 'failure') }}
         run: exit 1
+  links:
+    name: upstream overlap scan
+    runs-on: ubuntu-26.04
+    # Twice SCAN_BUDGET_SECONDS; test_workflow_actions checks the relationship.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+      - name: Check open pull requests for upstream overlaps
+        id: links
+        run: python3 scripts/upstream_links.py check
