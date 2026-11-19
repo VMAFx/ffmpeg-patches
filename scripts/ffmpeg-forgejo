@@ -13,6 +13,7 @@
 #                          --lease force-pushes only while the remote branch is still <sha>
 #                          --promises maps own comment IDs naming the/my next push/revision/version/iteration/round outside quoted lines to literal fragments in whitespace-normalized commit messages or PR body;
 #                          A question that names the next push is refused too; the author answers through the unchanged promise file.
+#                          A comment with an own code block and a quoted reviewer sentence naming the marker is refused on purpose; the author answers through the promise file.
 #                          missing or unfulfilled promises exit 79 before Git push
 #   ffmpeg-forgejo pr      --sweep <file> [--overlap-ok <number>]... <branch> <title> <body-file>
 #                          open PR <you>:<branch> -> master; refuses overlap with an own open PR
@@ -1329,27 +1330,20 @@ def refuse(message: str) -> None:
     raise SystemExit(79)
 
 
-# No container parsing for lists or quotes holding fences; retain doubtful author text.
+# No container parsing: drop quoted lines only when unquoted lines lack code fences and HTML starters.
+# A comment with an own code block and a quoted reviewer sentence naming the marker is refused on purpose; the author answers through the promise file.
 def promise_author_text(body: str) -> str:
-    """Remove quote lines outside fences while retaining fenced and indented code."""
+    """Drop quoted lines only when unquoted lines lack code fences and HTML starters."""
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n").removeprefix("\ufeff")
+    lines = normalized.split("\n")
+    if len(lines) > 65536:
+        return normalized
     kept = []
-    fence_char, fence_length = "", 0
-    for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n")[:65536]:
-        marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)\Z", line)
-        if fence_char:
-            if (
-                marker
-                and marker[1][0] == fence_char
-                and len(marker[1]) >= fence_length
-                and not marker[2].strip(" \t")
-            ):
-                fence_char, fence_length = "", 0
-        elif marker:
-            run, rest = marker.groups()
-            if run[0] == "~" or "`" not in rest:
-                fence_char, fence_length = run[0], len(run)
-        elif re.match(r" {0,3}>", line):
+    for line in lines[:65536]:
+        if re.match(r" {0,3}>", line):
             continue
+        if "```" in line or "~~~" in line or line.lstrip(" \t").startswith("<"):
+            return normalized
         kept.append(line)
     return "\n".join(kept)
 PY
