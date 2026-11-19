@@ -2,15 +2,17 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Planted upstream-lint defects; no repository gates or credential tests.
 
-Deterministic fixtures stub the pre-commit subprocess, never its surrounding
-Git, isolation or reporting logic. Real-tool fixtures copy base files with
-git show from the named upstream checkout and skip explicitly if unavailable.
+Deterministic fixtures stub the pre-commit and semgrep_scan.sh subprocesses,
+never their surrounding Git, isolation or reporting logic. Real-tool fixtures
+copy base files with git show from the named upstream checkout and skip
+explicitly if unavailable.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import signal
 import subprocess  # nosec B404 - fixed commands in disposable Git repositories.
@@ -28,9 +30,34 @@ import upstream_lint  # noqa: E402
 
 UPSTREAM = Path(os.environ["UPSTREAM_TREE"]) if os.environ.get("UPSTREAM_TREE") else None
 SOURCE = "int ff_value(void)\n{\n    return 1;\n}\n"
+RTSP_WITH_CLOSE = (
+    "int mux_write_header(SessionHandle *s)\n"
+    "{\n"
+    "    int ret = ff_rtsp_connect(s);\n"
+    "    if (ret < 0)\n"
+    "        return ret;\n"
+    "    ret = start_step(s);\n"
+    "    if (ret < 0) {\n"
+    "        ff_rtsp_close_connections(s);\n"
+    "        ff_network_close();\n"
+    "        return ret;\n"
+    "    }\n"
+    "    return 0;\n"
+    "}\n"
+)
+RTSP_WITHOUT_CLOSE = RTSP_WITH_CLOSE.replace("        ff_network_close();\n", "")
 FAKE_CONFIG = "repos: []\n"
 FAKE_MESSAGE = '#!/bin/sh\ngit log --format=%s "$1" | grep -Eq "^[^:]+: .+"\n'
 FAKE_PATCHECK = "#!/bin/sh\ncat > patcheck.stdout\nprintf 'patcheck fixture\\n'\n"
+DOCSTRING_EMPTY_CLEAN = (
+    "Docstring coverage: 100.00% (0/0 covered, counted: 0, covered: 0, threshold: 80%)\n"
+)
+DOCSTRING_FINDING = (
+    "Docstring coverage: 0.00% (0/2 covered, counted: 2, covered: 0, threshold: 80%)\n"
+    "libavfilter/vf_x.c:5 ff_alpha\n"
+    "libavfilter/vf_x.c:12 ff_beta\n"
+)
+DOCSTRING_ADVICE = "add a doc comment to each listed function, or pass --docstring-reason"
 
 
 class RulesTest(unittest.TestCase):
@@ -199,6 +226,30 @@ class RegressionTestPathTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(upstream_lint.is_source_path(path))
 
+    def test_is_c_source_path(self) -> None:
+        """Library and fftools C and header paths match; assembly, tests and others do not."""
+        for path in (
+            "libavformat/rtsp.c",
+            "libavformat/rtsp.h",
+            "fftools/ffmpeg.c",
+            "fftools/ffmpeg.h",
+            "libavcodec/tests.c",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(upstream_lint.is_c_source_path(path))
+        for path in (
+            "compat/strtod.c",
+            "tools/ismindex.c",
+            "doc/filters.texi",
+            "libavcodec/tests/x.c",
+            "libavformat/tests/rtsp.h",
+            "libavcodec/arm/x.S",
+            "libavcodec/x86/x.asm",
+            "rtsp.c",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(upstream_lint.is_c_source_path(path))
+
 
 class FixWordTest(unittest.TestCase):
     """Positive, negative and boundary coverage of fix detection in commit messages."""
@@ -247,6 +298,134 @@ class FixWordTest(unittest.TestCase):
             "avfilter/vf_x: update y\n\nSigned-off-by: Bug Fixer <fixer@invalid>\n",
         ):
             with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_added_defect_words_and_phrases(self) -> None:
+        """Every added memory-safety and UB defect word or phrase matches in the body."""
+        words = (
+            "uninitialised",
+            "uninitialized",
+            "use after free",
+            "use-after-free",
+            "double free",
+            "double-free",
+            "null dereference",
+            "null dereferences",
+            "null pointer dereference",
+            "null pointer dereferences",
+            "division by zero",
+            "divide by zero",
+            "undefined behaviour",
+            "undefined behavior",
+            "deadlock",
+            "deadlocks",
+            "deadlocked",
+            "segfault",
+            "segfaults",
+            "segfaulted",
+            "segmentation fault",
+            "segmentation faults",
+            "memory corruption",
+            "heap corruption",
+            "stack corruption",
+            "OOB",
+            "oob",
+        )
+        for word in words:
+            with self.subTest(word=word):
+                message = f"avformat/rtsp: check write\n\nAvoid {word} on reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), word)
+
+    def test_wrapped_and_hyphenated_added_defect_phrases(self) -> None:
+        """Added multi-word phrases match across line breaks, and free phrases across hyphens."""
+        phrases = (
+            "use\nafter free",
+            "use after\nfree",
+            "use-after-free",
+            "use-after-\nfree",
+            "use\n-after-free",
+            "double\nfree",
+            "double-free",
+            "double-\nfree",
+            "double\n-free",
+            "null\ndereference",
+            "null\ndereferences",
+            "null\npointer dereference",
+            "null pointer\ndereferences",
+            "division\nby zero",
+            "division by\nzero",
+            "divide\nby zero",
+            "divide by\nzero",
+            "undefined\nbehaviour",
+            "undefined\nbehavior",
+            "segmentation\nfault",
+            "segmentation\nfaults",
+            "memory\ncorruption",
+            "heap\ncorruption",
+            "stack\ncorruption",
+        )
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                message = f"avformat/rtsp: check write\n\nAvoid {phrase} on reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), phrase)
+
+    def test_excluded_and_partial_words_return_none(self) -> None:
+        """Excluded concurrency words and isolated parts of defect phrases return None."""
+        words = (
+            "hang",
+            "hangs",
+            "race",
+            "race condition",
+            "data race",
+            "infinite loop",
+            "free",
+            "freed",
+            "double",
+            "zero",
+            "undefined",
+            "behaviour",
+            "behavior",
+            "pointer",
+            "initialised",
+            "initialized",
+            "lock",
+        )
+        for word in words:
+            with self.subTest(word=word):
+                message = f"avformat/rtsp: check write\n\nHandle {word} in reply.\n"
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_added_defect_word_in_signoff_returns_none(self) -> None:
+        """Added defect words inside Signed-off-by trailers are ignored."""
+        for trailer in (
+            "Signed-off-by: Uninitialised Segfault <x@invalid>",
+            "signed-off-by: Double Free <oob@invalid>",
+        ):
+            with self.subTest(trailer=trailer):
+                message = f"avformat/rtsp: check write\n\n{trailer}\n"
+                self.assertIsNone(upstream_lint.fix_word(message))
+
+    def test_hyphenated_uninitialised_and_warning_flags(self) -> None:
+        """Sanitizer hyphenated forms match while warning flag prefixes return None."""
+        for token, expected in (
+            ("use-of-uninitialized-value", "uninitialized"),
+            ("use-of-uninitialised-value", "uninitialised"),
+        ):
+            with self.subTest(token=token):
+                message = f"avformat/rtsp: check write\n\nHandle {token} in reply.\n"
+                self.assertEqual(upstream_lint.fix_word(message), expected)
+        for flag in (
+            "-Wmaybe-uninitialized",
+            "-Wmaybe-uninitialised",
+            "maybe-uninitialized",
+            "maybe-uninitialised",
+            "-Wsometimes-uninitialized",
+            "-Wsometimes-uninitialised",
+            "sometimes-uninitialized",
+            "sometimes-uninitialised",
+        ):
+            with self.subTest(flag=flag):
+                message = f"avformat/rtsp: check write\n\nHandle {flag} in reply.\n"
                 self.assertIsNone(upstream_lint.fix_word(message))
 
 
@@ -2007,8 +2186,139 @@ class TestProgramTest(unittest.TestCase):
                 self.assertFalse(upstream_lint.is_test_program_path(name))
 
 
+class DocstringsStepTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of the docstrings step and reader."""
+
+    def run_step(self, returncode: int, stdout: str, waiver: str = "") -> upstream_lint.Step:
+        """Run _docstrings with _run stubbed to return the chosen status and output."""
+        stub = upstream_lint.RunResult((), returncode, stdout)
+        with unittest.mock.patch.object(upstream_lint, "_run", return_value=stub):
+            return upstream_lint._docstrings(Path("/fixture/ffmpeg"), "base", "head", waiver)
+
+    def test_coverage_pass_returns_zero(self) -> None:
+        """Exit 0 with a valid first-line coverage summary returns step rc 0."""
+        covered = (
+            "Docstring coverage: 85.71% (6/7 covered, counted: 7, covered: 6, threshold: 80%)\n"
+        )
+        for stdout in (DOCSTRING_EMPTY_CLEAN, covered):
+            with self.subTest(stdout=stdout):
+                expected = stdout.rstrip("\n")
+                self.assertEqual(
+                    upstream_lint.docstring_result(0, stdout),
+                    upstream_lint.Step("docstrings", 0, expected),
+                )
+                step = self.run_step(0, stdout)
+                self.assertEqual(step, upstream_lint.Step("docstrings", 0, expected))
+
+    def test_coverage_finding_returns_one_with_functions_and_advice(self) -> None:
+        """Exit 1 with a coverage summary keeps the function lines and appends advice."""
+        expected = f"{DOCSTRING_FINDING.rstrip()}\n{DOCSTRING_ADVICE}"
+        self.assertEqual(
+            upstream_lint.docstring_result(1, DOCSTRING_FINDING),
+            upstream_lint.Step("docstrings", 1, expected),
+        )
+        step = self.run_step(1, DOCSTRING_FINDING)
+        self.assertEqual(step.rc, 1)
+        self.assertEqual(step.output, expected)
+        self.assertIn("libavfilter/vf_x.c:5 ff_alpha", step.output)
+        self.assertIn("libavfilter/vf_x.c:12 ff_beta", step.output)
+
+    def test_blank_or_whitespace_waiver_returns_one(self) -> None:
+        """An empty or whitespace-only --docstring-reason leaves a finding at rc 1."""
+        for reason in ("", " ", " \t\n "):
+            with self.subTest(reason=reason):
+                step = self.run_step(1, DOCSTRING_FINDING, reason)
+                self.assertEqual(step.rc, 1)
+                self.assertNotIn("waived:", step.output)
+                self.assertTrue(step.output.endswith(DOCSTRING_ADVICE))
+
+    def test_non_blank_waiver_waives_finding(self) -> None:
+        """A non-blank --docstring-reason returns rc 0 with the waived header line."""
+        expected = f"waived: internal wrappers\n{DOCSTRING_FINDING.rstrip()}"
+        self.assertEqual(
+            upstream_lint.docstring_result(1, DOCSTRING_FINDING, "  internal wrappers  "),
+            upstream_lint.Step("docstrings", 0, expected),
+        )
+        step = self.run_step(1, DOCSTRING_FINDING, "internal wrappers")
+        self.assertEqual(step.rc, 0)
+        self.assertEqual(step.output, expected)
+
+    def test_hook_refusal_returns_two(self) -> None:
+        """Exit 1 starting with a praetor hooks refusal fails closed with rc 2."""
+        refusal = "praetor hooks: installing the engine failed\n"
+        for reason in ("", "cannot waive refusal"):
+            with self.subTest(reason=reason):
+                step = self.run_step(1, refusal, reason)
+                self.assertEqual(step.rc, 2)
+                self.assertIn("1", step.output.splitlines()[0])
+                self.assertIn("praetor hooks: installing the engine failed", step.output)
+                self.assertNotIn("waived:", step.output)
+
+    def test_engine_error_exit_two_returns_two_even_when_waived(self) -> None:
+        """Exit 2 with an [ERROR] line returns rc 2 even when a waiver is supplied."""
+        error = "[ERROR] cannot read base revision\n"
+        for reason in ("", "not a finding"):
+            with self.subTest(reason=reason):
+                step = self.run_step(2, error, reason)
+                self.assertEqual(step.rc, 2)
+                self.assertIn("2", step.output.splitlines()[0])
+                self.assertIn("[ERROR] cannot read base revision", step.output)
+                self.assertNotIn("waived:", step.output)
+
+    def test_timeout_exit_returns_two(self) -> None:
+        """A timed-out engine run with exit 124 fails closed with rc 2."""
+        for stdout in ("\ncommand timed out\n", f"{DOCSTRING_EMPTY_CLEAN}command timed out\n"):
+            with self.subTest(stdout=stdout):
+                step = self.run_step(124, stdout, "not waivable")
+                self.assertEqual(step.rc, 2)
+                self.assertIn("124", step.output.splitlines()[0])
+                self.assertNotIn("waived:", step.output)
+
+    def test_zero_exit_without_coverage_line_returns_two(self) -> None:
+        """Exit 0 without the allow-listed coverage line fails closed with rc 2."""
+        for stdout in ("", "ok\n", "Docstring coverage: ok\n"):
+            with self.subTest(stdout=stdout):
+                step = self.run_step(0, stdout)
+                self.assertEqual(step.rc, 2)
+                self.assertIn("0", step.output.splitlines()[0])
+
+    def test_non_first_coverage_line_returns_two(self) -> None:
+        """A coverage summary preceded by another line fails closed with rc 2."""
+        cases = (
+            (0, f"praetor hooks: running engine on PATH\n{DOCSTRING_EMPTY_CLEAN}"),
+            (1, f"\n{DOCSTRING_FINDING}"),
+        )
+        for returncode, stdout in cases:
+            with self.subTest(returncode=returncode):
+                step = self.run_step(returncode, stdout, "not a finding")
+                self.assertEqual(step.rc, 2)
+                self.assertNotIn("waived:", step.output)
+
+    def test_step_passes_expected_argv_and_cwd_to_run(self) -> None:
+        """The step runs engine.sh via bash from REPO_ROOT with DOCSTRINGS_TIMEOUT."""
+        tree = Path("/fixture/ffmpeg")
+        stub = upstream_lint.RunResult((), 0, DOCSTRING_EMPTY_CLEAN)
+        with unittest.mock.patch.object(upstream_lint, "_run", return_value=stub) as run:
+            step = upstream_lint._docstrings(tree, "base_rev", "head_rev", "")
+        self.assertEqual(step.rc, 0)
+        self.assertEqual(upstream_lint.DOCSTRINGS_TIMEOUT, 300)
+        run.assert_called_once_with(
+            [
+                "bash",
+                str(upstream_lint.REPO_ROOT / ".config" / "lefthook" / "engine.sh"),
+                "docstrings",
+                "check",
+                f"--path={tree}",
+                "--base=base_rev",
+                "--head=head_rev",
+            ],
+            upstream_lint.REPO_ROOT,
+            timeout=upstream_lint.DOCSTRINGS_TIMEOUT,
+        )
+
+
 class FixtureTest(unittest.TestCase):
-    """Shared disposable Git fixture; stub the pre-commit subprocess only."""
+    """Shared disposable Git fixture; stub pre-commit, semgrep_scan.sh and the Praetor engine."""
 
     def setUp(self) -> None:
         """Create a minimal committed base without inheriting template hooks."""
@@ -2030,6 +2340,13 @@ class FixtureTest(unittest.TestCase):
         self.hook_rc = 0
         self.hook_effect = lambda cwd: None
         self.hook_calls = []
+        self.c_rules_rc = 0
+        self.c_rules_stdout = ""
+        self.c_rules_json: str | None = ""
+        self.c_rules_calls: list[tuple[list[str], Path, float]] = []
+        self.engine_rc = 0
+        self.engine_output = DOCSTRING_EMPTY_CLEAN
+        self.engine_calls = []
 
     def git(self, *args: str) -> str:
         """Run bounded fixture Git commands with explicit author and signing settings."""
@@ -2069,15 +2386,28 @@ class FixtureTest(unittest.TestCase):
     def command(
         self, argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60
     ) -> upstream_lint.RunResult:
-        """Intercept only pre-commit; execute the real bounded runner otherwise."""
+        """Stub hooks, scans and the engine with full default path coverage; bound the rest."""
         if Path(argv[0]).name == upstream_lint.PRE_COMMIT:
             self.hook_calls.append((argv, Path(argv[3]).read_text(encoding="utf-8")))
             self.hook_effect(Path(cwd))
             return upstream_lint.RunResult(tuple(argv), self.hook_rc, "fixture pre-commit\n")
+        if len(argv) >= 2 and argv[0] == "bash" and Path(argv[1]) == upstream_lint.SEMGREP_SCAN:
+            self.c_rules_calls.append((argv, Path(cwd), timeout))
+            if self.c_rules_json is not None:
+                json_arg = next(item for item in argv if item.startswith("--json-output="))
+                Path(json_arg.removeprefix("--json-output=")).write_text(
+                    self.c_rules_json
+                    or json.dumps({"paths": {"scanned": argv[5:]}, "results": [], "errors": []}),
+                    encoding="utf-8",
+                )
+            return upstream_lint.RunResult(tuple(argv), self.c_rules_rc, self.c_rules_stdout)
+        if argv[:2] == ["bash", str(upstream_lint.REPO_ROOT / upstream_lint.ENGINE_SCRIPT)]:
+            self.engine_calls.append((argv, Path(cwd)))
+            return upstream_lint.RunResult(tuple(argv), self.engine_rc, self.engine_output)
         return self.real_run(argv, cwd, data, timeout)
 
     def check(self, *args: str) -> tuple[int, str]:
-        """Capture the complete gate report with a controlled pre-commit result."""
+        """Capture the complete gate report with controlled hook and engine results."""
         output = io.StringIO()
         with (
             unittest.mock.patch.object(
@@ -2091,7 +2421,7 @@ class FixtureTest(unittest.TestCase):
 
 
 class PipelineTest(FixtureTest):
-    """Run Git and base tools in a throwaway repository; stub pre-commit only."""
+    """Run Git and base tools in a throwaway repository; stub external hooks and engine."""
 
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
         """A correctly named clean commit passes every collected check."""
@@ -2112,8 +2442,153 @@ class PipelineTest(FixtureTest):
             "doc-wrap",
             "doc-reference",
             "test-program",
+            "c-rules",
+            "docstrings",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
+
+    def test_c_rules_finding_on_added_line_fails(self) -> None:
+        """A c-rules finding touching an added source line fails the step and pipeline."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit()
+        self.c_rules_rc = 1
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavfilter/vf_x.c"]},
+                "results": [
+                    {
+                        "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                        "path": "libavfilter/vf_x.c",
+                        "start": {"line": 3},
+                        "end": {"line": 3},
+                        "extra": {"message": "call ff_network_close() before returning"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: c-rules rc: 1", output)
+        self.assertIn(
+            "finding: libavfilter/vf_x.c:3: "
+            "ffmpeg-rtsp-connect-failure-without-network-close: "
+            "call ff_network_close() before returning",
+            output,
+        )
+        self.assertIn("fix the flagged path, or pass --c-rule-reason", output)
+        self.assertIn("step: test-program rc: 0", output)
+
+    def test_c_rules_waiver_passes(self) -> None:
+        """A non-blank --c-rule-reason waives a c-rules finding and prints the reason."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit()
+        self.c_rules_rc = 1
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavfilter/vf_x.c"]},
+                "results": [
+                    {
+                        "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                        "path": "libavfilter/vf_x.c",
+                        "start": {"line": 3},
+                        "end": {"line": 3},
+                        "extra": {"message": "call ff_network_close() before returning"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        rc, output = self.check("--c-rule-reason", "caller owns network teardown")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: c-rules rc: 0\nwaived: caller owns network teardown", output)
+
+    def test_c_rules_renamed_source_tracks_only_changed_lines(self) -> None:
+        """A pure rename leaves pre-existing matches untouched; editing inside one fails."""
+        self.write("libavformat/rtsp_old.c", RTSP_WITHOUT_CLOSE)
+        self.commit("avformat/rtsp: add mux helper")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.c_rules_rc = 1
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtsp_new.c"]},
+                "results": [
+                    {
+                        "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                        "path": "libavformat/rtsp_new.c",
+                        "start": {"line": 8},
+                        "end": {"line": 9},
+                        "extra": {"message": "call ff_network_close() before returning"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        self.git("mv", "libavformat/rtsp_old.c", "libavformat/rtsp_new.c")
+        self.commit("avformat/rtsp: rename mux helper")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertEqual(self.c_rules_calls[0][0][5:], ["libavformat/rtsp_new.c"])
+        self.assertIn("pre-existing (untouched): libavformat/rtsp_new.c:8:", output)
+
+        self.git("reset", "--hard", self.base)
+        self.c_rules_calls.clear()
+        self.git("mv", "libavformat/rtsp_old.c", "libavformat/rtsp_new.c")
+        self.write(
+            "libavformat/rtsp_new.c",
+            RTSP_WITHOUT_CLOSE.replace(
+                "        return ret;\n    }\n", "        return -1;\n    }\n"
+            ),
+        )
+        self.commit("avformat/rtsp: rename and adjust return")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertEqual(self.c_rules_calls[0][0][5:], ["libavformat/rtsp_new.c"])
+        self.assertIn("step: c-rules rc: 1", output)
+        self.assertIn("finding: libavformat/rtsp_new.c:8:", output)
+
+    def test_c_rules_deletion_only_hunks_and_span_boundaries(self) -> None:
+        """Deletions inside or directly after a match span fail; before start_line passes."""
+        self.c_rules_rc = 1
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtsp.c"]},
+                "results": [
+                    {
+                        "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                        "path": "libavformat/rtsp.c",
+                        "start": {"line": 8},
+                        "end": {"line": 9},
+                        "extra": {"message": "call ff_network_close() before returning"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        after_end = RTSP_WITHOUT_CLOSE.replace(
+            "        return ret;\n", "        return ret;\n        /* after match */\n"
+        )
+        before_start = RTSP_WITHOUT_CLOSE.replace(
+            "        ff_rtsp_close_connections(s);\n",
+            "        /* before match */\n        ff_rtsp_close_connections(s);\n",
+        )
+        saved_base = self.base
+        for label, base_source, expected_rc, marker in (
+            ("inside", RTSP_WITH_CLOSE, 1, "finding: libavformat/rtsp.c:8:"),
+            ("after-end", after_end, 1, "finding: libavformat/rtsp.c:8:"),
+            ("before-start", before_start, 0, "pre-existing (untouched): libavformat/rtsp.c:8:"),
+        ):
+            with self.subTest(case=label):
+                self.git("reset", "--hard", saved_base)
+                self.write("libavformat/rtsp.c", base_source)
+                self.commit("avformat/rtsp: add mux helper")
+                self.base = self.git("rev-parse", "HEAD").strip()
+                self.write("libavformat/rtsp.c", RTSP_WITHOUT_CLOSE)
+                self.commit("avformat/rtsp: trim mux helper")
+                rc, output = self.check()
+                self.assertEqual(rc, expected_rc, output)
+                self.assertIn(f"step: c-rules rc: {expected_rc}", output)
+                self.assertIn(marker, output)
 
     def test_fix_without_test_fails(self) -> None:
         """A source fix commit with no changed test path in the range fails."""
@@ -2160,6 +2635,41 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: regression-test rc: 1", output)
+
+    def test_body_uninitialised_defect_word_requires_test_or_waiver(self) -> None:
+        """An uninitialised-reply body fails without a test and passes when waived or neutral."""
+        subject = "avformat/rtsp: check command write before using replies"
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit(
+            f"{subject}\n\nIgnoring that error can make callers inspect an uninitialised reply."
+        )
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        rc, output = self.check("--no-test-reason", "needs a live RTSP server")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("waived: needs a live RTSP server", output)
+        self.git("commit", "--amend", "-qm", f"{subject}\n\nRename the reply helper.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+
+    def test_hyphenated_uninitialized_subject_requires_test_or_waiver(self) -> None:
+        """A use-of-uninitialized-value subject fails without a test unless waived."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avformat/x: use-of-uninitialized-value in keybuffer")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: regression-test rc: 1", output)
+        rc, output = self.check("--no-test-reason", "reproducer requires MemorySanitizer")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("waived: reproducer requires MemorySanitizer", output)
+        self.git("commit", "--amend", "-qm", "avformat/x: clear keybuffer")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
 
     def test_wrapped_body_defect_phrase_without_test_fails(self) -> None:
         """A source commit whose body wraps a defect phrase fails without a changed test path."""
@@ -2614,6 +3124,29 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: test-program rc: 0", output)
+
+    def test_docstrings_finding_fails(self) -> None:
+        """An unwaived docstrings engine finding fails its step and the overall run."""
+        self.engine_rc = 1
+        self.engine_output = DOCSTRING_FINDING
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: docstrings rc: 1", output)
+        self.assertIn("libavfilter/vf_x.c:5 ff_alpha", output)
+        self.assertIn(DOCSTRING_ADVICE, output)
+
+    def test_docstrings_waiver_passes(self) -> None:
+        """A non-blank --docstring-reason waives a docstrings finding in the report."""
+        self.engine_rc = 1
+        self.engine_output = DOCSTRING_FINDING
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit()
+        rc, output = self.check("--docstring-reason", "internal static wrappers")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: docstrings rc: 0\nwaived: internal static wrappers", output)
+        self.assertIn("libavfilter/vf_x.c:5 ff_alpha", output)
 
     def test_renamed_two_hunk_scope_claim_passes(self) -> None:
         """A renamed file with two source hunks satisfies a multi-site scope claim."""
@@ -3334,6 +3867,487 @@ class PreCommitResolutionTest(unittest.TestCase):
         with unittest.mock.patch("shutil.which", return_value="/fixture/user/bin/pre-commit"):
             executable = upstream_lint._pre_commit()
         upstream_lint._validate_executable([executable, "run"])
+
+
+class CRulesTest(unittest.TestCase):
+    """Unit coverage of the c-rules allow-list, argv, working directory and waiver."""
+
+    def setUp(self) -> None:
+        """Set default stub state for one changed C source with added lines 11 and 12."""
+        self.tree = Path("/fixture/ffmpeg")
+        self.diff_names = "libavformat/rtspenc.c\0"
+        self.patches = {"libavformat/rtspenc.c": "@@ -10,0 +11,2 @@\n+a\n+b\n"}
+        self.stub_rc = 0
+        self.stub_stdout = ""
+        self.stub_json: str | None = json.dumps(
+            {"paths": {"scanned": ["libavformat/rtspenc.c"]}, "results": [], "errors": []}
+        )
+        self.calls: list[tuple[list[str], Path, float]] = []
+
+    def fake_git(self, tree: Path, *args: str) -> str:
+        """Return stubbed changed-path or zero-context diff output for _c_rules."""
+        if "--name-only" in args:
+            return self.diff_names
+        if args[-1] in self.patches:
+            return self.patches[args[-1]]
+        names = [name for name in self.diff_names.split("\0") if name]
+        sections = [
+            f"diff --git a/{name} b/{name}\n{self.patches.get(name, '')}".rstrip("\n")
+            for name in names
+        ]
+        return "\n".join(sections) + ("\n" if sections else "")
+
+    def fake_run(
+        self, argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60
+    ) -> upstream_lint.RunResult:
+        """Write stubbed JSON when configured and return the chosen RunResult."""
+        self.calls.append((argv, cwd, timeout))
+        if self.stub_json is not None:
+            json_arg = next(item for item in argv if item.startswith("--json-output="))
+            Path(json_arg.removeprefix("--json-output=")).write_text(
+                self.stub_json, encoding="utf-8"
+            )
+        return upstream_lint.RunResult(tuple(argv), self.stub_rc, self.stub_stdout)
+
+    def run_c_rules(self, waiver: str = "") -> upstream_lint.Step:
+        """Execute _c_rules through _collect with _git and _run stubbed."""
+        with (
+            unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
+        ):
+            return upstream_lint._collect(
+                "c-rules",
+                lambda: upstream_lint._c_rules(self.tree, "base", "head", waiver),
+            )
+
+    def inter_hunk_fixture(self) -> FixtureTest:
+        """Create real Git hunks around an unchanged defect with context fusion enabled."""
+        fixture = FixtureTest()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        fixture.git("config", "diff.interHunkContext", "2")
+        source = (
+            "int ff_value(void)\n{\n    ff_first();\n    ff_second();\n"
+            "    ff_third();\n    ff_fourth();\n    ff_before(1);\n"
+            "\tff_old();\n    ff_between();\n    return 1;\n}\n"
+        )
+        fixture.write("libavfilter/vf_x.c", source)
+        fixture.commit("avfilter/vf_x: add inherited defect")
+        fixture.base = fixture.git("rev-parse", "HEAD").strip()
+        fixture.write(
+            "libavfilter/vf_x.c",
+            source.replace("ff_before(1)", "ff_before(2)").replace("return 1", "return 2"),
+        )
+        fixture.commit()
+        return fixture
+
+    def test_inter_hunk_context_keeps_c_rule_match_untouched(self) -> None:
+        """Configured context fusion cannot turn an unchanged Semgrep match into a finding."""
+        fixture = self.inter_hunk_fixture()
+        fixture.c_rules_rc = 1
+        fixture.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavfilter/vf_x.c"]},
+                "results": [
+                    {
+                        "check_id": "inherited-defect",
+                        "path": "libavfilter/vf_x.c",
+                        "start": {"line": 8},
+                        "end": {"line": 8},
+                        "extra": {"message": "inherited match"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=fixture.command):
+            step = upstream_lint._c_rules(fixture.root, fixture.base, "HEAD", "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("pre-existing (untouched): libavfilter/vf_x.c:8:", step.output)
+
+    def test_inter_hunk_context_keeps_line_rule_defect_untouched(self) -> None:
+        """Configured context fusion cannot mark an unchanged TAB line as added."""
+        fixture = self.inter_hunk_fixture()
+        step = upstream_lint._mechanical(fixture.root, fixture.base, "HEAD")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("pre-existing (untouched): libavfilter/vf_x.c:8: TAB character", step.output)
+
+    def test_requested_path_missing_from_scanned_is_unwaivable(self) -> None:
+        """Every requested path must be scanned even when a waiver is supplied."""
+        self.diff_names += "libavformat/rtsp.h\0"
+        self.patches["libavformat/rtsp.h"] = "@@ -1,0 +2 @@\n+x\n"
+        self.stub_json = json.dumps(
+            {"paths": {"scanned": ["libavformat/rtspenc.c"]}, "results": [], "errors": []}
+        )
+        for waiver in ("", "caller closes network"):
+            with self.subTest(waiver=waiver):
+                step = self.run_c_rules(waiver)
+                self.assertEqual(step.rc, 2, step.output)
+                self.assertNotIn("waived:", step.output)
+
+    def test_invalid_scanned_paths_is_unwaivable(self) -> None:
+        """Missing or malformed scan coverage gives rc 2 with or without a waiver."""
+        for coverage in (
+            {},
+            {"paths": None},
+            {"paths": []},
+            {"paths": {}},
+            {"paths": {"scanned": None}},
+            {"paths": {"scanned": "libavformat/rtspenc.c"}},
+            {"paths": {"scanned": {"libavformat/rtspenc.c": True}}},
+            {"paths": {"scanned": ["libavformat/rtspenc.c", 7]}},
+        ):
+            self.stub_json = json.dumps({"results": [], "errors": [], **coverage})
+            for waiver in ("", "caller closes network"):
+                with self.subTest(coverage=coverage, waiver=waiver):
+                    step = self.run_c_rules(waiver)
+                    self.assertEqual(step.rc, 2, step.output)
+                    self.assertNotIn("waived:", step.output)
+
+    def test_no_changed_source_makes_no_run_call(self) -> None:
+        """No changed library or fftools C or header source returns rc 0 without _run."""
+        for names in ("", "doc/x.texi\0libavcodec/tests/x.c\0libavcodec/x86/x.asm\0"):
+            with self.subTest(names=names):
+                self.diff_names = names
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertIn("no added or modified C or header source", step.output)
+                self.assertEqual(self.calls, [])
+
+    def test_argv_working_directory_and_timeout(self) -> None:
+        """Scan argv disables the target size limit and preserves tree and timeout settings."""
+        self.diff_names = "libavformat/rtspenc.c\0libavformat/rtsp.h\0"
+        self.patches["libavformat/rtsp.h"] = "@@ -1,0 +2,1 @@\n+x\n"
+        self.stub_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtspenc.c", "libavformat/rtsp.h"]},
+                "results": [],
+                "errors": [],
+            }
+        )
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(len(self.calls), 1)
+        argv, cwd, timeout = self.calls[0]
+        self.assertEqual(cwd, self.tree)
+        self.assertEqual(timeout, 300)
+        self.assertEqual(timeout, upstream_lint.C_RULES_TIMEOUT)
+        self.assertEqual(
+            argv[:3],
+            [
+                "bash",
+                str(upstream_lint.REPO_ROOT / "scripts" / "semgrep_scan.sh"),
+                f"--rules={upstream_lint.REPO_ROOT / '.semgrep-ffmpeg.yml'}",
+            ],
+        )
+        self.assertTrue(argv[3].startswith("--json-output="))
+        self.assertFalse(Path(argv[3].removeprefix("--json-output=")).parent.exists())
+        self.assertEqual(argv[4], "--max-target-bytes=0")
+        self.assertEqual(argv[5:], ["libavformat/rtspenc.c", "libavformat/rtsp.h"])
+
+    def test_exit_zero_empty_results_passes(self) -> None:
+        """Exit status 0 with empty results and errors lists returns step rc 0."""
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 finding(s)", step.output)
+
+    def test_exit_one_result_on_added_line_fails(self) -> None:
+        """A result whose line range meets an added line gives a finding and step rc 1."""
+        self.stub_rc = 1
+        self.stub_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                "results": [
+                    {
+                        "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                        "path": "libavformat/rtspenc.c",
+                        "start": {"line": 10},
+                        "end": {"line": 11},
+                        "extra": {"message": "first message line\nsecond detail line"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: libavformat/rtspenc.c:10: "
+            "ffmpeg-rtsp-connect-failure-without-network-close: first message line",
+            step.output,
+        )
+        self.assertNotIn("second detail line", step.output)
+        self.assertIn("fix the flagged path, or pass --c-rule-reason", step.output)
+
+    def test_rules_path_prefix_stripped_from_check_id(self) -> None:
+        """A check_id prefixed with the dotted rules path reports the bare rule id."""
+        rule = "ffmpeg-rtsp-connect-failure-without-network-close"
+        self.stub_rc = 1
+        self.stub_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                "results": [
+                    {
+                        "check_id": f"home.user.checkout.{rule}",
+                        "path": "libavformat/rtspenc.c",
+                        "start": {"line": 11},
+                        "end": {"line": 11},
+                        "extra": {"message": "missing ff_network_close()"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            f"finding: libavformat/rtspenc.c:11: {rule}: missing ff_network_close()", step.output
+        )
+        self.assertNotIn("home.user", step.output)
+
+    def test_result_on_untouched_line_passes_and_lists_preexisting(self) -> None:
+        """A result outside added lines is listed as pre-existing without failing."""
+        self.stub_rc = 1
+        self.stub_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                "results": [
+                    {
+                        "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                        "path": "libavformat/rtspenc.c",
+                        "start": {"line": 3},
+                        "end": {"line": 5},
+                        "extra": {"message": "missing ff_network_close()"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn(
+            "pre-existing (untouched): libavformat/rtspenc.c:3: "
+            "ffmpeg-rtsp-connect-failure-without-network-close: missing ff_network_close()",
+            step.output,
+        )
+        self.assertNotIn("finding:", step.output)
+
+    def test_partial_parsing_error_is_informational(self) -> None:
+        """PartialParsing errors produce informational file lines without failing."""
+        for error_type in ("PartialParsing", ["PartialParsing", [{"path": "libavformat/rtsp.c"}]]):
+            with self.subTest(error_type=error_type):
+                self.stub_json = json.dumps(
+                    {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                        "results": [],
+                        "errors": [{"type": error_type, "path": "libavformat/rtsp.c"}],
+                    }
+                )
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertIn("informational: libavformat/rtsp.c: PartialParsing", step.output)
+
+    def test_other_error_type_gives_rc_two(self) -> None:
+        """Any error type other than PartialParsing gives step rc 2 with status and output."""
+        self.stub_stdout = "rule parse error\n"
+        self.stub_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                "results": [],
+                "errors": [{"type": "Syntax error", "path": "libavformat/rtsp.c"}],
+            }
+        )
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertTrue(step.output.startswith("command rc: 0\nrule parse error"))
+
+    def test_unexpected_exit_statuses_give_rc_two(self) -> None:
+        """Exit statuses 2, 127 and 124 give step rc 2 naming the exit status and output."""
+        for status, text in (
+            (2, "fatal config error\n"),
+            (127, "semgrep: command not found\n"),
+            (124, "command timed out\n"),
+        ):
+            with self.subTest(status=status):
+                self.stub_rc = status
+                self.stub_stdout = text
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 2, step.output)
+                self.assertTrue(step.output.startswith(f"command rc: {status}\n{text}"))
+
+    def test_warning_line_gives_rc_two(self) -> None:
+        """A semgrep_scan: warning line in output gives step rc 2 even on exit 0 or 1."""
+        for status in (0, 1):
+            with self.subTest(status=status):
+                self.stub_rc = status
+                self.stub_stdout = (
+                    "Rule demo contains warning\n"
+                    "semgrep_scan: a rule in .semgrep-ffmpeg.yml draws the warning above\n"
+                )
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 2, step.output)
+                self.assertTrue(step.output.startswith(f"command rc: {status}\n"))
+                self.assertIn("semgrep_scan:", step.output)
+
+    def test_missing_json_file_gives_rc_two(self) -> None:
+        """A missing JSON output file gives step rc 2 naming the exit status and output."""
+        self.stub_json = None
+        self.stub_stdout = "no json written\n"
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertTrue(step.output.startswith("command rc: 0\nno json written"))
+
+    def test_unparseable_json_gives_rc_two(self) -> None:
+        """Unparseable or structurally invalid JSON payloads give step rc 2."""
+        self.stub_stdout = "scan finished\n"
+        for payload in (
+            "{not-json",
+            "[]",
+            json.dumps({"paths": {"scanned": ["libavformat/rtspenc.c"]}, "results": []}),
+            json.dumps(
+                {"paths": {"scanned": ["libavformat/rtspenc.c"]}, "results": [{}], "errors": []}
+            ),
+        ):
+            with self.subTest(payload=payload):
+                self.stub_json = payload
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 2, step.output)
+                self.assertTrue(step.output.startswith("command rc: 0\nscan finished"))
+
+    def test_waiver_on_rc_one_and_rc_two(self) -> None:
+        """A non-blank reason waives rc 1 with waived: first; blank fails; rc 2 stays 2."""
+        self.stub_rc = 1
+        self.stub_json = json.dumps(
+            {
+                "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                "results": [
+                    {
+                        "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                        "path": "libavformat/rtspenc.c",
+                        "start": {"line": 11},
+                        "end": {"line": 12},
+                        "extra": {"message": "call ff_network_close()"},
+                    }
+                ],
+                "errors": [],
+            }
+        )
+        waived = self.run_c_rules("caller closes network")
+        self.assertEqual(waived.rc, 0, waived.output)
+        self.assertEqual(waived.output.splitlines()[0], "waived: caller closes network")
+        self.assertIn("finding: libavformat/rtspenc.c:11:", waived.output)
+        self.assertNotIn("pass --c-rule-reason", waived.output)
+
+        blank = self.run_c_rules("   ")
+        self.assertEqual(blank.rc, 1, blank.output)
+        self.assertNotIn("waived:", blank.output)
+
+        self.stub_rc = 127
+        self.stub_stdout = "semgrep: not found\n"
+        unwaivable = self.run_c_rules("caller closes network")
+        self.assertEqual(unwaivable.rc, 2, unwaivable.output)
+        self.assertNotIn("waived:", unwaivable.output)
+
+    def test_empty_rule_id_gives_unwaivable_rc_two(self) -> None:
+        """A check_id whose final dotted segment is empty gives non-waivable rc 2."""
+        self.stub_rc = 1
+        self.stub_stdout = "scan finished\n"
+        for check_id in ("rules.", "."):
+            with self.subTest(check_id=check_id):
+                self.stub_json = json.dumps(
+                    {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                        "results": [
+                            {
+                                "check_id": check_id,
+                                "path": "libavformat/rtspenc.c",
+                                "start": {"line": 11},
+                                "end": {"line": 12},
+                                "extra": {"message": "call ff_network_close()"},
+                            }
+                        ],
+                        "errors": [],
+                    }
+                )
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 2, step.output)
+                waived = self.run_c_rules("caller closes network")
+                self.assertEqual(waived.rc, 2, waived.output)
+                self.assertNotIn("waived:", waived.output)
+
+    def test_unscanned_result_path_gives_unwaivable_rc_two(self) -> None:
+        """A result path absent from the scanned path list gives non-waivable rc 2."""
+        self.stub_rc = 1
+        self.stub_stdout = "scan finished\n"
+        for result_path in (
+            "libavformat/rtsp.c",
+            "./libavformat/rtspenc.c",
+            "/fixture/ffmpeg/libavformat/rtspenc.c",
+        ):
+            with self.subTest(result_path=result_path):
+                self.stub_json = json.dumps(
+                    {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                        "results": [
+                            {
+                                "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                                "path": result_path,
+                                "start": {"line": 11},
+                                "end": {"line": 12},
+                                "extra": {"message": "call ff_network_close()"},
+                            }
+                        ],
+                        "errors": [],
+                    }
+                )
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 2, step.output)
+                waived = self.run_c_rules("caller closes network")
+                self.assertEqual(waived.rc, 2, waived.output)
+                self.assertNotIn("waived:", waived.output)
+
+    def test_semgrep_span_boundaries_give_rc_two(self) -> None:
+        """Boolean, zero and inverted start/end line numbers give step rc 2."""
+        self.stub_rc = 1
+        for start_line, end_line in ((True, 11), (11, True), (0, 11), (12, 11)):
+            with self.subTest(start=start_line, end=end_line):
+                self.stub_json = json.dumps(
+                    {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                        "results": [
+                            {
+                                "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                                "path": "libavformat/rtspenc.c",
+                                "start": {"line": start_line},
+                                "end": {"line": end_line},
+                                "extra": {"message": "call ff_network_close()"},
+                            }
+                        ],
+                        "errors": [],
+                    }
+                )
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 2, step.output)
+
+    def test_partial_parsing_boundaries_give_rc_two(self) -> None:
+        """Empty error paths, non-matching list types and string errors give rc 2."""
+        for error_entry in (
+            {"type": "PartialParsing", "path": ""},
+            {"type": [], "path": "libavformat/rtspenc.c"},
+            {"type": ["Syntax error"], "path": "libavformat/rtspenc.c"},
+            {"type": "PartialParsing", "path": ["libavformat/rtspenc.c"]},
+            "PartialParsing",
+        ):
+            with self.subTest(error=error_entry):
+                self.stub_json = json.dumps(
+                    {
+                        "paths": {"scanned": ["libavformat/rtspenc.c"]},
+                        "results": [],
+                        "errors": [error_entry],
+                    }
+                )
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 2, step.output)
 
 
 if __name__ == "__main__":

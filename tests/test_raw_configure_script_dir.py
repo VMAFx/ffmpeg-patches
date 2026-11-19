@@ -9,22 +9,55 @@ import subprocess  # nosec B404 - only the fixed guard runs.
 from pathlib import Path
 from typing import NamedTuple
 
+from scripts.raw_configure_body import BASH_VARIABLES
 from tests.raw_configure_support import RawConfigureGuardBase
 
 UNKNOWN_SOURCE = "relative script path after a source the guard cannot read; use an absolute path"
 AMBIGUOUS = "assigned in a sourced file and elsewhere"
 UNRESOLVED = "own-directory name assigned in a function, branch or loop"
 UNSUBSTITUTED = "expansion the guard cannot substitute"
+REBOUND = "can rebind the commands of the idiom"
+NEWLINE = "directory path holds a newline"
+NEWLINE_NAME = "resolved script file name holds a newline"
 BENIGN_NEXT = {"tools/next.sh": "echo benign\n"}
 DEFAULT = 'HERE=${LANE_TEST_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}\n'
 DOLLAR0 = 'HERE="$(dirname "$(readlink -f "$0")")"\n'
 REALPATH = 'HERE=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")\n'
+CDPWD = 'HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
+GH = 'gh() { . "$HERE/lib.sh"; }\n'
+JH = 'jh() { . "$HERE/lib.sh"; }\n'
+# Unicode escape openers of ANSI-C quoting, spelled in two parts so tools that decode Unicode
+# escapes in text they copy keep the escape.
+ESC_U = "\\" + "u"
+ESC_UU = "\\" + "U"
+THERE = 'THERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)\n'
+CDPWD_P = 'HERE="$(cd -P -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")" && pwd -P)"\n'
+CD_LINK_DIR = 'HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)\n'
+CD_EXTRA = 'HERE=$(cd "$(dirname "$(readlink -f "$0")")" && cd sub && pwd)\n'
 SRC = '. "$HERE/lib.sh"\n'
+SRC_THERE = '. "$THERE/lib.sh"\n'
 UNREAD = '. "$UNSET_DIR/x.sh"\n'
 RUN = "bash inner.sh\n"
 CFG = "<cfg>\n"
+WRITTEN = "own-directory name the script also writes another way"
+BRACE_WORD = "{a,b,"
+OTHER = {"other/lib.sh": CFG}
+PRINTF = "printf -v HERE '%s' <case>/other\n"
+POSIX = "set -o posix\n"
 LINK = "-> ../tools/run.sh"
 RUN_NEXT = 'run_next() {\n  "$HERE/next.sh" check\n}\n'
+HASH_DIRNAME = "{ builtin hash -p <case>/bin/dirname dirname; }\n"
+OTHER_DIRNAME = {"bin/dirname": "echo <case>/other\n", "other/lib.sh": CFG}
+ARGV0_OWN = 'BASH_ARGV0=$(dirname "$(readlink -f "$0")")\n'
+ROOT_LIB = {"lib.sh": CFG}
+PREFIXED = "script path in a function that the script calls with a prefix assignment"
+SOURCED = "prefix assignment in a sourced file before a call of a function"
+# Round r23: the command word $c with the two halves of the name HERE, read from a here-string.
+NAME_HERE = "n=HE\nm=RE\n"
+CALL_C = '"$c" "$n$m" <<< <case>/other\n'
+X16 = "".join(f"c=x{idx:02d}\n" for idx in range(16))
+CALL_ARRAY = '"${arr[@]}" "$n$m" <<< <case>/other\n'
+READ_RUN = "bash tools/run.sh read"
 
 
 class Case(NamedTuple):
@@ -140,7 +173,7 @@ SCRIPT_DIR = {
         None,
         {"tools/next.sh": "echo benign\n"},
     ),
-    "declare-lowercase": Case("declare -l " + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "declare-lowercase": Case("declare -l " + DOLLAR0 + SRC + RUN, 2, REBOUND),
     "export-assignment": Case("export " + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
     "local-in-function-keeps-top-level": Case(
         DEFAULT + "f() {\n  local " + DOLLAR0.lower() + "}\n" + SRC + RUN, 0
@@ -187,7 +220,1577 @@ SCRIPT_DIR = {
         UNSUBSTITUTED,
         BENIGN_NEXT,
     ),
+    "cd-pwd-form": Case(CDPWD + SRC + RUN, 0),
+    "cd-pwd-physical": Case(CDPWD_P + SRC + RUN, 0),
+    "cd-pwd-lib-runs-configure": Case(CDPWD + SRC, 2, "tree/configure", {"tools/lib.sh": CFG}),
+    "cd-pwd-symlink-reads-target-dir": Case(
+        CDPWD + SRC,
+        2,
+        "tree/configure",
+        {"link/run.sh": LINK, "tools/lib.sh": CFG},
+        command="bash link/run.sh",
+    ),
+    "cd-link-dir-unresolved": Case(CD_LINK_DIR + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "cd-extra-command-unresolved": Case(CD_EXTRA + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "cd-pwd-two-names": Case(CDPWD + THERE + SRC_THERE + RUN, 0),
+    "cd-pwd-two-names-lib-runs-configure": Case(
+        CDPWD + THERE + SRC_THERE, 2, "tree/configure", {"tools/lib.sh": CFG}
+    ),
+    "subst-cd-keeps-relative-paths": Case("X=$(cd sub && bash ./inner.sh)\n", 2, "tree/configure"),
+    "subst-cd-leaves-caller-dir": Case("X=$(cd sub && pwd)\n" + RUN, 0),
+    "subshell-cd-leaves-caller-dir": Case("(cd sub && true)\n" + RUN, 0),
+    "process-subst-cd-leaves-caller-dir": Case("true <(cd sub && pwd)\n" + RUN, 0),
+    "brace-group-cd-moves-caller": Case("{ cd sub; }\n" + RUN, 2, "tree/configure"),
+    "shadowed-pwd": Case('pwd() { echo "<case>/sub"; }\n' + CDPWD + SRC + RUN, 2, REBOUND),
+    "shadowed-dirname": Case(
+        'dirname() { echo "<case>/sub"; }\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "shadowed-cd-function-keyword": Case(
+        'function cd { builtin cd "<case>/sub"; }\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "shadowed-realpath": Case(
+        'realpath() { echo "<case>/sub/x"; }\n' + REALPATH + SRC + RUN, 2, REBOUND
+    ),
+    "shadowed-readlink-in-sourced-file": Case(
+        '. "<case>/tools/shadow.sh"\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+        {"tools/shadow.sh": 'readlink() { echo "<case>/sub/x"; }\n'},
+    ),
+    "alias-before": Case(
+        "shopt -s expand_aliases\nalias pwd='echo <case>/sub'\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "enable-before": Case("enable -n pwd\n" + CDPWD + SRC + RUN, 2, REBOUND),
+    "hash-p-before": Case("hash -p /bin/echo dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "path-before": Case("PATH=<case>/bin:$PATH\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "export-path-before": Case("export PATH=<case>/bin:$PATH\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "path-same-statement": Case("PATH=<case>/bin " + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unset-path-before": Case("unset PATH\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-v-path-before": Case(
+        "printf -v PATH '%s' <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "nameref-path-before": Case(
+        "declare -n P=PATH\nP=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "bash-func-in-environment": Case(
+        DOLLAR0 + SRC + RUN, 2, REBOUND, env={"BASH_FUNC_dirname%%": "() {  echo /x; }"}
+    ),
+    "bash-env-in-environment": Case(
+        DOLLAR0 + SRC + RUN, 2, REBOUND, env={"BASH_ENV": "/nonexistent/rc"}
+    ),
+    "path-after-idiom": Case(DOLLAR0 + "PATH=<case>/bin:$PATH\n" + SRC + RUN, 0),
+    "path-command-prefix": Case("PATH=/usr/bin:/bin true\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unrelated-function": Case("helper() { echo hi; }\n" + DOLLAR0 + SRC + RUN, 0),
+    "pwd-function-after-idiom": Case(CDPWD + "pwd() { echo x; }\n" + SRC + RUN, 0),
+    "hash-r-before": Case("hash -r\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "for-path-before": Case(
+        "for PATH in <case>/bin; do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "for-path-positional-before": Case("for PATH; do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "select-path-before": Case(
+        "select PATH in <case>/bin; do break; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "colon-path-prefix-before": Case("PATH=<case>/bin :\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "export-path-prefix-before": Case(
+        "PATH=<case>/bin export Y=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "eval-path-prefix-before": Case(
+        "PATH=<case>/bin eval true\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "dot-path-prefix-before": Case(
+        'PATH=<case>/bin . "<case>/tools/empty.sh"\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+        {"tools/empty.sh": "X=1\n"},
+    ),
+    "c-style-for-path-before": Case(
+        "for ((PATH=1; PATH<2; PATH++)); do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "arith-path-before": Case("(( PATH=1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "arith-subscript-path-before": Case("(( PATH[0]=1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "arith-expansion-path-before": Case(": $((PATH=5))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "assign-default-path-before": Case(": ${PATH:=<case>/bin}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "assign-default-plain-path-before": Case(
+        ": ${PATH=<case>/bin}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "wait-p-path-before": Case("wait -p PATH\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "compgen-v-path-before": Case(
+        "compgen -V PATH -W <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "coproc-path-before": Case("coproc PATH { true; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "read-subscript-path-before": Case("read PATH[0]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unset-quoted-path-before": Case("unset 'PATH'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unset-double-quoted-path-before": Case('unset "PATH"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "unset-split-quoted-path-before": Case('unset P"ATH"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "export-quoted-path-before": Case(
+        "export 'PATH=<case>/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "declare-quoted-path-before": Case(
+        'declare "PATH=<case>/bin"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "for-other-before": Case("for d in a b; do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "function-path-prefix-before": Case(
+        "f() { :; }\nPATH=<case>/bin f\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "default-expansion-path-before": Case(
+        ": ${PATH:-<case>/bin}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "arith-other-before": Case("(( n=1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "for-path-after-idiom": Case(DOLLAR0 + "for PATH in <case>/bin; do :; done\n" + SRC + RUN, 0),
+    "let-comma-path-before": Case("let '0,PATH=1'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "let-increment-path-before": Case("let PATH++\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "let-expansion-before": Case('let "$X"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "let-other-before": Case("let 'n=1'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-attached-path-before": Case(
+        "printf -vPATH '%s' <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "read-attached-path-before": Case(
+        "read -raPATH <<< <case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "printf-attached-other-before": Case("printf -vX '%s' 1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "arith-literal-value-path-before": Case(
+        "x='PATH=7'\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "test-eq-path-before": Case("[[ 1 -eq PATH=7 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "subscript-path-before": Case("a[PATH=7]=v\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "substring-offset-path-before": Case(
+        's=abc\n: "${s:PATH=1:1}"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "integer-assign-path-before": Case(
+        "declare -i n\nn='PATH=7'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "echo-path-read-before": Case('echo "PATH is $PATH"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "path-compare-before": Case("[[ $PATH == /x ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "builtin-export-path-before": Case(
+        "builtin export PATH=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "command-export-path-before": Case(
+        "command export PATH=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "builtin-declare-nameref-before": Case(
+        "builtin declare -n P=PATH\nP=<case>/bin\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "builtin-export-other-before": Case("builtin export X=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "declare-quoted-nameref-before": Case(
+        'declare "-n" P=PATH\nP=<case>/bin\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "declare-quoted-integer-before": Case('declare "-i" n=1\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "export-n-other-before": Case("export -n X\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "bash-argv0-before": Case(
+        "BASH_ARGV0=<case>/other/anchor.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "bash-cmds-before": Case(
+        "BASH_CMDS[dirname]=<case>/bin/dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "bash-cmds-cdpwd-before": Case(
+        "BASH_CMDS[dirname]=<case>/bin/dirname\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "bash-cmds-cdpwd-p-before": Case(
+        "BASH_CMDS[realpath]=<case>/bin/realpath\n" + CDPWD_P + SRC + RUN, 2, REBOUND
+    ),
+    "bash-cmds-cdpwd-after-idiom": Case(
+        CDPWD + "BASH_CMDS[dirname]=<case>/bin/dirname\n" + SRC + RUN, 0
+    ),
+    "bash-aliases-cdpwd-before": Case("BASH_ALIASES[cd]=false\n" + CDPWD + SRC + RUN, 2, REBOUND),
+    "bash-aliases-before": Case("BASH_ALIASES[dirname]=false\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "execignore-before": Case("EXECIGNORE=/usr/bin/dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "read-bash-cmds-before": Case(
+        "read -r 'BASH_CMDS[dirname]' <<< <case>/bin/dirname\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "declare-argv0-before": Case(
+        "declare BASH_ARGV0=<case>/other/anchor.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "arith-argv0-before": Case(": $((BASH_ARGV0=7))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-attached-argv0-before": Case(
+        "printf -vBASH_ARGV0 '%s' <case>/other/anchor.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "lc-all-prefix-before": Case("LC_ALL=C true\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "undocumented-bash-name-before": Case("BASH_CMDS_X=1\n" + DOLLAR0 + SRC + RUN, 0),
+    "echo-path-assign-before": Case("echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-path-assign-before": Case(
+        "printf '%s\\n' 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "builtin-echo-path-assign-before": Case(
+        "builtin echo 'PATH=/usr/bin'\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "subst-echo-path-before": Case(
+        "x=$(echo 'PATH=7')\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "redirect-echo-path-before": Case("echo 'PATH=7' > f\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "pipe-echo-path-before": Case("echo 'PATH=7' | read -r x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "printf-v-capture-path-before": Case(
+        "printf -v x '%s' 'PATH=7'\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "function-echo-path-before": Case("f() { echo 'PATH=7'; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "eval-echo-path-before": Case("eval \"echo 'PATH=7'\"\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "sourced-echo-capture-before": Case(
+        'x=$(. "<case>/tools/print.sh")\n: $((x))\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+        {"tools/print.sh": "echo 'PATH=7'\n"},
+    ),
+    "devstdout-readback-before": Case(
+        "echo 'PATH=7'\nread -r x < /dev/stdout\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "exec-redirect-readback-before": Case(
+        "exec 3>&1 >f\necho 'PATH=7'\nexec >&3\nread -r x < f\n: $((x))\n" + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "proc-fd-readback-before": Case(
+        "echo 'PATH=7'\nx=$(< /proc/self/fd/1)\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "newline-name-symlink": Case(
+        DOLLAR0 + SRC + RUN,
+        2,
+        NEWLINE_NAME,
+        {"tools/\n": DOLLAR0 + SRC + RUN, "tools/run.sh": "-> \n", "lib.sh": CFG},
+    ),
+    "r8-cr-printf-dynamic-dest": Case(
+        "v=${missing:-BASH_ARGV0}\nprintf -v \"$v\" '%s' <case>/other/anchor.sh\n"
+        + DOLLAR0
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-cr-printf-dynamic-dest-cdpwd": Case(
+        "v=${missing:-BASH_ARGV0}\nprintf -v \"$v\" '%s' <case>/other/anchor.sh\n"
+        + CDPWD
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-cr-declare-i-expanded": Case(
+        'p=PA\nq=TH\ndeclare -i n\nn="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-cr-declare-i-expanded-cdpwd": Case(
+        'p=PA\nq=TH\ndeclare -i n\nn="${p}${q}=7"\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r8-arith-expansion-dynamic": Case(
+        "p=PA\nq=TH\n: $((${p}${q}=7))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-arith-command-dynamic": Case(
+        "p=PA\nq=TH\n(( ${p}${q}=7 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-declare-i-value-expanded": Case(
+        'p=PA\nq=TH\ndeclare -i n="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-integer-append-expanded": Case(
+        'p=PA\nq=TH\ndeclare -i n\nn+="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-typeset-ix-expanded": Case(
+        'p=PA\nq=TH\ntypeset -ix n\nn="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-integer-from-env-var": Case("declare -i n\nn=$UNSET_X\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-integer-array-element": Case(
+        'p=PA\nq=TH\ndeclare -ai a\na[0]="${p}${q}=7"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-subscript-arith-dynamic": Case(
+        "p=PA\nq=TH\ndeclare -a a\na[${p}${q}=7]=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-dbracket-eq-dynamic": Case(
+        "p=PA\nq=TH\n[[ ${p}${q}=7 -eq 7 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-read-dynamic-dest": Case(
+        'v=${missing:-BASH_ARGV0}\nread -r "$v" <<< <case>/other/anchor.sh\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-declare-dynamic-name": Case(
+        'v=${missing:-BASH_ARGV0}\ndeclare "$v=<case>/other/anchor.sh"\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-printf-braced-dynamic": Case(
+        "v=${missing:-BASH_ARGV0}\nprintf -v \"${v}\" '%s' <case>/other/anchor.sh\n"
+        + DOLLAR0
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-printf-attached-dynamic": Case(
+        "v=${missing:-BASH_ARGV0}\nprintf -v\"$v\" '%s' <case>/other/anchor.sh\n"
+        + DOLLAR0
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-mapfile-dynamic-dest": Case(
+        'v=${missing:-BASH_ARGV0}\nmapfile -t "$v" <<< <case>/other/anchor.sh\n'
+        + DOLLAR0
+        + SRC
+        + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-export-dynamic-name": Case(
+        'v=${missing:-PATH}\nexport "$v=<case>/other"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-mapfile-dynamic-path": Case(
+        'v=${missing:-PATH}\nmapfile -t "$v" <<< <case>/other\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-subscript-read-dynamic": Case(
+        'p=PA\nq=TH\ndeclare -a a\n: "${a[${p}${q}=7]}"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-substring-offset-dynamic": Case(
+        'p=PA\nq=TH\nx=abc\n: "${x:${p}${q}=7}"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-getopts-dynamic-dest": Case(
+        'v=${missing:-BASH_ARGV0}\ngetopts a "$v" -a\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-local-i-in-function": Case(
+        'p=PA\nq=TH\nf() {\n  local -i n\n  n="${p}${q}=7"\n}\nf\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-dbracket-env-operand": Case("[[ $UNSET_X -eq 0 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-indirect-assign-default": Case(
+        'v=${missing:-BASH_ARGV0}\n: "${!v:=<case>/other/anchor.sh}"\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r8-read-array-dynamic": Case(
+        'v=${missing:-PATH}\nread -r -a "$v" <<< <case>/other\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-wait-p-dynamic": Case(
+        'v=${missing:-BASH_ARGV0}\ntrue &\nwait -p "$v" -n\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-compgen-V-dynamic": Case(
+        'v=${missing:-PATH}\ncompgen -V "$v" -W <case>/other\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-unset-dynamic": Case('v=${missing:-PATH}\nunset "$v"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-printf-subscript-arith": Case(
+        'p=PA\nq=TH\ndeclare -a a\nprintf -v "a[${p}${q}=7]" x\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-dollar-bracket-arith": Case(
+        "p=PA\nq=TH\n: $[${p}${q}=7]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-cfor-dynamic": Case(
+        "p=PA\nq=TH\nfor (( ${p}${q}=7; 0; )); do :; done\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-expansion": Case(
+        "x=${missing:-PATH=7}\n: $((x))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-command": Case(
+        "x=${missing:-PATH=7}\n(( x ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-dbracket": Case(
+        "x=${missing:-PATH=7}\n[[ x -eq 7 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-subscript": Case(
+        "x=${missing:-PATH=7}\ndeclare -a a\na[x]=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-integer": Case(
+        "x=${missing:-PATH=7}\ndeclare -i n\nn=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-bare-ref-let": Case("x=${missing:-PATH=7}\nlet y=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-positional-arith": Case(": $(( $1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-integer-literal-sum": Case(
+        'declare -i n\nn="1+2"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-safe-printf-literal-dest": Case("printf -v x '%s' y\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-read-dynamic-prompt": Case(
+        'm=hi\nread -r -p "$m" x <<< y\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-safe-integer-number": Case("declare -i n\nn=3\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-arith-read-only": Case("p=1\nq=2\n: $((p+q))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-array-element": Case("declare -a a\na[0]=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-dbracket-literal": Case("[[ 1 -eq 1 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-dbracket-argc": Case("[[ $# -eq 0 ]]\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-assoc-dynamic-subscript": Case(
+        "declare -A m\nm[$PWD]=1\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r8-safe-arith-status": Case(": $(( $? + 1 ))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r8-safe-string-append": Case("n=1\nn+=x\n" + DOLLAR0 + SRC + RUN, 0),
+    "r8-safe-literal-int-ref": Case("x=3\n: $((x + 1))\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-cr-read-herestring-arith": Case(
+        'x=3\np=BASH_\nq=ARGV0\nread -r x <<< "${p}${q}=7"\n: $((x))\n' + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r9-cr-read-herestring-arith-cdpwd": Case(
+        'x=3\np=BASH_\nq=ARGV0\nread -r x <<< "${p}${q}=7"\n: $((x))\n' + CDPWD + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r9-cr-unset-assoc-subscript": Case(
+        "declare -A a\nunset a\np=BASH_\nq=ARGV0\na[${p}${q}=7]=v\n" + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+    ),
+    "r9-cr-unset-assoc-subscript-cdpwd": Case(
+        "declare -A a\nunset a\np=BASH_\nq=ARGV0\na[${p}${q}=7]=v\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r9-cr-printf-percent-n": Case("printf '%n' BASH_ARGV0\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-cr-printf-percent-n-cdpwd": Case(
+        "printf '%n' BASH_ARGV0\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r9-cr-subshell-assoc-subscript": Case(
+        "(declare -A a)\np=BASH_\nq=ARGV0\na[${p}${q}=7]=v\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r9-cr-subshell-assoc-subscript-cdpwd": Case(
+        "(declare -A a)\np=BASH_\nq=ARGV0\na[${p}${q}=7]=v\n" + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r9-allow-set-euo-pipefail": Case("set -euo pipefail\n" + DOLLAR0 + SRC + RUN, 0),
+    "r9-allow-set-o-pairs": Case("set -o errexit -o nounset\n" + CDPWD + SRC + RUN, 0),
+    "r9-allow-static-assigns": Case(
+        "a=1\nb=x/y\nc='lit'\nd=\"$a-${b}\"\ne=$'t'\nf=\n" + DOLLAR0 + SRC + RUN, 0
+    ),
+    "r9-allow-plain-assign-list": Case("a=1 b=2\n" + DOLLAR0 + SRC + RUN, 0),
+    "r9-allow-comment-colon-true": Case("# setup\n:\ntrue\n" + DOLLAR0 + SRC + RUN, 0),
+    "r9-allow-source-before": Case(
+        ". <case>/tools/pre.sh\n" + DOLLAR0 + SRC + RUN, 0, None, {"tools/pre.sh": "X=1\n"}
+    ),
+    "r9-sourced-echo-before": Case(". <case>/tools/inner.sh\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-cd-or-exit": Case("cd <case> || exit 1\n" + DOLLAR0 + SRC + RUN, 2, UNKNOWN_SOURCE),
+    "r9-echo-names-line": Case("echo hi\n" + DOLLAR0 + SRC + RUN, 2, "after line 2 (echo)"),
+    "r9-set-o-posix": Case("set -o posix\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-set-x": Case("set -x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-set-a": Case("set -a\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-quoted-set": Case("'set' -e\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-default-expansion-value": Case("X=${Y:-z}\n" + DOLLAR0 + SRC + RUN, 0),
+    "r9-command-substitution-value": Case("X=$(true)\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-cdpath-assign": Case("CDPATH=/x\n" + CDPWD + SRC + RUN, 2, REBOUND),
+    "r9-env-name-assign": Case("LANE_X=2\n" + DOLLAR0 + SRC + RUN, 2, REBOUND, env={"LANE_X": "1"}),
+    "r9-redirected-true": Case("true > /dev/null\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-prefix-assign-true": Case("X=1 true\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-if-compound": Case("if true; then :; fi\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-array-assign": Case("a=(x)\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-subscript-assign": Case("a[0]=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r9-function-named-set": Case("set() { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-plain-word": Case("export LANE_R10=squash_merge.sh\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-export-name": Case("LANE_R10=1\nexport LANE_R10\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-landing-squash-shape": Case(
+        "set -euo pipefail\nexport LANE_CALLER=squash_merge.sh\n" + DOLLAR0 + SRC + RUN, 0
+    ),
+    "r10-landing-reland-shape": Case(
+        "set -euo pipefail\nR=a/b; pr=$1; wt=$2\nT=${LANE_ROOT:-/home/x/triage-1}\n"
+        + DOLLAR0
+        + SRC
+        + RUN,
+        0,
+    ),
+    "r10-default-dash": Case("X=${Y-z}\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-default-empty": Case("X=${Y:-}\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-default-concat": Case("X=${Y:-/a}/b\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-default-quoted": Case('X="${Y:-/a}"\n' + DOLLAR0 + SRC + RUN, 0),
+    "r10-default-path-read": Case("X=${PATH:-/bin}\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-function-longer-name-body": Case("f() { MYPATH=x; }\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-function-bare-path-word": Case("f() { echo PATH; }\n" + DOLLAR0 + SRC + RUN, 0),
+    "r10-export-bash-variable": Case("export IFS=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-path": Case("export PATH=/x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-bash-name": Case("export BASH_ENV\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-ld-preload": Case("export LD_PRELOAD=/x.so\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-ld-name": Case(
+        "LD_AUDIT=/x.so\nexport LD_AUDIT\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r10-export-loader-name": Case("export GCONV_PATH=/x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-env-name": Case(
+        "export LANE_X=2\n" + DOLLAR0 + SRC + RUN, 2, REBOUND, env={"LANE_X": "1"}
+    ),
+    "r10-export-quoted-value": Case('export LANE_R10="$x"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-substitution": Case("export LANE_R10=$(true)\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-default-value": Case("export LANE_R10=${Y:-z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-two-operands": Case("export A=1 B=2\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-append": Case("export LANE_R10+=x\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-export-flag-p": Case("export -p\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-assign-colon": Case("X=${Y:=z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-assign": Case("X=${Y=z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-alternative": Case("X=${Y:+z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-indirect": Case("X=${!Y:-z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-substitution": Case("X=${Y:-$(true)}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-nested": Case("X=${Y:-$Z}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-exit-operand": Case("exit ${Y:-1}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-default-path-target": Case("PATH=${Y:-/x}\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-function-ifs-body": Case("f() { IFS=x; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r10-function-printed-argv0": Case(
+        "f() { printf '%s' 'BASH_ARGV0=/x'; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r11-export-keyword-fn": Case(
+        "function export " + HASH_DIRNAME + "export LANE=ok\n" + CDPWD + SRC + RUN,
+        2,
+        REBOUND,
+        OTHER_DIRNAME,
+    ),
+    "r11-export-keyword-fn-bare": Case(
+        "function export " + HASH_DIRNAME + "export LANE\n" + CDPWD + SRC + RUN,
+        2,
+        REBOUND,
+        OTHER_DIRNAME,
+    ),
+    "r11-export-keyword-fn-dollar0": Case(
+        "function export " + HASH_DIRNAME + "export LANE=ok\n" + DOLLAR0 + SRC + RUN,
+        2,
+        REBOUND,
+        OTHER_DIRNAME,
+    ),
+    "r11-export-paren-fn": Case(
+        "export() " + HASH_DIRNAME + "export LANE=ok\n" + CDPWD + SRC + RUN, 2, None, OTHER_DIRNAME
+    ),
+    "r11-export-keyword-fn-noop": Case(
+        "function export { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r11-declare-keyword-fn": Case("function declare { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r11-typeset-keyword-fn": Case("function typeset { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r11-readonly-keyword-fn": Case("function readonly { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r11-local-keyword-fn": Case("function local { :; }\n" + DOLLAR0 + SRC + RUN, 2, REBOUND),
+    "r11-local-own-dir": Case("local " + DOLLAR0 + SRC + RUN, 2),
+    "r11-export-flag-own-dir": Case(
+        'export -r HERE=$(dirname "$(readlink -f "$0")")\n' + SRC + RUN, 2
+    ),
+    "r11-readonly-flag-own-dir": Case(
+        'readonly -x HERE=$(dirname "$(readlink -f "$0")")\n' + SRC + RUN, 2
+    ),
+    "r11-argv0-own-dir": Case(ARGV0_OWN + CDPWD + SRC + RUN, 2, REBOUND, ROOT_LIB),
+    "r11-argv0-own-dir-dollar0": Case(ARGV0_OWN + DOLLAR0 + SRC + RUN, 2, REBOUND, ROOT_LIB),
+    "r11-path-own-dir": Case(
+        'PATH=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-ifs-own-dir": Case(
+        'IFS=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-cdpath-own-dir": Case(
+        'CDPATH=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-bash-env-own-dir": Case(
+        'BASH_ENV=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-home-own-dir": Case(
+        'HOME=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-ld-preload-own-dir": Case(
+        'LD_PRELOAD=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-loader-own-dir": Case(
+        'GCONV_PATH=$(dirname "$(readlink -f "$0")")\n' + CDPWD + SRC + RUN, 2, REBOUND
+    ),
+    "r11-env-name-own-dir": Case(
+        'LANE_X=$(dirname "$(readlink -f "$0")")\n. "$LANE_X/lib.sh"\n' + RUN,
+        2,
+        UNKNOWN_SOURCE,
+        env={"LANE_X": "/x"},
+    ),
+    "r11-plain-own-dir-name": Case(
+        'TOP=$(dirname "$(readlink -f "$0")")\n. "$TOP/lib.sh"\n' + RUN, 0
+    ),
+    "r12-printf-v-own-dir": Case(DOLLAR0 + PRINTF + SRC, 2, WRITTEN, OTHER),
+    "r12-printf-v-quoted-name": Case(
+        DOLLAR0 + "printf -v 'HERE' '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-printf-v-cdpwd": Case(CDPWD + PRINTF + SRC, 2, WRITTEN, OTHER),
+    "r12-printf-v-default": Case(DEFAULT + PRINTF + SRC, 2, WRITTEN, OTHER),
+    "r12-read-own-dir": Case(DOLLAR0 + "read -r HERE <<< <case>/other\n" + SRC, 2, WRITTEN, OTHER),
+    "r12-mapfile-own-dir": Case(
+        DOLLAR0 + "mapfile -t HERE <<< <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-arith-own-dir": Case(DOLLAR0 + "echo $((HERE=7))\n" + SRC, 2, WRITTEN, {"7/lib.sh": CFG}),
+    "r12-for-own-dir": Case(
+        DOLLAR0 + "for HERE in <case>/other; do :; done\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-assign-default-colon": Case(DOLLAR0 + ": ${HERE:=x}\n" + SRC, 2, WRITTEN),
+    "r12-assign-default": Case(DOLLAR0 + ": ${HERE=x}\n" + SRC, 2, WRITTEN),
+    "r12-unset-own-dir": Case(DOLLAR0 + "unset HERE\n" + SRC, 2, WRITTEN),
+    "r12-nameref-own-dir": Case(
+        DOLLAR0 + "declare -n R=HERE\nR=<case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-eval-string-own-dir": Case(
+        DOLLAR0 + "eval 'HERE=<case>/other'\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-trap-debug-own-dir": Case(
+        DOLLAR0 + "trap 'HERE=<case>/other' DEBUG\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-colon-prefix-posix": Case(
+        DOLLAR0 + POSIX + "HERE=<case>/other :\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-source-prefix-posix": Case(
+        DOLLAR0 + POSIX + 'HERE=<case>/other . "$HERE/lib.sh"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-eval-prefix-posix": Case(
+        DOLLAR0 + POSIX + "HERE=<case>/other eval :\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-quoted-command-prefix": Case(
+        DOLLAR0 + POSIX + "HERE=<case>/other ':'\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-redirect-only-prefix": Case(
+        DOLLAR0 + "HERE=<case>/other >/dev/null\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r12-unquoted-heredoc-default": Case(
+        DOLLAR0 + "cat <<EOF\n${HERE:=x}\nEOF\n" + SRC, 2, WRITTEN
+    ),
+    "r12-append-own-dir": Case(DOLLAR0 + "HERE+=/../other\n" + SRC + RUN, 2, UNKNOWN_SOURCE, OTHER),
+    "r12-index-own-dir": Case(
+        DOLLAR0 + "HERE[0]=<case>/other\n" + SRC + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r12-source-file-printf": Case(
+        DOLLAR0 + '. "$HERE/w.sh"\n' + SRC,
+        2,
+        AMBIGUOUS,
+        {"tools/w.sh": "printf -v HERE %s <case>/other\n", "other/lib.sh": CFG},
+    ),
+    "r12-override-append": Case(
+        "LANE_TEST_DIR+=<case>/other\n" + DEFAULT + SRC + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r12-literal-printf-run": Case(
+        "X=<case>/tools\nprintf -v X '%s' <case>/other\n" + '. "$X/lib.sh"\n' + RUN,
+        2,
+        UNKNOWN_SOURCE,
+        OTHER,
+    ),
+    "r12-keep-export-bare": Case(DOLLAR0 + "export HERE\n" + SRC + RUN, 0),
+    "r12-keep-readonly-bare": Case(DOLLAR0 + "readonly HERE\n" + SRC + RUN, 0),
+    "r12-keep-comment": Case(DOLLAR0 + "# printf -v HERE x\n" + SRC + RUN, 0),
+    "r12-keep-braced-reads": Case(
+        DOLLAR0
+        + 'echo "${HERE%/}" "${HERE#/}" "${HERE:-x}" "${HERE:0:2}" "${#HERE}" "${HERE^^}" '
+        + '"${HERE@Q}" "${HERE/a/b}"\n'
+        + SRC
+        + RUN,
+        0,
+    ),
+    "r12-keep-quoted-heredoc": Case(
+        DOLLAR0 + "python3 - <<'PY'\nHERE = 1\nprint(HERE)\nPY\n" + SRC + RUN, 0
+    ),
+    "r12-keep-program-prefix": Case(DOLLAR0 + "HERE=<case>/other env\n" + SRC + RUN, 0),
+    "r12-keep-function-prefix": Case(
+        DOLLAR0 + "g() { echo hi; }\nHERE=<case>/other g\n" + SRC + RUN, 0
+    ),
+    "r12-keep-command-prefix": Case(
+        DOLLAR0 + POSIX + "HERE=<case>/other command :\n" + SRC + RUN, 0
+    ),
+    "r12-keep-landing-prefix": Case(
+        DOLLAR0 + 'f() { :; }\nrun() {\n  HERE="$d/missing" MODE=always f\n}\n' + SRC + RUN, 0
+    ),
+    "r13-function-prefix-source": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\nHERE=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r13-function-prefix-program": Case(
+        DOLLAR0 + 'f() {\n  "$HERE/next.sh"\n}\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/next.sh": "echo benign\n", "other/next.sh": CFG},
+    ),
+    "r13-function-prefix-callee": Case(
+        DOLLAR0 + 'g() { . "$HERE/lib.sh"; }\nf() { g; }\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r13-function-prefix-callee-later": Case(
+        DOLLAR0 + 'f() { g; }\ng() { . "$HERE/lib.sh"; }\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r13-function-prefix-cdpwd": Case(
+        CDPWD + 'f() { . "$HERE/lib.sh"; }\nHERE=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r13-function-prefix-literal": Case(
+        'X=<case>/tools\nf() { . "$X/lib.sh"; }\nX=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r13-function-prefix-nested-call": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\nrun() {\n  HERE=<case>/other f\n}\nrun\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r13-function-before-dir": Case(
+        'f() { . "$HERE/lib.sh"; }\n' + DOLLAR0 + "HERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r13-function-in-sourced-file": Case(
+        DOLLAR0 + '. "$HERE/fn.sh"\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/fn.sh": 'f() { . "$HERE/lib.sh"; }\n', "other/lib.sh": CFG},
+    ),
+    "r13-keep-other-prefix": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\nMODE=x f\n' + RUN, 0, files=OTHER
+    ),
+    "r13-keep-function-reads-only": Case(
+        DOLLAR0 + 'f() { echo "$HERE"; }\nHERE=<case>/other f\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r13-keep-unrelated-function": Case(
+        DOLLAR0 + 'g() { . "$HERE/lib.sh"; }\nf() { echo hi; }\nHERE=<case>/other f\ng\n' + RUN,
+        0,
+        files=OTHER,
+    ),
+    "r13-keep-landing-judge": Case(
+        DOLLAR0
+        + 'judge() {\n  python3 -B "$HERE/../x.py"\n}\n'
+        + 'run() {\n  HERE="$d/missing" judge\n}\nrun\n'
+        + SRC
+        + RUN,
+        0,
+    ),
+    "r13-sourced-prefix-call": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\n. "$HERE/call.sh"\n' + RUN,
+        2,
+        SOURCED,
+        {"tools/call.sh": "HERE=<case>/other f\n", "other/lib.sh": CFG},
+    ),
+    "r13-sourced-defines-and-calls": Case(
+        DOLLAR0 + '. "$HERE/call.sh"\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/call.sh": 'f() { . "$HERE/lib.sh"; }\nHERE=<case>/other f\n', "other/lib.sh": CFG},
+    ),
+    "r13-sourced-callee-chain": Case(
+        DOLLAR0 + '. "$HERE/fn.sh"\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/fn.sh": 'f() { g; }\ng() { . "$HERE/lib.sh"; }\n', "other/lib.sh": CFG},
+    ),
+    "r13-sourced-literal-prefix": Case(
+        DOLLAR0 + '. "$HERE/fn.sh"\nf() { . "$X/lib.sh"; }\nX=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        {"tools/fn.sh": "X=<case>/tools\n", "other/lib.sh": CFG},
+    ),
+    "r13-keep-sourced-prefix-command": Case(
+        DOLLAR0 + 'f() { . "$HERE/lib.sh"; }\n. "$HERE/call.sh"\nf\n' + RUN,
+        0,
+        files={"tools/call.sh": "HERE=<case>/other true\n", "other/lib.sh": CFG},
+    ),
+    "r13-keep-sourced-prefix-unreferenced": Case(
+        DOLLAR0 + 'f() { echo hi; }\n. "$HERE/call.sh"\n' + SRC + RUN,
+        0,
+        files={"tools/call.sh": "HERE=<case>/other f\n", "other/lib.sh": CFG},
+    ),
+    "r13-keep-untrusted-prefix": Case(
+        DOLLAR0
+        + 'TOOL=${TOOL:-true}\ng() { "$TOOL" ok; }\nf() { g; }\nTOOL=<case>/stub f\n'
+        + SRC
+        + RUN,
+        0,
+        files=OTHER,
+    ),
+    "r14-printf-split-single": Case(
+        DOLLAR0 + "printf -v H''ERE '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-read-split-double": Case(
+        DOLLAR0 + 'read -r H""ERE <<< <case>/other\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-printf-backslash": Case(
+        DOLLAR0 + "printf -v H\\ERE '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-printf-ansi-empty": Case(
+        DOLLAR0 + "printf -v H$''ERE '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-printf-ansi-escape": Case(
+        DOLLAR0 + "printf -v $'\\x48ERE' '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r14-printf-dynamic-dest": Case(
+        DOLLAR0 + "v=${missing:-HERE}\nprintf -v \"$v\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r14-declare-split": Case(CDPWD + "declare H''ERE=<case>/other\n" + SRC, 2, WRITTEN, OTHER),
+    "r14-keep-printf-other": Case(DOLLAR0 + "printf -v x '%s' y\n" + SRC + RUN, 0, files=OTHER),
+    "r14-keep-read-line": Case(DOLLAR0 + "read -r line <<< hi\n" + SRC + RUN, 0, files=OTHER),
+    "r14-callee-double-quoted": Case(
+        CDPWD + GH + 'f() { g""h; }\nHERE=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-callee-single-quoted": Case(
+        CDPWD + GH + "f() { g''h; }\nHERE=<case>/other f\n" + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-callee-backslash": Case(
+        CDPWD + GH + "f() { g\\h; }\nHERE=<case>/other f\n" + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-callee-dynamic": Case(
+        CDPWD + GH + 'f() { "$1"; }\nHERE=<case>/other f gh\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-eval-dynamic": Case(
+        CDPWD + GH + 'f() { eval "$1"; }\nHERE=<case>/other f gh\n' + RUN, 2, WRITTEN, OTHER
+    ),
+    "r14-eval-quoted-callee": Case(
+        CDPWD + GH + "f() { eval 'g''h'; }\nHERE=<case>/other f\n" + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-eval-inline-body": Case(
+        CDPWD + "f() { eval '. \"$HERE/lib.sh\"'; }\nHERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-sourced-inline-body": Case(
+        CDPWD + "f() { . <case>/tools/mid.sh; }\nHERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        {"tools/mid.sh": SRC, "other/lib.sh": CFG},
+    ),
+    "r14-bash-c-inline-body": Case(
+        CDPWD + "f() { bash -c '. \"$HERE/lib.sh\"'; }\nHERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-keep-eval-unheld": Case(
+        CDPWD + "f() { eval '. \"$HERE/lib.sh\"'; }\nMODE=x f\n" + RUN, 0, files=OTHER
+    ),
+    "r14-keep-run-dollar-at": Case(
+        DOLLAR0 + 'run() { "$@"; }\nrun true\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r14-keep-read-prompt": Case(
+        DOLLAR0 + 'prompt=go\nread -r -p "$prompt" line <<< hi\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r14-keep-prefix-loop-unset": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do unset "$k"; done\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r14-keep-timeout-dynamic": Case(
+        CDPWD + GH + 'f() { timeout 5 "$1"; }\nHERE=<case>/other f gh\n' + RUN, 0, files=OTHER
+    ),
+    "r14-keep-exec-dynamic": Case(
+        CDPWD + GH + 'f() { exec "$1"; }\nHERE=<case>/other f gh\n' + RUN, 0, files=OTHER
+    ),
+    "r14-time-dynamic": Case(
+        CDPWD + GH + 'f() { time "$1"; }\nHERE=<case>/other f gh\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r14-command-eval": Case(
+        CDPWD + GH + 'f() { command "$1" gh; }\nHERE=<case>/other f eval\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-builtin-eval": Case(
+        CDPWD + GH + 'f() { builtin "$1" gh; }\nHERE=<case>/other f eval\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-slash-callee": Case(
+        CDPWD + 'a/b() { . "$HERE/lib.sh"; }\nf() { "$1"; }\nHERE=<case>/other f a/b\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r14-prefix-loop-match": Case(
+        DOLLAR0 + 'for k in "${!HER@}"; do printf -v "$k" %s <case>/other; done\n' + SRC + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r14-prefix-loop-extra": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do unset "$k" "$1"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r14-prefix-loop-unquoted": Case(
+        DOLLAR0 + 'for k in ${!GIT_@}; do unset "$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r14-prefix-loop-two": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do echo; unset "$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r15-eval-surrogate-write": Case(
+        DOLLAR0 + "eval $'" + ESC_U + "D800\\nHERE=<case>/other'\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r15-printf-past-range-name": Case(
+        DOLLAR0 + "printf -v $'H" + ESC_UU + "80000000ERE' '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r15-printf-locale-name": Case(
+        DOLLAR0 + "printf -v $'H" + ESC_U + "00c9RE' '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r15-printf-option-dynamic": Case(
+        CDPWD + 'opt=v\ndest=${missing:-H}ERE\nprintf -"$opt" "$dest" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r15-printf-attached-dynamic": Case(
+        CDPWD + "dest=${missing:-H}ERE\nprintf -v\"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r15-wait-option-dynamic": Case(
+        DOLLAR0 + 'o=p\ndest=${missing:-H}ERE\nwait -"$o" "$dest"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r15-eval-defined-callee": Case(
+        CDPWD + JH + "eval 'gh() { jh; }'\nf() { gh; }\nHERE=<case>/other f\n" + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r15-eval-defined-double": Case(
+        CDPWD + JH + 'eval "gh() { jh; }"\nf() { gh; }\nHERE=<case>/other f\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r15-eval-defined-direct": Case(
+        CDPWD + JH + "eval 'gh() { jh; }'\nHERE=<case>/other gh\n" + RUN, 2, PREFIXED, OTHER
+    ),
+    "r15-keep-surrogate-colon": Case(
+        DOLLAR0 + ": $'" + ESC_U + "D800'\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r15-keep-surrogate-no-dir": Case(": $'" + ESC_U + "DFFF'\n" + RUN, 0),
+    "r15-keep-wide-colon": Case(
+        DOLLAR0 + ": $'" + ESC_UU + "00110000'\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r15-keep-printf-dash-operand": Case(
+        DOLLAR0 + 'x=a\nprintf "%s\\n" -"$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r15-keep-read-prompt-attached": Case(
+        DOLLAR0 + 'p=go\nread -r -p"$p" line <<< hi\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r15-keep-eval-defined-unheld": Case(
+        CDPWD + JH + "eval 'gh() { jh; }'\nf() { gh; }\nf\n" + RUN, 0, files=OTHER
+    ),
+    "r16-printf-leading-option": Case(
+        CDPWD + "opt=-v\ndest=${missing:-H}ERE\nprintf $opt \"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-printf-leading-option-quoted": Case(
+        CDPWD + 'opt=-v\ndest=${missing:-H}ERE\nprintf "$opt" "$dest" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-command-word-dynamic": Case(
+        CDPWD + "c=printf\nn=HE\nm=RE\n$c -v \"$n$m\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-command-word-quoted": Case(
+        CDPWD + 'c=printf\nn=HE\nm=RE\n"$c" -v "$n$m" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-command-word-builtin": Case(
+        CDPWD + 'c=printf\nn=HE\nm=RE\nbuiltin "$c" -v"$n$m" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r16-command-word-wait": Case(
+        CDPWD + 'c=wait\nn=HE\nm=RE\n"$c" -p "$n$m"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r16-getopts-split-name": Case(
+        CDPWD + 'spec="ab ${missing:-H}ERE"\ngetopts $spec\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r16-keep-printf-literal-format": Case(
+        DOLLAR0 + 'x=a\nprintf "%s\\n" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r16-keep-wait-pid": Case(DOLLAR0 + 'sleep 0 &\np=$!\nwait "$p"\n' + SRC + RUN, 0, files=OTHER),
+    "r16-keep-command-path": Case(
+        DOLLAR0 + 'd=/usr\nx=a\n"$d/bin/true" -v "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r16-keep-command-external-wrapper": Case(
+        DOLLAR0 + 'c=true\nx=a\ntimeout 5 "$c" -v "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r16-keep-command-output-option": Case(
+        DOLLAR0 + 'CC=true\nout=a\n"$CC" -o "$out" "$1"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-translated-printf-dest": Case(
+        CDPWD + "printf -v $\"OTHER\" '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r18-translated-callee": Case(
+        CDPWD + GH + 'f() { $"jx"; }\nHERE=<case>/other f\n' + RUN, 2, PREFIXED, OTHER
+    ),
+    "r18-translated-concat-read": Case(
+        DOLLAR0 + 'read -r H$"OTHER" <<< <case>/other\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r18-translated-source-path": Case(
+        DOLLAR0 + '. $"HERE/lib.sh"\n' + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r18-keep-translated-echo": Case(
+        DOLLAR0 + 'msg=$"hello"\necho $"world" "$msg"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-escaped-dollar-printf": Case(
+        DOLLAR0 + 'printf "%s\\n" \\$"OTHER"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-prefix-command-eval": Case(
+        CDPWD + "HERE=<case>/other command eval '. \"$HERE/lib.sh\"'\n" + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-prefix-builtin-source": Case(
+        DOLLAR0 + 'HERE=<case>/other builtin source "$HERE/lib.sh"\n' + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-prefix-wrapper-chain-dot": Case(
+        CDPWD + 'HERE=<case>/other builtin command -p -- . "$HERE/lib.sh"\n' + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-prefix-command-trap": Case(
+        DOLLAR0 + "HERE=<case>/other command trap '. \"$HERE/lib.sh\"' EXIT\n" + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-keep-prefix-command-true": Case(
+        DOLLAR0 + "HERE=<case>/other command -p true\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-prefix-command-describe": Case(
+        DOLLAR0 + "HERE=<case>/other command -v eval\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-command-word-read": Case(
+        CDPWD + 'c=read\nn=HE\nm=RE\n"$c" "$n$m" <<< <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-parts": Case(
+        CDPWD + 'a=re\nb=ad\nn=HE\nm=RE\n"$a$b" -r "$n$m" <<< <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-declare": Case(
+        DOLLAR0 + 'a=dec\nn=HE\nm=RE\n"${a}"lare "$n$m=<case>/other"\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-printf-opt": Case(
+        CDPWD + 'c=printf\nopt=-v\nn=HE\nm=RE\n"$c" "$opt" "$n$m" \'%s\' <case>/other\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-eval": Case(
+        CDPWD + 'c=eval\nn=HE\nm=RE\n"$c" "$n$m=<case>/other"\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-trap": Case(
+        CDPWD + 'c=trap\nn=HE\nm=RE\n"$c" "$n$m=<case>/other" DEBUG\n:\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r18-command-word-source": Case(
+        CDPWD + 'a=sou\nb=rce\nc="$a$b"\n"$c" <case>/tools/w.sh\n' + SRC,
+        2,
+        WRITTEN,
+        {"tools/w.sh": "HERE=<case>/other\n", "other/lib.sh": CFG},
+    ),
+    "r18-command-word-dot": Case(
+        DOLLAR0 + 'c=${missing:-.}\n"$c" <case>/tools/w.sh\n' + SRC,
+        2,
+        WRITTEN,
+        {"tools/w.sh": "HERE=<case>/other\n", "other/lib.sh": CFG},
+    ),
+    "r18-keep-command-word-echo": Case(
+        DOLLAR0 + 'c=echo\nx=hi\n"$c" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-command-word-parts-true": Case(
+        DOLLAR0 + 'a=tr\nb=ue\nx=hi\n"$a$b" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-command-word-printf-plain": Case(
+        DOLLAR0 + 'c=printf\nx=hi\n"$c" "%s\\n" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r18-keep-command-word-default-prog": Case(
+        DOLLAR0 + 'TOOL=${TOOL:-true}\nx=hi\n"$TOOL" "$x"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r19-command-word-source-written": Case(
+        DOLLAR0
+        + "HERE=<case>/other command eval ':'\n"
+        + 'c=source\n"$c" <case>/tools/w.sh\n'
+        + SRC,
+        2,
+        WRITTEN,
+        {"tools/w.sh": "HERE=<case>/other\n", "other/lib.sh": CFG},
+    ),
+    "r19-keep-translated-slash": Case(
+        DOLLAR0 + 'bash $"OTHER/inner.sh"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-translated-unset-dest": Case(DOLLAR0 + 'unset $"OTHER"\n' + SRC, 2, WRITTEN, OTHER),
+    "r20-translated-declare-dest": Case(
+        CDPWD + 'declare $"OTHER=<case>/other"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-translated-concat-source": Case(
+        DOLLAR0 + '. "$HERE/lib"$".sh"\n' + RUN,
+        2,
+        UNKNOWN_SOURCE,
+        {"tools/lib": "X=1\n", "tools/lib.sh": CFG},
+    ),
+    "r20-translated-quoted-source": Case(
+        DOLLAR0 + ". '<case>/tools/lib.sh'$\"x\"\n" + SRC + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r20-keep-translated-quoted-prog": Case(
+        DOLLAR0 + "'<case>/other/lib.sh'$\"x\"\n" + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-translated-long-opt-compress": Case(
+        DOLLAR0 + 'sort --compress-program=$"configure" data.txt\n' + SRC + RUN, 2, "configure"
+    ),
+    "r20-translated-brace-source": Case(
+        DOLLAR0 + '. {}$"x"\n' + SRC + RUN, 2, UNKNOWN_SOURCE, {"{}": "X=1\n", **OTHER}
+    ),
+    "r20-translated-expanded-source": Case(
+        DOLLAR0 + '. $"$HERE/lib.sh"\n' + RUN, 2, UNKNOWN_SOURCE, OTHER
+    ),
+    "r20-translated-expanded-assign-before": Case(
+        'a=1\nX=$"$a"\n' + DOLLAR0 + SRC + RUN, 2, REBOUND
+    ),
+    "r20-printf-attached-translated-dest": Case(
+        CDPWD + "printf -v$\"OTHER\" '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-printf-prefixed-translated-dest": Case(
+        CDPWD + "printf -vH$\"OTHER\" '%s' <case>/other\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-compgen-attached-translated-dest": Case(
+        CDPWD + 'compgen -W <case>/other -VH$"OTHER"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-wait-attached-translated-dest": Case(
+        CDPWD + 'wait -pH$"OTHER"\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-prefix-command-translated-opt": Case(
+        DOLLAR0 + "HERE=<case>/other command -$\"p\" eval ':'\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r20-prefix-bash-translated-opt": Case(
+        DOLLAR0 + 'HERE=<case>/other bash -$"c" \'. "$HERE/lib.sh"\'\n' + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-keep-pid-before-quoted": Case(
+        DOLLAR0 + 'printf "%s\\n" $$"OTHER"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-translated-leading-printf-opt": Case(
+        CDPWD + "dest=${missing:-H}ERE\nprintf $\"-v\"'' \"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-translated-leading-bash-opt": Case(
+        CDPWD + "HERE=<case>/other bash $\"-c\"'' '. \"$HERE/lib.sh\"'\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-translated-concat-printf-opt": Case(
+        CDPWD + "dest=${missing:-H}ERE\nprintf ''$\"-v\" \"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-translated-expanded-printf-opt": Case(
+        CDPWD + "o=v\ndest=${missing:-H}ERE\nprintf ''$\"-$o\" \"$dest\" '%s' <case>/other\n" + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r20-declare-var-translated-suffix": Case(CDPWD + 'declare H$"x"=1\n' + SRC, 2, WRITTEN, OTHER),
+    "r20-keep-declare-split-translated-rhs": Case(
+        DOLLAR0 + 'declare x"="$"y"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-prefix-loop-translated-list": Case(
+        DOLLAR0 + 'for k in $"${!GIT_@}"; do unset "$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r20-prefix-loop-translated-var": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do unset $"$k"; done\n' + SRC + RUN, 2, WRITTEN, OTHER
+    ),
+    "r20-keep-translated-escaped-name": Case(
+        DOLLAR0 + 'echo $"H\\\nERE"\n' + SRC + RUN, 0, files=OTHER
+    ),
+    "r20-keep-prefix-command-glob-fn": Case(
+        DOLLAR0 + 'f*x() { . "$HERE/lib.sh"; }\nHERE=<case>/other command true\n' + SRC + RUN,
+        0,
+        files=OTHER,
+    ),
+    "r20-keep-prefix-command-braced-fn": Case(
+        DOLLAR0 + 'f[x]() { . "$HERE/lib.sh"; }\nHERE=<case>/other command -p :\n' + SRC + RUN,
+        0,
+        files=OTHER,
+    ),
+    "r20-sourced-uses-caller-command-var": Case(
+        CDPWD + 'c=read\n. "$HERE/w.sh"\n' + SRC,
+        2,
+        AMBIGUOUS,
+        {"tools/w.sh": 'n=HE\nm=RE\n"$c" "$n$m" <<< <case>/other\n', "other/lib.sh": CFG},
+    ),
+    "r20-caller-uses-sourced-command-var": Case(
+        DOLLAR0 + '. "$HERE/def.sh"\n"$c" <case>/other/lib.sh\n',
+        2,
+        "tree/configure",
+        {"tools/def.sh": 'a=ba\nb=sh\nc="$a$b"\n', "other/lib.sh": CFG},
+    ),
+    "r20-keep-sourced-command-var-true": Case(
+        DOLLAR0 + '. "$HERE/def.sh"\nx=hi\n"$c" "$x"\n' + SRC + RUN,
+        0,
+        files={"tools/def.sh": 'a=tr\nb=ue\nc="$a$b"\n', **OTHER},
+    ),
+    "r20-command-word-bash-script": Case(
+        DOLLAR0 + 'a=ba\nb=sh\nc="$a$b"\n"$c" "$HERE/lib.sh"\n',
+        2,
+        "tree/configure",
+        {"tools/lib.sh": CFG},
+    ),
+    "r20-inline-uses-top-command-var": Case(
+        DOLLAR0 + 'a=ba\nb=sh\nc="$a$b"\nbash -c \'"$c" <case>/other/lib.sh\'\n',
+        2,
+        "tree/configure",
+        OTHER,
+    ),
+    "r20-glob-defined-fn-prefix": Case(
+        CDPWD + 'f*x() { . "$HERE/lib.sh"; }\nHERE=<case>/other gh\n' + RUN,
+        2,
+        PREFIXED,
+        OTHER,
+    ),
+    "r20-sourced-prefix-glob-fn": Case(
+        DOLLAR0 + 'f*x() { . "$HERE/lib.sh"; }\n. "$HERE/call.sh"\n' + RUN,
+        2,
+        SOURCED,
+        {"tools/call.sh": "HERE=<case>/other gh\n", "other/lib.sh": CFG},
+    ),
+    "r21-wait-concat-translated-dest": Case(
+        CDPWD + "wait ''-pH$\"OTHER\"\n" + SRC, 2, WRITTEN, OTHER
+    ),
+    "r21-prefix-loop-read-translated-var": Case(
+        DOLLAR0 + 'for k in "${!GIT_@}"; do read -r $"$k" <<< <case>/other; done\n' + SRC + RUN,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r21-translated-source-option": Case(
+        DOLLAR0 + '. -$"p" <case>/tools/lib.sh\n' + SRC + RUN,
+        2,
+        "source option the guard does not follow",
+        OTHER,
+    ),
+    "r21-escaped-dollar-quoted-source": Case(
+        DOLLAR0 + ". '<case>/tools/lib'\\$\".sh\"\n" + RUN,
+        2,
+        UNKNOWN_SOURCE,
+        {"tools/lib$.sh": CFG},
+    ),
+    "r23-positional-fallback-command": Case(
+        CDPWD + "c=${1:-true}\n" + NAME_HERE + CALL_C + SRC, 2, WRITTEN, OTHER, command=READ_RUN
+    ),
+    "r23-cap-sixteen-then-read": Case(
+        CDPWD + X16 + "c=read\n" + NAME_HERE + CALL_C + SRC, 2, WRITTEN, OTHER
+    ),
+    "r23-unresolved-assignment-keeps-true": Case(
+        CDPWD + 'c=true\nc="$1"\n' + NAME_HERE + CALL_C + SRC, 2, WRITTEN, OTHER, command=READ_RUN
+    ),
+    "r23-keep-positional-fallback-data": Case(CDPWD + 'c=${1:-true}\necho "$c"\n' + SRC, 0),
+    "r23-keep-sixteen-harmless": Case(CDPWD + X16 + NAME_HERE + CALL_C + SRC, 0),
+    "r23-keep-two-resolved": Case(CDPWD + "c=true\nc=false\n" + NAME_HERE + CALL_C + SRC, 0),
+    **{
+        f"r23-unknown-fallback-{param}": Case(
+            CDPWD + NAME_HERE + '"${' + param + ':-true}" "$n$m" <<< <case>/other\n' + SRC,
+            2,
+            WRITTEN,
+            OTHER,
+        )
+        for param in (
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "10",
+            "@",
+            "*",
+            "#",
+            "?",
+            "-",
+            "$",
+            "!",
+        )
+    },
+    "r23-concat-cap-read": Case(
+        CDPWD
+        + "a=x0\na=x1\na=x2\na=x3\na=rea\nb=y0\nb=y1\nb=y2\nb=y3\nb=d\n"
+        + NAME_HERE
+        + '"$a$b" "$n$m" <<< <case>/other\n'
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r23-fallback-cap-read": Case(
+        CDPWD + X16 + NAME_HERE + '"${c:-read}" "$n$m" <<< <case>/other\n' + SRC, 2, WRITTEN, OTHER
+    ),
+    "r23-keep-fallback-sixteen": Case(
+        CDPWD + X16 + NAME_HERE + '"${c:-x00}" "$n$m" <<< <case>/other\n' + SRC, 0
+    ),
+    "r23-array-join-cap-read": Case(
+        CDPWD
+        + "a=x0\na=x1\na=x2\na=x3\na=read\nb=y0\nb=y1\nb=y2\nb=y3\nb=-r\n"
+        + 'arr=("$a" "$b")\n'
+        + NAME_HERE
+        + CALL_ARRAY
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r23-array-bucket-cap-read": Case(
+        CDPWD
+        + "".join(f"arr=(p{idx} q{jdx})\n" for idx in range(4) for jdx in range(4))
+        + "arr=(read -r)\n"
+        + NAME_HERE
+        + CALL_ARRAY
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r23-array-index-cap-read": Case(
+        CDPWD
+        + "c=("
+        + " ".join(f"x{idx:02d}" for idx in range(16))
+        + " read)\n"
+        + NAME_HERE
+        + '"${c[16]}" "$n$m" <<< <case>/other\n'
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r23-keep-array-index-sixteen": Case(
+        CDPWD
+        + "c=("
+        + " ".join(f"x{idx:02d}" for idx in range(16))
+        + ")\n"
+        + NAME_HERE
+        + '"${c[15]}" "$n$m" <<< <case>/other\n'
+        + SRC,
+        0,
+    ),
+    **{
+        f"r24-keep-{form}-{position}": Case(idiom + tail, 0)
+        for form, idiom in (
+            ("cd-pwd", CDPWD),
+            ("bash-source", 'HERE=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")\n'),
+        )
+        for position, tail in (
+            ("source-first", SRC + 'c="$HERE/x.sh"\n"$c" a\n'),
+            ("source-between", 'c="$HERE/x.sh"\n' + SRC + '"$c" a\n'),
+            ("source-last", 'c="$HERE/x.sh"\n"$c" a\n' + SRC),
+        )
+    },
+    "r24-keep-default-command": Case(DEFAULT + 'c="$HERE/x.sh"\n"$c" a\n' + SRC, 0),
+    "r24-keep-or-list-command": Case(CDPWD + 'c="$HERE/x.sh"\nfoo a || { "$c" a; }\n' + SRC, 0),
+    "r24-keep-if-command": Case(CDPWD + 'c="$HERE/x.sh"\nif true; then "$c" a; fi\n' + SRC, 0),
+    "r24-keep-or-list-env-command": Case(
+        CDPWD + 'c="$HERE/x.sh"\nfoo env A=1 git || { "$c" a; }\n' + SRC, 0
+    ),
+    "r24-keep-command-without-source": Case(CDPWD + 'c="$HERE/x.sh"\n"$c" a\n', 0),
+    "r24-keep-direct-command": Case(CDPWD + '"$HERE/x.sh" a\n' + SRC, 0),
+    "r24-keep-unquoted-data": Case(CDPWD + 'c=$HERE/x.sh\necho "$c"\n' + SRC, 0),
+    "r24-unresolved-after-own-directory": Case(
+        CDPWD + 'c="$HERE/x.sh"\nc="$1"\n' + NAME_HERE + CALL_C + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+        command=READ_RUN,
+    ),
+    "r24-unresolved-with-own-directory": Case(
+        CDPWD + 'c="$HERE$1"\n' + NAME_HERE + CALL_C + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+        command=READ_RUN,
+    ),
+    "r24-static-cap-sixteen-then-read": Case(
+        CDPWD
+        + "".join(f'declare "c=x{idx:02d}"\n' for idx in range(16))
+        + 'declare "c=read"\n'
+        + NAME_HERE
+        + CALL_C
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r24-keep-static-sixteen-harmless": Case(
+        CDPWD
+        + "".join(f'declare "c=x{idx:02d}"\n' for idx in range(16))
+        + NAME_HERE
+        + CALL_C
+        + SRC,
+        0,
+    ),
+    "r25-operand-read-bash-source": Case(
+        'HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"\n'
+        + "c=read\n"
+        + NAME_HERE
+        + CALL_C
+        + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r25-brace-loop-command": Case(
+        'HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"\n'
+        + "for c in {a,b,read}; do :; done\n"
+        + NAME_HERE
+        + CALL_C
+        + SRC,
+        2,
+        BRACE_WORD,
+        OTHER,
+    ),
+    "r25-brace-loop-body": Case(
+        CDPWD + 'for c in {a,b,read}; do "$c" HERE <<< <case>/other; done\n' + SRC,
+        2,
+        BRACE_WORD,
+        OTHER,
+    ),
+    "r25-plain-loop-command": Case(
+        CDPWD + "for c in a b read; do :; done\n" + NAME_HERE + CALL_C + SRC,
+        2,
+        WRITTEN,
+        OTHER,
+    ),
+    "r25-brace-loop-harmless": Case(
+        CDPWD + "for c in {a,b,true}; do :; done\n" + NAME_HERE + CALL_C + SRC,
+        2,
+        BRACE_WORD,
+    ),
 }
+
+
+SCRIPT_DIR.update(
+    {
+        "r26-command-mixed-candidates": Case(
+            'c=bash\nc=./other/run.sh\n"$c" <case>/inner.sh\n',
+            2,
+            "other/run.sh",
+            {"other/run.sh": CFG},
+        ),
+        "r26-command-harmless-candidates": Case('c=bash\nc=true\n"$c" <case>/inner.sh\n', 0),
+        "r26-array-nine-writer": Case(
+            CDPWD
+            + "arr=(bash)\n"
+            + "arr=(command command command command command command command command read)\n"
+            + NAME_HERE
+            + CALL_ARRAY
+            + SRC,
+            2,
+            WRITTEN,
+            OTHER,
+        ),
+        "r26-array-nine-harmless": Case(
+            CDPWD + "arr=(true true true true true true true true true)\n" + CALL_ARRAY + SRC,
+            0,
+        ),
+        **{
+            f"r26-nameref-{declaration}-{position}": Case(
+                (CDPWD if position == "after" else "")
+                + NAME_HERE
+                + declaration
+                + ' -n ref="$n$m"\n'
+                + (CDPWD if position == "before" else "")
+                + "ref=<case>/other\n"
+                + SRC,
+                2,
+                WRITTEN if position == "after" else REBOUND,
+                OTHER,
+            )
+            for declaration in ("declare", "local", "typeset")
+            for position in ("after", "before")
+        },
+        "r26-nameref-quoted-operand": Case(
+            CDPWD + NAME_HERE + 'builtin declare -n "ref=$n$m"\nref=<case>/other\n' + SRC,
+            2,
+            WRITTEN,
+            OTHER,
+        ),
+        "r26-nameref-literal-unrelated": Case(
+            CDPWD + "declare -n ref=unrelated\nref=<case>/other\n" + SRC, 0, None, OTHER
+        ),
+        **{
+            f"r26-arithmetic-{form}": Case(
+                CDPWD + "p=HE\nq=RE\n" + writer + SRC, 2, WRITTEN, {"7/lib.sh": CFG}
+            )
+            for form, writer in (
+                ("expansion", ": $(( ${p}${q}=7 ))\n"),
+                ("command", "(( ${p}${q}=7 ))\n"),
+                ("let", 'let "${p}${q}=7"\n'),
+                ("subscript", "arr[${p}${q}=7]=x\n"),
+                ("postincrement", "(( ${p}${q}++ ))\n"),
+                ("preincrement", ": $(( ++${p}${q} ))\n"),
+                ("let-increment", 'let "${p}${q}++"\n'),
+            )
+        },
+        "r26-arithmetic-readonly": Case(CDPWD + "p=1\nq=2\n: $(( ${p}${q}+7 ))\n" + SRC, 0),
+        "r26-arithmetic-literal-unrelated": Case(CDPWD + ": $(( unrelated=7 ))\n" + SRC, 0),
+        "r26-arithmetic-literal-dynamic-rhs": Case(
+            CDPWD + "p=1\n: $(( unrelated=${p}+7 ))\n" + SRC, 0
+        ),
+        "r26-arithmetic-let-readonly": Case(CDPWD + 'p=1\nlet "${p}+7"\n' + SRC, 0),
+        "r26-child-prefix-path": Case(
+            "PATH=<case>/bin:/usr/bin:/bin /bin/bash <case>/tools/child.sh\n",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+        ),
+        "r26-tool-prefix-path": Case(
+            "",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="PATH=<case>/bin:/usr/bin:/bin /bin/bash tools/child.sh",
+        ),
+        "r26b-tool-env-prefix-path": Case(
+            "",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="env PATH=<case>/bin:/usr/bin:/bin /bin/bash tools/child.sh",
+        ),
+        "r26b-tool-prefix-unrelated": Case(
+            "",
+            0,
+            None,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="UNRELATED=<case>/bin:/usr/bin:/bin /bin/bash tools/child.sh",
+        ),
+        "r26b-tool-program-prefix-path": Case(
+            "",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="PATH=<case>/bin:/usr/bin:/bin ./tools/child.sh",
+        ),
+        "r26b-tool-program-prefix-unrelated": Case(
+            "",
+            0,
+            None,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+            command="UNRELATED=<case>/bin:/usr/bin:/bin ./tools/child.sh",
+        ),
+        "r26-child-export-path": Case(
+            "export PATH=<case>/bin:/usr/bin:/bin\n/bin/bash <case>/tools/child.sh\n",
+            2,
+            REBOUND,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+        ),
+        "r26-child-unchanged-environment": Case(
+            "/bin/bash <case>/tools/child.sh\n",
+            0,
+            None,
+            {"tools/child.sh": CDPWD + SRC, **OTHER_DIRNAME},
+        ),
+    }
+)
 
 
 class TestRawConfigureScriptDir(RawConfigureGuardBase):
@@ -224,9 +1827,18 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
         run_env = {"PATH": os.defpath, "LC_ALL": "C.UTF-8", **(env or {})}
         return self.run_guard("claude", self.payload("claude", command, base), env=run_env)
 
+    def test_bash_variables_documented(self) -> None:
+        """Keep the 110 bash 5.3 manual variable names and exclude undocumented names."""
+        self.assertEqual(len(BASH_VARIABLES), 110)
+        self.assertLessEqual(
+            {"_", "PATH", "BASH_ARGV0", "BASH_CMDS", "BASH_ALIASES", "EXECIGNORE", "IFS", "UID"},
+            BASH_VARIABLES,
+        )
+        self.assertNotIn("BASH_CMDS_X", BASH_VARIABLES)
+
     def test_script_dir_shapes(self) -> None:
-        """Replay all 49 own-directory shapes: resolved, marked uncertain or refused."""
-        self.assertEqual(len(SCRIPT_DIR), 49)
+        """Replay all 558 own-directory shapes: resolved, marked uncertain or refused."""
+        self.assertEqual(len(SCRIPT_DIR), 558)
         for name, case in SCRIPT_DIR.items():
             with self.subTest(shape=name):
                 base = self._case_dir(name, case)
@@ -235,6 +1847,37 @@ class TestRawConfigureScriptDir(RawConfigureGuardBase):
                 if case.reason is not None:
                     self.assertIn(case.reason, result.stderr)
                 self.assertFalse(self.marker.exists())
+
+    def test_newline_script_dir_refuses(self) -> None:
+        """Refuse own-directory references when the script directory path holds a newline."""
+        for i, form in enumerate((DOLLAR0, CDPWD)):
+            with self.subTest(i=i):
+                base = self._case_dir(
+                    f"newline-{i}",
+                    Case(
+                        form + SRC + RUN,
+                        2,
+                        files={
+                            "tools/lib.sh": CFG,
+                            "tools\n/run.sh": form + SRC + RUN,
+                            "tools\n/lib.sh": "X=1\n",
+                            "tools\n/inner.sh": "echo benign\n",
+                        },
+                    ),
+                )
+                result = self._run(base / "tools\n", "bash ./run.sh")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(NEWLINE, result.stderr)
+                self.assertFalse(self.marker.exists())
+
+    def test_unsuffixed_sibling_of_newline_dir_allowed(self) -> None:
+        """Allow an unsuffixed sibling directory when only the newline directory holds configure."""
+        base = self._case_dir(
+            "newline-sibling", Case(DOLLAR0 + SRC + RUN, 0, files={"tools\n/lib.sh": CFG})
+        )
+        result = self._run(base / "tools", "bash ./run.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.marker.exists())
 
     def test_unreadable_script_dir_source_refuses(self) -> None:
         """Keep refusing a resolved source the guard cannot read or that is no regular file."""
