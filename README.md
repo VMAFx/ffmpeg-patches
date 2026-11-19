@@ -43,12 +43,10 @@ patches shared by the VMAFx projects
 
 ## Why this project
 
-A fix lives here once, so consumers do not maintain their own copies
-([ADR-0001](docs/adr/0001-shared-fix-series.md)). Consumers apply the shared
-series first and carry only their own feature patches
-([ADR-0001](docs/adr/0001-shared-fix-series.md)). Every fix is sent
-[upstream](upstream-contributions.json); it is dropped when a pinned FFmpeg
-release contains it (see [How it works](#how-it-works)).
+A fix lives here once, so consumers do not maintain their own copies.
+Consumers carry only their own feature patches
+([ADR-0001](docs/adr/0001-shared-fix-series.md)). See
+[How it works](#how-it-works) for the patch lifecycle.
 
 ## Get started
 
@@ -80,16 +78,16 @@ without your git configuration and reports the result:
 ### How it works
 
 The series is a list of FFmpeg fixes in `git format-patch` form, applied in
-order onto one pinned FFmpeg release. Every fix is also sent upstream. When
-upstream merges it and a release containing it is pinned, the patch is
-dropped.
+order onto one pinned FFmpeg release. Each fix is intended for upstream. Its
+[`patches/NNNN-slug.toml`](patches/) sidecar records its `status` and, once
+submitted, its `upstream` reference; `unsubmitted` means it has not yet been
+submitted. When upstream merges it and a release containing it is pinned,
+the patch is dropped.
 
 Consumers apply this series first and their own feature patches on top:
 
 - [VMAFx/vmafx](https://github.com/VMAFx/vmafx)
 - [VMAFx/pelorus](https://github.com/VMAFx/pelorus)
-
-A fix lives here once. A consumer does not carry its own copy.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px', 'primaryColor': '#111a35', 'primaryTextColor': '#e2e8f0', 'primaryBorderColor': '#3b82f6', 'lineColor': '#3b82f6', 'edgeLabelBackground': '#111a35', 'tertiaryColor': '#0b1020'}}}%%
