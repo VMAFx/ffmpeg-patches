@@ -26,6 +26,11 @@ Commands above upstream_lint.MAX_COMMAND_ARGS are refused with exit 2 before
 scratch work; commands at the cap are accepted.
 Non-UTF-8 filenames round-trip through filesystem surrogate escapes, stored as
 JSON escapes in UTF-8 records and restored unchanged by the reader.
+Human output renders lone surrogates as visible backslash-u escapes without
+changing Git arguments, stdin or stored records; literal escape spellings can
+look identical, so distinguish them using stored JSON or raw Git path bytes.
+End-to-end filename support is claimed only for UTF-8 filesystem encodings;
+other filesystem encodings retain native decode/encode behavior but are unverified.
 """
 
 from __future__ import annotations
@@ -106,7 +111,7 @@ def tracked_status(tree: Path) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for revert_proof.py."""
-    parser = argparse.ArgumentParser(
+    parser = upstream_lint.DisplayArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--tree", type=Path, required=True)
@@ -390,22 +395,24 @@ def run_proof(config: ProofConfig) -> None:
     config.record.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _error_exit(error: Exception, status: int) -> int:
+    """Display producer diagnostics safely while retaining their failure status."""
+    print(upstream_lint.display_text(f"revert_proof: {error}"), file=sys.stderr)
+    return status
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run revert_proof CLI and map each failure class to its exit code."""
     try:
         run_proof(parse_config(argv))
     except _ScratchRemovalError as error:
-        print(f"revert_proof: {error}", file=sys.stderr)
-        return 5
+        return _error_exit(error, 5)
     except _ReverseApplyError as error:
-        print(f"revert_proof: {error}", file=sys.stderr)
-        return 4
+        return _error_exit(error, 4)
     except _HeadTestError as error:
-        print(f"revert_proof: {error}", file=sys.stderr)
-        return 3
-    except (_PreflightError, OSError) as error:
-        print(f"revert_proof: {error}", file=sys.stderr)
-        return 2
+        return _error_exit(error, 3)
+    except (_PreflightError, OSError, UnicodeError) as error:
+        return _error_exit(error, 2)
     return 0
 
 

@@ -78,6 +78,12 @@ and whose rc_reverted is a nonzero integer. The head must resolve to a commit
 with head_tree, and reverted_paths must equal the sorted source paths of the fix.
 Non-UTF-8 filenames round-trip through filesystem surrogate escapes, stored as
 JSON escapes in UTF-8 records and restored unchanged by the reader.
+Human output renders lone surrogates as visible backslash-u escapes without
+changing Git arguments, stdin or stored records; literal escape spellings can
+look identical, so distinguish them using stored JSON or raw Git path bytes.
+End-to-end filename support is claimed only for UTF-8 filesystem encodings;
+other filesystem encodings retain native decode/encode behavior but are unverified.
+Base configuration and script files are extracted as their original blob bytes.
 Raw commit and path lists above MAX_PATHS fail before classification; neither
 list is silently truncated. Command environments have a separate
 MAX_ENV_ENTRIES bound of 16384, leaving ample room for environments with
@@ -485,6 +491,20 @@ def decode_git_output(output: bytes) -> str:
     return os.fsdecode(output)
 
 
+def display_text(text: str) -> str:
+    """Escape lone surrogates for display without changing Git or record transport."""
+    return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+class DisplayArgumentParser(argparse.ArgumentParser):
+    """Escape parser help and error text at argparse's shared output boundary."""
+
+    def _print_message(self, message: str | None, file=None) -> None:
+        """Render parser messages without changing the arguments being parsed."""
+        if message:
+            super()._print_message(display_text(message), file)
+
+
 def _run_output(
     output: bytes, errors: bytes | None, returncode: int, *, git_stdout: bool = False
 ) -> str:
@@ -547,12 +567,17 @@ def _run(
             raise
 
 
-def _git(tree: Path, *args: str) -> str:
-    """Return Git output or raise an error with the command's captured result."""
+def _git_result(tree: Path, *args: str) -> RunResult:
+    """Return checked Git bytes and text or raise with the captured failure."""
     result: RunResult = _run(["git", *args], tree)
     if result.returncode:
         raise RuntimeError(f"git {shlex.join(args)}: rc={result.returncode}\n{result.stdout}")
-    return result.stdout
+    return result
+
+
+def _git(tree: Path, *args: str) -> str:
+    """Return Git output or raise an error with the command's captured result."""
+    return _git_result(tree, *args).stdout
 
 
 def _status(tree: Path) -> str:
@@ -577,8 +602,9 @@ def _prepare(tree: Path, base: str, head: str) -> tuple[str, str]:
 
 
 def _base_file(tree: Path, base: str, name: str, scratch: Path) -> Path:
+    """Extract the exact base blob bytes for configuration and script consumers."""
     target = scratch / Path(name).name
-    target.write_text(_git(tree, "show", f"{base}:{name}"), encoding="utf-8")
+    target.write_bytes(_git_result(tree, "show", f"{base}:{name}").stdout_bytes)
     target.chmod(0o700)
     return target
 
@@ -2744,7 +2770,7 @@ def _add_revert_proof_options(parser: argparse.ArgumentParser) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     """Build the command line parser with the range options and one waiver per step."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = DisplayArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", default="HEAD")
@@ -2791,6 +2817,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_report(report: str, target: Path | None) -> bool:
+    """Render a report safely at the terminal and optional UTF-8 file boundary."""
+    try:
+        report = display_text(report)
+        print(report, end="", flush=True)
+        if target:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(report, encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        print(display_text(f"report: {error}"), file=sys.stderr)
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run all upstream checks, print their statuses, and optionally save a report."""
     args = _parser().parse_args(argv)
@@ -2819,14 +2859,8 @@ def main(argv: list[str] | None = None) -> int:
         + "\n\n".join(f"step: {step.name} rc: {step.rc}\n{step.output.rstrip()}" for step in steps)
         + "\n"
     )
-    print(report, end="")
-    if args.report:
-        try:
-            args.report.parent.mkdir(parents=True, exist_ok=True)
-            args.report.write_text(report, encoding="utf-8")
-        except OSError as error:
-            print(f"report: {error}", file=sys.stderr)
-            return 2
+    if not _write_report(report, args.report):
+        return 2
     return 2 if steps[0].name == "preflight" else int(any(step.rc for step in steps))
 
 
