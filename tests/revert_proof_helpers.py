@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
+import io
 import os
 import select
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -249,3 +252,87 @@ class RevertProofFixture(unittest.TestCase):
         self.write(name, FIXED_SOURCE)
         fix = self.commit("avfilter: fix byte-name source")
         return name, sibling_fix, fix
+
+
+class ProcessOutputFixture(unittest.TestCase):
+    """Run executable output boundaries with deterministic text and real OS pipes."""
+
+    def pipe_process(self, arguments: list[str], closed: str | None = None):
+        """Close a pipe reader before spawn when requested and always reap the child."""
+        inherited = os.environ.copy()
+        self.assertLessEqual(len(inherited), upstream_lint.MAX_ENV_ENTRIES)
+        environment = {
+            name: value
+            for name, value in list(inherited.items())[: upstream_lint.MAX_ENV_ENTRIES]
+            if not name.startswith("GIT_")
+        }
+        environment.update(
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1",
+            COLUMNS="80",
+            LINES="24",
+            LC_ALL="C",
+            LANG="C",
+            LANGUAGE="C",
+            PYTHONUTF8="1",
+            PYTHONIOENCODING="utf-8",
+            TERM="xterm-256color",
+            FORCE_COLOR="1",
+            NO_COLOR="",
+            PYTHON_COLORS="0",
+        )
+        destinations = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+        with contextlib.ExitStack() as resources:
+            if closed is not None:
+                reader, writer = os.pipe()
+                os.close(reader)
+                destinations[closed] = resources.enter_context(os.fdopen(writer, "wb", buffering=0))
+            process = subprocess.Popen(
+                [sys.executable, "-B", *arguments],
+                cwd=upstream_lint.REPO_ROOT,
+                env=environment,
+                stdin=subprocess.PIPE,
+                **destinations,
+            )
+            try:
+                output, errors = process.communicate(timeout=15)
+                return process.returncode, output or b"", errors or b""
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=15)
+                for stream in (process.stdin, process.stdout, process.stderr)[:3]:
+                    if stream is not None:
+                        stream.close()
+
+    def parser_result(self, name: str, arguments: list[str]):
+        """Capture complete plain parser text with the same fixed child formatting."""
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            unittest.mock.patch.dict(os.environ, {"COLUMNS": "80", "LINES": "24"}),
+            unittest.mock.patch.object(argparse, "_", lambda message: message),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            parser = (
+                upstream_lint._parser() if name == "upstream_lint" else revert_proof.build_parser()
+            )
+            parser.prog = name + ".py"
+            with self.assertRaises(SystemExit) as caught:
+                parser.parse_args(arguments)
+        return caught.exception.code, output.getvalue().encode(), errors.getvalue().encode()
+
+    def assert_pipe_result(self, arguments: list[str], expected, closed: str) -> None:
+        """Require full open-pipe output and the same decided status after reader closure."""
+        with self.subTest(reader="open", arguments=arguments):
+            self.assertEqual(self.pipe_process(arguments), expected)
+        status, output, errors = expected
+        with self.subTest(reader="closed", arguments=arguments):
+            self.assertEqual(
+                self.pipe_process(arguments, closed),
+                (
+                    status,
+                    b"" if closed == "stdout" else output,
+                    b"" if closed == "stderr" else errors,
+                ),
+            )

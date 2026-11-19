@@ -31,8 +31,10 @@ changing Git arguments, stdin or stored records; literal escape spellings can
 look identical, so distinguish them using stored JSON or raw Git path bytes.
 Diagnostics and parser messages also escape characters outside the destination
 stream's encoding; broken or closed output streams retain the decided exit status.
-Parser help, usage and errors stay plain even when terminal colour is forced;
-formatting does not query the output stream's file descriptor for colour.
+At executable exit, a failed original stdout or stderr flush removes that stream
+from interpreter cleanup; replacement streams remain owned by their callers.
+Parser help, usage and errors stay plain with colour detection disabled.
+Help wrapping may still query the original standard output's terminal size.
 Record files use UTF-8 with ASCII JSON escapes, independently of terminal encoding.
 End-to-end filename support is claimed only for UTF-8 filesystem encodings;
 other filesystem encodings retain native decode/encode behavior but are unverified.
@@ -422,4 +424,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        upstream_lint.finish_process_output()

@@ -15,7 +15,75 @@ import unittest.mock
 from pathlib import Path
 
 from scripts import revert_proof, upstream_lint
-from tests.revert_proof_helpers import BASE_SOURCE, FIXED_SOURCE, RevertProofFixture
+from tests.revert_proof_helpers import (
+    BASE_SOURCE,
+    FIXED_SOURCE,
+    ProcessOutputFixture,
+    RevertProofFixture,
+)
+
+
+class ProcessOutputTest(ProcessOutputFixture):
+    """Keep executable statuses through interpreter shutdown with closed pipe readers."""
+
+    def test_both_script_help_statuses_survive_closed_stdout(self) -> None:
+        """Both real entry points retain help status zero without shutdown diagnostics."""
+        for name in ("upstream_lint", "revert_proof")[:2]:
+            self.assert_pipe_result(
+                [f"scripts/{name}.py", "--help"], self.parser_result(name, ["--help"]), "stdout"
+            )
+
+    def test_both_script_usage_statuses_survive_closed_stderr(self) -> None:
+        """Both real entry points retain usage status two with a closed error reader."""
+        for name in ("upstream_lint", "revert_proof")[:2]:
+            self.assert_pipe_result([f"scripts/{name}.py"], self.parser_result(name, []), "stderr")
+
+    def test_producer_tool_error_survives_closed_stderr(self) -> None:
+        """An actual preflight error retains two and its open-pipe diagnostic is complete."""
+        arguments = [
+            "scripts/revert_proof.py",
+            "--tree",
+            ".",
+            "--commit",
+            "HEAD",
+            "--record",
+            "unused.json",
+        ]
+        self.assert_pipe_result(
+            arguments, (2, b"", b"revert_proof: test command is empty\n"), "stderr"
+        )
+
+    def test_final_flush_only_failures_keep_all_decided_statuses(self) -> None:
+        """A first flush failure at exit preserves buffered output's decided status zero to five."""
+        for name in ("stdout", "stderr")[:2]:
+            for status in range(6):
+                source = (
+                    "import sys\nfrom scripts import upstream_lint\n"
+                    f"sys.{name}.reconfigure(line_buffering=False, write_through=False)\n"
+                    f"sys.{name}.write('buffered')\n"
+                    f"try:\n    sys.exit({status})\n"
+                    "finally:\n    upstream_lint.finish_process_output()\n"
+                )
+                expected = (
+                    status,
+                    b"buffered" if name == "stdout" else b"",
+                    b"buffered" if name == "stderr" else b"",
+                )
+                self.assert_pipe_result(["-c", source], expected, name)
+
+    def test_process_finalizer_leaves_replacement_streams_untouched(self) -> None:
+        """Patching current and original stream aliases cannot transfer stream ownership."""
+        stream = unittest.mock.Mock()
+        with (
+            unittest.mock.patch.object(sys, "stdout", stream),
+            unittest.mock.patch.object(sys, "stderr", stream),
+            unittest.mock.patch.object(sys, "__stdout__", stream),
+            unittest.mock.patch.object(sys, "__stderr__", stream),
+        ):
+            upstream_lint.finish_process_output()
+            self.assertIs(sys.stdout, stream)
+            self.assertIs(sys.stderr, stream)
+        self.assertEqual(stream.mock_calls, [])
 
 
 class DisplayTextTest(unittest.TestCase):
@@ -345,7 +413,7 @@ class DisplayBoundaryTest(RevertProofFixture):
                             parser.parse_args(argv)
                         self.assertEqual(caught.exception.code, expected)
 
-    def test_both_parsers_never_consult_stream_descriptors(self) -> None:
+    def test_both_parsers_do_not_query_destination_descriptors_for_colour(self) -> None:
         """Invalid and raising descriptors cannot affect parser formatting or exit status."""
         for error in (None, ValueError("closed stream"), io.UnsupportedOperation("fileno")):
             with self.subTest(error=error):

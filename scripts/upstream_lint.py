@@ -84,8 +84,10 @@ look identical, so distinguish them using stored JSON or raw Git path bytes.
 Terminal findings, diagnostics and parser messages escape characters outside the
 destination stream's encoding as visible backslash escapes. Emission failures
 retain the caller's decided status, even when a stream is closed or broken.
-Parser help, usage and errors always use plain text, including on colour terminals;
-formatting never queries the destination stream's file descriptor for colour.
+At executable exit, a failed original stdout or stderr flush removes that stream
+from interpreter cleanup; replacement streams remain owned by their callers.
+Parser help, usage and errors always use plain text with colour detection disabled.
+Help wrapping may still query the original standard output's terminal size.
 Optional human reports use UTF-8, retaining valid Unicode and escaping lone
 surrogates; terminal codec fallback does not alter the report file or JSON records.
 End-to-end filename support is claimed only for UTF-8 filesystem encodings;
@@ -227,6 +229,7 @@ from pathlib import Path, PurePosixPath
 
 # Ensure repository root is on sys.path for test/tool imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
+_PROCESS_STREAMS = (("stdout", sys.__stdout__), ("stderr", sys.__stderr__))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -514,6 +517,18 @@ def emit_text(text: str, stream) -> None:
     except Exception:
         # Emission is best effort; even a broken stream must retain the decided status.
         return
+
+
+def finish_process_output() -> None:
+    """Flush original process streams and retire failed ones before interpreter shutdown."""
+    for name, stream in _PROCESS_STREAMS[:2]:
+        if stream is None or getattr(sys, name) is not stream:
+            continue
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            # Do not let interpreter cleanup retry a failed process-owned stream.
+            setattr(sys, name, None)
 
 
 class DisplayArgumentParser(argparse.ArgumentParser):
@@ -2891,4 +2906,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        finish_process_output()
