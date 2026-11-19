@@ -4357,8 +4357,10 @@ class UnreadWaiverTest(unittest.TestCase):
         entries = [{**self.entry, "path": paths[index]} for index in range(len(paths))]
         expected = [
             "unused waiver: a.c",
-            "unread: libavformat/rtspenc.c: rules could not read this file; "
-            "touched lines need a check by hand",
+            (
+                "unread: libavformat/rtspenc.c: rules could not read this file; "
+                "touched lines need a check by hand"
+            ),
             "no waiver: libavformat/rtspenc.c: pass --c-rule-unread-waiver",
             "unused waiver: z.c",
         ]
@@ -4533,12 +4535,18 @@ class UnreadWaiverTest(unittest.TestCase):
         self.assertEqual(
             step.output.splitlines(),
             [
-                "unread: libavformat/rtsp.c: rules could not read this file; "
-                "touched lines need a check by hand",
-                "waived: libavformat/rtsp.c: category C, expires 2026-11-29: "
-                "touched lines checked by hand",
-                "unread: libavformat/rtspenc.c: rules could not read this file; "
-                "touched lines need a check by hand",
+                (
+                    "unread: libavformat/rtsp.c: rules could not read this file; "
+                    "touched lines need a check by hand"
+                ),
+                (
+                    "waived: libavformat/rtsp.c: category C, expires 2026-11-29: "
+                    "touched lines checked by hand"
+                ),
+                (
+                    "unread: libavformat/rtspenc.c: rules could not read this file; "
+                    "touched lines need a check by hand"
+                ),
                 "expired: libavformat/rtspenc.c: category C, expired 2026-11-19",
             ],
         )
@@ -4564,12 +4572,19 @@ class UnreadWaiverTest(unittest.TestCase):
                 self.assertEqual(self.process_rc, 1 - index, self.output)
                 self.assertEqual(step.rc, 1 - index, step.output)
                 expected = [
-                    "finding: libavformat/rtsp.c:11: "
-                    "ffmpeg-rtsp-connect-failure-without-network-close: missing ff_network_close()",
-                    "unread: libavformat/rtspenc.c: rules could not read this file; "
-                    "touched lines need a check by hand",
-                    "waived: libavformat/rtspenc.c: category C, expires 2026-11-19: "
-                    "touched lines checked by hand",
+                    (
+                        "finding: libavformat/rtsp.c:11: "
+                        "ffmpeg-rtsp-connect-failure-without-network-close: "
+                        "missing ff_network_close()"
+                    ),
+                    (
+                        "unread: libavformat/rtspenc.c: rules could not read this file; "
+                        "touched lines need a check by hand"
+                    ),
+                    (
+                        "waived: libavformat/rtspenc.c: category C, expires 2026-11-19: "
+                        "touched lines checked by hand"
+                    ),
                 ]
                 if index:
                     expected.insert(0, "waived: checked finding by hand")
@@ -4589,10 +4604,14 @@ class UnreadWaiverTest(unittest.TestCase):
         self.assertEqual(
             step.output.splitlines(),
             [
-                "unread: libavformat/rtspenc.c: rules could not read this file; "
-                "touched lines need a check by hand",
-                "waived: libavformat/rtspenc.c: category C, expires 2026-11-19: "
-                "touched lines checked by hand",
+                (
+                    "unread: libavformat/rtspenc.c: rules could not read this file; "
+                    "touched lines need a check by hand"
+                ),
+                (
+                    "waived: libavformat/rtspenc.c: category C, expires 2026-11-19: "
+                    "touched lines checked by hand"
+                ),
                 "unused waiver: z.c",
             ],
         )

@@ -2082,14 +2082,16 @@ def _syntax_error_path(error: object, requested: frozenset[str] | None) -> str |
     if not isinstance(error, dict) or not error.keys() <= fields:
         return None
     path = error.get("path")
+    code = error.get("code", 3)
     if (
         error.get("type") != "Syntax error"
         or not isinstance(path, str)
         or not path
         or requested is None
         or path not in requested
-        or type(error.get("code", 3)) is not int
-        or error.get("code", 3) != 3
+        or not isinstance(code, int)
+        or isinstance(code, bool)
+        or code != 3
         or error.get("level", "warn") != "warn"
         or not isinstance(error.get("message", ""), str)
     ):
@@ -2540,7 +2542,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         unread = _parse_unread_waivers(args.c_rule_unread_waiver, _TODAY())
     except ValueError as error:
-        parser.error(f"--c-rule-unread-waiver: {error}")
+        return parser.error(f"--c-rule-unread-waiver: {error}")
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
