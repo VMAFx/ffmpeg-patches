@@ -66,7 +66,7 @@ def job_timeout_seconds(workflow: Path = WORKFLOW) -> int:
     except (OSError, UnicodeError, yaml.YAMLError, KeyError, TypeError) as exc:
         detail = " ".join(str(exc).split())
         raise ValueError(f"{workflow}: cannot read {key}: {detail}") from exc
-    if type(minutes) is not int or minutes <= 0:
+    if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0:
         raise ValueError(f"{workflow}: {key} must be a positive integer")
     return minutes * 60
 

@@ -221,11 +221,29 @@ class UnitTestBudgetTest(unittest.TestCase):
             workflow.write_text("jobs:\n  check:\n    timeout-minutes: 7\n", encoding="utf-8")
             self.assertEqual(unit_test_budget.job_timeout_seconds(workflow), 420)
 
+    def test_one_minute_workflow_timeout_is_accepted(self) -> None:
+        """The smallest positive integer timeout supplies sixty seconds."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "series.yml"
+            workflow.write_text("jobs:\n  check:\n    timeout-minutes: 1\n", encoding="utf-8")
+            self.assertEqual(unit_test_budget.job_timeout_seconds(workflow), 60)
+
     def test_invalid_workflow_timeout_is_rejected(self) -> None:
         """Malformed timeout values cannot silently disable the unit deadline."""
         with tempfile.TemporaryDirectory() as scratch:
             workflow = Path(scratch) / "series.yml"
-            values = ("0", "-1", "true", "'10'", "null", "1.5")
+            values = (
+                "0",
+                "-1",
+                "true",
+                "false",
+                "'10'",
+                "null",
+                "1.5",
+                "[5]",
+                "{a: 1}",
+                "2026-11-19",
+            )
             for index in range(len(values)):
                 value = values[index]
                 with self.subTest(value=value):
