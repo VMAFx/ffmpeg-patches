@@ -1596,6 +1596,107 @@ static int earlier_derived_check(uint8_t *dst)
         """Treat a reallocated allocation ternary as out of scope."""
         self.assertEqual(_ternary_finding_lines(FFMPEG_REALLOCATED_ALLOCATION_TERNARY), [])
 
+    def test_earlier_buffer_eq_zero_check_out_of_scope(self) -> None:
+        """Skip an earlier buffer == 0 check; removing that check reports the ternary."""
+        source = _earlier_nonnull_ternary_source("buffer == 0")
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("    if (buffer == 0)\n        return -1;\n", "", 1)
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_earlier_zero_eq_buffer_check_out_of_scope(self) -> None:
+        """Skip an earlier 0 == buffer check; removing that check reports the ternary."""
+        source = _earlier_nonnull_ternary_source("0 == buffer")
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("    if (0 == buffer)\n        return -1;\n", "", 1)
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_earlier_buffer_ne_zero_check_out_of_scope(self) -> None:
+        """Skip an earlier buffer != 0 check; removing that check reports the ternary."""
+        source = _earlier_nonnull_ternary_source("buffer != 0")
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("    if (buffer != 0)\n        return -1;\n", "", 1)
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_earlier_zero_ne_buffer_check_out_of_scope(self) -> None:
+        """Skip an earlier 0 != buffer check; removing that check reports the ternary."""
+        source = _earlier_nonnull_ternary_source("0 != buffer")
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("    if (0 != buffer)\n        return -1;\n", "", 1)
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_earlier_double_negation_buffer_check_out_of_scope(self) -> None:
+        """Skip an earlier !!buffer check; removing that check reports the ternary."""
+        source = _earlier_nonnull_ternary_source("!!buffer")
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("    if (!!buffer)\n        return -1;\n", "", 1)
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_closed_list_earlier_buffer_checks_out_of_scope(self) -> None:
+        """Skip each direct buffer check in the closed list; removing it reports the ternary."""
+        checks = (
+            "buffer",
+            "!buffer",
+            "!!buffer",
+            "buffer == NULL",
+            "NULL == buffer",
+            "buffer != NULL",
+            "NULL != buffer",
+            "buffer == 0",
+            "0 == buffer",
+            "buffer != 0",
+            "0 != buffer",
+        )
+        for index in range(len(checks)):
+            check = checks[index]
+            with self.subTest(check=check):
+                source = _earlier_nonnull_ternary_source(check)
+                self.assertEqual(_ternary_finding_lines(source), [])
+                control = source.replace(f"    if ({check})\n        return -1;\n", "", 1)
+                self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_zero_and_double_negation_boolean_operands_out_of_scope(self) -> None:
+        """Skip zero-literal and double-negation buffer checks as whole AND/OR operands."""
+        checks = ("!!buffer", "buffer == 0", "0 == buffer", "buffer != 0", "0 != buffer")
+        operators = ("&&", "||")
+        for index in range(len(checks)):
+            for operator_index in range(len(operators)):
+                operator = operators[operator_index]
+                check = f"flag {operator} {checks[index]} {operator} ready()"
+                with self.subTest(check=check):
+                    source = _earlier_nonnull_ternary_source(check)
+                    self.assertEqual(_ternary_finding_lines(source), [])
+                    control = source.replace(f"    if ({check})\n        return -1;\n", "", 1)
+                    self.assertEqual(
+                        _ternary_finding_lines(control), _buffer_ternary_lines(control)
+                    )
+
+    def test_ternary_scope_narrowing_cast_in_earlier_check_reported(self) -> None:
+        """Report an earlier narrowing integer cast check because casts are not seen."""
+        checks = ("(unsigned char)buffer", "!(unsigned char)buffer")
+        for index in range(len(checks)):
+            check = checks[index]
+            with self.subTest(check=check):
+                source = _earlier_nonnull_ternary_source(check)
+                self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+                control = source.replace(f"if ({check})", "if (!buffer)", 1)
+                self.assertEqual(_ternary_finding_lines(control), [])
+
+    def test_ternary_scope_pointer_cast_in_earlier_check_reported(self) -> None:
+        """Report an earlier pointer cast check because casts of any type are not seen."""
+        checks = (
+            "(void *)buffer",
+            "!(void *)buffer",
+            "(uint8_t *)buffer",
+            "(void *)buffer == NULL",
+        )
+        for index in range(len(checks)):
+            check = checks[index]
+            with self.subTest(check=check):
+                source = _earlier_nonnull_ternary_source(check)
+                self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+                control = source.replace(f"if ({check})", "if (!buffer)", 1)
+                self.assertEqual(_ternary_finding_lines(control), [])
+
     def test_planted_write_header_missing_network_close_flagged(self) -> None:
         """Planted connect-then-close failure without ff_network_close flags the close line."""
         results = _scan_ffmpeg_c(FFMPEG_PLANTED_WRITE_HEADER)
