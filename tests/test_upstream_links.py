@@ -66,6 +66,8 @@ COUNT_PULL = {
 
 PLANTED_OWN_25805_JSON = """{
   "number": 25805,
+  "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "base": {"ref": "master"},
   "user": {"login": "lusoris"},
   "title": "checkasm/scene_sad: use the depth-adjusted width in bench_new()",
   "state": "open",
@@ -78,6 +80,8 @@ PLANTED_OWN_25805_JSON = """{
 
 PLANTED_OWN_25805_CLOSED_JSON = """{
   "number": 25805,
+  "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "base": {"ref": "master"},
   "user": {"login": "lusoris"},
   "title": "checkasm/scene_sad: use the depth-adjusted width in bench_new()",
   "state": "closed",
@@ -90,6 +94,8 @@ PLANTED_OWN_25805_CLOSED_JSON = """{
 
 PLANTED_OTHER_25950_JSON = """{
   "number": 25950,
+  "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "base": {"ref": "master"},
   "user": {"login": "bcoudurier"},
   "title": "tests/checkasm/scene_sad: benchmark the width that is tested",
   "state": "closed",
@@ -229,6 +235,8 @@ class PlantedSceneSadOverlapTest(unittest.TestCase):
         """A candidate merged before the own pull was opened is not an overlap and exits 0."""
         merged_before_json = """{
           "number": 25950,
+  "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "base": {"ref": "master"},
           "user": {"login": "bcoudurier"},
           "title": "tests/checkasm/scene_sad: benchmark the width that is tested",
           "state": "closed",
@@ -392,6 +400,8 @@ class FillAndCheckCommandTest(unittest.TestCase):
         """Return a FakeForge covering pulls 10, 20 and candidate 25."""
         pull_10 = {
             "number": 10,
+            "head": {"sha": "a" * 40},
+            "base": {"ref": "master"},
             "user": {"login": "alice"},
             "title": "avutil/test: change 10",
             "state": "open",
@@ -403,6 +413,8 @@ class FillAndCheckCommandTest(unittest.TestCase):
         }
         pull_20 = {
             "number": 20,
+            "head": {"sha": "a" * 40},
+            "base": {"ref": "master"},
             "user": {"login": "alice"},
             "title": "avutil/test: change 20",
             "state": "closed",
@@ -414,6 +426,8 @@ class FillAndCheckCommandTest(unittest.TestCase):
         }
         pull_25 = {
             "number": 25,
+            "head": {"sha": "a" * 40},
+            "base": {"ref": "master"},
             "user": {"login": "bob"},
             "title": "avutil/test: rival change",
             "state": "open",
@@ -554,6 +568,8 @@ def forge_pull(number: int, opened: str = "2026-11-01", updated: str = "2026-11-
     """Build a complete open Forgejo pull with controllable opening and update dates."""
     return {
         "number": number,
+        "head": {"sha": "a" * 40},
+        "base": {"ref": "master"},
         "user": {"login": "alice" if number < 100 else "bob"},
         "title": f"component: distinct change {number}",
         "state": "open",
@@ -854,7 +870,8 @@ class MeasuredWindowTest(unittest.TestCase):
         self.assertEqual((rc, errors.getvalue()), (1, ""))
         expected = (
             "window 2026-11-05T00:00:00+00:00: candidates 556, file candidates 503; "
-            "expected requests 519 (one page per file listing), at most 10114; cap 20062\n"
+            "expected requests 519 (one page per file listing), at most 10114; cap 20062; "
+            "same-patch-id not checked live\n"
         )
         self.assertEqual(at_files[0], expected)
         self.assertEqual(output.getvalue().count("expected requests"), 1)
@@ -979,7 +996,8 @@ class FillAgeWindowTest(unittest.TestCase):
             self.assertEqual(
                 out.splitlines()[0],
                 "window 2026-10-29T00:00:00+00:00: candidates 2, file candidates 2; "
-                "expected requests 8 (one page per file listing), at most 84; cap 20062",
+                "expected requests 8 (one page per file listing), at most 84; cap 20062; "
+                "same-patch-id not checked live",
             )
             self.assertEqual(
                 [line for line in out.splitlines()[:4] if "not read" in line],
@@ -1156,7 +1174,8 @@ class FillAgeWindowTest(unittest.TestCase):
         self.assertEqual(
             out.splitlines()[0],
             "window 2026-06-24T00:00:00+00:00: candidates 1, file candidates 1; "
-            "expected requests 6 (one page per file listing), at most 63; cap 20062",
+            "expected requests 6 (one page per file listing), at most 63; cap 20062; "
+            "same-patch-id not checked live",
         )
         self.assertEqual(len(forge.read), 6)
         self.assertIn("10 101 bob same-files open", out)
@@ -1566,6 +1585,573 @@ class OversizedCandidateTest(unittest.TestCase):
             rc, out, err = run_cli(self.root, forge, "check")
         self.assertEqual((rc, err), (1, ""))
         self.assertIn("10 101 bob same-files open", out)
+
+
+class FailClosedForgeTest(unittest.TestCase):
+    """Plant hostile forge fields through complete offline fill and check paths."""
+
+    def setUp(self) -> None:
+        """Create one own pull and one overlapping candidate with complete metadata."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.path = write_manifest(self.root, [manifest_entry(10)])
+        self.before = self.path.read_bytes()
+        self.own = forge_pull(10) | {"head": {"sha": "a" * 40}, "base": {"ref": "master"}}
+        self.candidate = forge_pull(101) | {"head": {"sha": "b" * 40}, "base": {"ref": "master"}}
+        self.page = f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1"
+        self.answers = {
+            f"{API}/pulls/10": self.own,
+            self.page: [self.candidate],
+            f"{API}/pulls/10/files?limit=50&page=1": [{"filename": "shared.c"}],
+            f"{API}/pulls/101/files?limit=50&page=1": [{"filename": "shared.c"}],
+        }
+
+    def assert_rejected(self, field: str, number: int | None = 101) -> None:
+        """Require an identified error and byte-identical manifest for both commands."""
+        for command in ("fill", "check"):
+            with self.subTest(command=command):
+                self.path.write_bytes(self.before)
+                rc, _, err = run_cli(self.root, FakeForge(self.answers), command)
+                self.assertEqual(rc, 2, err)
+                self.assertIn(str(number) if number is not None else API, err)
+                self.assertIn(field, err)
+                self.assertEqual(self.path.read_bytes(), self.before)
+
+    def test_missing_update_is_error_before_age_stop(self) -> None:
+        """A missing update cannot turn an old candidate into a successful empty scan."""
+        self.candidate["created_at"] = "2020-01-01T00:00:00Z"
+        del self.candidate["updated_at"]
+        self.assert_rejected("updated_at")
+
+    def test_null_update_is_error_before_age_stop(self) -> None:
+        """A null update cannot use the old creation date as a fallback."""
+        self.candidate.update(created_at="2020-01-01T00:00:00Z", updated_at=None)
+        self.assert_rejected("updated_at")
+
+    def test_malformed_update_is_error(self) -> None:
+        """Wrong types and invalid update instants identify the candidate and field."""
+        for value in ("broken", "", 123, [], "2026-11-11", "2026-11-11T00:00:00"):
+            with self.subTest(value=value):
+                self.candidate["updated_at"] = value
+                self.assert_rejected("updated_at")
+
+    def test_update_at_cutoff_is_retained(self) -> None:
+        """The exact own-opening boundary remains eligible for a proven overlap."""
+        self.candidate["updated_at"] = self.own["created_at"]
+        rc, out, err = run_cli(self.root, FakeForge(self.answers), "check", "--since", "2026-11-01")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("101 bob same-files", out)
+
+    def test_required_forge_fields_fail_closed(self) -> None:
+        """Absent and malformed metadata cannot become normalized harmless defaults."""
+        for field in ("created_at", "merged_at", "state", "number", "head", "base", "body"):
+            original = self.candidate[field]
+            for missing in (True, False):
+                with self.subTest(field=field, missing=missing):
+                    if missing:
+                        del self.candidate[field]
+                    else:
+                        self.candidate[field] = []
+                    self.assert_rejected(field, None if field == "number" else 101)
+                    self.candidate[field] = original
+
+    def test_nested_head_and_base_are_validated(self) -> None:
+        """Missing, blank and non-string commit and branch fields fail closed."""
+        for field, key in (("head", "sha"), ("base", "ref")):
+            original = self.candidate[field]
+            for value in ({}, {key: None}, {key: ""}, {key: "z"}):
+                if field == "base" and value == {key: "z"}:
+                    continue
+                with self.subTest(field=field, value=value):
+                    self.candidate[field] = value
+                    self.assert_rejected(field)
+            self.candidate[field] = original
+
+    def test_forge_only_normalized_extras_are_ignored(self) -> None:
+        """Forge author, kind, patch IDs and seen cannot override trusted normalization."""
+        self.candidate.update(author="alice", kind="issue", seen="not-a-date")
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        rows = json.loads(self.path.read_bytes())["contributions"][0]["related"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(
+            (row["author"], row["kind"], row["seen"]), ("bob", "pull", TODAY.isoformat())
+        )
+
+    def test_live_patch_ids_are_not_claimed(self) -> None:
+        """Unverified supplied patch IDs cannot create a live same-patch-id record."""
+        self.own["patch_ids"] = self.candidate["patch_ids"] = ["forged-id"]
+        self.answers[f"{API}/pulls/101/files?limit=50&page=1"] = [{"filename": "other.c"}]
+        rc, out, err = run_cli(self.root, FakeForge(self.answers), "check", keep_progress=True)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("same-patch-id not checked live", out)
+        self.assertEqual(self.path.read_bytes(), self.before)
+
+    def test_issue_clause_cap_is_not_silent(self) -> None:
+        """Clause 65 aborts without recording a partial issue list."""
+        self.own["body"] = "\n".join(f"Fixes #{n}" for n in range(1, 66))
+        self.assert_rejected("65", 10)
+
+    def test_issue_clause_cap_boundary_is_accepted(self) -> None:
+        """All 64 allowed clauses reach the stored issue list."""
+        self.own["body"] = "\n".join(f"Fixes #{n}" for n in range(1, 65))
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        entry = json.loads(self.path.read_bytes())["contributions"][0]
+        self.assertEqual(entry["fixes_issues"], list(range(1, 65)))
+
+    def test_foreign_issue_namespace_is_counted_not_recorded(self) -> None:
+        """Foreign hosts, repos, URL suffixes and prose digits cannot become local issues."""
+        self.own["body"] = (
+            "Fixes https://foreign.invalid/FFmpeg/FFmpeg/issues/123, "
+            "https://code.ffmpeg.org/Other/FFmpeg/issues/124, "
+            "https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/125/extra, "
+            "https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/126?x=1, "
+            "https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/127, #128, 129, version 130"
+        )
+        rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        entry = json.loads(self.path.read_bytes())["contributions"][0]
+        self.assertEqual(entry["fixes_issues"], [127, 128, 129])
+        self.assertIn("10: ignored 4 foreign issue addresses", out)
+        self.assertEqual(out.count("foreign issue addresses"), 1)
+
+    def test_text_field_limits_reject_overflow(self) -> None:
+        """Titles, account names, branch names, bodies and inline paths have hard ceilings."""
+        for field, limit in (("title", 4096), ("body", 262144), ("files", 4096)):
+            original = self.candidate.get(field)
+            value = "x" * (limit + 1)
+            self.candidate[field] = [value] if field == "files" else value
+            with self.subTest(field=field):
+                self.assert_rejected(field)
+            if original is None:
+                del self.candidate[field]
+            else:
+                self.candidate[field] = original
+        self.candidate["user"] = {"login": "x" * 257}
+        self.assert_rejected("login")
+        self.candidate["user"] = {"login": "bob"}
+        self.candidate["base"] = {"ref": "x" * 257}
+        self.assert_rejected("base")
+
+    def test_text_field_limit_boundaries_are_accepted(self) -> None:
+        """Maximum valid title, body, login, branch and path lengths remain readable."""
+        self.candidate.update(title="x" * 4096, body="x" * 262144, files=["x" * 4096])
+        self.candidate["user"] = {"login": "x" * 256}
+        self.candidate["base"] = {"ref": "x" * 256}
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+
+    def test_file_row_path_limits_include_rename_alias(self) -> None:
+        """Neither current nor previous endpoint filename can exceed the path ceiling."""
+        for field in ("filename", "previous_filename"):
+            self.answers[f"{API}/pulls/101/files?limit=50&page=1"] = [
+                {"filename": "shared.c", field: "x" * 4097}
+            ]
+            with self.subTest(field=field):
+                self.assert_rejected(field)
+
+    def test_interrupted_manifest_write_keeps_original_and_cleans_temp(self) -> None:
+        """An interrupted sync cannot truncate the destination or leave a staging file."""
+        with unittest.mock.patch("os.fsync", side_effect=OSError("planted interrupted sync")):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [self.path.name])
+
+    def test_failed_replace_keeps_original_and_cleans_temp(self) -> None:
+        """A failed atomic replacement preserves the old bytes and removes the sibling."""
+        with unittest.mock.patch("os.replace", side_effect=OSError("planted replacement failure")):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [self.path.name])
+
+    def test_manifest_changed_during_preparation_is_not_overwritten(self) -> None:
+        """A concurrent edit after temporary preparation aborts the manifest replacement."""
+        changed = self.before + b" "
+        with unittest.mock.patch("os.fsync", side_effect=lambda _: self.path.write_bytes(changed)):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("changed since read", err)
+        self.assertEqual(self.path.read_bytes(), changed)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [self.path.name])
+
+    def test_manifest_changed_during_scan_is_not_overwritten(self) -> None:
+        """A changed destination before temporary preparation is also refused."""
+        forge = FakeForge(self.answers)
+        changed = self.before + b" "
+
+        def fetch(url: str) -> dict | list:
+            """Plant a concurrent manifest edit while the list endpoint is read."""
+            if url == self.page:
+                self.path.write_bytes(changed)
+            return forge(url)
+
+        rc, _, err = run_cli(self.root, fetch, "fill")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("changed since read", err)
+        self.assertEqual(self.path.read_bytes(), changed)
+
+    def test_stored_seen_is_validated_on_read(self) -> None:
+        """An invalid retained discovery date aborts before any forge read."""
+        self.path = write_manifest(
+            self.root,
+            [
+                manifest_entry(
+                    10,
+                    related=[
+                        {
+                            "number": 101,
+                            "kind": "pull",
+                            "author": "bob",
+                            "reason": "same-files",
+                            "state": "open",
+                            "seen": "2026-02-30",
+                        }
+                    ],
+                )
+            ],
+        )
+        forge = FakeForge({})
+        rc, _, err = run_cli(self.root, forge, "fill")
+        self.assertEqual(rc, 2)
+        self.assertIn("seen", err)
+        self.assertEqual(forge.read, [])
+
+    def test_partial_stream_write_keeps_original_and_cleans_temp(self) -> None:
+        """A real partial sibling write followed by an exception leaves the target intact."""
+        factory = tempfile.NamedTemporaryFile
+
+        def interrupted(*args: object, **kwargs: object) -> object:
+            """Write a real temporary prefix before raising the planted interruption."""
+            stream = factory(*args, **kwargs)
+
+            def write(data: bytes) -> None:
+                """Leave partial temporary bytes so cleanup must remove a real file."""
+                stream.file.write(data[:7])
+                raise OSError("planted partial write")
+
+            stream.write = write
+            return stream
+
+        with unittest.mock.patch.object(tempfile, "NamedTemporaryFile", side_effect=interrupted):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("planted partial write", err)
+        self.assertEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [self.path.name])
+
+    def test_successful_atomic_write_is_synced_before_replace(self) -> None:
+        """Publish complete bytes only after a sibling file was flushed and synced."""
+        events: list[str] = []
+        replace = upstream_links.os.replace if hasattr(upstream_links, "os") else None
+
+        def sync(descriptor: int) -> None:
+            """Record the sync before replacement while the destination still holds old bytes."""
+            self.assertIsInstance(descriptor, int)
+            self.assertEqual(self.path.read_bytes(), self.before)
+            staging = list(self.root.glob(f".{self.path.name}.*.tmp"))
+            self.assertEqual(len(staging), 1)
+            self.assertEqual(json.loads(staging[0].read_bytes())["checked"], "2026-11-12")
+            events.append("sync")
+
+        def publish(source: Path, target: Path) -> None:
+            """Inspect complete sibling content before performing the real replacement."""
+            self.assertEqual(source.parent, target.parent)
+            self.assertEqual(target, self.path)
+            self.assertEqual(events, ["sync"])
+            self.assertEqual(json.loads(source.read_bytes())["checked"], "2026-11-12")
+            events.append("replace")
+            replace(source, target)
+
+        with (
+            unittest.mock.patch("os.fsync", side_effect=sync),
+            unittest.mock.patch("os.replace", side_effect=publish),
+        ):
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(events, ["sync", "replace"])
+        self.assertNotEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [self.path.name])
+
+    def test_competing_fill_lock_is_not_removed_or_overwritten(self) -> None:
+        """An existing sibling lock blocks publication without taking another fill's lock."""
+        lock = self.path.with_name(f".{self.path.name}.lock")
+        lock.write_bytes(b"another writer")
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("another fill", err)
+        self.assertEqual(lock.read_bytes(), b"another writer")
+        self.assertEqual(self.path.read_bytes(), self.before)
+
+    def test_clock_is_read_once_and_forge_seen_is_ignored(self) -> None:
+        """Every fresh discovery date comes from one local UTC clock read."""
+        self.candidate["seen"] = "2000-01-01"
+        real_clock = upstream_links.datetime
+        instant = real_clock(2026, 11, 12, tzinfo=upstream_links.UTC)
+        with unittest.mock.patch.object(upstream_links, "datetime", wraps=real_clock) as clock:
+            clock.now.return_value = instant
+            rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill", today=None)
+        self.assertEqual((rc, err), (0, ""))
+        clock.now.assert_called_once_with(upstream_links.UTC)
+        row = json.loads(self.path.read_bytes())["contributions"][0]["related"][0]
+        self.assertEqual(row["seen"], "2026-11-12")
+
+    def test_inline_file_row_ceiling_rejects_overflow(self) -> None:
+        """An oversized inline envelope fails rather than allocate an unlimited prefix copy."""
+        self.candidate["files"] = ["a.c"] * 2001
+        self.assert_rejected("files")
+
+    def test_inline_file_row_ceiling_accepts_boundary_with_notice(self) -> None:
+        """A 2000-row inline listing retains and discloses only its 1000-name prefix."""
+        self.candidate["files"] = ["shared.c"] * 2000
+        rc, out, err = run_cli(self.root, FakeForge(self.answers), "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("files incomplete: 1000 names read; same-files proven from prefix", out)
+
+    def test_malformed_inline_tail_is_not_hidden_by_prefix(self) -> None:
+        """A malformed inline name after the retained prefix still aborts the run."""
+        for tail in (None, 9, "x" * 4097):
+            with self.subTest(tail_type=type(tail).__name__):
+                self.candidate["files"] = ["shared.c"] * 1000 + [tail]
+                self.assert_rejected("files")
+
+    def test_endpoint_path_ceiling_accepts_boundary(self) -> None:
+        """Current and previous filenames at the exact character ceiling remain readable."""
+        self.answers[f"{API}/pulls/101/files?limit=50&page=1"] = [
+            {"filename": "x" * 4096, "previous_filename": "y" * 4096}
+        ]
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+
+    def test_clause_limit_also_counts_same_line_clauses(self) -> None:
+        """Repeated keywords on one line cannot evade the 64-clause ceiling."""
+        self.own["body"] = " ".join(f"Fixes #{n}" for n in range(1, 66))
+        self.assert_rejected("65", 10)
+
+    def test_exact_issue_namespace_uses_configured_host_and_path(self) -> None:
+        """Only the exact configured issue origin and repository count as URL references."""
+        body = (
+            "Refs https://custom.invalid/Owner/Repo/issues/1, "
+            "https://custom.invalid/owner/Repo/issues/2, "
+            "https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/3, #4"
+        )
+        out = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                upstream_links.upstream_drift,
+                "repo_api_url",
+                return_value="https://custom.invalid/api/v1/repos/Owner/Repo",
+            ),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertEqual(upstream_links.body_issues(body), [1, 4])
+        self.assertIn("ignored 2 foreign issue addresses\n", out.getvalue())
+
+    def test_invalid_forge_seen_is_not_stored(self) -> None:
+        """A forge-supplied invalid discovery date never enters an otherwise valid relation."""
+        self.candidate["seen"] = "not-a-date"
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+        row = json.loads(self.path.read_bytes())["contributions"][0]["related"][0]
+        self.assertEqual(row["seen"], TODAY.isoformat())
+
+    def test_stored_text_overflow_is_rejected_before_fetch(self) -> None:
+        """Stored titles, branch names and related account names obey the same ceilings."""
+        for field, limit in (("title", 4096), ("base", 256), ("author", 256)):
+            entry = manifest_entry(10)
+            if field == "author":
+                entry["related"] = [
+                    {
+                        "number": 101,
+                        "kind": "pull",
+                        "author": "x" * (limit + 1),
+                        "reason": "same-files",
+                        "state": "open",
+                        "seen": TODAY.isoformat(),
+                    }
+                ]
+            else:
+                entry[field] = "x" * (limit + 1)
+            write_manifest(self.root, [entry])
+            forge = FakeForge(self.answers)
+            with self.subTest(field=field):
+                rc, _, err = run_cli(self.root, forge, "fill")
+                self.assertEqual(rc, 2, err)
+                self.assertIn(field, err)
+                self.assertEqual(forge.read, [])
+
+    def test_stored_text_boundaries_remain_valid(self) -> None:
+        """Maximum stored title, branch and account lengths pass before a normal fill."""
+        entry = manifest_entry(10, title="x" * 4096, base="x" * 256)
+        entry["related"] = [
+            {
+                "number": 101,
+                "kind": "pull",
+                "author": "x" * 256,
+                "reason": "same-files",
+                "state": "open",
+                "seen": TODAY.isoformat(),
+            }
+        ]
+        write_manifest(self.root, [entry])
+        rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertEqual((rc, err), (0, ""))
+
+
+class BoundedResponseTest(unittest.TestCase):
+    """Exercise the shared byte reader without any network or credential lookup."""
+
+    def test_response_ceiling_rejects_one_extra_byte_before_json(self) -> None:
+        """Object and list readers reject cap-plus-one even when valid JSON fits inside."""
+        drift = upstream_links.upstream_drift
+        for allow_list in (False, True):
+            answer = io.BytesIO(b"{}" + b" " * 127)
+            with (
+                unittest.mock.patch.object(drift, "MAX_RESPONSE_BYTES", 128, create=True),
+                unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer),
+                self.assertRaisesRegex(drift.DriftError, "response.*128"),
+            ):
+                drift.fetch_json(f"{API}/pulls/101", allow_list=allow_list)
+
+    def test_response_ceiling_accepts_exact_boundary_and_short_body(self) -> None:
+        """Complete JSON bodies at the exact byte ceiling and below remain readable."""
+        drift = upstream_links.upstream_drift
+        for prefix, expected in ((b"{}", {}), (b"[]", [])):
+            for size in (2, 128):
+                answer = io.BytesIO(prefix + b" " * (size - 2))
+                with (
+                    unittest.mock.patch.object(drift, "MAX_RESPONSE_BYTES", 128, create=True),
+                    unittest.mock.patch.object(
+                        drift.urllib.request, "urlopen", return_value=answer
+                    ),
+                ):
+                    self.assertEqual(
+                        drift.fetch_json(f"{API}/pulls/101", allow_list=True), expected
+                    )
+
+    def test_repeated_issue_tokens_have_a_scalar_limit(self) -> None:
+        """Repeating one issue cannot evade the reference-loop ceiling."""
+        body = "Fixes " + ", ".join(["#1"] * 1025)
+        with self.assertRaisesRegex(upstream_links.DriftError, "references.*1025"):
+            upstream_links.body_issues(body)
+
+    def test_repeated_issue_tokens_accept_limit_boundary(self) -> None:
+        """Exactly 1024 references remain accepted and deduplicated."""
+        body = "Fixes " + ", ".join(["#1"] * 1024)
+        self.assertEqual(upstream_links.body_issues(body), [1])
+
+    def test_response_overflow_is_not_parsed(self) -> None:
+        """Reject bytes above the ceiling before invoking the JSON decoder."""
+        drift = upstream_links.upstream_drift
+        with (
+            unittest.mock.patch.object(drift, "MAX_RESPONSE_BYTES", 128, create=True),
+            unittest.mock.patch.object(
+                drift.urllib.request, "urlopen", return_value=io.BytesIO(b"x" * 129)
+            ),
+            unittest.mock.patch.object(drift.json, "loads", return_value={}) as decode,
+            self.assertRaisesRegex(drift.DriftError, "response.*128"),
+        ):
+            upstream_links.fetch_forge(f"{API}/pulls/101")
+        decode.assert_not_called()
+
+    def test_duplicate_response_keys_are_rejected(self) -> None:
+        """Duplicate decision keys fail instead of selecting a last-value default."""
+        drift = upstream_links.upstream_drift
+        answer = io.BytesIO(b'{"number": 1, "number": 2}')
+        with (
+            unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer),
+            self.assertRaisesRegex(drift.DriftError, "written twice"),
+        ):
+            drift.fetch_json(f"{API}/pulls/101")
+
+    def test_issue_id_width_is_bounded(self) -> None:
+        """Issue ID conversion rejects digits beyond the 20-digit ceiling."""
+        with self.assertRaisesRegex(upstream_links.DriftError, "issue number exceeds 20"):
+            upstream_links.body_issues("Fixes #" + "9" * 21)
+        self.assertEqual(upstream_links.body_issues("Fixes #" + "9" * 20), [int("9" * 20)])
+
+    def test_response_object_key_ceiling_rejects_overflow(self) -> None:
+        """Oversized JSON objects abort before any unbounded duplicate-key traversal."""
+        drift = upstream_links.upstream_drift
+        answer = io.BytesIO(json.dumps({str(n): n for n in range(1025)}).encode())
+        with (
+            unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer),
+            self.assertRaisesRegex(drift.DriftError, "response object exceeds 1024 keys"),
+        ):
+            drift.fetch_json(f"{API}/pulls/101")
+
+    def test_response_object_key_ceiling_accepts_boundary(self) -> None:
+        """A JSON object with exactly 1024 unique keys remains readable."""
+        drift = upstream_links.upstream_drift
+        expected = {str(n): n for n in range(1024)}
+        answer = io.BytesIO(json.dumps(expected).encode())
+        with unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer):
+            self.assertEqual(drift.fetch_json(f"{API}/pulls/101"), expected)
+
+
+class BoundedMatcherInputTest(unittest.TestCase):
+    """Protect matcher entry points from silently truncating caller collections."""
+
+    def test_merge_related_rejects_oversized_inputs(self) -> None:
+        """Existing and fresh relation lists must fail before the first slice."""
+        cap = upstream_links.series.MAX_RELATED
+        rows = [
+            {
+                "number": n,
+                "kind": "pull",
+                "author": "bob",
+                "reason": "same-files",
+                "state": "open",
+                "seen": TODAY.isoformat(),
+            }
+            for n in range(1, cap + 2)
+        ]
+        for existing, fresh in ((rows, []), ([], rows)):
+            with (
+                self.subTest(existing=bool(existing)),
+                self.assertRaisesRegex(upstream_links.DriftError, "related entries exceed"),
+            ):
+                upstream_links.merge_related(existing, fresh)
+        self.assertEqual(upstream_links.merge_related(rows[:cap], []), rows[:cap])
+        self.assertEqual(upstream_links.merge_related([], rows[:cap]), rows[:cap])
+        self.assertEqual(upstream_links.merge_related([], []), [])
+
+    def test_run_target_ceiling_is_checked_before_fetch(self) -> None:
+        """A target above the scope cap errors while empty and exact-cap scopes still work."""
+        url = f"{API}/pulls/10"
+        target = (10, f"{FORGE}10", set())
+        forge = FakeForge(
+            {
+                url: forge_pull(10) | {"files": []},
+                f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1": [],
+            }
+        )
+        with unittest.mock.patch.object(upstream_links.upstream_drift, "MAX_SERIES_ENTRIES", 1):
+            with self.assertRaisesRegex(upstream_links.DriftError, "targets exceed 1"):
+                upstream_links.read_run_pulls([target, target], forge)
+            self.assertEqual(forge.read, [])
+            own, candidates, _ = upstream_links.read_run_pulls([target], forge)
+            self.assertEqual(len(own), 1)
+            self.assertEqual(candidates, [])
+            self.assertEqual(upstream_links.read_run_pulls([], forge), ([], [], {}))
+
+    def test_subject_ceiling_rejects_overflow_and_accepts_boundary(self) -> None:
+        """Subject normalization cannot store text longer than the title ceiling."""
+        with self.assertRaisesRegex(upstream_links.DriftError, "subject exceeds 4096"):
+            upstream_links.subject_key("x" * 4097)
+        self.assertEqual(upstream_links.subject_key("X" * 4096), "x" * 4096)
+        self.assertEqual(upstream_links.subject_key("lib: short"), "short")
+
+    def test_standalone_body_ceiling_is_not_bypassed(self) -> None:
+        """The public issue extractor enforces its body bound independently of forge parsing."""
+        with self.assertRaisesRegex(upstream_links.DriftError, "body exceeds 262144"):
+            upstream_links.body_issues("x" * 262145)
+        self.assertEqual(upstream_links.body_issues("x" * 262144), [])
+        self.assertEqual(upstream_links.body_issues("Fixes #1"), [1])
 
 
 if __name__ == "__main__":

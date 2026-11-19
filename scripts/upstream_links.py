@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from itertools import islice
 from pathlib import Path
 
 try:
@@ -53,14 +56,32 @@ MAX_PULL_ROWS = PAGE_SIZE * MAX_PULL_PAGES
 MAX_FILE_PAGES = 20
 MAX_FILE_ROWS = PAGE_SIZE * MAX_FILE_PAGES
 MAX_CANDIDATES = MAX_PULL_ROWS
+# Every clause can contribute an issue; reject overflow rather than lose links.
 MAX_ISSUE_MATCHES = series.MAX_FIXES_ISSUES
+# Bound repeated references as well as unique IDs to cap matching work.
+MAX_ISSUE_REFERENCES = 1024
+# Twenty digits accommodate long issue IDs while bounding integer conversion.
+MAX_ISSUE_NUMBER_DIGITS = 20
+# Permit descriptive forge subjects while bounding stored title and subject text.
+MAX_TITLE_CHARS = 4096
+# Cover practical source paths, including rename aliases, without unbounded strings.
+MAX_PATH_CHARS = 4096
+# Account and branch names need much less space than source paths.
+MAX_NAME_CHARS = 256
+# Permit substantial pull descriptions while bounding regular-expression work.
+MAX_BODY_CHARS = 256 * 1024
+# ISO timestamps with fractional seconds and offsets fit well below this ceiling.
+MAX_TIMESTAMP_CHARS = 64
+# Validate all inline names before retaining the documented 1000-name prefix.
+MAX_INLINE_FILE_ROWS = 2 * MAX_FILE_ROWS
 ISSUE_CLAUSE = re.compile(
-    r"\b(?:fixes|closes|refs)\b\s*:?\s*([^\r\n;]+)",
+    r"\b(?:fixes|closes|refs)\b\s*:?\s*([^\r\n;]+?)"
+    r"(?=\b(?:fixes|closes|refs)\b|[\r\n;]|$)",
     re.IGNORECASE,
 )
 ISSUE_REF = re.compile(
-    r"(?:https?://[^\s,;]+/issues/|#|\bissues?\s+#?)([1-9][0-9]*)\b"
-    r"|(?<!/)\b([1-9][0-9]*)\b",
+    r"https?://[^\s,;]+|(?:#|\bissues?\s+#?)([1-9][0-9]*)\b"
+    r"|(?:^|,\s*|\band\s+|\bor\s+)([1-9][0-9]*)\b",
     re.IGNORECASE,
 )
 
@@ -135,14 +156,29 @@ class _FillOptions:
     max_age_days: int = DEFAULT_FILL_MAX_AGE_DAYS
 
 
+def _run_day(today: date | None) -> date:
+    """Read the local UTC clock once per run unless the fixture supplies its date."""
+    return datetime.now(UTC).date() if today is None else today
+
+
 def fetch_forge(url: str) -> dict | list:
     """Fetch a JSON object or list from the forge with the shared request deadline."""
     return upstream_drift.fetch_json(url, allow_list=True)
 
 
+def _bounded_text(raw: object, field: str, limit: int) -> str:
+    """Require string data within its named character ceiling before storing or parsing."""
+    if not isinstance(raw, str):
+        raise DriftError(f"invalid {field}: expected string")
+    if len(raw) > limit:
+        raise DriftError(f"{field} exceeds {limit} characters")
+    return raw
+
+
 def parse_timestamp(raw: object, field: str = "timestamp") -> datetime:
     """Parse an ISO-8601 instant or YYYY-MM-DD date string into a UTC datetime."""
-    if not isinstance(raw, str) or not raw.strip():
+    _bounded_text(raw, field, MAX_TIMESTAMP_CHARS)
+    if not raw.strip():
         raise DriftError(f"invalid {field}: {raw!r}")
     text = f"{raw}T00:00:00+00:00" if series.DAY.fullmatch(raw) else raw
     try:
@@ -156,6 +192,7 @@ def parse_timestamp(raw: object, field: str = "timestamp") -> datetime:
 
 def subject_key(title: str) -> str:
     """Return a title normalized by dropping its component prefix, case and outer space."""
+    _bounded_text(title, "subject", MAX_TITLE_CHARS)
     body = title.partition(":")[2] if ":" in title else title
     return body.strip().lower()
 
@@ -170,6 +207,7 @@ def _string_tuple(raw: object, label: str, cap: int) -> tuple[str, ...]:
     for item in list(raw)[:cap]:
         if not isinstance(item, str) or not item.strip():
             raise DriftError(f"invalid {label} entry: {item!r}")
+        _bounded_text(item, label, MAX_PATH_CHARS)
         items.append(item)
     return tuple(items)
 
@@ -183,8 +221,8 @@ def _item_files(raw: object, number: int, partial: bool) -> FileNames:
             raise DriftError(f"{label}: incomplete own pull listing")
         return raw
     if partial and isinstance(raw, (list, tuple, set)):
-        names = _string_tuple(list(raw)[:MAX_FILE_ROWS], label, MAX_FILE_ROWS)
-        return FileNames(names, complete=len(raw) <= MAX_FILE_ROWS)
+        names = _string_tuple(raw, label, MAX_INLINE_FILE_ROWS)
+        return FileNames(names[:MAX_FILE_ROWS], complete=len(raw) <= MAX_FILE_ROWS)
     return FileNames(_string_tuple(raw, label, MAX_FILE_ROWS))
 
 
@@ -197,6 +235,7 @@ def _extract_author(raw: dict) -> str:
         author = user.get("login") if isinstance(user, dict) else None
     if not isinstance(author, str) or not author.strip() or "\n" in author:
         raise DriftError("missing or invalid pull author")
+    _bounded_text(author, "user.login", MAX_NAME_CHARS)
     return author
 
 
@@ -216,7 +255,7 @@ def _extract_state(raw: dict, default_state: str) -> str:
 def normalize_item(
     raw: object, *, default_state: str = "open", partial_files: bool = False
 ) -> dict[str, object]:
-    """Validate and normalize an own pull or candidate pull or issue mapping."""
+    """Normalize trusted matcher inputs; raw forge rows must use parse_forge_pull."""
     if not isinstance(raw, dict):
         raise DriftError("pull or candidate is not an object")
     number = raw.get("number")
@@ -225,6 +264,7 @@ def normalize_item(
     title = raw.get("title")
     if not isinstance(title, str) or not title.strip():
         raise DriftError(f"pull {number}: missing or invalid title")
+    _bounded_text(title, f"pull {number} title", MAX_TITLE_CHARS)
     kind = raw.get("kind", "pull")
     if not isinstance(kind, str) or kind not in series.RELATED_KINDS:
         raise DriftError(f"pull {number}: invalid kind {kind!r}")
@@ -249,7 +289,7 @@ def normalize_item(
         ),
         "created_at": created_at,
         "merged_at": merged_at,
-        "seen": raw.get("seen") or "",
+        "seen": "",
     }
 
 
@@ -274,7 +314,7 @@ def related_for(
     if not isinstance(candidates, list) or len(candidates) > MAX_CANDIDATES:
         raise DriftError(f"candidates must be a list of at most {MAX_CANDIDATES} items")
     own = normalize_item(pull)
-    seen_day = (today or datetime.now(UTC).date()).isoformat()
+    seen_day = _run_day(today).isoformat()
     by_number: dict[int, RelatedRow] = {}
     for raw in candidates[:MAX_CANDIDATES]:
         cand = normalize_item(raw, partial_files=True)
@@ -288,7 +328,7 @@ def related_for(
             author=cand["author"],
             reason=reason,
             state=cand["state"],
-            seen=cand["seen"] or seen_day,
+            seen=seen_day,
         )
         row.own_author = str(own["author"])
         row.own_opened = str(own["created_at"])
@@ -327,21 +367,65 @@ def overlaps(related: list[dict]) -> list[dict]:
     return loud
 
 
-def body_issues(body: object) -> list[int]:
-    """Extract sorted unique upstream issue numbers after Fixes, Closes or Refs in a pull body."""
+def _issue_reference(match: re.Match[str], local_url: re.Pattern[str]) -> tuple[int | None, bool]:
+    """Accept bare issue numbers or exact configured issue URLs without URL digit leakage."""
+    token = match.group(1) or match.group(2)
+    if token is not None:
+        return _issue_number(token), False
+    address = match.group(0).rstrip(".")
+    local = local_url.fullmatch(address)
+    if local is not None:
+        return _issue_number(local.group(1)), False
+    return None, "/issues/" in address
+
+
+def _issue_number(token: str) -> int:
+    """Reject oversized decimal IDs before integer conversion."""
+    if len(token) > MAX_ISSUE_NUMBER_DIGITS:
+        raise DriftError(f"body issue number exceeds {MAX_ISSUE_NUMBER_DIGITS} digits")
+    return int(token)
+
+
+def _issue_matches(body: str, number: int | None) -> list[re.Match[str]]:
+    """Bound both clause traversal and total reference traversal before recording issues."""
+    clauses = ISSUE_CLAUSE.findall(body)
+    if len(clauses) > MAX_ISSUE_MATCHES:
+        raise DriftError(
+            f"pull {number} body issue clauses: {len(clauses)} exceeds {MAX_ISSUE_MATCHES}"
+        )
+    matches: list[re.Match[str]] = []
+    for clause in clauses[:MAX_ISSUE_MATCHES]:
+        remaining = MAX_ISSUE_REFERENCES - len(matches)
+        matches.extend(islice(ISSUE_REF.finditer(clause.strip()), remaining + 1))
+        if len(matches) > MAX_ISSUE_REFERENCES:
+            raise DriftError(
+                f"pull {number} body issue references: {len(matches)} "
+                f"exceeds {MAX_ISSUE_REFERENCES}"
+            )
+    return matches
+
+
+def body_issues(body: object, *, number: int | None = None) -> list[int]:
+    """Extract local issues and print one foreign-address count without storing those URLs."""
     if body is None:
         return []
-    if not isinstance(body, str):
-        raise DriftError("pull request body must be a string")
+    _bounded_text(body, f"pull {number} body", MAX_BODY_CHARS)
+    local = upstream_drift.repo_api_url().replace("/api/v1/repos/", "/")
+    local_url = re.compile(re.escape(local) + r"/issues/([1-9][0-9]*)")
     numbers: set[int] = set()
-    clauses = ISSUE_CLAUSE.findall(body)
-    for clause in clauses[:MAX_ISSUE_MATCHES]:
-        for match in ISSUE_REF.finditer(clause):
-            token = match.group(1) or match.group(2)
-            if token:
-                numbers.add(int(token))
+    ignored = 0
+    try:
+        for match in _issue_matches(body, number)[:MAX_ISSUE_REFERENCES]:
+            issue, foreign = _issue_reference(match, local_url)
+            ignored += int(foreign)
+            if issue is not None:
+                numbers.add(issue)
             if len(numbers) > series.MAX_FIXES_ISSUES:
                 raise DriftError(f"fixes_issues entries exceed {series.MAX_FIXES_ISSUES}")
+    except DriftError as exc:
+        raise DriftError(f"pull {number} body: {exc}") from exc
+    if ignored:
+        print(f"{number}: ignored {ignored} foreign issue addresses")
     return sorted(numbers)
 
 
@@ -361,11 +445,13 @@ def _file_names_from_row(row: object, url: str) -> list[str]:
     filename = row.get("filename")
     if not isinstance(filename, str) or not filename.strip():
         raise DriftError(f"{url}: file entry lacks a valid filename")
+    _bounded_text(filename, f"{url} filename", MAX_PATH_CHARS)
     names = [filename]
     previous = row.get("previous_filename")
     if previous is not None:
         if not isinstance(previous, str):
             raise DriftError(f"{url}: invalid previous_filename")
+        _bounded_text(previous, f"{url} previous_filename", MAX_PATH_CHARS)
         if previous.strip():
             names.append(previous)
     return names
@@ -405,17 +491,64 @@ def read_pull_files(pull_url: str, fetch: Fetch, *, partial: bool = False) -> Fi
     return _file_result(files, False, partial, pull_url, f"exceeds {MAX_FILE_PAGES} pages")
 
 
+def _forge_time(raw: object, field: str) -> None:
+    """Require a complete forge timestamp with an explicit UTC offset."""
+    _bounded_text(raw, field, MAX_TIMESTAMP_CHARS)
+    if not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})",
+        raw,
+    ):
+        raise DriftError(f"invalid {field}: expected timestamp with timezone")
+    parse_timestamp(raw, field)
+
+
+def _forge_branch_fields(raw: dict) -> None:
+    """Require the head commit and base branch instead of trusting malformed objects."""
+    head, base = raw["head"], raw["base"]
+    if not isinstance(head, dict) or not isinstance(head.get("sha"), str):
+        raise DriftError("invalid head.sha")
+    _bounded_text(head["sha"], "head.sha", MAX_NAME_CHARS)
+    if not series.COMMIT.fullmatch(head["sha"]):
+        raise DriftError("invalid head.sha: expected full commit")
+    if not isinstance(base, dict) or not isinstance(base.get("ref"), str):
+        raise DriftError("invalid base.ref")
+    _bounded_text(base["ref"], "base.ref", MAX_NAME_CHARS)
+    if not base["ref"].strip():
+        raise DriftError("invalid base.ref: expected nonblank branch")
+
+
 def _require_forge_envelope(raw: object) -> dict:
-    """Validate top-level Forgejo pull fields before normalizing the record."""
+    """Require forge fields before any chronological stop or normalized matching."""
     if not isinstance(raw, dict):
         raise DriftError("pull request answer is not a JSON object")
-    user = raw.get("user")
+    for key in (
+        "number",
+        "title",
+        "user",
+        "merged",
+        "state",
+        "created_at",
+        "updated_at",
+        "merged_at",
+        "head",
+        "base",
+        "body",
+    ):
+        if key not in raw:
+            raise DriftError(f"missing {key}")
+    user = raw["user"]
     if not isinstance(user, dict) or not isinstance(user.get("login"), str):
-        raise DriftError("pull request answer has invalid user")
-    if not isinstance(raw.get("merged"), bool):
-        raise DriftError("pull request answer lacks boolean merged field")
-    if raw.get("state") not in ("open", "closed"):
-        raise DriftError(f"pull request answer has invalid state {raw.get('state')!r}")
+        raise DriftError("invalid user.login")
+    if not isinstance(raw["merged"], bool):
+        raise DriftError("invalid merged: expected boolean")
+    if raw["state"] not in ("open", "closed"):
+        raise DriftError("invalid state: expected open or closed")
+    _forge_time(raw["created_at"], "created_at")
+    _forge_time(raw["updated_at"], "updated_at")
+    if raw["merged"] or raw["merged_at"] is not None:
+        _forge_time(raw["merged_at"], "merged_at")
+    _forge_branch_fields(raw)
     return raw
 
 
@@ -429,29 +562,28 @@ def _forge_files(raw: dict, partial: bool) -> FileNames:
     names = raw.get("files")
     if "files" in raw and not isinstance(names, list):
         raise DriftError(f"invalid files: found {type(names).__name__}; expected list")
-    return _item_files(names, raw.get("number", "?"), partial)
+    return _item_files(names, raw["number"], partial)
 
 
 def _parse_forge_pull(raw: object, partial_files: bool) -> dict[str, object]:
-    """Validate a forge envelope and its normalized metadata with the selected file policy."""
+    """Normalize only allow-listed forge fields after validating required metadata."""
     checked = _require_forge_envelope(raw)
     names = _forge_files(checked, partial_files)
-    item = normalize_item(checked | {"files": names}, partial_files=partial_files)
+    trusted = {
+        key: checked[key]
+        for key in ("number", "title", "user", "merged", "state", "created_at", "merged_at")
+    }
+    item = normalize_item(trusted | {"files": names}, partial_files=partial_files)
     item["inline_files"] = "files" in checked
     item["changed_files"] = checked.get("changed_files")
-    if not item["created_at"]:
-        raise DriftError(f"pull request {item['number']}: missing created_at")
-    if item["state"] == "merged" and not item["merged_at"]:
-        raise DriftError(f"pull request {item['number']}: merged pull lacks merged_at")
-    updated_at = checked.get("updated_at")
-    if updated_at is None:
-        updated_at = item["merged_at"] or item["created_at"]
-    parse_timestamp(updated_at, "updated_at")
-    body = checked.get("body", "")
+    body = checked["body"]
     if body is not None and not isinstance(body, str):
-        raise DriftError(f"pull request {item['number']}: invalid body")
-    item["updated_at"] = updated_at
-    item["body"] = body or ""
+        raise DriftError(f"pull {item['number']}: invalid body")
+    if body is not None:
+        _bounded_text(body, "body", MAX_BODY_CHARS)
+        _issue_matches(body, int(item["number"]))
+    item["updated_at"] = checked["updated_at"]
+    item["body"] = "" if body is None else body
     return item
 
 
@@ -568,7 +700,7 @@ def _print_request_plan(
             f"window {cutoff.isoformat()}: candidates {len(candidates)}, "
             f"file candidates {len(eligible)}; expected requests {fetch.count + listings} "
             f"(one page per file listing), at most {fetch.count + listings * MAX_FILE_PAGES}; "
-            f"cap {fetch.cap}"
+            f"cap {fetch.cap}; same-patch-id not checked live"
         )
 
 
@@ -594,6 +726,8 @@ def read_run_pulls(
     targets: list[tuple[int, str, set[int]]], fetch: Fetch, since: datetime | None = None
 ) -> tuple[list[dict], list[dict], dict[int, FileNames]]:
     """Plan one bounded metadata window before reading and memoizing own file names."""
+    if len(targets) > upstream_drift.MAX_SERIES_ENTRIES:
+        raise DriftError(f"targets exceed {upstream_drift.MAX_SERIES_ENTRIES}")
     files: dict[int, FileNames] = {}
     own = [
         inspect_own_pull(number, url, fetch, files, metadata_only=True)
@@ -658,6 +792,32 @@ def _undecided_lines(own: dict, undecided: list[dict]) -> list[str]:
     ]
 
 
+def _partial_match_lines(own: dict, candidates: list[dict]) -> list[str]:
+    """Disclose retained file prefixes even when they already prove a shared path."""
+    return [
+        f"{own['number']} {row['number']}: files incomplete: {row['files'].read_count} "
+        "names read; same-files proven from prefix"
+        for row in candidates[:MAX_CANDIDATES]
+        if not row["files"].complete and set(own["files"]) & set(row["files"])
+    ]
+
+
+def _manifest_text_limits(data: dict) -> None:
+    """Apply stored text ceilings after schema and retained discovery-date validation."""
+    for entry in data["contributions"][: upstream_drift.MAX_SERIES_ENTRIES]:
+        number = entry["number"]
+        for field, cap in (
+            ("title", MAX_TITLE_CHARS),
+            ("base", MAX_NAME_CHARS),
+            ("patch", MAX_PATH_CHARS),
+        ):
+            _bounded_text(entry[field], f"pull {number} {field}", cap)
+        for row in entry.get("related", [])[: series.MAX_RELATED]:
+            _bounded_text(
+                row["author"], f"pull {number} related {row['number']} author", MAX_NAME_CHARS
+            )
+
+
 def _checked_manifest(root: Path) -> dict:
     """Validate and return the contribution manifest data in root."""
     findings = series.Findings()
@@ -670,11 +830,14 @@ def _checked_manifest(root: Path) -> dict:
     data = series.checked_contributions(root, names, findings)
     if data is None or findings.errors:
         raise DriftError("; ".join(findings.errors) or f"{series.CONTRIBUTIONS} is unsound")
+    _manifest_text_limits(data)
     return data
 
 
 def merge_related(existing: list[dict], fresh: list[RelatedRow]) -> list[dict]:
     """Merge freshly discovered related rows with existing manifest rows, keeping seen dates."""
+    if len(existing) > series.MAX_RELATED or len(fresh) > series.MAX_RELATED:
+        raise DriftError(f"related entries exceed {series.MAX_RELATED}")
     by_number: dict[int, dict] = {
         int(row["number"]): dict(row) for row in existing[: series.MAX_RELATED]
     }
@@ -704,7 +867,10 @@ def _fill_targets(entries: list[dict], pulls: list[int]) -> list[tuple[int, str,
 
 def _fill_entry(entry: dict, own: dict, related: list[RelatedRow]) -> str:
     """Merge discovered links into an entry and return a diagnostic only when changed."""
-    merged_issues = sorted(set(entry.get("fixes_issues", [])) | set(body_issues(own["body"])))
+    merged_issues = sorted(
+        set(entry.get("fixes_issues", []))
+        | set(body_issues(own["body"], number=int(own["number"])))
+    )
     if len(merged_issues) > series.MAX_FIXES_ISSUES:
         raise DriftError(f"fixes_issues entries exceed {series.MAX_FIXES_ISSUES}")
     merged_rel = merge_related(entry.get("related", []), related)
@@ -727,7 +893,7 @@ def fill_window(max_age_days: int, today: date | None = None) -> datetime:
             f"--max-age-days must be an integer from {MIN_FILL_MAX_AGE_DAYS} "
             f"through {MAX_FILL_MAX_AGE_DAYS}: {max_age_days!r}"
         )
-    day = today or datetime.now(UTC).date()
+    day = _run_day(today)
     try:
         return parse_timestamp(day.isoformat(), "fill date") - timedelta(days=max_age_days)
     except OverflowError as exc:
@@ -743,9 +909,45 @@ def _fill_window_lines(own_pulls: list[dict], cutoff: datetime) -> list[str]:
     ]
 
 
+def _write_manifest_temp(path: Path, original: bytes, rendered: bytes) -> None:
+    """Sync a sibling temporary file and compare again immediately before replacement."""
+    staging: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
+        ) as stream:
+            staging = Path(stream.name)
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.read_bytes() != original:
+            raise DriftError(f"{path}: changed since read; no changes written")
+        os.replace(staging, path)
+    finally:
+        if staging is not None:
+            staging.unlink(missing_ok=True)
+
+
+def _replace_manifest(path: Path, original: bytes, rendered: bytes) -> None:
+    """Serialize cooperating fills and reject changed content before atomic publication."""
+    lock = path.with_name(f".{path.name}.lock")
+    try:
+        stream = lock.open("xb")
+    except FileExistsError as exc:
+        raise DriftError(f"{path}: another fill holds {lock.name}; no changes written") from exc
+    try:
+        with stream:
+            if path.read_bytes() != original:
+                raise DriftError(f"{path}: changed since read; no changes written")
+            _write_manifest_temp(path, original, rendered)
+    finally:
+        lock.unlink()
+
+
 def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]:
     """Fill selected rows within an age and request budget, naming unread older history."""
-    cutoff = fill_window(options.max_age_days, options.today)
+    run_day = _run_day(options.today)
+    cutoff = fill_window(options.max_age_days, run_day)
     path = root / series.CONTRIBUTIONS
     original = path.read_bytes() if path.is_file() else b""
     data = _checked_manifest(root)
@@ -757,8 +959,9 @@ def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]
     changes = _fill_window_lines(own_pulls, cutoff)
     for own in own_pulls[: upstream_drift.MAX_SERIES_ENTRIES]:
         eligible = inspect_candidates(own, candidates, set(), files, request)
-        related = related_for(own, eligible, today=options.today)
+        related = related_for(own, eligible, today=run_day)
         changes.extend(_undecided_lines(own, _undecided_for(own, eligible)))
+        changes.extend(_partial_match_lines(own, eligible))
         line = _fill_entry(by_number[own["number"]], own, related)
         if line:
             changes.append(line)
@@ -768,7 +971,7 @@ def _fill_manifest(root: Path, fetch: Fetch, options: _FillOptions) -> list[str]
         rendered = (json.dumps(data, indent=2, ensure_ascii=original.isascii()) + "\n").encode(
             "utf-8"
         )
-        path.write_bytes(rendered)
+        _replace_manifest(path, original, rendered)
     return changes
 
 
@@ -836,6 +1039,7 @@ def check_overlaps(
     since: str | None = None,
 ) -> tuple[list[str], list[dict]]:
     """Report new relations and undecided file comparisons using one bounded run memo."""
+    run_day = _run_day(today)
     data = _checked_manifest(root)
     cutoff = check_window(data["checked"], since)
     targets = _check_targets(data["contributions"], extra_pulls)
@@ -853,9 +1057,10 @@ def check_overlaps(
         strict=True,
     ):
         eligible = inspect_candidates(own, candidates, recorded, files, request)
-        new_rows = related_for(own, eligible, today=today)
+        new_rows = related_for(own, eligible, today=run_day)
         undecided = _undecided_for(own, eligible)
         lines.extend(_undecided_lines(own, undecided))
+        lines.extend(_partial_match_lines(own, eligible))
         loud.extend(undecided)
         for row in new_rows[: series.MAX_RELATED]:
             lines.append(

@@ -30,7 +30,6 @@ import json
 import re
 import sys
 import tomllib
-import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -45,6 +44,10 @@ except ModuleNotFoundError:
 
 Fetch = Callable[[str], dict]
 REQUEST_TIMEOUT = 30
+# Allow 50 ordinary pull bodies per page while bounding decoding and allocation.
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# Forge envelopes need far fewer keys; bound duplicate checks within each JSON object.
+MAX_RESPONSE_OBJECT_KEYS = 1024
 MAX_SERIES_ENTRIES = 4096
 MAX_SIDECAR_LINES = 4096
 MAX_REPAIR_PATHS = MAX_SERIES_ENTRIES + 2
@@ -119,13 +122,33 @@ def api_url(url: str, number: int | None = None) -> str:
     return f"{host}/api/v1/repos/{owner}/{repository}/pulls/{number}"
 
 
+def response_object(pairs: list[tuple[str, object]]) -> dict:
+    """Reject duplicate response keys with bounded linear work per decoded object."""
+    if len(pairs) > MAX_RESPONSE_OBJECT_KEYS:
+        raise ValueError(f"response object exceeds {MAX_RESPONSE_OBJECT_KEYS} keys")
+    result: dict = {}
+    for key, value in pairs[:MAX_RESPONSE_OBJECT_KEYS]:
+        if key in result:
+            raise ValueError(f"key {key!r} is written twice")
+        result[key] = value
+    return result
+
+
+def read_response(answer: object, url: str) -> bytes:
+    """Read at most one byte beyond the response ceiling before JSON decoding."""
+    content = answer.read(MAX_RESPONSE_BYTES + 1)
+    if len(content) > MAX_RESPONSE_BYTES:
+        raise DriftError(f"{url}: response exceeds {MAX_RESPONSE_BYTES} bytes")
+    return content
+
+
 def fetch_json(url: str, *, allow_list: bool = False) -> dict | list:
     """Fetch and decode a JSON object, or a list when allow_list is set, from the forge."""
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as answer:
-            data = json.load(answer)
-    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            data = json.loads(read_response(answer, url), object_pairs_hook=response_object)
+    except (OSError, ValueError, RecursionError) as exc:
         raise DriftError(f"{url}: {exc}") from exc
     if allow_list and isinstance(data, list):
         return data

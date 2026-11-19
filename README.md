@@ -469,8 +469,12 @@ optional, append-only lists that do not change the README table:
 `same-files`, `same-patch-id` or `same-subject`, `state`, and `seen`
 `YYYY-MM-DD` date). Run `python3 scripts/upstream_links.py fill` (`--dry-run`
 to preview without writing) to populate both fields for open and merged
-manifest records from the forge. Repeat `--pull N` to fill only named open or
-merged manifest rows, for example `fill --pull 25805 --pull 25950`. Candidate
+manifest records from the forge. Fill and check send GET requests only, post
+nothing and need no credentials. Live matching checks shared files and subjects;
+same-patch-id is not checked live, and forge-supplied patch IDs are ignored.
+The schema retains that reason for separately supplied evidence. Repeat
+`--pull N` to fill only named open or merged manifest rows, for example
+`fill --pull 25805 --pull 25950`. Candidate
 pulls are scanned once per run from the later of the earliest scoped opening
 and UTC midnight 14 days before the run date (`DEFAULT_FILL_MAX_AGE_DAYS`);
 each pull's changed files are fetched at most once. For every own pull opened
@@ -494,22 +498,40 @@ candidates merged at or before the own pull opened are skipped before file
 reads; candidates updated before an own pull opened are also skipped. Older
 open candidates remain eligible when their updates fall inside the run window
 and at or after that own opening. Every remaining candidate can
-match files even when its subject and patch IDs differ. Existing related
+match files even when its subject differs. Existing related
 records are retained; skipped candidates produce no new records.
-When a candidate's file listing is incomplete at the 1000-name or 20-page limit without a proven shared file, `fill --dry-run`, `fill` and `check` print its pull number, the number of files read and `same-files undecided`; it is not recorded as a relation, and `check` exits 1 for the undecided comparison.
+When a candidate's file listing is incomplete at the 1000-name or 20-page
+limit without a proven shared file, `fill --dry-run`, `fill` and `check` print
+its pull number, the number of files read and `same-files undecided`; it is
+not recorded as a relation, and `check` exits 1 for the undecided comparison.
+A proven shared file in a partial prefix remains a relation, with an explicit
+incomplete-files diagnostic. Same-files matching remains a broad signal.
 
 Each run pauses 0.5 seconds before every request, including the first, and
 retains the shared 30-second request deadline. A first fill costs `N + P + F`
 requests for `N` own pulls, `P` list pages and `F` total fetched file pages
 across distinct own and eligible candidate pulls (with one file page per
 pull, the measured two-pull, 12-page window needs at most 519 requests and
-259.5 seconds of pauses plus network time, before author and memo savings). Both commands derive their request cap as
+259.5 seconds of pauses plus network time, before author and memo savings).
+Both commands derive their request cap as
 `N + 20 + (N + 1000) * 20` from the own-pull count, 20 list pages, 1000
 candidate rows and 20 file pages per pull. Before reading files, a progress
 line gives the candidate count, expected requests assuming one file page per
 pull and a file-page upper bound. A request above the cap exits 2 with its
 count, cap, window start, candidate count and narrowing option; `fill` writes
-nothing on error. Shorten a fill with `fill --max-age-days N`, select a
+nothing on error. Fill syncs a sibling temporary file before atomic
+replacement and refuses content changed since the initial read; concurrent
+fills use an exclusive sibling lock. A stopped process may leave a lock that
+must be reviewed before another fill can write. Other writers must coordinate
+with that lock to exclude edits during the final compare-and-replace step.
+Missing or malformed decision fields, responses over 16 MiB, titles or paths
+over 4096 characters, names over 256 characters, bodies over 256 Ki characters,
+inline file lists over 2000 names, duplicate JSON keys, and JSON objects over
+1024 keys fail with exit 2. Issue parsing permits
+at most 64 clauses and 1024 references, including repeats; excess is an error.
+Only bare issue numbers and exact configured repository issue URLs are local;
+foreign issue addresses are ignored and counted in one line per pull.
+Shorten a fill with `fill --max-age-days N`, select a
 later-opening `fill --pull N`, or narrow a check
 with `check --since YYYY-MM-DD`. The week-long margin revisits recent updates
 around the drift snapshot, which can advance independently of the link scan;
