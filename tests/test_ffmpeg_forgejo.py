@@ -1306,7 +1306,7 @@ class RunCommandTest(ForgejoTest):
 
     def test_usage_documents_landed_note_comment_path(self) -> None:
         """Printed usage routes landed-head notes through comments without test claims."""
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 - fixed bash, repository helper path, no shell.
             ["bash", str(self.helper)],
             cwd=self.repo,
             env=isolated_git_environment(preserve_config=True),
