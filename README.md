@@ -22,17 +22,17 @@
   <!-- 6 support -->
   [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-8b5cf6?style=for-the-badge&logo=githubsponsors&logoColor=white&labelColor=111a35)](https://github.com/sponsors/lusoris)
 
-  **Shared FFmpeg fix patch series for VMAFx projects, tracked against FFmpeg master ([`series.txt`](series.txt)) and [sent upstream](upstream-contributions.json)**
+  **Shared FFmpeg fixes for VMAFx, written to go upstream; [upstream state](upstream-contributions.json) tracked per patch ([`series.txt`](series.txt))**
 
   *Consumers [`apply`](scripts/series.py) this series first and carry only their own feature patches*
 
 </div>
 
-ffmpeg-patches is one shared FFmpeg patch series for VMAFx projects: fixes
-are tracked against FFmpeg master ([`series.txt`](series.txt)) and
-[sent upstream](upstream-contributions.json); consumers
-[`apply`](scripts/series.py) this series first and carry only their own
-feature patches. The name describes the repository's contents: FFmpeg
+ffmpeg-patches is a shared FFmpeg fix series for VMAFx, written to go
+upstream with [state tracked per patch](upstream-contributions.json).
+It tracks FFmpeg master ([`series.txt`](series.txt)); consumers
+[`apply`](scripts/series.py) it first and carry only their own feature
+patches. The name describes the repository's contents: FFmpeg
 patches shared by the VMAFx projects
 ([ADR-0001](docs/adr/0001-shared-fix-series.md)); pronounce it
 "eff-eff-em-peg patches".
@@ -78,11 +78,14 @@ without your git configuration and reports the result:
 ### How it works
 
 The series is a list of FFmpeg fixes in `git format-patch` form, applied in
-order onto one pinned FFmpeg release. Each fix is intended for upstream. Its
-[`patches/NNNN-slug.toml`](patches/) sidecar records its `status` and, once
-submitted, its `upstream` reference; `unsubmitted` means it has not yet been
-submitted. When upstream merges it and a release containing it is pinned,
-the patch is dropped.
+order onto one pinned FFmpeg release. Its
+[`patches/NNNN-slug.toml`](patches/) sidecars record each patch's `status`:
+`unsubmitted`, `submitted`, `merged` or `rejected`, with an `upstream`
+reference once submitted. `unsubmitted` means no submission yet. Fixes are
+written to go upstream; rejected, withdrawn or replaced submissions may
+remain only for the pinned release and need not be submitted again. Drop
+a patch once its fixes have merged upstream and a release containing them
+is pinned. A withdrawn patch stays only while the pinned base needs it.
 
 Consumers apply this series first and their own feature patches on top:
 
@@ -94,17 +97,20 @@ Consumers apply this series first and their own feature patches on top:
 flowchart TD
     found["Fix found in a consumer<br/>or in this series"]:::input
     series["Add patch to series<br/>for pinned FFmpeg release"]:::step
-    upstream["Send fix upstream"]:::step
+    upstream["Submit fix upstream<br/>where applicable"]:::step
     consumers["Consumers apply shared series"]:::step
     features["Apply own feature patches"]:::step
-    merged["Upstream merges fix"]:::step
+    merged["If upstream merges the fixes"]:::step
     pin["Pin a release containing the fix"]:::step
+    retained["Keep rejected or withdrawn fix<br/>while pinned base needs it"]:::step
     drop["Drop patch from series"]:::step
     found --> series
     series --> upstream
     series --> consumers
     consumers --> features
     upstream --> merged
+    upstream -->|rejected or withdrawn| retained
+    retained -->|pinned base no longer needs fix| drop
     merged --> pin
     pin --> drop
 classDef input fill:#0b1020,stroke:#06b6d4,stroke-width:2px,color:#e2e8f0
@@ -137,9 +143,10 @@ Metadata keys:
   must know
 
 The series carries one form of each patch: the one for the pinned release.
-The pull request linked in `upstream` is the FFmpeg master form. For a
-`submitted` patch, optional `master_form = { base = "<40-hex>", head = "<40-hex>" }`
-records the PR's merge base with master at submission and its head commit.
+The `upstream` link records the submission, which may target master or a
+release branch. For a `submitted` patch, optional
+`master_form = { base = "<40-hex>", head = "<40-hex>" }` records the PR's merge
+base with master at submission and its head commit.
 Update these ids whenever the PR is pushed again. For a `merged` patch,
 optional `upstream_commit = "<40-hex>"` records the commit carrying the fix
 on FFmpeg master. All ids must be full lowercase commit hashes.
@@ -388,12 +395,10 @@ https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard).
 ## Support ffmpeg-patches
 
 **Why it matters.** ffmpeg-patches keeps one shared series of FFmpeg fixes
-for VMAFx and pelorus and sends every fix upstream; a patch is dropped once
-a pinned FFmpeg release carries it
-([ADR-0001](docs/adr/0001-shared-fix-series.md)). The current patch list is
-[`series.txt`](series.txt); its own and backported upstream pull requests
-and their states are in
-[`upstream-contributions.json`](upstream-contributions.json).
+for VMAFx and pelorus, written to go upstream with state tracked per patch
+in [`upstream-contributions.json`](upstream-contributions.json).
+The current patch list is [`series.txt`](series.txt)
+([ADR-0001](docs/adr/0001-shared-fix-series.md)).
 
 **What support funds.**
 - Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
