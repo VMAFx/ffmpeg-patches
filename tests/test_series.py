@@ -9,6 +9,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess  # nosec B404 - fixed git and make argv in temporary test trees; result types for mocks.
 import tarfile
@@ -2190,6 +2192,88 @@ DIST_FILES = (
     "README.md",
     "REUSE.toml",
 )
+
+
+def _shallow_fetches_without_no_tags(text: str) -> list[tuple[int, str]]:
+    """Return physical line numbers and joined shallow fetches that can follow tags."""
+    limits = {"--depth", "--deepen", "--shallow-since", "--shallow-exclude"}
+    offenders = []
+    for match in re.finditer(r"(?:[^\n]*\\\n)*[^\n]+", text):
+        line = match.group().replace("\\\n", " ")
+        command = re.match(r"\s*(?:(?:-\s*)?run:\s*)?(git\s+.*)", line)
+        if command is None:
+            continue
+        words = shlex.split(command[1], comments=True)
+        if words[1:2] == ["clone"] or "fetch" not in words:
+            continue
+        options = words[words.index("fetch") + 1 :]
+        limited = any(word.split("=", 1)[0] in limits for word in options)
+        if limited and "--no-tags" not in options:
+            offenders.append((text.count("\n", 0, match.start()) + 1, line.strip()))
+    return offenders
+
+
+class ShallowFetchTagsTest(unittest.TestCase):
+    """Keep history-limiting shell fetches from following unrelated upstream tags."""
+
+    LIMITED_FETCHES = (
+        "git -C x fetch -q --depth=1 origin tag",
+        "git -C x fetch -q --depth 1 origin tag",
+        "git fetch --shallow-exclude=ref origin master",
+        "git fetch --shallow-exclude ref origin master",
+        "git fetch --deepen=5 origin master",
+        "git fetch --deepen 5 origin master",
+        "git fetch --shallow-since=2026-01-01 origin master",
+        "git fetch --shallow-since 2026-01-01 origin master",
+        "git fetch origin tag \\\n  --depth=1",
+    )
+
+    def test_repository_shallow_fetches_disable_tag_following(self) -> None:
+        """Name every shell fetch that limits history without disabling tag following."""
+        paths = sorted(series.ROOT.glob(".github/workflows/*.yml"))
+        paths += sorted(series.ROOT.glob(".github/actions/*/action.yml"))
+        paths += sorted(series.ROOT.glob("scripts/*.sh"))
+        for path in paths:
+            for number, command in _shallow_fetches_without_no_tags(
+                path.read_text(encoding="utf-8")
+            ):
+                with self.subTest(path=str(path.relative_to(series.ROOT)), line=number):
+                    self.fail(f"{path.relative_to(series.ROOT)}:{number}: {command}")
+
+    def test_limited_fetches_without_no_tags_are_reported(self) -> None:
+        """Detect each history limit and join backslash-continued fetch commands."""
+        for command in self.LIMITED_FETCHES:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    _shallow_fetches_without_no_tags(command),
+                    [(1, command.replace("\\\n", " "))],
+                )
+
+    def test_limited_fetches_with_no_tags_are_allowed(self) -> None:
+        """Accept explicit no-tags on each fetch, including its continued line."""
+        for command in self.LIMITED_FETCHES:
+            with self.subTest(command=command):
+                safe = command.replace("fetch ", "fetch --no-tags ", 1)
+                self.assertEqual(_shallow_fetches_without_no_tags(safe), [])
+        continued = "git fetch origin tag \\\n  --no-tags --depth=1"
+        self.assertEqual(_shallow_fetches_without_no_tags(continued), [])
+
+    def test_consumers_clone_and_unlimited_fetch_are_out_of_scope(self) -> None:
+        """Exclude consumers.yml:191's shallow clone and fetches without history limits."""
+        self.assertEqual(_shallow_fetches_without_no_tags("git fetch origin master"), [])
+        self.assertEqual(_shallow_fetches_without_no_tags("git clone --depth=1 url"), [])
+        consumer_clone = (
+            'git clone -q --depth=1 --filter=blob:none --sparse "${branch[@]}" \\\n'
+            '  "$url" "$directory"'
+        )
+        self.assertEqual(_shallow_fetches_without_no_tags(consumer_clone), [])
+
+    def test_comments_explicit_tags_and_empty_text(self) -> None:
+        """Ignore comments and empty text while reporting an explicit shallow tags fetch."""
+        self.assertEqual(_shallow_fetches_without_no_tags("# git fetch --depth=1"), [])
+        explicit = "git fetch --tags --depth=1 origin master"
+        self.assertEqual(_shallow_fetches_without_no_tags(explicit), [(1, explicit)])
+        self.assertEqual(_shallow_fetches_without_no_tags(""), [])
 
 
 class MakeTargetsTest(unittest.TestCase):
