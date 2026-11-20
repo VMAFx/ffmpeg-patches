@@ -1583,6 +1583,8 @@ WRAP_TEXT = (
     "SVT-AV1 would apply the map to the scaled frame with the full layout.\n"
     "@end table\n"
 )
+REFERENCE_CONFIGURE = 'EXTERNAL_LIBRARY_LIST="\nlibaom libsvtav1 vaapi libvpx libx264+ libaom+\n"\n'
+REFERENCE_LIBRARIES = frozenset({"libaom", "libsvtav1", "vaapi", "libvpx", "libx264+", "libaom+"})
 REFERENCE_TEXT = (
     "@section libaom-av1\n"
     "@table @option\n"
@@ -1812,12 +1814,116 @@ class DocReferenceTest(unittest.TestCase):
     """Positive, negative and boundary coverage of added references to another section."""
 
     def findings(self, text: str, added: set[int] | None = None) -> list[str]:
-        """Check the reference lines of one Texinfo text."""
+        """Check Texinfo references against the explicit fixture library names."""
         lines = text.splitlines()
-        return upstream_lint.reference_findings("doc/encoders.texi", lines, added or {11})
+        return upstream_lint.reference_findings(
+            "doc/encoders.texi", lines, added or {11}, REFERENCE_LIBRARIES
+        )
+
+    def test_configure_library_blocks(self) -> None:
+        """Library blocks contribute whitespace-separated lowercase names only."""
+        configure = (
+            'EXTERNAL_LIBRARY_LIST="\nlibaom LIBSVTAV1\n"\n'
+            'HWACCEL_AUTODETECT_LIBRARY_LIST="\nVAAPI\tnvenc\n"\n'
+            'EXTERNAL_LIBRARY_NONFREE_LIST="\nlibfdk_aac\n"\n'
+            'LIBRARY_LIST="\navcodec\n"\n'
+        )
+        self.assertEqual(
+            upstream_lint.configure_libraries(configure),
+            frozenset({"libaom", "libsvtav1", "vaapi", "nvenc", "libfdk_aac"}),
+        )
+
+    def test_configure_library_variables_are_skipped(self) -> None:
+        """Dollar-prefixed entries are skipped while their own blocks are read independently."""
+        configure = (
+            'EXTERNAL_LIBRARY_LIST="\n$EXTERNAL_LIBRARY_GPL_LIST ${OTHER} libaom\n"\n'
+            'EXTERNAL_LIBRARY_GPL_LIST="\nlibx264\n"\n'
+            'HWACCEL_LIBRARY_LIST="\n$UNLISTED libmfx libvpl\n"\n'
+        )
+        self.assertEqual(
+            upstream_lint.configure_libraries(configure),
+            frozenset({"libaom", "libx264", "libmfx", "libvpl"}),
+        )
+
+    def test_configure_without_library_blocks(self) -> None:
+        """Text lacking the nine library blocks yields an empty frozenset."""
+        self.assertEqual(
+            upstream_lint.configure_libraries('LIBRARY_LIST="\nlibaom\n"\nvaapi\n'), frozenset()
+        )
+
+    def test_configure_all_nine_library_blocks(self) -> None:
+        """Each declared external or hardware library block contributes its names."""
+        blocks = (
+            "EXTERNAL_AUTODETECT_LIBRARY_LIST",
+            "EXTERNAL_LIBRARY_GPL_LIST",
+            "EXTERNAL_LIBRARY_NONFREE_LIST",
+            "EXTERNAL_LIBRARY_VERSION3_LIST",
+            "EXTERNAL_LIBRARY_GPLV3_LIST",
+            "EXTERNAL_LIBRARY_LIST",
+            "HWACCEL_AUTODETECT_LIBRARY_LIST",
+            "HWACCEL_LIBRARY_NONFREE_LIST",
+            "HWACCEL_LIBRARY_LIST",
+        )
+        for block in blocks:
+            with self.subTest(block=block):
+                self.assertEqual(
+                    upstream_lint.configure_libraries(f'{block}="\nlibaom\n"\n'),
+                    frozenset({"libaom"}),
+                )
+
+    def test_listed_heading_words_and_prefixes(self) -> None:
+        """Only listed words or dash prefixes longer than two characters are admitted."""
+        self.assertEqual(
+            upstream_lint.section_names(
+                "Vaapi-driver libaom-av1 AV libx QSV libre",
+                frozenset({"vaapi", "libaom-av1", "av"}),
+            ),
+            frozenset({"Vaapi", "libaom-av1"}),
+        )
+
+    def test_no_doc_change_does_not_read_configure(self) -> None:
+        """Boundary control: no changed doc files passes without reading configure."""
+        with (
+            unittest.mock.patch.object(upstream_lint, "_doc_files", return_value=[]),
+            unittest.mock.patch.object(upstream_lint, "_git") as git,
+        ):
+            step = upstream_lint._doc_reference(Path("fixture"), "base", "head", "")
+        self.assertEqual(step.rc, 0)
+        git.assert_not_called()
+
+    def test_mixed_case_vaapi_own_library_passes(self) -> None:
+        """Mixed-case citing and target VAAPI headings identify the same library."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section VAAPI encoders")
+        text = text.replace("@section libsvtav1", "@section Vaapi encoders")
+        text = text.replace("libaom reads", "vaapi reads")
+        self.assertEqual(self.findings(text), [])
+
+    def test_format_acronym_is_not_a_library(self) -> None:
+        """An unlisted AV format acronym cannot name a library in an item body."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom AV formats")
+        text = text.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "Read offsets from the AV file; a missing offset is zero.",
+        )
+        self.assertEqual(self.findings(text), [])
+
+    def test_libre_is_not_a_library(self) -> None:
+        """An unlisted lib-prefixed ordinary word cannot name a library in an item body."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom libre format")
+        text = text.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "Read offsets in the libre format; a missing offset is zero.",
+        )
+        self.assertEqual(self.findings(text), [])
+
+    def test_qsv_heading_known_limit_passes(self) -> None:
+        """Known limit of reading configure lists: a QSV-only heading names no library."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section QSV encoders")
+        text = text.replace("libaom reads", "QSV reads")
+        self.assertEqual(self.findings(text), [])
 
     def test_deferred_reference_is_found(self) -> None:
-        """A reference deferring the format to another library's item is found."""
+        """Boundary control: the baseline reference retains its exact libaom finding."""
         self.assertEqual(
             self.findings(REFERENCE_TEXT),
             [
@@ -1984,7 +2090,7 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(self.findings(text), [])
 
     def test_uppercase_target_library_is_found(self) -> None:
-        """Body matching ignores case while finding text preserves heading spelling."""
+        """Boundary control: D3 preserves uppercase target spelling in its one finding."""
         text = REFERENCE_TEXT.replace("@section libaom-av1", "@section LIBAOM-AV1")
         self.assertEqual(
             self.findings(text),
@@ -2467,18 +2573,20 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(self.findings(REFERENCE_TEXT, {10}), [])
         lines = REFERENCE_TEXT.splitlines()
         first = [*lines[9:11], *lines[:6]]
-        self.assertEqual(upstream_lint.reference_findings("doc/x.texi", first, {2}), [])
+        self.assertEqual(
+            upstream_lint.reference_findings("doc/x.texi", first, {2}, REFERENCE_LIBRARIES), []
+        )
 
     def test_section_names(self) -> None:
-        """Only lib-prefixed or uppercase heading words and valid long prefixes name libraries."""
+        """Only configure-listed heading words and dash prefixes longer than two qualify."""
         self.assertEqual(
-            upstream_lint.section_names("libaom-av1"), frozenset({"libaom-av1", "libaom"})
+            upstream_lint.section_names("libaom-av1", REFERENCE_LIBRARIES), frozenset({"libaom"})
         )
         for title, expected in (
-            ("libaom-av1 encoder", {"libaom-av1", "libaom"}),
+            ("libaom-av1 encoder", {"libaom"}),
             ("ac3 and ac3_fixed", set()),
-            ("--libaom--/libvpx:libx264+ lib_name", {"libaom", "libvpx", "libx264+", "lib_name"}),
-            ("AA-A1 VAAPI2 A1", {"AA-A1", "VAAPI2"}),
+            ("--libaom--/libvpx:libx264+ lib_name", {"libaom", "libvpx", "libx264+"}),
+            ("AA-A1 VAAPI2 A1", set()),
             ("VAAPI encoders", {"VAAPI"}),
             ("libaom Decoders", {"libaom"}),
             (
@@ -2488,8 +2596,10 @@ class DocReferenceTest(unittest.TestCase):
             ),
         ):
             with self.subTest(title=title):
-                self.assertEqual(upstream_lint.section_names(title), frozenset(expected))
-        self.assertEqual(upstream_lint.section_names("qp of x"), frozenset())
+                self.assertEqual(
+                    upstream_lint.section_names(title, REFERENCE_LIBRARIES), frozenset(expected)
+                )
+        self.assertEqual(upstream_lint.section_names("qp of x", REFERENCE_LIBRARIES), frozenset())
         self.assertEqual(
             upstream_lint.texi_sections(["a", "@section b c", "d"]), ["", "b c", "b c"]
         )
@@ -2711,6 +2821,7 @@ class FixtureTest(unittest.TestCase):
         self.write("tools/patcheck", FAKE_PATCHECK)
         self.write("libavfilter/vf_x.c", SOURCE)
         self.write("libavfilter/allfilters.c", FILTER_DECLARATIONS)
+        self.write("configure", REFERENCE_CONFIGURE)
         self.commit("avfilter/vf_x: initial fixture")
         self.base = self.git("rev-parse", "HEAD").strip()
         self.real_run = upstream_lint._run
@@ -3437,6 +3548,34 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: doc-reference rc: 0", output)
+
+    def test_doc_reference_missing_configure_fails(self) -> None:
+        """Missing head configure fails doc-reference even with a doc-reason waiver."""
+        self.git("rm", "configure")
+        self.write("doc/encoders.texi", REFERENCE_TEXT)
+        self.commit("doc/encoders: describe qpfile")
+        for args in ((), ("--doc-reason", "cannot waive missing library lists")):
+            with self.subTest(args=args):
+                rc, output = self.check(*args)
+                self.assertEqual(rc, 1, output)
+                self.assertIn(
+                    "step: doc-reference rc: 1\nconfigure is absent at checked head", output
+                )
+
+    def test_doc_reference_empty_library_lists_fail(self) -> None:
+        """Empty head configure library lists fail doc-reference even with a waiver."""
+        self.write("configure", 'EXTERNAL_LIBRARY_LIST="\n$UNLISTED\n"\n')
+        self.write("doc/encoders.texi", REFERENCE_TEXT)
+        self.commit("doc/encoders: describe qpfile")
+        for args in ((), ("--doc-reason", "cannot waive empty library lists")):
+            with self.subTest(args=args):
+                rc, output = self.check(*args)
+                self.assertEqual(rc, 1, output)
+                self.assertIn(
+                    "step: doc-reference rc: 1\n"
+                    "configure library lists give no names at checked head",
+                    output,
+                )
 
     def test_test_program_fails(self) -> None:
         """A new lib*/tests program registered in its Makefile fails the test-program step."""

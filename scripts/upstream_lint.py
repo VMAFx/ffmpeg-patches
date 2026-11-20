@@ -1947,21 +1947,40 @@ def texi_sections(lines: list[str]) -> list[str]:
     return titles
 
 
-def _library_name(name: str) -> bool:
-    """Recognize lib-prefixed names or uppercase names containing at least two letters."""
-    return name.lower().startswith("lib") or (
-        name.isupper() and sum(char.isalpha() for char in name) >= 2
+def configure_libraries(configure: str) -> frozenset[str]:
+    """Read lowercase library names from configure's nine library lists, skipping variables."""
+    blocks = (
+        "EXTERNAL_AUTODETECT_LIBRARY_LIST",
+        "EXTERNAL_LIBRARY_GPL_LIST",
+        "EXTERNAL_LIBRARY_NONFREE_LIST",
+        "EXTERNAL_LIBRARY_VERSION3_LIST",
+        "EXTERNAL_LIBRARY_GPLV3_LIST",
+        "EXTERNAL_LIBRARY_LIST",
+        "HWACCEL_AUTODETECT_LIBRARY_LIST",
+        "HWACCEL_LIBRARY_NONFREE_LIST",
+        "HWACCEL_LIBRARY_LIST",
     )
+    starts = {f'{name}="' for name in blocks}
+    names: set[str] = set()
+    active = False
+    for line in configure.splitlines():
+        if line in starts:
+            active = True
+        elif line.strip() == '"':
+            active = False
+        elif active:
+            names.update(word.lower() for word in line.split() if not word.startswith("$"))
+    return frozenset(names)
 
 
-def section_names(title: str) -> frozenset[str]:
-    """Return library heading words and valid long dash prefixes with original spelling."""
+def section_names(title: str, libraries: frozenset[str]) -> frozenset[str]:
+    """Return configure-listed heading words and long dash prefixes with original spelling."""
     words = [word.strip("-") for word in re.split(r"[^A-Za-z0-9_+-]+", title)]
     return frozenset(
         name
         for word in words
         for name in (word, word.split("-")[0])
-        if _library_name(name) and (name == word or len(name) > 2)
+        if len(name) > 2 and name.lower() in libraries
     )
 
 
@@ -2102,12 +2121,16 @@ def _reference_arguments(lines: list[str], index: int, start: int) -> tuple[list
     return args, stop + 1
 
 
-def _item_libraries(lines: list[str], sections: list[str], source: int, target: int) -> list[str]:
-    """Match whole library names including plus signs, excluding citing library families."""
+def _item_libraries(
+    lines: list[str], sections: list[str], source: int, target: int, libraries: frozenset[str]
+) -> list[str]:
+    """Match configure-listed library names in item bodies, excluding citing families."""
     body = "\n".join(_anchor_item(lines, target))
-    citing = {name.split("-")[0].lower() for name in section_names(sections[source])}
+    citing = {name.split("-")[0].lower() for name in section_names(sections[source], libraries)}
     others = {
-        name for name in section_names(sections[target]) if name.split("-")[0].lower() not in citing
+        name
+        for name in section_names(sections[target], libraries)
+        if name.split("-")[0].lower() not in citing
     }
     return sorted(
         name
@@ -2136,10 +2159,11 @@ def _reference_finding(
     path: str,
     lines: list[str],
     sections: list[str],
-    anchors: dict[str, int],
     added: set[int],
+    libraries: frozenset[str],
 ) -> list[str]:
-    """Find deferred local references whose bounded span includes an added line."""
+    """Find deferred local references to configure-listed libraries on added spans."""
+    anchors = _table_anchors(lines)
     findings: list[str] = []
     for number, column, args in _added_references(lines, added):
         index = number - 1
@@ -2151,7 +2175,7 @@ def _reference_finding(
             continue
         if not DEFER_WORDING.search(f"{before} {lines[index][:column]}"):
             continue
-        named = _item_libraries(lines, sections, index, target)
+        named = _item_libraries(lines, sections, index, target, libraries)
         if named:
             findings.append(
                 f"{path}:{number}: the {sections[index]} text defers to @ref{{{args[0]}}}, "
@@ -2160,12 +2184,13 @@ def _reference_finding(
     return findings
 
 
-def reference_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
-    """Find visible deferred item references with any added line in their bounded span."""
+def reference_findings(
+    path: str, lines: list[str], added: set[int], libraries: frozenset[str]
+) -> list[str]:
+    """Find visible deferred references to configure-listed libraries on added spans."""
     lines = _reference_lines(lines)
     sections = texi_sections(lines)
-    anchors = _table_anchors(lines)
-    return _reference_finding(path, lines, sections, anchors, added)
+    return _reference_finding(path, lines, sections, added, libraries)
 
 
 def _doc_files(tree: Path, base: str, head: str) -> list[tuple[str, list[str], set[int]]]:
@@ -2191,11 +2216,29 @@ def _doc_wrap(tree: Path, base: str, head: str, waiver: str) -> Step:
 
 
 def _doc_reference(tree: Path, base: str, head: str, waiver: str) -> Step:
-    """Fail added doc references that defer to an item describing another library."""
+    """Check added doc references against head configure libraries; fail if unavailable."""
     files = _doc_files(tree, base, head)
+    libraries: frozenset[str] = frozenset()
+    if files:
+        try:
+            if not _git(tree, "ls-tree", "--name-only", head, "--", "configure").strip():
+                return Step("doc-reference", 1, f"configure is absent at checked head {head}")
+            libraries = configure_libraries(_git(tree, "show", f"{head}:configure"))
+        except (OSError, RuntimeError) as error:
+            return Step(
+                "doc-reference", 1, f"cannot read configure at checked head {head}: {error}"
+            )
+        if not libraries:
+            return Step(
+                "doc-reference", 1, f"configure library lists give no names at checked head {head}"
+            )
     return _waivable_step(
         "doc-reference",
-        [f for path, lines, added in files for f in reference_findings(path, lines, added)],
+        [
+            f
+            for path, lines, added in files
+            for f in reference_findings(path, lines, added, libraries)
+        ],
         waiver,
         f"no deferred reference to another section in {len(files)} changed doc file(s)",
         "describe the case in this section, or pass --doc-reason",
