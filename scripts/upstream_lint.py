@@ -258,7 +258,8 @@ REFERENCE = re.compile(r"^[^:\n]+?[:-]\d+[:-](.*)$")
 FUNCTION = re.compile(r"^(?:[A-Za-z_]\w*[ *]+)+[A-Za-z_]\w*\([^();{}]*\)\s*\{")
 CONTROL = re.compile(r"(?:}\s*)?(?:(?:else\s+)?(?:if|for|while|switch)\s*\(.*\)|else|do)")
 C_NONCODE = re.compile(
-    r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+    r'/\*.*?(?:\*/|\Z)|//(?:\\\r?\n|[^\n])*|"(?:\\.|[^"\\])*(?:"|\\?\Z)'
+    r"|\'(?:\\.|[^\'\\])*(?:\'|\\?\Z)",
     re.DOTALL | re.MULTILINE,
 )
 FIX_MESSAGE = re.compile(
@@ -593,20 +594,45 @@ def _deleted_lines(patch: str) -> set[int]:
     return deleted
 
 
+def _c_mask_noncode(source: str) -> tuple[list[str], set[int], list[str]]:
+    """Mask noncode and track comment-only directive prefixes and spanning block comments."""
+    parts: list[str] = []
+    prefixes: list[str] = []
+    spanning: set[int] = set()
+    offset, line = 0, 0
+    matches = list(C_NONCODE.finditer(source))
+    for index in range(len(matches)):
+        match = matches[index]
+        prefix = source[offset : match.start()]
+        parts.append(prefix)
+        prefixes.append(prefix)
+        line += prefix.count("\n")
+        last = line + match[0].count("\n")
+        if match[0].startswith("/*"):
+            spanning.update(range(line, last))
+        masked = re.sub(r"[^\n]", " ", match[0])
+        parts.append(masked)
+        prefixes.append(masked if match[0].startswith("/") else match[0])
+        offset, line = match.end(), last
+    parts.append(source[offset:])
+    prefixes.append(source[offset:])
+    return "".join(parts).split("\n"), spanning, "".join(prefixes).split("\n")
+
+
 def _c_lex_lines(source: str) -> tuple[list[str], list[str]]:
-    """Mask C comments, literals and logical directives, retaining real directive starts."""
+    """Mask directives through splices and block comments, accepting comment-prefixed hashes."""
     raw = source.split("\n")
-    code = C_NONCODE.sub(lambda match: re.sub(r"[^\n]", " ", match[0]), source).split("\n")
+    code, spanning, prefixes = _c_mask_noncode(source)
     directives: list[str] = []
     continued = False
     for index in range(len(raw)):
-        starts = raw[index].lstrip(" \t").startswith("#") and code[index].lstrip(" \t").startswith(
-            "#"
-        )
+        starts = code[index].lstrip(" \t\r\v\f").startswith("#") and prefixes[index].lstrip(
+            " \t\r\v\f"
+        ).startswith("#")
         if continued or starts:
             if not continued:
                 directives.append(code[index])
-            continued = raw[index].removesuffix("\r").endswith("\\")
+            continued = index in spanning or raw[index].removesuffix("\r").endswith("\\")
             code[index] = " " * len(code[index])
     return code, directives
 
@@ -2388,15 +2414,17 @@ def _c_rules_report(
 
 
 def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
-    """Discover real attribute directives only from a header contained in the checked tree."""
+    """Discover contained attribute directives and diagnose escaping headers without reading."""
     header = tree / "libavutil/attributes.h"
     if not _c_rules_inside(header, tree):
         return set(), [
-            "informational: libavutil/attributes.h: resolves outside the checked tree; "
+            "error: libavutil/attributes.h: resolves outside the checked tree; "
             "attribute blanking skipped"
         ]
     try:
         source = header.read_bytes()
+    except IsADirectoryError:
+        return set(), []
     except FileNotFoundError:
         return set(), ["informational: missing libavutil/attributes.h; attribute blanking skipped"]
     directives = _c_lex_lines(source.decode("latin-1"))[1]
@@ -2460,13 +2488,17 @@ def _c_rules_inside(path: Path, root: Path) -> bool:
 def _c_rules_scan_root(
     tree: Path, paths: list[str], directory: str
 ) -> tuple[Path, list[str], list[str]]:
-    """Copy contained sources, retain unread links and report rejected source or target escapes."""
+    """Copy contained files, skip directories and report source, target and header escapes."""
     attributes, notices = _c_rules_attributes(tree)
     root = Path(directory) / "sources"
     root.mkdir()
     escaped: list[str] = []
+    if not _c_rules_inside(tree / "libavutil/attributes.h", tree):
+        escaped.append("libavutil/attributes.h")
     for index in range(len(paths)):
         name = paths[index]
+        if name in escaped:
+            continue
         source, target = tree / name, root / name
         reason = ""
         if not _c_rules_inside(source, tree):
@@ -2477,6 +2509,8 @@ def _c_rules_scan_root(
             escaped.append(name)
             notices.append(f"error: {_waiver_text(name)}: {reason}")
             continue
+        if source.is_dir():
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             content = source.read_bytes()
@@ -2485,6 +2519,15 @@ def _c_rules_scan_root(
         else:
             target.write_bytes(_c_rules_blank(content, attributes))
     return root, notices, escaped
+
+
+def _c_rules_file_paths(
+    tree: Path, paths: list[str], escaped: list[str], unread_paths: list[str]
+) -> list[str]:
+    """Exclude escaped paths and record requested directories as unread sources."""
+    paths = [path for path in paths if path not in escaped]
+    unread_paths.extend(path for path in paths if (tree / path).is_dir())
+    return [path for path in paths if path not in unread_paths]
 
 
 def _c_rules_scan(
@@ -2513,7 +2556,7 @@ def _c_rules_scan(
 def _c_rules(
     tree: Path, base: str, head: str, waiver: str, unread_waivers: tuple[UnreadWaiver, ...] = ()
 ) -> Step:
-    """Scan contained scratch sources with blanking and require unwaivable escape rejection."""
+    """Scan contained scratch files, report unread directories and reject all escapes."""
     touched_by_path = _c_rules_touched(tree, base, head)
     if not touched_by_path:
         unused = _unread_report([], unread_waivers)
@@ -2526,11 +2569,15 @@ def _c_rules(
     unread_paths: list[str] = []
     with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
         scan_root, notices, escaped = _c_rules_scan_root(tree, paths, directory)
-        paths = [path for path in paths if path not in escaped]
+        paths = _c_rules_file_paths(tree, paths, escaped, unread_paths)
         unread_waivers = tuple(entry for entry in unread_waivers if entry.path not in escaped)
         if not paths:
-            unused = _unread_report([], unread_waivers)
-            return Step("c-rules", 2, "\n".join([*notices, unused.output]).rstrip("\n"))
+            unused = _unread_report(unread_paths, unread_waivers)
+            return Step(
+                "c-rules",
+                2 if escaped else unused.rc,
+                "\n".join([*notices, unused.output]).rstrip("\n"),
+            )
         result, parsed = _c_rules_scan(
             scan_root, paths, Path(directory) / "semgrep.json", unread_paths
         )

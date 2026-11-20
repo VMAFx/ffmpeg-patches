@@ -3546,6 +3546,217 @@ class CRulesScratchTest(FixtureTest):
             [index for index, byte in enumerate(source) if byte == 10],
         )
 
+    def test_r3_spliced_line_comments(self) -> None:
+        """LF and CRLF splices keep the next physical line inside a line comment."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                comment = b"// continued " + bytes([92]) + newline + b"av_fixture_tag" + newline
+                self.assert_blanked(
+                    comment + b"av_fixture_tag int code;\n",
+                    comment + b"               int code;\n",
+                )
+
+    def test_r3_spliced_header_comment(self) -> None:
+        """A definition on a spliced comment line contributes no attribute words."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                header = self.root / "libavutil/attributes.h"
+                prefix = b"// continued " + bytes([92]) + newline
+                header.write_bytes(
+                    prefix + b"#define av_buffer" + newline + b"#define av_fixture_tag\n"
+                )
+                names, notices = upstream_lint._c_rules_attributes(self.root)
+                self.assertEqual(names, {b"av_fixture_tag"})
+                self.assertEqual(notices, [])
+
+    def test_r3_boundary_spliced_literals(self) -> None:
+        """Boundary control: spliced strings and characters retain every literal byte."""
+        for quote in (b'"', b"'"):
+            for newline in (b"\n", b"\r\n"):
+                with self.subTest(quote=quote, newline=newline):
+                    literal = (
+                        quote + b"continued " + bytes([92]) + newline + b"av_fixture_tag" + quote
+                    )
+                    self.assert_blanked(
+                        literal + b";\nav_fixture_tag int code;\n",
+                        literal + b";\n               int code;\n",
+                    )
+
+    def test_r3_unterminated_block_comment(self) -> None:
+        """An unterminated block comment masks through the end of the source."""
+        for suffix in (b"", b"\n", b"\\"):
+            with self.subTest(suffix=suffix):
+                tail = b"/* av_fixture_tag\nav_fixture_tag" + suffix
+                self.assert_blanked(
+                    b"av_fixture_tag int code;\n" + tail,
+                    b"               int code;\n" + tail,
+                )
+
+    def test_r3_unterminated_literals(self) -> None:
+        """Unterminated strings and characters mask through EOF including a trailing escape."""
+        for quote in (b'"', b"'"):
+            for suffix in (b"", b"\\"):
+                with self.subTest(quote=quote, suffix=suffix):
+                    tail = quote + b"av_fixture_tag\nav_fixture_tag" + suffix
+                    self.assert_blanked(
+                        b"av_fixture_tag int code;\n" + tail,
+                        b"               int code;\n" + tail,
+                    )
+
+    def test_r3_boundary_unspliced_line_comment(self) -> None:
+        """Boundary control: an unspliced line comment ends at its physical newline."""
+        self.assert_blanked(
+            b"// av_fixture_tag\nav_fixture_tag int code;\n",
+            b"// av_fixture_tag\n               int code;\n",
+        )
+
+    def test_r3_comment_prefixed_directive(self) -> None:
+        """A comment-prefixed directive protects its spliced physical continuation."""
+        directive = b"/* leading */ #define KEEP \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(
+            directive + b"av_fixture_tag int code;\n",
+            directive + b"               int code;\n",
+        )
+
+    def test_r3_directive_spanning_block_comment(self) -> None:
+        """A directive continues across block comments and stops after their closing line."""
+        for middle in (b"", b"av_fixture_tag\n"):
+            with self.subTest(middle=middle):
+                directive = b"#define KEEP /* open\n" + middle + b"*/ av_fixture_tag int keep;\n"
+                self.assert_blanked(
+                    directive + b"av_fixture_tag int code;\n",
+                    directive + b"               int code;\n",
+                )
+
+    def test_r3_boundary_hash_after_code(self) -> None:
+        """Boundary control: a hash after ordinary code cannot start a directive."""
+        self.assert_blanked(
+            b"int x; # y \\\nav_fixture_tag int code;\n",
+            b"int x; # y \\\n               int code;\n",
+        )
+
+    def test_r3_boundary_hash_after_literal(self) -> None:
+        """Boundary control: masking a literal cannot turn a later hash into a directive."""
+        for quote in (b'"', b"'"):
+            with self.subTest(quote=quote):
+                prefix = b"/* leading */ " + quote + b"literal" + quote + b" # y "
+                prefix += bytes([92, 10])
+                self.assert_blanked(
+                    prefix + b"av_fixture_tag int code;\n",
+                    prefix + b"               int code;\n",
+                )
+
+    def escaping_header(self) -> Path:
+        """Establish an unchanged escaping header in the disposable fixture base."""
+        target = self.root.parent / "outside.h"
+        target.write_bytes(b"#define av_fixture_tag\n")
+        header = self.root / "libavutil/attributes.h"
+        header.unlink()
+        header.symlink_to(target)
+        self.commit("avutil/attributes: establish escaping fixture header")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        return target
+
+    def assert_header_escape(self, step: upstream_lint.Step) -> None:
+        """Require an unwaivable escape status and exactly one header diagnostic."""
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertEqual(step.output.count("libavutil/attributes.h"), 1, step.output)
+        self.assertIn("resolves outside the checked tree", step.output)
+
+    def test_r3_escaping_header_keeps_finding(self) -> None:
+        """An escaping header fails closed without suppressing another source's finding."""
+        self.escaping_header()
+        step = self.scan_source(self.allocation_source())
+        self.assert_header_escape(step)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+
+    def test_r3_escaping_header_cannot_be_waived(self) -> None:
+        """Neither a finding reason nor a dated unread waiver excuses a header escape."""
+        self.escaping_header()
+        self.write("libavfilter/vf_x.c", self.allocation_source())
+        self.commit()
+        waiver = upstream_lint.UnreadWaiver(
+            "libavutil/attributes.h", "fixture", "B", date(2026, 11, 23), False
+        )
+        step = upstream_lint._c_rules(self.root, self.base, "HEAD", "fixture", (waiver,))
+        self.assert_header_escape(step)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+
+    def test_r3_escaping_header_keeps_unread_status(self) -> None:
+        """A header escape retains both findings and unread statuses for other requested sources."""
+        self.escaping_header()
+        name, other = "libavfilter/vf_unread.c", "libavfilter/vf_x.c"
+        self.write(name, "int unread;\n")
+        self.write(other, self.allocation_source())
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": [name, other]},
+                "results": [
+                    {
+                        "path": other,
+                        "check_id": "ffmpeg-null-ternary-after-allocation",
+                        "start": {"line": 1},
+                        "end": {"line": 1},
+                        "extra": {"message": "fixture finding"},
+                    }
+                ],
+                "errors": [{"type": "Syntax error", "path": name}],
+            }
+        )
+        with (
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command),
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_touched", return_value={name: {1}, other: {1}}
+            ),
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assert_header_escape(step)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"no waiver: {name}:", step.output)
+        self.assertIn(f"finding: {other}:1:", step.output)
+
+    def test_r3_requested_directories_are_unread(self) -> None:
+        """Requested root and subdirectories use the existing unread waiver rules."""
+        for name in (".", "libavfilter"):
+            waiver = upstream_lint.UnreadWaiver(name, "fixture", "B", date(2026, 11, 23), False)
+            for reason, unread, rc in (("", (), 1), ("fixture", (), 1), ("", (waiver,), 0)):
+                with self.subTest(name=name, reason=reason, unread=unread):
+                    with unittest.mock.patch.object(
+                        upstream_lint, "_c_rules_touched", return_value={name: {1}}
+                    ):
+                        step = upstream_lint._c_rules(self.root, self.base, "HEAD", reason, unread)
+                    self.assertIsInstance(step, upstream_lint.Step)
+                    self.assertEqual(step.rc, rc, step.output)
+                    self.assertIn(f"unread: {name}:", step.output)
+                    self.assertIn(f"{'waived' if unread else 'no waiver'}: {name}:", step.output)
+
+    def test_r3_requested_directory_keeps_other_finding(self) -> None:
+        """An unread directory does not suppress scanning an ordinary requested source."""
+        self.write("libavfilter/vf_x.c", self.allocation_source())
+        with unittest.mock.patch.object(
+            upstream_lint, "_c_rules_touched", return_value={".": {1}, "libavfilter/vf_x.c": {1}}
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unread: .:", step.output)
+        self.assertIn("no waiver: .:", step.output)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+
+    def test_r3_requested_header_directory_is_unread(self) -> None:
+        """A requested attributes-header directory reaches the ordinary unread report."""
+        name = "libavutil/attributes.h"
+        header = self.root / name
+        header.unlink()
+        header.mkdir()
+        with unittest.mock.patch.object(
+            upstream_lint, "_c_rules_touched", return_value={name: {1}}
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertIsInstance(step, upstream_lint.Step)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"no waiver: {name}:", step.output)
+
     def test_d1_attributes_only_in_code(self) -> None:
         """Attribute words inside literals and comments remain byte-identical."""
         tail = (
@@ -3698,12 +3909,8 @@ class CRulesScratchTest(FixtureTest):
         self.assertNotIn("resolves outside", step.output)
 
     def test_d3_escaping_header_is_not_read(self) -> None:
-        """An escaping attributes header is named and contributes no blanked attributes."""
-        target = self.root.parent / "outside.h"
-        target.write_bytes(b"#define av_fixture_tag\n")
-        header = self.root / "libavutil/attributes.h"
-        header.unlink()
-        header.symlink_to(target)
+        """An escaping header is never read, contributes no attributes and fails the step closed."""
+        target = self.escaping_header()
         source = b"av_fixture_tag int code;\n"
         self.write("libavfilter/vf_x.c", source.decode("ascii"))
         real_read = Path.read_bytes
@@ -3728,6 +3935,9 @@ class CRulesScratchTest(FixtureTest):
         self.assertEqual(len(prepared[1]), 1)
         self.assertIn("libavutil/attributes.h", prepared[1][0])
         self.assertIn("resolves outside the checked tree", prepared[1][0])
+        with unittest.mock.patch.object(Path, "read_bytes", read):
+            step = self.scan_source("void clean(void) { av_malloc(8); }\n")
+        self.assert_header_escape(step)
 
     def test_attribute_parser_failure_is_blanked(self) -> None:
         """A discovered attribute cannot make an otherwise clean step exit two."""
