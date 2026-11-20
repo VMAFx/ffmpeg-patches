@@ -1019,6 +1019,25 @@ class FateShapeTest(unittest.TestCase):
         self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
         self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
 
+    def test_immediate_self_reads_resolve_destination_deferred_references(self) -> None:
+        """Deferred destination entries keep one finding and chain across all immediate reads."""
+        for middle, reference in (
+            ("MIDDLE = $(FATE_LIBAVUTIL)\n", "MIDDLE"),
+            ("", "FATE_LIBAVUTIL"),
+            ("", "OTHER"),
+        ):
+            with self.subTest(middle=middle, reference=reference):
+                source = (
+                    "OTHER += fate-x\n"
+                    "FATE_LIBAVUTIL = $(OTHER)\n"
+                    f"{middle}FATE_LIBAVUTIL := $({reference}) fate-y\n"
+                    "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+                self.assertIn("OTHER: OTHER -> FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
     def test_repeated_immediate_self_reads_keep_one_entry(self) -> None:
         """Twelve immediate self reads neither duplicate entries nor extend their chains."""
         source = (

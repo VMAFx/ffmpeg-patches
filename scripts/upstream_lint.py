@@ -1679,7 +1679,7 @@ class _FateShapeState:
 def _fate_shape_snapshot(
     destination: str, value: str, states: dict[str, _FateShapeState]
 ) -> tuple[set[str], list[_FateShapeEntry]]:
-    """Capture bounded transitive entries, preserving destination self reads as identity."""
+    """Capture bounded entries, resolving destination references with only its identity tail."""
     pending = [
         (name, [_fate_shape_normalize(destination)]) for name in _fate_shape_references(value)
     ]
@@ -1698,11 +1698,12 @@ def _fate_shape_snapshot(
             continue
         if name == destination:
             entries.extend(state.entries)
-            continue
-        entries.extend(
-            _FateShapeEntry(entry.variable, entry.targets, entry.line, [*entry.chain, *tail])
-            for entry in state.entries
-        )
+            tail = []
+        else:
+            entries.extend(
+                _FateShapeEntry(entry.variable, entry.targets, entry.line, [*entry.chain, *tail])
+                for entry in state.entries
+            )
         pending.extend(
             (reference, [_fate_shape_normalize(name), *tail])
             for reference in sorted(state.references)
