@@ -1718,7 +1718,7 @@
       "in_release": "",
       "patch": "0040-avfilter-vf_libvmaf-accept-more-planar-pixel-formats.patch, 0041-avfilter-vf_libvmaf-copy-all-planes-of-CUDA-hardware.patch",
       "project": "vmafx",
-      "note": "By luoye-cpu, not from this series (VMAFx/vmafx#3274); the series carries it ahead of review. 25708 stacks on 24973, which the series does not carry; the conflict was context only.",
+      "note": "By luoye-cpu, not from this series (vidiko/vmafx#3274); the series carries it ahead of review. 25708 stacks on 24973, which the series does not carry; the conflict was context only.",
       "fixes_issues": [],
       "related": [
         {
