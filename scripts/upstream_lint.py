@@ -109,6 +109,17 @@ an @end naming the innermost raw block change the open blocks, so an @end line
 shown inside a raw block closes no outer block. --doc-reason TEXT waives it and
 prints the reason.
 
+The doc-reference step fails an added @ref, @xref or @pxref inside a @section
+that follows wording such as described for or in, or same format as, in the
+same sentence across the previous line, when its anchor sits in another
+@section of the same file and the anchored table item names a library of that
+section (a word of its title, or the part before its first -, whose lower-case
+form is a name in configure's library lists at the checked head) that the
+citing section does not name. References to nodes or to other files, and
+deferrals worded otherwise, are not detected. --doc-reason TEXT waives it and
+prints the reason. A listed name that is also an ordinary word (metal) counts
+as a library; an unlisted name (QSV) does not.
+
 The test-program step fails when base..head adds a C file directly under a
 lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
 TESTPROGS-$(CONFIG_X) +=) in that library's Makefile at head lists the file's
@@ -1749,6 +1760,39 @@ TEXI_RAW_END = re.compile(r"\s*@end\s+([A-Za-z][\w-]*)")
 TEXI_FIRST_WORD = re.compile(r"@[A-Za-z]+\{[^}]*\}\S*|\S+")
 WRAP_MIN_NEIGHBOUR = 50
 SENTENCE_END = re.compile(r"(?:[.:;!?]|@\*)\s*$")
+TEXI_ANCHOR = re.compile(r"@anchor\{([^}]+)\}")
+TEXI_SECTION = re.compile(r"@section\s+(.+?)\s*$")
+TEXI_CHAPTER = re.compile(
+    r"@(?:chapter|unnumbered|appendix|top|part|majorheading|chapheading|centerchap)\b"
+)
+TEXI_ITEM = re.compile(r"@itemx?\b")
+TEXI_ANCHOR_METADATA = re.compile(r"@(?:anchor\{|(?:[cfkptv]|op)index(?:\s|$))")
+TEXI_ITEM_END = re.compile(r"@(?:itemx?|end|section|subsection|chapter|anchor)\b")
+TEXI_ITEM_BLOCKS = (
+    "example",
+    "smallexample",
+    "verbatim",
+    "display",
+    "format",
+    "quotation",
+    "cartouche",
+    "itemize",
+    "enumerate",
+    "table",
+    "ftable",
+    "vtable",
+    "multitable",
+)
+TEXI_REF = re.compile(r"(?<!@)(?:@@)*(?P<reference>@(?:ref|xref|pxref)\{)")
+TEXI_COMMENT = re.compile(r"(?<!@)(?:@@)*@(?:c|comment)(?=\s|$)")
+DEFER_WORDING = re.compile(
+    r"\b(?:(?:described|documented|defined|specified|explained)\s+(?:for|in|under|by|with)"
+    r"|(?:same|identical)\s+(?:format|syntax)\s+as)\b(?:(?![.!?]\s)[^;])*$",
+    re.IGNORECASE,
+)
+ANCHOR_ITEM_LIMIT = 400
+REFERENCE_CONTEXT_LINES = 6
+REFERENCE_LOOKAHEAD_LINES = 3
 
 
 def is_doc_path(name: str) -> bool:
@@ -1891,6 +1935,290 @@ def wrap_findings(path: str, lines: list[str], added: set[int]) -> list[str]:
     return findings
 
 
+def texi_sections(lines: list[str]) -> list[str]:
+    """Return each line's @section title, cleared by headings at chapter level or above."""
+    current = ""
+    titles: list[str] = []
+    for line in lines:
+        match = TEXI_SECTION.match(line)
+        if match:
+            current = match[1]
+        elif TEXI_CHAPTER.match(line):
+            current = ""
+        titles.append(current)
+    return titles
+
+
+def configure_libraries(configure: str) -> frozenset[str]:
+    """Read lowercase library names from configure's nine library lists, skipping variables."""
+    blocks = (
+        "EXTERNAL_AUTODETECT_LIBRARY_LIST",
+        "EXTERNAL_LIBRARY_GPL_LIST",
+        "EXTERNAL_LIBRARY_NONFREE_LIST",
+        "EXTERNAL_LIBRARY_VERSION3_LIST",
+        "EXTERNAL_LIBRARY_GPLV3_LIST",
+        "EXTERNAL_LIBRARY_LIST",
+        "HWACCEL_AUTODETECT_LIBRARY_LIST",
+        "HWACCEL_LIBRARY_NONFREE_LIST",
+        "HWACCEL_LIBRARY_LIST",
+    )
+    starts = {f'{name}="' for name in blocks}
+    names: set[str] = set()
+    active = False
+    for line in configure.splitlines():
+        if line in starts:
+            active = True
+        elif line.strip() == '"':
+            active = False
+        elif active:
+            names.update(word.lower() for word in line.split() if not word.startswith("$"))
+    return frozenset(names)
+
+
+def section_names(title: str, libraries: frozenset[str]) -> frozenset[str]:
+    """Return configure-listed heading words and long dash prefixes with original spelling.
+    A listed name that is also an ordinary word (metal) counts; an unlisted name (QSV)
+    does not.
+    """
+    words = [word.strip("-") for word in re.split(r"[^A-Za-z0-9_+-]+", title)]
+    return frozenset(
+        name
+        for word in words
+        for name in (word, word.split("-")[0])
+        if len(name) > 2 and name.lower() in libraries
+    )
+
+
+def _anchor_boundary(line: str, stack: list[str]) -> bool:
+    """Stop at unmatched ends or peer boundaries hidden only by conditional blocks."""
+    if stack and stack[-1] in TEXI_RAW:
+        return False
+    end = TEXI_END.match(line)
+    if end:
+        return end[1] not in stack
+    return all(name.startswith("if") for name in stack) and bool(TEXI_ITEM_END.match(line))
+
+
+def _anchor_body(lines: list[str], anchor: int | None = None) -> list[str]:
+    """Collect a bounded item body, skipping its own anchor until a peer boundary."""
+    blocks = _texi_blocks(lines) | frozenset(TEXI_ITEM_BLOCKS)
+    body: list[str] = []
+    stack: list[str] = []
+    for index, line in enumerate(lines[:ANCHOR_ITEM_LIMIT]):
+        if index == anchor:
+            continue
+        if _anchor_boundary(line, stack):
+            break
+        _texi_prose_line(line, blocks, stack)
+        body.append(line)
+    return body
+
+
+def _anchor_next_line(lines: list[str], start: int) -> int | None:
+    """Find the next nonblank line excluding anchors and index entries within the bound."""
+    for index in range(start + 1, min(len(lines), start + 1 + ANCHOR_ITEM_LIMIT)):
+        if lines[index].strip() and not TEXI_ANCHOR_METADATA.match(lines[index]):
+            return index
+    return None
+
+
+def _anchor_item(lines: list[str], start: int, item: int | None = None) -> list[str]:
+    """Read the indexed item, preserving anchor-before-item bounds and skipping aliases."""
+    if item is not None and item > start:
+        item = None
+    next_line = _anchor_next_line(lines, start) if item is None else item
+    if next_line is None:
+        return []
+    first = next_line + 1 if TEXI_ITEM.match(lines[next_line]) else start + 1
+    index = first
+    stop = (start if item is None else item) + 1 + ANCHOR_ITEM_LIMIT
+    for index in range(first, min(len(lines), stop)):
+        if not re.match(r"@itemx\b", lines[index]):
+            break
+    return _anchor_body(
+        lines[index : index + ANCHOR_ITEM_LIMIT], start - index if item is not None else None
+    )
+
+
+def _texi_ref_arguments(text: str) -> tuple[list[str], bool]:
+    """Split complete or started reference arguments and report a matching closing brace."""
+    parts: list[str] = []
+    start, depth, escaped = 0, 0, False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if char == "@":
+            escaped = True
+        elif char == "{":
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+        elif char == "}":
+            return [*parts, text[start:index].strip()], True
+        elif char == "," and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    return [*parts, text[start:].strip()], False
+
+
+def _reference_context(lines: list[str], index: int, comments: set[int]) -> str:
+    """Join bounded physical lines across comments, stopping at paragraphs and blocks."""
+    before: list[str] = []
+    for at in range(index - 1, max(-1, index - 1 - REFERENCE_CONTEXT_LINES), -1):
+        if at in comments:
+            continue
+        line = lines[at].strip()
+        if not line:
+            break
+        command = TEXI_COMMAND.match(line)
+        if command and not (command[1] in TEXI_INLINE and line[command.end() :].startswith("{")):
+            break
+        before.append(line)
+    return " ".join(reversed(before))
+
+
+def _reference_lines(lines: list[str]) -> tuple[list[str], set[int]]:
+    """Blank raw blocks and split comments once by escape parity, marking comment-only lines."""
+    visible: list[str] = []
+    comments: set[int] = set()
+    stack: list[str] = []
+    for line in lines:
+        if stack:
+            _texi_raw_line(line, stack)
+            visible.append("")
+            continue
+        comment = TEXI_COMMENT.search(line)
+        prose = line[: comment.start()] if comment else line
+        if comment and not prose.strip() and not comment[0].startswith("@@"):
+            comments.add(len(visible))
+        command = TEXI_COMMAND.match(prose)
+        if command and command[1] in TEXI_RAW:
+            stack.append(command[1])
+            prose = ""
+        visible.append(prose)
+    return visible, comments
+
+
+def _anchor_owner(lines: list[str], index: int, frame: int, items: dict[int, int]) -> int | None:
+    """Prefer an item after anchor metadata, otherwise use the open non-conditional frame."""
+    next_line = _anchor_next_line(lines, index)
+    if next_line is not None and TEXI_ITEM.match(lines[next_line]):
+        return next_line
+    return items.get(frame)
+
+
+def _table_anchors(lines: list[str]) -> dict[str, tuple[int, int | None]]:
+    """Index anchors to following items first, otherwise their open non-conditional frame."""
+    blocks = _texi_blocks(lines)
+    stack: list[str] = []
+    items: dict[int, int] = {}
+    anchors: dict[str, tuple[int, int | None]] = {}
+    for index, line in enumerate(lines):
+        containers = [name for name in stack if not name.startswith("if")]
+        frame = len(containers)
+        if containers and containers[-1] in ("table", "ftable", "vtable"):
+            if TEXI_ITEM.match(line):
+                items[frame] = index
+            elif (match := TEXI_ANCHOR.match(line)) and (
+                item := _anchor_owner(lines, index, frame, items)
+            ) is not None:
+                anchors.setdefault(match[1].strip(), (index, item))
+        _texi_prose_line(line, blocks, stack)
+        depth = sum(not name.startswith("if") for name in stack)
+        items = {frame: item for frame, item in items.items() if frame <= depth}
+    return anchors
+
+
+def _reference_arguments(lines: list[str], index: int, start: int) -> tuple[list[str], int]:
+    """Parse reference arguments within three following lines and return the last line."""
+    text = lines[index][start:]
+    for stop in range(index, min(len(lines), index + REFERENCE_LOOKAHEAD_LINES + 1)):
+        args, closed = _texi_ref_arguments(" ".join([text, *lines[index + 1 : stop + 1]]))
+        if closed:
+            return args, stop + 1
+    args[0] = re.split(r"[,}]", text, maxsplit=1)[0].strip()
+    return args, stop + 1
+
+
+def _item_libraries(
+    lines: list[str],
+    sections: list[str],
+    source: int,
+    target: tuple[int, int | None],
+    libraries: frozenset[str],
+) -> list[str]:
+    """Match library names in the owning item body, excluding citing families."""
+    anchor, item = target
+    body = "\n".join(_anchor_item(lines, anchor, item))
+    citing = {name.split("-")[0].lower() for name in section_names(sections[source], libraries)}
+    others = {
+        name
+        for name in section_names(sections[anchor], libraries)
+        if name.split("-")[0].lower() not in citing
+    }
+    return sorted(
+        name
+        for name in others
+        if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w+])", body, re.IGNORECASE)
+    )
+
+
+def _added_references(lines: list[str], added: set[int]) -> list[tuple[int, int, list[str]]]:
+    """Collect unescaped references with an added line in each bounded span once."""
+    numbers = {
+        start
+        for number in added
+        for start in range(max(1, number - REFERENCE_LOOKAHEAD_LINES), min(number, len(lines)) + 1)
+    }
+    references: list[tuple[int, int, list[str]]] = []
+    for number in sorted(numbers):
+        for ref in TEXI_REF.finditer(lines[number - 1]):
+            args, last = _reference_arguments(lines, number - 1, ref.end())
+            if not added.isdisjoint(range(number, last + 1)):
+                references.append((number, ref.start("reference"), args))
+    return references
+
+
+def _reference_finding(
+    path: str,
+    visible: tuple[list[str], set[int]],
+    sections: list[str],
+    added: set[int],
+    libraries: frozenset[str],
+) -> list[str]:
+    """Find deferred local references with comment-aware context and owning item bodies."""
+    lines, comments = visible
+    anchors = _table_anchors(lines)
+    findings: list[str] = []
+    for number, column, args in _added_references(lines, added):
+        index = number - 1
+        before = _reference_context(lines, index, comments)
+        if len(args) > 3 and args[3]:
+            continue
+        target = anchors.get(args[0])
+        if target is None or not sections[index]:
+            continue
+        if not DEFER_WORDING.search(f"{before} {lines[index][:column]}"):
+            continue
+        named = _item_libraries(lines, sections, index, target, libraries)
+        if named:
+            findings.append(
+                f"{path}:{number}: the {sections[index]} text defers to @ref{{{args[0]}}}, "
+                f"whose item in the {sections[target[0]]} section names {', '.join(named)}"
+            )
+    return findings
+
+
+def reference_findings(
+    path: str, lines: list[str], added: set[int], libraries: frozenset[str]
+) -> list[str]:
+    """Find deferred references across comments to libraries in their whole owning items."""
+    visible = _reference_lines(lines)
+    sections = texi_sections(visible[0])
+    return _reference_finding(path, visible, sections, added, libraries)
+
+
 def _doc_files(tree: Path, base: str, head: str) -> list[tuple[str, list[str], set[int]]]:
     """Return each changed doc/*.texi file with its head lines and added line numbers."""
     files: list[tuple[str, list[str], set[int]]] = []
@@ -1910,6 +2238,36 @@ def _doc_wrap(tree: Path, base: str, head: str, waiver: str) -> Step:
         waiver,
         f"no early line break in {len(files)} changed doc file(s)",
         "join each line with the next one, or pass --doc-reason",
+    )
+
+
+def _doc_reference(tree: Path, base: str, head: str, waiver: str) -> Step:
+    """Check added doc references against head configure libraries; fail if unavailable."""
+    files = _doc_files(tree, base, head)
+    libraries: frozenset[str] = frozenset()
+    if files:
+        try:
+            if not _git(tree, "ls-tree", "--name-only", head, "--", "configure").strip():
+                return Step("doc-reference", 1, f"configure is absent at checked head {head}")
+            libraries = configure_libraries(_git(tree, "show", f"{head}:configure"))
+        except (OSError, RuntimeError) as error:
+            return Step(
+                "doc-reference", 1, f"cannot read configure at checked head {head}: {error}"
+            )
+        if not libraries:
+            return Step(
+                "doc-reference", 1, f"configure library lists give no names at checked head {head}"
+            )
+    return _waivable_step(
+        "doc-reference",
+        [
+            f
+            for path, lines, added in files
+            for f in reference_findings(path, lines, added, libraries)
+        ],
+        waiver,
+        f"no deferred reference to another section in {len(files)} changed doc file(s)",
+        "describe the case in this section, or pass --doc-reason",
     )
 
 
@@ -2259,6 +2617,7 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
             _collect("doc-wrap", lambda: _doc_wrap(tree, base, head, waivers.doc)),
+            _collect("doc-reference", lambda: _doc_reference(tree, base, head, waivers.doc)),
             _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
             _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule)),
             _collect("docstrings", lambda: _docstrings(tree, base, head, waivers.docstring)),
@@ -2289,8 +2648,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--doc-reason",
         default="",
-        help="why the added docs may leave out a case the doc-terms step names or break a "
-        "line early; waives the doc-terms and doc-wrap steps",
+        help="why the added docs may leave out a case the doc-terms step names, break a line "
+        "early or defer to another section; waives the doc-terms, doc-wrap and doc-reference steps",
     )
     parser.add_argument(
         "--test-program-reason",
