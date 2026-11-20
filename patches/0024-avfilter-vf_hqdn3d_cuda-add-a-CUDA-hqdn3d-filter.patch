@@ -94,7 +94,7 @@ index 20fd10c7f159d3450599317937944a81257574a5..c77fb72188d1abbe09d72ada1cf43298
  @section hqdn3d_vulkan
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 38d39d201689bda9164e885366cce28fbc98aaee..0dd379ad13056b96742fe656badb784bb847a648 100644
+index cfef04a371792550fc891780828a784f79525998..5ee6f807466d6e6ec9c7b22c330540d7a6b77361 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -347,6 +347,7 @@ OBJS-$(CONFIG_HFLIP_VULKAN_FILTER)           += vf_flip_vulkan.o vulkan.o
