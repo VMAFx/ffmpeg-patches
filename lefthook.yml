@@ -49,6 +49,11 @@ pre-commit:
         sh .config/lefthook/python.sh scripts/series.py contributions --write
         && git add README.md
 
+commit-msg:
+  jobs:
+    - name: signoff
+      run: sh .config/lefthook/python.sh scripts/signoff.py --message-file {1}
+
 post-commit:
   commands:
     state-sync:

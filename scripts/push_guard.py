@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Refuse pushes that revive a closed pull request or skip a bot review body.
+"""Refuse invalid sign-offs, revived closed pull requests and unanswered bot review bodies.
 
 At most 256 pull request lookups may start within a 120-second check deadline,
 and review reads end by that deadline. Remote configuration queries share a
@@ -9,8 +9,11 @@ and review reads end by that deadline. Remote configuration queries share a
 
     push_guard.py REMOTE_NAME REMOTE_URL
         Read Git pre-push ref updates from stdin. For each branch update,
-        query its GitHub pull requests through gh, newest first (fewer than
-        100). Non-GitHub remotes, tags and branch deletions pass without
+        validate introduced commits (including merges) against the configured
+        sign-off identity before any GitHub query, then query its pull requests
+        through gh, newest first (fewer than 100). Non-GitHub remotes still
+        require valid sign-offs; tags and
+        branch deletions skip sign-off checks. These updates pass without
         querying GitHub. For each open pull request, read its reviews and
         issue comments in the pull request's base repository (at most 10
         pages of 100 each) and refuse while a bot review with a body has no
@@ -27,9 +30,9 @@ and review reads end by that deadline. Remote configuration queries share a
         so it narrows but cannot close a race with a merge or a bot review
         that lands during the push.
 
-Exit status: 0 when allowed, 1 for a closed pull request's absent or unchanged
-head branch or an open pull request with an unanswered bot review body, 2 when
-the guard cannot determine whether the push is safe.
+Exit status: 0 when allowed, 1 for an invalid sign-off, a closed pull request's
+absent or unchanged head branch, or an unanswered bot review body on an open
+pull request; 2 when the guard cannot determine whether the push is safe.
 """
 
 from __future__ import annotations
@@ -47,6 +50,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TextIO
 from urllib.parse import quote, urlsplit
+
+try:
+    import signoff
+except ModuleNotFoundError:
+    from scripts import signoff
 
 MAX_UPDATES = 1000
 MAX_REPOSITORIES = 32
@@ -469,19 +477,40 @@ def check_branch(
     return 0
 
 
+def branch_update(line: str) -> tuple[str, str, str] | None:
+    """Validate one update and select branch creations or updates, excluding deletions."""
+    _, local_sha, remote_ref, remote_sha = line.split()
+    if not SHA.fullmatch(local_sha) or not SHA.fullmatch(remote_sha):
+        raise ValueError("invalid pre-push SHA")
+    if set(local_sha) == {"0"} or not remote_ref.startswith("refs/heads/"):
+        return None
+    return remote_ref.removeprefix("refs/heads/"), local_sha, remote_sha
+
+
+def check_signoff_update(line: str) -> int:
+    """Check sign-offs once per branch update, independently of remote hosting."""
+    update = branch_update(line)
+    if update is None:
+        return 0
+    branch, local_sha, remote_sha = update
+    reason = signoff.check_commits(local_sha, remote_sha)
+    if reason:
+        print(f"push_guard: refusing branch {branch}: {reason}; {signoff.FIX}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def check_update(
     repository: str,
     line: str,
     reader: APIReader,
     activity: ActivityReader = read_review_activity,
 ) -> int:
-    """Check one pre-push update line, skipping deletions and non-branch refs."""
-    _, local_sha, remote_ref, remote_sha = line.split()
-    if not SHA.fullmatch(local_sha) or not SHA.fullmatch(remote_sha):
-        raise ValueError("invalid pre-push SHA")
-    if set(local_sha) == {"0"} or not remote_ref.startswith("refs/heads/"):
+    """Check pull requests for one validated branch update in one repository."""
+    update = branch_update(line)
+    if update is None:
         return 0
-    branch = remote_ref.removeprefix("refs/heads/")
+    branch, _, remote_sha = update
     return check_branch(repository, branch, remote_sha, reader, activity)
 
 
@@ -586,6 +615,9 @@ def check_updates(
                 return 0
             if index == MAX_UPDATES:
                 raise ValueError(f"more than {MAX_UPDATES} pre-push updates")
+            status = check_signoff_update(line)
+            if status:
+                return status
             for repository_index in range(MAX_REPOSITORIES):
                 if repository_index == len(repositories):
                     break
@@ -618,8 +650,7 @@ def main(
         print(f"push_guard: {reason}{exc}; refusing (fail closed)", file=sys.stderr)
         return 2
     if not repositories:
-        print("push_guard: non-GitHub remote; skipping", file=sys.stderr)
-        return 0
+        print("push_guard: non-GitHub remote; skipping pull request checks", file=sys.stderr)
     return check_updates(repositories, reader, activity=activity_reader)
 
 
