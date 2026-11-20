@@ -243,6 +243,9 @@ class UnitTestBudgetTest(unittest.TestCase):
                 "[5]",
                 "{a: 1}",
                 "2026-11-19",
+                "2026-02-28",
+                "2026-02-30",
+                "2026-13-01 10:00:00",
             )
             for index in range(len(values)):
                 value = values[index]
@@ -250,8 +253,24 @@ class UnitTestBudgetTest(unittest.TestCase):
                     workflow.write_text(
                         f"jobs:\n  check:\n    timeout-minutes: {value}\n", encoding="utf-8"
                     )
-                    with self.assertRaises(ValueError):
+                    with self.assertRaises(ValueError) as caught:
                         unit_test_budget.job_timeout_seconds(workflow)
+                    self.assertIn(str(workflow), str(caught.exception))
+                    self.assertIn("jobs.check.timeout-minutes", str(caught.exception))
+                    if value == "2026-02-28":
+                        self.assertEqual(
+                            str(caught.exception),
+                            f"{workflow}: jobs.check.timeout-minutes must be a positive integer",
+                        )
+
+    def test_cli_malformed_workflow_date_is_refused(self) -> None:
+        """A malformed YAML date produces one contextual error before starting tests."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "malformed-date.yml"
+            workflow.write_text(
+                "jobs:\n  check:\n    timeout-minutes: 2026-02-30\n", encoding="utf-8"
+            )
+            self.assert_workflow_refused(workflow)
 
     def test_cli_preserves_command_arguments(self) -> None:
         """The CLI passes arguments after the separator unchanged to the guarded command."""

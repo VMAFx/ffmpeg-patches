@@ -63,7 +63,7 @@ def job_timeout_seconds(workflow: Path = WORKFLOW) -> int:
     try:
         document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
         minutes = document["jobs"]["check"]["timeout-minutes"]
-    except (OSError, UnicodeError, yaml.YAMLError, KeyError, TypeError) as exc:
+    except (OSError, UnicodeError, yaml.YAMLError, KeyError, TypeError, ValueError) as exc:
         detail = " ".join(str(exc).split())
         raise ValueError(f"{workflow}: cannot read {key}: {detail}") from exc
     if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0:
