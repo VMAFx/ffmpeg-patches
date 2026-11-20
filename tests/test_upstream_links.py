@@ -1387,8 +1387,10 @@ class FillAgeWindowTest(unittest.TestCase):
             self.assertEqual(
                 [line for line in out.splitlines()[:4] if "not read" in line],
                 [
-                    "10: candidates updated before 2026-10-29T00:00:00+00:00 "
-                    "not read (fill age limit)"
+                    (
+                        "10: candidates updated before 2026-10-29T00:00:00+00:00 "
+                        "not read (fill age limit)"
+                    )
                 ],
             )
             self.assertEqual(out.count("not read"), 1)
