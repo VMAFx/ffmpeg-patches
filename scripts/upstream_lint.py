@@ -1638,8 +1638,8 @@ def _fate_shape_scope(kind: str, depth: int, defines: int) -> tuple[int, int]:
 
 def _fate_shape_assignments(
     lines: list[FateLine],
-) -> list[tuple[str, str, str, bool, bool, FateLine]]:
-    """Share raw assignments, replacement decisions and define-body flavor boundaries."""
+) -> list[tuple[str, str, str, bool, bool, int, FateLine]]:
+    """Share replacement decisions, define boundaries and conditional depths for flavor sets."""
     assignments, depth, defines = [], 0, 0
     for line in lines:
         depth, defines = _fate_shape_scope(_fate_kind(line)[0], depth, defines)
@@ -1651,9 +1651,16 @@ def _fate_shape_assignments(
             assignment[2] != "+="
             and not depth
             and not defines
-            and not _fate_shape_self_reference(_fate_shape_normalize(destination), assignment[3])
+            and (
+                not _fate_shape_self_reference(_fate_shape_normalize(destination), assignment[3])
+                or (
+                    assignment[2] == ":=" and "$" not in FATE_SHAPE_REFERENCE.sub("", assignment[3])
+                )
+            )
         )
-        assignments.append((destination, assignment[2], assignment[3], replaces, not defines, line))
+        assignments.append(
+            (destination, assignment[2], assignment[3], replaces, not defines, depth, line)
+        )
     return assignments
 
 
@@ -1669,9 +1676,9 @@ class _FateShapeEntry:
 
 @dataclass
 class _FateShapeState:
-    """Hold one raw destination's flavor, deferred references and current entries."""
+    """Hold one raw destination's possible flavors, deferred references and current entries."""
 
-    flavor: str = ""
+    flavors: set[str] = field(default_factory=lambda: {"recursive"})
     references: set[str] = field(default_factory=set)
     entries: list[_FateShapeEntry] = field(default_factory=list)
 
@@ -1711,26 +1718,36 @@ def _fate_shape_snapshot(
     return references, entries
 
 
-def _fate_shape_flavor(operator: str, previous: str) -> str:
-    """Determine the new flavor for an assignment outside a define body."""
+def _fate_shape_flavor(operator: str, previous: set[str], depth: int) -> set[str]:
+    """Preserve conditional flavor alternatives and replace them after definite assignments."""
     if operator == "+=":
-        return previous or "recursive"
-    return "simple" if operator == ":=" else "recursive"
+        return previous
+    current = {"simple" if operator == ":=" else "recursive"}
+    return previous | current if depth else current
+
+
+def _fate_shape_value(
+    destination: str, operator: str, value: str, states: dict[str, _FateShapeState], outside: bool
+) -> tuple[set[str], list[_FateShapeEntry]]:
+    """Union snapshots and deferred reads when conditional flavors permit both expansions."""
+    flavors = states.get(destination, _FateShapeState()).flavors
+    immediate = outside and (operator == ":=" or (operator == "+=" and "simple" in flavors))
+    references, entries = (
+        _fate_shape_snapshot(destination, value, states) if immediate else (set(), [])
+    )
+    if not immediate or (operator == "+=" and "recursive" in flavors):
+        references.update(_fate_shape_references(value))
+    return references, entries
 
 
 def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
-    """Deduplicate ordered snapshots by line and defer all reads inside define bodies."""
+    """Deduplicate snapshots while preserving conditional flavors and deferred define reads."""
     states: dict[str, _FateShapeState] = {}
-    for destination, operator, value, replaces, outside, line in _fate_shape_assignments(lines):
+    for destination, operator, value, replaces, outside, depth, line in _fate_shape_assignments(
+        lines
+    ):
         state = states.get(destination, _FateShapeState())
-        immediate = outside and (
-            operator == ":=" or (operator == "+=" and state.flavor == "simple")
-        )
-        references, entries = (
-            _fate_shape_snapshot(destination, value, states)
-            if immediate
-            else (set(_fate_shape_references(value)), [])
-        )
+        references, entries = _fate_shape_value(destination, operator, value, states, outside)
         if replaces:
             state.references, state.entries = set(), []
         state.references.update(references)
@@ -1743,7 +1760,7 @@ def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
                 _FateShapeEntry(variable, targets, line, [_fate_shape_normalize(variable)])
             )
         if outside:
-            state.flavor = _fate_shape_flavor(operator, state.flavor)
+            state.flavors = _fate_shape_flavor(operator, state.flavors, depth)
         states[destination] = state
     return states
 

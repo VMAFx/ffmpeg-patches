@@ -994,6 +994,80 @@ class FateShapeTest(unittest.TestCase):
                 if findings:
                     self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
 
+    def test_conditional_simple_flavor_preserves_deferred_append(self) -> None:
+        """A skipped simple assignment leaves recursive and undefined appends deferred."""
+        for prefix in ("FATE_FFMPEG =\n", ""):
+            with self.subTest(prefix=prefix):
+                source = (
+                    "FATE_LIBAVUTIL =\n" + prefix + "ifeq (x,y)\nFATE_FFMPEG :=\nendif\n"
+                    "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual(
+                    [(f.rule, f.line) for f in findings],
+                    [("registration", len(source.splitlines()) - 1)],
+                )
+                self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_unconditional_simple_flavor_keeps_append_immediate(self) -> None:
+        """An unconditional simple assignment resets prior conditional flavor alternatives."""
+        for conditional in ("", "ifeq (x,y)\nFATE_FFMPEG :=\nendif\n"):
+            with self.subTest(conditional=conditional):
+                source = (
+                    "FATE_LIBAVUTIL =\nFATE_FFMPEG =\n"
+                    + conditional
+                    + "FATE_FFMPEG :=\nFATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_conditional_recursive_flavor_preserves_deferred_append(self) -> None:
+        """A conditional recursive assignment keeps deferred reads beside simple snapshots."""
+        source = (
+            "FATE_LIBAVUTIL =\nFATE_FFMPEG :=\n"
+            "ifeq (x,y)\nFATE_FFMPEG =\nendif\n"
+            "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 7)])
+        self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_mixed_flavor_append_keeps_snapshot_entries(self) -> None:
+        """Either conditional flavor order preserves snapshots across later source replacement."""
+        for initial, conditional in ((":=", "="), ("=", ":=")):
+            with self.subTest(initial=initial, conditional=conditional):
+                source = (
+                    "FATE_LIBAVUTIL += fate-old\n"
+                    f"FATE_FFMPEG {initial}\n"
+                    f"ifeq (x,y)\nFATE_FFMPEG {conditional}\nendif\n"
+                    "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    "FATE_LIBAVUTIL =\nfate-old: CMD = run libavutil/tests/old\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+                self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_mixed_flavor_append_keeps_snapshot_and_deferred_references(self) -> None:
+        """Mixed appends retain unresolved snapshot names alongside the original deferred read."""
+        for initial, conditional in ((":=", "="), ("=", ":=")):
+            with self.subTest(initial=initial, conditional=conditional):
+                source = (
+                    "MIDDLE = $(EARLY)\n"
+                    f"FATE_FFMPEG {initial}\n"
+                    f"ifeq (x,y)\nFATE_FFMPEG {conditional}\nendif\n"
+                    "FATE_FFMPEG += $(MIDDLE)\nMIDDLE = $(LATE)\n"
+                    "EARLY += fate-old\nLATE += fate-new\n"
+                    "fate-old: CMD = run libavutil/tests/old\n"
+                    "fate-new: CMD = run libavutil/tests/new\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual(
+                    sorted((f.rule, f.line) for f in findings),
+                    [("registration", 8), ("registration", 9)],
+                )
+
     def test_immediate_self_read_preserves_chain(self) -> None:
         """A direct immediate self read retains the original registration chain once."""
         source = (
@@ -1005,6 +1079,55 @@ class FateShapeTest(unittest.TestCase):
         findings = self.findings(source)
         self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
         self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
+
+    def test_plain_immediate_self_read_replaces_deferred_references(self) -> None:
+        """Plain immediate self reads retain prior entries without later source appends."""
+        for target, expected in (("new", []), ("old", [("registration", 1)])):
+            with self.subTest(target=target):
+                source = (
+                    "FATE_LIBAVUTIL += fate-old\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    "FATE_FFMPEG := $(FATE_FFMPEG)\n"
+                    "FATE_LIBAVUTIL += fate-new\n"
+                    f"fate-{target}: CMD = run libavutil/tests/{target}\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], expected)
+                if findings:
+                    self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_opaque_or_scoped_self_reads_keep_deferred_references(self) -> None:
+        """Opaque, conditional, recursive, append and define self reads preserve deferred edges."""
+        for assignment in (
+            "FATE_FFMPEG := $(filter fate-%,$(FATE_FFMPEG))\n",
+            "FATE_FFMPEG := $(FATE_FFMPEG:fate-%=fate-%)\n",
+            "FATE_FFMPEG := $(FATE_FFMPEG) $(OTHER:%=%)\n",
+            "ifeq (x,y)\nFATE_FFMPEG := $(FATE_FFMPEG)\nendif\n",
+            "FATE_FFMPEG = $(FATE_FFMPEG)\n",
+            "FATE_FFMPEG += $(FATE_FFMPEG)\n",
+            "define AGG\nFATE_FFMPEG := $(FATE_FFMPEG)\nendef\n",
+        ):
+            with self.subTest(assignment=assignment):
+                source = (
+                    "FATE_LIBAVUTIL += fate-old\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    + assignment
+                    + "FATE_LIBAVUTIL += fate-new\nfate-new: CMD = run libavutil/tests/new\n"
+                )
+                number = len(source.splitlines()) - 1
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", number)])
+
+    def test_plain_immediate_self_read_keeps_unresolved_references(self) -> None:
+        """Immediate self snapshots retain names not yet defined as deferred references."""
+        source = (
+            "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+            "FATE_FFMPEG := $(FATE_FFMPEG)\n"
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 3)])
+        self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
 
     def test_immediate_indirect_self_read_preserves_chain(self) -> None:
         """A replacing read through another variable keeps the destination's original entries."""
