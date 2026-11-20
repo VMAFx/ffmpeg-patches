@@ -9,7 +9,7 @@ set -euo pipefail
 
 git init -q ffmpeg
 git -C ffmpeg remote add origin "$FFMPEG_REMOTE"
-git -C ffmpeg fetch -q --depth=1 origin \
+git -C ffmpeg fetch -q --no-tags --depth=1 origin \
   "refs/tags/${FFMPEG_TAG}:refs/tags/${FFMPEG_TAG}"
 actual=$(git -C ffmpeg rev-parse --verify "refs/tags/${FFMPEG_TAG}^{commit}")
 if [ "$actual" != "$FFMPEG_COMMIT" ]; then
