@@ -1944,8 +1944,10 @@ class DocReferenceTest(unittest.TestCase):
                 "doc/encoders.texi", text.splitlines(), {12}, libraries
             ),
             [
-                "doc/encoders.texi:12: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the Metal formats section names Metal"
+                (
+                    "doc/encoders.texi:12: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the Metal formats section names Metal"
+                )
             ],
         )
 
@@ -1954,8 +1956,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(REFERENCE_TEXT),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom-av1 section names libaom"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
             ],
         )
 
@@ -1974,9 +1978,11 @@ class DocReferenceTest(unittest.TestCase):
                 self.assertEqual(
                     self.findings(text),
                     [
-                        "doc/encoders.texi:11: the libsvtav1 text defers to "
-                        "@ref{libaom-av1-qpfile}, "
-                        "whose item in the libaom-av1 section names libaom"
+                        (
+                            "doc/encoders.texi:11: the libsvtav1 text defers to "
+                            "@ref{libaom-av1-qpfile}, "
+                            "whose item in the libaom-av1 section names libaom"
+                        )
                     ],
                 )
 
@@ -1987,8 +1993,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom+ section names libaom+"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom+ section names libaom+"
+                )
             ],
         )
 
@@ -2005,8 +2013,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom section names libaom"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom section names libaom"
+                )
             ],
         )
 
@@ -2024,8 +2034,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text, {13}),
             [
-                "doc/encoders.texi:13: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom-av1 section names libaom"
+                (
+                    "doc/encoders.texi:13: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
             ],
         )
 
@@ -2038,8 +2050,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom-av1 section names libaom"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
             ],
         )
 
@@ -2058,8 +2072,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text, {12}),
             [
-                "doc/encoders.texi:12: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom-av1 section names libaom"
+                (
+                    "doc/encoders.texi:12: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
             ],
         )
 
@@ -2091,8 +2107,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text, {14}),
             [
-                "doc/encoders.texi:14: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom-av1 section names libaom"
+                (
+                    "doc/encoders.texi:14: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
             ],
         )
 
@@ -2106,8 +2124,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text, {15}),
             [
-                "doc/encoders.texi:15: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom-av1 section names libaom"
+                (
+                    "doc/encoders.texi:15: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
             ],
         )
 
@@ -2122,8 +2142,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the LIBAOM-AV1 section names LIBAOM"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the LIBAOM-AV1 section names LIBAOM"
+                )
             ],
         )
 
@@ -2139,8 +2161,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom: section names libaom"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom: section names libaom"
+                )
             ],
         )
 
@@ -2169,8 +2193,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings(text),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the VAAPI encoders section names VAAPI"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the VAAPI encoders section names VAAPI"
+                )
             ],
         )
 
@@ -2192,8 +2218,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings("\n".join(lines)),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom-av1 section names libaom"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
             ],
         )
 
@@ -2204,8 +2232,10 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(
             self.findings("\n".join(lines)),
             [
-                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
-                "whose item in the libaom-av1 section names libaom"
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
             ],
         )
 
@@ -2617,8 +2647,10 @@ class DocReferenceTest(unittest.TestCase):
             ("VAAPI encoders", {"VAAPI"}),
             ("libaom Decoders", {"libaom"}),
             (
-                "and encoder encoders decoder decoders muxer muxers demuxer demuxers "
-                "filter filters device devices codec codecs options",
+                (
+                    "and encoder encoders decoder decoders muxer muxers demuxer demuxers "
+                    "filter filters device devices codec codecs options"
+                ),
                 set(),
             ),
         ):
