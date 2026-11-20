@@ -610,8 +610,8 @@ def _c_splice_lines(source: str) -> tuple[str, list[int]]:
     return "".join(parts), offsets
 
 
-def _c_mask_noncode(source: str) -> tuple[list[str], set[int], list[str]]:
-    """Mask logical noncode and track comment prefixes and spanning block comments."""
+def _c_mask_noncode(source: str, code_splices: set[int]) -> tuple[list[str], set[int], list[str]]:
+    """Mask logical noncode and exclude splices strictly inside comments and literals."""
     parts: list[str] = []
     prefixes: list[str] = []
     spanning: set[int] = set()
@@ -619,6 +619,7 @@ def _c_mask_noncode(source: str) -> tuple[list[str], set[int], list[str]]:
     matches = list(C_NONCODE.finditer(source))
     for index in range(len(matches)):
         match = matches[index]
+        code_splices.difference_update(range(match.start() + 1, match.end()))
         prefix = source[offset : match.start()]
         parts.append(prefix)
         prefixes.append(prefix)
@@ -635,21 +636,40 @@ def _c_mask_noncode(source: str) -> tuple[list[str], set[int], list[str]]:
     return "".join(parts).split("\n"), spanning, "".join(prefixes).split("\n")
 
 
-def _c_lex_lines(source: str) -> tuple[list[str], list[str]]:
-    """Classify phase-2 logical text and project code masks onto original physical lines."""
+def _c_code_splices(logical: str, offsets: list[int]) -> set[int]:
+    """Locate removed splice runs between two non-blank logical bytes via the phase-2 map."""
+    blanks = " \t\f\v\r\n"
+    return {
+        index
+        for index in range(1, len(offsets))
+        if offsets[index] > offsets[index - 1] + 1
+        and logical[index - 1] not in blanks
+        and logical[index] not in blanks
+    }
+
+
+def _c_lex_lines(source: str, reject_token_splices: bool = False) -> tuple[list[str], list[str]]:
+    """Project phase-2 code masks onto physical lines and optionally reject code-token splices."""
     logical, offsets = _c_splice_lines(source)
-    code, spanning, prefixes = _c_mask_noncode(logical)
+    splices = _c_code_splices(logical, offsets) if reject_token_splices else set()
+    code, spanning, prefixes = _c_mask_noncode(logical, splices)
     directives: list[str] = []
     continued = False
+    offset = 0
     for index in range(len(code)):
+        end = offset + len(code[index])
         starts = code[index].lstrip(" \t\r\v\f").startswith("#") and prefixes[index].lstrip(
             " \t\r\v\f"
         ).startswith("#")
         if continued or starts:
+            splices.difference_update(range(offset, end + 1))
             if not continued:
                 directives.append(code[index])
             continued = index in spanning
             code[index] = " " * len(code[index])
+        offset = end + 1
+    if splices:
+        raise ValueError("line splice inside code between two non-blank bytes is not supported")
     masked = "\n".join(code)
     physical = list(re.sub(r"[^\r\n]", " ", source))
     for index in range(len(offsets)):
@@ -2434,15 +2454,16 @@ def _c_rules_report(
 
 
 def _c_rules_read_source(path: Path) -> bytes:
-    """Read source bytes and reject unsupported bare CR line endings before lexing."""
+    """Read source bytes, rejecting bare CR line endings and unsupported code-token splices."""
     source = path.read_bytes()
     if re.search(rb"\r(?!\n)", source):
         raise ValueError("bare CR line endings are not supported")
+    _c_lex_lines(source.decode("latin-1"), reject_token_splices=True)
     return source
 
 
 def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
-    """Discover contained attributes, rejecting escapes and unsupported bare CR headers."""
+    """Discover contained attributes, rejecting escapes and unsupported source syntax."""
     header = tree / "libavutil/attributes.h"
     if not _c_rules_inside(header, tree):
         return set(), [
@@ -2516,7 +2537,7 @@ def _c_rules_inside(path: Path, root: Path) -> bool:
 
 
 def _c_rules_copy_source(source: Path, target: Path, attributes: set[bytes]) -> str:
-    """Copy supported source bytes or retain unread links, returning a bare CR reason."""
+    """Copy supported bytes or retain unread links, returning an unsupported-syntax reason."""
     try:
         content = _c_rules_read_source(source)
     except OSError:
@@ -2531,7 +2552,7 @@ def _c_rules_copy_source(source: Path, target: Path, attributes: set[bytes]) -> 
 def _c_rules_scan_root(
     tree: Path, paths: list[str], directory: str
 ) -> tuple[Path, list[str], list[str]]:
-    """Copy contained supported files, skipping directories, bare CR sources and escapes."""
+    """Copy contained supported files, skipping directories, unsupported syntax and escapes."""
     attributes, notices = _c_rules_attributes(tree)
     root = Path(directory) / "sources"
     root.mkdir()
@@ -2563,7 +2584,7 @@ def _c_rules_scan_root(
 
 
 def _c_rules_unread_source(path: Path) -> bool:
-    """Classify directories and unsupported bare CR sources for existing unread waivers."""
+    """Classify directories and unsupported source syntax for existing unread waivers."""
     if path.is_dir():
         return True
     try:
@@ -2578,7 +2599,7 @@ def _c_rules_unread_source(path: Path) -> bool:
 def _c_rules_file_paths(
     tree: Path, paths: list[str], escaped: list[str], unread_paths: list[str]
 ) -> list[str]:
-    """Exclude escaped paths and record directories and bare CR sources as unread."""
+    """Exclude escaped paths and record directories and unsupported source syntax as unread."""
     paths = [path for path in paths if path not in escaped]
     unread_paths.extend(path for path in paths if _c_rules_unread_source(tree / path))
     return [path for path in paths if path not in unread_paths]

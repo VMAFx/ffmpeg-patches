@@ -3595,6 +3595,148 @@ class CRulesScratchTest(FixtureTest):
             [index for index, byte in enumerate(source) if byte in (10, 13)],
         )
 
+    def _r6_assert_unread(self, source: bytes, waived: bool = False) -> None:
+        """Require token splices to use the exact existing unread and dated-waiver report."""
+        name = "libavfilter/vf_x.c"
+        waiver = upstream_lint.UnreadWaiver(name, "fixture", "B", date(2026, 11, 23), False)
+        step, copies = self._r5_scan(source, (waiver,) if waived else ())
+        reason = "line splice inside code between two non-blank bytes is not supported"
+        self.assertEqual(step.rc, 0 if waived else 1, step.output)
+        self.assertEqual(copies, {})
+        self.assertEqual(step.output.count(reason), 1)
+        self.assertEqual(step.output.count(name), 3)
+        self.assertIn(f"informational: {name}: {reason}", step.output)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"{'waived' if waived else 'no waiver'}: {name}:", step.output)
+        self.assertNotIn("finding:", step.output)
+
+    def _r6_assert_scanned(self, source: bytes, line: int, path_count: int = 1) -> None:
+        """Require boundary controls to retain the exact scratch bytes and physical finding."""
+        step, copies = self._r5_scan(source)
+        self._r5_assert_copy(source, copies)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"finding: libavfilter/vf_x.c:{line}:", step.output)
+        self.assertEqual(step.output.count("finding:"), 1)
+        self.assertEqual(step.output.count("libavfilter/vf_x.c"), path_count)
+        self.assertNotIn("unread:", step.output)
+        self.assertNotIn("line splice inside code", step.output)
+
+    def test_r6_identifier_splice(self) -> None:
+        """The review's LF-split allocator is unread instead of silently hiding its finding."""
+        source = self._r5_allocation().replace(b"av_malloc(", b"av_mal\\\nloc(")
+        self._r6_assert_unread(source)
+
+    def test_r6_identifier_crlf(self) -> None:
+        """The review's CRLF-split allocator is unread with the same exact diagnostic."""
+        source = self._r5_allocation().replace(b"av_malloc(", b"av_mal\\\r\nloc(")
+        self._r6_assert_unread(source)
+
+    def test_r6_two_splices(self) -> None:
+        """The review's adjacent splice run is checked across both removed newlines."""
+        source = self._r5_allocation().replace(b"av_malloc(", b"av_mal\\\n\\\nloc(")
+        self._r6_assert_unread(source)
+
+    def test_r6_code_token_boundaries(self) -> None:
+        """Non-blank code splices also fail closed beside operators and noncode boundaries."""
+        for suffix in (b"a+\\\nb;\n", b'"a"\\\n"b";\n', b"/* end */\\\nint x;\n"):
+            with self.subTest(suffix=suffix):
+                self._r6_assert_unread(self._r5_allocation() + suffix)
+
+    def test_r6_token_splices_waived(self) -> None:
+        """A live dated unread waiver applies to each of the three split allocator shapes."""
+        for splice in (b"\\\n", b"\\\r\n", b"\\\n\\\n"):
+            with self.subTest(splice=splice):
+                source = self._r5_allocation().replace(b"av_malloc(", b"av_mal" + splice + b"loc(")
+                self._r6_assert_unread(source, waived=True)
+
+    def test_r6_attributes_token_splice(self) -> None:
+        """An incidental header with a code-token splice contributes no words and is named once."""
+        reason = "line splice inside code between two non-blank bytes is not supported"
+        for splice in (b"\\\n", b"\\\r\n", b"\\\n\\\n"):
+            with self.subTest(splice=splice):
+                header = b"#define av_malloc\nint sp" + splice + b"lit;\n"
+                (self.root / "libavutil/attributes.h").write_bytes(header)
+                self.assertEqual(
+                    upstream_lint._c_rules_attributes(self.root),
+                    (set(), [f"informational: libavutil/attributes.h: {reason}"]),
+                )
+                step, copies = self._r5_scan(self._r5_allocation())
+                self._r5_assert_copy(self._r5_allocation(), copies)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(step.output.count("libavutil/attributes.h"), 1)
+                self.assertEqual(step.output.count(reason), 1)
+                self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1)
+                self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
+
+    def test_r6_requested_header_token_splice(self) -> None:
+        """A requested unsupported header uses unread waivers without duplicating its reason."""
+        name = "libavutil/attributes.h"
+        reason = "line splice inside code between two non-blank bytes is not supported"
+        (self.root / name).write_bytes(b"#define av_fixture_tag\nint sp\\\nlit;\n")
+        waiver = upstream_lint.UnreadWaiver(name, "fixture", "B", date(2026, 11, 23), False)
+        for unread in ((), (waiver,)):
+            with self.subTest(unread=unread):
+                step, copies = self._r5_scan(b"int clean;\n", unread, header_requested=True)
+                self.assertEqual(step.rc, 0 if unread else 1, step.output)
+                self.assertEqual(copies, {"libavfilter/vf_x.c": b"int clean;\n"})
+                self.assertEqual(step.output.count(name), 3)
+                self.assertEqual(step.output.count(reason), 1)
+                self.assertIn(f"unread: {name}:", step.output)
+                self.assertIn(f"{'waived' if unread else 'no waiver'}: {name}:", step.output)
+
+    def test_r6_boundary_code_blank_before(self) -> None:
+        """Boundary control: a blank before a code splice preserves bytes and findings."""
+        source = self._r5_allocation().replace(
+            b"    if (!buffer)", b"    a + \\\nb;\n    if (!buffer)"
+        )
+        self._r6_assert_scanned(source, 3)
+
+    def test_r6_boundary_code_blank_after(self) -> None:
+        """Boundary control: a blank after a code splice preserves bytes and findings."""
+        source = self._r5_allocation().replace(
+            b"    if (!buffer)", b"    a +\\\n b;\n    if (!buffer)"
+        )
+        self._r6_assert_scanned(source, 3)
+
+    def test_r6_boundary_string_splice(self) -> None:
+        """Boundary control: a token splice inside a string literal remains supported."""
+        source = b'const char *s = "av_fix\\\nture_tag";\n' + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_character_splice(self) -> None:
+        """Boundary control: a splice inside a character literal remains supported."""
+        source = b"int c = 'a\\\n';\n" + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_block_comment_splice(self) -> None:
+        """Boundary control: a token splice inside a block comment remains supported."""
+        source = b"/* av_fix\\\nture_tag */\n" + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_define_splice(self) -> None:
+        """Boundary control: a token splice inside a multiline define remains supported."""
+        source = b"#define KEEP av_fix\\\nture_tag\n" + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_backslash_eof(self) -> None:
+        """Boundary control: a final backslash without a newline is not a splice."""
+        source = self._r5_allocation() + b"#define KEEP av_fixture_tag \\"
+        self._r6_assert_scanned(source, 3)
+
+    def test_r6_boundary_splice_eof(self) -> None:
+        """Boundary control: a splice at EOF has no following byte and stays supported."""
+        source = self._r5_allocation() + b"#define KEEP av_fixture_tag \\\n"
+        self._r6_assert_scanned(source, 3)
+
+    def test_r6_boundary_splice_offset_zero(self) -> None:
+        """Boundary control: the review's leading splice has no preceding byte."""
+        source = b"\\\n/* prefix */ #define KEEP av_fixture_tag\n" + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_unsplit_allocation(self) -> None:
+        """Boundary control: an unsplit allocation reports the line-three finding and rc one."""
+        self._r6_assert_scanned(self._r5_allocation(), 3)
+
     def test_r5_split_comment_opener(self) -> None:
         """Phase 2 hides commented allocation definitions across repeated LF and CRLF splices."""
         for newline in (b"\n", b"\r\n"):
