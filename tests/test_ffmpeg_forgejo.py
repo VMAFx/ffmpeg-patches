@@ -21,7 +21,7 @@ import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 
-from scripts import review_classes
+from scripts import review_classes, unit_test_budget
 from tests.helpers import isolated_git_environment
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -5558,6 +5558,15 @@ class ReplyMutantTest(unittest.TestCase):
             (ReplyTest, "test_reply_stored_with_another_range_fails_read_back"),
             "reply read-back ignores the line range",
         )
+
+
+def load_tests(
+    loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None
+) -> unittest.TestSuite:
+    """Schedule independent methods separately without changing test IDs or bodies."""
+    # No module/class fixtures: each method owns its scratch tree and HTTP server.
+    # Singleton suites let --level class preserve class fixtures in other modules.
+    return unit_test_budget.individual_test_suites(tests)
 
 
 if __name__ == "__main__":
