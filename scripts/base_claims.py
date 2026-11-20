@@ -154,14 +154,13 @@ def _dependency_attribution_error(sentence: str, first: re.Match[str], end: int)
 
 
 def _reject_hidden_dependency_members(
-    sentence: str, first: re.Match[str], start: int, end: int
+    sentence: str, first: re.Match[str], end: int, parsed_starts: set[int]
 ) -> None:
-    """Reject separator-led members in the unparsed tail of any dependency list."""
-    if any(
-        DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
-        for separator in DEPENDENCY_SEPARATOR.finditer(sentence, start, end)
-    ):
-        raise _dependency_attribution_error(sentence, first, end)
+    """Reject separator-led members anywhere in the window unless already parsed."""
+    for separator in DEPENDENCY_SEPARATOR.finditer(sentence, first.end(), end):
+        member = DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
+        if member is not None and member.start() not in parsed_starts:
+            raise _dependency_attribution_error(sentence, first, end)
 
 
 def _dependency_member_heads(
@@ -189,7 +188,7 @@ def _reject_unpaired_dependency_heads(
 
 
 def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]]:
-    """Yield grammar spans, rejecting hidden tail members and unpaired member-owned heads."""
+    """Yield grammar spans, rejecting hidden window members and unpaired member-owned heads."""
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
     for index, first in enumerate(references):
         end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
@@ -205,7 +204,8 @@ def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]
             if following is None:
                 break
             reference = following
-        _reject_hidden_dependency_members(sentence, first, members[-1][1], end)
+        parsed_starts = {reference.start() for reference, _ in members[1:]}
+        _reject_hidden_dependency_members(sentence, first, end, parsed_starts)
         if len(members) == 1:
             members[0] = (members[0][0], end)
         _reject_unpaired_dependency_heads(sentence, members, end)

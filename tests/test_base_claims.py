@@ -638,6 +638,71 @@ class BaseClaimsTest(unittest.TestCase):
                 self.assertIn("#13", err)
                 self.assertEqual(stdout.getvalue(), "")
 
+    def test_dependency_list_first_annotation_rejects_hidden_word_members(self) -> None:
+        """Word-form members inside the first annotation cannot be silently discarded."""
+        for annotation in (
+            "(head aaaaaaa, and PR 13 head bbbbbbb)",
+            "(head aaaaaaa, PR 13 head bbbbbbb)",
+            "[head aaaaaaa, and pull request 13 head bbbbbbb]",
+            "(head aaaaaaa, and PR 13)",
+        ):
+            with (
+                self.subTest(annotation=annotation),
+                self.assertRaisesRegex(ValueError, r"#12.*#13"),
+            ):
+                base_claims.find_dependency_claims(f"Depends on #12 {annotation}.")
+
+    def test_dependency_cli_first_annotation_rejects_hidden_word_members(self) -> None:
+        """Both modes reject hidden first-annotation members with empty stdout."""
+        dependency = self.dependency_json()
+        options = [
+            arg for number in (12, 13) for arg in ("--dependency-json", f"{number}={dependency}")
+        ]
+        for annotation in (
+            "(head aaaaaaa, and PR 13 head bbbbbbb)",
+            "(head aaaaaaa, PR 13 head bbbbbbb)",
+            "[head aaaaaaa, and pull request 13 head bbbbbbb]",
+            "(head aaaaaaa, and PR 13)",
+        ):
+            body = self.write_fixture("body.md", f"Depends on #12 {annotation}.")
+            for flags in ((), ("--list-dependencies",)):
+                with self.subTest(annotation=annotation, flags=flags):
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        rc, err = self.run_cli(
+                            "--merge-base", MERGE_BASE, *options, *flags, str(body)
+                        )
+                    self.assertEqual(rc, 2)
+                    self.assertRegex(err, r"#12.*#13")
+                    self.assertEqual(stdout.getvalue(), "")
+
+    def test_dependency_list_later_annotation_rejects_hidden_word_member(self) -> None:
+        """A word-form member hidden in a later annotation names all window references."""
+        text = "Depends on #12 (head aaaaaaa), #13 (head bbbbbbb, and PR 14 head ccccccc)."
+        with self.assertRaisesRegex(ValueError, r"#12.*#13.*#14"):
+            base_claims.find_dependency_claims(text)
+
+    def test_dependency_cli_later_annotation_rejects_hidden_word_member(self) -> None:
+        """Both modes reject hidden later-annotation members with empty stdout."""
+        body = self.write_fixture(
+            "body.md",
+            "Depends on #12 (head aaaaaaa), #13 (head bbbbbbb, and PR 14 head ccccccc).",
+        )
+        dependency = self.dependency_json()
+        options = [
+            arg
+            for number in (12, 13, 14)
+            for arg in ("--dependency-json", f"{number}={dependency}")
+        ]
+        for flags in ((), ("--list-dependencies",)):
+            with self.subTest(flags=flags):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc, err = self.run_cli("--merge-base", MERGE_BASE, *options, *flags, str(body))
+                self.assertEqual(rc, 2)
+                self.assertRegex(err, r"#12.*#13.*#14")
+                self.assertEqual(stdout.getvalue(), "")
+
     def test_dependency_list_truncated_middle_member_rejects_hidden_tail(self) -> None:
         """A truncated multi-member list rejects later members with their full attribution."""
         for annotation in (": aaaaaaa", " ~ previous head aaaaaaa"):
