@@ -910,6 +910,90 @@ class FateShapeTest(unittest.TestCase):
                         [("registration", number)] if retained and position == "between" else [],
                     )
 
+    def test_immediate_aggregation_snapshots_prior_entries(self) -> None:
+        """Immediate reads retain prior entries without following later source appends."""
+        for target, expected in (("new", []), ("old", [("registration", 1)])):
+            with self.subTest(target=target):
+                source = (
+                    "FATE_LIBAVUTIL += fate-old\n"
+                    "FATE_FFMPEG := $(FATE_LIBAVUTIL)\n"
+                    "FATE_LIBAVUTIL += fate-new\n"
+                    f"fate-{target}: CMD = run libavutil/tests/{target}\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], expected)
+                if findings:
+                    self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+                self.assertNotIn(
+                    "FATE_FFMPEG",
+                    upstream_lint._fate_shape_graph([source]).get("FATE_LIBAVUTIL", set()),
+                )
+                self.assertEqual(self.findings(source + "FATE_FFMPEG =\n"), [])
+        source = (
+            "FATE_LIBAVUTIL += fate-old\n"
+            "FATE_FFMPEG := $(FATE_LIBAVUTIL)\n"
+            "OTHER = $(FATE_LIBAVUTIL)\n"
+            "DEFERRED = $(OTHER)\n"
+            "fate-old: CMD = run libavutil/tests/old\n"
+        )
+        findings = self.findings(source, ffmpeg={"FATE_FFMPEG", "DEFERRED"})
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+
+    def test_immediate_aggregation_resolves_transitive_entries(self) -> None:
+        """Immediate reads resolve current transitive values and terminate reference cycles."""
+        for middle, operator, expected in (
+            ("MIDDLE = $(FATE_LIBAVUTIL)\n", ":=", [("registration", 1)]),
+            ("MIDDLE = $(FATE_LIBAVUTIL)\n", "=", []),
+            ("MIDDLE := $(FATE_LIBAVUTIL)\n", ":=", [("registration", 1)]),
+            ("INNER = $(FATE_LIBAVUTIL)\nMIDDLE = $(INNER)\n", ":=", [("registration", 1)]),
+            ("MIDDLE = $(sort $(FATE_LIBAVUTIL))\n", ":=", []),
+        ):
+            with self.subTest(middle=middle, operator=operator):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\n"
+                    + middle
+                    + f"FATE_FFMPEG {operator} $(MIDDLE)\n"
+                    + "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], expected)
+                if findings:
+                    self.assertIn("FATE_LIBAVUTIL", findings[0].message)
+                    self.assertIn("MIDDLE -> FATE_FFMPEG", findings[0].message)
+        self.assertEqual(self.findings("A = $(B)\nB = $(A)\nFATE_FFMPEG := $(A)\n"), [])
+        source = (
+            "MIDDLE := $(FATE_LIBAVUTIL)\n"
+            "FATE_LIBAVUTIL += fate-x\n"
+            "FATE_FFMPEG := $(MIDDLE)\n"
+            "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 2)])
+        self.assertIn("FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG", findings[0].message)
+
+    def test_simple_append_snapshots_prior_entries(self) -> None:
+        """Appends expand immediately only for destinations retaining the simple flavor."""
+        for prefix, expected in (
+            ("FATE_FFMPEG :=\n", [("registration", 1)]),
+            ("FATE_FFMPEG =\n", []),
+            ("", []),
+            ("FATE_FFMPEG :=\ndefine RESET\nFATE_FFMPEG =\nendef\n", [("registration", 1)]),
+            ("FATE_FFMPEG =\ndefine RESET\nFATE_FFMPEG :=\nendef\n", []),
+            ("FATE_FFMPEG :=\nFATE_FFMPEG =\n", []),
+            ("FATE_FFMPEG =\nFATE_FFMPEG :=\n", [("registration", 1)]),
+        ):
+            with self.subTest(prefix=prefix):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\n"
+                    + prefix
+                    + "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    + "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], expected)
+                if findings:
+                    self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
     def test_graph_define_replacements_keep_registration(self) -> None:
         """Replacements in define bodies preserve earlier aggregation references."""
         source = (

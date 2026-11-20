@@ -1636,8 +1636,10 @@ def _fate_shape_scope(kind: str, depth: int, defines: int) -> tuple[int, int]:
     return depth, defines
 
 
-def _fate_shape_assignments(lines: list[FateLine]) -> list[tuple[str, str, str, bool, FateLine]]:
-    """Share raw destinations, operators and unscoped non-self replacement decisions."""
+def _fate_shape_assignments(
+    lines: list[FateLine],
+) -> list[tuple[str, str, str, bool, bool, FateLine]]:
+    """Share raw assignments, replacement decisions and define-body flavor boundaries."""
     assignments, depth, defines = [], 0, 0
     for line in lines:
         depth, defines = _fate_shape_scope(_fate_kind(line)[0], depth, defines)
@@ -1651,29 +1653,102 @@ def _fate_shape_assignments(lines: list[FateLine]) -> list[tuple[str, str, str, 
             and not defines
             and not _fate_shape_self_reference(_fate_shape_normalize(destination), assignment[3])
         )
-        assignments.append((destination, assignment[2], assignment[3], replaces, line))
+        assignments.append((destination, assignment[2], assignment[3], replaces, not defines, line))
     return assignments
 
 
-def _fate_shape_source_references(source: str) -> dict[str, set[str]]:
-    """Clear edges only for the same raw destination using shared replacement decisions."""
-    references: dict[str, set[str]] = {}
-    for destination, _, value, replaces, _ in _fate_shape_assignments(_fate_lines(source)):
-        if replaces:
-            references[destination] = set()
-        references.setdefault(destination, set()).update(
-            _fate_shape_normalize(name) for name in _fate_shape_references(value)
+@dataclass
+class _FateShapeEntry:
+    """Keep a registration's original line and its captured aggregation path."""
+
+    variable: str
+    targets: list[str]
+    line: FateLine
+    chain: list[str]
+
+
+@dataclass
+class _FateShapeState:
+    """Hold one raw destination's flavor, deferred references and current entries."""
+
+    flavor: str = ""
+    references: set[str] = field(default_factory=set)
+    entries: list[_FateShapeEntry] = field(default_factory=list)
+
+
+def _fate_shape_snapshot(
+    destination: str, value: str, states: dict[str, _FateShapeState]
+) -> tuple[set[str], list[_FateShapeEntry]]:
+    """Capture current transitive entries with a visited worklist and an edge-count bound."""
+    pending = [
+        (name, [_fate_shape_normalize(destination)]) for name in _fate_shape_references(value)
+    ]
+    references, entries, visited = set(), [], set()
+    bound = len(pending) + sum(len(state.references) for state in states.values())
+    for _ in range(bound):
+        if not pending:
+            break
+        name, tail = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        state = states.get(name)
+        if state is None:
+            references.add(name)
+            continue
+        entries.extend(
+            _FateShapeEntry(entry.variable, entry.targets, entry.line, [*entry.chain, *tail])
+            for entry in state.entries
         )
-    return references
+        pending.extend(
+            (reference, [_fate_shape_normalize(name), *tail])
+            for reference in sorted(state.references)
+        )
+    return references, entries
+
+
+def _fate_shape_flavor(operator: str, previous: str) -> str:
+    """Determine the new flavor for an assignment outside a define body."""
+    if operator == "+=":
+        return previous or "recursive"
+    return "simple" if operator == ":=" else "recursive"
+
+
+def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
+    """Evaluate raw destinations once in order, sharing snapshots and deferred edges."""
+    states: dict[str, _FateShapeState] = {}
+    for destination, operator, value, replaces, outside, line in _fate_shape_assignments(lines):
+        state = states.get(destination, _FateShapeState())
+        immediate = operator == ":=" or (operator == "+=" and state.flavor == "simple")
+        references, entries = (
+            _fate_shape_snapshot(destination, value, states)
+            if immediate
+            else (set(_fate_shape_references(value)), [])
+        )
+        if replaces:
+            state.references, state.entries = set(), []
+        state.references.update(references)
+        state.entries.extend(entries)
+        variable, targets = _fate_shape_registration(line)
+        if targets:
+            state.entries.append(
+                _FateShapeEntry(variable, targets, line, [_fate_shape_normalize(variable)])
+            )
+        if outside:
+            state.flavor = _fate_shape_flavor(operator, state.flavor)
+        states[destination] = state
+    return states
 
 
 def _fate_shape_graph(sources: list[str]) -> dict[str, set[str]]:
-    """Normalize and union per-source edges after raw-destination replacements."""
+    """Normalize and union deferred edges from the shared in-source evaluator."""
     graph: dict[str, set[str]] = {}
     for source in sources:
-        for destination, references in _fate_shape_source_references(source).items():
-            for name in references:
-                graph.setdefault(name, set()).add(_fate_shape_normalize(destination))
+        for destination, state in _fate_shape_evaluate(_fate_lines(source)).items():
+            for name in state.references:
+                graph.setdefault(_fate_shape_normalize(name), set()).add(
+                    _fate_shape_normalize(destination)
+                )
     return graph
 
 
@@ -1695,32 +1770,9 @@ def _fate_shape_chain(variable: str, graph: dict[str, set[str]], ffmpeg: set[str
     return []
 
 
-def _fate_shape_captured_registrations(
-    value: str, registrations: dict[str, list[tuple[str, list[str], FateLine]]]
-) -> set[int]:
-    """Identify existing literal registration lines read by an immediate assignment."""
-    return {
-        entry[2].first
-        for name in _fate_shape_references(value)
-        for entry in registrations.get(name, [])
-    }
-
-
-def _fate_shape_live_registrations(lines: list[FateLine]) -> list[tuple[str, list[str], FateLine]]:
-    """Replace same-spelling appends except registrations already captured by immediate reads."""
-    registrations: dict[str, list[tuple[str, list[str], FateLine]]] = {}
-    captured: set[int] = set()
-    for destination, operator, value, replaces, line in _fate_shape_assignments(lines):
-        if operator == ":=":
-            captured.update(_fate_shape_captured_registrations(value, registrations))
-        if replaces:
-            registrations[destination] = [
-                entry for entry in registrations.get(destination, []) if entry[2].first in captured
-            ]
-        variable, targets = _fate_shape_registration(line)
-        if targets:
-            registrations.setdefault(destination, []).append((variable, targets, line))
-    return [entry for entries in registrations.values() for entry in entries]
+def _fate_shape_live_registrations(lines: list[FateLine]) -> list[_FateShapeEntry]:
+    """Return literal and captured entries surviving each raw destination's replacements."""
+    return [entry for state in _fate_shape_evaluate(lines).values() for entry in state.entries]
 
 
 def _fate_shape_registrations(
@@ -1730,7 +1782,7 @@ def _fate_shape_registrations(
     graph: dict[str, set[str]],
     ffmpeg: set[str],
 ) -> list[FateShapeFinding]:
-    """Pair surviving added library registrations with their ffmpeg aggregation chains."""
+    """Report each added library registration once, joining captured and deferred paths."""
     libraries = [
         (target, library)
         for targets, command, _ in commands
@@ -1738,19 +1790,22 @@ def _fate_shape_registrations(
         for target in targets.split()
         if target.startswith("fate-")
     ]
-    findings = []
-    for variable, targets, line in _fate_shape_live_registrations(lines):
-        number = _fate_shape_added(line, added)
-        chain = _fate_shape_chain(variable, graph, ffmpeg) if number is not None else []
-        if chain:
+    findings = {}
+    for entry in _fate_shape_live_registrations(lines):
+        number = _fate_shape_added(entry.line, added)
+        route = _fate_shape_chain(entry.chain[-1], graph, ffmpeg) if number is not None else []
+        if route:
+            chain = [*entry.chain[:-1], *route]
             for target, library in libraries:
-                if target in targets:
+                if target in entry.targets:
                     message = (
-                        f"{target}: {variable}: {' -> '.join(chain)}: "
+                        f"{target}: {entry.variable}: {' -> '.join(chain)}: "
                         f"register it under the matching {library} variable"
                     )
-                    findings.append(FateShapeFinding("registration", number, message))
-    return findings
+                    findings[entry.line.first, target] = FateShapeFinding(
+                        "registration", number, message
+                    )
+    return list(findings.values())
 
 
 def _fate_shape_segments(command: str) -> list[str]:
