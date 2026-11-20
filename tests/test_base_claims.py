@@ -241,6 +241,180 @@ class BaseClaimsTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(base_claims.find_dependency_claims(text), expected)
 
+    def test_dependency_list_pairs_each_members_own_head(self) -> None:
+        """Each list reference owns only the head inside its member span."""
+        for verb in ("depends on", "stacked on", "on top of", "builds on", "based on"):
+            for reference in ("#13", "PR #13", "PR 13", "pull request #13", "pull request 13"):
+                text = f"{verb.upper()} #12 (head AAAAAAA) and {reference.upper()} (tip bbbbbbb)"
+                with self.subTest(text=text):
+                    self.assertEqual(
+                        base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+                    )
+
+    def test_dependency_comma_list_pairs_each_members_own_head(self) -> None:
+        """Comma and Oxford-comma lists pair each member with its own head."""
+        for separator in (", ", ", and "):
+            with self.subTest(separator=separator):
+                self.assertEqual(
+                    base_claims.find_dependency_claims(
+                        f"Depends on #12 (head aaaaaaa){separator}PR #13 (head bbbbbbb)"
+                    ),
+                    [(12, "aaaaaaa"), (13, "bbbbbbb")],
+                )
+
+    def test_dependency_ampersand_list_pairs_each_members_own_head(self) -> None:
+        """Ampersand lists pair each member with its own head."""
+        self.assertEqual(
+            base_claims.find_dependency_claims(
+                "Depends on #12 (head aaaaaaa) & #13 (head bbbbbbb)"
+            ),
+            [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        )
+
+    def test_dependency_list_headless_member_is_listed_without_claim(self) -> None:
+        """A headless final member is listed without borrowing another member's head."""
+        text = "Depends on #12 (head aaaaaaa) and #13"
+        self.assertEqual(base_claims.find_dependency_claims(text), [(12, "aaaaaaa")])
+        body = self.write_fixture("body.md", text)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc, err = self.run_cli("--merge-base", MERGE_BASE, "--list-dependencies", str(body))
+        self.assertEqual((rc, err, stdout.getvalue()), (0, "", "12\n13\n"))
+
+    def test_dependency_list_trailing_head_is_ambiguous(self) -> None:
+        """A lone trailing list head fails closed with numbers and repair instructions."""
+        message = (
+            r"ambiguous.*#12.*#13.*bbbbbbb.*head right after each reference"
+            r".*one dependency per sentence"
+        )
+        for separator in (" and ", ", ", ", and ", " & "):
+            with self.subTest(separator=separator), self.assertRaisesRegex(ValueError, message):
+                base_claims.find_dependency_claims(f"Depends on #12{separator}#13 (head bbbbbbb)")
+
+    def test_dependency_cli_ambiguous_list_refuses_check_and_listing(self) -> None:
+        """Both CLI modes return two and explain an ambiguous trailing list head."""
+        body = self.write_fixture("body.md", "Depends on #12 and #13 (head bbbbbbb)")
+        dependency = self.dependency_json({"head": {"sha": "b" * 40}})
+        for flags in ((), ("--list-dependencies",)):
+            with self.subTest(flags=flags):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc, err = self.run_cli(
+                        "--merge-base",
+                        MERGE_BASE,
+                        "--dependency-json",
+                        f"12={dependency}",
+                        *flags,
+                        str(body),
+                    )
+                self.assertEqual(rc, 2)
+                for detail in (
+                    "ambiguous",
+                    "#12",
+                    "#13",
+                    "bbbbbbb",
+                    "head right after each reference",
+                    "one dependency per sentence",
+                ):
+                    self.assertIn(detail, err)
+                self.assertEqual(stdout.getvalue(), "")
+
+    def test_dependency_list_headless_members_count_toward_limit(self) -> None:
+        """Every list member counts toward the shared distinct dependency limit."""
+        text = "Depends on " + ", ".join(
+            f"#{number}" for number in range(1, base_claims.MAX_DEPENDENCIES + 2)
+        )
+        message = f"more than {base_claims.MAX_DEPENDENCIES} distinct dependency PR numbers"
+        with self.assertRaisesRegex(ValueError, message):
+            base_claims.find_dependency_claims(text)
+        body = self.write_fixture("body.md", text)
+        for flags in ((), ("--list-dependencies",)):
+            with self.subTest(flags=flags):
+                rc, err = self.run_cli("--merge-base", MERGE_BASE, *flags, str(body))
+                self.assertEqual(rc, 2)
+                self.assertIn(message, err)
+
+    def test_dependency_list_lead_history_applies_to_every_member(self) -> None:
+        """Lead-clause history suppresses every member's head across list commas."""
+        for history in ("Previous", "prior", "earlier", "former", "old", "previously"):
+            for lead in (f"{history} dependency: depends on #12", f"Depends on #12 {history}"):
+                with self.subTest(lead=lead):
+                    self.assertEqual(
+                        base_claims.find_dependency_claims(
+                            f"{lead} (head aaaaaaa), #13 (head bbbbbbb)"
+                        ),
+                        [],
+                    )
+
+    def test_dependency_list_history_is_local_to_each_members_clauses(self) -> None:
+        """Member history stays local and ordinary clause breaks retain their meaning."""
+        cases = (
+            ("Depends on #12 (old head aaaaaaa), #13 (head bbbbbbb)", [(13, "bbbbbbb")]),
+            (
+                "Depends on #12 (head aaaaaaa), #13 from an earlier series (head bbbbbbb)",
+                [(12, "aaaaaaa")],
+            ),
+            (
+                "Depends on #12 (head aaaaaaa), #13 (previous head bbbbbbb, now head ccccccc)",
+                [(12, "aaaaaaa"), (13, "ccccccc")],
+            ),
+            (
+                "Previous dependency, depends on #12 (head aaaaaaa), #13 (head bbbbbbb)",
+                [(12, "aaaaaaa"), (13, "bbbbbbb")],
+            ),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(base_claims.find_dependency_claims(text), expected)
+
+    def test_dependency_cli_second_list_members_stale_head_names_its_number(self) -> None:
+        """A matching first head cannot hide a stale head belonging to the second member."""
+        body = self.write_fixture("body.md", "Depends on #12 (head bbbbbbb) and #13 (head aaaaaaa)")
+        dependency = self.dependency_json({"head": {"sha": "b" * 40}})
+        rc, err = self.run_cli(
+            "--merge-base",
+            MERGE_BASE,
+            "--dependency-json",
+            f"12={dependency}",
+            "--dependency-json",
+            f"13={dependency}",
+            str(body),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            err, f"{body}: names head aaaaaaa of #13, the live head of #13 is {'b' * 40}\n"
+        )
+
+    def test_dependency_list_stops_before_unrelated_text(self) -> None:
+        """Unrelated prose terminates list membership and its members' own head spans."""
+        text = "Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb), unrelated #14 head ccccccc"
+        self.assertEqual(
+            base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+        )
+
+    def test_dependency_list_limit_boundary_and_duplicate_members(self) -> None:
+        """Exactly the distinct limit and repeated list members remain accepted."""
+        references = [f"#{number}" for number in range(1, base_claims.MAX_DEPENDENCIES + 1)]
+        text = "Depends on " + ", ".join([*references, "#1"])
+        body = self.write_fixture("body.md", text)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc, err = self.run_cli("--merge-base", MERGE_BASE, "--list-dependencies", str(body))
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(stdout.getvalue(), "".join(f"{n}\n" for n in range(1, 9)))
+
+    def test_dependency_list_head_markers_and_parenthesized_hashes(self) -> None:
+        """List annotations accept every head marker and parenthesized uppercase hashes."""
+        for marker in ("head", "ending at", "ends at", "tip"):
+            for span in (f"{marker}: (AAAAAAA)", f"({marker}: (AAAAAAA))"):
+                with self.subTest(span=span):
+                    self.assertEqual(
+                        base_claims.find_dependency_claims(
+                            f"Depends on #12 {span}, #13 (head bbbbbbb)"
+                        ),
+                        [(12, "aaaaaaa"), (13, "bbbbbbb")],
+                    )
+
     def test_dependency_exclamation_sentence_break(self) -> None:
         """An exclamation sentence break prevents associating a later unrelated head."""
         self.assertEqual(

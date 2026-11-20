@@ -9,6 +9,8 @@ overrides the display label for FILE arguments in stale-claim diagnostics.
 Repeat --dependency-json N=PATH to supply each dependency PR's live head (no stdin).
 With --list-dependencies, print sorted unique dependency PR numbers instead of
 checking claims, after the same input and optional pull-head validation.
+Dependency lists pair each reference with its own head; an ambiguous lone
+trailing head is rejected. Headless list members still count toward the limit.
 """
 
 from __future__ import annotations
@@ -24,13 +26,23 @@ BASE_CLAIM = re.compile(
     r"\bbase\b[:\s]+(?:(?:ffmpeg|master|is|commit)\s+){0,3}([0-9a-f]{7,40})\b",
     re.IGNORECASE,
 )
+DEPENDENCY_MEMBER = re.compile(r"(?:#|PR\s+#?|pull\s+request\s+#?)([0-9]{1,7})\b", re.IGNORECASE)
 DEPENDENCY_REFERENCE = re.compile(
     r"\b(?:depends\s+on|stacked\s+on|on\s+top\s+of|builds\s+on|based\s+on)"
-    r"\s+(?:#|PR\s+#?|pull\s+request\s+#?)([0-9]{1,7})\b",
+    r"\s+" + DEPENDENCY_MEMBER.pattern,
     re.IGNORECASE,
 )
+DEPENDENCY_SEPARATOR = re.compile(r"\s*(?:,\s*(?:and\s+)?|and\s+|&\s*)", re.IGNORECASE)
 DEPENDENCY_HEAD = re.compile(
     r"\b(?:head|ending\s+at|ends\s+at|tip)\b[\s:(]*([0-9a-f]{7,40})\b", re.IGNORECASE
+)
+DEPENDENCY_ANNOTATION = re.compile(
+    r"\s*(?:[,|]\s*)?(?:[a-z]+\s+)*(?:\([^()#&;]*"
+    + DEPENDENCY_HEAD.pattern
+    + r"[^()#&;]*\)+|"
+    + DEPENDENCY_HEAD.pattern
+    + r"\)*)",
+    re.IGNORECASE,
 )
 SENTENCE_BREAK = re.compile(r"[.!?]\s|;")
 CLAUSE_BREAK = re.compile(r"[;,|()]|\.\s")
@@ -116,30 +128,112 @@ def _dependency_head_is_historical(
     )
 
 
-def _sentence_dependencies(sentence: str) -> list[tuple[int, str]]:
-    """Extract heads with history judged in the reference clause and each head's own clause."""
-    claims: list[tuple[int, str]] = []
+def _dependency_member_end(sentence: str, start: int, end: int) -> int:
+    """Consume only adjacent head annotations, leaving list separators and unrelated prose."""
+    cursor = start
+    for _ in range(end - start + 1):
+        annotation = DEPENDENCY_ANNOTATION.match(sentence, cursor, end)
+        if annotation is None:
+            break
+        cursor = annotation.end()
+    return cursor
+
+
+def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]]:
+    """Yield led reference lists with each member's own head-span endpoint."""
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
-    for index, reference in enumerate(references):
+    for index, first in enumerate(references):
         end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
-        reference_clause_start = _dependency_clause_start(sentence, 0, reference.start())
-        for head in DEPENDENCY_HEAD.finditer(sentence, reference.end(), end):
-            if _dependency_head_is_historical(sentence, reference, head, reference_clause_start):
-                continue
-            number = int(reference.group(1))
-            if number > 0:
+        reference = first
+        members = []
+        for _ in range(end - reference.end() + 1):
+            member_end = _dependency_member_end(sentence, reference.end(), end)
+            members.append((reference, member_end))
+            separator = DEPENDENCY_SEPARATOR.match(sentence, member_end, end)
+            following = (
+                DEPENDENCY_MEMBER.match(sentence, separator.end(), end) if separator else None
+            )
+            if following is None:
+                break
+            reference = following
+        if len(members) == 1:
+            members[0] = (members[0][0], end)
+        yield members
+
+
+def _reject_ambiguous_dependency_list(
+    members: list[tuple[re.Match[str], int]], heads: list[list[re.Match[str]]]
+) -> None:
+    """Reject a lone trailing head that could belong to one member or the whole list."""
+    if len(members) > 1 and heads[-1] and not any(heads[:-1]):
+        numbers = ", ".join(f"#{int(reference.group(1))}" for reference, _ in members)
+        prefix = heads[-1][0].group(1).lower()
+        raise ValueError(
+            f"ambiguous dependency heads for {numbers}: {prefix}; "
+            "write the head right after each reference or one dependency per sentence"
+        )
+
+
+def _dependency_list_claims(
+    sentence: str, members: list[tuple[re.Match[str], int]]
+) -> list[tuple[int, str | None]]:
+    """Pair member heads with local and lead history, retaining headless list numbers."""
+    heads = [
+        list(DEPENDENCY_HEAD.finditer(sentence, reference.end(), end)) for reference, end in members
+    ]
+    _reject_ambiguous_dependency_list(members, heads)
+    first = members[0][0]
+    lead_start = _dependency_clause_start(sentence, 0, first.start())
+    lead_end = heads[0][0].start(1) if heads[0] else first.end()
+    boundary = next(CLAUSE_BREAK.finditer(sentence, first.end(), lead_end), None)
+    lead = sentence[lead_start : boundary.start() if boundary else lead_end]
+    historical = HISTORY_WORDS.search(lead) or re.search(r"\bpreviously\b", lead, re.IGNORECASE)
+    claims: list[tuple[int, str | None]] = []
+    for (reference, _), member_heads in zip(members, heads, strict=True):
+        number = int(reference.group(1))
+        if number == 0:
+            continue
+        if len(members) > 1:
+            claims.append((number, None))
+        clause_start = lead_start if reference is first else reference.start()
+        for head in member_heads:
+            if not historical and not _dependency_head_is_historical(
+                sentence, reference, head, clause_start
+            ):
                 claims.append((number, head.group(1).lower()))
     return claims
 
 
-def find_dependency_claims(text: str) -> list[tuple[int, str]]:
-    """Return dependency PR numbers and head prefixes outside fences, quotes and history."""
+def _sentence_dependencies(sentence: str) -> list[tuple[int, str | None]]:
+    """Extract list members and their own heads, raising ValueError for ambiguous lists."""
     return [
+        claim
+        for members in _dependency_lists(sentence)
+        for claim in _dependency_list_claims(sentence, members)
+    ]
+
+
+def _check_dependency_count(numbers: set[int]) -> None:
+    """Reject distinct dependency member counts above the shared limit."""
+    if len(numbers) > MAX_DEPENDENCIES:
+        raise ValueError(f"more than {MAX_DEPENDENCIES} distinct dependency PR numbers")
+
+
+def _dependency_records(text: str) -> list[tuple[int, str | None]]:
+    """Collect bounded member records outside fences and quotes, rejecting ambiguous lists."""
+    records = [
         claim
         for line in _claim_lines(text)
         for sentence in SENTENCE_BREAK.split(line)
         for claim in _sentence_dependencies(sentence)
     ]
+    _check_dependency_count({number for number, _ in records})
+    return records
+
+
+def find_dependency_claims(text: str) -> list[tuple[int, str]]:
+    """Return members' own nonhistorical heads; raise ValueError on ambiguity or excess."""
+    return [(number, head) for number, head in _dependency_records(text) if head is not None]
 
 
 def stale_claims(text: str, merge_base: str) -> list[str]:
@@ -247,11 +341,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _dependency_numbers(targets: list[tuple[str, str]]) -> list[int]:
-    """Collect sorted dependency PR numbers, rejecting more than the shared limit."""
-    numbers = sorted({number for _, text in targets for number, _ in find_dependency_claims(text)})
-    if len(numbers) > MAX_DEPENDENCIES:
-        raise ValueError(f"more than {MAX_DEPENDENCIES} distinct dependency PR numbers")
-    return numbers
+    """List all member numbers, including headless members; reject ambiguity and overflow."""
+    numbers = {number for _, text in targets for number, _ in _dependency_records(text)}
+    _check_dependency_count(numbers)
+    return sorted(numbers)
 
 
 def _dependency_option(option: str) -> tuple[int, str]:
@@ -307,7 +400,7 @@ def _dependency_diagnostics(targets: list[tuple[str, str]], heads: dict[int, str
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Validate pull head and both claim kinds, or list bounded dependency PR numbers."""
+    """Check claims or list bounded dependency members, refusing ambiguous heads with rc 2."""
     args = _build_parser().parse_args(argv)
     try:
         mismatch, merge_base, targets = _load_targets(args)
