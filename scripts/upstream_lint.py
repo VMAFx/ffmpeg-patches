@@ -1781,7 +1781,7 @@ TEXI_ITEM_BLOCKS = (
     "vtable",
     "multitable",
 )
-TEXI_REF = re.compile(r"@(?:ref|xref|pxref)\{")
+TEXI_REF = re.compile(r"(?<!@)(?:@@)*(?P<reference>@(?:ref|xref|pxref)\{)")
 TEXI_COMMENT = re.compile(r"(?<!@)(?:@@)*@(?:c|comment)(?=\s|$)")
 DEFER_WORDING = re.compile(
     r"\b(?:(?:described|documented|defined|specified|explained)\s+(?:for|in|under|by|with)"
@@ -1997,14 +1997,14 @@ def _anchor_next_line(lines: list[str], start: int) -> int | None:
 
 
 def _anchor_item(lines: list[str], start: int) -> list[str]:
-    """Return an anchored item's bounded body, skipping metadata before its item line."""
+    """Return a bounded item body, skipping leading metadata and item aliases only."""
     next_line = _anchor_next_line(lines, start)
     if next_line is None:
         return []
-    first = next_line if TEXI_ITEM.match(lines[next_line]) else start + 1
+    first = next_line + 1 if TEXI_ITEM.match(lines[next_line]) else start + 1
     index = first
     for index in range(first, min(len(lines), start + 1 + ANCHOR_ITEM_LIMIT)):
-        if not TEXI_ITEM.match(lines[index]):
+        if not re.match(r"@itemx\b", lines[index]):
             break
     return _anchor_body(lines[index : index + ANCHOR_ITEM_LIMIT])
 
@@ -2103,19 +2103,21 @@ def _reference_arguments(lines: list[str], index: int, start: int) -> tuple[list
 
 
 def _item_libraries(lines: list[str], sections: list[str], source: int, target: int) -> list[str]:
-    """Match target library names case-insensitively, excluding the citing library families."""
+    """Match whole library names including plus signs, excluding citing library families."""
     body = "\n".join(_anchor_item(lines, target))
     citing = {name.split("-")[0].lower() for name in section_names(sections[source])}
     others = {
         name for name in section_names(sections[target]) if name.split("-")[0].lower() not in citing
     }
     return sorted(
-        name for name in others if re.search(rf"(?<![\w-]){re.escape(name)}\b", body, re.IGNORECASE)
+        name
+        for name in others
+        if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w+])", body, re.IGNORECASE)
     )
 
 
 def _added_references(lines: list[str], added: set[int]) -> list[tuple[int, int, list[str]]]:
-    """Collect each reference with an added line in its bounded span once."""
+    """Collect unescaped references with an added line in each bounded span once."""
     numbers = {
         start
         for number in added
@@ -2126,7 +2128,7 @@ def _added_references(lines: list[str], added: set[int]) -> list[tuple[int, int,
         for ref in TEXI_REF.finditer(lines[number - 1]):
             args, last = _reference_arguments(lines, number - 1, ref.end())
             if not added.isdisjoint(range(number, last + 1)):
-                references.append((number, ref.start(), args))
+                references.append((number, ref.start("reference"), args))
     return references
 
 

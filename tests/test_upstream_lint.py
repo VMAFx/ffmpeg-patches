@@ -1826,6 +1826,57 @@ class DocReferenceTest(unittest.TestCase):
             ],
         )
 
+    def test_escaped_reference_opener_passes(self) -> None:
+        """An escaped at-sign before a reference command makes the opener literal text."""
+        for command in ("ref", "xref", "pxref"):
+            with self.subTest(command=command):
+                text = REFERENCE_TEXT.replace("the @ref{", f"the @@{command}{{")
+                self.assertEqual(self.findings(text), [])
+
+    def test_reference_after_escaped_pair_is_found(self) -> None:
+        """An escaped at-sign pair before a real reference preserves the finding."""
+        for command in ("ref", "xref", "pxref"):
+            with self.subTest(command=command):
+                text = REFERENCE_TEXT.replace("the @ref{", f"the @@@{command}{{")
+                self.assertEqual(
+                    self.findings(text),
+                    [
+                        "doc/encoders.texi:11: the libsvtav1 text defers to "
+                        "@ref{libaom-av1-qpfile}, "
+                        "whose item in the libaom-av1 section names libaom"
+                    ],
+                )
+
+    def test_plus_library_name_is_found(self) -> None:
+        """A library name ending in plus matches its exact spelling in the item body."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom+")
+        text = text.replace("libaom reads", "libaom+ reads")
+        self.assertEqual(
+            self.findings(text),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom+ section names libaom+"
+            ],
+        )
+
+    def test_library_name_continuation_passes(self) -> None:
+        """A continued library word cannot match the shorter library heading name."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom")
+        text = text.replace("libaom reads", "libaomx reads")
+        self.assertEqual(self.findings(text), [])
+
+    def test_library_hyphen_family_is_found(self) -> None:
+        """A hyphenated family spelling still matches its library heading prefix."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom")
+        text = text.replace("libaom reads", "libaom-av1 reads")
+        self.assertEqual(
+            self.findings(text),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom section names libaom"
+            ],
+        )
+
     def test_anchor_without_table_item_passes(self) -> None:
         """An anchor followed by prose without any table item names no item."""
         text = REFERENCE_TEXT.replace("@item qpfile @var{filename}\n", "", 1)
@@ -1858,6 +1909,35 @@ class DocReferenceTest(unittest.TestCase):
                 "whose item in the libaom-av1 section names libaom"
             ],
         )
+
+    def test_adjacent_peer_item_ends_empty_body(self) -> None:
+        """A peer item immediately after the anchored item cannot supply its library."""
+        text = REFERENCE_TEXT.replace(
+            "@item qpfile @var{filename}\n", "@item qpfile @var{filename}\n@item other\n", 1
+        )
+        self.assertEqual(self.findings(text, {12}), [])
+
+    def test_item_alias_keeps_library_in_body(self) -> None:
+        """An item alias immediately after the anchored item preserves its library body."""
+        text = REFERENCE_TEXT.replace(
+            "@item qpfile @var{filename}\n", "@item qpfile @var{filename}\n@itemx qpf\n", 1
+        )
+        self.assertEqual(
+            self.findings(text, {12}),
+            [
+                "doc/encoders.texi:12: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom-av1 section names libaom"
+            ],
+        )
+
+    def test_commented_peer_item_ends_empty_body(self) -> None:
+        """A comment before a peer item cannot transfer the peer's library to the anchor."""
+        text = REFERENCE_TEXT.replace(
+            "@item qpfile @var{filename}\n",
+            "@item qpfile @var{filename}\n@c note\n@item other\n",
+            1,
+        )
+        self.assertEqual(self.findings(text, {13}), [])
 
     def test_conditional_peer_item_ends_body(self) -> None:
         """A peer item inside a conditional cannot supply the referenced item's library."""
