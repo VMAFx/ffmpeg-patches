@@ -20,7 +20,7 @@ from scripts import push_guard
 from tests.helpers import GIT_ENVIRONMENT_NAMES, capture_main
 from tests.helpers import isolated_git_environment as without_repository_variables
 
-REPOSITORY = "VMAFx/ffmpeg-patches"
+REPOSITORY = "vidiko/ffmpeg-patches"
 REMOTE = f"https://github.com/{REPOSITORY}.git"
 # GIT_CONFIG_GLOBAL needs Git 2.32 or newer.
 ISOLATED_GIT_CONFIG = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
@@ -253,8 +253,9 @@ class ConfigModeTest(unittest.TestCase):
         reader.assert_called_once_with(REPOSITORY, BRANCH)
 
     def test_repository_case_variants_keep_first_spelling(self) -> None:
-        config = {"origin": ["https://github.com/VMAFx/x", "https://github.com/vmafx/X"]}
-        self.assertEqual(push_guard.config_repositories(lambda: config), ["VMAFx/x"])
+        """Deduplicate repository case variants while preserving the first spelling."""
+        config = {"origin": ["https://github.com/vidiko/x", "https://github.com/vidiko/X"]}
+        self.assertEqual(push_guard.config_repositories(lambda: config), ["vidiko/x"])
 
     def test_repository_count_ignores_case_variants(self) -> None:
         owner = "ownername"
@@ -1263,7 +1264,7 @@ class APIReaderTest(unittest.TestCase):
             self.assertEqual(push_guard.read_pull_requests(REPOSITORY, BRANCH), "[]")
         self.assertEqual(run.call_count, 2)
         pulls_endpoint = (
-            f"repos/{REPOSITORY}/pulls?head=VMAFx:{BRANCH}"
+            f"repos/{REPOSITORY}/pulls?head={REPOSITORY.partition('/')[0]}:{BRANCH}"
             "&state=all&sort=created&direction=desc&per_page=100"
         )
         run.assert_has_calls(
@@ -1303,7 +1304,9 @@ class APIReaderTest(unittest.TestCase):
             push_guard.read_pull_requests(REPOSITORY, "fix/a&state=open#b+c")
         self.assertEqual(run.call_count, 2)
         endpoint = run.call_args_list[1].args[0][2]
-        self.assertIn("head=VMAFx:fix/a%26state%3Dopen%23b%2Bc&state=all", endpoint)
+        self.assertIn(
+            f"head={REPOSITORY.partition('/')[0]}:fix/a%26state%3Dopen%23b%2Bc&state=all", endpoint
+        )
 
     def test_fork_with_pr_in_parent(self) -> None:
         """A fork with a PR in its parent returns the parent PR response."""
