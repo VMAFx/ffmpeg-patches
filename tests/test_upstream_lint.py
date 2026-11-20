@@ -46,6 +46,10 @@ RTSP_WITH_CLOSE = (
     "}\n"
 )
 RTSP_WITHOUT_CLOSE = RTSP_WITH_CLOSE.replace("        ff_network_close();\n", "")
+FATE_FFMPEG_RULE = (
+    "$(FATE_FFMPEG) $(FATE_FFMPEG_FFPROBE) $(FATE_SAMPLES_AVCONV) "
+    "$(FATE_SAMPLES_FFMPEG) $(FATE_SAMPLES_FFMPEG_FFPROBE): ffmpeg$(PROGSSUF)$(EXESUF)\n"
+)
 FAKE_CONFIG = "repos: []\n"
 FAKE_MESSAGE = '#!/bin/sh\ngit log --format=%s "$1" | grep -Eq "^[^:]+: .+"\n'
 FAKE_PATCHECK = "#!/bin/sh\ncat > patcheck.stdout\nprintf 'patcheck fixture\\n'\n"
@@ -599,6 +603,1763 @@ FILTER_DECLARATIONS = (
     "extern const FFFilter ff_asrc_sine;\n"
     "extern const FFFilter ff_avsrc_movie;\n"
 )
+
+
+class FateShapeTest(unittest.TestCase):
+    """Plant FATE registration, shell-status and endian defects without external gates."""
+
+    def findings(
+        self,
+        source: str,
+        added: set[int] | None = None,
+        shell_grammar: bool = False,
+        graph: dict[str, set[str]] | None = None,
+        ffmpeg: set[str] | upstream_lint.FateShapeContext | None = None,
+    ):
+        """Run per-file rules with explicit aggregation, dependencies and revision commands."""
+        path = "tests/fate-run.sh" if shell_grammar else "tests/fate/shape.mak"
+        if added is None:
+            added = set(range(1, len(source.splitlines()) + 1))
+        if graph is None:
+            graph = upstream_lint._fate_shape_graph([source])
+        return upstream_lint._fate_shape_file(
+            path,
+            source,
+            added,
+            graph,
+            {"FATE_FFMPEG"} if ffmpeg is None else ffmpeg,
+        )
+
+    def fixture(
+        self, source: str = "", shell_grammar: bool = False, makefile: str | None = "default"
+    ):
+        """Commit one FATE change in the existing isolated disposable Git fixture."""
+        fixture = FixtureTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        if makefile is not None:
+            rule = "$(FATE_FFMPEG): ffmpeg$(PROGSSUF)$(EXESUF)\n"
+            fixture.write("tests/Makefile", rule if makefile == "default" else makefile)
+        if source:
+            path = "tests/fate-run.sh" if shell_grammar else "tests/fate/shape.mak"
+            fixture.write(path, source)
+            fixture.commit()
+        return fixture
+
+    def test_shell_multiline_quotes_preserve_pipe_boundaries(self) -> None:
+        """Open shell quotes span physical newlines without exposing quoted pipelines."""
+        for quote, producer in (("'", "ffmpeg"), ('"', "run")):
+            with self.subTest(quote=quote):
+                output_format = "'%s\\n'" if quote == "'" else '"%s"'
+                source = (
+                    f"printf {output_format} {quote}line one\n{producer} x | sort\nend{quote}\n"
+                )
+                self.assertEqual(self.findings(source, {2}, shell_grammar=True), [])
+        self.assertEqual(
+            self.findings("ffmpeg -i 'a\nb' -f null - | sort\n", {2}, shell_grammar=True),
+            [
+                upstream_lint.FateShapeFinding(
+                    "helper-pipe", 2, "ffmpeg: pipeline hides producer exit status"
+                )
+            ],
+        )
+        self.assertEqual(
+            self.findings("printf x\nrun x | sort\n", {2}, shell_grammar=True),
+            [
+                upstream_lint.FateShapeFinding(
+                    "helper-pipe", 2, "run: pipeline hides producer exit status"
+                )
+            ],
+        )
+        for source in (
+            "printf x 'a\\\nffmpeg x | sort\nend'\n",
+            'printf x "a\\"\nrun x | sort\nend"\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source, {2}, shell_grammar=True), [])
+
+    def test_assignment_prefixed_pipeline_producers(self) -> None:
+        """Leading shell assignments preserve producer checks and generator exemptions."""
+        for prefix, producer in (("LC_ALL=C", "ffmpeg"), ("LC_ALL=C", "run"), ("A=1 B=2", "run")):
+            for shell_grammar in (False, True):
+                with self.subTest(prefix=prefix, producer=producer, shell_grammar=shell_grammar):
+                    source = f"{prefix} {producer} x | sort\n"
+                    if not shell_grammar:
+                        source = "CMD = " + source
+                    rule = "helper-pipe" if shell_grammar else "pipe"
+                    self.assertEqual(
+                        self.findings(source, shell_grammar=shell_grammar),
+                        [
+                            upstream_lint.FateShapeFinding(
+                                rule,
+                                1,
+                                ("" if shell_grammar else "CMD: ")
+                                + f"{producer}: pipeline hides producer exit status",
+                            )
+                        ],
+                    )
+        for segment in ("LC_ALL=C printf x", "A=1 B=2", "if A=1 B=2 printf x"):
+            for shell_grammar in (False, True):
+                with self.subTest(segment=segment, shell_grammar=shell_grammar):
+                    source = ("" if shell_grammar else "CMD = ") + segment + " | sort\n"
+                    self.assertEqual(self.findings(source, shell_grammar=shell_grammar), [])
+
+    def test_format_named_pixel_formats_at_any_position(self) -> None:
+        """Named pix_fmts options count wherever they occur among format options."""
+        for options in (
+            "color_ranges=tv:pix_fmts=yuv420p10le",
+            "pix_fmts=yuv420p10le:color_ranges=tv",
+            "yuv420p10le",
+            "color_spaces=bt709:color_ranges=tv:pix_fmts=yuv420p10le",
+        ):
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.findings(f'CMD = framecrc -vf "format={options},null"\n'),
+                    [
+                        upstream_lint.FateShapeFinding(
+                            "endian",
+                            1,
+                            f"CMD: format={options}: endian format reaches consumer null",
+                        )
+                    ],
+                )
+        for options in ("color_ranges=tv", "color_spaces=bt709", "color_ranges=gray16le"):
+            with self.subTest(options=options):
+                self.assertEqual(self.findings(f'CMD = framecrc -vf "format={options},null"\n'), [])
+
+    def test_filter_options_are_whole_quoted_shell_words(self) -> None:
+        """Option text inside another shell word cannot introduce a filter graph."""
+        for option in ("-lavfi", "-vf", "-filter_complex", "-filter:v"):
+            with self.subTest(option=option):
+                source = (
+                    f'fate-x: CMD = framecrc -metadata "title=note {option} '
+                    'format=gray16le,null marker" -f lavfi -i testsrc2\n'
+                )
+                self.assertEqual(self.findings(source), [])
+                for graph in ('"format=gray16le,null"', "format=gray16le,null"):
+                    self.assertEqual(
+                        self.findings(f"CMD = framecrc {option} {graph}\n"),
+                        [
+                            upstream_lint.FateShapeFinding(
+                                "endian",
+                                1,
+                                "CMD: format=gray16le: endian format reaches consumer null",
+                            )
+                        ],
+                    )
+        self.assertEqual(self.findings("CMD = framecrc title=-vf format=gray16le,null\n"), [])
+
+    def test_literal_replacement_registrations(self) -> None:
+        """Replacement assignments register their literal targets after clearing prior values."""
+        for variable, route in (("FATE_FFMPEG", ""), ("MID", "FATE_FFMPEG += $(MID)\n")):
+            for operator in ("=", ":=", "+="):
+                with self.subTest(variable=variable, operator=operator):
+                    source = (
+                        f"{variable} {operator} fate-x\n"
+                        "fate-x: CMD = run libavutil/tests/x\n" + route
+                    )
+                    chain = variable + (" -> FATE_FFMPEG" if route else "")
+                    self.assertEqual(
+                        self.findings(source),
+                        [
+                            upstream_lint.FateShapeFinding(
+                                "registration",
+                                1,
+                                f"fate-x: {variable}: {chain}: "
+                                "register it under the matching FATE_LIBAVUTIL variable",
+                            )
+                        ],
+                    )
+        for operator in ("=", ":="):
+            with self.subTest(clearing=operator):
+                self.assertEqual(
+                    self.findings(
+                        f"FATE_FFMPEG {operator} fate-x\nFATE_FFMPEG {operator}\n"
+                        "fate-x: CMD = run libavutil/tests/x\n"
+                    ),
+                    [],
+                )
+        self.assertEqual(self.findings("fate-x: CMD = run libavutil/tests/x\n"), [])
+
+    def test_define_reference_snapshot_eligibility(self) -> None:
+        """Snapshot references from define bodies require expansion before the read."""
+        prefix = (
+            "MIDDLE :=\ndefine ADD\nMIDDLE += $(FATE_LIBAVUTIL)\nendef\n"
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        for snapshot in (
+            "FATE_FFMPEG := $(MIDDLE)\n",
+            "FATE_FFMPEG :=\nFATE_FFMPEG += $(MIDDLE)\n",
+        ):
+            for position in ("absent", "before", "after"):
+                with self.subTest(snapshot=snapshot, position=position):
+                    expansion = "$(eval $(ADD))\n"
+                    source = prefix + (expansion if position == "before" else "") + snapshot
+                    source += expansion if position == "after" else ""
+                    expected = (
+                        [
+                            upstream_lint.FateShapeFinding(
+                                "registration",
+                                5,
+                                "fate-x: FATE_LIBAVUTIL: FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG: "
+                                "register it under the matching FATE_LIBAVUTIL variable",
+                            )
+                        ]
+                        if position == "before"
+                        else []
+                    )
+                    self.assertEqual(self.findings(source), expected)
+
+    def test_define_deferred_reference_expansions_across_fragments(self) -> None:
+        """Deferred body references require a top-level expansion in any graph fragment."""
+        prefix = (
+            "MIDDLE =\ndefine ADD\nMIDDLE += $(FATE_LIBAVUTIL)\nendef\n"
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        route = "FATE_FFMPEG += $(MIDDLE)\n"
+        expected = [
+            upstream_lint.FateShapeFinding(
+                "registration",
+                5,
+                "fate-x: FATE_LIBAVUTIL: FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG: "
+                "register it under the matching FATE_LIBAVUTIL variable",
+            )
+        ]
+        self.assertEqual(self.findings(prefix + route), [])
+        for source in (prefix + "$(eval $(ADD))\n" + route, prefix + route + "$(eval $(ADD))\n"):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), expected)
+        source = prefix + route
+        expansion = "$(eval $(ADD))\n"
+        for fragments in ([source, expansion], [expansion, source]):
+            with self.subTest(fragments=fragments):
+                self.assertEqual(
+                    self.findings(source, graph=upstream_lint._fate_shape_graph(fragments)),
+                    expected,
+                )
+        nested = "define WRAPPER\n$(eval $(ADD))\nendef\n"
+        self.assertEqual(
+            self.findings(source, graph=upstream_lint._fate_shape_graph([source, nested])), []
+        )
+
+    def test_revision_commands_join_added_registration(self) -> None:
+        """Added registrations find unchanged sibling commands without extra Git reads."""
+        fixture = self.fixture()
+        fixture.write("tests/fate/command.mak", "fate-x: CMD = run libavutil/tests/x\n")
+        fixture.commit()
+        base = fixture.git("rev-parse", "HEAD").strip()
+        fixture.write("tests/fate/shape.mak", "FATE_FFMPEG += fate-x\n")
+        fixture.commit()
+        with unittest.mock.patch.object(upstream_lint, "_git", wraps=upstream_lint._git) as git:
+            step = upstream_lint._fate_shape(fixture.root, base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(
+            step.output.splitlines()[0],
+            "finding: tests/fate/shape.mak:1: registration: "
+            "fate-x: FATE_FFMPEG: FATE_FFMPEG: "
+            "register it under the matching FATE_LIBAVUTIL variable",
+        )
+        self.assertIn("registration=1, pipe=0, helper-pipe=0, grep=0, endian=0", step.output)
+        self.assertLessEqual(len(git.call_args_list), 5)
+        commands = {
+            "fate-x": [
+                "run libavutil/tests/x | grep x -vf format=gray16le,null",
+                "run libavfilter/tests/y",
+            ]
+        }
+        source = "FATE_FFMPEG += fate-x\n"
+        expected = [
+            upstream_lint.FateShapeFinding(
+                "registration",
+                1,
+                "fate-x: FATE_FFMPEG: FATE_FFMPEG: "
+                "register it under the matching FATE_LIBAVFILTER variable",
+            )
+        ]
+        context = upstream_lint.FateShapeContext({"FATE_FFMPEG"}, commands)
+        self.assertEqual(self.findings(source, ffmpeg=context), expected)
+        self.assertEqual(
+            self.findings(source + "fate-x: CMD = run tests/tool\n", ffmpeg=context), []
+        )
+        self.assertEqual(self.findings(source + "fate-%: CMD = run libavfilter/tests/x\n"), [])
+
+    def test_limit_eval_call_arguments_are_not_substituted(self) -> None:
+        """Limit: eval and call match define names without substituting argument values."""
+        source = (
+            "define ADD\nFATE_FFMPEG += $(1)\nendef\n"
+            "$(eval $(call ADD,fate-x))\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        self.assertEqual(self.findings(source), [])
+
+    def test_limit_config_conditionals_are_enabled(self) -> None:
+        """Limit: CONFIG values are not read and every conditional spelling is enabled."""
+        source = (
+            "FATE_FFMPEG-$(CONFIG_NEVER_SET) += fate-x\n"
+            "fate-x: CMD = run libavutil/tests/x\nFATE_FFMPEG += $(FATE_FFMPEG-yes)\n"
+        )
+        self.assertEqual(
+            self.findings(source),
+            [
+                upstream_lint.FateShapeFinding(
+                    "registration",
+                    1,
+                    "fate-x: FATE_FFMPEG-$(CONFIG_NEVER_SET): FATE_FFMPEG-yes -> FATE_FFMPEG: "
+                    "register it under the matching FATE_LIBAVUTIL variable",
+                )
+            ],
+        )
+
+    def test_limit_fragments_have_no_include_order(self) -> None:
+        """Limit: include order is unmodelled and fragments form an unordered set."""
+        a = "FATE_FFMPEG := $(MID)\n"
+        b = "MID += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        expected = [
+            upstream_lint.FateShapeFinding(
+                "registration",
+                1,
+                "fate-x: MID: MID -> FATE_FFMPEG: "
+                "register it under the matching FATE_LIBAVUTIL variable",
+            )
+        ]
+        for fragments in ([a, b], [b, a]):
+            with self.subTest(fragments=fragments):
+                self.assertEqual(
+                    self.findings(b, graph=upstream_lint._fate_shape_graph(fragments)), expected
+                )
+
+    def test_limit_shell_and_other_function_values_are_not_followed(self) -> None:
+        """Limit: shell, filter and other make function results are not followed."""
+        for registration in (
+            "FATE_FFMPEG += $(shell echo fate-x)\n",
+            "MID += fate-x\nFATE_FFMPEG += $(filter fate-%,$(MID))\n",
+        ):
+            with self.subTest(registration=registration):
+                self.assertEqual(
+                    self.findings(registration + "fate-x: CMD = run libavutil/tests/x\n"), []
+                )
+
+    def test_limit_pattern_and_target_specific_variables_are_not_read(self) -> None:
+        """Limit: pattern commands and target-specific registrations are not read."""
+        source = "FATE_FFMPEG += fate-x\nfate-%: CMD = run libavutil/tests/x\n"
+        self.assertEqual(self.findings(source), [])
+        self.assertEqual(
+            self.findings("fate-x: FATE_FFMPEG += fate-x\nfate-x: CMD = run libavutil/tests/x\n"),
+            [],
+        )
+
+    def test_physical_line_numbers_use_only_lf(self) -> None:
+        """Comment separators other than LF cannot move an added pipeline's physical line."""
+        for separator in ("\u2028", "\u2029", "\f", "\v", "\x85", "\r"):
+            for shell in (False, True):
+                with self.subTest(separator=separator, shell_grammar=shell):
+                    command = "run x | sort" if shell else "CMD = run x | sort"
+                    source = f"# comment {separator} text\n{command}\n"
+                    findings = self.findings(source, {2}, shell_grammar=shell)
+                    rule = "helper-pipe" if shell else "pipe"
+                    self.assertEqual([(f.rule, f.line) for f in findings], [(rule, 2)])
+        for ending in ("", "\n", "\r\n"):
+            with self.subTest(ending=ending):
+                lines = upstream_lint._fate_lines("CMD = run x | sort" + ending)
+                self.assertEqual(len(lines), 1)
+                self.assertEqual((lines[0].first, lines[0].last), (1, 1))
+
+    def test_library_registration_mismatch_fails(self) -> None:
+        """A library registration feeding ffmpeg needs the matching library group."""
+        source = (
+            "FATE_FILTER-$(CONFIG_ZSCALE_FILTER) += fate-zscale-test\n"
+            "fate-zscale-test: CMD = run libavfilter/tests/zscale_test$(EXESUF)\n"
+            "FATE_FFMPEG += $(FATE_FILTER-yes)\n"
+        )
+        for added in ({1}, {1, 2}):
+            with self.subTest(added=added):
+                findings = self.findings(source, added)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0].rule, "registration")
+                self.assertIn(findings[0].line, added)
+                for word in ("fate-zscale-test", "FATE_FILTER", "FATE_LIBAVFILTER"):
+                    self.assertIn(word, findings[0].message)
+        self.assertEqual(self.findings(source, set()), [])
+        self.assertEqual(self.findings(source, {2}), [])
+
+    def test_library_registration_and_command_boundaries(self) -> None:
+        """Correct library groups and routed ordinary commands pass unlike library tests."""
+        for variable, command in (
+            ("FATE_LIBAVFILTER-$(CONFIG_ZSCALE_FILTER)", "run libavfilter/tests/zscale_test"),
+            ("FATE_LIBAVUTIL", "run libavutil/tests/formats"),
+        ):
+            with self.subTest(correct_group=variable):
+                self.assertEqual(
+                    self.findings(f"{variable} += fate-x\nfate-x: CMD = {command}\n"), []
+                )
+        for command in (
+            "framecrc -lavfi testsrc2 -frames:v 1",
+            "run tests/tool",
+            "run libavfilter/tool",
+        ):
+            with self.subTest(command=command):
+                source = (
+                    f"FATE_FILTER += fate-x\nfate-x: CMD = {command}\n"
+                    "FATE_FFMPEG += $(FATE_FILTER)\n"
+                )
+                self.assertEqual(self.findings(source), [])
+        self.assertEqual(
+            self.findings(
+                "FATE_FILTER += fate-x\nfate-x: CMD = run libavfilter/tests/x\n"
+                "FATE_FFMPEG += $(FATE_FILTER)\n"
+            ),
+            [
+                upstream_lint.FateShapeFinding(
+                    "registration",
+                    1,
+                    "fate-x: FATE_FILTER: FATE_FILTER -> FATE_FFMPEG: "
+                    "register it under the matching FATE_LIBAVFILTER variable",
+                )
+            ],
+        )
+
+    def test_aggregate_targets_are_not_literal_registrations(self) -> None:
+        """Calibration aggregate references remain outside direct target matching."""
+        source = (
+            "FATE_AVCONV += $(FATE_SEEK)\n"
+            "FATE_SAMPLES_AVCONV += $(FATE_SAMPLES_SEEK)\n"
+            "$(FATE_SEEK) $(FATE_SAMPLES_SEEK): CMD = run libavformat/tests/seek\n"
+        )
+        self.assertEqual(self.findings(source), [])
+
+    def test_plain_registration_fails(self) -> None:
+        """Unconditional non-library registrations also need a library group."""
+        findings = self.findings(
+            "FATE_FFMPEG += fate-formats\nfate-formats: CMD = run libavutil/tests/formats\n"
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertIn("FATE_LIBAVUTIL", findings[0].message)
+
+    def test_non_ffmpeg_aggregations_pass(self) -> None:
+        """Hardware, selftest and library groups reaching only FATE pass."""
+        for variable, aggregation in (
+            ("FATE_FILTER-$(CONFIG_ZSCALE_FILTER)", "FATE += $(FATE_FILTER-yes)"),
+            ("FATE_HWCONTEXT", "FATE_HW-yes += $(FATE_HWCONTEXT)\nFATE += $(FATE_HW-yes)"),
+            ("FATE_HW-$(CONFIG_CUDA)", "FATE += $(FATE_HW-yes)"),
+            ("FATE_SWR_SELFTEST-$(CONFIG_SWRESAMPLE)", "FATE-yes += $(FATE_SWR_SELFTEST-yes)"),
+            ("FATE_LIBAVFILTER", "FATE += $(FATE_LIBAVFILTER)"),
+        ):
+            with self.subTest(variable=variable):
+                source = f"{variable} += fate-x\nfate-x: CMD = run libavfilter/tests/x\n"
+                self.assertEqual(self.findings(source + aggregation + "\n"), [])
+
+    def test_two_hop_aggregation_reports_chain(self) -> None:
+        """Two aggregation hops report the actual executable-dependent endpoint."""
+        source = "FATE_X-$(CONFIG_X) += fate-x\nfate-x: CMD = run libavfilter/tests/x\n"
+        graph = upstream_lint._fate_shape_graph(
+            ["MIDDLE := $(FATE_X-yes)\nFATE_CUSTOM = $(MIDDLE)\n"]
+        )
+        findings = self.findings(source, graph=graph, ffmpeg={"FATE_CUSTOM"})
+        self.assertEqual(len(findings), 1)
+        self.assertIn("FATE_X-yes -> MIDDLE -> FATE_CUSTOM", findings[0].message)
+
+    def test_library_name_has_no_special_exemption(self) -> None:
+        """Even a library-named group fails if its aggregation requires ffmpeg."""
+        source = (
+            "FATE_LIBAVFILTER += fate-x\nfate-x: CMD = run libavfilter/tests/x\n"
+            "FATE_FFMPEG += $(FATE_LIBAVFILTER)\n"
+        )
+        self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_graph_unconditional_replacements_drop_edges(self) -> None:
+        """Unconditional replacements remove earlier edges from the same source."""
+        for operator in ("=", ":="):
+            with self.subTest(operator=operator):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    f"FATE_FFMPEG {operator} fate-real\n"
+                )
+                graph = upstream_lint._fate_shape_graph([source])
+                self.assertNotIn("FATE_FFMPEG", graph.get("FATE_LIBAVUTIL", set()))
+                self.assertEqual(self.findings(source, graph=graph), [])
+
+    def test_graph_append_order_keeps_registration(self) -> None:
+        """Appends retain earlier references and references after replacements."""
+        for aggregation in (
+            "FATE_FFMPEG += $(FATE_LIBAVUTIL)\nFATE_FFMPEG += fate-real\n",
+            "FATE_FFMPEG = fate-real\nFATE_FFMPEG += $(FATE_LIBAVUTIL)\n",
+        ):
+            with self.subTest(aggregation=aggregation):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n" + aggregation
+                )
+                self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_graph_conditional_replacements_keep_registration(self) -> None:
+        """Conditional replacements conservatively retain references in every branch."""
+        for opening in ("ifeq (x,y)", "ifneq (x,y)", "ifdef CONFIG_X", "ifndef CONFIG_X"):
+            for branch in ("", "else\n", "ifdef CONFIG_Y\nendif\nelse\n"):
+                with self.subTest(opening=opening, branch=branch):
+                    source = (
+                        "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                        "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                        f"{opening}\n{branch}FATE_FFMPEG := fate-real\nendif\n"
+                    )
+                    self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_graph_closed_conditionals_replace_edges(self) -> None:
+        """Closed and unmatched condition endings leave replacements at depth zero."""
+        for conditions in ("ifdef CONFIG_X\nendif\n", "endif\nifdef CONFIG_X\nendif\n"):
+            with self.subTest(conditions=conditions):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    f"{conditions}FATE_FFMPEG := fate-real\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_graph_self_replacements_keep_registration(self) -> None:
+        """Actual self references inside functions, substitutions and braces retain old edges."""
+        for destination, value, retained in (
+            ("FATE_FFMPEG", "$(if $(CONFIG_X), $(FATE_FFMPEG))", True),
+            ("FATE_FFMPEG", "$(FATE_FFMPEG:%=fate-%)", True),
+            ("FATE_FFMPEG-yes", "$(FATE_FFMPEG-yes:%=fate-%)", True),
+            ("FATE_FFMPEG-$(CONFIG_X)", "$(if $(CONFIG_X), $(FATE_FFMPEG-yes))", True),
+            ("FATE_FFMPEG", "${FATE_FFMPEG} more", True),
+            ("FATE_FFMPEG", "prefix_FATE_FFMPEG_suffix", False),
+        ):
+            with self.subTest(destination=destination, value=value):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                    f"{destination} = $(FATE_LIBAVUTIL)\n{destination} := {value}\n"
+                )
+                graph = upstream_lint._fate_shape_graph([source])
+                ffmpeg = {upstream_lint._fate_shape_normalize(destination)}
+                self.assertEqual(
+                    [f.rule for f in self.findings(source, graph=graph, ffmpeg=ffmpeg)],
+                    ["registration"] if retained else [],
+                )
+
+    def test_graph_literal_self_name_replaces_edges(self) -> None:
+        """Literal destination names replace old edges while actual self references retain them."""
+        for value, retained in (
+            ("fate-real-FATE_FFMPEG", False),
+            ("prefix_FATE_FFMPEG_suffix", False),
+            ("$(FATE_FFMPEG_OTHER)", False),
+            ("$(FATE_FFMPEG) more", True),
+            ("${FATE_FFMPEG} more", True),
+        ):
+            with self.subTest(value=value):
+                source = f"FATE_FFMPEG += $(OLD)\nFATE_FFMPEG := {value}\n"
+                graph = upstream_lint._fate_shape_graph([source])
+                self.assertEqual("FATE_FFMPEG" in graph.get("OLD", set()), retained)
+
+    def test_registration_replacements_drop_old_appends(self) -> None:
+        """Replacements discard old literal registrations and keep later append provenance."""
+        for variable in ("FATE_FFMPEG", "FATE_FFMPEG-yes", "FATE_FFMPEG-$(CONFIG_X)"):
+            for value in ("fate-real", f"fate-real-{variable.split('-', 1)[0]}"):
+                with self.subTest(variable=variable, value=value):
+                    source = (
+                        f"{variable} += fate-x\n{variable} = {value}\n"
+                        "fate-x: CMD = run libavutil/tests/x\n"
+                    )
+                    roots = {upstream_lint._fate_shape_normalize(variable)}
+                    self.assertEqual(self.findings(source, ffmpeg=roots), [])
+                    source += f"{variable} += fate-x\n"
+                    findings = self.findings(source, ffmpeg=roots)
+                    self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 4)])
+
+    def test_registration_self_reference_and_scope_preserve_appends(self) -> None:
+        """Only actual self references or scoped replacements preserve prior literal appends."""
+        for replacement, retained in (
+            ("FATE_FFMPEG := $(FATE_FFMPEG) more\n", True),
+            ("FATE_FFMPEG := ${FATE_FFMPEG} more\n", True),
+            ("ifdef CONFIG_X\nFATE_FFMPEG = fate-real\nendif\n", True),
+            ("define RESET\nFATE_FFMPEG = fate-real\nendef\n", True),
+            ("FATE_FFMPEG = fate-real-FATE_FFMPEG\n", False),
+        ):
+            with self.subTest(replacement=replacement):
+                source = (
+                    "FATE_FFMPEG += fate-x\n"
+                    + replacement
+                    + "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source)],
+                    [("registration", 1)] if retained else [],
+                )
+
+    def test_registration_replacements_require_raw_destination(self) -> None:
+        """Only the exact destination spelling can replace a previous literal registration."""
+        for original, replacement, retained in (
+            ("FATE_X-yes", "FATE_X-$(CONFIG_X)", True),
+            ("FATE_X-yes", "FATE_X-yes", False),
+            ("FATE_X-$(CONFIG_X)", "FATE_X-$(CONFIG_X)", False),
+        ):
+            with self.subTest(original=original, replacement=replacement):
+                source = (
+                    f"CONFIG_X := no\n{original} += fate-x\n{replacement} = fate-real\n"
+                    "FATE_FFMPEG += $(FATE_X-yes)\n"
+                    "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source, {2})],
+                    [("registration", 2)] if retained else [],
+                )
+
+    def test_graph_replacements_require_raw_destination(self) -> None:
+        """Raw destination spellings control edge replacement before normalized reachability."""
+        for replacement, retained in (
+            ("FATE_X-$(CONFIG_X)", True),
+            ("FATE_X-yes", False),
+        ):
+            with self.subTest(replacement=replacement):
+                source = (
+                    "CONFIG_X := no\nFATE_LIBAVUTIL += fate-x\n"
+                    "FATE_X-yes += $(FATE_LIBAVUTIL)\n"
+                    f"{replacement} = fate-real\nFATE_FFMPEG += $(FATE_X-yes)\n"
+                    "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                graph = upstream_lint._fate_shape_graph([source])
+                self.assertEqual("FATE_X-yes" in graph.get("FATE_LIBAVUTIL", set()), retained)
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source, {2}, graph=graph)],
+                    [("registration", 2)] if retained else [],
+                )
+
+    def test_immediate_aggregation_preserves_registration(self) -> None:
+        """Immediate reads preserve only prior registrations across later source replacements."""
+        for operator, retained in ((":=", True), ("=", False), ("+=", False)):
+            for position in ("before", "between", "after"):
+                with self.subTest(operator=operator, position=position):
+                    lines = ["FATE_LIBAVUTIL += fate-x\n", "FATE_LIBAVUTIL =\n"]
+                    index = {"before": 0, "between": 1, "after": 2}[position]
+                    lines.insert(index, f"FATE_FFMPEG {operator} $(FATE_LIBAVUTIL)\n")
+                    source = "".join(lines) + "fate-x: CMD = run libavutil/tests/x\n"
+                    number = 2 if position == "before" else 1
+                    self.assertEqual(
+                        [(f.rule, f.line) for f in self.findings(source, {number})],
+                        [("registration", number)] if retained and position == "between" else [],
+                    )
+
+    def test_immediate_aggregation_snapshots_prior_entries(self) -> None:
+        """Immediate reads retain prior entries without following later source appends."""
+        for target, expected in (("new", []), ("old", [("registration", 1)])):
+            with self.subTest(target=target):
+                source = (
+                    "FATE_LIBAVUTIL += fate-old\n"
+                    "FATE_FFMPEG := $(FATE_LIBAVUTIL)\n"
+                    "FATE_LIBAVUTIL += fate-new\n"
+                    f"fate-{target}: CMD = run libavutil/tests/{target}\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], expected)
+                if findings:
+                    self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+                self.assertNotIn(
+                    "FATE_FFMPEG",
+                    upstream_lint._fate_shape_graph([source]).get("FATE_LIBAVUTIL", set()),
+                )
+                self.assertEqual(self.findings(source + "FATE_FFMPEG =\n"), [])
+        source = (
+            "FATE_LIBAVUTIL += fate-old\n"
+            "FATE_FFMPEG := $(FATE_LIBAVUTIL)\n"
+            "OTHER = $(FATE_LIBAVUTIL)\n"
+            "DEFERRED = $(OTHER)\n"
+            "fate-old: CMD = run libavutil/tests/old\n"
+        )
+        findings = self.findings(source, ffmpeg={"FATE_FFMPEG", "DEFERRED"})
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+
+    def test_immediate_aggregation_resolves_transitive_entries(self) -> None:
+        """Immediate reads capture transitive entries, freeze missing names and bound cycles."""
+        for middle, operator, expected in (
+            ("MIDDLE = $(FATE_LIBAVUTIL)\n", ":=", [("registration", 1)]),
+            ("MIDDLE = $(FATE_LIBAVUTIL)\n", "=", []),
+            ("MIDDLE := $(FATE_LIBAVUTIL)\n", ":=", [("registration", 1)]),
+            ("INNER = $(FATE_LIBAVUTIL)\nMIDDLE = $(INNER)\n", ":=", [("registration", 1)]),
+            ("MIDDLE = $(sort $(FATE_LIBAVUTIL))\n", ":=", []),
+        ):
+            with self.subTest(middle=middle, operator=operator):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\n"
+                    + middle
+                    + f"FATE_FFMPEG {operator} $(MIDDLE)\n"
+                    + "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], expected)
+                if findings:
+                    self.assertIn("FATE_LIBAVUTIL", findings[0].message)
+                    self.assertIn("MIDDLE -> FATE_FFMPEG", findings[0].message)
+        self.assertEqual(self.findings("A = $(B)\nB = $(A)\nFATE_FFMPEG := $(A)\n"), [])
+        source = (
+            "MIDDLE := $(FATE_LIBAVUTIL)\n"
+            "FATE_LIBAVUTIL += fate-x\n"
+            "FATE_FFMPEG := $(MIDDLE)\n"
+            "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        # Review 5987325156: an undefined immediate read stays empty in this source.
+        self.assertEqual([(f.rule, f.line) for f in findings], [])
+
+    def test_immediate_forward_read_stays_frozen(self) -> None:
+        """Later snapshots cannot resolve an earlier undefined immediate read in the same source."""
+        for middle in ("MIDDLE", "NEXT"):
+            with self.subTest(middle=middle):
+                source = (
+                    "MIDDLE := $(FATE_LIBAVUTIL)\nNEXT := $(MIDDLE)\n"
+                    "FATE_LIBAVUTIL += fate-x\n"
+                    f"FATE_FFMPEG := $({middle})\n"
+                    "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_immediate_forward_read_preserves_fragment_edges(self) -> None:
+        """Frozen names retain the intermediate path across separately evaluated fragments."""
+        aggregation = "MIDDLE := $(FATE_LIBAVUTIL)\nFATE_FFMPEG := $(MIDDLE)\n"
+        source = "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        for sources in ([aggregation, source], [source, aggregation]):
+            with self.subTest(sources=sources):
+                graph = upstream_lint._fate_shape_graph(sources)
+                findings = self.findings(source, graph=graph)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+                self.assertIn("FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG", findings[0].message)
+
+    def test_recursive_forward_read_remains_deferred(self) -> None:
+        """Recursive assignments still resolve registrations appended before a later snapshot."""
+        source = (
+            "MIDDLE = $(FATE_LIBAVUTIL)\nFATE_LIBAVUTIL += fate-x\n"
+            "FATE_FFMPEG := $(MIDDLE)\nFATE_LIBAVUTIL =\n"
+            "fate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 2)])
+        self.assertIn("FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG", findings[0].message)
+
+    def test_immediate_conditional_alias_captures_entries(self) -> None:
+        """Immediate reads capture either conditional spelling before its raw replacement."""
+        for stored, read in (
+            ("FATE_LIBAVUTIL-$(CONFIG_X)", "FATE_LIBAVUTIL-yes"),
+            ("FATE_LIBAVUTIL-yes", "FATE_LIBAVUTIL-$(CONFIG_X)"),
+        ):
+            with self.subTest(stored=stored, read=read):
+                source = (
+                    f"{stored} += fate-x\nFATE_FFMPEG := $({read})\n{stored} =\n"
+                    "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+                self.assertIn("FATE_LIBAVUTIL-yes -> FATE_FFMPEG", findings[0].message)
+
+    def test_immediate_conditional_alias_follows_references(self) -> None:
+        """All normalized states contribute entries and transitive references to a snapshot."""
+        source = (
+            "OTHER += fate-x\nFATE_LIBAVUTIL-$(CONFIG_X) = $(OTHER)\n"
+            "FATE_LIBAVUTIL-yes =\nFATE_FFMPEG := $(FATE_LIBAVUTIL-yes)\n"
+            "OTHER =\nFATE_LIBAVUTIL-$(CONFIG_X) =\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+        self.assertIn("OTHER -> FATE_LIBAVUTIL-yes -> FATE_FFMPEG", findings[0].message)
+
+    def test_immediate_conditional_alias_keeps_raw_replacement(self) -> None:
+        """Raw replacement preserves other spellings and unrelated reads stay empty."""
+        for stored, cleared in (
+            ("FATE_LIBAVUTIL-yes", "FATE_LIBAVUTIL-$(CONFIG_X)"),
+            ("FATE_LIBAVUTIL-$(CONFIG_X)", "FATE_LIBAVUTIL-yes"),
+        ):
+            for read, expected in ((stored, [("registration", 1)]), ("UNRELATED", [])):
+                with self.subTest(stored=stored, read=read):
+                    source = (
+                        f"{stored} += fate-x\n{cleared} =\nFATE_FFMPEG := $({read})\n"
+                        "fate-x: CMD = run libavutil/tests/x\n"
+                    )
+                    self.assertEqual([(f.rule, f.line) for f in self.findings(source)], expected)
+
+    def test_simple_append_snapshots_prior_entries(self) -> None:
+        """Appends expand immediately only for destinations retaining the simple flavor."""
+        for prefix, expected in (
+            ("FATE_FFMPEG :=\n", [("registration", 1)]),
+            ("FATE_FFMPEG =\n", []),
+            ("", []),
+            ("FATE_FFMPEG :=\ndefine RESET\nFATE_FFMPEG =\nendef\n", [("registration", 1)]),
+            ("FATE_FFMPEG =\ndefine RESET\nFATE_FFMPEG :=\nendef\n", []),
+            ("FATE_FFMPEG :=\nFATE_FFMPEG =\n", []),
+            ("FATE_FFMPEG =\nFATE_FFMPEG :=\n", [("registration", 1)]),
+        ):
+            with self.subTest(prefix=prefix):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\n"
+                    + prefix
+                    + "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    + "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], expected)
+                if findings:
+                    self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_conditional_simple_flavor_preserves_deferred_append(self) -> None:
+        """A skipped simple assignment leaves recursive and undefined appends deferred."""
+        for prefix in ("FATE_FFMPEG =\n", ""):
+            with self.subTest(prefix=prefix):
+                source = (
+                    "FATE_LIBAVUTIL =\n" + prefix + "ifeq (x,y)\nFATE_FFMPEG :=\nendif\n"
+                    "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual(
+                    [(f.rule, f.line) for f in findings],
+                    [("registration", len(source.splitlines()) - 1)],
+                )
+                self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_unconditional_simple_flavor_keeps_append_immediate(self) -> None:
+        """An unconditional simple assignment resets prior conditional flavor alternatives."""
+        for conditional in ("", "ifeq (x,y)\nFATE_FFMPEG :=\nendif\n"):
+            with self.subTest(conditional=conditional):
+                source = (
+                    "FATE_LIBAVUTIL =\nFATE_FFMPEG =\n"
+                    + conditional
+                    + "FATE_FFMPEG :=\nFATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_conditional_recursive_flavor_preserves_deferred_append(self) -> None:
+        """A conditional recursive assignment keeps deferred reads beside simple snapshots."""
+        source = (
+            "FATE_LIBAVUTIL =\nFATE_FFMPEG :=\n"
+            "ifeq (x,y)\nFATE_FFMPEG =\nendif\n"
+            "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 7)])
+        self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_mixed_flavor_append_keeps_snapshot_entries(self) -> None:
+        """Either conditional flavor order preserves snapshots across later source replacement."""
+        for initial, conditional in ((":=", "="), ("=", ":=")):
+            with self.subTest(initial=initial, conditional=conditional):
+                source = (
+                    "FATE_LIBAVUTIL += fate-old\n"
+                    f"FATE_FFMPEG {initial}\n"
+                    f"ifeq (x,y)\nFATE_FFMPEG {conditional}\nendif\n"
+                    "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    "FATE_LIBAVUTIL =\nfate-old: CMD = run libavutil/tests/old\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+                self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_mixed_flavor_append_keeps_snapshot_and_deferred_references(self) -> None:
+        """Mixed appends retain unresolved snapshot names alongside the original deferred read."""
+        for initial, conditional in ((":=", "="), ("=", ":=")):
+            with self.subTest(initial=initial, conditional=conditional):
+                source = (
+                    "MIDDLE = $(EARLY)\n"
+                    f"FATE_FFMPEG {initial}\n"
+                    f"ifeq (x,y)\nFATE_FFMPEG {conditional}\nendif\n"
+                    "FATE_FFMPEG += $(MIDDLE)\nMIDDLE = $(LATE)\n"
+                    "EARLY += fate-old\nLATE += fate-new\n"
+                    "fate-old: CMD = run libavutil/tests/old\n"
+                    "fate-new: CMD = run libavutil/tests/new\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual(
+                    sorted((f.rule, f.line) for f in findings),
+                    [("registration", 8), ("registration", 9)],
+                )
+
+    def test_immediate_self_read_preserves_chain(self) -> None:
+        """A direct immediate self read retains the original registration chain once."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\n"
+            "FATE_LIBAVUTIL := $(FATE_LIBAVUTIL) fate-y\n"
+            "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+            "fate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+        self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
+
+    def test_immediate_conditional_self_read_preserves_chain(self) -> None:
+        """Normalized self reads retain one hop across conditional alias spellings."""
+        with self.subTest(destination="MID-yes"):
+            source = (
+                "MID-$(CONFIG_Y) += fate-x\n"
+                "MID-yes := $(MID-$(CONFIG_Y))\n"
+                "FATE_FFMPEG := $(MID-yes)\n"
+                "MID-$(CONFIG_Y) =\n"
+                "fate-x: CMD = run libavutil/tests/x\n"
+            )
+            findings = self.findings(source)
+            self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+            self.assertIn("MID-yes -> FATE_FFMPEG", findings[0].message)
+            self.assertNotIn("MID-yes -> MID-yes", findings[0].message)
+            states = upstream_lint._fate_shape_evaluate(upstream_lint._fate_lines(source))
+            self.assertEqual(states["MID-yes"].entries[0].chain, ["MID-yes"])
+            self.assertEqual(states["FATE_FFMPEG"].entries[0].chain, ["MID-yes", "FATE_FFMPEG"])
+        with self.subTest(destination="FATE_FFMPEG-yes"):
+            source = (
+                "FATE_FFMPEG-$(CONFIG_Y) += fate-x\n"
+                "FATE_FFMPEG-yes := $(FATE_FFMPEG-$(CONFIG_Y)) fate-new\n"
+                "fate-x: CMD = run libavutil/tests/x\n"
+            )
+            states = upstream_lint._fate_shape_evaluate(upstream_lint._fate_lines(source))
+            self.assertEqual(len(states["FATE_FFMPEG-yes"].entries), 1)
+            for entry in states["FATE_FFMPEG-yes"].entries:
+                pairs = zip(entry.chain, entry.chain[1:], strict=False)
+                self.assertFalse(any(a == b for a, b in pairs))
+                self.assertEqual(entry.chain, ["FATE_FFMPEG-yes"])
+
+    def test_plain_immediate_self_read_replaces_deferred_references(self) -> None:
+        """Plain immediate self reads retain prior entries without later source appends."""
+        for target, expected in (("new", []), ("old", [("registration", 1)])):
+            with self.subTest(target=target):
+                source = (
+                    "FATE_LIBAVUTIL += fate-old\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    "FATE_FFMPEG := $(FATE_FFMPEG)\n"
+                    "FATE_LIBAVUTIL += fate-new\n"
+                    f"fate-{target}: CMD = run libavutil/tests/{target}\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], expected)
+                if findings:
+                    self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_opaque_or_scoped_self_reads_keep_deferred_references(self) -> None:
+        """Opaque, conditional, recursive, append and define self reads preserve deferred edges."""
+        for assignment in (
+            "FATE_FFMPEG := $(filter fate-%,$(FATE_FFMPEG))\n",
+            "FATE_FFMPEG := $(FATE_FFMPEG:fate-%=fate-%)\n",
+            "FATE_FFMPEG := $(FATE_FFMPEG) $(OTHER:%=%)\n",
+            "ifeq (x,y)\nFATE_FFMPEG := $(FATE_FFMPEG)\nendif\n",
+            "FATE_FFMPEG = $(FATE_FFMPEG)\n",
+            "FATE_FFMPEG += $(FATE_FFMPEG)\n",
+            "define AGG\nFATE_FFMPEG := $(FATE_FFMPEG)\nendef\n",
+        ):
+            with self.subTest(assignment=assignment):
+                source = (
+                    "FATE_LIBAVUTIL += fate-old\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    + assignment
+                    + "FATE_LIBAVUTIL += fate-new\nfate-new: CMD = run libavutil/tests/new\n"
+                )
+                number = len(source.splitlines()) - 1
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", number)])
+
+    def test_plain_immediate_self_read_keeps_unresolved_references(self) -> None:
+        """Immediate self snapshots retain names not yet defined as deferred references."""
+        source = (
+            "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+            "FATE_FFMPEG := $(FATE_FFMPEG)\n"
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 3)])
+        self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_immediate_indirect_self_read_preserves_chain(self) -> None:
+        """A replacing read through another variable keeps the destination's original entries."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\n"
+            "MIDDLE = $(FATE_LIBAVUTIL)\n"
+            "FATE_LIBAVUTIL := $(MIDDLE) fate-y\n"
+            "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+            "fate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+        self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
+
+    def test_immediate_self_reads_resolve_destination_deferred_references(self) -> None:
+        """Deferred destination entries keep one finding and chain across all immediate reads."""
+        for middle, reference in (
+            ("MIDDLE = $(FATE_LIBAVUTIL)\n", "MIDDLE"),
+            ("", "FATE_LIBAVUTIL"),
+            ("", "OTHER"),
+        ):
+            with self.subTest(middle=middle, reference=reference):
+                source = (
+                    "OTHER += fate-x\n"
+                    "FATE_LIBAVUTIL = $(OTHER)\n"
+                    f"{middle}FATE_LIBAVUTIL := $({reference}) fate-y\n"
+                    "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+                    "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+                self.assertIn("OTHER: OTHER -> FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
+    def test_repeated_immediate_self_reads_keep_one_entry(self) -> None:
+        """Twelve immediate self reads neither duplicate entries nor extend their chains."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\n"
+            + "FATE_LIBAVUTIL := $(FATE_LIBAVUTIL)\n" * 12
+            + "FATE_FFMPEG += $(FATE_LIBAVUTIL)\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+        states = upstream_lint._fate_shape_evaluate(upstream_lint._fate_lines(source))
+        self.assertEqual(len(states["FATE_LIBAVUTIL"].entries), 1)
+        self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
+
+    def test_define_entries_require_prior_expansion(self) -> None:
+        """Snapshots copy define-body entries only after a named top-level expansion."""
+        for expansion in (
+            "$(eval $(call ADD))\n",
+            "  $(eval $(call ADD,arg))  \n",
+            "$(eval $(ADD))\n",
+        ):
+            for position in ("absent", "before", "after"):
+                with self.subTest(expansion=expansion, position=position):
+                    source = (
+                        "define ADD\nFATE_LIBAVUTIL += fate-x\nendef\n"
+                        + (expansion if position == "before" else "")
+                        + "FATE_FFMPEG := $(FATE_LIBAVUTIL)\n"
+                        + (expansion if position == "after" else "")
+                        + "fate-x: CMD = run libavutil/tests/x\n"
+                    )
+                    findings = self.findings(source)
+                    self.assertEqual(
+                        [(f.rule, f.line) for f in findings],
+                        [("registration", 2)] if position == "before" else [],
+                    )
+
+    def test_define_expansion_requires_top_level_exact_name(self) -> None:
+        """Other names and expansions inside define bodies cannot activate a snapshot entry."""
+        for expansion in (
+            "$(eval $(call ADD_MORE))\n",
+            "$(eval $(ADD_MORE))\n",
+            "define WRAPPER\n$(eval $(call ADD))\nendef\n",
+        ):
+            with self.subTest(expansion=expansion):
+                source = (
+                    "define ADD\nFATE_LIBAVUTIL += fate-x\nendef\n"
+                    + expansion
+                    + "FATE_FFMPEG := $(FATE_LIBAVUTIL)\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_define_entries_keep_direct_graph_route(self) -> None:
+        """Unexpanded entries remain available to the established deferred graph route."""
+        for aggregation in ("FATE_FFMPEG = $(FATE_LIBAVUTIL)\n", ""):
+            with self.subTest(aggregation=aggregation):
+                variable = "FATE_LIBAVUTIL" if aggregation else "FATE_FFMPEG"
+                source = (
+                    f"define ADD\n{variable} += fate-x\nendef\n"
+                    + aggregation
+                    + "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source)], [("registration", 2)]
+                )
+
+    def test_define_body_immediate_reads_remain_deferred(self) -> None:
+        """Unexpanded define-body references cannot route simple assignments or appends."""
+        for prefix, operator in (
+            ("FATE_LIBAVUTIL += fate-old\n", ":="),
+            ("FATE_FFMPEG :=\n", "+="),
+            ("FATE_LIBAVUTIL += fate-old\nFATE_FFMPEG :=\n", "+="),
+        ):
+            with self.subTest(prefix=prefix, operator=operator):
+                source = (
+                    prefix
+                    + f"define AGG\nFATE_FFMPEG {operator} $(FATE_LIBAVUTIL)\nendef\n"
+                    + "FATE_LIBAVUTIL += fate-new\nfate-new: CMD = run libavutil/tests/new\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual(findings, [])
+
+    def test_graph_define_replacements_keep_registration(self) -> None:
+        """Replacements in define bodies preserve earlier aggregation references."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+            "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+            "define RESET\nFATE_FFMPEG := fate-real\nendef\n"
+        )
+        self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_graph_replacements_after_define_drop_edges(self) -> None:
+        """Define bodies cannot leak their conditional or nested define depth."""
+        for body in ("ifdef CONFIG_X\n", "define INNER\nFATE_FFMPEG = fate-inner\nendef\n"):
+            with self.subTest(body=body):
+                source = (
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                    "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+                    f"define RESET\n{body}endef\nFATE_FFMPEG = fate-real\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_graph_separate_source_replacements_keep_registration(self) -> None:
+        """A replacement in another source cannot erase existing reference edges."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+            "FATE_FFMPEG = $(FATE_LIBAVUTIL)\n"
+        )
+        replacement = "FATE_FFMPEG := fate-real\n"
+        for sources in ([source, replacement], [replacement, source]):
+            with self.subTest(sources=sources):
+                graph = upstream_lint._fate_shape_graph(sources)
+                self.assertEqual(graph["FATE_LIBAVUTIL"], {"FATE_FFMPEG"})
+                self.assertEqual(
+                    [f.rule for f in self.findings(source, graph=graph)], ["registration"]
+                )
+
+    def test_graph_replacements_add_new_references(self) -> None:
+        """Replacement references survive while unrelated destinations keep edges."""
+        for operator in ("=", ":="):
+            with self.subTest(operator=operator):
+                graph = upstream_lint._fate_shape_graph(
+                    [
+                        f"FATE_FFMPEG = $(OLD)\nOTHER += $(OLD)\nFATE_FFMPEG {operator} $(NEW)\n",
+                        "FATE_FFMPEG += $(OLD)\n",
+                    ]
+                )
+                self.assertEqual(graph, {"OLD": {"OTHER", "FATE_FFMPEG"}, "NEW": {"FATE_FFMPEG"}})
+
+    def test_aggregation_cycle_is_bounded(self) -> None:
+        """A visited set terminates cycles and still finds an outgoing dependency."""
+        source = "FATE_X += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        graph = upstream_lint._fate_shape_graph(["FATE_X += $(MIDDLE)\nMIDDLE = $(FATE_X)\n"])
+        self.assertEqual(self.findings(source, graph=graph), [])
+        graph["MIDDLE"].add("FATE_FFMPEG")
+        findings = self.findings(source, graph=graph)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("FATE_X -> MIDDLE -> FATE_FFMPEG", findings[0].message)
+
+    def test_graph_assignments_and_normalization(self) -> None:
+        """Plain references join conditional names across assignment operators."""
+        graph = upstream_lint._fate_shape_graph(
+            [
+                "DEST-$(CONFIG_X) := $(SRC-$(CONFIG_Y)) # $(IGNORED)\n",
+                "NEXT = $(DEST-yes)\nFINAL += \\\n $(NEXT)\nNOT_AN_EDGE ?= $(SRC)\n",
+            ]
+        )
+        self.assertEqual(graph["SRC-yes"], {"DEST-yes"})
+        self.assertEqual(graph["DEST-yes"], {"NEXT"})
+        self.assertEqual(graph["NEXT"], {"FINAL"})
+        self.assertNotIn("IGNORED", graph)
+        self.assertNotIn("SRC", graph)
+
+    def test_direct_aggregation_references_keep_edges(self) -> None:
+        """Direct plain and conditional references retain their ffmpeg edges."""
+        for reference, name in (
+            ("FATE_LIBAVUTIL", "FATE_LIBAVUTIL"),
+            ("FATE_X-yes", "FATE_X-yes"),
+            ("FATE_X-$(CONFIG_Y)", "FATE_X-yes"),
+        ):
+            with self.subTest(reference=reference):
+                source = f"FATE_FFMPEG += $({reference})\n"
+                self.assertEqual(upstream_lint._fate_shape_graph([source]), {name: {"FATE_FFMPEG"}})
+                source += f"{reference} += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+                self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_make_function_arguments_do_not_create_edges(self) -> None:
+        """Make function arguments create no plain variable aggregation edges."""
+        for expression in (
+            "$(filter-out $(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(filter $(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(patsubst %,x,$(FATE_LIBAVUTIL))",
+            "$(foreach x,$(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(if $(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(call fn,$(FATE_LIBAVUTIL),$(FATE_OTHER))",
+            "$(sort $(FATE_LIBAVUTIL))",
+            "$(addprefix x,$(FATE_LIBAVUTIL))",
+            "$(wildcard $(FATE_LIBAVUTIL))",
+            "$(sort\t$(FATE_LIBAVUTIL))",
+            "$(sort $(filter-out $(FATE_LIBAVUTIL),$(FATE_OTHER)))",
+        ):
+            with self.subTest(expression=expression):
+                source = f"FATE_FFMPEG += $(BEFORE) {expression} $(AFTER-$(CONFIG_X))\n"
+                self.assertEqual(
+                    upstream_lint._fate_shape_graph([source]),
+                    {"BEFORE": {"FATE_FFMPEG"}, "AFTER-yes": {"FATE_FFMPEG"}},
+                )
+
+    def test_range_make_function_aggregation_passes(self) -> None:
+        """A library command aggregated only through filter-out has no finding."""
+        fixture = self.fixture(
+            "FATE_LIBAVUTIL += fate-x\n"
+            "fate-x: CMD = run libavutil/tests/x\n"
+            "FATE_FFMPEG += $(filter-out $(FATE_LIBAVUTIL),$(FATE_OTHER))\n"
+        )
+        step = upstream_lint._fate_shape(fixture.root, fixture.base, "HEAD", "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("registration=0", step.output)
+
+    def test_ffmpeg_dependencies_discovered_from_rule(self) -> None:
+        """Only variables on targets with the exact executable prerequisite qualify."""
+        makefile = (
+            "$(CUSTOM) $(OTHER-$(CONFIG_X)): other ffmpeg$(PROGSSUF)$(EXESUF)\n"
+            "$(PLAIN): ffprobe$(PROGSSUF)$(EXESUF)\n"
+            "# $(COMMENT): ffmpeg$(PROGSSUF)$(EXESUF)\n"
+            "$(NOT_FFMPEG): tools/ffmpeg$(PROGSSUF)$(EXESUF)\n"
+            "TEXT = $(DECOY): ffmpeg$(PROGSSUF)$(EXESUF)\n"
+        )
+        self.assertEqual(upstream_lint._fate_shape_ffmpeg(makefile), {"CUSTOM", "OTHER-yes"})
+
+    def test_pipe_and_grep_fail(self) -> None:
+        """Piping a test loses status and grep assertions need reference comparisons."""
+        for command, rule in (
+            ("run libavfilter/tests/bt2408 | sed s/x/y/", "pipe"),
+            ("sh -c 'run x && ! grep -q failed $(errfile)'", "grep"),
+        ):
+            with self.subTest(command=command):
+                findings = self.findings(f"fate-bt2408: CMD = {command}\n")
+                self.assertEqual([item.rule for item in findings], [rule])
+
+    def test_grep_command_positions_ignore_data(self) -> None:
+        """Grep assertions require command position rather than metadata or other arguments."""
+        for command, expected in (
+            ("framecrc -metadata title=grep -f lavfi -i testsrc2", []),
+            ("run x grep", []),
+            ("printf '%s' 'grep'", []),
+            ("grep x", ["grep"]),
+            ("run grep x", ["grep"]),
+            ("cmd | grep x", ["pipe", "grep"]),
+            ("cmd;grep x", ["grep"]),
+            ("cmd && grep x", ["grep"]),
+            ("cmd || grep x", ["grep"]),
+            ('sh -c "run x && ! grep -q failed $(errfile)"', ["grep"]),
+            ('sh -c "printf grep"', []),
+            ('run x "data | grep x"', []),
+            ('"grep data"', []),
+            ("'grep data'", []),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual([f.rule for f in self.findings(f"CMD = {command}\n")], expected)
+
+    def test_grep_shell_script_before_positional_operands(self) -> None:
+        """The first quoted sh -c word is script text even when positional operands follow."""
+        for command, expected in (
+            ("sh -c 'grep -q pattern \"$$1\"' sh result.txt", ["grep"]),
+            (r'sh -c "grep -q pattern \"$$1\"" sh result.txt', ["grep"]),
+            (r'sh -c "printf \"x\"; grep -q pattern \"\$\$1\"" sh result.txt', ["grep"]),
+            ('sh -c "printf grep" sh x', []),
+            (r'sh -c "printf \"grep\"" sh x', []),
+            ("sh -c 'printf \"grep\"' sh x", []),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual([f.rule for f in self.findings(f"CMD = {command}\n")], expected)
+
+    def test_pipeline_boundaries_pass(self) -> None:
+        """Quoted, escaped and expansion pipes, OR lists and data generators pass."""
+        commands = (
+            "framecrc -lavfi testsrc2 -frames:v 1",
+            "run x || run y",
+            "run x 'a|b'",
+            'run x "a|b"',
+            r"run x a\|b",
+            "run $(call x, a | b)",
+            "run $(call x, $(call y, a | b))",
+            "printf 'x' | ffmpeg -i - -f null -",
+            "echo x | ffmpeg -i - -f null -",
+            "cat input | ffmpeg -i - -f null -",
+            "run x grepper",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.findings(f"CMD = {command}\n"), [])
+
+    def test_each_pipeline_segment_is_checked(self) -> None:
+        """A generator only exempts its own segment, including after list operators."""
+        for command in (
+            "printf x | ffmpeg -i - -f null - | sed s/x/y/",
+            "printf x && run x | sed s/x/y/",
+            "echo x; run x | sed s/x/y/",
+            "echo x || run x | sed s/x/y/",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual([f.rule for f in self.findings(f"CMD = {command}\n")], ["pipe"])
+
+    def test_helper_pipelines_fail(self) -> None:
+        """Shell helpers catch test commands and command variables on the left."""
+        for command in ("run x", "ffmpeg x", "ffprobe x", "$showfiltfmts x", '"$@"'):
+            with self.subTest(command=command):
+                findings = self.findings(f"    {command} | sort\n", shell_grammar=True)
+                self.assertEqual([f.rule for f in findings], ["helper-pipe"])
+
+    def test_helper_redirection_pipelines_fail(self) -> None:
+        """Descriptor and combined redirections cannot hide helper test producers."""
+        for command in (
+            "ffmpeg x 2>&1 | sort",
+            "run x >&2 | sort",
+            "ffprobe x 2>&- | sort",
+            "ffmpeg x &>log | sort",
+            "run x <&0 | sort",
+            "ffmpeg x &>>log | sort",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)],
+                    ["helper-pipe"],
+                )
+
+    def test_make_redirection_pipeline_fails(self) -> None:
+        """Make CMD pipelines retain findings after descriptor redirection."""
+        self.assertEqual([f.rule for f in self.findings("CMD = run x 2>&1 | sort\n")], ["pipe"])
+
+    def test_redirection_list_boundaries(self) -> None:
+        """Standalone ampersands split commands while redirections leave lists intact."""
+        for command, rules in (
+            ("printf x & ffmpeg y | sort", ["helper-pipe"]),
+            ("ffmpeg x & printf y | sort", []),
+            ("ffmpeg x 2>&1 || return", []),
+            ("ffmpeg x >out 2>&1", []),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)], rules
+                )
+
+    def test_shell_redirection_tokens(self) -> None:
+        """Redirections remain whole non-operator tokens before shell list operators."""
+        for token in ("2>&1", ">&2", "<&0", "2>&-", "12>&345", "&>", "&>>", "<", ">", ">>"):
+            with self.subTest(token=token):
+                self.assertEqual(
+                    [m[0] for m in upstream_lint.FATE_SHELL_TOKEN.finditer(token)], [token]
+                )
+                command = f"run x {token}out | sort"
+                self.assertEqual(
+                    upstream_lint._fate_shell_operators(command), [(command.index("|"), "|")]
+                )
+
+    def test_target_specific_command_assignment_pipes(self) -> None:
+        """Target-specific recursive and simple CMD assignments both check pipelines."""
+        for operator in ("=", ":="):
+            with self.subTest(operator=operator):
+                source = f"fate-x: CMD {operator} run x | sort\n"
+                self.assertEqual([f.rule for f in self.findings(source)], ["pipe"])
+
+    def test_target_specific_command_assignment_registrations(self) -> None:
+        """Both target-specific CMD operators expose library registration mismatches."""
+        for operator in ("=", ":="):
+            with self.subTest(operator=operator):
+                source = (
+                    "FATE_FFMPEG += fate-formats\n"
+                    f"fate-formats: CMD {operator} run libavutil/tests/formats\n"
+                )
+                self.assertEqual([f.rule for f in self.findings(source)], ["registration"])
+
+    def test_target_specific_command_assignment_classifier(self) -> None:
+        """The shared command classifier keeps two groups and rejects other names or operators."""
+        line = upstream_lint.FateLine("fate-x: CMD := run x", 1, 1)
+        self.assertEqual(upstream_lint._fate_kind(line), ("command", ("fate-x", "run x")))
+        for assignment in ("CMDX :=", "CMD +=", "CMD ?="):
+            with self.subTest(assignment=assignment):
+                line = upstream_lint.FateLine(f"fate-x: {assignment} run x", 1, 1)
+                self.assertNotEqual(upstream_lint._fate_kind(line)[0], "command")
+
+    def test_control_word_helper_pipelines_fail(self) -> None:
+        """Control words do not hide helper test producers before a pipe."""
+        for command in (
+            "if ffmpeg -i in -f null - | sort; then :; fi",
+            "while run foo | head; do :; done",
+            "! ffprobe x | sort",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)],
+                    ["helper-pipe"],
+                )
+
+    def test_control_word_generators_pass(self) -> None:
+        """Control words preserve exemptions for literal data generators."""
+        self.assertEqual(self.findings("if printf x | sort; then :; fi", shell_grammar=True), [])
+        for producer in ("printf", "echo", "cat"):
+            with self.subTest(producer=producer):
+                self.assertEqual(self.findings(f"CMD = if {producer} x | sort\n"), [])
+
+    def test_control_word_prefixes_and_sequences(self) -> None:
+        """Only whole leading control words are skipped in either pipe rule."""
+        for prefix in ("if", "then", "elif", "else", "while", "until", "do", "!", "{", "("):
+            with self.subTest(prefix=prefix):
+                findings = self.findings(f"{prefix} run x | sort", shell_grammar=True)
+                self.assertEqual([f.rule for f in findings], ["helper-pipe"])
+                self.assertEqual(self.findings(f"CMD = {prefix} printf x | sort\n"), [])
+        self.assertEqual(
+            [f.rule for f in self.findings("if then ! { ( run x | sort", shell_grammar=True)],
+            ["helper-pipe"],
+        )
+        self.assertEqual(self.findings("ifconfig ffmpeg x | sort", shell_grammar=True), [])
+        self.assertEqual(
+            [f.rule for f in self.findings("CMD = ifconfig printf x | sort\n")], ["pipe"]
+        )
+
+    def test_helper_boundaries_pass(self) -> None:
+        """Comments, ordinary text processing and quoted helper pipes pass."""
+        for line in (
+            "# ffmpeg x | sort",
+            "printf x | ffmpeg -i - -f null -",
+            "do_md5sum x | awk '{print $1}'",
+            "ffmpeg x || return",
+            'ffmpeg "x|y"',
+            "x=$(ffmpeg x | sort)",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.findings(line, shell_grammar=True), [])
+
+    def test_shell_quoted_hash_pipelines_fail(self) -> None:
+        """Quoted hashes retain helper pipelines for producer status checking."""
+        for command in (
+            "ffmpeg -metadata title='#' -i input | sort",
+            'run x "a # b" | sort',
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)],
+                    ["helper-pipe"],
+                )
+
+    def test_shell_comment_word_boundaries(self) -> None:
+        """Word hashes and parameter expansions preserve pipes unlike real comments."""
+        for argument in ("foo#bar", "$#", "${#x}", r"\#", r'"a\" # b"'):
+            with self.subTest(argument=argument):
+                command = f"run x {argument} | sort"
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)],
+                    ["helper-pipe"],
+                )
+
+    def test_shell_real_comments_and_generators_pass(self) -> None:
+        """Real shell comments end commands while quoted generator hashes pass."""
+        for command in (
+            "echo foo # | sort",
+            "ffmpeg x # | sort",
+            "# ffmpeg x | sort",
+            "printf '%s\\n' \"#\" | sort",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.findings(command, shell_grammar=True), [])
+        self.assertEqual(self.findings("CMD = run x # | sort\n"), [])
+        self.assertEqual(self.findings("CMD = run x '#' | sort\n"), [])
+        makefile = "$(FATE_X): # ffmpeg$(PROGSSUF)$(EXESUF)\n"
+        with self.assertRaisesRegex(ValueError, "no ffmpeg"):
+            upstream_lint._fate_shape_ffmpeg(makefile)
+
+    def test_shell_escaped_space_and_operator_comments(self) -> None:
+        """Escaped spaces keep hashes in words while control operators start comments."""
+        for command, rules in (
+            (r"run x foo\ #bar | sort", ["helper-pipe"]),
+            ("run x;# run y | sort", []),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    [f.rule for f in self.findings(command, shell_grammar=True)], rules
+                )
+        for operator in (";", "&", "|", "(", ")", "&&", "||", ";;", "|&"):
+            with self.subTest(operator=operator):
+                command = f"printf x{operator}# run y | sort"
+                self.assertEqual(self.findings(command, shell_grammar=True), [])
+                self.assertEqual(
+                    upstream_lint._fate_shell_uncomment(command), f"printf x{operator}"
+                )
+
+    def test_shell_quoted_hash_continuation_provenance(self) -> None:
+        """Real shell continuations retain endpoints while comment backslashes end at newline."""
+        source = "ffmpeg -metadata title='#' \\\n    -i input | sort\n"
+        for added in ({1}, {2}):
+            with self.subTest(added=added):
+                findings = self.findings(source, added, shell_grammar=True)
+                self.assertEqual([f.rule for f in findings], ["helper-pipe"])
+                self.assertEqual([f.line for f in findings], list(added))
+        self.assertEqual(self.findings(source, {3}, shell_grammar=True), [])
+        source = "ffmpeg x # comment \\\nrun y | sort\n"
+        self.assertEqual(self.findings(source, {1}, shell_grammar=True), [])
+        findings = self.findings(source, {2}, shell_grammar=True)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("helper-pipe", 2)])
+        self.assertEqual(self.findings("CMD = " + source), [])
+        source = 'run x "quoted # \\\ntext" | sort\n'
+        for added in ({1}, {2}):
+            with self.subTest(added=added):
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source, added, shell_grammar=True)],
+                    [("helper-pipe", min(added))],
+                )
+
+    def test_shell_continuations_join_without_separator(self) -> None:
+        """Shell continuation fragments form one word while make fragments retain a space."""
+        source = "ff\\\nmpeg x | sort\n"
+        expected = self.findings("ffmpeg x | sort\n", {1}, shell_grammar=True)
+        self.assertEqual([f.rule for f in expected], ["helper-pipe"])
+        for added in ({1}, {2}):
+            with self.subTest(added=added):
+                findings = self.findings(source, added, shell_grammar=True)
+                self.assertEqual([f.message for f in findings], [f.message for f in expected])
+                self.assertEqual([f.line for f in findings], list(added))
+        line = upstream_lint._fate_lines(source, shell_grammar=True)[0]
+        self.assertEqual((line.text, line.first, line.last), ("ffmpeg x | sort", 1, 2))
+        self.assertEqual(upstream_lint._fate_lines(source)[0].text, "ff mpeg x | sort")
+        self.assertEqual(self.findings(source, {3}, shell_grammar=True), [])
+
+    def test_endian_quoted_and_escaped_graph_delimiters(self) -> None:
+        """Quoted or escaped graph delimiters cannot invent endian filters or consumers."""
+        for option in ("-lavfi", "-vf", "-filter_complex", "-filter:v"):
+            for graph in (
+                "drawtext=text='sample,format=gray16le,null,end'",
+                r"drawtext=text=sample\,format=gray16le,null",
+                "drawtext=text='sample;format=gray16le,null'",
+                r"drawtext=text=sample\;format=gray16le,null",
+            ):
+                with self.subTest(option=option, graph=graph):
+                    self.assertEqual(self.findings(f'CMD = framecrc {option} "{graph}"\n'), [])
+            for graph in ("format=gray16le,null", "drawtext=text='sample\\',format=gray16le,null"):
+                with self.subTest(option=option, graph=graph):
+                    findings = self.findings(f'CMD = framecrc {option} "{graph}"\n')
+                    self.assertEqual([f.rule for f in findings], ["endian"])
+
+    def test_endian_graph_fails(self) -> None:
+        """Explicit endian format filters fail for each supported graph option."""
+        for option in ("-lavfi", "-vf", "-filter_complex", "-filter:v"):
+            for formats in ("yuv420p12le", "pix_fmts=yuv420p|gbrp10be"):
+                with self.subTest(option=option, formats=formats):
+                    findings = self.findings(
+                        f'CMD = framecrc {option} "nullsrc,format={formats},geq=lum=1,hqdn3d" '
+                        "-frames:v 5\n"
+                    )
+                    self.assertEqual([f.rule for f in findings], ["endian"])
+
+    def test_endian_instance_producers_fail(self) -> None:
+        """Format instance IDs do not hide endian forcing before native consumers."""
+        for graph in (
+            "format@forced=gray16le,hqdn3d",
+            "format@a=pix_fmts=yuv420p10le,hqdn3d",
+        ):
+            with self.subTest(graph=graph):
+                findings = self.findings(f"CMD = framecrc -vf {graph}\n")
+                self.assertEqual([f.rule for f in findings], ["endian"])
+
+    def test_endian_instance_converters_pass(self) -> None:
+        """Scale and format instance IDs retain their conversion exemptions."""
+        for graph in (
+            "format=gray16le,scale@convert=w=32:h=32",
+            "format@f=gray16le,format@g=gray",
+            "format=gray16le,format@g=gray",
+            "format@f=gray16le,scale@convert=w=32:h=32",
+        ):
+            with self.subTest(graph=graph):
+                self.assertEqual(self.findings(f"CMD = framecrc -vf {graph}\n"), [])
+
+    def test_unquoted_endian_example_fails(self) -> None:
+        """The planted unquoted native-endian-filter graph reports its format."""
+        findings = self.findings(
+            "CMD = framecrc -lavfi nullsrc,format=yuv420p12le,geq=lum=1,hqdn3d -frames:v 5\n"
+        )
+        self.assertEqual([f.rule for f in findings], ["endian"])
+
+    def test_endian_boundaries_pass(self) -> None:
+        """Native formats, non-format words, scaling and output pixel formats pass."""
+        commands = (
+            "framecrc -lavfi nullsrc,format=yuv420p12,geq=lum=1,hqdn3d,scale "
+            "-pix_fmt yuv420p12le -frames:v 5",
+            "framecrc -vf scale,format=yuv420p10le",
+            "framecrc -vf scale=w=32:h=32,format=pix_fmts=gbrp10be",
+            "framecrc -vf nullsrc,shuffleplanes",
+            "framecrc -pix_fmt yuv420p10le",
+            "framecrc -metadata title=lowercasele",
+            "framecrc -vf nullsrc,aformat=sample_fmts=s16le",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.findings(f"CMD = {command}\n"), [])
+
+    def test_format_consumer_fails_after_scale(self) -> None:
+        """A preceding scale cannot protect the consumer of the forced format."""
+        for graph in (
+            "scale,format=yuv420p10le,hqdn3d",
+            "scale;nullsrc,format=yuv420p10le,geq",
+            "scale_cuda,format=yuv420p10le[a],hqdn3d",
+            "format=yuv420p10be,null",
+        ):
+            with self.subTest(graph=graph):
+                command = f'framecrc -vf "{graph}"'
+                self.assertEqual(len(upstream_lint._fate_shape_endian(command)), 1)
+                findings = self.findings(f"CMD = {command}\n")
+                self.assertEqual([f.rule for f in findings], ["endian"])
+
+    def test_format_conversion_and_chain_ends_pass(self) -> None:
+        """Conversion consumers and formats ending labelled chains are portable."""
+        for graph in (
+            "testsrc2,format=pix_fmts=yuv422p12le,scale,framerate=fps=60,scale",
+            "format=yuv444p16le,format=yuv444p16",
+            "format=yuv444p16le,scale=w=32:h=32",
+            "format=yuv444p16le[a],scale[out]",
+            "format=yuv444p16le,format=yuv444p16[out]",
+            "scale,format=yuv420p10le",
+            "format=yuv444p16le[a]",
+            "[in]format=yuv444p16le[a];[a]hqdn3d",
+            "scale,null,format=yuv420p10le",
+        ):
+            with self.subTest(graph=graph):
+                command = f'framecrc -vf "{graph}"'
+                self.assertEqual(upstream_lint._fate_shape_endian(command), [])
+                self.assertEqual(self.findings(f"CMD = {command}\n"), [])
+
+    def test_old_lines_and_comments_pass(self) -> None:
+        """Only added lines can report shell, grep and endian findings."""
+        source = "CMD = run x | sed s/x/y/\nCMD = grep failed\nCMD = framecrc -vf format=gray16le\n"
+        self.assertEqual(self.findings(source, {4}), [])
+        self.assertEqual(self.findings("# " + source.splitlines()[0]), [])
+        self.assertEqual(self.findings("CMD = run x # | sed s/x/y/\n"), [])
+        self.assertEqual(self.findings("ffmpeg x | sort\n", set(), shell_grammar=True), [])
+
+    def test_continuations_report_added_physical_line(self) -> None:
+        """Joined commands and registrations report the added continuation line."""
+        source = "fate-x: CMD = run x \\\n    | sed s/x/y/\n"
+        self.assertEqual([f.line for f in self.findings(source, {2})], [2])
+        source = (
+            "FATE_FILTER-$(CONFIG_X) += \\\n fate-x # trailing comment\n"
+            "fate-x: CMD = run libavfilter/tests/x\n"
+            "FATE_FFMPEG += $(FATE_FILTER-yes)\n"
+        )
+        self.assertEqual([f.line for f in self.findings(source, {2})], [2])
+        self.assertEqual(self.findings("CMD = run x # comment \\\n | sort\n"), [])
+
+    def test_range_finding_and_waiver(self) -> None:
+        """Real range diffs fail and retain findings under a non-blank waiver."""
+        fixture = self.fixture("fate-x: CMD = run x | sort\n")
+        for reason, rc in (("", 1), ("   ", 1), ("reference pending", 0)):
+            with self.subTest(reason=reason):
+                step = upstream_lint._fate_shape(fixture.root, fixture.base, "HEAD", reason)
+                self.assertEqual(step.rc, rc, step.output)
+                self.assertIn("finding: tests/fate/shape.mak:1:", step.output)
+                if rc == 0:
+                    self.assertTrue(step.output.startswith("waived: reference pending\n"))
+                else:
+                    self.assertIn("pass --fate-shape-reason", step.output)
+
+    def test_range_aggregation_uses_all_revision_files(self) -> None:
+        """Sibling aggregation survives column and fixed-pattern Git configuration overrides."""
+        fixture = self.fixture()
+        fixture.write(
+            "tests/Makefile", "$(CUSTOM): ffmpeg$(PROGSSUF)$(EXESUF)\nCUSTOM += $(MIDDLE)\n"
+        )
+        fixture.write("tests/fate/aggregate.mak", "MIDDLE += $(FATE_FILTER-yes)\n")
+        fixture.commit()
+        base = fixture.git("rev-parse", "HEAD").strip()
+        fixture.write(
+            "tests/fate/shape.mak",
+            ("FATE_FILTER-$(CONFIG_X) += fate-x\nfate-x: CMD = run libavfilter/tests/x\n"),
+        )
+        fixture.commit()
+        fixture.write("tests/Makefile", "$(IGNORED): ffmpeg$(PROGSSUF)$(EXESUF)\n")
+        expected = None
+        for column, pattern in (("false", "basic"), ("true", "basic"), ("false", "fixed")):
+            with self.subTest(column=column, pattern=pattern):
+                fixture.git("config", "grep.column", column)
+                fixture.git("config", "grep.patternType", pattern)
+                with unittest.mock.patch.object(
+                    upstream_lint, "_git", wraps=upstream_lint._git
+                ) as git:
+                    step = upstream_lint._fate_shape(fixture.root, base, "HEAD", "")
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("FATE_FILTER-yes -> MIDDLE -> CUSTOM", step.output)
+                self.assertLessEqual(len(git.call_args_list), 5)
+                if expected is None:
+                    expected = step.output
+                self.assertEqual(step.output, expected)
+
+    def test_revision_comment_separators_and_malformed_records(self) -> None:
+        """Only newlines delimit Git records; Unicode or control comment separators remain data."""
+        for separator in ("\u2028", "\f"):
+            with self.subTest(separator=repr(separator)):
+                fixture = self.fixture()
+                fixture.write(
+                    "tests/fate/aggregate.mak",
+                    f"# before{separator}after\nFATE_FFMPEG += $(FATE_LIBAVUTIL)\n",
+                )
+                fixture.commit()
+                base = fixture.git("rev-parse", "HEAD").strip()
+                fixture.write(
+                    "tests/fate/shape.mak",
+                    "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n",
+                )
+                fixture.commit()
+                step = upstream_lint._fate_shape(fixture.root, base, "HEAD", "")
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("registration=1", step.output)
+        for listing in ("missing separator\n", "HEAD:tests/fate/x.mak\0# ok\n\n"):
+            with (
+                self.subTest(listing=listing),
+                unittest.mock.patch.object(
+                    upstream_lint, "_fate_makefile", return_value=FATE_FFMPEG_RULE
+                ),
+                unittest.mock.patch.object(upstream_lint, "_git", return_value=listing),
+                self.assertRaisesRegex(ValueError, "malformed git grep record"),
+            ):
+                upstream_lint._fate_shape_revision(Path("."), "HEAD")
+
+    def test_range_missing_makefile_is_unwaivable(self) -> None:
+        """A missing revision Makefile returns rc 2 even with a waiver."""
+        fixture = self.fixture("FATE_X += fate-x\n", makefile=None)
+        for reason in ("", "reference pending"):
+            step = upstream_lint._fate_shape(fixture.root, fixture.base, "HEAD", reason)
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertIn("tests/Makefile", step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_range_missing_ffmpeg_rule_is_unwaivable(self) -> None:
+        """A Makefile without the executable rule is an unwaivable input error."""
+        fixture = self.fixture("FATE_X += fate-x\n", makefile="FATE += $(FATE_X)\n")
+        for reason in ("", "reference pending"):
+            step = upstream_lint._fate_shape(fixture.root, fixture.base, "HEAD", reason)
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertIn("tests/Makefile", step.output)
+            self.assertIn("ffmpeg", step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_range_shell_file_is_checked(self) -> None:
+        """The range driver includes added fate-run.sh helper lines."""
+        fixture = self.fixture("ffmpeg x | sort\n", shell_grammar=True)
+        step = upstream_lint._fate_shape(fixture.root, fixture.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("tests/fate-run.sh:1:", step.output)
+
+    def test_range_old_pipe_is_ignored(self) -> None:
+        """An inherited pipe remains unreported when only a comment is added."""
+        fixture = self.fixture("fate-x: CMD = run x | sort\n")
+        base = fixture.git("rev-parse", "HEAD").strip()
+        fixture.write("tests/fate/shape.mak", "fate-x: CMD = run x | sort\n# added comment\n")
+        fixture.commit()
+        step = upstream_lint._fate_shape(fixture.root, base, "HEAD", "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("1 file(s) checked", step.output)
+        self.assertIn("pipe=0", step.output)
+
+    def test_range_unreadable_head_is_unwaivable(self) -> None:
+        """An unreadable head returns rc 2 even with a waiver."""
+        fixture = self.fixture()
+        for reason in ("", "reference pending"):
+            step = upstream_lint._fate_shape(fixture.root, fixture.base, "missing-head", reason)
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_read_error_is_unwaivable(self) -> None:
+        """Read failures keep rc 2 and the original diagnostic."""
+        with unittest.mock.patch.object(upstream_lint, "_git", side_effect=OSError("unreadable")):
+            step = upstream_lint._fate_shape(Path("."), "base", "head", "reference pending")
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertIn("unreadable", step.output)
+        self.assertNotIn("waived:", step.output)
+
+    def test_range_without_fate_changes_passes(self) -> None:
+        """A range without FATE changes reports its empty scope."""
+        fixture = self.fixture()
+        step = upstream_lint._fate_shape(fixture.root, fixture.base, "HEAD", "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("no added or modified FATE file or fate-run.sh", step.output)
+
+    def test_pipeline_order_and_cli_waiver(self) -> None:
+        """The collected step follows fate-deps and receives the command-line waiver."""
+        fixture = self.fixture("fate-x: CMD = run x | sort\n")
+        rc, output = fixture.check("--fate-shape-reason", "reference pending")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: fate-shape rc: 0\nwaived: reference pending", output)
+        self.assertLess(output.index("step: fate-deps"), output.index("step: fate-shape"))
+        self.assertLess(output.index("step: fate-shape"), output.index("step: regression-test"))
+        self.assertEqual(upstream_lint.Waivers(fate_shape="why").fate_shape, "why")
 
 
 class FateDepsTest(unittest.TestCase):
@@ -2099,6 +3860,13 @@ class FixtureTest(unittest.TestCase):
 class PipelineTest(FixtureTest):
     """Run Git and base tools in a throwaway repository; stub external hooks and engine."""
 
+    def setUp(self) -> None:
+        """Include the snapshot's mandatory ffmpeg prerequisite rule in every pipeline base."""
+        super().setUp()
+        self.write("tests/Makefile", FATE_FFMPEG_RULE)
+        self.commit("tests: add ffmpeg prerequisite fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
         """A correctly named clean commit passes every collected check."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
@@ -2906,7 +4674,10 @@ class PipelineTest(FixtureTest):
 
     def test_fate_macro_catalog_and_missing_file(self) -> None:
         """Head macro definitions grant only ALLYES wrappers and missing catalogs fail."""
-        self.write("tests/Makefile", "ALLYES = $(strip $(1))\nVIDEO = $(call ALLYES, $(1))\n")
+        self.write(
+            "tests/Makefile",
+            FATE_FFMPEG_RULE + "ALLYES = $(strip $(1))\nVIDEO = $(call ALLYES, $(1))\n",
+        )
         self.write(
             "tests/fate/filter-video.mak",
             "FATE_X-$(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER) += fate-x\n"

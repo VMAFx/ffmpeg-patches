@@ -16,6 +16,23 @@ rules:
       - pattern: subprocess.$FUNC(..., shell=True, ...)
       - pattern: subprocess.$FUNC(..., shell=1, ...)
 
+  - id: shell-keyword-outside-subprocess
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Codacy Bandit B604 flags any call passing a shell keyword other than
+      the literal False. Use a parameter name that says what it selects.
+    paths:
+      include:
+        - scripts/
+        - tests/
+    patterns:
+      - pattern: $FUNC(..., shell=$VALUE, ...)
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: ^(?!False$)
+      - pattern-not: subprocess.$SUBPROCESS_FUNC(...)
+
   - id: subprocess-argv-from-environment
     languages: [python]
     severity: ERROR
