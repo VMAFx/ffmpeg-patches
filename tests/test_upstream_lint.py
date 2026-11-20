@@ -4138,6 +4138,89 @@ class CRulesTest(unittest.TestCase):
 class RevertProofStepTest(FixtureTest):
     """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
 
+    def test_record_hex_width_and_case_boundaries(self) -> None:
+        """Lowercase SHA-256 IDs validate while short and uppercase IDs remain type errors."""
+        commit, head, head_tree = self.add_fix_commit()
+        for field in ("commit", "head", "head_tree"):
+            with self.subTest(field=field):
+                payload = self.valid_record(commit, head, head_tree, **{field: "a" * 64})
+                self.assertIsNone(upstream_lint._revert_proof_schema_error(payload))
+                for invalid in ("a" * 63, "A" * 40):
+                    payload[field] = invalid
+                    self.assertEqual(
+                        upstream_lint._revert_proof_schema_error(payload),
+                        f"wrong value type for {field}",
+                    )
+
+    def test_sha256_unmatched_record_is_silent_in_sha1_range(self) -> None:
+        """A valid 64-hex record outside a SHA-1 fix range produces no schema finding."""
+        self.add_fix_commit()
+        record = self.write_record("unmatched.json", self.valid_record(*(["a" * 64] * 3)))
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("no revert-proof record", step.output)
+        self.assertNotIn(str(record), step.output)
+        self.assertNotIn("wrong value type", step.output)
+
+    def test_docs_only_range_validates_supplied_records(self) -> None:
+        """Neutral ranges report malformed records while accepting absent or unrelated records."""
+        self.write("doc/manual.txt", "neutral documentation\n")
+        self.commit("doc: update manual")
+        self.assertEqual(self.proof_step().rc, 0)
+        record = self.write_record("unmatched.json", self.valid_record(*([self.base] * 3)))
+        self.assertEqual(self.proof_step(record).rc, 0)
+        for text, diagnostic in (("broken JSON", "not valid JSON"), ("{}", "missing key")):
+            with self.subTest(text=text):
+                record.write_text(text, encoding="utf-8")
+                step = self.proof_step(record)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn(f"{record}: {diagnostic}", step.output)
+                self.assertEqual(len(step.output.splitlines()), 1)
+                waived = upstream_lint._revert_proof(
+                    self.root, self.base, "HEAD", (record,), "manual verification"
+                )
+                self.assertEqual(waived.rc, 0, waived.output)
+                self.assertIn("waived: manual verification", waived.output)
+
+    def test_fix_cap_respects_nonblank_waiver(self) -> None:
+        """Only a nonblank waiver overrides the fix cap and skips per-fix validation."""
+        self.add_fix_commit()
+        self.add_fix_commit("libavfilter/vf_y.c", "avfilter/vf_y: fix second")
+        cap = "fix commits exceed MAX_CLAIM_COMMITS=1: 2"
+        with (
+            unittest.mock.patch.object(upstream_lint, "MAX_CLAIM_COMMITS", 1),
+            unittest.mock.patch.object(
+                upstream_lint, "_load_revert_proofs", side_effect=AssertionError("over cap")
+            ),
+        ):
+            for reason, expected in (("manual verification", 0), ("", 1), (" \t ", 1)):
+                with self.subTest(reason=reason):
+                    step = upstream_lint._revert_proof(self.root, self.base, "HEAD", waiver=reason)
+                    self.assertEqual(step.rc, expected, step.output)
+                    self.assertEqual(
+                        step.output, f"waived: {reason}\n{cap}" if expected == 0 else cap
+                    )
+
+    def test_record_byte_limit_refuses_before_json_parse(self) -> None:
+        """Exactly the limit parses, while one byte more is refused before JSON parsing."""
+        commit, head, head_tree = self.add_fix_commit()
+        record = self.write_record("oversized.json", self.valid_record(commit, head, head_tree))
+        encoded = record.read_bytes()
+        limit = len(encoded) + 16
+        record.write_bytes(encoded + b" " * 16)
+        with unittest.mock.patch.object(upstream_lint, "MAX_RECORD_BYTES", limit, create=True):
+            step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
+        record.write_bytes(encoded + b" " * 17)
+        with (
+            unittest.mock.patch.object(upstream_lint, "MAX_RECORD_BYTES", limit, create=True),
+            unittest.mock.patch.object(json, "loads", side_effect=AssertionError("parsed")),
+        ):
+            payload, bound_commit, error = upstream_lint._read_revert_proof(record)
+        self.assertIsNone(payload)
+        self.assertIsNone(bound_commit)
+        self.assertEqual(error, f"{record}: record exceeds MAX_RECORD_BYTES={limit}")
+
     def test_noop_graft_cli_demands_source_record(self) -> None:
         """Full CLI preflight admits a no-op graft and demands the source fix record."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))

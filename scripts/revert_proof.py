@@ -15,11 +15,13 @@ Tracked changes that Git status shows are refused, and cleanup is attempted afte
 every outcome the module survives; input errors mean exit 2, HEAD failure or
 movement or a command launch failure means exit 3 without a record,
 reverse-apply failure means exit 4, and scratch removal
-failure means exit 5 and names its path; an older record is removed before runs
+failure means exit 5 and names its path; a changed record parent or oversized
+encoded record means exit 2 without publication; an older record is removed before runs
 start, output must be outside the caller work tree and Git administration, and
 the temporary parent must be outside the caller work tree.
 Root fix commits are compared against the empty tree; reversing their source
-patch removes the added source files in scratch, with conflicts still exiting 4.
+patch removes the added source files in scratch; conflicts or pathspecs selecting
+non-source paths exit 4. Only sha1 and sha256 object formats are accepted in preflight.
 Parents hidden by shallow history, grafts or replace refs cause exit 2 before
 scratch work or old-record removal; fetch missing history or restore the parents.
 Commands above upstream_lint.MAX_COMMAND_ARGS are refused with exit 2 before
@@ -173,8 +175,16 @@ def worktree_root(tree: Path) -> Path:
     return root
 
 
+def _check_object_format(tree: Path) -> None:
+    """Refuse unsupported object formats before old-record removal or measurements."""
+    object_format = git_out(tree, "rev-parse", "--show-object-format").strip()
+    if object_format not in ("sha1", "sha256"):
+        raise _PreflightError(f"unsupported Git object format: {object_format}")
+
+
 def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str], str]:
-    """Refuse tracked changes or hidden parents and validate ancestry and source paths."""
+    """Validate object format, clean history, ancestry and the source path set."""
+    _check_object_format(tree)
     if not tree.is_dir():
         raise _PreflightError(f"work tree not found: {tree}")
     if tracked_status(tree):
@@ -199,6 +209,11 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
     )
     if ancestor.returncode != 0:
         raise _PreflightError(f"commit {commit} is not an ancestor of HEAD ({head})")
+    return commit, head, head_tree, _source_paths(tree, commit), head_ref
+
+
+def _source_paths(tree: Path, commit: str) -> list[str]:
+    """Return the bounded sorted source path set changed by a validated commit."""
     names = list(
         filter(
             None,
@@ -224,7 +239,7 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
     )
     if not source_paths:
         raise _PreflightError(f"commit {commit} changes no source path")
-    return commit, head, head_tree, source_paths, head_ref
+    return source_paths
 
 
 def run_test_command(command: list[str], tree: Path, timeout: float) -> int | str:
@@ -308,21 +323,30 @@ def _check_record_location(config: ProofConfig, path: Path) -> None:
             )
 
 
-def clear_record(config: ProofConfig) -> None:
-    """Exclude caller work tree and Git administration before removing an old record."""
+def clear_record(config: ProofConfig, descriptor: int | None = None) -> None:
+    """Remove an old record by name through its validated directory descriptor."""
     path = config.record
     _check_record_location(config, path)
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as error:
-        raise _PreflightError(f"cannot remove old record {path}: {error}") from error
+    with contextlib.ExitStack() as resources:
+        if descriptor is None:
+            descriptor = _open_record_directory(config)
+            resources.callback(os.close, descriptor)
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path.name, dir_fd=descriptor)
+        except OSError as error:
+            raise _PreflightError(f"cannot remove old record {path}: {error}") from error
 
 
 def _open_record_directory(config: ProofConfig) -> int:
-    """Pin and validate the output directory before either measurement starts."""
+    """Require directory-relative operations, then pin and validate the output directory."""
     # CPython lists rename rather than its replace alias in supports_dir_fd.
-    if os.open not in os.supports_dir_fd or not ({os.rename, os.replace} & os.supports_dir_fd):
-        raise _PreflightError("record write requires dir_fd support for os.open and os.replace")
+    if not {os.open, os.unlink} <= os.supports_dir_fd or not (
+        {os.rename, os.replace} & os.supports_dir_fd
+    ):
+        raise _PreflightError(
+            "record write requires dir_fd support for os.open and os.replace and os.unlink"
+        )
     config.record.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(config.record.parent, flags)
@@ -338,15 +362,31 @@ def _open_record_directory(config: ProofConfig) -> int:
         raise
 
 
+def _verify_record_directory(config: ProofConfig, descriptor: int) -> None:
+    """Require both the requested parent and its resolved path to name the pinned directory."""
+    parent = config.record.parent
+    try:
+        opened = os.fstat(descriptor)
+        expected = (opened.st_dev, opened.st_ino)
+        for named in (os.lstat(parent), os.stat(os.path.realpath(parent))):
+            if (named.st_dev, named.st_ino) != expected:
+                raise _PreflightError(f"record directory changed: {parent}")
+    except OSError as error:
+        raise _PreflightError(f"record directory changed: {parent}: {error}") from error
+
+
 def _write_record(descriptor: int, name: str, payload: dict[str, object]) -> None:
-    """Publish owner-only JSON atomically through the pinned directory; remove failed writes."""
+    """Bound encoded JSON before publishing through the pinned directory; clean failed writes."""
+    encoded = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    if len(encoded) > upstream_lint.MAX_RECORD_BYTES:
+        raise _PreflightError(f"record exceeds MAX_RECORD_BYTES={upstream_lint.MAX_RECORD_BYTES}")
     temporary = f".revert-proof-{uuid.uuid4().hex}.tmp"
     file_descriptor = os.open(
         temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=descriptor
     )
     try:
-        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, indent=2) + "\n")
+        with os.fdopen(file_descriptor, "wb") as stream:
+            stream.write(encoded)
         os.replace(temporary, name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
     except NotImplementedError as error:
         raise _PreflightError("record write requires dir_fd support for os.replace") from error
@@ -355,30 +395,40 @@ def _write_record(descriptor: int, name: str, payload: dict[str, object]) -> Non
             os.unlink(temporary, dir_fd=descriptor)
 
 
-def measure_reverted(
-    config: ProofConfig,
-    commit: str,
-    source_paths: list[str],
-) -> int | str:
-    """Reverse-apply only fix source paths in scratch and run the same test command."""
-    patch = git_result(
+def _source_patch(
+    config: ProofConfig, commit: str, source_paths: list[str]
+) -> upstream_lint.RunResult:
+    """Reject extra paths selected by recursive literal pathspecs before building the patch."""
+    options = ["diff-tree", "--root", "--no-commit-id", "-r", "--no-renames"]
+    selection = [commit, "--", *(f":(literal){p}" for p in source_paths[: upstream_lint.MAX_PATHS])]
+    names = git_out(config.tree, *options, "--name-only", "-z", *selection).split("\0")
+    extras = sorted(set(filter(None, names)) - set(source_paths))
+    if extras:
+        raise _ReverseApplyError(
+            f"reverse patch includes paths outside source_paths: {extras[:10]!r} "
+            f"({len(extras)} extra path(s))"
+        )
+    return git_result(
         config.tree,
-        "diff-tree",
-        "--root",
-        "--no-commit-id",
-        "-r",
+        *options,
         "-p",
         "--binary",
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
-        "--no-renames",
         "--src-prefix=a/",
         "--dst-prefix=b/",
-        commit,
-        "--",
-        *(f":(literal){path}" for path in source_paths[: upstream_lint.MAX_PATHS]),
+        *selection,
     )
+
+
+def measure_reverted(
+    config: ProofConfig,
+    commit: str,
+    source_paths: list[str],
+) -> int | str:
+    """Validate the exact reverse patch path set, apply it and run the same command."""
+    patch = _source_patch(config, commit, source_paths)
     applied = upstream_lint._run(
         ["git", "apply", "--whitespace=nowarn", "--no-ignore-whitespace", "-R", "-"],
         config.tree,
@@ -429,15 +479,16 @@ def measure_scratch(
 
 
 def run_proof(config: ProofConfig) -> None:
-    """Run both measurements in detached scratch, remove it, then publish the record."""
+    """Remove the old record through a pinned parent and publish only if it stays named."""
     config = ProofConfig(
         worktree_root(config.tree), config.commit, config.record, config.timeout, config.command
     )
     commit, head, head_tree, source_paths, head_ref = prepare_tree(config.tree, config.commit)
     scratch_parent(config.tree)
-    clear_record(config)
+    _check_record_location(config, config.record)
     descriptor = _open_record_directory(config)
     try:
+        clear_record(config, descriptor)
         rc_head = measure_scratch(config, head)
         rc_reverted = measure_scratch(config, head, commit, source_paths)
         verify_caller_head(config.tree, head, head_ref)
@@ -450,6 +501,7 @@ def run_proof(config: ProofConfig) -> None:
             "rc_reverted": rc_reverted,
             "reverted_paths": source_paths,
         }
+        _verify_record_directory(config, descriptor)
         _write_record(descriptor, config.record.name, payload)
     finally:
         os.close(descriptor)

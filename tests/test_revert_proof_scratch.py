@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import stat
+import subprocess  # nosec B404 - bounded fixture Git initialization errors only.
 import sys
 import tempfile
 import time
@@ -89,8 +90,33 @@ class RevertProofScratchTest(RevertProofFixture):
         self.assertEqual(rc, 0, error)
         self.assertEqual(stat.S_IMODE(os.stat(self.record_path).st_mode), 0o600)
 
+    def test_record_parent_swap_before_removal_preserves_sentinel(self) -> None:
+        """A parent swapped after the path check cannot redirect old-record removal."""
+        fix = self.make_fix()
+        parent, second = self.root / "records", self.root / "second"
+        parent.mkdir()
+        second.mkdir()
+        sentinel = second / "record.json"
+        sentinel.write_bytes(b"sentinel")
+        self.record_path = parent / "record.json"
+        real_check = revert_proof._check_record_location
+
+        def swap_after_check(config, path):
+            """Replace the requested parent immediately after its path location check."""
+            real_check(config, path)
+            if path == self.record_path and not parent.is_symlink():
+                parent.rename(self.root / "held")
+                parent.symlink_to(second, target_is_directory=True)
+
+        with unittest.mock.patch.object(
+            revert_proof, "_check_record_location", side_effect=swap_after_check
+        ):
+            rc, _, _ = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2)
+        self.assertEqual(sentinel.read_bytes(), b"sentinel")
+
     def test_record_parent_swap_cannot_write_inside_caller(self) -> None:
-        """Swapping the checked parent to a caller symlink keeps publication on its handle."""
+        """Swapping the pinned parent to a caller symlink refuses publication with exit two."""
         fix = self.make_fix()
         parent, held = self.root / "records", self.root / "held-records"
         self.record_path = parent / "record.json"
@@ -109,12 +135,105 @@ class RevertProofScratchTest(RevertProofFixture):
             revert_proof, "measure_scratch", side_effect=swap_after_head
         ):
             rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
-        self.assertEqual(rc, 0, error)
+        self.assertEqual(rc, 2, error)
+        self.assertIn(f"record directory changed: {parent}", error)
         self.assertFalse((self.tree / "record.json").exists())
-        payload = json.loads((held / "record.json").read_text(encoding="utf-8"))
-        expected = self.valid_record(fix, rc_reverted=0)
-        self.assertEqual(payload, expected)
-        self.assertEqual(list(held.iterdir()), [held / "record.json"])
+        self.assertEqual(list(held.iterdir()), [])
+
+    def test_record_parent_renamed_away_refuses_publication(self) -> None:
+        """Renaming the pinned parent without replacement refuses publication everywhere."""
+        fix = self.make_fix()
+        parent, held = self.root / "records", self.root / "held-records"
+        parent.mkdir()
+        self.record_path = parent / "record.json"
+        real_measure = revert_proof.measure_scratch
+
+        def rename_after_head(config, head, commit=None, source_paths=None):
+            """Rename the record parent after measuring HEAD without replacing its name."""
+            result = real_measure(config, head, commit, source_paths)
+            if commit is None:
+                parent.rename(held)
+            return result
+
+        with unittest.mock.patch.object(
+            revert_proof, "measure_scratch", side_effect=rename_after_head
+        ):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 2, error)
+        self.assertIn(f"record directory changed: {parent}", error)
+        self.assertFalse(parent.exists())
+        self.assertEqual(list(held.iterdir()), [])
+        self.assertEqual(list(self.root.rglob("record.json")), [])
+
+    def test_reverse_patch_refuses_source_replaced_by_directory(self) -> None:
+        """A literal source pathspec cannot reverse a non-source descendant file."""
+        self.write("libavfilter/old.c", BASE_SOURCE)
+        self.commit("add source fixture")
+        (self.tree / "libavfilter/old.c").unlink()
+        self.write("libavfilter/old.c/fixture.txt", "non-source sentinel\n")
+        fix = self.commit("fix old source layout")
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 4, error)
+        self.assertIn("old.c/fixture.txt", error)
+        self.assertFalse(self.record_path.exists())
+        self.assertEqual(
+            (self.tree / "libavfilter/old.c/fixture.txt").read_text(encoding="utf-8"),
+            "non-source sentinel\n",
+        )
+
+    def test_sha256_producer_record_passes_consumer(self) -> None:
+        """SHA-256 Git object IDs survive real producer and consumer measurements."""
+        self.tree = self.root / "sha256"
+        self.tree.mkdir()
+        try:
+            run_git(self.tree, "init", "-q", "--object-format=sha256", preserve_config=True)
+        except subprocess.CalledProcessError as error:
+            refusal = ("unknown option", "unknown hash algorithm", "unsupported object format")
+            if not any(marker in error.stderr.lower() for marker in refusal):
+                raise
+            self.skipTest(f"installed Git refuses git init --object-format=sha256: {error.stderr}")
+        self.write("libavfilter/vf_x.c", BASE_SOURCE)
+        self.base = self.commit("avfilter: base")
+        fix = self.make_fix()
+        program = (
+            "from pathlib import Path; "
+            "raise SystemExit(0 if 'return 2;' in Path('libavfilter/vf_x.c').read_text() else 17)"
+        )
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", program])
+        self.assertEqual(rc, 0, error)
+        payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(payload["commit"]), 64)
+        step = upstream_lint._revert_proof(self.tree, self.base, fix, (self.record_path,))
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output, "1 fix commit(s), 1 revert-proof record(s)")
+
+    def test_unknown_object_format_preserves_old_record(self) -> None:
+        """Unknown Git object formats fail preflight before removing an old record."""
+        fix = self.make_fix()
+        self.record_path.write_bytes(b"old record")
+        real_out = revert_proof.git_out
+
+        def unknown_format(tree, *args):
+            """Plant an unsupported format while retaining real Git for other queries."""
+            if args == ("rev-parse", "--show-object-format"):
+                return "future-format\n"
+            return real_out(tree, *args)
+
+        with unittest.mock.patch.object(revert_proof, "git_out", side_effect=unknown_format):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("unsupported Git object format: future-format", error)
+        self.assertEqual(self.record_path.read_bytes(), b"old record")
+
+    def test_oversized_payload_refuses_before_temporary_write(self) -> None:
+        """An oversized encoded payload leaves neither a record nor a temporary file."""
+        fix = self.make_fix()
+        self.record_path = self.root / "records" / "record.json"
+        with unittest.mock.patch.object(upstream_lint, "MAX_RECORD_BYTES", 1, create=True):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 2, error)
+        self.assertIn("record exceeds MAX_RECORD_BYTES=1", error)
+        self.assertEqual(list(self.record_path.parent.iterdir()), [])
 
     def test_failed_record_replace_removes_temporary_file(self) -> None:
         """A failed atomic publication leaves no record or temporary file behind."""
@@ -126,13 +245,23 @@ class RevertProofScratchTest(RevertProofFixture):
         self.assertIn("publish failed", error)
         self.assertEqual(list(self.record_path.parent.iterdir()), [])
 
+    def test_record_unlink_requires_directory_fd_support(self) -> None:
+        """Missing unlink dir_fd support refuses removal before any measurements."""
+        fix = self.make_fix()
+        supported = os.supports_dir_fd - {os.unlink}
+        with unittest.mock.patch.object(os, "supports_dir_fd", supported):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("dir_fd support for os.open and os.replace and os.unlink", error)
+        self.assertFalse(self.record_path.exists())
+
     def test_record_write_requires_directory_fd_support(self) -> None:
         """Unsupported directory-relative writes fail explicitly before measurements."""
         fix = self.make_fix()
         with unittest.mock.patch.object(os, "supports_dir_fd", set()):
             rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
         self.assertEqual(rc, 2, error)
-        self.assertIn("dir_fd support for os.open and os.replace", error)
+        self.assertIn("dir_fd support for os.open and os.replace and os.unlink", error)
         self.assertFalse(self.record_path.exists())
 
     def test_reverse_apply_preserves_parent_whitespace_despite_git_config(self) -> None:

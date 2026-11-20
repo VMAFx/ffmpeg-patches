@@ -71,7 +71,7 @@ process keeps its numeric exit code, including 127. The reader rejects timeout
 and launch-error sentinels as no-verdict results.
 An older record is removed before commands start; the tree argument must name the
 root, and output must be outside that root and Git administration.
-The record contains commit, head, head_tree,
+The record contains lowercase 40- or 64-hex commit, head, head_tree,
 command, rc_head, rc_reverted and reverted_paths. The step checks that each
 fix commit has a valid record whose head_tree matches head, whose rc_head is 0
 and whose rc_reverted is a nonzero integer. The head must resolve to a commit
@@ -1789,7 +1789,8 @@ def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
     return _unreached_test_step(unreached, reason)
 
 
-HEX_40 = re.compile(r"^[0-9a-f]{40}$")
+HEX_40_OR_64 = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+MAX_RECORD_BYTES = 64 * 1024 * 1024
 REVERT_PROOF_KEYS = frozenset(
     {
         "commit",
@@ -1836,10 +1837,10 @@ def _is_command_list(value: object) -> bool:
 
 
 def _valid_hex_fields(payload: dict[str, object]) -> str | None:
-    """Return the first non-40-hex commit or tree field name, or None."""
+    """Return the first commit or tree field outside lowercase 40- or 64-hex IDs."""
     for key in ("commit", "head", "head_tree"):
         value = payload[key]
-        if not isinstance(value, str) or not HEX_40.fullmatch(value):
+        if not isinstance(value, str) or not HEX_40_OR_64.fullmatch(value):
             return f"wrong value type for {key}"
     return None
 
@@ -1879,9 +1880,13 @@ def _revert_proof_schema_error(payload: dict[str, object]) -> str | None:
 def _read_revert_proof(
     path: Path,
 ) -> tuple[dict[str, object] | None, str | None, str | None]:
-    """Read and validate one revert-proof JSON file, refusing duplicate keys."""
+    """Bound one JSON record before parsing, then validate its keys and field types."""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys)
+        with path.open("rb") as stream:
+            encoded = stream.read(MAX_RECORD_BYTES + 1)
+        if len(encoded) > MAX_RECORD_BYTES:
+            return None, None, f"{path}: record exceeds MAX_RECORD_BYTES={MAX_RECORD_BYTES}"
+        payload = json.loads(encoded.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None, None, f"{path}: not valid JSON"
     except ValueError as error:
@@ -1999,21 +2004,34 @@ def _revert_proof(
     records: tuple[Path, ...] = (),
     waiver: str = "",
 ) -> Step:
-    """Report incomplete history and require measured records for source fixes in base..head."""
+    """Validate supplied records and source fixes, allowing an explicit waiver even above cap."""
     history_errors: list[str] = []
     try:
         fixes = _fix_commits(tree, base, head, include_merges=True, history_errors=history_errors)
     except RuntimeError as error:
         return Step("revert-proof", 1, str(error))
     summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
-    if not fixes and not history_errors:
+    if not fixes and not history_errors and not records:
         return Step("revert-proof", 0, summary)
     if len(fixes) > MAX_CLAIM_COMMITS:
+        cap = f"fix commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(fixes)}"
+        reason = waiver.strip()
         return Step(
-            "revert-proof",
-            1,
-            f"fix commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(fixes)}",
+            "revert-proof", 0 if reason else 1, f"waived: {reason}\n{cap}" if reason else cap
         )
+    return _revert_proof_result(tree, head, (fixes, history_errors), records, waiver)
+
+
+def _revert_proof_result(
+    tree: Path,
+    head: str,
+    history: tuple[list[tuple[str, str, frozenset[str]]], list[str]],
+    records: tuple[Path, ...],
+    waiver: str,
+) -> Step:
+    """Collect bounded per-fix and step-scope findings and apply the optional waiver."""
+    fixes, history_errors = history
+    summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
     head_tree = _git(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
     fix_ids = frozenset(commit for commit, _, _ in fixes[:MAX_CLAIM_COMMITS])
     loaded = _load_revert_proofs(tuple(records), fix_ids)
