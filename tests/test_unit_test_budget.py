@@ -8,6 +8,7 @@ import ast
 import contextlib
 import io
 import os
+import select
 import signal
 import socket
 import subprocess  # nosec B404 - synthetic tests only, bounded local runner.
@@ -482,28 +483,81 @@ class UnitTestBudgetTest(unittest.TestCase):
         self.assertIn("Running 2 test suites (2 total tests) across 2 workers", result.stderr)
         self.assertIn("unit tests: wall time", result.stderr)
 
-    def test_singleton_pool_timeout_kills_descendants_and_cleans_fixture(self) -> None:
-        """A timed-out pool run kills worker descendants and removes fixture directories."""
+    def _pool_timeout_attempt(self, timeout: float) -> bool:
+        """Check timeout cleanup only when a worker connection meets the precondition."""
         listener, port = self._pool_listener()
-        source = self._worker_probe_source(port, "time.sleep(30)")
-        fixture_paths: list[Path] = []
-        exc: subprocess.TimeoutExpired | None = None
-        result: subprocess.CompletedProcess[str] | None = None
-        try:
-            result = self.run_pool_fixture(source, timeout=2.5, fixture_paths=fixture_paths)
-        except subprocess.TimeoutExpired as caught:
-            exc = caught
-        worker_pid, conn = self._accept_worker_pid(listener)
-        self.assertEqual(len(fixture_paths), 1)
-        self.assertFalse(fixture_paths[0].exists())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(worker_pid, 0)
-        self.assertEqual(conn.recv(64), b"")
-        self.assertIsNone(exc)
-        if result is not None:
-            self.assertEqual(result.returncode, 124, result.stderr)
-            self.assertIn("exceeded the 1.5 s deadline", result.stderr)
-            self.assertIn("FAIL wall-time budget exceeded", result.stderr)
+        with listener:
+            source = self._worker_probe_source(port, "time.sleep(30)")
+            fixture_paths: list[Path] = []
+            exc: subprocess.TimeoutExpired | None = None
+            result: subprocess.CompletedProcess[str] | None = None
+            try:
+                result = self.run_pool_fixture(source, timeout=timeout, fixture_paths=fixture_paths)
+            except subprocess.TimeoutExpired as caught:
+                exc = caught
+            self.assertIsNone(exc)
+            if not select.select([listener], [], [], 0.5)[0]:
+                return False
+            worker_pid, conn = self._accept_worker_pid(listener)
+            self.assertEqual(len(fixture_paths), 1)
+            self.assertFalse(fixture_paths[0].exists())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(worker_pid, 0)
+            self.assertEqual(conn.recv(64), b"")
+            if result is not None:
+                self.assertEqual(result.returncode, 124, result.stderr)
+                deadline = timeout * unit_test_budget.UNIT_BUDGET_SHARE
+                self.assertIn(f"exceeded the {deadline:g} s deadline", result.stderr)
+                self.assertIn("FAIL wall-time budget exceeded", result.stderr)
+        return True
+
+    def test_singleton_pool_timeout_kills_descendants_and_cleans_fixture(self) -> None:
+        """Retry missing worker connections before asserting timeout cleanup and diagnostics."""
+        timeouts = (2.5, 5.0, 10.0)
+        for timeout in timeouts:
+            if self._pool_timeout_attempt(timeout):
+                return
+        deadlines = ", ".join(
+            f"{timeout * unit_test_budget.UNIT_BUDGET_SHARE:g} s" for timeout in timeouts
+        )
+        self.fail(
+            "Unmet precondition: worker connected before the deadline; "
+            f"deadlines tried: {deadlines}"
+        )
+
+    def test_pool_timeout_retries_only_missing_worker_connection(self) -> None:
+        """Retry missing connections with bounded deadlines and report exhausted attempts."""
+        for outcomes in ((False, True), (False, False, False)):
+            with (
+                self.subTest(outcomes=outcomes),
+                unittest.mock.patch.object(
+                    self, "_pool_timeout_attempt", side_effect=outcomes
+                ) as attempt,
+            ):
+                if any(outcomes):
+                    self.test_singleton_pool_timeout_kills_descendants_and_cleans_fixture()
+                else:
+                    with self.assertRaises(AssertionError) as caught:
+                        self.test_singleton_pool_timeout_kills_descendants_and_cleans_fixture()
+                    self.assertIn("worker connected before the deadline", str(caught.exception))
+                    self.assertIn("1.5 s, 3 s, 6 s", str(caught.exception))
+                self.assertEqual(
+                    attempt.call_args_list,
+                    [unittest.mock.call(timeout) for timeout in (2.5, 5.0, 10.0)[: len(outcomes)]],
+                )
+
+    def test_pool_timeout_does_not_retry_assertion_failure(self) -> None:
+        """Propagate an attempt assertion failure without retrying the pool fixture."""
+        with (
+            unittest.mock.patch.object(
+                self,
+                "_pool_timeout_attempt",
+                side_effect=AssertionError("planted assertion failure"),
+            ) as attempt,
+            self.assertRaisesRegex(AssertionError, "planted assertion failure"),
+        ):
+            self.test_singleton_pool_timeout_kills_descendants_and_cleans_fixture()
+        attempt.assert_called_once_with(2.5)
 
     def test_singleton_pool_failing_worker_cleans_descendants_and_fixture(self) -> None:
         """A failing worker case preserves failure status without a false timeout or leak."""
