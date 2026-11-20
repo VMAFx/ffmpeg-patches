@@ -113,10 +113,12 @@ The doc-reference step fails an added @ref, @xref or @pxref inside a @section
 that follows wording such as described for or in, or same format as, in the
 same sentence across the previous line, when its anchor sits in another
 @section of the same file and the anchored table item names a library of that
-section (a word of its title, or the part of the word before its first -) that
-the citing section does not name. References to nodes or to other files, and
+section (a word of its title, or the part before its first -, whose lower-case
+form is a name in configure's library lists at the checked head) that the
+citing section does not name. References to nodes or to other files, and
 deferrals worded otherwise, are not detected. --doc-reason TEXT waives it and
-prints the reason.
+prints the reason. A listed name that is also an ordinary word (metal) counts
+as a library; an unlisted name (QSV) does not.
 
 The test-program step fails when base..head adds a C file directly under a
 lib*/tests/ directory and a TESTPROGS assignment (TESTPROGS =, := or +=, or
@@ -1974,7 +1976,10 @@ def configure_libraries(configure: str) -> frozenset[str]:
 
 
 def section_names(title: str, libraries: frozenset[str]) -> frozenset[str]:
-    """Return configure-listed heading words and long dash prefixes with original spelling."""
+    """Return configure-listed heading words and long dash prefixes with original spelling.
+    A listed name that is also an ordinary word (metal) counts; an unlisted name (QSV)
+    does not.
+    """
     words = [word.strip("-") for word in re.split(r"[^A-Za-z0-9_+-]+", title)]
     return frozenset(
         name

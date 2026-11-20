@@ -1922,6 +1922,29 @@ class DocReferenceTest(unittest.TestCase):
         text = text.replace("libaom reads", "QSV reads")
         self.assertEqual(self.findings(text), [])
 
+    def test_metal_heading_known_limit_is_found(self) -> None:
+        """Known configure-list limit: a listed ordinary heading word counts as a library."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section Metal formats")
+        text = text.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "The metal format stores one offset per line; a missing offset is zero.",
+        )
+        text = text.replace(
+            "Read per-frame offsets from @var{filename}, in the format described for\n",
+            "Read one offset per line from @var{filename}; a missing offset is zero.\n"
+            "The file uses the same format as\n",
+        )
+        libraries = REFERENCE_LIBRARIES | {"metal"}
+        self.assertEqual(
+            upstream_lint.reference_findings(
+                "doc/encoders.texi", text.splitlines(), {12}, libraries
+            ),
+            [
+                "doc/encoders.texi:12: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the Metal formats section names Metal"
+            ],
+        )
+
     def test_deferred_reference_is_found(self) -> None:
         """Boundary control: the baseline reference retains its exact libaom finding."""
         self.assertEqual(
