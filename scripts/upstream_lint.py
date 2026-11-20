@@ -1764,6 +1764,7 @@ TEXI_CHAPTER = re.compile(
     r"@(?:chapter|unnumbered|appendix|top|part|majorheading|chapheading|centerchap)\b"
 )
 TEXI_ITEM = re.compile(r"@itemx?\b")
+TEXI_ANCHOR_METADATA = re.compile(r"@(?:anchor\{|[cfkptv]index(?:\s|$))")
 TEXI_ITEM_END = re.compile(r"@(?:itemx?|end|section|subsection|chapter|anchor)\b")
 TEXI_ITEM_BLOCKS = (
     "example",
@@ -1780,26 +1781,8 @@ TEXI_ITEM_BLOCKS = (
     "vtable",
     "multitable",
 )
-SECTION_DESCRIPTION_WORDS = (
-    "and",
-    "encoder",
-    "encoders",
-    "decoder",
-    "decoders",
-    "muxer",
-    "muxers",
-    "demuxer",
-    "demuxers",
-    "filter",
-    "filters",
-    "device",
-    "devices",
-    "codec",
-    "codecs",
-    "options",
-)
 TEXI_REF = re.compile(r"@(?:ref|xref|pxref)\{")
-TEXI_COMMENT = re.compile(r"(?<!@)@(?:c|comment)(?=\s|$)")
+TEXI_COMMENT = re.compile(r"(?<!@)(?:@@)*@(?:c|comment)(?=\s|$)")
 DEFER_WORDING = re.compile(
     r"\b(?:(?:described|documented|defined|specified|explained)\s+(?:for|in|under|by|with)"
     r"|(?:same|identical)\s+(?:format|syntax)\s+as)\b(?:(?![.!?]\s)[^;])*$",
@@ -1964,23 +1947,32 @@ def texi_sections(lines: list[str]) -> list[str]:
     return titles
 
 
+def _library_name(name: str) -> bool:
+    """Recognize lib-prefixed names or uppercase names containing at least two letters."""
+    return name.lower().startswith("lib") or (
+        name.isupper() and sum(char.isalpha() for char in name) >= 2
+    )
+
+
 def section_names(title: str) -> frozenset[str]:
-    """Return library tokens over two letters and dash prefixes, omitting descriptive words."""
-    words = [word for word in re.split(r"[\s,]+", title) if word]
+    """Return library heading words and valid long dash prefixes with original spelling."""
+    words = [word.strip("-") for word in re.split(r"[^A-Za-z0-9_+-]+", title)]
     return frozenset(
         name
         for word in words
         for name in (word, word.split("-")[0])
-        if len(name) > 2 and name.lower() not in SECTION_DESCRIPTION_WORDS
+        if _library_name(name) and (name == word or len(name) > 2)
     )
 
 
 def _anchor_boundary(line: str, stack: list[str]) -> bool:
-    """Stop at unmatched block ends or peer item boundaries outside raw blocks."""
+    """Stop at unmatched ends or peer boundaries hidden only by conditional blocks."""
     if stack and stack[-1] in TEXI_RAW:
         return False
     end = TEXI_END.match(line)
-    return bool(end and end[1] not in stack) or (not stack and bool(TEXI_ITEM_END.match(line)))
+    if end:
+        return end[1] not in stack
+    return all(name.startswith("if") for name in stack) and bool(TEXI_ITEM_END.match(line))
 
 
 def _anchor_body(lines: list[str]) -> list[str]:
@@ -1996,10 +1988,22 @@ def _anchor_body(lines: list[str]) -> list[str]:
     return body
 
 
-def _anchor_item(lines: list[str], start: int) -> list[str]:
-    """Return an anchored table item's bounded body, including its nested blocks."""
-    index = start + 1
+def _anchor_next_line(lines: list[str], start: int) -> int | None:
+    """Find the next nonblank line excluding anchors and index entries within the bound."""
     for index in range(start + 1, min(len(lines), start + 1 + ANCHOR_ITEM_LIMIT)):
+        if lines[index].strip() and not TEXI_ANCHOR_METADATA.match(lines[index]):
+            return index
+    return None
+
+
+def _anchor_item(lines: list[str], start: int) -> list[str]:
+    """Return an anchored item's bounded body, skipping metadata before its item line."""
+    next_line = _anchor_next_line(lines, start)
+    if next_line is None:
+        return []
+    first = next_line if TEXI_ITEM.match(lines[next_line]) else start + 1
+    index = first
+    for index in range(first, min(len(lines), start + 1 + ANCHOR_ITEM_LIMIT)):
         if not TEXI_ITEM.match(lines[index]):
             break
     return _anchor_body(lines[index : index + ANCHOR_ITEM_LIMIT])
@@ -2042,7 +2046,7 @@ def _reference_context(lines: list[str], index: int) -> str:
 
 
 def _reference_lines(lines: list[str]) -> list[str]:
-    """Blank raw blocks and trim unescaped Texinfo comments, preserving line numbers."""
+    """Blank raw blocks and trim comments using at-sign escape parity, keeping line numbers."""
     visible: list[str] = []
     stack: list[str] = []
     for line in lines:
@@ -2059,20 +2063,31 @@ def _reference_lines(lines: list[str]) -> list[str]:
     return visible
 
 
+def _anchor_has_item(lines: list[str], index: int, depth: int, items: set[int]) -> bool:
+    """Require an item already open at this depth or immediately after anchor metadata."""
+    if depth in items:
+        return True
+    next_line = _anchor_next_line(lines, index)
+    return next_line is not None and bool(TEXI_ITEM.match(lines[next_line]))
+
+
 def _table_anchors(lines: list[str]) -> dict[str, int]:
-    """Index anchors whose innermost non-conditional block is an option table."""
+    """Index table anchors with an enclosing item or an immediately following item."""
     blocks = _texi_blocks(lines)
     stack: list[str] = []
+    item_depths: set[int] = set()
     anchors: dict[str, int] = {}
     for index, line in enumerate(lines):
         containers = [name for name in stack if not name.startswith("if")]
-        if (
-            containers
-            and containers[-1] in ("table", "ftable", "vtable")
-            and (match := TEXI_ANCHOR.match(line))
-        ):
-            anchors.setdefault(match[1].strip(), index)
+        if containers and containers[-1] in ("table", "ftable", "vtable"):
+            if TEXI_ITEM.match(line):
+                item_depths.add(len(stack))
+            elif (match := TEXI_ANCHOR.match(line)) and _anchor_has_item(
+                lines, index, len(stack), item_depths
+            ):
+                anchors.setdefault(match[1].strip(), index)
         _texi_prose_line(line, blocks, stack)
+        item_depths.intersection_update(range(len(stack) + 1))
     return anchors
 
 
@@ -2088,10 +2103,15 @@ def _reference_arguments(lines: list[str], index: int, start: int) -> tuple[list
 
 
 def _item_libraries(lines: list[str], sections: list[str], source: int, target: int) -> list[str]:
-    """Return other section library names mentioned in the referenced item's body."""
+    """Match target library names case-insensitively, excluding the citing library families."""
     body = "\n".join(_anchor_item(lines, target))
-    others = section_names(sections[target]) - section_names(sections[source])
-    return sorted(name for name in others if re.search(rf"(?<![\w-]){re.escape(name)}\b", body))
+    citing = {name.split("-")[0].lower() for name in section_names(sections[source])}
+    others = {
+        name for name in section_names(sections[target]) if name.split("-")[0].lower() not in citing
+    }
+    return sorted(
+        name for name in others if re.search(rf"(?<![\w-]){re.escape(name)}\b", body, re.IGNORECASE)
+    )
 
 
 def _added_references(lines: list[str], added: set[int]) -> list[tuple[int, int, list[str]]]:

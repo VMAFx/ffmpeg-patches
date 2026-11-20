@@ -1826,6 +1826,176 @@ class DocReferenceTest(unittest.TestCase):
             ],
         )
 
+    def test_anchor_without_table_item_passes(self) -> None:
+        """An anchor followed by prose without any table item names no item."""
+        text = REFERENCE_TEXT.replace("@item qpfile @var{filename}\n", "", 1)
+        self.assertEqual(self.findings(text, {10}), [])
+
+    def test_anchor_metadata_before_item_is_found(self) -> None:
+        """Blank lines and index entries between an anchor and its item are allowed."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n",
+            "@anchor{libaom-av1-qpfile}\n\n@cindex qpfile\n",
+        )
+        self.assertEqual(
+            self.findings(text, {13}),
+            [
+                "doc/encoders.texi:13: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom-av1 section names libaom"
+            ],
+        )
+
+    def test_anchor_inside_table_item_is_found(self) -> None:
+        """An anchor on the first line of an existing item's text retains ownership."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n@item qpfile @var{filename}",
+            "@item qpfile @var{filename}\n@anchor{libaom-av1-qpfile}",
+        )
+        self.assertEqual(
+            self.findings(text),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom-av1 section names libaom"
+            ],
+        )
+
+    def test_conditional_peer_item_ends_body(self) -> None:
+        """A peer item inside a conditional cannot supply the referenced item's library."""
+        text = REFERENCE_TEXT.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "Read per-frame offsets.\n@ifset extra\n@item other\n"
+            "libaom reads a missing offset as 0.\n@end ifset",
+        )
+        self.assertEqual(self.findings(text, {15}), [])
+
+    def test_conditional_library_inside_item_is_found(self) -> None:
+        """Conditional prose naming the library remains inside the referenced item."""
+        text = REFERENCE_TEXT.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "Read per-frame offsets.\n@ifset extra\n"
+            "libaom reads a missing offset as 0.\n@end ifset",
+        )
+        self.assertEqual(
+            self.findings(text, {14}),
+            [
+                "doc/encoders.texi:14: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom-av1 section names libaom"
+            ],
+        )
+
+    def test_nested_table_item_stays_in_body(self) -> None:
+        """An item in a nested table remains part of the referenced outer item."""
+        text = REFERENCE_TEXT.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "Read per-frame offsets.\n@table @option\n@item nested\n"
+            "libaom reads a missing offset as 0.\n@end table",
+        )
+        self.assertEqual(
+            self.findings(text, {15}),
+            [
+                "doc/encoders.texi:15: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom-av1 section names libaom"
+            ],
+        )
+
+    def test_uppercase_citing_library_passes(self) -> None:
+        """Citing library names match target families regardless of case."""
+        text = REFERENCE_TEXT.replace("@section libsvtav1", "@section LIBAOM")
+        self.assertEqual(self.findings(text), [])
+
+    def test_uppercase_target_library_is_found(self) -> None:
+        """Body matching ignores case while finding text preserves heading spelling."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section LIBAOM-AV1")
+        self.assertEqual(
+            self.findings(text),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the LIBAOM-AV1 section names LIBAOM"
+            ],
+        )
+
+    def test_citing_library_family_passes(self) -> None:
+        """A target variant and its citing library share the first-hyphen family."""
+        text = REFERENCE_TEXT.replace("@section libsvtav1", "@section libaom")
+        text = text.replace("libaom reads", "libaom-av1 reads")
+        self.assertEqual(self.findings(text), [])
+
+    def test_punctuated_target_heading_is_found(self) -> None:
+        """Punctuation separates heading words without becoming part of a library name."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom:")
+        self.assertEqual(
+            self.findings(text),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom: section names libaom"
+            ],
+        )
+
+    def test_heading_video_word_passes(self) -> None:
+        """An ordinary heading word cannot become a library through body repetition."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section libaom video")
+        text = text.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "Read per-frame offsets; the video offset defaults to zero.",
+        )
+        self.assertEqual(self.findings(text), [])
+
+    def test_heading_article_passes(self) -> None:
+        """An article in a heading cannot become a library through body repetition."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section the libaom")
+        text = text.replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "Read per-frame offsets; the offset defaults to zero.",
+        )
+        self.assertEqual(self.findings(text), [])
+
+    def test_capitals_target_library_is_found(self) -> None:
+        """An uppercase library heading matches lowercase prose and retains its spelling."""
+        text = REFERENCE_TEXT.replace("@section libaom-av1", "@section VAAPI encoders")
+        text = text.replace("libaom reads", "vaapi reads")
+        self.assertEqual(
+            self.findings(text),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the VAAPI encoders section names VAAPI"
+            ],
+        )
+
+    def test_comment_after_escaped_pair_passes(self) -> None:
+        """An escaped at-sign pair before a real comment does not expose its reference."""
+        for command in ("c", "comment"):
+            with self.subTest(command=command):
+                lines = REFERENCE_TEXT.splitlines()
+                lines[10] = (
+                    f"@@@{command} The format is described in "
+                    "@ref{libaom-av1-qpfile,,libaom-av1 @option{qpfile} option}."
+                )
+                self.assertEqual(self.findings("\n".join(lines)), [])
+
+    def test_escaped_comment_command_is_found(self) -> None:
+        """One escaped at-sign pair leaves the following reference visible."""
+        lines = REFERENCE_TEXT.splitlines()
+        lines[10] = "@@c The format is described in @ref{libaom-av1-qpfile}."
+        self.assertEqual(
+            self.findings("\n".join(lines)),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom-av1 section names libaom"
+            ],
+        )
+
+    def test_two_escaped_comment_pairs_are_found(self) -> None:
+        """Two escaped at-sign pairs leave plain text and its reference visible."""
+        lines = REFERENCE_TEXT.splitlines()
+        lines[10] = "@@@@c The format is described in @ref{libaom-av1-qpfile}."
+        self.assertEqual(
+            self.findings("\n".join(lines)),
+            [
+                "doc/encoders.texi:11: the libsvtav1 text defers to @ref{libaom-av1-qpfile}, "
+                "whose item in the libaom-av1 section names libaom"
+            ],
+        )
+
     def test_other_defer_wordings_and_commands_are_found(self) -> None:
         """Same-format wording and @xref or @pxref references are found too."""
         for old, new in (
@@ -2220,13 +2390,15 @@ class DocReferenceTest(unittest.TestCase):
         self.assertEqual(upstream_lint.reference_findings("doc/x.texi", first, {2}), [])
 
     def test_section_names(self) -> None:
-        """Library names omit descriptive words and retain long prefixes before a dash."""
+        """Only lib-prefixed or uppercase heading words and valid long prefixes name libraries."""
         self.assertEqual(
             upstream_lint.section_names("libaom-av1"), frozenset({"libaom-av1", "libaom"})
         )
         for title, expected in (
             ("libaom-av1 encoder", {"libaom-av1", "libaom"}),
-            ("ac3 and ac3_fixed", {"ac3", "ac3_fixed"}),
+            ("ac3 and ac3_fixed", set()),
+            ("--libaom--/libvpx:libx264+ lib_name", {"libaom", "libvpx", "libx264+", "lib_name"}),
+            ("AA-A1 VAAPI2 A1", {"AA-A1", "VAAPI2"}),
             ("VAAPI encoders", {"VAAPI"}),
             ("libaom Decoders", {"libaom"}),
             (
