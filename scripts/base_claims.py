@@ -153,11 +153,13 @@ def _dependency_attribution_error(sentence: str, first: re.Match[str], end: int)
     )
 
 
-def _reject_hidden_dependency_members(sentence: str, first: re.Match[str], end: int) -> None:
-    """Reject separator-led members hidden inside the single-member fallback window."""
+def _reject_hidden_dependency_members(
+    sentence: str, first: re.Match[str], start: int, end: int
+) -> None:
+    """Reject separator-led members in the unparsed tail of any dependency list."""
     if any(
         DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
-        for separator in DEPENDENCY_SEPARATOR.finditer(sentence, first.end(), end)
+        for separator in DEPENDENCY_SEPARATOR.finditer(sentence, start, end)
     ):
         raise _dependency_attribution_error(sentence, first, end)
 
@@ -187,7 +189,7 @@ def _reject_unpaired_dependency_heads(
 
 
 def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]]:
-    """Yield grammar spans, rejecting unpaired heads owned by nearest member references."""
+    """Yield grammar spans, rejecting hidden tail members and unpaired member-owned heads."""
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
     for index, first in enumerate(references):
         end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
@@ -203,8 +205,8 @@ def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]
             if following is None:
                 break
             reference = following
+        _reject_hidden_dependency_members(sentence, first, members[-1][1], end)
         if len(members) == 1:
-            _reject_hidden_dependency_members(sentence, first, end)
             members[0] = (members[0][0], end)
         _reject_unpaired_dependency_heads(sentence, members, end)
         yield members

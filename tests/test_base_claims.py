@@ -638,6 +638,102 @@ class BaseClaimsTest(unittest.TestCase):
                 self.assertIn("#13", err)
                 self.assertEqual(stdout.getvalue(), "")
 
+    def test_dependency_list_truncated_middle_member_rejects_hidden_tail(self) -> None:
+        """A truncated multi-member list rejects later members with their full attribution."""
+        for annotation in (": aaaaaaa", " ~ previous head aaaaaaa"):
+            text = f"Depends on #12 (head aaaaaaa), #13{annotation}, #14 (head bbbbbbb)"
+            with (
+                self.subTest(annotation=annotation),
+                self.assertRaisesRegex(ValueError, r"#12.*#13.*#14"),
+            ):
+                base_claims.find_dependency_claims(text)
+
+    def test_dependency_cli_truncated_middle_member_rejects_hidden_tail(self) -> None:
+        """Both modes reject hidden tails even when all supplied live heads match."""
+        dependency = self.dependency_json()
+        options = [
+            arg
+            for number in (12, 13, 14)
+            for arg in ("--dependency-json", f"{number}={dependency}")
+        ]
+        for annotation in (": aaaaaaa", " ~ previous head aaaaaaa"):
+            for head in ("aaaaaaa", "bbbbbbb"):
+                body = self.write_fixture(
+                    "body.md", f"Depends on #12 (head aaaaaaa), #13{annotation}, #14 (head {head})"
+                )
+                for flags in ((), ("--list-dependencies",)):
+                    with self.subTest(annotation=annotation, head=head, flags=flags):
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            rc, err = self.run_cli(
+                                "--merge-base", MERGE_BASE, *options, *flags, str(body)
+                            )
+                        self.assertEqual(rc, 2)
+                        self.assertRegex(err, r"#12.*#13.*#14")
+                        self.assertEqual(stdout.getvalue(), "")
+
+    def test_dependency_list_truncated_nine_members_fail_closed(self) -> None:
+        """A truncated second member cannot hide a list beyond the eight-member bound."""
+        text = "Depends on #1 (head aaaaaaa), #2: aaaaaaa, " + ", ".join(
+            f"#{number} (head bbbbbbb)" for number in range(3, 10)
+        )
+        with self.assertRaisesRegex(ValueError, r"#1.*#2.*#9"):
+            base_claims.find_dependency_claims(text)
+
+    def test_dependency_cli_truncated_nine_members_fail_closed(self) -> None:
+        """Both modes reject hidden excess members instead of listing only the first two."""
+        text = "Depends on #1 (head aaaaaaa), #2: aaaaaaa, " + ", ".join(
+            f"#{number} (head bbbbbbb)" for number in range(3, 10)
+        )
+        body = self.write_fixture("body.md", text)
+        dependency = self.dependency_json()
+        options = [
+            arg for number in (1, 2) for arg in ("--dependency-json", f"{number}={dependency}")
+        ]
+        for flags in ((), ("--list-dependencies",)):
+            with self.subTest(flags=flags):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc, err = self.run_cli("--merge-base", MERGE_BASE, *options, *flags, str(body))
+                self.assertEqual(rc, 2)
+                self.assertRegex(err, r"#1.*#2.*#9")
+                self.assertEqual(stdout.getvalue(), "")
+
+    def test_dependency_list_marked_middle_member_preserves_third_claim(self) -> None:
+        """A supported middle annotation keeps all three members paired with their heads."""
+        text = "Depends on #12 (head aaaaaaa), #13: head aaaaaaa, #14 (head bbbbbbb)"
+        self.assertEqual(
+            base_claims.find_dependency_claims(text),
+            [(12, "aaaaaaa"), (13, "aaaaaaa"), (14, "bbbbbbb")],
+        )
+
+    def test_dependency_cli_marked_middle_member_checks_stale_third(self) -> None:
+        """Check mode still names the stale third member after a supported middle annotation."""
+        body = self.write_fixture(
+            "body.md", "Depends on #12 (head aaaaaaa), #13: head aaaaaaa, #14 (head bbbbbbb)"
+        )
+        dependency = self.dependency_json()
+        options = [
+            arg
+            for number in (12, 13, 14)
+            for arg in ("--dependency-json", f"{number}={dependency}")
+        ]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc, err = self.run_cli("--merge-base", MERGE_BASE, *options, str(body))
+        self.assertEqual(rc, 1)
+        self.assertIn("head bbbbbbb of #14", err)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_dependency_list_nonmember_prose_keeps_two_claims(self) -> None:
+        """Separator-led prose without a leading member remains a nonmember boundary."""
+        for tail in ("unrelated #14 head ccccccc", "see #14 ~ head ccccccc", "unrelated text"):
+            text = f"Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb), {tail}"
+            with self.subTest(tail=tail):
+                self.assertEqual(
+                    base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+                )
+
     def test_dependency_list_history_precedes_trailing_head_ambiguity(self) -> None:
         """Historical reference and head clauses are ignored before ambiguity checks."""
         for text in (
