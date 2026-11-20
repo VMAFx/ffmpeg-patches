@@ -1824,6 +1824,307 @@ class DocReferenceTest(unittest.TestCase):
             "doc/encoders.texi", lines, added or {11}, REFERENCE_LIBRARIES
         )
 
+    def test_cr_item_text_before_anchor(self) -> None:
+        """Library text preceding an owned anchor remains in its item."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "libaom reads a missing offset as 0.\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "Read per-frame offsets.",
+        )
+        self.assertEqual(
+            self.findings(text, {12}),
+            [
+                (
+                    "doc/encoders.texi:12: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_item_alias_before_anchor(self) -> None:
+        """An owning item alias does not hide library prose before its anchor."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "@itemx qpf\n"
+            "libaom reads a missing offset as 0.\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "Read per-frame offsets.",
+        )
+        self.assertEqual(
+            self.findings(text, {13}),
+            [
+                (
+                    "doc/encoders.texi:13: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_in_ifset(self) -> None:
+        """An anchor inside ifset retains its enclosing item."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "@ifset extra\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.\n"
+            "@end ifset",
+        )
+        self.assertEqual(
+            self.findings(text, {13}),
+            [
+                (
+                    "doc/encoders.texi:13: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_in_ifclear(self) -> None:
+        """An anchor inside ifclear retains its enclosing item."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "@ifclear extra\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.\n"
+            "@end ifclear",
+        )
+        self.assertEqual(
+            self.findings(text, {13}),
+            [
+                (
+                    "doc/encoders.texi:13: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_in_ifnottex(self) -> None:
+        """An anchor inside ifnottex retains its enclosing item."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "@ifnottex\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.\n"
+            "@end ifnottex",
+        )
+        self.assertEqual(
+            self.findings(text, {13}),
+            [
+                (
+                    "doc/encoders.texi:13: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_item_without_library(self) -> None:
+        """Boundary control: library-free prose around an anchor gives no finding."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "Read offsets.\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "A missing offset is zero.",
+        )
+        self.assertEqual(self.findings(text, {12}), [])
+
+    def test_cr_peer_item_library(self) -> None:
+        """Boundary control: a previous peer item cannot supply its library."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item other\n"
+            "libaom reads a missing offset as 0.\n"
+            "@item qpfile @var{filename}\n"
+            "Read offsets.\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "A missing offset is zero.",
+        )
+        self.assertEqual(self.findings(text, {14}), [])
+
+    def test_cr_anchor_in_example(self) -> None:
+        """Boundary control: a non-conditional block breaks table item ownership."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "@example\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.\n"
+            "@end example",
+        )
+        self.assertEqual(self.findings(text, {13}), [])
+
+    def test_cr_anchor_last_item_line(self) -> None:
+        """An anchor just before the table end retains preceding item prose."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "libaom reads a missing offset as 0.\n"
+            "@anchor{libaom-av1-qpfile}",
+        )
+        self.assertEqual(
+            self.findings(text, {11}),
+            [
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_first_item_line(self) -> None:
+        """Boundary control: an anchor immediately after its item stays eligible."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+        )
+        self.assertEqual(
+            self.findings(text, {11}),
+            [
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_comment_line(self) -> None:
+        """A comment-only line preserves prose context across physical lines."""
+        text = REFERENCE_TEXT.replace("described for\n", "described for\n@c note\n")
+        self.assertEqual(
+            self.findings(text, {12}),
+            [
+                (
+                    "doc/encoders.texi:12: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_long_comment_line(self) -> None:
+        """A long-form comment-only line preserves prose context."""
+        text = REFERENCE_TEXT.replace("described for\n", "described for\n@comment note\n")
+        self.assertEqual(
+            self.findings(text, {12}),
+            [
+                (
+                    "doc/encoders.texi:12: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_indented_comment_line(self) -> None:
+        """An indented comment-only line preserves prose context."""
+        text = REFERENCE_TEXT.replace("described for\n", "described for\n  @c note\n")
+        self.assertEqual(
+            self.findings(text, {12}),
+            [
+                (
+                    "doc/encoders.texi:12: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_two_comment_lines(self) -> None:
+        """Two consecutive comment-only lines preserve prose context."""
+        text = REFERENCE_TEXT.replace("described for\n", "described for\n@c note\n@comment note\n")
+        self.assertEqual(
+            self.findings(text, {13}),
+            [
+                (
+                    "doc/encoders.texi:13: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_escaped_pairs_before_comment(self) -> None:
+        """Boundary control: escaped at-signs before a comment are not comment-only text."""
+        text = REFERENCE_TEXT.replace("described for\n", "described for\n@@@c note\n")
+        self.assertEqual(self.findings(text, {12}), [])
+
+    def test_cr_comment_at_context_bound(self) -> None:
+        """Five comment lines preserve wording on the sixth preceding physical line."""
+        text = REFERENCE_TEXT.replace("the @ref{", "@c note\n" * 5 + "the @ref{")
+        self.assertEqual(
+            self.findings(text, {16}),
+            [
+                (
+                    "doc/encoders.texi:16: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_real_blank_line(self) -> None:
+        """Boundary control: a real blank line still ends deferral context."""
+        text = REFERENCE_TEXT.replace("described for\n", "described for\n\n")
+        self.assertEqual(self.findings(text, {12}), [])
+
+    def test_cr_comment_only_wording(self) -> None:
+        """Boundary control: deferral wording in a comment supplies no visible context."""
+        text = REFERENCE_TEXT.replace("in the format described for\n", "\n@c described for\n")
+        self.assertEqual(self.findings(text, {12}), [])
+
+    def test_cr_comment_outside_context_bound(self) -> None:
+        """Boundary control: a seventh preceding comment cannot extend the six-line bound."""
+        text = REFERENCE_TEXT.replace("the @ref{", "@c note\n" + "continued\n" * 6 + "the @ref{")
+        self.assertEqual(self.findings(text, {18}), [])
+
+    def test_cr_unchanged_reference(self) -> None:
+        """Boundary control: the unchanged fixture keeps its exact finding."""
+        self.assertEqual(
+            self.findings(REFERENCE_TEXT),
+            [
+                (
+                    "doc/encoders.texi:11: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
     def test_configure_library_blocks(self) -> None:
         """Library blocks contribute whitespace-separated lowercase names only."""
         configure = (

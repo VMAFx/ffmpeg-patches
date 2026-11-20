@@ -1999,12 +1999,14 @@ def _anchor_boundary(line: str, stack: list[str]) -> bool:
     return all(name.startswith("if") for name in stack) and bool(TEXI_ITEM_END.match(line))
 
 
-def _anchor_body(lines: list[str]) -> list[str]:
-    """Collect a bounded nested item body until a peer boundary or unmatched end."""
+def _anchor_body(lines: list[str], anchor: int | None = None) -> list[str]:
+    """Collect a bounded item body, skipping its own anchor until a peer boundary."""
     blocks = _texi_blocks(lines) | frozenset(TEXI_ITEM_BLOCKS)
     body: list[str] = []
     stack: list[str] = []
-    for line in lines[:ANCHOR_ITEM_LIMIT]:
+    for index, line in enumerate(lines[:ANCHOR_ITEM_LIMIT]):
+        if index == anchor:
+            continue
         if _anchor_boundary(line, stack):
             break
         _texi_prose_line(line, blocks, stack)
@@ -2020,17 +2022,20 @@ def _anchor_next_line(lines: list[str], start: int) -> int | None:
     return None
 
 
-def _anchor_item(lines: list[str], start: int) -> list[str]:
-    """Return a bounded item body, skipping leading metadata and item aliases only."""
-    next_line = _anchor_next_line(lines, start)
+def _anchor_item(lines: list[str], start: int, item: int | None = None) -> list[str]:
+    """Read the owning item or the item after anchor metadata, skipping leading aliases."""
+    next_line = _anchor_next_line(lines, start) if item is None else item
     if next_line is None:
         return []
     first = next_line + 1 if TEXI_ITEM.match(lines[next_line]) else start + 1
     index = first
-    for index in range(first, min(len(lines), start + 1 + ANCHOR_ITEM_LIMIT)):
+    stop = (start if item is None else item) + 1 + ANCHOR_ITEM_LIMIT
+    for index in range(first, min(len(lines), stop)):
         if not re.match(r"@itemx\b", lines[index]):
             break
-    return _anchor_body(lines[index : index + ANCHOR_ITEM_LIMIT])
+    return _anchor_body(
+        lines[index : index + ANCHOR_ITEM_LIMIT], start - index if item is not None else None
+    )
 
 
 def _texi_ref_arguments(text: str) -> tuple[list[str], bool]:
@@ -2055,10 +2060,12 @@ def _texi_ref_arguments(text: str) -> tuple[list[str], bool]:
     return [*parts, text[start:].strip()], False
 
 
-def _reference_context(lines: list[str], index: int) -> str:
-    """Join bounded preceding prose without crossing a paragraph or block command."""
+def _reference_context(lines: list[str], index: int, comments: set[int]) -> str:
+    """Join bounded physical lines across comments, stopping at paragraphs and blocks."""
     before: list[str] = []
     for at in range(index - 1, max(-1, index - 1 - REFERENCE_CONTEXT_LINES), -1):
+        if at in comments:
+            continue
         line = lines[at].strip()
         if not line:
             break
@@ -2069,49 +2076,55 @@ def _reference_context(lines: list[str], index: int) -> str:
     return " ".join(reversed(before))
 
 
-def _reference_lines(lines: list[str]) -> list[str]:
-    """Blank raw blocks and trim comments using at-sign escape parity, keeping line numbers."""
+def _reference_lines(lines: list[str]) -> tuple[list[str], set[int]]:
+    """Blank raw blocks and split comments once by escape parity, marking comment-only lines."""
     visible: list[str] = []
+    comments: set[int] = set()
     stack: list[str] = []
     for line in lines:
         if stack:
             _texi_raw_line(line, stack)
             visible.append("")
             continue
-        prose = TEXI_COMMENT.split(line, maxsplit=1)[0]
+        comment = TEXI_COMMENT.search(line)
+        prose = line[: comment.start()] if comment else line
+        if comment and not prose.strip() and not comment[0].startswith("@@"):
+            comments.add(len(visible))
         command = TEXI_COMMAND.match(prose)
         if command and command[1] in TEXI_RAW:
             stack.append(command[1])
             prose = ""
         visible.append(prose)
-    return visible
+    return visible, comments
 
 
-def _anchor_has_item(lines: list[str], index: int, depth: int, items: set[int]) -> bool:
-    """Require an item already open at this depth or immediately after anchor metadata."""
-    if depth in items:
+def _anchor_has_item(lines: list[str], index: int, frame: int, items: dict[int, int]) -> bool:
+    """Require an item in this non-conditional frame or just after anchor metadata."""
+    if frame in items:
         return True
     next_line = _anchor_next_line(lines, index)
     return next_line is not None and bool(TEXI_ITEM.match(lines[next_line]))
 
 
-def _table_anchors(lines: list[str]) -> dict[str, int]:
-    """Index table anchors with an enclosing item or an immediately following item."""
+def _table_anchors(lines: list[str]) -> dict[str, tuple[int, int | None]]:
+    """Index table anchors and owning item lines with conditionals transparent to frames."""
     blocks = _texi_blocks(lines)
     stack: list[str] = []
-    item_depths: set[int] = set()
-    anchors: dict[str, int] = {}
+    items: dict[int, int] = {}
+    anchors: dict[str, tuple[int, int | None]] = {}
     for index, line in enumerate(lines):
         containers = [name for name in stack if not name.startswith("if")]
+        frame = len(containers)
         if containers and containers[-1] in ("table", "ftable", "vtable"):
             if TEXI_ITEM.match(line):
-                item_depths.add(len(stack))
+                items[frame] = index
             elif (match := TEXI_ANCHOR.match(line)) and _anchor_has_item(
-                lines, index, len(stack), item_depths
+                lines, index, frame, items
             ):
-                anchors.setdefault(match[1].strip(), index)
+                anchors.setdefault(match[1].strip(), (index, items.get(frame)))
         _texi_prose_line(line, blocks, stack)
-        item_depths.intersection_update(range(len(stack) + 1))
+        depth = sum(not name.startswith("if") for name in stack)
+        items = {frame: item for frame, item in items.items() if frame <= depth}
     return anchors
 
 
@@ -2127,14 +2140,19 @@ def _reference_arguments(lines: list[str], index: int, start: int) -> tuple[list
 
 
 def _item_libraries(
-    lines: list[str], sections: list[str], source: int, target: int, libraries: frozenset[str]
+    lines: list[str],
+    sections: list[str],
+    source: int,
+    target: tuple[int, int | None],
+    libraries: frozenset[str],
 ) -> list[str]:
-    """Match configure-listed library names in item bodies, excluding citing families."""
-    body = "\n".join(_anchor_item(lines, target))
+    """Match library names in the owning item body, excluding citing families."""
+    anchor, item = target
+    body = "\n".join(_anchor_item(lines, anchor, item))
     citing = {name.split("-")[0].lower() for name in section_names(sections[source], libraries)}
     others = {
         name
-        for name in section_names(sections[target], libraries)
+        for name in section_names(sections[anchor], libraries)
         if name.split("-")[0].lower() not in citing
     }
     return sorted(
@@ -2162,17 +2180,18 @@ def _added_references(lines: list[str], added: set[int]) -> list[tuple[int, int,
 
 def _reference_finding(
     path: str,
-    lines: list[str],
+    visible: tuple[list[str], set[int]],
     sections: list[str],
     added: set[int],
     libraries: frozenset[str],
 ) -> list[str]:
-    """Find deferred local references to configure-listed libraries on added spans."""
+    """Find deferred local references with comment-aware context and owning item bodies."""
+    lines, comments = visible
     anchors = _table_anchors(lines)
     findings: list[str] = []
     for number, column, args in _added_references(lines, added):
         index = number - 1
-        before = _reference_context(lines, index)
+        before = _reference_context(lines, index, comments)
         if len(args) > 3 and args[3]:
             continue
         target = anchors.get(args[0])
@@ -2184,7 +2203,7 @@ def _reference_finding(
         if named:
             findings.append(
                 f"{path}:{number}: the {sections[index]} text defers to @ref{{{args[0]}}}, "
-                f"whose item in the {sections[target]} section names {', '.join(named)}"
+                f"whose item in the {sections[target[0]]} section names {', '.join(named)}"
             )
     return findings
 
@@ -2192,10 +2211,10 @@ def _reference_finding(
 def reference_findings(
     path: str, lines: list[str], added: set[int], libraries: frozenset[str]
 ) -> list[str]:
-    """Find visible deferred references to configure-listed libraries on added spans."""
-    lines = _reference_lines(lines)
-    sections = texi_sections(lines)
-    return _reference_finding(path, lines, sections, added, libraries)
+    """Find deferred references across comments to libraries in their whole owning items."""
+    visible = _reference_lines(lines)
+    sections = texi_sections(visible[0])
+    return _reference_finding(path, visible, sections, added, libraries)
 
 
 def _doc_files(tree: Path, base: str, head: str) -> list[tuple[str, list[str], set[int]]]:
