@@ -1679,7 +1679,7 @@ class _FateShapeState:
 def _fate_shape_snapshot(
     destination: str, value: str, states: dict[str, _FateShapeState]
 ) -> tuple[set[str], list[_FateShapeEntry]]:
-    """Capture current transitive entries with a visited worklist and an edge-count bound."""
+    """Capture bounded transitive entries, preserving destination self reads as identity."""
     pending = [
         (name, [_fate_shape_normalize(destination)]) for name in _fate_shape_references(value)
     ]
@@ -1695,6 +1695,9 @@ def _fate_shape_snapshot(
         state = states.get(name)
         if state is None:
             references.add(name)
+            continue
+        if name == destination:
+            entries.extend(state.entries)
             continue
         entries.extend(
             _FateShapeEntry(entry.variable, entry.targets, entry.line, [*entry.chain, *tail])
@@ -1715,11 +1718,13 @@ def _fate_shape_flavor(operator: str, previous: str) -> str:
 
 
 def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
-    """Evaluate raw destinations once in order, sharing snapshots and deferred edges."""
+    """Deduplicate ordered snapshots by line and defer all reads inside define bodies."""
     states: dict[str, _FateShapeState] = {}
     for destination, operator, value, replaces, outside, line in _fate_shape_assignments(lines):
         state = states.get(destination, _FateShapeState())
-        immediate = operator == ":=" or (operator == "+=" and state.flavor == "simple")
+        immediate = outside and (
+            operator == ":=" or (operator == "+=" and state.flavor == "simple")
+        )
         references, entries = (
             _fate_shape_snapshot(destination, value, states)
             if immediate
@@ -1728,7 +1733,9 @@ def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
         if replaces:
             state.references, state.entries = set(), []
         state.references.update(references)
-        state.entries.extend(entries)
+        state.entries = list(
+            {entry.line.first: entry for entry in [*entries, *state.entries]}.values()
+        )
         variable, targets = _fate_shape_registration(line)
         if targets:
             state.entries.append(

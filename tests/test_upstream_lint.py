@@ -994,6 +994,61 @@ class FateShapeTest(unittest.TestCase):
                 if findings:
                     self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
 
+    def test_immediate_self_read_preserves_chain(self) -> None:
+        """A direct immediate self read retains the original registration chain once."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\n"
+            "FATE_LIBAVUTIL := $(FATE_LIBAVUTIL) fate-y\n"
+            "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+            "fate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+        self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
+
+    def test_immediate_indirect_self_read_preserves_chain(self) -> None:
+        """A replacing read through another variable keeps the destination's original entries."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\n"
+            "MIDDLE = $(FATE_LIBAVUTIL)\n"
+            "FATE_LIBAVUTIL := $(MIDDLE) fate-y\n"
+            "FATE_FFMPEG += $(FATE_LIBAVUTIL)\n"
+            "fate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+        self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
+
+    def test_repeated_immediate_self_reads_keep_one_entry(self) -> None:
+        """Twelve immediate self reads neither duplicate entries nor extend their chains."""
+        source = (
+            "FATE_LIBAVUTIL += fate-x\n"
+            + "FATE_LIBAVUTIL := $(FATE_LIBAVUTIL)\n" * 12
+            + "FATE_FFMPEG += $(FATE_LIBAVUTIL)\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+        states = upstream_lint._fate_shape_evaluate(upstream_lint._fate_lines(source))
+        self.assertEqual(len(states["FATE_LIBAVUTIL"].entries), 1)
+        self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
+
+    def test_define_body_immediate_reads_remain_deferred(self) -> None:
+        """Define bodies defer simple assignments and appends until an unknown evaluation point."""
+        for prefix, operator, line in (
+            ("FATE_LIBAVUTIL += fate-old\n", ":=", 5),
+            ("FATE_FFMPEG :=\n", "+=", 5),
+            ("FATE_LIBAVUTIL += fate-old\nFATE_FFMPEG :=\n", "+=", 6),
+        ):
+            with self.subTest(prefix=prefix, operator=operator):
+                source = (
+                    prefix
+                    + f"define AGG\nFATE_FFMPEG {operator} $(FATE_LIBAVUTIL)\nendef\n"
+                    + "FATE_LIBAVUTIL += fate-new\nfate-new: CMD = run libavutil/tests/new\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", line)])
+                self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+
     def test_graph_define_replacements_keep_registration(self) -> None:
         """Replacements in define bodies preserve earlier aggregation references."""
         source = (
