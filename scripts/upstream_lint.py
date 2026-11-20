@@ -1575,6 +1575,7 @@ def _fate_shape_normalize(name: str) -> str:
 FATE_SHAPE_REFERENCE = re.compile(r"\$\(([A-Za-z_]\w*(?:-yes|-\$\([^()]*\))?)\)")
 FATE_SHAPE_FUNCTION = re.compile(r"\$\([^\s()]+\s")
 FATE_SHAPE_ASSIGNMENT = re.compile(r"([A-Za-z_]\w*(?:-\$\(.+\)|-yes)?)\s*(\+=|:=|=)\s*(.*)")
+FATE_SHAPE_EVAL = re.compile(r"\$\(eval\s+\$\((?:call\s+([A-Za-z_]\w*)(?=[,)])|([A-Za-z_]\w*)\)\))")
 
 
 def _fate_shape_ffmpeg(makefile: str) -> set[str]:
@@ -1666,56 +1667,110 @@ def _fate_shape_assignments(
 
 @dataclass
 class _FateShapeEntry:
-    """Keep a registration's original line and its captured aggregation path."""
+    """Keep a registration's original line, define body and captured aggregation path."""
 
     variable: str
     targets: list[str]
     line: FateLine
     chain: list[str]
+    body: str = ""
 
 
 @dataclass
 class _FateShapeState:
-    """Hold one raw destination's possible flavors, deferred references and current entries."""
+    """Hold raw flavors, followable references, frozen fragment edges and current entries."""
 
     flavors: set[str] = field(default_factory=lambda: {"recursive"})
     references: set[str] = field(default_factory=set)
+    frozen: set[tuple[str, str]] = field(default_factory=set)
     entries: list[_FateShapeEntry] = field(default_factory=list)
 
 
+def _fate_shape_contexts(lines: list[FateLine]) -> dict[int, tuple[str, frozenset[str]]]:
+    """Track defining bodies and named expansions strictly before each top-level line."""
+    contexts, bodies, expanded = {}, [], set()
+    for line in lines:
+        kind = _fate_kind(line)[0]
+        if kind == "define":
+            bodies.append(line.text.split()[1])
+        elif kind == "endef" and bodies:
+            bodies.pop()
+        contexts[line.first] = (bodies[-1] if bodies else "", frozenset(expanded))
+        if not bodies:
+            expanded.update(
+                match[1] or match[2] for match in FATE_SHAPE_EVAL.finditer(line.text.strip())
+            )
+    return contexts
+
+
+def _fate_shape_matching_states(
+    name: str, states: dict[str, _FateShapeState]
+) -> list[tuple[str, _FateShapeState]]:
+    """Return possible raw states sharing a conditional variable's normalized name."""
+    normalized = _fate_shape_normalize(name)
+    return [
+        (raw, state) for raw, state in states.items() if _fate_shape_normalize(raw) == normalized
+    ]
+
+
+def _fate_shape_snapshot_entries(
+    destination: str,
+    name: str,
+    state: _FateShapeState,
+    tail: list[str],
+    expanded: frozenset[str],
+) -> list[_FateShapeEntry]:
+    """Copy top-level or expanded-body entries, preserving the raw self-read identity."""
+    entries = [entry for entry in state.entries if not entry.body or entry.body in expanded]
+    if name == destination:
+        return entries
+    return [
+        _FateShapeEntry(
+            entry.variable, entry.targets, entry.line, [*entry.chain, *tail], entry.body
+        )
+        for entry in entries
+    ]
+
+
+def _fate_shape_snapshot_frozen(
+    destination: str, name: str, state: _FateShapeState
+) -> set[tuple[str, str]]:
+    """Carry frozen names with captured edge endpoints, retaining each intermediate hop."""
+    return state.frozen | {(name, destination)} if state.frozen else set()
+
+
 def _fate_shape_snapshot(
-    destination: str, value: str, states: dict[str, _FateShapeState]
-) -> tuple[set[str], list[_FateShapeEntry]]:
-    """Capture bounded entries, resolving destination references with only its identity tail."""
+    destination: str,
+    value: str,
+    states: dict[str, _FateShapeState],
+    expanded: frozenset[str],
+) -> tuple[set[tuple[str, str]], list[_FateShapeEntry]]:
+    """Capture eligible possible values and freeze missing names against later same-file reads."""
     pending = [
         (name, [_fate_shape_normalize(destination)]) for name in _fate_shape_references(value)
     ]
-    references, entries, visited = set(), [], set()
+    frozen, entries, visited = set(), [], set()
     bound = len(pending) + sum(len(state.references) for state in states.values())
     for _ in range(bound):
         if not pending:
             break
         name, tail = pending.pop()
-        if name in visited:
+        normalized = _fate_shape_normalize(name)
+        if normalized in visited:
             continue
-        visited.add(name)
-        state = states.get(name)
-        if state is None:
-            references.add(name)
+        visited.add(normalized)
+        matching = _fate_shape_matching_states(name, states)
+        if not matching:
+            frozen.add((name, destination))
             continue
-        if name == destination:
-            entries.extend(state.entries)
-            tail = []
-        else:
-            entries.extend(
-                _FateShapeEntry(entry.variable, entry.targets, entry.line, [*entry.chain, *tail])
-                for entry in state.entries
+        for raw, state in matching:
+            frozen.update(_fate_shape_snapshot_frozen(destination, raw, state))
+            entries.extend(_fate_shape_snapshot_entries(destination, raw, state, tail, expanded))
+            next_tail = [] if raw == destination else tail
+            pending.extend(
+                (reference, [normalized, *next_tail]) for reference in sorted(state.references)
             )
-        pending.extend(
-            (reference, [_fate_shape_normalize(name), *tail])
-            for reference in sorted(state.references)
-        )
-    return references, entries
+    return frozen, entries
 
 
 def _fate_shape_flavor(operator: str, previous: set[str], depth: int) -> set[str]:
@@ -1727,37 +1782,48 @@ def _fate_shape_flavor(operator: str, previous: set[str], depth: int) -> set[str
 
 
 def _fate_shape_value(
-    destination: str, operator: str, value: str, states: dict[str, _FateShapeState], outside: bool
-) -> tuple[set[str], list[_FateShapeEntry]]:
-    """Union snapshots and deferred reads when conditional flavors permit both expansions."""
+    destination: str,
+    operator: str,
+    value: str,
+    states: dict[str, _FateShapeState],
+    context: tuple[str, frozenset[str]],
+) -> tuple[set[str], set[tuple[str, str]], list[_FateShapeEntry]]:
+    """Keep eligible frozen snapshots separate from conditional and define deferred reads."""
+    body, expanded = context
     flavors = states.get(destination, _FateShapeState()).flavors
-    immediate = outside and (operator == ":=" or (operator == "+=" and "simple" in flavors))
-    references, entries = (
-        _fate_shape_snapshot(destination, value, states) if immediate else (set(), [])
+    immediate = not body and (operator == ":=" or (operator == "+=" and "simple" in flavors))
+    frozen, entries = (
+        _fate_shape_snapshot(destination, value, states, expanded) if immediate else (set(), [])
     )
+    references = set()
     if not immediate or (operator == "+=" and "recursive" in flavors):
         references.update(_fate_shape_references(value))
-    return references, entries
+    return references, frozen, entries
 
 
 def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
-    """Deduplicate snapshots while preserving conditional flavors and deferred define reads."""
+    """Preserve raw flavors, frozen names and body provenance with prior top-level expansions."""
     states: dict[str, _FateShapeState] = {}
+    contexts = _fate_shape_contexts(lines)
     for destination, operator, value, replaces, outside, depth, line in _fate_shape_assignments(
         lines
     ):
         state = states.get(destination, _FateShapeState())
-        references, entries = _fate_shape_value(destination, operator, value, states, outside)
+        body, expanded = contexts[line.first]
+        references, frozen, entries = _fate_shape_value(
+            destination, operator, value, states, (body, expanded)
+        )
         if replaces:
-            state.references, state.entries = set(), []
+            state.references, state.frozen, state.entries = set(), set(), []
         state.references.update(references)
+        state.frozen.update(frozen)
         state.entries = list(
             {entry.line.first: entry for entry in [*entries, *state.entries]}.values()
         )
         variable, targets = _fate_shape_registration(line)
         if targets:
             state.entries.append(
-                _FateShapeEntry(variable, targets, line, [_fate_shape_normalize(variable)])
+                _FateShapeEntry(variable, targets, line, [_fate_shape_normalize(variable)], body)
             )
         if outside:
             state.flavors = _fate_shape_flavor(operator, state.flavors, depth)
@@ -1766,13 +1832,14 @@ def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
 
 
 def _fate_shape_graph(sources: list[str]) -> dict[str, set[str]]:
-    """Normalize and union deferred edges from the shared in-source evaluator."""
+    """Union normalized deferred and frozen cross-fragment edges from the shared evaluator."""
     graph: dict[str, set[str]] = {}
     for source in sources:
         for destination, state in _fate_shape_evaluate(_fate_lines(source)).items():
-            for name in state.references:
+            edges = state.frozen | {(name, destination) for name in state.references}
+            for name, captured_destination in edges:
                 graph.setdefault(_fate_shape_normalize(name), set()).add(
-                    _fate_shape_normalize(destination)
+                    _fate_shape_normalize(captured_destination)
                 )
     return graph
 

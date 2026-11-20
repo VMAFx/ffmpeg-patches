@@ -940,7 +940,7 @@ class FateShapeTest(unittest.TestCase):
         self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
 
     def test_immediate_aggregation_resolves_transitive_entries(self) -> None:
-        """Immediate reads resolve current transitive values and terminate reference cycles."""
+        """Immediate reads capture transitive entries, freeze missing names and bound cycles."""
         for middle, operator, expected in (
             ("MIDDLE = $(FATE_LIBAVUTIL)\n", ":=", [("registration", 1)]),
             ("MIDDLE = $(FATE_LIBAVUTIL)\n", "=", []),
@@ -968,8 +968,82 @@ class FateShapeTest(unittest.TestCase):
             "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
         )
         findings = self.findings(source)
+        # Review 5987325156: an undefined immediate read stays empty in this source.
+        self.assertEqual([(f.rule, f.line) for f in findings], [])
+
+    def test_immediate_forward_read_stays_frozen(self) -> None:
+        """Later snapshots cannot resolve an earlier undefined immediate read in the same source."""
+        for middle in ("MIDDLE", "NEXT"):
+            with self.subTest(middle=middle):
+                source = (
+                    "MIDDLE := $(FATE_LIBAVUTIL)\nNEXT := $(MIDDLE)\n"
+                    "FATE_LIBAVUTIL += fate-x\n"
+                    f"FATE_FFMPEG := $({middle})\n"
+                    "FATE_LIBAVUTIL =\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_immediate_forward_read_preserves_fragment_edges(self) -> None:
+        """Frozen names retain the intermediate path across separately evaluated fragments."""
+        aggregation = "MIDDLE := $(FATE_LIBAVUTIL)\nFATE_FFMPEG := $(MIDDLE)\n"
+        source = "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        for sources in ([aggregation, source], [source, aggregation]):
+            with self.subTest(sources=sources):
+                graph = upstream_lint._fate_shape_graph(sources)
+                findings = self.findings(source, graph=graph)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+                self.assertIn("FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG", findings[0].message)
+
+    def test_recursive_forward_read_remains_deferred(self) -> None:
+        """Recursive assignments still resolve registrations appended before a later snapshot."""
+        source = (
+            "MIDDLE = $(FATE_LIBAVUTIL)\nFATE_LIBAVUTIL += fate-x\n"
+            "FATE_FFMPEG := $(MIDDLE)\nFATE_LIBAVUTIL =\n"
+            "fate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
         self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 2)])
         self.assertIn("FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG", findings[0].message)
+
+    def test_immediate_conditional_alias_captures_entries(self) -> None:
+        """Immediate reads capture either conditional spelling before its raw replacement."""
+        for stored, read in (
+            ("FATE_LIBAVUTIL-$(CONFIG_X)", "FATE_LIBAVUTIL-yes"),
+            ("FATE_LIBAVUTIL-yes", "FATE_LIBAVUTIL-$(CONFIG_X)"),
+        ):
+            with self.subTest(stored=stored, read=read):
+                source = (
+                    f"{stored} += fate-x\nFATE_FFMPEG := $({read})\n{stored} =\n"
+                    "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                findings = self.findings(source)
+                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+                self.assertIn("FATE_LIBAVUTIL-yes -> FATE_FFMPEG", findings[0].message)
+
+    def test_immediate_conditional_alias_follows_references(self) -> None:
+        """All normalized states contribute entries and transitive references to a snapshot."""
+        source = (
+            "OTHER += fate-x\nFATE_LIBAVUTIL-$(CONFIG_X) = $(OTHER)\n"
+            "FATE_LIBAVUTIL-yes =\nFATE_FFMPEG := $(FATE_LIBAVUTIL-yes)\n"
+            "OTHER =\nFATE_LIBAVUTIL-$(CONFIG_X) =\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        findings = self.findings(source)
+        self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+        self.assertIn("OTHER -> FATE_LIBAVUTIL-yes -> FATE_FFMPEG", findings[0].message)
+
+    def test_immediate_conditional_alias_keeps_raw_replacement(self) -> None:
+        """Raw replacement preserves other spellings and unrelated reads stay empty."""
+        for stored, cleared in (
+            ("FATE_LIBAVUTIL-yes", "FATE_LIBAVUTIL-$(CONFIG_X)"),
+            ("FATE_LIBAVUTIL-$(CONFIG_X)", "FATE_LIBAVUTIL-yes"),
+        ):
+            for read, expected in ((stored, [("registration", 1)]), ("UNRELATED", [])):
+                with self.subTest(stored=stored, read=read):
+                    source = (
+                        f"{stored} += fate-x\n{cleared} =\nFATE_FFMPEG := $({read})\n"
+                        "fate-x: CMD = run libavutil/tests/x\n"
+                    )
+                    self.assertEqual([(f.rule, f.line) for f in self.findings(source)], expected)
 
     def test_simple_append_snapshots_prior_entries(self) -> None:
         """Appends expand immediately only for destinations retaining the simple flavor."""
@@ -1173,6 +1247,57 @@ class FateShapeTest(unittest.TestCase):
         states = upstream_lint._fate_shape_evaluate(upstream_lint._fate_lines(source))
         self.assertEqual(len(states["FATE_LIBAVUTIL"].entries), 1)
         self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
+
+    def test_define_entries_require_prior_expansion(self) -> None:
+        """Snapshots copy define-body entries only after a named top-level expansion."""
+        for expansion in (
+            "$(eval $(call ADD))\n",
+            "  $(eval $(call ADD,arg))  \n",
+            "$(eval $(ADD))\n",
+        ):
+            for position in ("absent", "before", "after"):
+                with self.subTest(expansion=expansion, position=position):
+                    source = (
+                        "define ADD\nFATE_LIBAVUTIL += fate-x\nendef\n"
+                        + (expansion if position == "before" else "")
+                        + "FATE_FFMPEG := $(FATE_LIBAVUTIL)\n"
+                        + (expansion if position == "after" else "")
+                        + "fate-x: CMD = run libavutil/tests/x\n"
+                    )
+                    findings = self.findings(source)
+                    self.assertEqual(
+                        [(f.rule, f.line) for f in findings],
+                        [("registration", 2)] if position == "before" else [],
+                    )
+
+    def test_define_expansion_requires_top_level_exact_name(self) -> None:
+        """Other names and expansions inside define bodies cannot activate a snapshot entry."""
+        for expansion in (
+            "$(eval $(call ADD_MORE))\n",
+            "$(eval $(ADD_MORE))\n",
+            "define WRAPPER\n$(eval $(call ADD))\nendef\n",
+        ):
+            with self.subTest(expansion=expansion):
+                source = (
+                    "define ADD\nFATE_LIBAVUTIL += fate-x\nendef\n"
+                    + expansion
+                    + "FATE_FFMPEG := $(FATE_LIBAVUTIL)\nfate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(self.findings(source), [])
+
+    def test_define_entries_keep_direct_graph_route(self) -> None:
+        """Unexpanded entries remain available to the established deferred graph route."""
+        for aggregation in ("FATE_FFMPEG = $(FATE_LIBAVUTIL)\n", ""):
+            with self.subTest(aggregation=aggregation):
+                variable = "FATE_LIBAVUTIL" if aggregation else "FATE_FFMPEG"
+                source = (
+                    f"define ADD\n{variable} += fate-x\nendef\n"
+                    + aggregation
+                    + "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source)], [("registration", 2)]
+                )
 
     def test_define_body_immediate_reads_remain_deferred(self) -> None:
         """Define bodies defer simple assignments and appends until an unknown evaluation point."""
