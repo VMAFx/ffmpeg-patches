@@ -723,6 +723,64 @@ class SemgrepRulesTest(unittest.TestCase):
             _expected_flagged(SUBTEST_CLEANUP_FIXTURE),
         )
 
+    def test_os_open_create_mode_wider_than_owner_rule(self) -> None:
+        """Creation defaults and wide literal modes flag exactly the unsafe cases."""
+        cases = {
+            "case_flagged_default": "os.open(path, os.O_CREAT)",
+            "case_flagged_644": "os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)",
+            "case_flagged_640": "os.open(path, os.O_CREAT | os.O_WRONLY, 0o640)",
+            "case_flagged_666": "os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)",
+            "case_flagged_777": "os.open(path, os.O_CREAT, 0o777)",
+            "case_flagged_default_dir_fd": "os.open(path, os.O_CREAT, dir_fd=directory)",
+            "case_flagged_keyword_mode": "os.open(path, os.O_CREAT, mode=0o644)",
+            "case_flagged_keyword_flags": "os.open(path, flags=os.O_CREAT, mode=0o640)",
+            "case_flagged_keyword_default": "os.open(path, flags=os.O_CREAT)",
+            "case_flagged_other_execute": "os.open(path, os.O_CREAT, 0o601)",
+            "case_flagged_group_execute": "os.open(path, os.O_CREAT, 0o610)",
+            "case_flagged_decimal": "os.open(path, os.O_CREAT, 420)",
+            "case_flagged_group_write": "os.open(path, os.O_CREAT, 0o620)",
+            "case_flagged_other_write": "os.open(path, os.O_CREAT, 0o602)",
+            "case_flagged_hex": "os.open(path, os.O_CREAT, 0x1A4)",
+            "case_flagged_binary": "os.open(path, os.O_CREAT, 0b110100100)",
+            "case_flagged_underscores": "os.open(path, os.O_CREAT, 0o6_4_4)",
+            "case_ok_600": "os.open(path, os.O_CREAT, 0o600)",
+            "case_ok_400": "os.open(path, os.O_CREAT, 0o400)",
+            "case_ok_700": "os.open(path, os.O_CREAT, mode=0o700)",
+            "case_ok_zero": "os.open(path, os.O_CREAT, 0)",
+            "case_ok_no_create": "os.open(path, os.O_RDONLY)",
+            "case_ok_wide_without_create": "os.open(path, os.O_WRONLY | os.O_EXCL, 0o666)",
+            "case_ok_dynamic_mode": "os.open(path, os.O_CREAT, mode)",
+            "case_ok_other_open": "other.open(path, os.O_CREAT, 0o777)",
+            "case_ok_builtin_open": "open(path, os.O_CREAT, 0o777)",
+        }
+        functions = [
+            f'def {name}(path, mode):\n    """Exercise one mode boundary."""\n    return {call}\n'
+            for name, call in cases.items()
+        ]
+        source = "import os\n\n" + "\n".join(functions)
+        expected = {
+            "case_flagged_default",
+            "case_flagged_644",
+            "case_flagged_640",
+            "case_flagged_666",
+            "case_flagged_777",
+            "case_flagged_default_dir_fd",
+            "case_flagged_keyword_mode",
+            "case_flagged_keyword_flags",
+            "case_flagged_keyword_default",
+            "case_flagged_other_execute",
+            "case_flagged_group_execute",
+            "case_flagged_decimal",
+            "case_flagged_group_write",
+            "case_flagged_other_write",
+            "case_flagged_hex",
+            "case_flagged_binary",
+            "case_flagged_underscores",
+        }
+        self.assertEqual(
+            _flagged_in_fixture(source, "os-open-create-mode-wider-than-owner"), expected
+        )
+
 
 FFMPEG_C_DECLARATIONS = (
     "typedef struct SessionHandle { int ready; } SessionHandle;\n"

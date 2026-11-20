@@ -1296,10 +1296,13 @@ class ClaimScopeTest(unittest.TestCase):
 
     def test_speed_claim_detected(self) -> None:
         """An encode or decode speed claim without an end-to-end figure returns its phrase."""
+        benchmark_claim = (
+            "avcodec/x: paint maps once\n\nThe map painter benchmark ran seven rounds, "
+            "so encoding is 10x faster.\n"
+        )
         cases = (
             (
-                "avcodec/x: paint maps once\n\nThe map painter benchmark ran seven rounds, "
-                "so encoding is 10x faster.\n",
+                benchmark_claim,
                 "encoding is 10x faster",
             ),
             ("avcodec/x: cache maps\n\nThis gives faster encoding.\n", "faster encoding"),
@@ -1400,12 +1403,13 @@ class ClaimScopeTest(unittest.TestCase):
         findings = upstream_lint._unverified_findings(
             "0123456789abcdef", "avcodec/x: cache maps\n\nEncoding is faster.\n"
         )
+        expected_finding = (
+            '0123456789ab: claims "Encoding is faster" without an end-to-end measurement; '
+            "name an ffmpeg -benchmark or fps result, or drop the claim"
+        )
         self.assertEqual(
             findings,
-            [
-                '0123456789ab: claims "Encoding is faster" without an end-to-end measurement; '
-                "name an ffmpeg -benchmark or fps result, or drop the claim"
-            ],
+            [expected_finding],
         )
 
     def test_source_hunks_reads_headers_outside_hunk_bodies(self) -> None:
@@ -1801,11 +1805,14 @@ class TestProgramTest(unittest.TestCase):
 
     def test_registered_new_program_is_found(self) -> None:
         """A new lib*/tests C file listed by a TESTPROGS assignment of its Makefile is found."""
-        for makefile in (
-            "TESTPROGS-$(CONFIG_ITUT_T35)              += aom_film_grain\n",
+        multiline_makefile = (
             "TESTPROGS = avcodec                                    \\\n"
             "            aom_film_grain                             \\\n"
-            "            golomb\n",
+            "            golomb\n"
+        )
+        for makefile in (
+            "TESTPROGS-$(CONFIG_ITUT_T35)              += aom_film_grain\n",
+            multiline_makefile,
             "TESTPROGS += aom_film_grain # needs a sample\n",
             "TESTPROGS-yes += golomb aom_film_grain\n",
             "TESTPROGS := golomb aom_film_grain\n",
