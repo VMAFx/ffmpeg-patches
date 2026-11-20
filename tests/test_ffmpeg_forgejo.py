@@ -21,7 +21,7 @@ import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 
-from scripts import review_classes
+from scripts import review_classes, unit_test_budget
 from scripts.raw_configure_body import bash_parser
 from tests.helpers import isolated_git_environment
 
@@ -7757,6 +7757,15 @@ class PrivateTempSourceTest(unittest.TestCase):
         source = self.helper.read_text(encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "malformed Bash"):
             private_temp_violations(source + "if true; then\n")
+
+
+def load_tests(
+    loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None
+) -> unittest.TestSuite:
+    """Schedule independent methods separately without changing test IDs or bodies."""
+    # No module/class fixtures: each method owns its scratch tree and HTTP server.
+    # Singleton suites let --level class preserve class fixtures in other modules.
+    return unit_test_budget.individual_test_suites(tests)
 
 
 if __name__ == "__main__":
