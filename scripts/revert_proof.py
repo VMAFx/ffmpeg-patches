@@ -312,7 +312,7 @@ def verify_head_run(scratch: Path, rc_head: int | str, head: str) -> int:
 def scratch_parent(tree: Path) -> Path:
     """Select a writable directory without probes and refuse caller-contained parents."""
     candidates = [os.environ[name] for name in ("TMPDIR", "TEMP", "TMP") if os.environ.get(name)]
-    candidates.extend(("/tmp", "/var/tmp", "/usr/tmp"))
+    candidates.extend(("/tmp", "/var/tmp", "/usr/tmp"))  # nosec B108 - fixed standard fallback order; parent checked outside caller tree before use.
     for candidate in candidates:
         path = Path(candidate)
         if path.is_dir() and os.access(path, os.W_OK | os.X_OK):
