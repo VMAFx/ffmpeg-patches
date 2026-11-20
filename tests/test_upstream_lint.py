@@ -3546,6 +3546,175 @@ class CRulesScratchTest(FixtureTest):
             [index for index, byte in enumerate(source) if byte == 10],
         )
 
+    def _r5_allocation(self) -> bytes:
+        """Return the fourth review's allocation finding without an attribute prefix."""
+        return (
+            b"void fixture(void) {\n"
+            b"    unsigned char *buffer = av_malloc(8);\n"
+            b"    unsigned char *dst = buffer ? buffer + 4 : NULL;\n"
+            b"    if (!buffer) { fail(); }\n}\n"
+        )
+
+    def _r5_scan(
+        self,
+        source: bytes,
+        unread: tuple[upstream_lint.UnreadWaiver, ...] = (),
+        header_requested: bool = False,
+    ) -> tuple[upstream_lint.Step, dict[str, bytes]]:
+        """Run the real step on review-style touched paths and retain scratch bytes."""
+        name = "libavfilter/vf_x.c"
+        (self.root / name).write_bytes(source)
+        paths = [name, "libavutil/attributes.h"] if header_requested else [name]
+        captured: dict[str, bytes] = {}
+
+        def capture(argv, cwd, data=None, timeout=60):
+            """Capture every accepted scratch source before running the real scanner."""
+            self.assertEqual(argv[:2], ["bash", str(upstream_lint.SEMGREP_SCAN)])
+            (cwd / ".git").mkdir(exist_ok=True)
+            captured.update({path: (cwd / path).read_bytes() for path in argv[5:]})
+            return self.real_run(argv, cwd, data, timeout)
+
+        with (
+            unittest.mock.patch.object(
+                upstream_lint,
+                "_c_rules_touched",
+                return_value={path: set(range(1, 100)) for path in paths},
+            ),
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=capture),
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "", unread)
+        return step, captured
+
+    def _r5_assert_copy(self, source: bytes, copies: dict[str, bytes]) -> None:
+        """Require the scanned function to retain exact bytes, length and newline offsets."""
+        blanked = copies["libavfilter/vf_x.c"]
+        self.assertEqual(blanked, source)
+        self.assertEqual(len(blanked), len(source))
+        self.assertEqual(
+            [index for index, byte in enumerate(blanked) if byte in (10, 13)],
+            [index for index, byte in enumerate(source) if byte in (10, 13)],
+        )
+
+    def test_r5_split_comment_opener(self) -> None:
+        """Phase 2 hides commented allocation definitions across repeated LF and CRLF splices."""
+        for newline in (b"\n", b"\r\n"):
+            for count in (1, 3):
+                with self.subTest(newline=newline, count=count):
+                    header = b"/" + (b"\\" + newline) * count
+                    header += b"*" + newline + b"#define av_malloc" + newline + b"*/" + newline
+                    (self.root / "libavutil/attributes.h").write_bytes(header)
+                    names, notices = upstream_lint._c_rules_attributes(self.root)
+                    source = self._r5_allocation()
+                    step, copies = self._r5_scan(source)
+                    self._r5_assert_copy(source, copies)
+                    self.assertEqual(names, set())
+                    self.assertEqual(notices, [])
+                    self.assertEqual(step.rc, 1, step.output)
+                    self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
+
+    def test_r5_boundary_plain_comment_opener(self) -> None:
+        """Boundary control: an ordinary comment opener hides the allocation definition."""
+        (self.root / "libavutil/attributes.h").write_bytes(b"/*\n#define av_malloc\n*/\n")
+        self.assertEqual(upstream_lint._c_rules_attributes(self.root), (set(), []))
+        source = self._r5_allocation()
+        step, copies = self._r5_scan(source)
+        self._r5_assert_copy(source, copies)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
+
+    def test_r5_phase2_delimiters(self) -> None:
+        """Spliced quotes, line-comment openers and block closers retain only noncode words."""
+        for newline in (b"\n", b"\r\n"):
+            splice = b"\\" + newline
+            cases = (
+                b'"' + splice + b"\\" + splice + b'"av_fixture_tag";',
+                b"/" + splice * 2 + b"/ av_fixture_tag",
+                b"/* av_fixture_tag *" + splice * 2 + b"/",
+            )
+            for prefix in cases:
+                with self.subTest(newline=newline, prefix=prefix):
+                    self.assert_blanked(
+                        prefix + newline + b"av_fixture_tag int code;" + newline,
+                        prefix + newline + b"               int code;" + newline,
+                    )
+
+    def test_r5_spliced_directive_tokens(self) -> None:
+        """Logical directives recognize definitions and comment prefixes across splices."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                splice = b"\\" + newline
+                prefix = b"/" + splice + b"* leading *" + splice + b"/ " + splice
+                directive = prefix + b"#def" + splice + b"ine av_fixture_tag" + newline
+                (self.root / "libavutil/attributes.h").write_bytes(directive)
+                self.assertEqual(
+                    upstream_lint._c_rules_attributes(self.root), ({b"av_fixture_tag"}, [])
+                )
+                self.assert_blanked(
+                    directive + b"av_fixture_tag int code;" + newline,
+                    directive + b"               int code;" + newline,
+                )
+
+    def test_r5_boundary_nonnewline_backslash(self) -> None:
+        """Boundary control: a backslash before an asterisk does not form a comment opener."""
+        self.assert_blanked(
+            b"/\\* av_fixture_tag */\nav_fixture_tag int code;\n",
+            b"/\\*                */\n               int code;\n",
+        )
+
+    def test_r5_bare_cr_source_unread(self) -> None:
+        """A bare CR directive boundary is unread and never reaches the scanner."""
+        source = (b"#define KEEP av_fixture_tag\n" + self._r5_allocation()).replace(b"\n", b"\r")
+        step, copies = self._r5_scan(source)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(copies, {})
+        self.assertEqual(step.output.count("bare CR line endings are not supported"), 1)
+        self.assertIn("unread: libavfilter/vf_x.c:", step.output)
+        self.assertIn("no waiver: libavfilter/vf_x.c:", step.output)
+
+    def test_r5_bare_cr_source_waived(self) -> None:
+        """The existing dated unread waiver applies to a bare CR source."""
+        source = (b"#define KEEP av_fixture_tag\n" + self._r5_allocation()).replace(b"\n", b"\r")
+        waiver = upstream_lint.UnreadWaiver(
+            "libavfilter/vf_x.c", "fixture", "B", date(2026, 11, 23), False
+        )
+        step, copies = self._r5_scan(source, (waiver,))
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(copies, {})
+        self.assertEqual(step.output.count("bare CR line endings are not supported"), 1)
+        self.assertIn("unread: libavfilter/vf_x.c:", step.output)
+        self.assertIn("waived: libavfilter/vf_x.c:", step.output)
+
+    def test_r5_bare_cr_attributes_header(self) -> None:
+        """A bare CR attributes header contributes no words and is diagnosed exactly once."""
+        (self.root / "libavutil/attributes.h").write_bytes(b"#define av_malloc\r")
+        names, notices = upstream_lint._c_rules_attributes(self.root)
+        self.assertEqual(names, set())
+        self.assertEqual(
+            notices,
+            ["informational: libavutil/attributes.h: bare CR line endings are not supported"],
+        )
+        for requested in (False, True):
+            with self.subTest(requested=requested):
+                source = self._r5_allocation()
+                step, copies = self._r5_scan(source, header_requested=requested)
+                self._r5_assert_copy(source, copies)
+                self.assertEqual(set(copies), {"libavfilter/vf_x.c"})
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(step.output.count("libavutil/attributes.h:"), 1 + 2 * requested)
+                self.assertEqual(step.output.count("bare CR line endings are not supported"), 1)
+                self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
+
+    def test_r5_boundary_supported_line_endings(self) -> None:
+        """Boundary control: LF and CRLF directive boundaries retain the allocation finding."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                source = (b"#define KEEP token\n" + self._r5_allocation()).replace(b"\n", newline)
+                step, copies = self._r5_scan(source)
+                self._r5_assert_copy(source, copies)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("finding: libavfilter/vf_x.c:4:", step.output)
+                self.assertNotIn("unread:", step.output)
+
     def test_r3_spliced_line_comments(self) -> None:
         """LF and CRLF splices keep the next physical line inside a line comment."""
         for newline in (b"\n", b"\r\n"):

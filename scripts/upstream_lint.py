@@ -258,7 +258,7 @@ REFERENCE = re.compile(r"^[^:\n]+?[:-]\d+[:-](.*)$")
 FUNCTION = re.compile(r"^(?:[A-Za-z_]\w*[ *]+)+[A-Za-z_]\w*\([^();{}]*\)\s*\{")
 CONTROL = re.compile(r"(?:}\s*)?(?:(?:else\s+)?(?:if|for|while|switch)\s*\(.*\)|else|do)")
 C_NONCODE = re.compile(
-    r'/\*.*?(?:\*/|\Z)|//(?:\\\r?\n|[^\n])*|"(?:\\.|[^"\\])*(?:"|\\?\Z)'
+    r'/\*.*?(?:\*/|\Z)|//[^\n]*|"(?:\\.|[^"\\])*(?:"|\\?\Z)'
     r"|\'(?:\\.|[^\'\\])*(?:\'|\\?\Z)",
     re.DOTALL | re.MULTILINE,
 )
@@ -594,8 +594,24 @@ def _deleted_lines(patch: str) -> set[int]:
     return deleted
 
 
+def _c_splice_lines(source: str) -> tuple[str, list[int]]:
+    """Remove phase-2 splices and map every logical character to its physical offset."""
+    parts: list[str] = []
+    offsets: list[int] = []
+    start = 0
+    splices = list(re.finditer(r"\\\r?\n", source))
+    for index in range(len(splices)):
+        splice = splices[index]
+        parts.append(source[start : splice.start()])
+        offsets.extend(range(start, splice.start()))
+        start = splice.end()
+    parts.append(source[start:])
+    offsets.extend(range(start, len(source)))
+    return "".join(parts), offsets
+
+
 def _c_mask_noncode(source: str) -> tuple[list[str], set[int], list[str]]:
-    """Mask noncode and track comment-only directive prefixes and spanning block comments."""
+    """Mask logical noncode and track comment prefixes and spanning block comments."""
     parts: list[str] = []
     prefixes: list[str] = []
     spanning: set[int] = set()
@@ -620,21 +636,25 @@ def _c_mask_noncode(source: str) -> tuple[list[str], set[int], list[str]]:
 
 
 def _c_lex_lines(source: str) -> tuple[list[str], list[str]]:
-    """Mask directives through splices and block comments, accepting comment-prefixed hashes."""
-    raw = source.split("\n")
-    code, spanning, prefixes = _c_mask_noncode(source)
+    """Classify phase-2 logical text and project code masks onto original physical lines."""
+    logical, offsets = _c_splice_lines(source)
+    code, spanning, prefixes = _c_mask_noncode(logical)
     directives: list[str] = []
     continued = False
-    for index in range(len(raw)):
+    for index in range(len(code)):
         starts = code[index].lstrip(" \t\r\v\f").startswith("#") and prefixes[index].lstrip(
             " \t\r\v\f"
         ).startswith("#")
         if continued or starts:
             if not continued:
                 directives.append(code[index])
-            continued = index in spanning or raw[index].removesuffix("\r").endswith("\\")
+            continued = index in spanning
             code[index] = " " * len(code[index])
-    return code, directives
+    masked = "\n".join(code)
+    physical = list(re.sub(r"[^\r\n]", " ", source))
+    for index in range(len(offsets)):
+        physical[offsets[index]] = masked[index]
+    return "".join(physical).split("\n"), directives
 
 
 def _code_lines(source: str) -> list[str]:
@@ -2413,8 +2433,16 @@ def _c_rules_report(
     return Step("c-rules", int(bool(unread.rc or (findings and not reason))), "\n".join(lines))
 
 
+def _c_rules_read_source(path: Path) -> bytes:
+    """Read source bytes and reject unsupported bare CR line endings before lexing."""
+    source = path.read_bytes()
+    if re.search(rb"\r(?!\n)", source):
+        raise ValueError("bare CR line endings are not supported")
+    return source
+
+
 def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
-    """Discover contained attribute directives and diagnose escaping headers without reading."""
+    """Discover contained attributes, rejecting escapes and unsupported bare CR headers."""
     header = tree / "libavutil/attributes.h"
     if not _c_rules_inside(header, tree):
         return set(), [
@@ -2422,11 +2450,13 @@ def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
             "attribute blanking skipped"
         ]
     try:
-        source = header.read_bytes()
+        source = _c_rules_read_source(header)
     except IsADirectoryError:
         return set(), []
     except FileNotFoundError:
         return set(), ["informational: missing libavutil/attributes.h; attribute blanking skipped"]
+    except ValueError as error:
+        return set(), [f"informational: libavutil/attributes.h: {error}"]
     directives = _c_lex_lines(source.decode("latin-1"))[1]
     names = re.findall(
         r"(?m)^[ \t]*#[ \t]*define[ \t]+((?:av_|attribute_)[A-Za-z0-9_]+)\b(?!\()",
@@ -2485,10 +2515,23 @@ def _c_rules_inside(path: Path, root: Path) -> bool:
     return path.resolve().is_relative_to(root.resolve())
 
 
+def _c_rules_copy_source(source: Path, target: Path, attributes: set[bytes]) -> str:
+    """Copy supported source bytes or retain unread links, returning a bare CR reason."""
+    try:
+        content = _c_rules_read_source(source)
+    except OSError:
+        target.symlink_to(source.absolute())
+    except ValueError as error:
+        return str(error)
+    else:
+        target.write_bytes(_c_rules_blank(content, attributes))
+    return ""
+
+
 def _c_rules_scan_root(
     tree: Path, paths: list[str], directory: str
 ) -> tuple[Path, list[str], list[str]]:
-    """Copy contained files, skip directories and report source, target and header escapes."""
+    """Copy contained supported files, skipping directories, bare CR sources and escapes."""
     attributes, notices = _c_rules_attributes(tree)
     root = Path(directory) / "sources"
     root.mkdir()
@@ -2512,21 +2555,32 @@ def _c_rules_scan_root(
         if source.is_dir():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            content = source.read_bytes()
-        except OSError:
-            target.symlink_to(source.absolute())
-        else:
-            target.write_bytes(_c_rules_blank(content, attributes))
+        reason = _c_rules_copy_source(source, target, attributes)
+        notice = f"informational: {_waiver_text(name)}: {reason}"
+        if reason and notice not in notices:
+            notices.append(notice)
     return root, notices, escaped
+
+
+def _c_rules_unread_source(path: Path) -> bool:
+    """Classify directories and unsupported bare CR sources for existing unread waivers."""
+    if path.is_dir():
+        return True
+    try:
+        _c_rules_read_source(path)
+    except ValueError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _c_rules_file_paths(
     tree: Path, paths: list[str], escaped: list[str], unread_paths: list[str]
 ) -> list[str]:
-    """Exclude escaped paths and record requested directories as unread sources."""
+    """Exclude escaped paths and record directories and bare CR sources as unread."""
     paths = [path for path in paths if path not in escaped]
-    unread_paths.extend(path for path in paths if (tree / path).is_dir())
+    unread_paths.extend(path for path in paths if _c_rules_unread_source(tree / path))
     return [path for path in paths if path not in unread_paths]
 
 
@@ -2556,7 +2610,7 @@ def _c_rules_scan(
 def _c_rules(
     tree: Path, base: str, head: str, waiver: str, unread_waivers: tuple[UnreadWaiver, ...] = ()
 ) -> Step:
-    """Scan contained scratch files, report unread directories and reject all escapes."""
+    """Scan contained supported sources, report unread files and reject all escapes."""
     touched_by_path = _c_rules_touched(tree, base, head)
     if not touched_by_path:
         unused = _unread_report([], unread_waivers)
