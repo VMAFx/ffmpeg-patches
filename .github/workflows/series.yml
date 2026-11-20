@@ -84,6 +84,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
+      - name: Record job budget start
+        run: echo "SERIES_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
       - *stop-on-draft
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event.pull_request.draft != true
@@ -101,7 +103,10 @@ jobs:
       - name: Install cosign
         if: github.event.pull_request.draft != true
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
-      # The Makefile test target runs the unit suite in UNIT_JOBS=4 worker processes (unittest-parallel) to stay under timeout-minutes.
+      # make test uses UNIT_JOBS=4 processes, class tasks and singleton forgejo methods.
+      # unit_test_budget.py reads this job's timeout-minutes as the sole limit source,
+      # reports job elapsed from the first step and unit wall time against its shared budget.
+      # The leak guard wraps the unit run; the runner reports the slowest suite timings.
       - name: Series check, lint and unit tests
         if: github.event.pull_request.draft != true
         run: make test
