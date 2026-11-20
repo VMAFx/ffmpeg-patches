@@ -222,6 +222,246 @@ class BaseClaimsTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue(err.startswith("shown-name:"), err)
 
+    def test_dependency_examples(self) -> None:
+        """Review examples and uppercase heads yield normalized dependency claims."""
+        cases = (
+            (
+                "Depends on #25664: the first three commits are that PR's series, "
+                "currently ending at c35b0e1fce.",
+                [(25664, "c35b0e1fce")],
+            ),
+            (
+                "This branch is stacked on pull request 25726 (head edd7328845e3); "
+                "only the last three commits are new here.",
+                [(25726, "edd7328845e3")],
+            ),
+            ("on top of PR #12 (head: ABCDEF1)", [(12, "abcdef1")]),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(base_claims.find_dependency_claims(text), expected)
+
+    def test_dependency_reference_and_head_forms(self) -> None:
+        """All dependency verbs, reference forms and head markers are recognized."""
+        for verb in ("depends on", "stacked on", "on top of", "builds on", "based on"):
+            for reference in ("#12", "PR 12", "PR #12", "pull request 12", "pull request #12"):
+                for marker in ("head", "ending at", "ends at", "tip"):
+                    text = f"{verb.upper()} {reference} {marker}: (ABCDEF1)"
+                    with self.subTest(text=text):
+                        self.assertEqual(
+                            base_claims.find_dependency_claims(text), [(12, "abcdef1")]
+                        )
+
+    def test_dependency_exclusions(self) -> None:
+        """Sentence boundaries, missing markers, fences, quotes and history exclude claims."""
+        cases = (
+            "Depends on #12. Head abcdef1",
+            "Depends on #12; head abcdef1",
+            "Depends on #12\nhead abcdef1",
+            "Depends on #12 at abcdef1",
+            "```text\nDepends on #12 head abcdef1\n```",
+            "~~~\nDepends on #12 head abcdef1\n~~~",
+            "> Depends on #12 head abcdef1",
+            "previously stacked on #12 at head abcdef1",
+            "Previous dependency: stacked on #12 (head abcdef1)",
+            "depends on #12 at old head abcdef1",
+            "depends on #12345678 head abcdef1",
+            "depends on #0 head abcdef1",
+            "depends on #12 head abcdef",
+            "depends on #12 head " + "a" * 41,
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(base_claims.find_dependency_claims(text), [])
+
+    def test_dependency_and_base_extraction_share_filtering(self) -> None:
+        """Both claim kinds share fence tracking without changing base extraction."""
+        text = (
+            "````text\n```\nDepends on #1 head aaaaaaa; base aaaaaaa\n````\n"
+            "> Depends on #2 head bbbbbbb; base bbbbbbb\n"
+            "Depends on #12 head abcdef1; base ccccccc\n"
+            "Previous base aaaaaaa, now base ddddddd\n"
+        )
+        self.assertEqual(base_claims.find_dependency_claims(text), [(12, "abcdef1")])
+        self.assertEqual(base_claims.find_base_claims(text), ["ccccccc", "ddddddd"])
+
+    def dependency_json(self, payload: object | None = None) -> Path:
+        """Write a dependency pull fixture with a full head unless overridden."""
+        return self.write_fixture(
+            "dependency.json",
+            json.dumps({"head": {"sha": "a" * 40}} if payload is None else payload),
+        )
+
+    def test_dependency_cli_stale_head(self) -> None:
+        """A stale dependency prefix reports both claimed and live heads with exit one."""
+        body = self.write_fixture("body.md", "Depends on #12 head bbbbbbb")
+        dependency = self.dependency_json()
+        rc, err = self.run_cli(
+            "--merge-base", MERGE_BASE, "--dependency-json", f"12={dependency}", str(body)
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            err, f"{body}: names head bbbbbbb of #12, the live head of #12 is {'a' * 40}\n"
+        )
+
+    def test_dependency_cli_current_prefix(self) -> None:
+        """A dependency prefix matches a full uppercase live head with exit zero."""
+        body = self.write_fixture("body.md", "stacked on pull request #12 (head AAAAAAA)")
+        dependency = self.dependency_json({"head": {"sha": "A" * 40}})
+        rc, err = self.run_cli(
+            "--merge-base", MERGE_BASE, "--dependency-json", f"12={dependency}", str(body)
+        )
+        self.assertEqual((rc, err), (0, ""))
+
+    def test_dependency_cli_missing_pull(self) -> None:
+        """A dependency claim without supplied pull JSON fails closed and names its PR."""
+        body = self.write_fixture("body.md", "Depends on #12 head aaaaaaa")
+        rc, err = self.run_cli("--merge-base", MERGE_BASE, str(body))
+        self.assertEqual(rc, 2)
+        self.assertIn("#12", err)
+
+    def test_dependency_cli_malformed_option(self) -> None:
+        """Malformed dependency mappings and stdin paths return input errors."""
+        for value in ("12", "x=file", "0=file", "-1=file", "12345678=file", "12=", "12=-"):
+            with self.subTest(value=value):
+                rc, err = self.run_cli("--merge-base", MERGE_BASE, "--dependency-json", value)
+                self.assertEqual(rc, 2)
+                self.assertIn("N=PATH", err)
+
+    def test_dependency_cli_repeated_number(self) -> None:
+        """Repeated dependency PR options are rejected even for the same file."""
+        dependency = self.dependency_json()
+        rc, err = self.run_cli(
+            "--merge-base",
+            MERGE_BASE,
+            "--dependency-json",
+            f"12={dependency}",
+            "--dependency-json",
+            f"012={dependency}",
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("repeated", err)
+        self.assertIn("#12", err)
+
+    def test_dependency_cli_bad_head(self) -> None:
+        """Missing, nonstring, short and nonhex dependency heads fail closed."""
+        payloads = [{}, {"head": []}, {"head": {}}] + [
+            {"head": {"sha": value}} for value in (None, 123, "a" * 7, "g" * 40, "a" * 41)
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                dependency = self.dependency_json(payload)
+                rc, err = self.run_cli(
+                    "--merge-base", MERGE_BASE, "--dependency-json", f"12={dependency}"
+                )
+                self.assertEqual(rc, 2)
+                self.assertIn("#12", err)
+
+    def test_dependency_cli_non_object_json(self) -> None:
+        """A dependency pull JSON array is an input error even without claims."""
+        dependency = self.dependency_json([])
+        rc, err = self.run_cli("--merge-base", MERGE_BASE, "--dependency-json", f"12={dependency}")
+        self.assertEqual(rc, 2)
+        self.assertIn("object", err)
+
+    def test_dependency_cli_list_sorted_unique(self) -> None:
+        """Dependency listing merges live and file bodies in sorted unique order."""
+        body = self.write_fixture(
+            "body.md", "Depends on #12 head aaaaaaa\nBuilds on PR 2 tip bbbbbbb"
+        )
+        pull = self.write_fixture(
+            "pull.json",
+            json.dumps(
+                {
+                    "head": {"sha": "d" * 40},
+                    "body": "Based on #3 ends at ccccccc\nDepends on #12 head aaaaaaa",
+                }
+            ),
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc, err = self.run_cli(
+                "--pull-json",
+                str(pull),
+                "--head",
+                "d" * 40,
+                "--live-body",
+                "--list-dependencies",
+                str(body),
+            )
+        self.assertEqual((rc, err, stdout.getvalue()), (0, "", "2\n3\n12\n"))
+
+    def test_dependency_cli_list_head_mismatch(self) -> None:
+        """Dependency listing still refuses a mismatched tested pull head."""
+        pull = self.write_fixture("pull.json", json.dumps({"head": {"sha": "d" * 40}}))
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc, err = self.run_cli(
+                "--pull-json", str(pull), "--head", "a" * 40, "--list-dependencies"
+            )
+        self.assertEqual(rc, 3)
+        self.assertIn("pull head", err)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_dependency_cli_list_input_error(self) -> None:
+        """Dependency listing validates live body input before emitting numbers."""
+        pull = self.write_fixture("pull.json", json.dumps({"body": []}))
+        rc, err = self.run_cli("--pull-json", str(pull), "--live-body", "--list-dependencies")
+        self.assertEqual(rc, 2)
+        self.assertIn("string body", err)
+
+    def test_dependency_cli_combined_stale_claims(self) -> None:
+        """One validation reports stale base and dependency claims together."""
+        body = self.write_fixture("body.md", "Base bbbbbbb; depends on #12 head ddddddd")
+        dependency = self.dependency_json()
+        rc, err = self.run_cli(
+            "--merge-base",
+            MERGE_BASE,
+            "--label",
+            "body",
+            "--dependency-json",
+            f"12={dependency}",
+            str(body),
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn(f"body: names base bbbbbbb, the live merge base is {MERGE_BASE}\n", err)
+        self.assertIn(f"body: names head ddddddd of #12, the live head of #12 is {'a' * 40}\n", err)
+
+    def test_dependency_cli_distinct_limit(self) -> None:
+        """Nine distinct dependency claims exceed the bound during checking and listing."""
+        body = self.write_fixture(
+            "body.md", "\n".join(f"Depends on #{number} head aaaaaaa" for number in range(1, 10))
+        )
+        for flags in ((), ("--list-dependencies",)):
+            with self.subTest(flags=flags):
+                rc, err = self.run_cli("--merge-base", MERGE_BASE, *flags, str(body))
+                self.assertEqual(rc, 2)
+                self.assertIn("8", err)
+
+    def test_dependency_cli_option_limit(self) -> None:
+        """Nine dependency JSON options exceed the shared bound."""
+        dependency = self.dependency_json()
+        options = [
+            arg
+            for number in range(1, 10)
+            for arg in ("--dependency-json", f"{number}={dependency}")
+        ]
+        rc, err = self.run_cli("--merge-base", MERGE_BASE, *options)
+        self.assertEqual(rc, 2)
+        self.assertIn("8", err)
+
+    def test_dependency_cli_limit_boundary(self) -> None:
+        """Exactly eight dependency options and claims are accepted."""
+        dependency = self.dependency_json()
+        body = self.write_fixture(
+            "body.md", "\n".join(f"Depends on #{number} head aaaaaaa" for number in range(1, 9))
+        )
+        options = [
+            arg for number in range(1, 9) for arg in ("--dependency-json", f"{number}={dependency}")
+        ]
+        rc, err = self.run_cli("--merge-base", MERGE_BASE, *options, str(body))
+        self.assertEqual((rc, err), (0, ""))
+
 
 if __name__ == "__main__":
     unittest.main()

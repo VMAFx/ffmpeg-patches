@@ -28,7 +28,7 @@
 #   ffmpeg-forgejo comment (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <body-file>
 #                          comment on an issue or PR; test claims must match the live PR head;
 #                          exits 78 when the body equals an own existing comment after whitespace normalization
-#                          with --tested-head, exits 80 when the comment or the live PR body names a base commit other than the live merge base
+#                          with --tested-head, exits 80 for stale base or dependency-head claims in the comment or live PR body
 #                          the comment posts the body file as read once at start; a head change seen by the base check exits 76
 #                          the base check compares the full live head read by the last tested-head check
 #   ffmpeg-forgejo reply   (--tested-head <sha> --evidence <file> | --no-test-claims) <number> <review-id> <comment-id> <body-file>
@@ -40,7 +40,7 @@
 #                          Without Autolabel, edit-body requires at least one terminal status and the newest status to be at least 30 minutes old.
 #                          A PR edit fires an "edited" event that cancels a running Labeler and leaves
 #                          a failure status on the head: edit the body before pushing, or after Autolabel.
-#                          exits 80 when the new body names a base commit other than the live merge base (scripts/base_claims.py)
+#                          exits 80 for stale base or dependency-head claims in the new body (scripts/base_claims.py)
 #                          the PATCH sends the body file as read once at start
 #   ffmpeg-forgejo close   <number> <comment-file>
 #                          comment on an own open PR, then close it; refuses (exit 80) a PR whose author is not the token login,
@@ -314,7 +314,44 @@ print(sha)' \
   [ -z "$evidence" ] || require_claim_evidence "$evidence" "$live"
 }
 
-# require_current_base NUMBER LIVE BODY-FILE HEAD LABEL: exit 80 when BODY-FILE (and the live PR body when LIVE is 1) names a base commit other than the live merge base; return 3 when the same pull read shows a head other than HEAD.
+# check_base_and_dependencies SELF BODY BODY-FILE ARGS...: fetch bounded dependency heads, check both claim kinds, and clean up private files; return 80 for stale claims.
+check_base_and_dependencies() (
+  local self="$1" body="$2" body_file="$3" dependencies dependency response status file rc
+  shift 3
+  local -a args=("$@") numbers=() dependency_files=()
+  trap 'rm -f -- "${dependency_files[@]}"' EXIT
+  if dependencies="$(python3 -I "${self%/*}/base_claims.py" "${args[@]}" --list-dependencies "$body_file" <<<"$body")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -ne 3 ] || return 3
+  [ "$rc" -eq 0 ] || die "base check: dependency listing exited $rc"
+  if [ -n "$dependencies" ]; then
+    readarray -t numbers <<<"$dependencies"
+    [ "${#numbers[@]}" -le 8 ] || die "base check: too many dependency pulls"
+    for dependency in "${numbers[@]}"; do
+      [[ "$dependency" =~ ^[1-9][0-9]*$ ]] || die "base check: invalid dependency pull number: $dependency"
+      response="$(pull_status "$dependency")" || die "base check: cannot read dependency pull #$dependency"
+      status="${response%%$'\n'*}"
+      [ "$status" = 200 ] || die "base check: cannot read dependency pull #$dependency (HTTP $status)"
+      file="$(mktemp)" || die "base check: cannot create dependency pull file"
+      dependency_files+=("$file")
+      chmod 600 "$file" || die "base check: cannot protect dependency pull file"
+      printf '%s\n' "${response#*$'\n'}" >"$file" || die "base check: cannot write dependency pull file"
+      args+=(--dependency-json "$dependency=$file")
+    done
+  fi
+  if python3 -I "${self%/*}/base_claims.py" "${args[@]}" "$body_file" <<<"$body"; then
+    return 0
+  else
+    rc=$?
+  fi
+  [ "$rc" -ne 1 ] || exit 80
+  return "$rc"
+)
+
+# require_current_base NUMBER LIVE BODY-FILE HEAD LABEL: exit 80 for stale base or dependency-head claims in BODY-FILE (and live PR body when LIVE is 1); return 3 when the same pull read shows a head other than HEAD.
 require_current_base() {
   local number="$1" live="$2" body_file="$3" head="$4" label="$5" response status body self rc
   local -a args=(--pull-json - --head "$head" --label "$label")
@@ -326,13 +363,13 @@ require_current_base() {
   self="$(python3 -I -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${BASH_SOURCE[0]}")" \
     || die "base check: cannot resolve helper path: ${BASH_SOURCE[0]}"
   [ "$live" != 1 ] || args+=(--live-body)
-  if python3 -I "${self%/*}/base_claims.py" "${args[@]}" "$body_file" <<<"$body"; then
+  if check_base_and_dependencies "$self" "$body" "$body_file" "${args[@]}"; then
     return 0
   else
     rc=$?
   fi
   [ "$rc" -ne 3 ] || return 3
-  [ "$rc" -ne 1 ] || exit 80
+  [ "$rc" -ne 80 ] || exit 80
   die "base check: helper exited $rc"
 }
 

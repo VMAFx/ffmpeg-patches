@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris
 # SPDX-License-Identifier: EUPL-1.2
-"""Check pull-request bodies and comments for stale base-commit claims.
+"""Check pull-request bodies and comments for stale base and dependency-head claims.
 
 With --pull-json, --head HEX requires an exact match between pull head.sha and
 full 40-hex HEX (exiting 3 on mismatch) before checking claims, and --label TEXT
 overrides the display label for FILE arguments in stale-claim diagnostics.
+Repeat --dependency-json N=PATH to supply each dependency PR's live head (no stdin).
+With --list-dependencies, print sorted unique dependency PR numbers instead of
+checking claims, after the same input and optional pull-head validation.
 """
 
 from __future__ import annotations
@@ -14,16 +17,27 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 BASE_CLAIM = re.compile(
     r"\bbase\b[:\s]+(?:(?:ffmpeg|master|is|commit)\s+){0,3}([0-9a-f]{7,40})\b",
     re.IGNORECASE,
 )
+DEPENDENCY_REFERENCE = re.compile(
+    r"\b(?:depends\s+on|stacked\s+on|on\s+top\s+of|builds\s+on|based\s+on)"
+    r"\s+(?:#|PR\s+#?|pull\s+request\s+#?)([0-9]{1,7})\b",
+    re.IGNORECASE,
+)
+DEPENDENCY_HEAD = re.compile(
+    r"\b(?:head|ending\s+at|ends\s+at|tip)\b[\s:(]*([0-9a-f]{7,40})\b", re.IGNORECASE
+)
+SENTENCE_BREAK = re.compile(r"\.\s|;")
 CLAUSE_BREAK = re.compile(r"[;,|()]|\.\s")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 HISTORY_WORDS = re.compile(r"\b(previous|prior|earlier|former|old)\b", re.IGNORECASE)
 HEX_SHA = re.compile(r"[0-9a-fA-F]{40}")
+MAX_DEPENDENCIES = 8
 
 
 def _step_fence(line: str, fence: tuple[str, int] | None) -> tuple[tuple[str, int] | None, bool]:
@@ -61,16 +75,47 @@ def _line_claims(line: str) -> list[str]:
     return claims
 
 
-def find_base_claims(text: str) -> list[str]:
-    """Return lowercased base-commit hex claims outside fences, quotes and history clauses."""
-    claims: list[str] = []
+def _claim_lines(text: str) -> Iterator[str]:
+    """Yield lines outside CommonMark fences and block quotes for both claim kinds."""
     fence: tuple[str, int] | None = None
     for line in text.splitlines():
         fence, skipped = _step_fence(line, fence)
-        if skipped or line.lstrip().startswith(">"):
-            continue
-        claims.extend(_line_claims(line))
+        if not skipped and not line.lstrip().startswith(">"):
+            yield line
+
+
+def find_base_claims(text: str) -> list[str]:
+    """Return lowercased base-commit hex claims outside fences, quotes and history clauses."""
+    return [claim for line in _claim_lines(text) for claim in _line_claims(line)]
+
+
+def _sentence_dependencies(sentence: str) -> list[tuple[int, str]]:
+    """Extract dependency heads while excluding historical clauses before each hex."""
+    claims: list[tuple[int, str]] = []
+    references = list(DEPENDENCY_REFERENCE.finditer(sentence))
+    for index, reference in enumerate(references):
+        end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
+        clause_start = 0
+        for sep in CLAUSE_BREAK.finditer(sentence, 0, reference.start()):
+            clause_start = sep.end()
+        for head in DEPENDENCY_HEAD.finditer(sentence, reference.end(), end):
+            clause = sentence[clause_start : head.start(1)]
+            if HISTORY_WORDS.search(clause) or re.search(r"\bpreviously\b", clause, re.IGNORECASE):
+                continue
+            number = int(reference.group(1))
+            if number > 0:
+                claims.append((number, head.group(1).lower()))
     return claims
+
+
+def find_dependency_claims(text: str) -> list[tuple[int, str]]:
+    """Return dependency PR numbers and head prefixes outside fences, quotes and history."""
+    return [
+        claim
+        for line in _claim_lines(text)
+        for sentence in SENTENCE_BREAK.split(line)
+        for claim in _sentence_dependencies(sentence)
+    ]
 
 
 def stale_claims(text: str, merge_base: str) -> list[str]:
@@ -141,7 +186,7 @@ def _load_targets(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Construct the command-line argument parser."""
+    """Construct the parser for base checks, dependency heads and dependency listing."""
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--merge-base", metavar="HEX", help="live 40-hex merge base")
@@ -161,31 +206,104 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         help="label every FILE argument as TEXT instead of its path",
     )
+    parser.add_argument(
+        "--dependency-json",
+        action="append",
+        default=[],
+        metavar="N=PATH",
+        help="dependency PR number and pull JSON path (repeatable, no stdin)",
+    )
+    parser.add_argument(
+        "--list-dependencies",
+        action="store_true",
+        help="list sorted unique dependency PR numbers without checking claims",
+    )
     parser.add_argument("files", nargs="*", metavar="FILE", help="body file to check")
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Validate optional pull head and base claims against the live merge base."""
-    args = _build_parser().parse_args(argv)
-    try:
-        mismatch, merge_base, targets = _load_targets(args)
-    except (OSError, UnicodeError, ValueError) as error:
-        print(f"base_claims: {error}", file=sys.stderr)
-        return 2
-    if mismatch is not None:
-        print(mismatch, file=sys.stderr)
-        return 3
+def _dependency_numbers(targets: list[tuple[str, str]]) -> list[int]:
+    """Collect sorted dependency PR numbers, rejecting more than the shared limit."""
+    numbers = sorted({number for _, text in targets for number, _ in find_dependency_claims(text)})
+    if len(numbers) > MAX_DEPENDENCIES:
+        raise ValueError(f"more than {MAX_DEPENDENCIES} distinct dependency PR numbers")
+    return numbers
+
+
+def _dependency_option(option: str) -> tuple[int, str]:
+    """Parse one positive bounded PR number and non-stdin dependency JSON path."""
+    number_text, separator, path = option.partition("=")
+    if not separator or re.fullmatch(r"[0-9]{1,7}", number_text) is None:
+        raise ValueError(f"invalid --dependency-json N=PATH: {option!r}")
+    number = int(number_text)
+    if number == 0 or not path or path == "-":
+        raise ValueError(f"invalid --dependency-json N=PATH: {option!r}")
+    return number, path
+
+
+def _load_dependencies(options: list[str]) -> dict[int, str]:
+    """Validate bounded N=PATH options and load full live dependency heads."""
+    if len(options) > MAX_DEPENDENCIES:
+        raise ValueError(f"more than {MAX_DEPENDENCIES} --dependency-json options")
+    heads: dict[int, str] = {}
+    for option in options:
+        number, path = _dependency_option(option)
+        if number in heads:
+            raise ValueError(f"repeated --dependency-json for #{number}")
+        payload = _read_pull_payload(path)
+        head = payload.get("head")
+        sha = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(sha, str) or HEX_SHA.fullmatch(sha) is None:
+            raise ValueError(f"invalid dependency pull #{number} head: {sha!r}")
+        heads[number] = sha.lower()
+    return heads
+
+
+def _base_diagnostics(targets: list[tuple[str, str]], merge_base: object) -> list[str]:
+    """Validate the merge base when needed and format stale base diagnostics."""
     if not any(find_base_claims(text) for _, text in targets):
-        return 0
+        return []
     if not isinstance(merge_base, str) or HEX_SHA.fullmatch(merge_base) is None:
-        print(f"base_claims: invalid merge base: {merge_base!r}", file=sys.stderr)
-        return 2
-    stale = [
+        raise ValueError(f"invalid merge base: {merge_base!r}")
+    return [
         f"{label}: names base {claim}, the live merge base is {merge_base}"
         for label, text in targets
         for claim in stale_claims(text, merge_base)
     ]
+
+
+def _dependency_diagnostics(targets: list[tuple[str, str]], heads: dict[int, str]) -> list[str]:
+    """Format stale dependency-head diagnostics from validated live heads."""
+    return [
+        f"{label}: names head {claim} of #{number}, the live head of #{number} is {heads[number]}"
+        for label, text in targets
+        for number, claim in find_dependency_claims(text)
+        if not heads[number].startswith(claim)
+    ]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Validate pull head and both claim kinds, or list bounded dependency PR numbers."""
+    args = _build_parser().parse_args(argv)
+    try:
+        mismatch, merge_base, targets = _load_targets(args)
+        if mismatch is not None:
+            print(mismatch, file=sys.stderr)
+            return 3
+        numbers = _dependency_numbers(targets)
+        heads = _load_dependencies(args.dependency_json)
+        if args.list_dependencies:
+            for number in numbers:
+                print(number)
+            return 0
+        for number in numbers:
+            if number not in heads:
+                raise ValueError(f"missing --dependency-json for #{number}")
+        stale = _base_diagnostics(targets, merge_base)
+        stale.extend(_dependency_diagnostics(targets, heads))
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"base_claims: {error}", file=sys.stderr)
+        return 2
     for message in stale:
         print(message, file=sys.stderr)
     return 1 if stale else 0
