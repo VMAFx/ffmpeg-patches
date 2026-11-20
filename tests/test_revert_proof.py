@@ -853,10 +853,13 @@ class RevertProofTest(RevertProofFixture):
             self.assertIsNone(payload)
             self.assertIsNone(commit)
             self.assertEqual(error, f"{self.record_path}: not valid JSON")
+            head_tree = upstream_lint._git(
+                self.tree, "--no-replace-objects", "rev-parse", "--verify", "HEAD^{tree}"
+            ).strip()
             loaded, by_commit, unmatched = upstream_lint._load_revert_proofs(
-                (self.record_path, good), frozenset({fix})
+                (self.record_path, good), frozenset({fix}), head_tree, self.tree
             )
-            self.assertEqual(loaded[fix], [self.valid_record(fix)])
+            self.assertEqual(loaded[fix], ([], True))
             self.assertEqual(by_commit, {})
             self.assertEqual(unmatched, [error])
             step = upstream_lint._revert_proof(self.tree, self.base, fix, (self.record_path, good))
