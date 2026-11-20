@@ -1,12 +1,12 @@
 ---
 version: 1
 repository:
-  owner: VMAFx
+  owner: vidiko
   name: ffmpeg-patches
   forge: github
   default_branch: main
   visibility: public
-  description: "Shared FFmpeg fix patch series for VMAFx projects, tracked against FFmpeg master and sent upstream"
+  description: "Shared FFmpeg fix patch series for the VMAFx and Pelorus projects, tracked against FFmpeg master and sent upstream"
   homepage: ""
   topics: []
 # Pinned by hand: auto-detection reads the README-only seed as template-seed.

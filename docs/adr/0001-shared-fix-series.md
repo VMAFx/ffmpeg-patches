@@ -6,7 +6,7 @@
 
 ## Context
 
-VMAFx/vmafx and VMAFx/pelorus each carry an FFmpeg patch stack against the
+vidiko/vmafx and vidiko/pelorus each carry an FFmpeg patch stack against the
 same release, n9.0.2 (`946fcce07b6d`). Most of their patches are features of
 the project itself. A few are plain FFmpeg fixes that any FFmpeg user needs:
 
