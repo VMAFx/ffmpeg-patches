@@ -37,9 +37,11 @@ DEPENDENCY_HEAD = re.compile(
     r"\b(?:head|ending\s+at|ends\s+at|tip)\b[\s:(]*([0-9a-f]{7,40})\b", re.IGNORECASE
 )
 DEPENDENCY_ANNOTATION = re.compile(
-    r"\s*(?:[:,|]\s*)?(?:[a-z]+\s+)*(?:\([^()#&;]*"
+    r"\s*(?:[:,|\u2013\u2014-]\s*)?(?:[a-z]+\s+)*(?:\([^()\[\]#&;]*"
     + DEPENDENCY_HEAD.pattern
-    + r"[^()#&;]*\)+|"
+    + r"[^()\[\]#&;]*\)+|\[[^\[\]#&;]*"
+    + DEPENDENCY_HEAD.pattern
+    + r"[^\[\]#&;]*\]|"
     + DEPENDENCY_HEAD.pattern
     + r"\)*)",
     re.IGNORECASE,
@@ -129,7 +131,7 @@ def _dependency_head_is_historical(
 
 
 def _dependency_member_end(sentence: str, start: int, end: int) -> int:
-    """Consume adjacent colon or parenthesized heads, leaving list separators and prose."""
+    """Consume colon, dash, parenthesis or bracket heads without crossing member separators."""
     cursor = start
     for _ in range(end - start + 1):
         annotation = DEPENDENCY_ANNOTATION.match(sentence, cursor, end)
@@ -139,8 +141,53 @@ def _dependency_member_end(sentence: str, start: int, end: int) -> int:
     return cursor
 
 
+def _dependency_attribution_error(sentence: str, first: re.Match[str], end: int) -> ValueError:
+    """Name window references when a head or hidden member cannot be safely attributed."""
+    numbers = ", ".join(
+        f"#{int(reference.group(1))}"
+        for reference in DEPENDENCY_MEMBER.finditer(sentence, first.start(), end)
+    )
+    return ValueError(
+        f"ambiguous dependency heads for {numbers}: unpaired head or hidden member; "
+        "write the head right after each reference or one dependency per sentence"
+    )
+
+
+def _reject_hidden_dependency_members(sentence: str, first: re.Match[str], end: int) -> None:
+    """Reject separator-led members hidden inside the single-member fallback window."""
+    if any(
+        DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
+        for separator in DEPENDENCY_SEPARATOR.finditer(sentence, first.end(), end)
+    ):
+        raise _dependency_attribution_error(sentence, first, end)
+
+
+def _dependency_member_heads(
+    sentence: str, reference: re.Match[str], end: int
+) -> list[re.Match[str]]:
+    """Attribute heads to their nearest preceding reference, including nonmembers."""
+    following = DEPENDENCY_MEMBER.search(sentence, reference.end(), end)
+    stop = following.start() if following else end
+    return list(DEPENDENCY_HEAD.finditer(sentence, reference.end(), stop))
+
+
+def _reject_unpaired_dependency_heads(
+    sentence: str, members: list[tuple[re.Match[str], int]], end: int
+) -> None:
+    """Reject current member-owned heads outside the shared annotation grammar."""
+    heads = [_dependency_member_heads(sentence, reference, end) for reference, _ in members]
+    current = _current_dependency_heads(sentence, members, heads)
+    for (_, member_end), member_heads in zip(members, current, strict=True):
+        for head in member_heads:
+            if head.end() > member_end:
+                raise ValueError(
+                    f"{_dependency_attribution_error(sentence, members[0][0], end)}: "
+                    f"{head.group(1).lower()}"
+                )
+
+
 def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]]:
-    """Yield reference lists with member-local colon or parenthesized head spans."""
+    """Yield grammar spans, rejecting unpaired heads owned by nearest member references."""
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
     for index, first in enumerate(references):
         end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
@@ -157,7 +204,9 @@ def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]
                 break
             reference = following
         if len(members) == 1:
+            _reject_hidden_dependency_members(sentence, first, end)
             members[0] = (members[0][0], end)
+        _reject_unpaired_dependency_heads(sentence, members, end)
         yield members
 
 
@@ -209,10 +258,8 @@ def _current_dependency_heads(
 def _dependency_list_claims(
     sentence: str, members: list[tuple[re.Match[str], int]]
 ) -> list[tuple[int, str | None]]:
-    """Pair colon and parenthesized heads, judging history before list ambiguity."""
-    heads = [
-        list(DEPENDENCY_HEAD.finditer(sentence, reference.end(), end)) for reference, end in members
-    ]
+    """Pair nearest-reference member heads, judging history before ambiguity."""
+    heads = [_dependency_member_heads(sentence, reference, end) for reference, end in members]
     current = _current_dependency_heads(sentence, members, heads)
     if any(heads) and not any(current):
         return []

@@ -392,6 +392,50 @@ class BaseClaimsTest(unittest.TestCase):
             base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
         )
 
+    def test_dependency_list_nonmember_owns_unsupported_head(self) -> None:
+        """A nearest nonmember reference owns its head even with an unsupported opener."""
+        for reference in ("#14", "PR 14", "pull request 14"):
+            for annotation in ("head ccccccc", "~ head ccccccc", "{head ccccccc}"):
+                text = (
+                    "Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb), "
+                    f"see {reference} {annotation}"
+                )
+                with self.subTest(text=text):
+                    self.assertEqual(
+                        base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+                    )
+
+    def test_dependency_list_unpaired_head_names_nearest_member_and_hex(self) -> None:
+        """Unsupported member annotations fail closed and identify their reference and head."""
+        for reference in ("#13", "PR 13", "pull request 13"):
+            for annotation in ("~ head bbbbbbb", "{head bbbbbbb}"):
+                text = f"Depends on #12 (head aaaaaaa) and {reference} {annotation}"
+                with self.subTest(text=text), self.assertRaisesRegex(ValueError, r"#13.*bbbbbbb"):
+                    base_claims.find_dependency_claims(text)
+
+    def test_dependency_cli_unpaired_head_names_nearest_member_and_hex(self) -> None:
+        """Both CLI modes identify unpaired member heads even when both live heads match."""
+        first = self.dependency_json()
+        second = self.write_fixture("second.json", json.dumps({"head": {"sha": "b" * 40}}))
+        for annotation in ("~ head bbbbbbb", "{head bbbbbbb}"):
+            body = self.write_fixture(
+                "body.md", f"Depends on #12 (head aaaaaaa) and #13 {annotation}"
+            )
+            for flags in ((), ("--list-dependencies",)):
+                with self.subTest(annotation=annotation, flags=flags):
+                    rc, err = self.run_cli(
+                        "--merge-base",
+                        MERGE_BASE,
+                        "--dependency-json",
+                        f"12={first}",
+                        "--dependency-json",
+                        f"13={second}",
+                        *flags,
+                        str(body),
+                    )
+                    self.assertEqual(rc, 2)
+                    self.assertRegex(err, r"#13.*bbbbbbb")
+
     def test_dependency_list_colon_heads_belong_to_their_own_members(self) -> None:
         """A colon on either list member preserves both reference and head pairs."""
         for text in (
@@ -446,6 +490,153 @@ class BaseClaimsTest(unittest.TestCase):
         self.assertEqual(
             base_claims.find_dependency_claims("Depends on #12: head aaaaaaa"), [(12, "aaaaaaa")]
         )
+
+    def test_dependency_single_dash_and_bracket_heads_are_preserved(self) -> None:
+        """Single dash and bracket heads retain their existing reference pairing."""
+        for annotation in ("- head bbbbbbb", "[head bbbbbbb]"):
+            with self.subTest(annotation=annotation):
+                self.assertEqual(
+                    base_claims.find_dependency_claims(f"Depends on #13 {annotation}"),
+                    [(13, "bbbbbbb")],
+                )
+
+    def test_dependency_list_member_openers_pair_both_positions(self) -> None:
+        """Every supported opener attributes heads to its own member in either position."""
+        for annotation in (
+            ": head {}",
+            "- head {}",
+            "\u2013 head {}",
+            "\u2014 head {}",
+            "[head {}]",
+        ):
+            for text in (
+                "Depends on #12 (head aaaaaaa) and #13 " + annotation.format("bbbbbbb"),
+                "Depends on #12 " + annotation.format("aaaaaaa") + " and #13 (head bbbbbbb)",
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual(
+                        base_claims._dependency_records(text),
+                        [(12, None), (12, "aaaaaaa"), (13, None), (13, "bbbbbbb")],
+                    )
+
+    def test_dependency_list_dash_first_does_not_borrow_second_head(self) -> None:
+        """A first-member dash cannot consume the following member's distinct head."""
+        text = "Depends on #12 - head aaaaaaa and #13 (head ccccccc)"
+        self.assertEqual(
+            base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "ccccccc")]
+        )
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [12, 13])
+
+    def test_dependency_cli_member_openers_list_both_members(self) -> None:
+        """Listing preserves both members with dash or bracket annotations."""
+        for annotation in ("- head {}", "\u2013 head {}", "\u2014 head {}", "[head {}]"):
+            for text in (
+                "Depends on #12 (head aaaaaaa) and #13 " + annotation.format("bbbbbbb"),
+                "Depends on #12 " + annotation.format("aaaaaaa") + " and #13 (head ccccccc)",
+            ):
+                with self.subTest(text=text):
+                    body = self.write_fixture("body.md", text)
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        rc, err = self.run_cli(
+                            "--merge-base", MERGE_BASE, "--list-dependencies", str(body)
+                        )
+                    self.assertEqual((rc, err, stdout.getvalue()), (0, "", "12\n13\n"))
+
+    def test_dependency_cli_member_openers_reject_stale_second_head(self) -> None:
+        """A current first member cannot hide a stale dash or bracket second member."""
+        dependency = self.dependency_json()
+        for annotation in ("- head bbbbbbb", "\u2013 head bbbbbbb", "[head bbbbbbb]"):
+            with self.subTest(annotation=annotation):
+                body = self.write_fixture(
+                    "body.md", f"Depends on #12 (head aaaaaaa) and #13 {annotation}"
+                )
+                rc, err = self.run_cli(
+                    "--merge-base",
+                    MERGE_BASE,
+                    "--dependency-json",
+                    f"12={dependency}",
+                    "--dependency-json",
+                    f"13={dependency}",
+                    str(body),
+                )
+                self.assertEqual(rc, 1)
+                self.assertIn("names head bbbbbbb of #13", err)
+
+    def test_dependency_list_dash_members_count_toward_limit(self) -> None:
+        """A dash on the first member cannot hide eight members from the bound."""
+        members = "Depends on #1 - head aaaaaaa, " + ", ".join(f"#{n}" for n in range(2, 9))
+        self.assertEqual(base_claims._dependency_numbers([("body", members)]), list(range(1, 9)))
+        text = members + ", #9"
+        message = "more than 8 distinct dependency PR numbers"
+        with self.assertRaisesRegex(ValueError, message):
+            base_claims.find_dependency_claims(text)
+        body = self.write_fixture("body.md", text)
+        for flags in ((), ("--list-dependencies",)):
+            with self.subTest(flags=flags):
+                rc, err = self.run_cli("--merge-base", MERGE_BASE, *flags, str(body))
+                self.assertEqual(rc, 2)
+                self.assertIn(message, err)
+
+    def test_dependency_list_unpaired_current_heads_fail_closed(self) -> None:
+        """Unknown tilde and brace openers cannot silently discard current list heads."""
+        for annotation in ("~ head bbbbbbb", "{head bbbbbbb}"):
+            text = f"Depends on #12 (head aaaaaaa) and #13 {annotation}"
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, r"#12.*#13"):
+                base_claims.find_dependency_claims(text)
+
+    def test_dependency_cli_unpaired_current_heads_fail_closed(self) -> None:
+        """Both CLI modes refuse unpaired current heads even with matching live heads."""
+        dependency = self.dependency_json()
+        for annotation in ("~ head aaaaaaa", "{head aaaaaaa}"):
+            body = self.write_fixture(
+                "body.md", f"Depends on #12 (head aaaaaaa) and #13 {annotation}"
+            )
+            for flags in ((), ("--list-dependencies",)):
+                with self.subTest(annotation=annotation, flags=flags):
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        rc, err = self.run_cli(
+                            "--merge-base",
+                            MERGE_BASE,
+                            "--dependency-json",
+                            f"12={dependency}",
+                            "--dependency-json",
+                            f"13={dependency}",
+                            *flags,
+                            str(body),
+                        )
+                    self.assertEqual(rc, 2)
+                    self.assertIn("#12", err)
+                    self.assertIn("#13", err)
+                    self.assertEqual(stdout.getvalue(), "")
+
+    def test_dependency_list_hidden_members_fail_closed(self) -> None:
+        """A single-member fallback rejects separator-led references hidden by an opener."""
+        text = "Depends on #12 ~ head aaaaaaa, #13"
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims.find_dependency_claims(text)
+
+    def test_dependency_cli_hidden_members_fail_closed(self) -> None:
+        """Hidden fallback members return two in both CLI modes with matching live heads."""
+        body = self.write_fixture("body.md", "Depends on #12 ~ head aaaaaaa, #13")
+        dependency = self.dependency_json()
+        for flags in ((), ("--list-dependencies",)):
+            with self.subTest(flags=flags):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc, err = self.run_cli(
+                        "--merge-base",
+                        MERGE_BASE,
+                        "--dependency-json",
+                        f"12={dependency}",
+                        *flags,
+                        str(body),
+                    )
+                self.assertEqual(rc, 2)
+                self.assertIn("#12", err)
+                self.assertIn("#13", err)
+                self.assertEqual(stdout.getvalue(), "")
 
     def test_dependency_list_history_precedes_trailing_head_ambiguity(self) -> None:
         """Historical reference and head clauses are ignored before ambiguity checks."""
