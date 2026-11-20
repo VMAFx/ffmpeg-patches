@@ -114,7 +114,7 @@ lengths-local:
 		  echo '  The HISS-04 applied-tree function-length gate needs the series'; \
 		  echo '  applied to an FFmpeg checkout. Before pushing a patch change run:'; \
 		  echo '    make verify-all FFMPEG_TREE=<applied FFmpeg tree>'; \
-		  echo '  (see "Apply the series" in README.md). CI runs this gate on every'; \
+		  echo '  (see "Get started" in README.md). CI runs this gate on every'; \
 		  echo '  push to main and every release run; on a non-draft pull request only'; \
 		  echo '  when scripts/series.py scope selects ffmpeg work. Draft or out-of-scope'; \
 		  echo '  pull requests skip it; a tree-less local run cannot catch it.'; \

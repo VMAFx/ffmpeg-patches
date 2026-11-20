@@ -7,19 +7,11 @@
 
   <img src="docs/assets/ffmpeg-patches-readme-banner.svg" alt="ffmpeg-patches — shared FFmpeg patch series for VMAFx and Pelorus" height="120" />
 
-  <!-- README-STANDARD badge block: one group, fixed order (docs/README-STANDARD.md) -->
+  <!-- Badge block: one group, fixed order. -->
   <!-- 1 release/version -->
   [![Release](https://img.shields.io/badge/Release-Releases-3b82f6?style=for-the-badge&labelColor=111a35)](https://github.com/VMAFx/ffmpeg-patches/releases)
-  <!-- 2 CI/build -->
-  [![Series](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml)
-  [![Consumers](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml)
-  [![FFmpeg Master](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml)
-  [![Upstream Drift](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml/badge.svg?branch=main&event=schedule)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml)
-  [![Release](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml/badge.svg)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml)
   <!-- 3 security/scorecard -->
-  [![Scanners](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml/badge.svg?branch=main&event=push)](https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml)
   [![OpenSSF Scorecard](https://img.shields.io/badge/OpenSSF-Scorecard-06b6d4?style=for-the-badge&labelColor=111a35)](https://scorecard.dev/viewer/?uri=github.com/VMAFx/ffmpeg-patches)
-  [![Codacy](https://app.codacy.com/project/badge/Grade/59284a64ef65425eb779b400aa2b624c)](https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard)
   [![CodeRabbit](https://img.shields.io/badge/Reviews-CodeRabbit-8b5cf6?style=for-the-badge&logo=coderabbit&logoColor=white&labelColor=111a35)](https://coderabbit.ai)
   <!-- 4 standards -->
   [![HISS-21](https://img.shields.io/badge/Standards-HISS--21-06b6d4?style=for-the-badge&logo=nasa&labelColor=111a35)](AGENTS.md)
@@ -30,37 +22,32 @@
   <!-- 6 support -->
   [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-8b5cf6?style=for-the-badge&logo=githubsponsors&logoColor=white&labelColor=111a35)](https://github.com/sponsors/lusoris)
 
-  **Shared FFmpeg fix patch series for VMAFx projects, tracked against FFmpeg master ([`series.txt`](series.txt)) and [sent upstream](upstream-contributions.json)**
+  **Shared FFmpeg fixes for VMAFx projects**
 
   *Consumers [`apply`](scripts/series.py) this series first and carry only their own feature patches*
 
 </div>
 
-ffmpeg-patches is one shared FFmpeg patch series for VMAFx projects: fixes
-are tracked against FFmpeg master ([`series.txt`](series.txt)) and
-[sent upstream](upstream-contributions.json); consumers
-[`apply`](scripts/series.py) this series first and carry only their own
-feature patches.
+ffmpeg-patches tracks FFmpeg master ([`series.txt`](series.txt)). Its name
+describes the repository's contents: FFmpeg patches shared by the VMAFx
+projects ([ADR-0001](docs/adr/0001-shared-fix-series.md)); pronounce it
+"eff-eff-em-peg patches".
+Each patch's state is recorded in the `.toml` sidecar beside it.
 
 **[📖 Architectural Decision Records](docs/adr/README.md)** · [ADR-0001: Shared Fix Series](docs/adr/0001-shared-fix-series.md)
 
 ---
 
-## How it works
+## Why this project
 
-The series is a list of FFmpeg fixes in `git format-patch` form, applied in
-order onto one pinned FFmpeg release. Every fix is also sent upstream. When
-upstream merges it and a release containing it is pinned, the patch is
-dropped.
+A fix lives here once, so consumers do not maintain their own copies.
+See [ADR-0001](docs/adr/0001-shared-fix-series.md) for that decision and
+[How it works](#how-it-works) for the patch lifecycle.
 
-Consumers apply this series first and their own feature patches on top:
+## Get started
 
-- [VMAFx/vmafx](https://github.com/VMAFx/vmafx)
-- [VMAFx/pelorus](https://github.com/VMAFx/pelorus)
-
-A fix lives here once. A consumer does not carry its own copy.
-
-## Apply the series
+This repository ships patches only and builds nothing
+(see the `build` target in [Makefile](Makefile)).
 
 ```bash
 . ./base.env
@@ -69,9 +56,11 @@ test "$(git -C ffmpeg rev-parse HEAD)" = "$FFMPEG_COMMIT"
 python3 scripts/series.py apply --expect-base ffmpeg
 ```
 
-`apply` checks each patch and prints one result per patch. It runs
-`git am --3way` without your git configuration only when the patch does not
-already apply and its added lines are not in the tree:
+`apply` checks each patch and prints one result per patch. In
+`apply_one` in [`scripts/series.py`](scripts/series.py), it skips
+`git am --3way` only when the forward application check fails and all added
+lines are already in the tree. Otherwise, it attempts `git am --3way`
+without your git configuration and reports the result:
 
 - `applied`: the patch applied
 - `conflict`: it did not; the run stops unless `--keep-going` is given
@@ -80,7 +69,51 @@ already apply and its added lines are not in the tree:
 - `not-tried`: the patch was not attempted because a preceding patch
   conflicted and `--keep-going` was not given
 
-## Layout
+## Architecture
+
+### How it works
+
+The series is a list of FFmpeg fixes in `git format-patch` form, applied in
+order onto one pinned FFmpeg release. Its
+[`patches/NNNN-slug.toml`](patches/) sidecars record each patch's `status`:
+`unsubmitted`, `submitted`, `merged` or `rejected`, with an `upstream`
+reference once submitted. `unsubmitted` means no submission yet. Fixes are
+written to go upstream; rejected, withdrawn or replaced submissions may
+remain only while the pinned base needs the fix and need not be submitted
+again. The series maintainer drops a patch once its fixes have merged
+upstream and a release containing them is pinned.
+
+Consumers:
+
+- [VMAFx/vmafx](https://github.com/VMAFx/vmafx)
+- [VMAFx/pelorus](https://github.com/VMAFx/pelorus)
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px', 'primaryColor': '#111a35', 'primaryTextColor': '#e2e8f0', 'primaryBorderColor': '#3b82f6', 'lineColor': '#3b82f6', 'edgeLabelBackground': '#111a35', 'tertiaryColor': '#0b1020'}}}%%
+flowchart TD
+    found["Fix found in a consumer<br/>or in this series"]:::input
+    series["Add patch to series<br/>for pinned FFmpeg release"]:::step
+    upstream["Submit fix upstream<br/>where applicable"]:::step
+    consumers["Consumers apply shared series"]:::step
+    features["Apply own feature patches"]:::step
+    merged["If upstream merges the fixes"]:::step
+    pin["Pin a release containing the fix"]:::step
+    retained["Keep rejected or withdrawn fix<br/>while pinned base needs it"]:::step
+    drop["Drop patch from series"]:::step
+    found --> series
+    series --> upstream
+    series --> consumers
+    consumers --> features
+    upstream --> merged
+    upstream -->|rejected or withdrawn| retained
+    retained -->|pinned base no longer needs fix| drop
+    merged --> pin
+    pin --> drop
+classDef input fill:#0b1020,stroke:#06b6d4,stroke-width:2px,color:#e2e8f0
+classDef step fill:#111a35,stroke:#3b82f6,stroke-width:2px,color:#e2e8f0
+```
+
+### Layout
 
 | Path | Role |
 | :-- | :-- |
@@ -88,7 +121,7 @@ already apply and its added lines are not in the tree:
 | `series.txt` | Patch order; the series is cumulative |
 | `patches/NNNN-slug.patch` | One fix, generated by `git format-patch` |
 | `patches/NNNN-slug.toml` | Its metadata: status, upstream link, consumers, origin |
-| `upstream-contributions.json` | Every upstream pull request with its state; source of the contributions table |
+| `upstream-contributions.json` | Upstream pull-request records and states; source of the contributions table |
 | `scripts/series.py` | `check`, `apply`, `export`, the `coverage` and `warnings` gates, the `contributions` table and release `notes` |
 | `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
 | `scripts/consumer_stacks.py` | Applies each consumer's patch stack on top of the applied series |
@@ -106,15 +139,21 @@ Metadata keys:
   must know
 
 The series carries one form of each patch: the one for the pinned release.
-The pull request linked in `upstream` is the FFmpeg master form. For a
-`submitted` patch, optional `master_form = { base = "<40-hex>", head = "<40-hex>" }`
-records the PR's merge base with master at submission and its head commit.
+The `upstream` link records the submission, which may target master or a
+release branch. For a `submitted` patch, record optional
+`master_form = { base = "<40-hex>", head = "<40-hex>" }` only if the PR's
+base branch is master, using the PR API's current `merge_base` as `base` and
+`head.sha` as `head`.
 Update these ids whenever the PR is pushed again. For a `merged` patch,
-optional `upstream_commit = "<40-hex>"` records the commit carrying the fix
+optional `upstream_commit = "<40-hex>"` must name the commit carrying the fix
 on FFmpeg master. All ids must be full lowercase commit hashes.
 A patch whose release form has no single master form (for example, one split
 into several upstream pull requests) records
 `release_only = "<reason>"`; it excludes `master_form` and `upstream_commit`.
+For a PR against a release branch, record `release_only` with a reason.
+Once the PR is merged and the fix is on master as one commit, replace
+`release_only` by hand with `upstream_commit` naming that commit. Otherwise,
+keep `release_only`, for example if the fix spans several master pull requests.
 The daily upstream drift check fails when a recorded `master_form` no longer
 matches the PR's head or merge base on the forge. An `unsubmitted` patch whose
 fix travels in another author's PR records it as
@@ -177,9 +216,20 @@ The forge helper scripts share configuration through environment variables, impl
 4. Write or update `patches/NNNN-slug.toml` and run `make test`, then
    `make lengths FFMPEG_TREE=ffmpeg` to catch a function grown past the
    60-line cap (HISS-04) before it reaches CI.
-5. When a patch file is renamed, or its `status` or `upstream` link
-   changes, update its record in `upstream-contributions.json` and
-   regenerate the table; `check` names a record that no longer fits.
+5. If a patch name or number changes, rename any old `.toml` sidecar that
+   export left behind after a slug change to match. Update matching paths
+   and comments in `REUSE.toml`, if present, and any existing record in
+   `upstream-contributions.json`. Update current-series references in
+   sidecar text, `README.md`, `docs/`, `tests/` (including numbered patch
+   lookups), and `.github/workflows/`; preserve historical references and
+   synthetic fixture names. Regenerate the table with
+   `python3 scripts/series.py contributions --write`, then run
+   `python3 scripts/series.py check`. It reports sidecar, contribution
+   record and libplacebo credit mismatches; review other REUSE paths and
+   references by hand.
+   Add a record when submitting a patch upstream; keep existing records in
+   sync when its `status` or `upstream` link changes, then regenerate the
+   table.
 
 ### Checks
 
@@ -338,9 +388,23 @@ Two gaps remain:
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding
 standards (HISS-21, NASA JPL Power of 10), and local verification instructions.
 
-## Support ffmpeg-patches
+Check the Actions pages for
+[Series](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml),
+[Consumers](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml),
+[FFmpeg Master](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml),
+[Upstream Drift](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml),
+[Release](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml),
+[Scanners](
+https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml),
+and the [Codacy dashboard](
+https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard).
 
-**Why it matters.** ffmpeg-patches keeps one shared series of 39 FFmpeg fixes for VMAFx and pelorus and sends every fix upstream; a patch is dropped once a pinned FFmpeg release carries it. It tracks [40 FFmpeg pull requests](upstream-contributions.json), its own and backported ones: 12 merged, 25 open.
+## Support ffmpeg-patches
 
 **What support funds.**
 - Cloud test time on an NVIDIA device for the hqdn3d_cuda parity test, which hosted runners cannot run.
@@ -348,7 +412,7 @@ standards (HISS-21, NASA JPL Power of 10), and local verification instructions.
 
 Sponsor on [GitHub Sponsors](https://github.com/sponsors/lusoris), any amount; no support or priority is sold. Open Collective: pending.
 
-## Releases
+## Roadmap and releases
 
 A tag `vX.Y.Z` publishes a release; `vX.Y.Z-rc.N` publishes a prerelease.
 `release.yml` first runs the full gate on the tagged commit, then
@@ -432,10 +496,12 @@ State read from the FFmpeg forge on 2026-11-17.
 A pull request against a release branch is a backport. It reaches a pinned
 base with the first release cut from that branch after the merge.
 
-The same facts are in `upstream-contributions.json`, one object per pull
-request, for other pages to read. Its `patch` field is a string of patch
-filenames separated by a comma and a space, or an empty string when the series carries
-none. Every named patch must link to that pull request and match its state.
+The same facts are in
+[`upstream-contributions.json`](upstream-contributions.json), one object
+per pull request, for other pages to read. Its `patch` field is a string of
+patch filenames separated by a comma and a space, or an empty string when
+the series carries none. Every named patch must link to that pull request
+and match its state.
 The table lists all their series numbers and is generated from that file:
 edit the file, then run `python3 scripts/series.py contributions --write`.
 The pre-commit hook also regenerates and stages `README.md` whenever
@@ -447,6 +513,10 @@ fields, set the checked date to today in UTC and regenerate the table.
 `--fix` also moves the status of each linked patch sidecar to the repaired
 state (submitted, merged with `upstream_commit`, rejected) and drops a
 `master_form` that the new status no longer allows.
+The inserted `upstream_commit` is the forge's merge commit, which is the
+master commit only when the PR targets master. For a release-targeted PR,
+replace it by hand with the master commit, or use `release_only` without
+`upstream_commit` if no single master form exists.
 Unchanged files keep their bytes and checked date. The README table is checked
 even when the forge records match; `--fix` repairs a stale table without changing
 the checked date. Concurrent edits detected before writing abort the repair
