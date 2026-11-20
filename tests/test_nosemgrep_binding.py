@@ -306,14 +306,15 @@ class NosemgrepBindingTest(unittest.TestCase):
                 with self.subTest(filename=filename, newline=newline):
                     source = "x = 1\f\n" + bound_source(marker=marker)
                     source = source.replace("\nrun()", "\n\nrun()")
+                    expected_error = (
+                        f"{filename}:3: R3 misplaced suppression: "
+                        "standalone line immediately before code required"
+                    )
                     self.assertEqual(
                         find_nosemgrep_offenders(
                             source.replace("\n", newline), set(), filename=filename, today=TODAY
                         ),
-                        [
-                            f"{filename}:3: R3 misplaced suppression: "
-                            "standalone line immediately before code required"
-                        ],
+                        [expected_error],
                     )
 
     def test_unicode_separator_preserves_valid_binding(self) -> None:
