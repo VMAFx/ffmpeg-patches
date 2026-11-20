@@ -642,6 +642,22 @@ class FateShapeTest(unittest.TestCase):
             fixture.commit()
         return fixture
 
+    def test_physical_line_numbers_use_only_lf(self) -> None:
+        """Comment separators other than LF cannot move an added pipeline's physical line."""
+        for separator in ("\u2028", "\u2029", "\f", "\v", "\x85", "\r"):
+            for shell in (False, True):
+                with self.subTest(separator=separator, shell=shell):
+                    command = "run x | sort" if shell else "CMD = run x | sort"
+                    source = f"# comment {separator} text\n{command}\n"
+                    findings = self.findings(source, {2}, shell_grammar=shell)
+                    rule = "helper-pipe" if shell else "pipe"
+                    self.assertEqual([(f.rule, f.line) for f in findings], [(rule, 2)])
+        for ending in ("", "\n", "\r\n"):
+            with self.subTest(ending=ending):
+                lines = upstream_lint._fate_lines("CMD = run x | sort" + ending)
+                self.assertEqual(len(lines), 1)
+                self.assertEqual((lines[0].first, lines[0].last), (1, 1))
+
     def test_library_registration_mismatch_fails(self) -> None:
         """A library registration feeding ffmpeg needs the matching library group."""
         source = (
@@ -824,8 +840,8 @@ class FateShapeTest(unittest.TestCase):
     def test_registration_self_reference_and_scope_preserve_appends(self) -> None:
         """Only actual self references or scoped replacements preserve prior literal appends."""
         for replacement, retained in (
-            ("FATE_FFMPEG = $(FATE_FFMPEG) more\n", True),
-            ("FATE_FFMPEG = ${FATE_FFMPEG} more\n", True),
+            ("FATE_FFMPEG := $(FATE_FFMPEG) more\n", True),
+            ("FATE_FFMPEG := ${FATE_FFMPEG} more\n", True),
             ("ifdef CONFIG_X\nFATE_FFMPEG = fate-real\nendif\n", True),
             ("define RESET\nFATE_FFMPEG = fate-real\nendef\n", True),
             ("FATE_FFMPEG = fate-real-FATE_FFMPEG\n", False),
@@ -840,6 +856,59 @@ class FateShapeTest(unittest.TestCase):
                     [(f.rule, f.line) for f in self.findings(source)],
                     [("registration", 1)] if retained else [],
                 )
+
+    def test_registration_replacements_require_raw_destination(self) -> None:
+        """Only the exact destination spelling can replace a previous literal registration."""
+        for original, replacement, retained in (
+            ("FATE_X-yes", "FATE_X-$(CONFIG_X)", True),
+            ("FATE_X-yes", "FATE_X-yes", False),
+            ("FATE_X-$(CONFIG_X)", "FATE_X-$(CONFIG_X)", False),
+        ):
+            with self.subTest(original=original, replacement=replacement):
+                source = (
+                    f"CONFIG_X := no\n{original} += fate-x\n{replacement} = fate-real\n"
+                    "FATE_FFMPEG += $(FATE_X-yes)\n"
+                    "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source, {2})],
+                    [("registration", 2)] if retained else [],
+                )
+
+    def test_graph_replacements_require_raw_destination(self) -> None:
+        """Raw destination spellings control edge replacement before normalized reachability."""
+        for replacement, retained in (
+            ("FATE_X-$(CONFIG_X)", True),
+            ("FATE_X-yes", False),
+        ):
+            with self.subTest(replacement=replacement):
+                source = (
+                    "CONFIG_X := no\nFATE_LIBAVUTIL += fate-x\n"
+                    "FATE_X-yes += $(FATE_LIBAVUTIL)\n"
+                    f"{replacement} = fate-real\nFATE_FFMPEG += $(FATE_X-yes)\n"
+                    "fate-x: CMD = run libavutil/tests/x\n"
+                )
+                graph = upstream_lint._fate_shape_graph([source])
+                self.assertEqual("FATE_X-yes" in graph.get("FATE_LIBAVUTIL", set()), retained)
+                self.assertEqual(
+                    [(f.rule, f.line) for f in self.findings(source, {2}, graph=graph)],
+                    [("registration", 2)] if retained else [],
+                )
+
+    def test_immediate_aggregation_preserves_registration(self) -> None:
+        """Immediate reads preserve only prior registrations across later source replacements."""
+        for operator, retained in ((":=", True), ("=", False), ("+=", False)):
+            for position in ("before", "between", "after"):
+                with self.subTest(operator=operator, position=position):
+                    lines = ["FATE_LIBAVUTIL += fate-x\n", "FATE_LIBAVUTIL =\n"]
+                    index = {"before": 0, "between": 1, "after": 2}[position]
+                    lines.insert(index, f"FATE_FFMPEG {operator} $(FATE_LIBAVUTIL)\n")
+                    source = "".join(lines) + "fate-x: CMD = run libavutil/tests/x\n"
+                    number = 2 if position == "before" else 1
+                    self.assertEqual(
+                        [(f.rule, f.line) for f in self.findings(source, {number})],
+                        [("registration", number)] if retained and position == "between" else [],
+                    )
 
     def test_graph_define_replacements_keep_registration(self) -> None:
         """Replacements in define bodies preserve earlier aggregation references."""
@@ -996,6 +1065,19 @@ class FateShapeTest(unittest.TestCase):
             ('run x "data | grep x"', []),
             ('"grep data"', []),
             ("'grep data'", []),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual([f.rule for f in self.findings(f"CMD = {command}\n")], expected)
+
+    def test_grep_shell_script_before_positional_operands(self) -> None:
+        """The first quoted sh -c word is script text even when positional operands follow."""
+        for command, expected in (
+            ("sh -c 'grep -q pattern \"$$1\"' sh result.txt", ["grep"]),
+            (r'sh -c "grep -q pattern \"$$1\"" sh result.txt', ["grep"]),
+            (r'sh -c "printf \"x\"; grep -q pattern \"\$\$1\"" sh result.txt', ["grep"]),
+            ('sh -c "printf grep" sh x', []),
+            (r'sh -c "printf \"grep\"" sh x', []),
+            ("sh -c 'printf \"grep\"' sh x", []),
         ):
             with self.subTest(command=command):
                 self.assertEqual([f.rule for f in self.findings(f"CMD = {command}\n")], expected)
@@ -1234,6 +1316,21 @@ class FateShapeTest(unittest.TestCase):
                     [(f.rule, f.line) for f in self.findings(source, added, shell_grammar=True)],
                     [("helper-pipe", min(added))],
                 )
+
+    def test_shell_continuations_join_without_separator(self) -> None:
+        """Shell continuation fragments form one word while make fragments retain a space."""
+        source = "ff\\\nmpeg x | sort\n"
+        expected = self.findings("ffmpeg x | sort\n", {1}, shell_grammar=True)
+        self.assertEqual([f.rule for f in expected], ["helper-pipe"])
+        for added in ({1}, {2}):
+            with self.subTest(added=added):
+                findings = self.findings(source, added, shell_grammar=True)
+                self.assertEqual([f.message for f in findings], [f.message for f in expected])
+                self.assertEqual([f.line for f in findings], list(added))
+        line = upstream_lint._fate_lines(source, shell_grammar=True)[0]
+        self.assertEqual((line.text, line.first, line.last), ("ffmpeg x | sort", 1, 2))
+        self.assertEqual(upstream_lint._fate_lines(source)[0].text, "ff mpeg x | sort")
+        self.assertEqual(self.findings(source, {3}, shell_grammar=True), [])
 
     def test_endian_quoted_and_escaped_graph_delimiters(self) -> None:
         """Quoted or escaped graph delimiters cannot invent endian filters or consumers."""

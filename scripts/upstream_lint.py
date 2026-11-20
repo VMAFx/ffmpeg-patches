@@ -787,24 +787,33 @@ def _fate_shell_continues(text: str) -> bool:
     return escaped
 
 
+def _fate_physical_lines(source: str) -> list[str]:
+    """Split on LF alone, dropping its final empty element and one trailing CR per line."""
+    physical_lines = source.split("\n")
+    if physical_lines[-1] == "":
+        physical_lines.pop()
+    return [line.removesuffix("\r") for line in physical_lines]
+
+
 def _fate_lines(source: str, *, shell_grammar: bool = False) -> list[FateLine]:
-    """Strip physical shell comments before joining; retain logical make comments and endpoints."""
+    """Join shell continuations verbatim or make ones with spaces, retaining LF endpoints."""
     uncomment = _fate_shell_uncomment if shell_grammar else _fate_uncomment
+    separator = "" if shell_grammar else " "
     lines, parts, first = [], [], 1
-    for number, physical in enumerate(source.splitlines(), 1):
+    for number, physical in enumerate(_fate_physical_lines(source), 1):
         if not parts:
             first = number
         text = physical
         if shell_grammar:
-            text = uncomment(" ".join([*parts, text]))
+            text = uncomment(separator.join([*parts, text]))
             parts = []
         continued = _fate_shell_continues(text) if shell_grammar else text.endswith("\\")
         parts.append(text[:-1] if continued else text)
         if not continued:
-            lines.append(FateLine(uncomment(" ".join(parts)).strip(), first, number))
+            lines.append(FateLine(uncomment(separator.join(parts)).strip(), first, number))
             parts = []
     if parts:
-        lines.append(FateLine(uncomment(" ".join(parts)).strip(), first, number))
+        lines.append(FateLine(uncomment(separator.join(parts)).strip(), first, number))
     return lines
 
 
@@ -1627,29 +1636,29 @@ def _fate_shape_scope(kind: str, depth: int, defines: int) -> tuple[int, int]:
     return depth, defines
 
 
-def _fate_shape_assignments(lines: list[FateLine]) -> list[tuple[str, str, bool, FateLine]]:
-    """Share depth-zero, outside-define, non-self replacement decisions for each assignment."""
+def _fate_shape_assignments(lines: list[FateLine]) -> list[tuple[str, str, str, bool, FateLine]]:
+    """Share raw destinations, operators and unscoped non-self replacement decisions."""
     assignments, depth, defines = [], 0, 0
     for line in lines:
         depth, defines = _fate_shape_scope(_fate_kind(line)[0], depth, defines)
         assignment = FATE_SHAPE_ASSIGNMENT.fullmatch(line.text)
         if not assignment:
             continue
-        destination = _fate_shape_normalize(assignment[1])
+        destination = assignment[1]
         replaces = (
             assignment[2] != "+="
             and not depth
             and not defines
-            and not _fate_shape_self_reference(destination, assignment[3])
+            and not _fate_shape_self_reference(_fate_shape_normalize(destination), assignment[3])
         )
-        assignments.append((destination, assignment[3], replaces, line))
+        assignments.append((destination, assignment[2], assignment[3], replaces, line))
     return assignments
 
 
 def _fate_shape_source_references(source: str) -> dict[str, set[str]]:
-    """Track per-source edges using shared replacement decisions and actual self references."""
+    """Clear edges only for the same raw destination using shared replacement decisions."""
     references: dict[str, set[str]] = {}
-    for destination, value, replaces, _ in _fate_shape_assignments(_fate_lines(source)):
+    for destination, _, value, replaces, _ in _fate_shape_assignments(_fate_lines(source)):
         if replaces:
             references[destination] = set()
         references.setdefault(destination, set()).update(
@@ -1659,12 +1668,12 @@ def _fate_shape_source_references(source: str) -> dict[str, set[str]]:
 
 
 def _fate_shape_graph(sources: list[str]) -> dict[str, set[str]]:
-    """Union per-source edges after unconditional replacements without actual self references."""
+    """Normalize and union per-source edges after raw-destination replacements."""
     graph: dict[str, set[str]] = {}
     for source in sources:
         for destination, references in _fate_shape_source_references(source).items():
             for name in references:
-                graph.setdefault(name, set()).add(destination)
+                graph.setdefault(name, set()).add(_fate_shape_normalize(destination))
     return graph
 
 
@@ -1686,12 +1695,28 @@ def _fate_shape_chain(variable: str, graph: dict[str, set[str]], ffmpeg: set[str
     return []
 
 
+def _fate_shape_captured_registrations(
+    value: str, registrations: dict[str, list[tuple[str, list[str], FateLine]]]
+) -> set[int]:
+    """Identify existing literal registration lines read by an immediate assignment."""
+    return {
+        entry[2].first
+        for name in _fate_shape_references(value)
+        for entry in registrations.get(name, [])
+    }
+
+
 def _fate_shape_live_registrations(lines: list[FateLine]) -> list[tuple[str, list[str], FateLine]]:
-    """Retain literal appends only after each variable's last shared replacing assignment."""
+    """Replace same-spelling appends except registrations already captured by immediate reads."""
     registrations: dict[str, list[tuple[str, list[str], FateLine]]] = {}
-    for destination, _, replaces, line in _fate_shape_assignments(lines):
+    captured: set[int] = set()
+    for destination, operator, value, replaces, line in _fate_shape_assignments(lines):
+        if operator == ":=":
+            captured.update(_fate_shape_captured_registrations(value, registrations))
         if replaces:
-            registrations[destination] = []
+            registrations[destination] = [
+                entry for entry in registrations.get(destination, []) if entry[2].first in captured
+            ]
         variable, targets = _fate_shape_registration(line)
         if targets:
             registrations.setdefault(destination, []).append((variable, targets, line))
@@ -1738,14 +1763,20 @@ def _fate_shape_segments(command: str) -> list[str]:
     return segments
 
 
+def _fate_shape_script(segment: str) -> str:
+    """Read the first quoted sh -c word with shell escapes, ignoring positional operands."""
+    match = re.match(r"""\s*sh\s+-c\s+(?:'([^']*)'|"((?:\\.|[^"\\])*)")(?:\s|$)""", segment)
+    if not match:
+        return ""
+    if match[1] is not None:
+        return match[1]
+    return re.sub(r'\\([$`"\\])', r"\1", match[2])
+
+
 def _fate_shape_grep(command: str) -> bool:
-    """Find grep in command position, including run wrappers and one sh -c script layer."""
+    """Find command-position grep in wrappers and one sh -c script word before operands."""
     segments = _fate_shape_segments(command)
-    scripts = [
-        match[2]
-        for segment in segments
-        if (match := re.fullmatch(r"\s*sh\s+-c\s+(['\"])(.*)\1\s*", segment))
-    ]
+    scripts = [_fate_shape_script(segment) for segment in segments]
     segments.extend(segment for script in scripts for segment in _fate_shape_segments(script))
     pattern = (
         r"\s*(?:(?:if|then|elif|else|while|until|do|!|run)\s+)*(?:grep|'grep'|\"grep\")(?:\s|$)"
