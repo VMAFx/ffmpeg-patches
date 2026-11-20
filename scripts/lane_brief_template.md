@@ -1,5 +1,5 @@
 task: <task>
-repo: VMAFx/ffmpeg-patches, worktree = cwd, branch <branch>. issue #<n>, round <r>.
+repo: vidiko/ffmpeg-patches, worktree = cwd, branch <branch>. issue #<n>, round <r>.
 finding / problem: <finding>
 fix: <fix>; HISS: no recursion, bounded loops, functions <= 60 LOC, typed, timeout on every I/O call.
 Configure FFmpeg builds only through `scripts/ffmpeg_configure.py`.

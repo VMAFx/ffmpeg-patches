@@ -1,5 +1,5 @@
 <!-- markdownlint-disable MD013 -->
-# VMAFx/ffmpeg-patches Agent Operating Harness
+# vidiko/ffmpeg-patches Agent Operating Harness
 
 <!-- praetor:head -->
 
