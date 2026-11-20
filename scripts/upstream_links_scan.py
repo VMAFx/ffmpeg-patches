@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-try:
+if not __package__:
     import upstream_drift
     from upstream_links_forge import (
         MAX_CANDIDATES,
@@ -20,7 +20,7 @@ try:
         read_candidate_pulls,
     )
     from upstream_links_parse import DriftError, FileNames, overlaps, parse_timestamp
-except ModuleNotFoundError:
+else:
     from scripts import upstream_drift
     from scripts.upstream_links_forge import (
         MAX_CANDIDATES,

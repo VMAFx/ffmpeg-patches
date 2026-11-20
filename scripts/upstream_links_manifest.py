@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-try:
+if not __package__:
     import series
     import upstream_drift
     from upstream_links_forge import Fetch, RequestBudget, _budgeted, related_for
@@ -34,7 +34,7 @@ try:
         read_run_pulls,
         request_cap,
     )
-except ModuleNotFoundError:
+else:
     from scripts import series, upstream_drift
     from scripts.upstream_links_forge import Fetch, RequestBudget, _budgeted, related_for
     from scripts.upstream_links_parse import (

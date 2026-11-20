@@ -7,10 +7,10 @@ from __future__ import annotations
 import re
 from datetime import UTC, date, datetime
 
-try:
+if not __package__:
     import series
     import upstream_drift
-except ModuleNotFoundError:
+else:
     from scripts import series, upstream_drift
 
 

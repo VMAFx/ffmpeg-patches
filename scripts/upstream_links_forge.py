@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable
 from datetime import date
 
-try:
+if not __package__:
     import series
     import upstream_drift
     from upstream_links_parse import (
@@ -34,7 +34,7 @@ try:
         match_reason,
         parse_timestamp,
     )
-except ModuleNotFoundError:
+else:
     from scripts import series, upstream_drift
     from scripts.upstream_links_parse import (
         MAX_BODY_CHARS,

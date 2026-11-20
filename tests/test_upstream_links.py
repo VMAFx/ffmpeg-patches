@@ -8,7 +8,10 @@ import contextlib
 import http.client
 import io
 import json
+import os
 import re
+import subprocess  # nosec B404 - fixed child interpreter and fixture-controlled Python source.
+import sys
 import tempfile
 import threading
 import unittest
@@ -198,6 +201,65 @@ def run_cli(
             if not (line.startswith("window ") and "; expected requests " in line)
         )
     return rc, output, err.getvalue()
+
+
+class ImportModeTest(unittest.TestCase):
+    """Keep link-watch imports in the namespace selected by package context."""
+
+    def _run_child(self, source: str) -> dict:
+        """Run fixture source with isolated Python imports and return its final JSON line."""
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+        result = subprocess.run(  # nosec B603 - fixed interpreter and fixture-controlled Python source.
+            [sys.executable, "-B", "-c", source],
+            cwd=Path(__file__).resolve().parent.parent,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout.splitlines()[-1])
+
+    def test_package_mode_with_scripts_on_path(self) -> None:
+        """Package imports stay packaged even after a top-level series import."""
+        result = self._run_child(
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path.cwd() / 'scripts'))\n"
+            "import series\n"
+            "from scripts import upstream_links, upstream_links_forge, upstream_links_manifest\n"
+            "print(json.dumps({\n"
+            "    'modules': sorted(name for name in sys.modules\n"
+            "                      if name.startswith('upstream_links')),\n"
+            "    'shared_budget': upstream_links_forge.RequestBudget\n"
+            "                     is upstream_links_manifest.RequestBudget,\n"
+            "}))\n"
+        )
+        self.assertEqual(result["modules"], [])
+        self.assertTrue(result["shared_budget"])
+
+    def test_script_mode_help_boundary_control(self) -> None:
+        """Boundary control: script help keeps all link-watch imports top-level."""
+        result = self._run_child(
+            "import json, runpy, sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path.cwd() / 'scripts'))\n"
+            "sys.argv = ['scripts/upstream_links.py', '--help']\n"
+            "status = 0\n"
+            "try:\n"
+            "    runpy.run_path('scripts/upstream_links.py', run_name='__main__')\n"
+            "except SystemExit as exc:\n"
+            "    status = exc.code\n"
+            "print(json.dumps({\n"
+            "    'modules': sorted(name for name in sys.modules\n"
+            "                      if name.startswith('scripts.upstream_links')),\n"
+            "    'status': status,\n"
+            "}))\n"
+        )
+        self.assertEqual(result["modules"], [])
+        self.assertEqual(result["status"], 0)
 
 
 class PlantedSceneSadOverlapTest(unittest.TestCase):
