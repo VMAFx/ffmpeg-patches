@@ -258,8 +258,7 @@ REFERENCE = re.compile(r"^[^:\n]+?[:-]\d+[:-](.*)$")
 FUNCTION = re.compile(r"^(?:[A-Za-z_]\w*[ *]+)+[A-Za-z_]\w*\([^();{}]*\)\s*\{")
 CONTROL = re.compile(r"(?:}\s*)?(?:(?:else\s+)?(?:if|for|while|switch)\s*\(.*\)|else|do)")
 C_NONCODE = re.compile(
-    r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
-    r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
+    r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
     re.DOTALL | re.MULTILINE,
 )
 FIX_MESSAGE = re.compile(
@@ -594,8 +593,27 @@ def _deleted_lines(patch: str) -> set[int]:
     return deleted
 
 
+def _c_lex_lines(source: str) -> tuple[list[str], list[str]]:
+    """Mask C comments, literals and logical directives, retaining real directive starts."""
+    raw = source.split("\n")
+    code = C_NONCODE.sub(lambda match: re.sub(r"[^\n]", " ", match[0]), source).split("\n")
+    directives: list[str] = []
+    continued = False
+    for index in range(len(raw)):
+        starts = raw[index].lstrip(" \t").startswith("#") and code[index].lstrip(" \t").startswith(
+            "#"
+        )
+        if continued or starts:
+            if not continued:
+                directives.append(code[index])
+            continued = raw[index].removesuffix("\r").endswith("\\")
+            code[index] = " " * len(code[index])
+    return code, directives
+
+
 def _code_lines(source: str) -> list[str]:
-    return C_NONCODE.sub(lambda match: re.sub(r"[^\n]", " ", match[0]), source).split("\n")
+    """Return physical C code lines with comments, literals and logical directives masked."""
+    return _c_lex_lines(source)[0]
 
 
 def _line_rules(raw: str, code: str, previous: str) -> list[str]:
@@ -2370,17 +2388,23 @@ def _c_rules_report(
 
 
 def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
-    """Discover object-like attribute names or report the missing attributes header."""
+    """Discover real attribute directives only from a header contained in the checked tree."""
     header = tree / "libavutil/attributes.h"
+    if not _c_rules_inside(header, tree):
+        return set(), [
+            "informational: libavutil/attributes.h: resolves outside the checked tree; "
+            "attribute blanking skipped"
+        ]
     try:
         source = header.read_bytes()
     except FileNotFoundError:
         return set(), ["informational: missing libavutil/attributes.h; attribute blanking skipped"]
+    directives = _c_lex_lines(source.decode("latin-1"))[1]
     names = re.findall(
-        rb"(?m)^[ \t]*#[ \t]*define[ \t]+((?:av_|attribute_)[A-Za-z0-9_]+)\b(?!\()",
-        source,
+        r"(?m)^[ \t]*#[ \t]*define[ \t]+((?:av_|attribute_)[A-Za-z0-9_]+)\b(?!\()",
+        "\n".join(directives),
     )
-    return set(names), []
+    return {name.encode("ascii") for name in names}, []
 
 
 def _c_rules_macro_call(line: str, names: set[str]) -> bool:
@@ -2398,36 +2422,61 @@ def _c_rules_macro_call(line: str, names: set[str]) -> bool:
     return depth == 0
 
 
+def _c_rules_blank_words(raw: bytes, clean: str, words: re.Pattern[bytes]) -> bytes:
+    """Blank attribute spans found only in lexically masked code without moving bytes."""
+    blanked = bytearray(raw)
+    matches = list(words.finditer(clean.encode("latin-1")))
+    for index in range(len(matches)):
+        match = matches[index]
+        blanked[match.start() : match.end()] = b" " * len(match[0])
+    return bytes(blanked)
+
+
 def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
-    """Blank attribute words and file-scope macro invocations without moving any byte."""
+    """Blank code attributes and file-scope macro calls, preserving all noncode bytes."""
+    code, directives = _c_lex_lines(source.decode("latin-1"))
     names = set(
-        name.decode("ascii")
-        for name in re.findall(rb"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(", source)
+        re.findall(r"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(", "\n".join(directives))
     )
     words = re.compile(rb"\b(?:" + b"|".join(sorted(attributes)) + rb")\b") if attributes else None
     lines = source.split(b"\n")
-    code = _code_lines(source.decode("latin-1"))
     depth = 0
     for index in range(len(lines)):
         raw, clean = lines[index], code[index]
-        if raw.lstrip().startswith(b"#"):
-            continue
         invocation = re.fullmatch(rb"[ \t]*[A-Za-z_]\w*[ \t]*\(.*\)[ \t\r]*", raw)
         if depth == 0 and invocation and _c_rules_macro_call(clean, names):
             lines[index] = re.sub(rb"[^\r]", b" ", raw)
         elif words is not None:
-            lines[index] = words.sub(lambda match: b" " * len(match[0]), raw)
+            lines[index] = _c_rules_blank_words(raw, clean, words)
         depth += clean.count("{") - clean.count("}")
     return b"\n".join(lines)
 
 
-def _c_rules_scan_root(tree: Path, paths: list[str], directory: str) -> tuple[Path, list[str]]:
-    """Copy requested sources for blanking and preserve unread paths as original-file links."""
+def _c_rules_inside(path: Path, root: Path) -> bool:
+    """Require the resolved path to remain inside its resolved root."""
+    return path.resolve().is_relative_to(root.resolve())
+
+
+def _c_rules_scan_root(
+    tree: Path, paths: list[str], directory: str
+) -> tuple[Path, list[str], list[str]]:
+    """Copy contained sources, retain unread links and report rejected source or target escapes."""
     attributes, notices = _c_rules_attributes(tree)
     root = Path(directory) / "sources"
     root.mkdir()
+    escaped: list[str] = []
     for index in range(len(paths)):
-        source, target = tree / paths[index], root / paths[index]
+        name = paths[index]
+        source, target = tree / name, root / name
+        reason = ""
+        if not _c_rules_inside(source, tree):
+            reason = "resolves outside the checked tree"
+        elif not _c_rules_inside(target, root):
+            reason = "resolves outside the scratch root"
+        if reason:
+            escaped.append(name)
+            notices.append(f"error: {_waiver_text(name)}: {reason}")
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             content = source.read_bytes()
@@ -2435,13 +2484,36 @@ def _c_rules_scan_root(tree: Path, paths: list[str], directory: str) -> tuple[Pa
             target.symlink_to(source.absolute())
         else:
             target.write_bytes(_c_rules_blank(content, attributes))
-    return root, notices
+    return root, notices, escaped
+
+
+def _c_rules_scan(
+    scan_root: Path, paths: list[str], json_path: Path, unread_paths: list[str]
+) -> tuple[RunResult, tuple[list[SemgrepMatch], list[str]] | None]:
+    """Run the unchanged scanner argv and validate coverage for the accepted scratch paths."""
+    argv = [
+        "bash",
+        str(SEMGREP_SCAN),
+        f"--rules={SEMGREP_FFMPEG_RULES}",
+        f"--json-output={json_path}",
+        "--max-target-bytes=0",
+        *paths,
+    ]
+    result = _run(argv, scan_root, timeout=C_RULES_TIMEOUT)
+    lines = result.stdout.splitlines()
+    has_warning = any(lines[index].startswith("semgrep_scan:") for index in range(len(lines)))
+    parsed = (
+        _read_semgrep_json(json_path, frozenset(paths), unread_paths=unread_paths)
+        if result.returncode in (0, 1) and not has_warning
+        else None
+    )
+    return result, parsed
 
 
 def _c_rules(
     tree: Path, base: str, head: str, waiver: str, unread_waivers: tuple[UnreadWaiver, ...] = ()
 ) -> Step:
-    """Scan scratch sources with attributes and file-scope macro calls blanked; require coverage."""
+    """Scan contained scratch sources with blanking and require unwaivable escape rejection."""
     touched_by_path = _c_rules_touched(tree, base, head)
     if not touched_by_path:
         unused = _unread_report([], unread_waivers)
@@ -2453,23 +2525,14 @@ def _c_rules(
     paths = list(touched_by_path)
     unread_paths: list[str] = []
     with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
-        scan_root, notices = _c_rules_scan_root(tree, paths, directory)
-        json_path = Path(directory) / "semgrep.json"
-        argv = [
-            "bash",
-            str(SEMGREP_SCAN),
-            f"--rules={SEMGREP_FFMPEG_RULES}",
-            f"--json-output={json_path}",
-            "--max-target-bytes=0",
-            *paths,
-        ]
-        result = _run(argv, scan_root, timeout=C_RULES_TIMEOUT)
-        lines = result.stdout.splitlines()
-        has_warning = any(lines[index].startswith("semgrep_scan:") for index in range(len(lines)))
-        parsed = (
-            _read_semgrep_json(json_path, frozenset(paths), unread_paths=unread_paths)
-            if result.returncode in (0, 1) and not has_warning
-            else None
+        scan_root, notices, escaped = _c_rules_scan_root(tree, paths, directory)
+        paths = [path for path in paths if path not in escaped]
+        unread_waivers = tuple(entry for entry in unread_waivers if entry.path not in escaped)
+        if not paths:
+            unused = _unread_report([], unread_waivers)
+            return Step("c-rules", 2, "\n".join([*notices, unused.output]).rstrip("\n"))
+        result, parsed = _c_rules_scan(
+            scan_root, paths, Path(directory) / "semgrep.json", unread_paths
         )
     if parsed is None:
         step = _c_rules_error(result)
@@ -2481,7 +2544,7 @@ def _c_rules(
             Waivers(c_rule=waiver, unread=unread_waivers),
             unread_paths,
         )
-    return Step(step.name, step.rc, "\n".join([*notices, step.output]))
+    return Step(step.name, 2 if escaped else step.rc, "\n".join([*notices, step.output]))
 
 
 DOCSTRING_COVERAGE = re.compile(

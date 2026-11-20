@@ -3536,6 +3536,199 @@ class CRulesScratchTest(FixtureTest):
         self.commit()
         return upstream_lint._c_rules(self.root, self.base, "HEAD", "")
 
+    def assert_blanked(self, source: bytes, expected: bytes) -> None:
+        """Assert exact scratch bytes, byte length and every newline offset."""
+        blanked = upstream_lint._c_rules_blank(source, {b"av_fixture_tag"})
+        self.assertEqual(blanked, expected)
+        self.assertEqual(len(blanked), len(source))
+        self.assertEqual(
+            [index for index, byte in enumerate(blanked) if byte == 10],
+            [index for index, byte in enumerate(source) if byte == 10],
+        )
+
+    def test_d1_attributes_only_in_code(self) -> None:
+        """Attribute words inside literals and comments remain byte-identical."""
+        tail = (
+            b'const char *text = "av_fixture_tag";\n'
+            b"int marker = 'x';\nint multichar = 'av_fixture_tag';\n"
+            b"/* av_fixture_tag\n   av_fixture_tag */\n"
+            b"// av_fixture_tag\n"
+        )
+        self.assert_blanked(
+            b"av_fixture_tag int code;\n" + tail,
+            b"               int code;\n" + tail,
+        )
+
+    def test_d1_attribute_discovery_ignores_noncode(self) -> None:
+        """Only real object-like attribute definitions are discovered."""
+        self.write(
+            "libavutil/attributes.h",
+            "/*\n#define av_buffer\n*/\n"
+            'const char *text = "\\\n#define av_string\\\n";\n'
+            "#define av_mark\n",
+        )
+        names, notices = upstream_lint._c_rules_attributes(self.root)
+        self.assertEqual(names, {b"av_mark"})
+        self.assertEqual(notices, [])
+
+    def test_d1_macro_discovery_ignores_noncode(self) -> None:
+        """Commented and quoted function macros cannot blank standalone calls."""
+        source = (
+            b"/*\n#define BUILD(x, n) int x;\n*/\nBUILD(x, 1)\n"
+            b'const char *text = "\\\n#define QUOTED(x) x\\\n";\nQUOTED(x)\n'
+        )
+        self.assert_blanked(source, source)
+
+    def test_d2_two_line_directive_and_code_boundary(self) -> None:
+        """A directive continuation is preserved and following code is blanked."""
+        directive = b"#define KEEP \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(
+            directive + b"av_fixture_tag int code;\n",
+            directive + b"               int code;\n",
+        )
+
+    def test_d2_three_line_directive(self) -> None:
+        """Every physical line of a three-line directive stays identical."""
+        source = b"#define KEEP \\\n    av_fixture_tag \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(source, source)
+
+    def test_d2_commented_hash_does_not_start_directive(self) -> None:
+        """A hash inside a block comment cannot exempt following ordinary code."""
+        prefix = b"/*\n#define KEEP \\\n*/ "
+        self.assert_blanked(
+            prefix + b"av_fixture_tag int code;\n",
+            prefix + b"               int code;\n",
+        )
+
+    def allocation_source(self) -> str:
+        """Return a one-line allocation finding that overlaps a committed symlink hunk."""
+        return (
+            "void fixture(void) { unsigned char *buffer = av_malloc(8); "
+            "unsigned char *dst = buffer ? buffer + 4 : NULL; "
+            "if (!buffer) { fail(); } }\n"
+        )
+
+    def commit_linked_source(self, internal: bool = False) -> Path:
+        """Commit a requested symlink with its target inside the disposable fixture parent."""
+        target = self.root / "fixtures/linked.c" if internal else self.root.parent / "outside.c"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.allocation_source(), encoding="utf-8")
+        source = self.root / "libavfilter/vf_x.c"
+        source.unlink()
+        source.symlink_to("before.c")
+        self.commit("avfilter/vf_x: establish linked source")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        source.unlink()
+        source.symlink_to(target)
+        self.commit()
+        return target
+
+    def test_d3_escaping_source_cannot_be_waived(self) -> None:
+        """An escaping source is never read or scanned and neither waiver can excuse it."""
+        target = self.commit_linked_source()
+        waiver = upstream_lint.UnreadWaiver(
+            "libavfilter/vf_x.c", "fixture", "B", date(2026, 11, 23), False
+        )
+        real_read = Path.read_bytes
+
+        def read(path):
+            """Reject any attempted read of the escaping requested source."""
+            self.assertNotEqual(path.resolve(), target)
+            return real_read(path)
+
+        for reason, unread in (("", ()), ("fixture", ()), ("fixture", (waiver,))):
+            with self.subTest(reason=reason, unread=unread):
+                with unittest.mock.patch.object(Path, "read_bytes", read):
+                    step = upstream_lint._c_rules(self.root, self.base, "HEAD", reason, unread)
+                self.assertEqual(step.rc, 2, step.output)
+                self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1, step.output)
+                self.assertIn("resolves outside the checked tree", step.output)
+                self.assertNotIn("ffmpeg-null-ternary-after-allocation", step.output)
+
+    def test_d3_escaping_source_keeps_other_findings(self) -> None:
+        """Rejecting one source still scans and reports an ordinary requested source."""
+        self.commit_linked_source()
+        self.write("libavfilter/vf_other.c", self.allocation_source())
+        self.commit()
+        step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1, step.output)
+        self.assertIn("resolves outside the checked tree", step.output)
+        self.assertIn("finding: libavfilter/vf_other.c:1:", step.output)
+        self.assertNotIn("finding: libavfilter/vf_x.c:", step.output)
+
+    def test_d3_escaping_source_keeps_unread_status(self) -> None:
+        """Rejecting one source retains unread and waiver statuses for another source."""
+        self.commit_linked_source()
+        name = "libavfilter/vf_unread.c"
+        self.write(name, "int unread;\n")
+        self.commit()
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": [name]},
+                "results": [],
+                "errors": [{"type": "Syntax error", "path": name}],
+            }
+        )
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1, step.output)
+        self.assertIn("resolves outside the checked tree", step.output)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"no waiver: {name}:", step.output)
+
+    def test_d3_scratch_target_cannot_escape(self) -> None:
+        """An absolute in-tree source cannot redirect a scratch write outside its root."""
+        name = str(self.root / "libavfilter/vf_x.c")
+        with tempfile.TemporaryDirectory() as directory:
+            with unittest.mock.patch.object(Path, "write_bytes") as write:
+                prepared = upstream_lint._c_rules_scan_root(self.root, [name], directory)
+            write.assert_not_called()
+        self.assertEqual(len(prepared[1]), 1)
+        self.assertIn(upstream_lint._waiver_text(name), prepared[1][0])
+        self.assertIn("resolves outside the scratch root", prepared[1][0])
+
+    def test_d3_internal_source_symlink_is_scanned(self) -> None:
+        """A requested symlink resolving inside the tree retains normal finding status."""
+        self.commit_linked_source(internal=True)
+        step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+        self.assertNotIn("resolves outside", step.output)
+
+    def test_d3_escaping_header_is_not_read(self) -> None:
+        """An escaping attributes header is named and contributes no blanked attributes."""
+        target = self.root.parent / "outside.h"
+        target.write_bytes(b"#define av_fixture_tag\n")
+        header = self.root / "libavutil/attributes.h"
+        header.unlink()
+        header.symlink_to(target)
+        source = b"av_fixture_tag int code;\n"
+        self.write("libavfilter/vf_x.c", source.decode("ascii"))
+        real_read = Path.read_bytes
+
+        def read(path):
+            """Reject any attempted read through the escaping attributes header."""
+            self.assertNotEqual(path.resolve(), target)
+            return real_read(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with unittest.mock.patch.object(Path, "read_bytes", read):
+                prepared = upstream_lint._c_rules_scan_root(
+                    self.root, ["libavfilter/vf_x.c"], directory
+                )
+            blanked = (prepared[0] / "libavfilter/vf_x.c").read_bytes()
+        self.assertEqual(blanked, source)
+        self.assertEqual(len(blanked), len(source))
+        self.assertEqual(
+            [index for index, byte in enumerate(blanked) if byte == 10],
+            [index for index, byte in enumerate(source) if byte == 10],
+        )
+        self.assertEqual(len(prepared[1]), 1)
+        self.assertIn("libavutil/attributes.h", prepared[1][0])
+        self.assertIn("resolves outside the checked tree", prepared[1][0])
+
     def test_attribute_parser_failure_is_blanked(self) -> None:
         """A discovered attribute cannot make an otherwise clean step exit two."""
         source = (
@@ -3651,7 +3844,7 @@ class CRulesBlankingTest(unittest.TestCase):
                 return real_read(path)
 
             with unittest.mock.patch.object(Path, "read_bytes", read):
-                root, notices = upstream_lint._c_rules_scan_root(
+                root, notices, escaped = upstream_lint._c_rules_scan_root(
                     tree, ["libavutil/unread.c"], directory
                 )
             target = root / "libavutil/unread.c"
@@ -3659,6 +3852,7 @@ class CRulesBlankingTest(unittest.TestCase):
             self.assertEqual(target.readlink(), source)
             self.assertFalse(target.exists())
             self.assertEqual(notices, [])
+            self.assertEqual(escaped, [])
 
 
 class CRulesTest(unittest.TestCase):
@@ -3709,7 +3903,7 @@ class CRulesTest(unittest.TestCase):
             unittest.mock.patch.object(
                 upstream_lint,
                 "_c_rules_scan_root",
-                side_effect=lambda tree, paths, directory: (tree, []),
+                side_effect=lambda tree, paths, directory: (tree, [], []),
             ),
             unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
             unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
@@ -3730,7 +3924,7 @@ class CRulesTest(unittest.TestCase):
             unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
             unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
             unittest.mock.patch.object(
-                upstream_lint, "_c_rules_scan_root", return_value=(sentinel, [])
+                upstream_lint, "_c_rules_scan_root", return_value=(sentinel, [], [])
             ) as prepare,
         ):
             step = upstream_lint._c_rules(self.tree, "base", "head", "")
