@@ -614,16 +614,20 @@ class FateShapeTest(unittest.TestCase):
         added: set[int] | None = None,
         shell_grammar: bool = False,
         graph: dict[str, set[str]] | None = None,
-        ffmpeg: set[str] | None = None,
+        ffmpeg: set[str] | upstream_lint.FateShapeContext | None = None,
     ):
-        """Run per-file rules with explicit aggregation and executable dependencies."""
+        """Run per-file rules with explicit aggregation, dependencies and revision commands."""
         path = "tests/fate-run.sh" if shell_grammar else "tests/fate/shape.mak"
         if added is None:
             added = set(range(1, len(source.splitlines()) + 1))
         if graph is None:
             graph = upstream_lint._fate_shape_graph([source])
         return upstream_lint._fate_shape_file(
-            path, source, added, graph, {"FATE_FFMPEG"} if ffmpeg is None else ffmpeg
+            path,
+            source,
+            added,
+            graph,
+            {"FATE_FFMPEG"} if ffmpeg is None else ffmpeg,
         )
 
     def fixture(
@@ -642,11 +646,312 @@ class FateShapeTest(unittest.TestCase):
             fixture.commit()
         return fixture
 
+    def test_shell_multiline_quotes_preserve_pipe_boundaries(self) -> None:
+        """Open shell quotes span physical newlines without exposing quoted pipelines."""
+        for quote, producer in (("'", "ffmpeg"), ('"', "run")):
+            with self.subTest(quote=quote):
+                output_format = "'%s\\n'" if quote == "'" else '"%s"'
+                source = (
+                    f"printf {output_format} {quote}line one\n{producer} x | sort\nend{quote}\n"
+                )
+                self.assertEqual(self.findings(source, {2}, shell_grammar=True), [])
+        self.assertEqual(
+            self.findings("ffmpeg -i 'a\nb' -f null - | sort\n", {2}, shell_grammar=True),
+            [
+                upstream_lint.FateShapeFinding(
+                    "helper-pipe", 2, "ffmpeg: pipeline hides producer exit status"
+                )
+            ],
+        )
+        self.assertEqual(
+            self.findings("printf x\nrun x | sort\n", {2}, shell_grammar=True),
+            [
+                upstream_lint.FateShapeFinding(
+                    "helper-pipe", 2, "run: pipeline hides producer exit status"
+                )
+            ],
+        )
+        for source in (
+            "printf x 'a\\\nffmpeg x | sort\nend'\n",
+            'printf x "a\\"\nrun x | sort\nend"\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source, {2}, shell_grammar=True), [])
+
+    def test_assignment_prefixed_pipeline_producers(self) -> None:
+        """Leading shell assignments preserve producer checks and generator exemptions."""
+        for prefix, producer in (("LC_ALL=C", "ffmpeg"), ("LC_ALL=C", "run"), ("A=1 B=2", "run")):
+            for shell_grammar in (False, True):
+                with self.subTest(prefix=prefix, producer=producer, shell_grammar=shell_grammar):
+                    source = f"{prefix} {producer} x | sort\n"
+                    if not shell_grammar:
+                        source = "CMD = " + source
+                    rule = "helper-pipe" if shell_grammar else "pipe"
+                    self.assertEqual(
+                        self.findings(source, shell_grammar=shell_grammar),
+                        [
+                            upstream_lint.FateShapeFinding(
+                                rule,
+                                1,
+                                ("" if shell_grammar else "CMD: ")
+                                + f"{producer}: pipeline hides producer exit status",
+                            )
+                        ],
+                    )
+        for segment in ("LC_ALL=C printf x", "A=1 B=2", "if A=1 B=2 printf x"):
+            for shell_grammar in (False, True):
+                with self.subTest(segment=segment, shell_grammar=shell_grammar):
+                    source = ("" if shell_grammar else "CMD = ") + segment + " | sort\n"
+                    self.assertEqual(self.findings(source, shell_grammar=shell_grammar), [])
+
+    def test_format_named_pixel_formats_at_any_position(self) -> None:
+        """Named pix_fmts options count wherever they occur among format options."""
+        for options in (
+            "color_ranges=tv:pix_fmts=yuv420p10le",
+            "pix_fmts=yuv420p10le:color_ranges=tv",
+            "yuv420p10le",
+            "color_spaces=bt709:color_ranges=tv:pix_fmts=yuv420p10le",
+        ):
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.findings(f'CMD = framecrc -vf "format={options},null"\n'),
+                    [
+                        upstream_lint.FateShapeFinding(
+                            "endian",
+                            1,
+                            f"CMD: format={options}: endian format reaches consumer null",
+                        )
+                    ],
+                )
+        for options in ("color_ranges=tv", "color_spaces=bt709", "color_ranges=gray16le"):
+            with self.subTest(options=options):
+                self.assertEqual(self.findings(f'CMD = framecrc -vf "format={options},null"\n'), [])
+
+    def test_filter_options_are_whole_quoted_shell_words(self) -> None:
+        """Option text inside another shell word cannot introduce a filter graph."""
+        for option in ("-lavfi", "-vf", "-filter_complex", "-filter:v"):
+            with self.subTest(option=option):
+                source = (
+                    f'fate-x: CMD = framecrc -metadata "title=note {option} '
+                    'format=gray16le,null marker" -f lavfi -i testsrc2\n'
+                )
+                self.assertEqual(self.findings(source), [])
+                for graph in ('"format=gray16le,null"', "format=gray16le,null"):
+                    self.assertEqual(
+                        self.findings(f"CMD = framecrc {option} {graph}\n"),
+                        [
+                            upstream_lint.FateShapeFinding(
+                                "endian",
+                                1,
+                                "CMD: format=gray16le: endian format reaches consumer null",
+                            )
+                        ],
+                    )
+        self.assertEqual(self.findings("CMD = framecrc title=-vf format=gray16le,null\n"), [])
+
+    def test_literal_replacement_registrations(self) -> None:
+        """Replacement assignments register their literal targets after clearing prior values."""
+        for variable, route in (("FATE_FFMPEG", ""), ("MID", "FATE_FFMPEG += $(MID)\n")):
+            for operator in ("=", ":=", "+="):
+                with self.subTest(variable=variable, operator=operator):
+                    source = (
+                        f"{variable} {operator} fate-x\n"
+                        "fate-x: CMD = run libavutil/tests/x\n" + route
+                    )
+                    chain = variable + (" -> FATE_FFMPEG" if route else "")
+                    self.assertEqual(
+                        self.findings(source),
+                        [
+                            upstream_lint.FateShapeFinding(
+                                "registration",
+                                1,
+                                f"fate-x: {variable}: {chain}: "
+                                "register it under the matching FATE_LIBAVUTIL variable",
+                            )
+                        ],
+                    )
+        for operator in ("=", ":="):
+            with self.subTest(clearing=operator):
+                self.assertEqual(
+                    self.findings(
+                        f"FATE_FFMPEG {operator} fate-x\nFATE_FFMPEG {operator}\n"
+                        "fate-x: CMD = run libavutil/tests/x\n"
+                    ),
+                    [],
+                )
+        self.assertEqual(self.findings("fate-x: CMD = run libavutil/tests/x\n"), [])
+
+    def test_define_reference_snapshot_eligibility(self) -> None:
+        """Snapshot references from define bodies require expansion before the read."""
+        prefix = (
+            "MIDDLE :=\ndefine ADD\nMIDDLE += $(FATE_LIBAVUTIL)\nendef\n"
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        for snapshot in (
+            "FATE_FFMPEG := $(MIDDLE)\n",
+            "FATE_FFMPEG :=\nFATE_FFMPEG += $(MIDDLE)\n",
+        ):
+            for position in ("absent", "before", "after"):
+                with self.subTest(snapshot=snapshot, position=position):
+                    expansion = "$(eval $(ADD))\n"
+                    source = prefix + (expansion if position == "before" else "") + snapshot
+                    source += expansion if position == "after" else ""
+                    expected = (
+                        [
+                            upstream_lint.FateShapeFinding(
+                                "registration",
+                                5,
+                                "fate-x: FATE_LIBAVUTIL: FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG: "
+                                "register it under the matching FATE_LIBAVUTIL variable",
+                            )
+                        ]
+                        if position == "before"
+                        else []
+                    )
+                    self.assertEqual(self.findings(source), expected)
+
+    def test_define_deferred_reference_expansions_across_fragments(self) -> None:
+        """Deferred body references require a top-level expansion in any graph fragment."""
+        prefix = (
+            "MIDDLE =\ndefine ADD\nMIDDLE += $(FATE_LIBAVUTIL)\nendef\n"
+            "FATE_LIBAVUTIL += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        route = "FATE_FFMPEG += $(MIDDLE)\n"
+        expected = [
+            upstream_lint.FateShapeFinding(
+                "registration",
+                5,
+                "fate-x: FATE_LIBAVUTIL: FATE_LIBAVUTIL -> MIDDLE -> FATE_FFMPEG: "
+                "register it under the matching FATE_LIBAVUTIL variable",
+            )
+        ]
+        self.assertEqual(self.findings(prefix + route), [])
+        for source in (prefix + "$(eval $(ADD))\n" + route, prefix + route + "$(eval $(ADD))\n"):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), expected)
+        source = prefix + route
+        expansion = "$(eval $(ADD))\n"
+        for fragments in ([source, expansion], [expansion, source]):
+            with self.subTest(fragments=fragments):
+                self.assertEqual(
+                    self.findings(source, graph=upstream_lint._fate_shape_graph(fragments)),
+                    expected,
+                )
+        nested = "define WRAPPER\n$(eval $(ADD))\nendef\n"
+        self.assertEqual(
+            self.findings(source, graph=upstream_lint._fate_shape_graph([source, nested])), []
+        )
+
+    def test_revision_commands_join_added_registration(self) -> None:
+        """Added registrations find unchanged sibling commands without extra Git reads."""
+        fixture = self.fixture()
+        fixture.write("tests/fate/command.mak", "fate-x: CMD = run libavutil/tests/x\n")
+        fixture.commit()
+        base = fixture.git("rev-parse", "HEAD").strip()
+        fixture.write("tests/fate/shape.mak", "FATE_FFMPEG += fate-x\n")
+        fixture.commit()
+        with unittest.mock.patch.object(upstream_lint, "_git", wraps=upstream_lint._git) as git:
+            step = upstream_lint._fate_shape(fixture.root, base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(
+            step.output.splitlines()[0],
+            "finding: tests/fate/shape.mak:1: registration: "
+            "fate-x: FATE_FFMPEG: FATE_FFMPEG: "
+            "register it under the matching FATE_LIBAVUTIL variable",
+        )
+        self.assertIn("registration=1, pipe=0, helper-pipe=0, grep=0, endian=0", step.output)
+        self.assertLessEqual(len(git.call_args_list), 5)
+        commands = {
+            "fate-x": [
+                "run libavutil/tests/x | grep x -vf format=gray16le,null",
+                "run libavfilter/tests/y",
+            ]
+        }
+        source = "FATE_FFMPEG += fate-x\n"
+        expected = [
+            upstream_lint.FateShapeFinding(
+                "registration",
+                1,
+                "fate-x: FATE_FFMPEG: FATE_FFMPEG: "
+                "register it under the matching FATE_LIBAVFILTER variable",
+            )
+        ]
+        context = upstream_lint.FateShapeContext({"FATE_FFMPEG"}, commands)
+        self.assertEqual(self.findings(source, ffmpeg=context), expected)
+        self.assertEqual(
+            self.findings(source + "fate-x: CMD = run tests/tool\n", ffmpeg=context), []
+        )
+        self.assertEqual(self.findings(source + "fate-%: CMD = run libavfilter/tests/x\n"), [])
+
+    def test_limit_eval_call_arguments_are_not_substituted(self) -> None:
+        """Limit: eval and call match define names without substituting argument values."""
+        source = (
+            "define ADD\nFATE_FFMPEG += $(1)\nendef\n"
+            "$(eval $(call ADD,fate-x))\nfate-x: CMD = run libavutil/tests/x\n"
+        )
+        self.assertEqual(self.findings(source), [])
+
+    def test_limit_config_conditionals_are_enabled(self) -> None:
+        """Limit: CONFIG values are not read and every conditional spelling is enabled."""
+        source = (
+            "FATE_FFMPEG-$(CONFIG_NEVER_SET) += fate-x\n"
+            "fate-x: CMD = run libavutil/tests/x\nFATE_FFMPEG += $(FATE_FFMPEG-yes)\n"
+        )
+        self.assertEqual(
+            self.findings(source),
+            [
+                upstream_lint.FateShapeFinding(
+                    "registration",
+                    1,
+                    "fate-x: FATE_FFMPEG-$(CONFIG_NEVER_SET): FATE_FFMPEG-yes -> FATE_FFMPEG: "
+                    "register it under the matching FATE_LIBAVUTIL variable",
+                )
+            ],
+        )
+
+    def test_limit_fragments_have_no_include_order(self) -> None:
+        """Limit: include order is unmodelled and fragments form an unordered set."""
+        a = "FATE_FFMPEG := $(MID)\n"
+        b = "MID += fate-x\nfate-x: CMD = run libavutil/tests/x\n"
+        expected = [
+            upstream_lint.FateShapeFinding(
+                "registration",
+                1,
+                "fate-x: MID: MID -> FATE_FFMPEG: "
+                "register it under the matching FATE_LIBAVUTIL variable",
+            )
+        ]
+        for fragments in ([a, b], [b, a]):
+            with self.subTest(fragments=fragments):
+                self.assertEqual(
+                    self.findings(b, graph=upstream_lint._fate_shape_graph(fragments)), expected
+                )
+
+    def test_limit_shell_and_other_function_values_are_not_followed(self) -> None:
+        """Limit: shell, filter and other make function results are not followed."""
+        for registration in (
+            "FATE_FFMPEG += $(shell echo fate-x)\n",
+            "MID += fate-x\nFATE_FFMPEG += $(filter fate-%,$(MID))\n",
+        ):
+            with self.subTest(registration=registration):
+                self.assertEqual(
+                    self.findings(registration + "fate-x: CMD = run libavutil/tests/x\n"), []
+                )
+
+    def test_limit_pattern_and_target_specific_variables_are_not_read(self) -> None:
+        """Limit: pattern commands and target-specific registrations are not read."""
+        source = "FATE_FFMPEG += fate-x\nfate-%: CMD = run libavutil/tests/x\n"
+        self.assertEqual(self.findings(source), [])
+        self.assertEqual(
+            self.findings("fate-x: FATE_FFMPEG += fate-x\nfate-x: CMD = run libavutil/tests/x\n"),
+            [],
+        )
+
     def test_physical_line_numbers_use_only_lf(self) -> None:
         """Comment separators other than LF cannot move an added pipeline's physical line."""
         for separator in ("\u2028", "\u2029", "\f", "\v", "\x85", "\r"):
             for shell in (False, True):
-                with self.subTest(separator=separator, shell=shell):
+                with self.subTest(separator=separator, shell_grammar=shell):
                     command = "run x | sort" if shell else "CMD = run x | sort"
                     source = f"# comment {separator} text\n{command}\n"
                     findings = self.findings(source, {2}, shell_grammar=shell)
@@ -677,18 +982,40 @@ class FateShapeTest(unittest.TestCase):
         self.assertEqual(self.findings(source, {2}), [])
 
     def test_library_registration_and_command_boundaries(self) -> None:
-        """Library groups, ordinary executables and non-run commands pass."""
+        """Correct library groups and routed ordinary commands pass unlike library tests."""
         for variable, command in (
             ("FATE_LIBAVFILTER-$(CONFIG_ZSCALE_FILTER)", "run libavfilter/tests/zscale_test"),
             ("FATE_LIBAVUTIL", "run libavutil/tests/formats"),
-            ("FATE_FILTER", "framecrc -lavfi testsrc2 -frames:v 1"),
-            ("FATE_FILTER", "run tests/tool"),
-            ("FATE_FILTER", "run libavfilter/tool"),
         ):
-            with self.subTest(variable=variable, command=command):
+            with self.subTest(correct_group=variable):
                 self.assertEqual(
                     self.findings(f"{variable} += fate-x\nfate-x: CMD = {command}\n"), []
                 )
+        for command in (
+            "framecrc -lavfi testsrc2 -frames:v 1",
+            "run tests/tool",
+            "run libavfilter/tool",
+        ):
+            with self.subTest(command=command):
+                source = (
+                    f"FATE_FILTER += fate-x\nfate-x: CMD = {command}\n"
+                    "FATE_FFMPEG += $(FATE_FILTER)\n"
+                )
+                self.assertEqual(self.findings(source), [])
+        self.assertEqual(
+            self.findings(
+                "FATE_FILTER += fate-x\nfate-x: CMD = run libavfilter/tests/x\n"
+                "FATE_FFMPEG += $(FATE_FILTER)\n"
+            ),
+            [
+                upstream_lint.FateShapeFinding(
+                    "registration",
+                    1,
+                    "fate-x: FATE_FILTER: FATE_FILTER -> FATE_FFMPEG: "
+                    "register it under the matching FATE_LIBAVFILTER variable",
+                )
+            ],
+        )
 
     def test_aggregate_targets_are_not_literal_registrations(self) -> None:
         """Calibration aggregate references remain outside direct target matching."""
@@ -1330,11 +1657,11 @@ class FateShapeTest(unittest.TestCase):
                 )
 
     def test_define_body_immediate_reads_remain_deferred(self) -> None:
-        """Define bodies defer simple assignments and appends until an unknown evaluation point."""
-        for prefix, operator, line in (
-            ("FATE_LIBAVUTIL += fate-old\n", ":=", 5),
-            ("FATE_FFMPEG :=\n", "+=", 5),
-            ("FATE_LIBAVUTIL += fate-old\nFATE_FFMPEG :=\n", "+=", 6),
+        """Unexpanded define-body references cannot route simple assignments or appends."""
+        for prefix, operator in (
+            ("FATE_LIBAVUTIL += fate-old\n", ":="),
+            ("FATE_FFMPEG :=\n", "+="),
+            ("FATE_LIBAVUTIL += fate-old\nFATE_FFMPEG :=\n", "+="),
         ):
             with self.subTest(prefix=prefix, operator=operator):
                 source = (
@@ -1343,8 +1670,7 @@ class FateShapeTest(unittest.TestCase):
                     + "FATE_LIBAVUTIL += fate-new\nfate-new: CMD = run libavutil/tests/new\n"
                 )
                 findings = self.findings(source)
-                self.assertEqual([(f.rule, f.line) for f in findings], [("registration", line)])
-                self.assertIn("FATE_LIBAVUTIL -> FATE_FFMPEG", findings[0].message)
+                self.assertEqual(findings, [])
 
     def test_graph_define_replacements_keep_registration(self) -> None:
         """Replacements in define bodies preserve earlier aggregation references."""

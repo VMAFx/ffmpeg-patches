@@ -34,11 +34,17 @@ It checks CMD values for unquoted pipelines and command-position grep assertions
 and helper pipelines starting with test commands or command variables. In CMD
 filter graphs after -lavfi, -vf, -filter_complex or -filter:v, an endian-specific
 format= is checked against its next consumer in the same chain: scale and
-format convert it, other consumers fail, and chain ends pass. Not checked:
-forced formats ending labelled chains feeding native-endian filters in another
-chain, aggregation built with make functions other than plain $(VAR) references
-(for example $(foreach) or $(call)), reference-file and C-test endian pairing,
-missing CONFIG gates, phony alias targets and pipes inside quoted strings.
+format convert it, other consumers fail, and chain ends pass. Graph options
+are whole shell words, with quotes respected across physical shell newlines.
+Limits: eval and call match expanded define names without substituting arguments
+such as $(1); CONFIG values are not read (every conditional spelling is enabled);
+include order is not modelled (fragments form an unordered set); shell and other
+function values such as $(shell ...) and $(filter ...) are not followed;
+target-specific and pattern-specific variables are not read (only literal
+target: CMD = lines supply registration commands, not fate-%: CMD = or
+target-specific registrations). Not checked: forced formats ending labelled
+chains feeding native-endian filters in another chain, reference-file and C-test
+endian pairing, phony alias targets and pipes inside quoted strings.
 --fate-shape-reason TEXT waives findings, never Git or read errors.
 
 The regression-test step fails when a commit whose subject or body, outside its
@@ -779,12 +785,16 @@ def _fate_shell_uncomment(text: str) -> str:
     return text
 
 
-def _fate_shell_continues(text: str) -> bool:
-    """Continue only an unescaped trailing backslash outside single quotes and stripped comments."""
+def _fate_line_part(text: str, shell_grammar: bool) -> tuple[str, bool]:
+    """Retain quoted shell newlines and remove only real backslash continuations."""
+    if not shell_grammar:
+        return (text[:-1], True) if text.endswith("\\") else (text, False)
     quote, escaped = "", False
     for char in text:
         quote, escaped = _fate_shell_quote(quote, escaped, char)
-    return escaped
+    if escaped:
+        return text[:-1], True
+    return (text + "\n", True) if quote else (text, False)
 
 
 def _fate_physical_lines(source: str) -> list[str]:
@@ -796,7 +806,7 @@ def _fate_physical_lines(source: str) -> list[str]:
 
 
 def _fate_lines(source: str, *, shell_grammar: bool = False) -> list[FateLine]:
-    """Join shell continuations verbatim or make ones with spaces, retaining LF endpoints."""
+    """Join quoted shell newlines and continuations or spaced make lines with LF endpoints."""
     uncomment = _fate_shell_uncomment if shell_grammar else _fate_uncomment
     separator = "" if shell_grammar else " "
     lines, parts, first = [], [], 1
@@ -807,8 +817,8 @@ def _fate_lines(source: str, *, shell_grammar: bool = False) -> list[FateLine]:
         if shell_grammar:
             text = uncomment(separator.join([*parts, text]))
             parts = []
-        continued = _fate_shell_continues(text) if shell_grammar else text.endswith("\\")
-        parts.append(text[:-1] if continued else text)
+        part, continued = _fate_line_part(text, shell_grammar)
+        parts.append(part)
         if not continued:
             lines.append(FateLine(uncomment(separator.join(parts)).strip(), first, number))
             parts = []
@@ -1133,31 +1143,40 @@ def _fate_video(
             )
 
 
-def _lavfi_words(command: str) -> list[str]:
-    """Join adjacent shell fragments with one linear, non-backtracking character walk."""
-    words, parts, quote, escaped, active = [], [], "", False, False
-    for char in command:
+def _lavfi_unquote(word: str, preserve_escapes: bool) -> str:
+    """Remove shell quotes while optionally retaining escapes for filtergraph parsing."""
+    parts, quote, escaped = [], "", False
+    for char in word:
         if escaped:
             parts.append(char)
             escaped = False
         elif char == "\\" and quote != "'":
-            escaped, active = True, True
+            escaped = True
+            parts.extend("\\" if preserve_escapes else "")
+        elif char == quote:
+            quote = ""
         elif quote:
-            if char == quote:
-                quote = ""
-            else:
-                parts.append(char)
+            parts.append(char)
         elif char in "\"'":
-            quote, active = char, True
-        elif char.isspace():
-            if active:
-                words.append("".join(parts))
-                parts, active = [], False
+            quote = char
         else:
             parts.append(char)
-            active = True
-    if active:
-        words.append("".join(parts))
+    return "".join(parts)
+
+
+def _lavfi_words(command: str, *, preserve_escapes: bool = False) -> list[str]:
+    """Scan whole shell words with shared quote state and optional filtergraph escapes."""
+    words, parts, quote, escaped = [], [], "", False
+    for char in command:
+        if not quote and not escaped and char.isspace():
+            if parts:
+                words.append(_lavfi_unquote("".join(parts), preserve_escapes))
+                parts = []
+        else:
+            parts.append(char)
+            quote, escaped = _fate_shell_quote(quote, escaped, char)
+    if parts:
+        words.append(_lavfi_unquote("".join(parts), preserve_escapes))
     return words
 
 
@@ -1424,9 +1443,15 @@ FATE_SHELL_TOKEN = re.compile(
     r"""\\.|'[^']*'|"(?:\\.|[^"\\])*"|\$\(|[0-9]*[<>]&(?:[0-9]+|-)|&>>?|>>?|<|"""
     r"""\|\||&&|[()|;&]|[^\\'"$()|;&<>]+|."""
 )
-FATE_GRAPH = re.compile(
-    r"""(?:^|\s)(?:-lavfi|-vf|-filter_complex|-filter:v)\s+("(?:\\.|[^"\\])*"|'[^']*'|\S+)"""
-)
+FATE_GRAPH_OPTIONS = frozenset({"-lavfi", "-vf", "-filter_complex", "-filter:v"})
+
+
+@dataclass(frozen=True)
+class FateShapeContext:
+    """Carry ffmpeg roots and revision-wide literal CMD values into the file checker."""
+
+    ffmpeg: set[str]
+    commands: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1458,10 +1483,12 @@ def _fate_shell_operators(command: str) -> list[tuple[int, str]]:
 
 
 def _fate_shape_producer(segment: str) -> str:
-    """Choose the first producer after leading whole shell control words."""
-    for word in segment.split():
-        if word not in {"if", "then", "elif", "else", "while", "until", "do", "!", "{", "("}:
-            return word.strip("\"'")
+    """Choose the producer after leading shell control words and assignment words."""
+    for word in _lavfi_words(segment):
+        if word in {"if", "then", "elif", "else", "while", "until", "do", "!", "{", "("}:
+            continue
+        if not re.match(r"[A-Za-z_][A-Za-z0-9_]*=", word):
+            return word
     return ""
 
 
@@ -1506,30 +1533,39 @@ def _fate_shape_graph_parts(text: str, delimiter: str) -> list[str]:
     return parts
 
 
+def _fate_shape_formats(item: str) -> list[str]:
+    """Read positional formats and named pix_fmts wherever they occur among options."""
+    formats = []
+    for index, option in enumerate(_fate_shape_graph_parts(item.partition("=")[2], ":")):
+        if option.startswith("pix_fmts="):
+            formats.extend(option.partition("=")[2].split("|"))
+        elif index == 0 and "=" not in option:
+            formats.extend(option.split("|"))
+    return formats
+
+
 def _fate_shape_endian_chain(chain: str) -> list[str]:
-    """Report forced endian consumers after splitting only unquoted, unescaped commas."""
+    """Check positional or named endian formats before non-converting chain consumers."""
     items = [_fate_shape_filter(item) for item in _fate_shape_graph_parts(chain, ",")]
     messages = []
     for item, consumer in zip(items, items[1:], strict=False):
-        formats = re.match(r"(?:pix_fmts=)?([^:\[\]]+)", item.partition("=")[2])
         if (
             _fate_shape_filter_name(item) == "format"
-            and formats
             and _fate_shape_filter_name(consumer) not in {"scale", "format"}
-            and any(name.strip("\"' ").endswith(("le", "be")) for name in formats[1].split("|"))
+            and any(name.strip("\"' ").endswith(("le", "be")) for name in _fate_shape_formats(item))
         ):
             messages.append(f"{item}: endian format reaches consumer {consumer}")
     return messages
 
 
 def _fate_shape_endian(command: str) -> list[str]:
-    """Judge endian consumers within chains separated by unquoted, unescaped semicolons."""
+    """Read graphs only after whole shell option words and judge each graph chain."""
+    words = _lavfi_words(command, preserve_escapes=True)
     return [
         message
-        for match in FATE_GRAPH.finditer(command)
-        for chain in _fate_shape_graph_parts(
-            match[1][1:-1] if match[1].startswith(("'", '"')) else match[1], ";"
-        )
+        for option, graph in zip(words, words[1:], strict=False)
+        if option in FATE_GRAPH_OPTIONS
+        for chain in _fate_shape_graph_parts(graph, ";")
         for message in _fate_shape_endian_chain(chain)
     ]
 
@@ -1546,6 +1582,16 @@ def _fate_shape_commands(lines: list[FateLine]) -> list[tuple[str, str, FateLine
     return commands
 
 
+def _fate_shape_command_values(commands: list[tuple[str, str, FateLine]]) -> dict[str, list[str]]:
+    """Collect CMD variants of literal fate targets, excluding make and pattern targets."""
+    values: dict[str, list[str]] = {}
+    for targets, command, _ in commands:
+        for target in targets.split():
+            if re.fullmatch(r"fate-[A-Za-z0-9_.+-]+", target):
+                values.setdefault(target, []).append(command)
+    return values
+
+
 def _fate_shape_library(command: str) -> str:
     """Return the matching library group for a direct run lib*/tests/ command."""
     words = command.split()
@@ -1558,12 +1604,15 @@ def _fate_shape_library(command: str) -> str:
 
 
 def _fate_shape_registration(line: FateLine) -> tuple[str, list[str]]:
-    """Extract literal append registrations using the existing FATE line kinds."""
+    """Extract append and replacement registrations using the existing FATE line kinds."""
     kind, groups = _fate_kind(line)
     if kind == "registration":
         return f"{groups[0]}-{groups[1]}", groups[2].split()
-    if kind == "variable" and groups[1] == "+=":
-        return groups[0], groups[2].split()
+    if kind == "variable":
+        targets = groups[2].split()
+        if groups[1] != "+=":
+            targets = [target for target in targets if target.startswith("fate-")]
+        return groups[0], targets
     return "", []
 
 
@@ -1678,10 +1727,10 @@ class _FateShapeEntry:
 
 @dataclass
 class _FateShapeState:
-    """Hold raw flavors, followable references, frozen fragment edges and current entries."""
+    """Hold raw flavors, body-tagged references, frozen fragment edges and current entries."""
 
     flavors: set[str] = field(default_factory=lambda: {"recursive"})
-    references: set[str] = field(default_factory=set)
+    references: set[tuple[str, str]] = field(default_factory=set)
     frozen: set[tuple[str, str]] = field(default_factory=set)
     entries: list[_FateShapeEntry] = field(default_factory=list)
 
@@ -1701,6 +1750,22 @@ def _fate_shape_contexts(lines: list[FateLine]) -> dict[int, tuple[str, frozense
                 match[1] or match[2] for match in FATE_SHAPE_EVAL.finditer(line.text.strip())
             )
     return contexts
+
+
+def _fate_shape_reference_names(state: _FateShapeState, expanded: frozenset[str]) -> set[str]:
+    """Follow body-tagged references only when their define is eligible for expansion."""
+    return {name for name, body in state.references if not body or body in expanded}
+
+
+def _fate_shape_expanded(lines: list[FateLine]) -> frozenset[str]:
+    """Collect exact define names expanded at top level, including the final line."""
+    contexts = _fate_shape_contexts(lines)
+    return frozenset(
+        match[1] or match[2]
+        for line in lines
+        if not contexts[line.first][0]
+        for match in FATE_SHAPE_EVAL.finditer(line.text.strip())
+    )
 
 
 def _fate_shape_matching_states(
@@ -1750,7 +1815,7 @@ def _fate_shape_snapshot(
     states: dict[str, _FateShapeState],
     expanded: frozenset[str],
 ) -> tuple[set[tuple[str, str]], list[_FateShapeEntry]]:
-    """Capture eligible values with normalized self hops and freeze missing same-file names."""
+    """Snapshot eligible entries and body references, freezing missing same-file names."""
     pending = [
         (name, [_fate_shape_normalize(destination)]) for name in _fate_shape_references(value)
     ]
@@ -1773,7 +1838,8 @@ def _fate_shape_snapshot(
             entries.extend(_fate_shape_snapshot_entries(destination, raw, state, tail, expanded))
             next_tail = [] if _fate_shape_is_self_read(destination, raw) else tail
             pending.extend(
-                (reference, [normalized, *next_tail]) for reference in sorted(state.references)
+                (reference, [normalized, *next_tail])
+                for reference in sorted(_fate_shape_reference_names(state, expanded))
             )
     return frozen, entries
 
@@ -1807,7 +1873,7 @@ def _fate_shape_value(
 
 
 def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
-    """Preserve raw flavors, frozen names and body provenance with prior top-level expansions."""
+    """Tag entries and deferred references by body while preserving flavors and frozen names."""
     states: dict[str, _FateShapeState] = {}
     contexts = _fate_shape_contexts(lines)
     for destination, operator, value, replaces, outside, depth, line in _fate_shape_assignments(
@@ -1820,7 +1886,7 @@ def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
         )
         if replaces:
             state.references, state.frozen, state.entries = set(), set(), []
-        state.references.update(references)
+        state.references.update((name, body) for name in references)
         state.frozen.update(frozen)
         state.entries = list(
             {entry.line.first: entry for entry in [*entries, *state.entries]}.values()
@@ -1837,11 +1903,15 @@ def _fate_shape_evaluate(lines: list[FateLine]) -> dict[str, _FateShapeState]:
 
 
 def _fate_shape_graph(sources: list[str]) -> dict[str, set[str]]:
-    """Union normalized deferred and frozen cross-fragment edges from the shared evaluator."""
+    """Union deferred and frozen edges with define expansions from every fragment."""
     graph: dict[str, set[str]] = {}
-    for source in sources:
-        for destination, state in _fate_shape_evaluate(_fate_lines(source)).items():
-            edges = state.frozen | {(name, destination) for name in state.references}
+    fragments = [_fate_lines(source) for source in sources]
+    expanded = frozenset().union(*(_fate_shape_expanded(lines) for lines in fragments))
+    for lines in fragments:
+        for destination, state in _fate_shape_evaluate(lines).items():
+            edges = state.frozen | {
+                (name, destination) for name in _fate_shape_reference_names(state, expanded)
+            }
             for name, captured_destination in edges:
                 graph.setdefault(_fate_shape_normalize(name), set()).add(
                     _fate_shape_normalize(captured_destination)
@@ -1874,18 +1944,17 @@ def _fate_shape_live_registrations(lines: list[FateLine]) -> list[_FateShapeEntr
 
 def _fate_shape_registrations(
     lines: list[FateLine],
-    commands: list[tuple[str, str, FateLine]],
+    commands: dict[str, list[str]],
     added: set[int],
     graph: dict[str, set[str]],
     ffmpeg: set[str],
 ) -> list[FateShapeFinding]:
-    """Report each added library registration once, joining captured and deferred paths."""
+    """Join added registration paths with literal target CMD variants from any fragment."""
     libraries = [
         (target, library)
-        for targets, command, _ in commands
+        for target, variants in commands.items()
+        for command in variants
         if (library := _fate_shape_library(command))
-        for target in targets.split()
-        if target.startswith("fate-")
     ]
     findings = {}
     for entry in _fate_shape_live_registrations(lines):
@@ -1950,9 +2019,10 @@ def _fate_shape_file(
     source: str,
     added: set[int],
     graph: dict[str, set[str]],
-    ffmpeg: set[str],
+    context: FateShapeContext | set[str],
 ) -> list[FateShapeFinding]:
-    """Check shared logical lines and report only added physical provenance."""
+    """Check added lines, preferring local CMD values over revision registration commands."""
+    context = context if isinstance(context, FateShapeContext) else FateShapeContext(context)
     lines = _fate_lines(source, shell_grammar=path == "tests/fate-run.sh")
     if path == "tests/fate-run.sh":
         return [
@@ -1962,7 +2032,8 @@ def _fate_shape_file(
             for message in _fate_shape_pipes(line.text, True)
         ]
     commands = _fate_shape_commands(lines)
-    findings = _fate_shape_registrations(lines, commands, added, graph, ffmpeg)
+    values = context.commands | _fate_shape_command_values(commands)
+    findings = _fate_shape_registrations(lines, values, added, graph, context.ffmpeg)
     for target, command, line in commands:
         number = _fate_shape_added(line, added)
         if number is not None:
@@ -1994,8 +2065,8 @@ def _fate_shape_report(
 
 def _fate_shape_revision(
     tree: Path, head: str, catalogs: dict[str, str | Exception] | None = None
-) -> tuple[dict[str, set[str]], set[str]]:
-    """Read newline-delimited FATE records with fixed column and regexp output modes."""
+) -> tuple[dict[str, set[str]], FateShapeContext]:
+    """Read revision fragments once for graph edges and literal-target CMD values."""
     makefile = _fate_makefile(tree, head, catalogs)
     ffmpeg = _fate_shape_ffmpeg(makefile)
     listing = _git(
@@ -2027,7 +2098,14 @@ def _fate_shape_revision(
         if not separator:
             raise ValueError("FATE aggregation: malformed git grep record")
         files.setdefault(name, []).append(text)
-    return _fate_shape_graph([makefile, *("\n".join(lines) for lines in files.values())]), ffmpeg
+    sources, commands = [makefile], {}
+    for lines in files.values():
+        source = "\n".join(lines)
+        sources.append(source)
+        values = _fate_shape_command_values(_fate_shape_commands(_fate_lines(source)))
+        for target, variants in values.items():
+            commands.setdefault(target, []).extend(variants)
+    return _fate_shape_graph(sources), FateShapeContext(ffmpeg, commands)
 
 
 def _fate_shape(
@@ -2037,7 +2115,7 @@ def _fate_shape(
     waiver: str,
     catalogs: dict[str, str | Exception] | None = None,
 ) -> Step:
-    """Check added FATE and helper lines from zero-context range diffs."""
+    """Check added FATE and helper lines with registration commands from the revision."""
     findings = []
     try:
         names = _changed_paths(
@@ -2047,13 +2125,13 @@ def _fate_shape(
             return Step(
                 "fate-shape", 0, "no added or modified FATE file or fate-run.sh in the range"
             )
-        graph, ffmpeg = _fate_shape_revision(tree, head, catalogs)
+        graph, context = _fate_shape_revision(tree, head, catalogs)
         for name in names:
             patch = _git(tree, *DIFF_COMMON, "-U0", base, head, "--", name)
             source = _git(tree, "show", f"{head}:{name}")
             findings.extend(
                 (name, item)
-                for item in _fate_shape_file(name, source, _added_lines(patch), graph, ffmpeg)
+                for item in _fate_shape_file(name, source, _added_lines(patch), graph, context)
             )
     except (OSError, RuntimeError, ValueError) as error:
         return Step("fate-shape", 2, str(error))
