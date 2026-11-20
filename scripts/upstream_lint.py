@@ -1766,7 +1766,7 @@ TEXI_CHAPTER = re.compile(
     r"@(?:chapter|unnumbered|appendix|top|part|majorheading|chapheading|centerchap)\b"
 )
 TEXI_ITEM = re.compile(r"@itemx?\b")
-TEXI_ANCHOR_METADATA = re.compile(r"@(?:anchor\{|[cfkptv]index(?:\s|$))")
+TEXI_ANCHOR_METADATA = re.compile(r"@(?:anchor\{|(?:[cfkptv]|op)index(?:\s|$))")
 TEXI_ITEM_END = re.compile(r"@(?:itemx?|end|section|subsection|chapter|anchor)\b")
 TEXI_ITEM_BLOCKS = (
     "example",
@@ -2023,7 +2023,9 @@ def _anchor_next_line(lines: list[str], start: int) -> int | None:
 
 
 def _anchor_item(lines: list[str], start: int, item: int | None = None) -> list[str]:
-    """Read the owning item or the item after anchor metadata, skipping leading aliases."""
+    """Read the indexed item, preserving anchor-before-item bounds and skipping aliases."""
+    if item is not None and item > start:
+        item = None
     next_line = _anchor_next_line(lines, start) if item is None else item
     if next_line is None:
         return []
@@ -2098,16 +2100,16 @@ def _reference_lines(lines: list[str]) -> tuple[list[str], set[int]]:
     return visible, comments
 
 
-def _anchor_has_item(lines: list[str], index: int, frame: int, items: dict[int, int]) -> bool:
-    """Require an item in this non-conditional frame or just after anchor metadata."""
-    if frame in items:
-        return True
+def _anchor_owner(lines: list[str], index: int, frame: int, items: dict[int, int]) -> int | None:
+    """Prefer an item after anchor metadata, otherwise use the open non-conditional frame."""
     next_line = _anchor_next_line(lines, index)
-    return next_line is not None and bool(TEXI_ITEM.match(lines[next_line]))
+    if next_line is not None and TEXI_ITEM.match(lines[next_line]):
+        return next_line
+    return items.get(frame)
 
 
 def _table_anchors(lines: list[str]) -> dict[str, tuple[int, int | None]]:
-    """Index table anchors and owning item lines with conditionals transparent to frames."""
+    """Index anchors to following items first, otherwise their open non-conditional frame."""
     blocks = _texi_blocks(lines)
     stack: list[str] = []
     items: dict[int, int] = {}
@@ -2118,10 +2120,10 @@ def _table_anchors(lines: list[str]) -> dict[str, tuple[int, int | None]]:
         if containers and containers[-1] in ("table", "ftable", "vtable"):
             if TEXI_ITEM.match(line):
                 items[frame] = index
-            elif (match := TEXI_ANCHOR.match(line)) and _anchor_has_item(
-                lines, index, frame, items
-            ):
-                anchors.setdefault(match[1].strip(), (index, items.get(frame)))
+            elif (match := TEXI_ANCHOR.match(line)) and (
+                item := _anchor_owner(lines, index, frame, items)
+            ) is not None:
+                anchors.setdefault(match[1].strip(), (index, item))
         _texi_prose_line(line, blocks, stack)
         depth = sum(not name.startswith("if") for name in stack)
         items = {frame: item for frame, item in items.items() if frame <= depth}

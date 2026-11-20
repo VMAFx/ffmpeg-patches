@@ -1824,6 +1824,119 @@ class DocReferenceTest(unittest.TestCase):
             "doc/encoders.texi", lines, added or {11}, REFERENCE_LIBRARIES
         )
 
+    def test_cr_anchor_before_peer_item(self) -> None:
+        """An anchor after peer prose labels the following item that names libaom."""
+        text = REFERENCE_TEXT.replace(
+            "@table @option\n", "@table @option\n@item cpu-used\nSet the speed preset.\n", 1
+        )
+        self.assertEqual(
+            self.findings(text, {13}),
+            [
+                (
+                    "doc/encoders.texi:13: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_before_peer_item_alias(self) -> None:
+        """A following item's leading alias preserves anchor-before-item ownership."""
+        text = REFERENCE_TEXT.replace(
+            "@table @option\n", "@table @option\n@item cpu-used\nSet the speed preset.\n", 1
+        ).replace("@item qpfile @var{filename}\n", "@item qpfile @var{filename}\n@itemx qpf\n", 1)
+        self.assertEqual(
+            self.findings(text, {14}),
+            [
+                (
+                    "doc/encoders.texi:14: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_before_peer_item_index(self) -> None:
+        """An index entry between anchor and following item does not select its peer."""
+        text = REFERENCE_TEXT.replace(
+            "@table @option\n", "@table @option\n@item cpu-used\nSet the speed preset.\n", 1
+        ).replace("@anchor{libaom-av1-qpfile}\n", "@anchor{libaom-av1-qpfile}\n@opindex qpfile\n")
+        self.assertEqual(
+            self.findings(text, {14}),
+            [
+                (
+                    "doc/encoders.texi:14: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_before_peer_item_blank(self) -> None:
+        """A blank line between anchor and following item does not select its peer."""
+        text = REFERENCE_TEXT.replace(
+            "@table @option\n", "@table @option\n@item cpu-used\nSet the speed preset.\n", 1
+        ).replace("@anchor{libaom-av1-qpfile}\n", "@anchor{libaom-av1-qpfile}\n\n")
+        self.assertEqual(
+            self.findings(text, {14}),
+            [
+                (
+                    "doc/encoders.texi:14: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_before_peer_item_without_library(self) -> None:
+        """Library prose in a preceding peer cannot contaminate the following item."""
+        text = REFERENCE_TEXT.replace(
+            "@table @option\n", "@table @option\n@item cpu-used\nlibaom speed preset.\n", 1
+        ).replace(
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "Read per-frame offsets.",
+        )
+        self.assertEqual(self.findings(text, {13}), [])
+
+    def test_cr_anchor_with_prose_before_next_item(self) -> None:
+        """Boundary control: intervening prose keeps the library-bearing owning item."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "libaom reads a missing offset as 0.\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "Read per-frame offsets.\n"
+            "@item cpu-used\n"
+            "Set the speed preset.",
+        )
+        self.assertEqual(
+            self.findings(text, {14}),
+            [
+                (
+                    "doc/encoders.texi:14: the libsvtav1 text defers to "
+                    "@ref{libaom-av1-qpfile}, "
+                    "whose item in the libaom-av1 section names libaom"
+                )
+            ],
+        )
+
+    def test_cr_anchor_with_prose_excludes_next_item_library(self) -> None:
+        """Boundary control: intervening prose prevents taking a following item's library."""
+        text = REFERENCE_TEXT.replace(
+            "@anchor{libaom-av1-qpfile}\n"
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets; libaom reads a missing offset as 0.",
+            "@item qpfile @var{filename}\n"
+            "Read per-frame offsets.\n"
+            "@anchor{libaom-av1-qpfile}\n"
+            "A missing offset is zero.\n"
+            "@item cpu-used\n"
+            "libaom speed preset.",
+        )
+        self.assertEqual(self.findings(text, {14}), [])
+
     def test_cr_item_text_before_anchor(self) -> None:
         """Library text preceding an owned anchor remains in its item."""
         text = REFERENCE_TEXT.replace(
