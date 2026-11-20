@@ -2467,8 +2467,10 @@ def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
     header = tree / "libavutil/attributes.h"
     if not _c_rules_inside(header, tree):
         return set(), [
-            "error: libavutil/attributes.h: resolves outside the checked tree; "
-            "attribute blanking skipped"
+            (
+                "error: libavutil/attributes.h: resolves outside the checked tree; "
+                "attribute blanking skipped"
+            )
         ]
     try:
         source = _c_rules_read_source(header)
