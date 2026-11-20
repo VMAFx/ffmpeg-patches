@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts import upstream_lint
+from scripts import unit_test_budget, upstream_lint
 
 ROOT = Path(__file__).resolve().parent.parent
 # Semgrep prints a rule configuration warning on stderr and still exits 0.
@@ -1787,3 +1787,12 @@ static int earlier_derived_check(uint8_t *dst)
         matches, partial_paths = parsed or ([], [])
         self.assertEqual(len(matches), 1)
         self.assertEqual(len(partial_paths), len(data["errors"]))
+
+
+def load_tests(
+    loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None
+) -> unittest.TestSuite:
+    """Schedule independent methods separately without changing test IDs or bodies."""
+    # No module/class fixtures: each method owns its scratch tree.
+    # Singleton suites let --level class preserve class fixtures in other modules.
+    return unit_test_budget.individual_test_suites(tests)
