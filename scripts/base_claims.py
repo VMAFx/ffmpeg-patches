@@ -32,7 +32,7 @@ DEPENDENCY_REFERENCE = re.compile(
 DEPENDENCY_HEAD = re.compile(
     r"\b(?:head|ending\s+at|ends\s+at|tip)\b[\s:(]*([0-9a-f]{7,40})\b", re.IGNORECASE
 )
-SENTENCE_BREAK = re.compile(r"\.\s|;")
+SENTENCE_BREAK = re.compile(r"[.!?]\s|;")
 CLAUSE_BREAK = re.compile(r"[;,|()]|\.\s")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 HISTORY_WORDS = re.compile(r"\b(previous|prior|earlier|former|old)\b", re.IGNORECASE)
@@ -89,18 +89,42 @@ def find_base_claims(text: str) -> list[str]:
     return [claim for line in _claim_lines(text) for claim in _line_claims(line)]
 
 
+def _dependency_clause_start(sentence: str, start: int, end: int, fallback: int = 0) -> int:
+    """Return the last clause boundary in a range or the supplied fallback."""
+    clause_start = fallback
+    for sep in CLAUSE_BREAK.finditer(sentence, start, end):
+        clause_start = sep.end()
+    return clause_start
+
+
+def _dependency_head_is_historical(
+    sentence: str, reference: re.Match[str], head: re.Match[str], reference_clause_start: int
+) -> bool:
+    """Check history in the reference clause and the head's own clause before its hex."""
+    boundary = next(CLAUSE_BREAK.finditer(sentence, reference.end(), head.start(1)), None)
+    reference_clause_end = boundary.start() if boundary is not None else head.start(1)
+    head_clause_start = _dependency_clause_start(
+        sentence, reference.end(), head.start(), reference_clause_start
+    )
+    clauses = (
+        sentence[reference_clause_start:reference_clause_end],
+        sentence[head_clause_start : head.start(1)],
+    )
+    return any(
+        HISTORY_WORDS.search(clause) or re.search(r"\bpreviously\b", clause, re.IGNORECASE)
+        for clause in clauses
+    )
+
+
 def _sentence_dependencies(sentence: str) -> list[tuple[int, str]]:
-    """Extract dependency heads while excluding historical clauses before each hex."""
+    """Extract heads with history judged in the reference clause and each head's own clause."""
     claims: list[tuple[int, str]] = []
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
     for index, reference in enumerate(references):
         end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
-        clause_start = 0
-        for sep in CLAUSE_BREAK.finditer(sentence, 0, reference.start()):
-            clause_start = sep.end()
+        reference_clause_start = _dependency_clause_start(sentence, 0, reference.start())
         for head in DEPENDENCY_HEAD.finditer(sentence, reference.end(), end):
-            clause = sentence[clause_start : head.start(1)]
-            if HISTORY_WORDS.search(clause) or re.search(r"\bpreviously\b", clause, re.IGNORECASE):
+            if _dependency_head_is_historical(sentence, reference, head, reference_clause_start):
                 continue
             number = int(reference.group(1))
             if number > 0:

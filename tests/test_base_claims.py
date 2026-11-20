@@ -241,6 +241,82 @@ class BaseClaimsTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(base_claims.find_dependency_claims(text), expected)
 
+    def test_dependency_exclamation_sentence_break(self) -> None:
+        """An exclamation sentence break prevents associating a later unrelated head."""
+        self.assertEqual(
+            base_claims.find_dependency_claims("Depends on #12! This PR has head bbbbbbb."), []
+        )
+
+    def test_dependency_question_sentence_break(self) -> None:
+        """A question sentence break prevents associating a later unrelated head."""
+        self.assertEqual(
+            base_claims.find_dependency_claims("Depends on #12? This PR has head bbbbbbb."), []
+        )
+
+    def test_dependency_head_before_exclamation_break(self) -> None:
+        """A head inside the dependency sentence survives a later exclamation break."""
+        self.assertEqual(
+            base_claims.find_dependency_claims("Depends on #12 (head abcdef1)! Next sentence."),
+            [(12, "abcdef1")],
+        )
+
+    def test_dependency_current_head_after_previous_clause(self) -> None:
+        """A previous head clause does not suppress a current head after a comma."""
+        self.assertEqual(
+            base_claims.find_dependency_claims(
+                "Depends on #12 (previous head aaaaaaa, now head bbbbbbb)"
+            ),
+            [(12, "bbbbbbb")],
+        )
+
+    def test_dependency_current_head_after_old_parenthesis(self) -> None:
+        """An old parenthesized head does not suppress a later current head."""
+        self.assertEqual(
+            base_claims.find_dependency_claims("Depends on #12 (old head aaaaaaa) at head bbbbbbb"),
+            [(12, "bbbbbbb")],
+        )
+
+    def test_dependency_historical_reference(self) -> None:
+        """A historical reference suppresses a head in the same clause."""
+        self.assertEqual(
+            base_claims.find_dependency_claims("previously stacked on #12 at head abcdef1"), []
+        )
+
+    def test_dependency_history_after_reference_before_parenthesis(self) -> None:
+        """History after the reference suppresses a head in a later parenthesized clause."""
+        self.assertEqual(
+            base_claims.find_dependency_claims(
+                "Depends on #12 from an earlier series (head abcdef1)"
+            ),
+            [],
+        )
+
+    def test_dependency_current_head_after_previously_clause(self) -> None:
+        """Previously in an intermediate head clause does not suppress the current head."""
+        self.assertEqual(
+            base_claims.find_dependency_claims(
+                "Depends on #12, previously at head aaaaaaa, now head bbbbbbb"
+            ),
+            [(12, "bbbbbbb")],
+        )
+
+    def test_dependency_cli_current_head_after_history(self) -> None:
+        """The CLI checks the current head after history against the live dependency head."""
+        body = self.write_fixture(
+            "body.md", "Depends on #12 (previous head aaaaaaa, now head bbbbbbb)."
+        )
+        for live_head, expected_rc in (("a" * 40, 1), ("b" * 40, 0)):
+            with self.subTest(live_head=live_head):
+                dependency = self.dependency_json({"head": {"sha": live_head}})
+                rc, err = self.run_cli(
+                    "--merge-base", MERGE_BASE, "--dependency-json", f"12={dependency}", str(body)
+                )
+                self.assertEqual(rc, expected_rc)
+                if expected_rc:
+                    self.assertIn("names head bbbbbbb of #12", err)
+                else:
+                    self.assertEqual(err, "")
+
     def test_dependency_reference_and_head_forms(self) -> None:
         """All dependency verbs, reference forms and head markers are recognized."""
         for verb in ("depends on", "stacked on", "on top of", "builds on", "based on"):
