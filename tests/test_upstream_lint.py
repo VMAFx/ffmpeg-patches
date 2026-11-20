@@ -3521,6 +3521,15 @@ class PreCommitResolutionTest(unittest.TestCase):
 class CRulesScratchTest(FixtureTest):
     """Exercise scratch preparation and real scanner results on synthetic sources."""
 
+    def setUp(self) -> None:
+        """Isolate scanner temporary files in a cleanup-managed directory per test."""
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = unittest.mock.patch.dict(os.environ, {"TMPDIR": directory.name})
+        self.addCleanup(environment.stop)
+        environment.start()
+
     def scan_source(self, source: str) -> upstream_lint.Step:
         """Commit one synthetic source and run only the real c-rules step."""
         self.write("libavfilter/vf_x.c", source)
