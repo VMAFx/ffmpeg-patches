@@ -1154,6 +1154,36 @@ class FateShapeTest(unittest.TestCase):
         self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
         self.assertIn("FATE_LIBAVUTIL: FATE_LIBAVUTIL -> FATE_FFMPEG:", findings[0].message)
 
+    def test_immediate_conditional_self_read_preserves_chain(self) -> None:
+        """Normalized self reads retain one hop across conditional alias spellings."""
+        with self.subTest(destination="MID-yes"):
+            source = (
+                "MID-$(CONFIG_Y) += fate-x\n"
+                "MID-yes := $(MID-$(CONFIG_Y))\n"
+                "FATE_FFMPEG := $(MID-yes)\n"
+                "MID-$(CONFIG_Y) =\n"
+                "fate-x: CMD = run libavutil/tests/x\n"
+            )
+            findings = self.findings(source)
+            self.assertEqual([(f.rule, f.line) for f in findings], [("registration", 1)])
+            self.assertIn("MID-yes -> FATE_FFMPEG", findings[0].message)
+            self.assertNotIn("MID-yes -> MID-yes", findings[0].message)
+            states = upstream_lint._fate_shape_evaluate(upstream_lint._fate_lines(source))
+            self.assertEqual(states["MID-yes"].entries[0].chain, ["MID-yes"])
+            self.assertEqual(states["FATE_FFMPEG"].entries[0].chain, ["MID-yes", "FATE_FFMPEG"])
+        with self.subTest(destination="FATE_FFMPEG-yes"):
+            source = (
+                "FATE_FFMPEG-$(CONFIG_Y) += fate-x\n"
+                "FATE_FFMPEG-yes := $(FATE_FFMPEG-$(CONFIG_Y)) fate-new\n"
+                "fate-x: CMD = run libavutil/tests/x\n"
+            )
+            states = upstream_lint._fate_shape_evaluate(upstream_lint._fate_lines(source))
+            self.assertEqual(len(states["FATE_FFMPEG-yes"].entries), 1)
+            for entry in states["FATE_FFMPEG-yes"].entries:
+                pairs = zip(entry.chain, entry.chain[1:], strict=False)
+                self.assertFalse(any(a == b for a, b in pairs))
+                self.assertEqual(entry.chain, ["FATE_FFMPEG-yes"])
+
     def test_plain_immediate_self_read_replaces_deferred_references(self) -> None:
         """Plain immediate self reads retain prior entries without later source appends."""
         for target, expected in (("new", []), ("old", [("registration", 1)])):

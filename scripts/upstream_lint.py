@@ -1713,6 +1713,11 @@ def _fate_shape_matching_states(
     ]
 
 
+def _fate_shape_is_self_read(destination: str, name: str) -> bool:
+    """Recognize self reads across raw conditional spellings of a normalized name."""
+    return _fate_shape_normalize(name) == _fate_shape_normalize(destination)
+
+
 def _fate_shape_snapshot_entries(
     destination: str,
     name: str,
@@ -1720,9 +1725,9 @@ def _fate_shape_snapshot_entries(
     tail: list[str],
     expanded: frozenset[str],
 ) -> list[_FateShapeEntry]:
-    """Copy top-level or expanded-body entries, preserving the raw self-read identity."""
+    """Copy eligible entries, preserving self-read identity across conditional spellings."""
     entries = [entry for entry in state.entries if not entry.body or entry.body in expanded]
-    if name == destination:
+    if _fate_shape_is_self_read(destination, name):
         return entries
     return [
         _FateShapeEntry(
@@ -1745,7 +1750,7 @@ def _fate_shape_snapshot(
     states: dict[str, _FateShapeState],
     expanded: frozenset[str],
 ) -> tuple[set[tuple[str, str]], list[_FateShapeEntry]]:
-    """Capture eligible possible values and freeze missing names against later same-file reads."""
+    """Capture eligible values with normalized self hops and freeze missing same-file names."""
     pending = [
         (name, [_fate_shape_normalize(destination)]) for name in _fate_shape_references(value)
     ]
@@ -1766,7 +1771,7 @@ def _fate_shape_snapshot(
         for raw, state in matching:
             frozen.update(_fate_shape_snapshot_frozen(destination, raw, state))
             entries.extend(_fate_shape_snapshot_entries(destination, raw, state, tail, expanded))
-            next_tail = [] if raw == destination else tail
+            next_tail = [] if _fate_shape_is_self_read(destination, raw) else tail
             pending.extend(
                 (reference, [normalized, *next_tail]) for reference in sorted(state.references)
             )
