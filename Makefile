@@ -3,7 +3,7 @@
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 .PHONY: all dev-deps verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply filter-deps lengths lengths-local upstream-lint dist doctor
-.PHONY: fairy-requests
+.PHONY: fairy-requests test-budgeted
 
 DOCSTRING_BASE ?= origin/main
 SEMGREP ?= semgrep
@@ -54,14 +54,22 @@ semgrep:
 build:
 	@sh .config/lefthook/python.sh scripts/series.py check
 
-# Unit tests run in UNIT_JOBS worker processes, one test module per task, so the series.yml check job stays under its
-# 10-minute limit on 4-vCPU GitHub-hosted runners; set UNIT_JOBS on the make command line to change it.
+# Unit tests run class tasks in UNIT_JOBS worker processes; the independent forgejo
+# methods use singleton tasks so its large classes cannot serialize the run.
+# series.yml jobs.check.timeout-minutes supplies the limit; the wrapper applies
+# UNIT_BUDGET_SHARE to job elapsed (including prerequisites) and unit wall time.
+# CI supplies its first-step timestamp; local test starts the clock before prerequisites.
+# The runner hook reports the slowest scheduled suites and their summed-time shares.
+# Set UNIT_JOBS on the make command line to change the worker count.
 UNIT_JOBS ?= 4
 
 # The temporary leak guard fails a run that leaves files in its temporary directory.
 # Unit tests ignore the host git configuration, as on CI, so a test that needs a git identity fails locally too.
-test: dev-deps build lint
-	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh .config/lefthook/python.sh scripts/tmp_leak_guard.py -- sh .config/lefthook/python.sh -m unittest_parallel -j $(UNIT_JOBS) --level module -s tests
+test:
+	@SERIES_JOB_STARTED_AT="$${SERIES_JOB_STARTED_AT-$$(date +%s)}" $(MAKE) test-budgeted
+
+test-budgeted: dev-deps build lint
+	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh .config/lefthook/python.sh scripts/unit_test_budget.py -- sh .config/lefthook/python.sh -m unittest_parallel -j $(UNIT_JOBS) --level class -s tests --runner scripts.unit_test_budget.TimedSuiteRunner
 
 lint: lint-mutable-defaults
 	@sh .config/lefthook/python.sh -m ruff check scripts tests

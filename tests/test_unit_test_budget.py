@@ -1,0 +1,800 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+"""Exercise scheduling and wall-time guards without running repository test fixtures."""
+
+from __future__ import annotations
+
+import ast
+import contextlib
+import io
+import os
+import select
+import signal
+import socket
+import subprocess  # nosec B404 - synthetic tests only, bounded local runner.
+import sys
+import tempfile
+import unittest
+import unittest.mock
+from pathlib import Path
+
+import unittest_parallel.main
+import yaml
+
+from scripts import unit_test_budget
+
+SINGLETON_POOL_SOURCE = (
+    "import unittest\n"
+    "from scripts import unit_test_budget\n"
+    "class IndependentCase(unittest.TestCase):\n"
+    "    def test_one(self):\n"
+    '        """Pass the first independent case."""\n'
+    "        self.assertTrue(True)\n"
+    "    def test_two(self):\n"
+    '        """Pass the second independent case."""\n'
+    "        self.assertTrue(True)\n"
+    "def load_tests(loader, tests, pattern):\n"
+    '    """Expose each synthetic case as a task."""\n'
+    "    return unit_test_budget.individual_test_suites(tests)\n"
+)
+POOL_WRAPPER_CODE = (
+    "import sys, unittest.mock\n"
+    "from scripts import unit_test_budget\n"
+    "with unittest.mock.patch.object(\n"
+    "    unit_test_budget, 'job_timeout_seconds', return_value=float(sys.argv[1])\n"
+    "):\n"
+    "    sys.exit(unit_test_budget.main(sys.argv[2:]))\n"
+)
+SUMMARY_POOL_SOURCE = (
+    "import unittest\n"
+    "from scripts import unit_test_budget\n"
+    "class SummaryCase(unittest.TestCase):\n"
+    "    def test_one(self):\n"
+    '        """Pass the first summary case."""\n'
+    "        self.assertTrue(True)\n"
+    "    def test_two(self):\n"
+    '        """Pass the second summary case."""\n'
+    "        self.assertTrue(True)\n"
+    "    @unittest.skip('planted skip')\n"
+    "    def test_three(self):\n"
+    '        """Skip the third summary case."""\n'
+    "        self.fail('skipped body must not run')\n"
+    "def load_tests(loader, tests, pattern):\n"
+    '    """Schedule each summary case independently."""\n'
+    "    return unit_test_budget.individual_test_suites(tests)\n"
+)
+
+
+class UnitTestBudgetTest(unittest.TestCase):
+    """Keep overruns visible and preserve failures, cleanup and test identifiers."""
+
+    def setUp(self) -> None:
+        """Give existing unit-only fixtures a valid job start without host dependencies."""
+        patcher = unittest.mock.patch.dict(
+            os.environ, {"SERIES_JOB_STARTED_AT": str(unit_test_budget.time.time())}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_timed(self, elapsed: float, rc: int = 0, *, timed_out: bool = False) -> tuple[int, str]:
+        """Simulate elapsed wall time while capturing the actual budget diagnostic."""
+        output = io.StringIO()
+        outcome = unit_test_budget.tmp_leak_guard.GuardOutcome(timed_out=timed_out)
+        with (
+            unittest.mock.patch.object(
+                unit_test_budget.tmp_leak_guard, "GuardOutcome", return_value=outcome
+            ),
+            unittest.mock.patch.object(
+                unit_test_budget.time, "perf_counter", side_effect=[0, elapsed]
+            ),
+            unittest.mock.patch.object(
+                unit_test_budget.tmp_leak_guard, "run_guard", return_value=rc
+            ),
+            contextlib.redirect_stderr(output),
+        ):
+            result = unit_test_budget.run_unit_tests("runner", ["arg"], 600)
+        return result, output.getvalue()
+
+    def test_within_budget_reports_elapsed_wall_time(self) -> None:
+        """A successful run below the budget reports its elapsed time and share."""
+        rc, output = self.run_timed(359.5)
+        self.assertEqual(rc, 0)
+        self.assertIn("wall time 359.500 s", output)
+        self.assertIn("budget 360 s (60%", output)
+        self.assertNotIn("FAIL", output)
+
+    def test_exact_budget_boundary_passes(self) -> None:
+        """A completed run at exactly the wall-time budget remains successful."""
+        self.assertEqual(self.run_timed(360)[0], 0)
+
+    def test_planted_overrun_fails_after_successful_command(self) -> None:
+        """A planted overrun including cleanup cannot return a successful status."""
+        rc, output = self.run_timed(360.001)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL wall-time budget exceeded", output)
+        self.assertIn("before the check job is cancelled", output)
+
+    def test_guard_deadline_is_workflow_share(self) -> None:
+        """The whole command receives the budget as its leak-guard deadline."""
+        with (
+            unittest.mock.patch.object(unit_test_budget.time, "perf_counter", side_effect=[0, 1]),
+            unittest.mock.patch.object(
+                unit_test_budget.tmp_leak_guard, "run_guard", return_value=0
+            ) as guard,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(unit_test_budget.run_unit_tests("runner", ["arg"], 500), 0)
+        guard.assert_called_once_with(
+            "runner", ["arg"], 300, outcome=unit_test_budget.tmp_leak_guard.GuardOutcome()
+        )
+
+    def test_deadline_failure_names_budget(self) -> None:
+        """A killed runner preserves its timeout status and reports the budget failure."""
+        rc, output = self.run_timed(360, 124, timed_out=True)
+        self.assertEqual(rc, 124)
+        self.assertIn("FAIL wall-time budget exceeded", output)
+
+    def test_nonzero_status_is_preserved(self) -> None:
+        """Reserved-looking child statuses remain statuses rather than inferred causes."""
+        statuses = (1, 2, 7, 124, 127)
+        for index in range(len(statuses)):
+            rc = statuses[index]
+            with self.subTest(status=rc):
+                result, output = self.run_timed(1, rc)
+                self.assertEqual(result, rc)
+                self.assertIn("\n\nFAILED\n", output)
+                self.assertNotIn("\nOK", output)
+                self.assertNotIn("FAIL wall-time budget exceeded", output)
+                result, output = self.run_timed(361, rc)
+                self.assertEqual(result, rc)
+                self.assertIn("FAIL wall-time budget exceeded", output)
+
+    def test_fast_child_status_124_is_not_a_deadline(self) -> None:
+        """A fast child exit 124 keeps its status without a false overrun diagnostic."""
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            rc = unit_test_budget.run_unit_tests(
+                sys.executable, ["-B", "-c", "import sys; sys.exit(124)"], 600
+            )
+        self.assertEqual(rc, 124)
+        self.assertIn("unit tests: wall time", output.getvalue())
+        self.assertNotIn("FAIL wall-time budget exceeded", output.getvalue())
+        self.assertNotIn("exceeded the", output.getvalue())
+
+    def assert_workflow_refused(self, workflow: Path) -> None:
+        """Refuse a bad workflow with one contextual line before starting the test run."""
+        reader = unit_test_budget.job_timeout_seconds
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                unit_test_budget, "job_timeout_seconds", side_effect=lambda: reader(workflow)
+            ),
+            unittest.mock.patch.object(unit_test_budget, "run_unit_tests") as run,
+            contextlib.redirect_stderr(output),
+        ):
+            self.assertEqual(unit_test_budget.main(["runner"]), 1)
+        run.assert_not_called()
+        self.assertIn(str(workflow), output.getvalue())
+        self.assertIn("jobs.check.timeout-minutes", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+
+    def test_unreadable_workflow_is_refused(self) -> None:
+        """An unreadable workflow names its file and key path without starting tests."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "unreadable.yml"
+            with unittest.mock.patch.object(
+                Path, "read_text", side_effect=PermissionError("permission denied")
+            ):
+                self.assert_workflow_refused(workflow)
+
+    def test_missing_workflow_job_is_refused(self) -> None:
+        """A missing check job names its file and key path without starting tests."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "missing-job.yml"
+            workflow.write_text("jobs:\n  other: {}\n", encoding="utf-8")
+            self.assert_workflow_refused(workflow)
+
+    def test_missing_workflow_timeout_is_refused(self) -> None:
+        """A missing timeout key names its file and key path without starting tests."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "missing-timeout.yml"
+            workflow.write_text("jobs:\n  check: {}\n", encoding="utf-8")
+            self.assert_workflow_refused(workflow)
+
+    def test_positive_integer_yaml_anchor_is_accepted(self) -> None:
+        """A resolved positive integer YAML anchor supplies the workflow timeout."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "anchored.yml"
+            workflow.write_text(
+                "limit: &limit 7\njobs:\n  check:\n    timeout-minutes: *limit\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(unit_test_budget.job_timeout_seconds(workflow), 420)
+
+    def test_workflow_is_single_timeout_source(self) -> None:
+        """The reader follows the live check job rather than a second timeout constant."""
+        document = yaml.safe_load(unit_test_budget.WORKFLOW.read_text(encoding="utf-8"))
+        seconds = document["jobs"]["check"]["timeout-minutes"] * 60
+        self.assertEqual(unit_test_budget.job_timeout_seconds(), seconds)
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "series.yml"
+            workflow.write_text("jobs:\n  check:\n    timeout-minutes: 7\n", encoding="utf-8")
+            self.assertEqual(unit_test_budget.job_timeout_seconds(workflow), 420)
+
+    def test_one_minute_workflow_timeout_is_accepted(self) -> None:
+        """The smallest positive integer timeout supplies sixty seconds."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "series.yml"
+            workflow.write_text("jobs:\n  check:\n    timeout-minutes: 1\n", encoding="utf-8")
+            self.assertEqual(unit_test_budget.job_timeout_seconds(workflow), 60)
+
+    def test_invalid_workflow_timeout_is_rejected(self) -> None:
+        """Malformed timeout values cannot silently disable the unit deadline."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "series.yml"
+            values = (
+                "0",
+                "-1",
+                "true",
+                "false",
+                "'10'",
+                "null",
+                "1.5",
+                "[5]",
+                "{a: 1}",
+                "2026-11-19",
+                "2026-02-28",
+                "2026-02-30",
+                "2026-13-01 10:00:00",
+            )
+            for index in range(len(values)):
+                value = values[index]
+                with self.subTest(value=value):
+                    workflow.write_text(
+                        f"jobs:\n  check:\n    timeout-minutes: {value}\n", encoding="utf-8"
+                    )
+                    with self.assertRaises(ValueError) as caught:
+                        unit_test_budget.job_timeout_seconds(workflow)
+                    self.assertIn(str(workflow), str(caught.exception))
+                    self.assertIn("jobs.check.timeout-minutes", str(caught.exception))
+                    if value == "2026-02-28":
+                        self.assertEqual(
+                            str(caught.exception),
+                            f"{workflow}: jobs.check.timeout-minutes must be a positive integer",
+                        )
+
+    def test_cli_malformed_workflow_date_is_refused(self) -> None:
+        """A malformed YAML date produces one contextual error before starting tests."""
+        with tempfile.TemporaryDirectory() as scratch:
+            workflow = Path(scratch) / "malformed-date.yml"
+            workflow.write_text(
+                "jobs:\n  check:\n    timeout-minutes: 2026-02-30\n", encoding="utf-8"
+            )
+            self.assert_workflow_refused(workflow)
+
+    def test_cli_preserves_command_arguments(self) -> None:
+        """The CLI passes arguments after the separator unchanged to the guarded command."""
+        with (
+            unittest.mock.patch.object(unit_test_budget, "job_timeout_seconds", return_value=600),
+            unittest.mock.patch.object(unit_test_budget, "run_unit_tests", return_value=9) as run,
+        ):
+            self.assertEqual(unit_test_budget.main(["--", "runner", "-j", "4"]), 9)
+        run.assert_called_once_with("runner", ["-j", "4"], 600)
+
+    def test_cli_requires_a_command(self) -> None:
+        """Missing commands fail argument parsing before starting a process."""
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            unit_test_budget.main([])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_real_guard_cleans_planted_leak(self) -> None:
+        """The budget wrapper retains whole-command leak detection and directory cleanup."""
+        code = (
+            "import pathlib, tempfile; pathlib.Path(tempfile.gettempdir(), 'planted-leak').touch()"
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            output = io.StringIO()
+            with (
+                unittest.mock.patch.object(tempfile, "tempdir", scratch),
+                contextlib.redirect_stderr(output),
+            ):
+                rc = unit_test_budget.run_unit_tests(sys.executable, ["-B", "-c", code], 10)
+            self.assertEqual(list(Path(scratch).iterdir()), [])
+        self.assertEqual(rc, 1)
+        self.assertIn("planted-leak", output.getvalue())
+        self.assertIn("unit tests: wall time", output.getvalue())
+
+    def test_real_guard_timeout_cleans_and_reports(self) -> None:
+        """A real timeout reports failure even when measured elapsed time is below budget."""
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as scratch:
+            with (
+                unittest.mock.patch.object(tempfile, "tempdir", scratch),
+                unittest.mock.patch.object(
+                    unit_test_budget.time, "perf_counter", side_effect=[0, 0.1]
+                ),
+                contextlib.redirect_stderr(output),
+            ):
+                rc = unit_test_budget.run_unit_tests(
+                    sys.executable, ["-B", "-c", "import time; time.sleep(30)"], 1
+                )
+            self.assertEqual(list(Path(scratch).iterdir()), [])
+        self.assertEqual(rc, 124)
+        self.assertIn("exceeded the 0.6 s deadline", output.getvalue())
+        self.assertIn("wall time 0.100 s", output.getvalue())
+        self.assertIn("FAIL wall-time budget exceeded", output.getvalue())
+
+    def test_singletons_preserve_ids_and_class_scheduling(self) -> None:
+        """Independent cases retain every ID while each becomes a distinct class-level task."""
+        cases = [unittest.FunctionTestCase(bool), unittest.FunctionTestCase(int)]
+        original = unittest.TestSuite([unittest.TestSuite(cases)])
+        adapted = unit_test_budget.individual_test_suites(original)
+        tasks = list(unittest_parallel.main._iter_class_suites(adapted))
+        self.assertEqual(original.countTestCases(), adapted.countTestCases())
+        self.assertEqual([task.countTestCases() for task in tasks], [1, 1])
+        self.assertEqual([list(task)[0].id() for task in tasks], [case.id() for case in cases])
+
+    def test_ordinary_class_stays_one_task(self) -> None:
+        """Unadapted modules retain their full class suites and class-fixture boundaries."""
+        cases = [unittest.FunctionTestCase(bool), unittest.FunctionTestCase(int)]
+        original = unittest.TestSuite([unittest.TestSuite(cases)])
+        tasks = list(unittest_parallel.main._iter_class_suites(original))
+        self.assertEqual([task.countTestCases() for task in tasks], [2])
+
+    def test_empty_singleton_suite(self) -> None:
+        """Empty suites add no synthetic cases or tasks."""
+        suite = unit_test_budget.individual_test_suites(unittest.TestSuite())
+        self.assertEqual(suite.countTestCases(), 0)
+        self.assertEqual(list(unittest_parallel.main._iter_class_suites(suite)), [])
+
+    def test_make_target_uses_budget_and_fine_tasks(self) -> None:
+        """The actual target retains Git isolation and selects guarded class scheduling."""
+        makefile = (unit_test_budget.ROOT / "Makefile").read_text(encoding="utf-8")
+        recipe = makefile.split("test-budgeted: dev-deps build lint\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1", recipe)
+        self.assertIn("scripts/unit_test_budget.py --", recipe)
+        self.assertIn("-m unittest_parallel -j $(UNIT_JOBS) --level class -s tests", recipe)
+        self.assertNotIn("--level module", recipe)
+        self.assertIn("--runner scripts.unit_test_budget.TimedSuiteRunner", recipe)
+
+    def run_pool_fixture(
+        self,
+        source: str = SINGLETON_POOL_SOURCE,
+        timeout: float = 15.0,
+        *,
+        fixture_paths: list[Path] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a synthetic fixture under the budget wrapper with an inner deadline below timeout."""
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            fixture_dir = root / "fixture"
+            guard_dir = root / "tmp"
+            fixture_dir.mkdir()
+            guard_dir.mkdir()
+            if fixture_paths is not None:
+                fixture_paths.append(fixture_dir)
+            (fixture_dir / "test_synthetic.py").write_text(source, encoding="utf-8")
+            result = subprocess.run(  # nosec B603 - fixed runner and fixture-only tests.
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    POOL_WRAPPER_CODE,
+                    f"{timeout:g}",
+                    "--",
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "unittest_parallel",
+                    "-j",
+                    "2",
+                    "--level",
+                    "class",
+                    "-s",
+                    str(fixture_dir),
+                    "--runner",
+                    "scripts.unit_test_budget.TimedSuiteRunner",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "TMPDIR": str(guard_dir),
+                    "SERIES_JOB_STARTED_AT": str(unit_test_budget.time.time()),
+                },
+                timeout=timeout,
+                check=False,
+            )
+            self.assertEqual(list(guard_dir.iterdir()), [])
+        self.assertFalse(root.exists())
+        return result
+
+    def _pool_listener(self) -> tuple[socket.socket, int]:
+        """Bind a localhost TCP listener with a bounded timeout and registered cleanup."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(5.0)
+        self.addCleanup(listener.close)
+        return listener, int(listener.getsockname()[1])
+
+    @staticmethod
+    def _kill_worker_group(pid: int) -> None:
+        """Terminate a surviving worker process and its process group if still running."""
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                pgid = os.getpgid(pid)
+                if pgid > 1 and pgid != os.getpgrp():
+                    os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.kill(pid, signal.SIGKILL)
+
+    @staticmethod
+    def _worker_probe_source(port: int, body: str, *, second_case: bool = True) -> str:
+        """Build a synthetic adapted module whose first worker reports its PID over TCP."""
+        second = (
+            "    def test_two(self):\n"
+            '        """Pass the second independent case."""\n'
+            "        self.assertTrue(True)\n"
+            if second_case
+            else ""
+        )
+        return (
+            "import os, socket, time, unittest\n"
+            "from scripts import unit_test_budget\n"
+            "class IndependentCase(unittest.TestCase):\n"
+            "    def test_one(self):\n"
+            '        """Report the worker PID and execute the requested probe body."""\n'
+            f"        sock = socket.create_connection(('127.0.0.1', {port}), timeout=5.0)\n"
+            "        sock.sendall(f'{os.getpid()}\\n'.encode('ascii'))\n"
+            f"        {body}\n"
+            "        sock.close()\n"
+            f"{second}"
+            "def load_tests(loader, tests, pattern):\n"
+            '    """Expose each synthetic case as a task."""\n'
+            "    return unit_test_budget.individual_test_suites(tests)\n"
+        )
+
+    def _accept_worker_pid(self, listener: socket.socket) -> tuple[int, socket.socket]:
+        """Accept one worker probe connection, register process cleanup and return its PID."""
+        conn, _ = listener.accept()
+        self.addCleanup(conn.close)
+        conn.settimeout(1.0)
+        data = bytearray()
+        for _ in range(64):
+            chunk = conn.recv(64)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if b"\n" in chunk:
+                break
+        pid = int(data.decode("ascii").strip())
+        self.addCleanup(self._kill_worker_group, pid)
+        return pid, conn
+
+    def test_singletons_run_in_real_process_pool(self) -> None:
+        """A synthetic adapted module produces two tasks and runs both tests in workers."""
+        result = self.run_pool_fixture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Running 2 test suites (2 total tests) across 2 workers", result.stderr)
+        self.assertIn("unit tests: wall time", result.stderr)
+
+    def _pool_timeout_attempt(self, timeout: float) -> bool:
+        """Check timeout cleanup only when a worker connection meets the precondition."""
+        listener, port = self._pool_listener()
+        with listener:
+            source = self._worker_probe_source(port, "time.sleep(30)")
+            fixture_paths: list[Path] = []
+            exc: subprocess.TimeoutExpired | None = None
+            result: subprocess.CompletedProcess[str] | None = None
+            try:
+                result = self.run_pool_fixture(source, timeout=timeout, fixture_paths=fixture_paths)
+            except subprocess.TimeoutExpired as caught:
+                exc = caught
+            self.assertIsNone(exc)
+            if not select.select([listener], [], [], 0.5)[0]:
+                return False
+            worker_pid, conn = self._accept_worker_pid(listener)
+            self.assertEqual(len(fixture_paths), 1)
+            self.assertFalse(fixture_paths[0].exists())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(worker_pid, 0)
+            self.assertEqual(conn.recv(64), b"")
+            if result is not None:
+                self.assertEqual(result.returncode, 124, result.stderr)
+                deadline = timeout * unit_test_budget.UNIT_BUDGET_SHARE
+                self.assertIn(f"exceeded the {deadline:g} s deadline", result.stderr)
+                self.assertIn("FAIL wall-time budget exceeded", result.stderr)
+        return True
+
+    def test_singleton_pool_timeout_kills_descendants_and_cleans_fixture(self) -> None:
+        """Retry missing worker connections before asserting timeout cleanup and diagnostics."""
+        timeouts = (2.5, 5.0, 10.0)
+        for timeout in timeouts:
+            if self._pool_timeout_attempt(timeout):
+                return
+        deadlines = ", ".join(
+            f"{timeout * unit_test_budget.UNIT_BUDGET_SHARE:g} s" for timeout in timeouts
+        )
+        self.fail(
+            "Unmet precondition: worker connected before the deadline; "
+            f"deadlines tried: {deadlines}"
+        )
+
+    def test_pool_timeout_retries_only_missing_worker_connection(self) -> None:
+        """Retry missing connections with bounded deadlines and report exhausted attempts."""
+        for outcomes in ((False, True), (False, False, False)):
+            with (
+                self.subTest(outcomes=outcomes),
+                unittest.mock.patch.object(
+                    self, "_pool_timeout_attempt", side_effect=outcomes
+                ) as attempt,
+            ):
+                if any(outcomes):
+                    self.test_singleton_pool_timeout_kills_descendants_and_cleans_fixture()
+                else:
+                    with self.assertRaises(AssertionError) as caught:
+                        self.test_singleton_pool_timeout_kills_descendants_and_cleans_fixture()
+                    self.assertIn("worker connected before the deadline", str(caught.exception))
+                    self.assertIn("1.5 s, 3 s, 6 s", str(caught.exception))
+                self.assertEqual(
+                    attempt.call_args_list,
+                    [unittest.mock.call(timeout) for timeout in (2.5, 5.0, 10.0)[: len(outcomes)]],
+                )
+
+    def test_pool_timeout_does_not_retry_assertion_failure(self) -> None:
+        """Propagate an attempt assertion failure without retrying the pool fixture."""
+        with (
+            unittest.mock.patch.object(
+                self,
+                "_pool_timeout_attempt",
+                side_effect=AssertionError("planted assertion failure"),
+            ) as attempt,
+            self.assertRaisesRegex(AssertionError, "planted assertion failure"),
+        ):
+            self.test_singleton_pool_timeout_kills_descendants_and_cleans_fixture()
+        attempt.assert_called_once_with(2.5)
+
+    def test_singleton_pool_failing_worker_cleans_descendants_and_fixture(self) -> None:
+        """A failing worker case preserves failure status without a false timeout or leak."""
+        invalid_timeouts = (0, -1)
+        for index in range(len(invalid_timeouts)):
+            invalid_timeout = invalid_timeouts[index]
+            with self.subTest(timeout=invalid_timeout), self.assertRaises(ValueError):
+                self.run_pool_fixture(timeout=invalid_timeout)
+        listener, port = self._pool_listener()
+        source = self._worker_probe_source(port, "sock.close(); self.fail('planted failure')")
+        fixture_paths: list[Path] = []
+        result = self.run_pool_fixture(source, timeout=10.0, fixture_paths=fixture_paths)
+        worker_pid, conn = self._accept_worker_pid(listener)
+        self.assertEqual(len(fixture_paths), 1)
+        self.assertFalse(fixture_paths[0].exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+        self.assertEqual(conn.recv(64), b"")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("FAIL wall-time budget exceeded", result.stderr)
+
+    def test_singleton_pool_single_case_boundary_within_deadline_passes(self) -> None:
+        """A single-case fixture completing within a short deadline cleans up and passes."""
+        listener, port = self._pool_listener()
+        source = self._worker_probe_source(port, "time.sleep(0.1)", second_case=False)
+        fixture_paths: list[Path] = []
+        result = self.run_pool_fixture(source, timeout=5.0, fixture_paths=fixture_paths)
+        worker_pid, conn = self._accept_worker_pid(listener)
+        self.assertEqual(len(fixture_paths), 1)
+        self.assertFalse(fixture_paths[0].exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+        self.assertEqual(conn.recv(64), b"")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("budget 3 s (60% of series.yml check job's 5 s limit)", result.stderr)
+        self.assertNotIn("FAIL", result.stderr)
+
+    def test_forgejo_adapter_has_no_shared_fixtures(self) -> None:
+        """Method tasks remain valid only while the adapted module has no shared fixtures."""
+        source = (unit_test_budget.ROOT / "tests/test_ffmpeg_forgejo.py").read_text(
+            encoding="utf-8"
+        )
+        forbidden = {"setUpModule", "tearDownModule", "setUpClass", "tearDownClass"}
+        tree = ast.parse(source)
+        names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+        self.assertEqual(names & forbidden, set(), "shared fixtures require coarser tasks")
+
+
+class RunSummaryTest(unittest.TestCase):
+    """Restore aggregate counts and status after the parallel runner hook's timings."""
+
+    def test_real_pool_reports_three_tests_and_one_skip(self) -> None:
+        """Three bounded singleton tasks retain their aggregate count and skip summary."""
+        result = UnitTestBudgetTest().run_pool_fixture(SUMMARY_POOL_SOURCE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ran 3 tests in ", result.stderr)
+        self.assertIn("\n\nOK (skipped=1)\n", result.stderr)
+        self.assertLess(result.stderr.index("unit suites:"), result.stderr.index("Ran 3 tests"))
+
+    def test_real_pool_reports_failure_and_preserves_nonzero_status(self) -> None:
+        """A bounded planted failure prints its aggregate failure count and fails the wrapper."""
+        source = SINGLETON_POOL_SOURCE.replace("self.assertTrue(True)", "self.fail('planted')", 1)
+        result = UnitTestBudgetTest().run_pool_fixture(source)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("\n\nFAILED (failures=1", result.stderr)
+        self.assertNotIn("\nOK", result.stderr)
+
+    def test_real_pool_reports_singular_test(self) -> None:
+        """Exactly one bounded test uses the parallel runner's singular summary wording."""
+        source = SINGLETON_POOL_SOURCE.split("    def test_two(", 1)[0]
+        result = UnitTestBudgetTest().run_pool_fixture(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ran 1 test in ", result.stderr)
+        self.assertIn("\n\nOK\n", result.stderr)
+
+    def test_real_pool_reports_all_result_counts_in_parallel_order(self) -> None:
+        """Failures, errors, skips and expected outcomes retain the upstream info order."""
+        source = (
+            "import unittest\n"
+            "class OutcomesCase(unittest.TestCase):\n"
+            "    def test_failure(self):\n"
+            '        """Fail the planted assertion."""\n'
+            "        self.fail('planted failure')\n"
+            "    def test_error(self):\n"
+            '        """Raise the planted error."""\n'
+            "        raise ValueError('planted error')\n"
+            "    @unittest.skip('planted skip')\n"
+            "    def test_skip(self):\n"
+            '        """Skip the planted case."""\n'
+            "        self.fail('must not run')\n"
+            "    @unittest.expectedFailure\n"
+            "    def test_expected_failure(self):\n"
+            '        """Fail as expected."""\n'
+            "        self.fail('expected failure')\n"
+            "    @unittest.expectedFailure\n"
+            "    def test_unexpected_success(self):\n"
+            '        """Pass unexpectedly."""\n'
+            "        self.assertTrue(True)\n"
+        )
+        result = UnitTestBudgetTest().run_pool_fixture(source)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("Ran 5 tests in ", result.stderr)
+        self.assertIn(
+            "\n\nFAILED (failures=1, errors=1, skipped=1, "
+            "expected failures=1, unexpected successes=1)\n",
+            result.stderr,
+        )
+
+
+class JobElapsedBudgetTest(unittest.TestCase):
+    """Account for setup and prerequisites without changing unit statuses."""
+
+    def run_job(self, start: str | None, status: int = 0) -> tuple[int, str]:
+        """Measure one synthetic second of units after an arbitrary job setup delay."""
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.dict(os.environ),
+            unittest.mock.patch.object(unit_test_budget.time, "time", return_value=1000),
+            unittest.mock.patch.object(unit_test_budget.time, "perf_counter", side_effect=[0, 1]),
+            unittest.mock.patch.object(
+                unit_test_budget.tmp_leak_guard, "run_guard", return_value=status
+            ) as guard,
+            contextlib.redirect_stderr(output),
+        ):
+            if start is None:
+                os.environ.pop("SERIES_JOB_STARTED_AT", None)
+            else:
+                os.environ["SERIES_JOB_STARTED_AT"] = start
+            rc = unit_test_budget.run_unit_tests("runner", [], 600)
+            valid = start in {"600", "639", "640"}
+            if not valid:
+                guard.assert_not_called()
+        return rc, output.getvalue()
+
+    def test_planted_setup_overrun_fails_fast_units(self) -> None:
+        """Setup time alone can exhaust the budget despite a passing unit command."""
+        rc, output = self.run_job("600")
+        self.assertEqual(rc, 1)
+        self.assertIn("wall time 1.000 s; budget 360 s", output)
+        self.assertIn("job elapsed 400.000 s; budget 360 s (60%", output)
+        self.assertIn("FAIL job elapsed budget exceeded", output)
+        self.assertNotIn("FAIL wall-time budget exceeded", output)
+
+    def test_job_elapsed_exact_budget_passes(self) -> None:
+        """The job elapsed check includes its exact budget boundary."""
+        rc, output = self.run_job("640")
+        self.assertEqual(rc, 0)
+        self.assertIn("job elapsed 360.000 s; budget 360 s", output)
+
+    def test_job_elapsed_one_second_above_budget_fails(self) -> None:
+        """One second beyond the job budget fails even with fast passing units."""
+        self.assertEqual(self.run_job("639")[0], 1)
+
+    def test_missing_job_start_fails_by_name(self) -> None:
+        """A missing start variable cannot silently reduce coverage to unit time."""
+        rc, output = self.run_job(None)
+        self.assertEqual(rc, 1)
+        self.assertIn("SERIES_JOB_STARTED_AT", output)
+
+    def test_malformed_job_start_fails_by_name(self) -> None:
+        """Empty, nonfinite, nonpositive and future starts fail explicitly."""
+        values = ("", "oops", "nan", "inf", "-inf", "0", "-1", "1001")
+        for index in range(len(values)):
+            with self.subTest(start=values[index]):
+                rc, output = self.run_job(values[index])
+                self.assertEqual(rc, 1)
+                self.assertIn("SERIES_JOB_STARTED_AT", output)
+
+    def test_job_overrun_preserves_nonzero_unit_status(self) -> None:
+        """An elapsed job overrun preserves the guarded command's failure status."""
+        self.assertEqual(self.run_job("600", 7)[0], 7)
+
+    def test_first_ci_step_records_job_start(self) -> None:
+        """The first check step records time before checkout and dependency setup."""
+        workflow = yaml.safe_load(unit_test_budget.WORKFLOW.read_text(encoding="utf-8"))
+        first = workflow["jobs"]["check"]["steps"][0]
+        self.assertIn("SERIES_JOB_STARTED_AT=", first.get("run", ""))
+        self.assertIn('"$GITHUB_ENV"', first["run"])
+
+    def test_make_starts_clock_before_prerequisites(self) -> None:
+        """The outer target starts the clock before entering prerequisite work."""
+        makefile = (unit_test_budget.ROOT / "Makefile").read_text(encoding="utf-8")
+        recipe = makefile.split("\ntest:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('SERIES_JOB_STARTED_AT="$${SERIES_JOB_STARTED_AT-$$(date +%s)}"', recipe)
+        self.assertIn("$(MAKE) test-budgeted", recipe)
+        self.assertIn("test-budgeted: dev-deps build lint", makefile)
+
+
+class SuiteTimingReportTest(unittest.TestCase):
+    """Expose task costs and their contribution to summed parallel suite time."""
+
+    def report(self, records: list[tuple[str, float]]) -> str:
+        """Capture deterministic suite durations without a real test process."""
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            unit_test_budget.print_suite_timings(records)
+        return output.getvalue()
+
+    def test_slowest_ten_include_duration_share_sum_and_count(self) -> None:
+        """Twelve tasks report the ten slowest and shares of all twelve durations."""
+        records = [(f"suite-{index:02d}", float(index)) for index in range(1, 13)]
+        output = self.report(records)
+        self.assertIn("12 suites; summed time 78.000 s", output)
+        lines = output.splitlines()
+        rows = [lines[index] for index in range(len(lines)) if "suite-" in lines[index]]
+        self.assertEqual(len(rows), 10)
+        self.assertIn("12.000 s (15.4%) suite-12", rows[0])
+        self.assertIn("3.000 s (3.8%) suite-03", rows[-1])
+        self.assertNotIn("suite-02", output)
+
+    def test_fewer_than_ten_suites_prints_all(self) -> None:
+        """A short run prints every suite with its share of the summed time."""
+        output = self.report([("fast", 1.0), ("slow", 3.0)])
+        self.assertIn("2 suites; summed time 4.000 s", output)
+        self.assertIn("3.000 s (75.0%) slow", output)
+        self.assertIn("1.000 s (25.0%) fast", output)
+
+    def test_zero_time_and_empty_suites_have_defined_output(self) -> None:
+        """Empty or sub-clock-resolution tasks cannot divide by zero."""
+        self.assertIn("0 suites; summed time 0.000 s", self.report([]))
+        self.assertIn("0.000 s (0.0%) zero", self.report([("zero", 0.0)]))
+
+    def test_real_pool_reports_each_scheduled_singleton(self) -> None:
+        """A bounded synthetic process pool reports both singleton tasks by test ID."""
+        fixture = UnitTestBudgetTest()
+        result = fixture.run_pool_fixture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 suites; summed time", result.stderr)
+        self.assertIn("test_synthetic.IndependentCase.test_one", result.stderr)
+        self.assertIn("test_synthetic.IndependentCase.test_two", result.stderr)
+
+    def test_real_pool_reports_one_task_per_ordinary_class(self) -> None:
+        """Two methods without adaptation produce one class timing rather than method timings."""
+        source = SINGLETON_POOL_SOURCE.split("def load_tests(", 1)[0]
+        result = UnitTestBudgetTest().run_pool_fixture(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Running 1 test suites (2 total tests) across 1 workers", result.stderr)
+        self.assertIn("1 suites; summed time", result.stderr)
+        self.assertIn("test_synthetic.IndependentCase", result.stderr)
+        self.assertNotIn("IndependentCase.test_", result.stderr)
