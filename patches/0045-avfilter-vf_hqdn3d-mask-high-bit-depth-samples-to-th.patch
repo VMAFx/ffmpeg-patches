@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sat, 14 Nov 2026 01:57:51 +0100
+Subject: [PATCH] avfilter/vf_hqdn3d: mask high bit depth samples to their
+ depth
+
+Fixes: out of array read
+Fixes: 8Z3kXCidIqzE
+
+Found-by: berrob14 (#24121)
+Found independently during triage of the security report AISLE-2026-R0057
+
+Out of array read Replicated through UnModified FFmpeg with ASAN
+
+(cherry picked from commit f824f2e1cd46940754d5c5844113d61eb25d7e05)
+Signed-off-by: lusoris <lusoris@proton.me>
+---
+ libavfilter/vf_hqdn3d.c       | 2 +-
+ libavfilter/x86/vf_hqdn3d.asm | 3 +++
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/libavfilter/vf_hqdn3d.c b/libavfilter/vf_hqdn3d.c
+index d066a0e75bb927300a19ccddfb80ba21f8ad92e8..5414f46260a51996ae54fa8fce798f59b3250105 100644
+--- a/libavfilter/vf_hqdn3d.c
++++ b/libavfilter/vf_hqdn3d.c
+@@ -43,7 +43,7 @@
+ #include "hqdn3d_coefs.h"
+ 
+ #define LUT_BITS (depth==16 ? 8 : 4)
+-#define LOAD(x) (((depth == 8 ? src[x] : AV_RN16A(src + (x) * 2)) << (16 - depth))\
++#define LOAD(x) (((depth == 8 ? src[x] : AV_RN16A(src + (x) * 2) & ((1 << depth) - 1)) << (16 - depth))\
+                  + (((1 << (16 - depth)) - 1) >> 1))
+ #define STORE(x,val) (depth == 8 ? dst[x] = (val) >> (16 - depth) : \
+                                    AV_WN16A(dst + (x) * 2, (val) >> (16 - depth)))
+diff --git a/libavfilter/x86/vf_hqdn3d.asm b/libavfilter/x86/vf_hqdn3d.asm
+index 1dfdc6c8fbb68afd27d7b57bbb52cd4d8c0607bb..cbe21e057d995c3e8585d3f3c94342767dfd047c 100644
+--- a/libavfilter/x86/vf_hqdn3d.asm
++++ b/libavfilter/x86/vf_hqdn3d.asm
+@@ -38,6 +38,9 @@ SECTION .text
+     movzx  %1, word [srcq+(%2)*2]
+ %endif
+ %if %3 != 16
++%if %3 != 8
++    and    %1, (1<<%3)-1
++%endif
+     shl    %1, 16-%3
+     add    %1, (1<<(15-%3))-1
+ %endif

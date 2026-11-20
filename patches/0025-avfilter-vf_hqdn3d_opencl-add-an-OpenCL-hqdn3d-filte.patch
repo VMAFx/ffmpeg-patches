@@ -26,11 +26,11 @@ Signed-off-by: lusoris <lusoris@proton.me>
  doc/filters.texi                  |  33 ++
  libavfilter/Makefile              |   2 +
  libavfilter/allfilters.c          |   1 +
- libavfilter/opencl/hqdn3d.cl      | 315 ++++++++++++
+ libavfilter/opencl/hqdn3d.cl      | 316 ++++++++++++
  libavfilter/opencl_source.h       |   1 +
  libavfilter/tests/hqdn3d_vulkan.c |  23 +-
  libavfilter/vf_hqdn3d_opencl.c    | 828 ++++++++++++++++++++++++++++++
- 8 files changed, 1203 insertions(+), 1 deletion(-)
+ 8 files changed, 1204 insertions(+), 1 deletion(-)
  create mode 100644 libavfilter/opencl/hqdn3d.cl
  create mode 100644 libavfilter/vf_hqdn3d_opencl.c
 
@@ -124,10 +124,10 @@ index 3cacb97a8fbfc2e5e0880aa1048f2459f9200884..81c1f2c8a8d38e38b40a2b6bfb3e8f05
  extern const FFFilter ff_vf_hstack;
 diff --git a/libavfilter/opencl/hqdn3d.cl b/libavfilter/opencl/hqdn3d.cl
 new file mode 100644
-index 0000000000000000000000000000000000000000..480d7300b17669168bde3ae67efd3b05de1e9ce2
+index 0000000000000000000000000000000000000000..d3cc6e0000cf19c9d8ffe1f8c5a93abb561150f1
 --- /dev/null
 +++ b/libavfilter/opencl/hqdn3d.cl
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,316 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -159,6 +159,7 @@ index 0000000000000000000000000000000000000000..480d7300b17669168bde3ae67efd3b05
 +{
 +    uint shift = 16u - s_depth;
 +    uint sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    sample_val &= (1u << s_depth) - 1u;
 +    uint rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
 +    return (sample_val << shift) + rounding;
 +}

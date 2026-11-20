@@ -68,11 +68,11 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/vf_hqdn3d.c                       |   33 +-
  libavfilter/vf_hqdn3d_vulkan.c                |  938 +++++++++++++++
  libavfilter/vulkan/Makefile                   |    2 +
- .../vulkan/hqdn3d_horizontal.comp.glsl        |  160 +++
- libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  233 ++++
+ .../vulkan/hqdn3d_horizontal.comp.glsl        |  161 +++
+ libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  234 ++++
  tests/fate/hw.mak                             |    4 +
  tests/ref/fate/filter-hqdn3d-vulkan           |   21 +
- 14 files changed, 2574 insertions(+), 31 deletions(-)
+ 14 files changed, 2576 insertions(+), 31 deletions(-)
  create mode 100644 libavfilter/hqdn3d_coefs.c
  create mode 100644 libavfilter/hqdn3d_coefs.h
  create mode 100644 libavfilter/tests/hqdn3d_vulkan.c
@@ -2385,10 +2385,10 @@ index f81542dcb9d8e40debcb11dd5eddb8ff34e4fa3e..4434028f839d0495c0c861eed63b581b
  OBJS-$(CONFIG_SCDET_VULKAN_FILTER) += vulkan/scdet.comp.spv.o
 diff --git a/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl b/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl
 new file mode 100644
-index 0000000000000000000000000000000000000000..22193402437fab2d94548bcde5054e0067f76849
+index 0000000000000000000000000000000000000000..4278955f51df02d1a4ed78949a0d1e67bd8d539b
 --- /dev/null
 +++ b/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,161 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -2467,6 +2467,7 @@ index 0000000000000000000000000000000000000000..22193402437fab2d94548bcde5054e00
 +{
 +    uint shift = 16u - s_depth;
 +    uint sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    sample_val &= (1u << s_depth) - 1u;
 +    uint rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
 +    return (sample_val << shift) + rounding;
 +}
@@ -2551,10 +2552,10 @@ index 0000000000000000000000000000000000000000..22193402437fab2d94548bcde5054e00
 +}
 diff --git a/libavfilter/vulkan/hqdn3d_vertical.comp.glsl b/libavfilter/vulkan/hqdn3d_vertical.comp.glsl
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a4d78e11e1780e44a412e2594cad292e2a4c25b
+index 0000000000000000000000000000000000000000..f78c7079502880337ab943bdac2f749d963dfb82
 --- /dev/null
 +++ b/libavfilter/vulkan/hqdn3d_vertical.comp.glsl
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,234 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -2649,6 +2650,7 @@ index 0000000000000000000000000000000000000000..2a4d78e11e1780e44a412e2594cad292
 +{
 +    uint shift = 16u - s_depth;
 +    uint sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    sample_val &= (1u << s_depth) - 1u;
 +    uint rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
 +    return (sample_val << shift) + rounding;
 +}
