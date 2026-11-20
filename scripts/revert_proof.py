@@ -19,7 +19,8 @@ failure means exit 5 and names its path; a changed record parent or oversized
 encoded record means exit 2 without publication; an older record is removed before runs
 start, output must be outside the caller work tree and Git administration, and
 the temporary parent must be outside the caller work tree, selected without probe writes.
-Scratch checkout reads stored objects without replace refs, populates all committed
+Ancestry, caller HEAD checks and scratch checkout read stored objects without replace refs.
+Scratch checkout populates all committed
 paths even for sparse callers, and suppresses setup hooks only; test commands keep hooks.
 Root fix commits are compared against the empty tree; reversing their source
 patch removes the added source files in scratch; conflicts or pathspecs selecting
@@ -186,7 +187,7 @@ def _check_object_format(tree: Path) -> None:
 
 
 def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str], str]:
-    """Validate object format, clean history, ancestry and the source path set."""
+    """Validate object format, clean history, stored ancestry and the source path set."""
     _check_object_format(tree)
     if not tree.is_dir():
         raise _PreflightError(f"work tree not found: {tree}")
@@ -208,7 +209,9 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
     if history_error:
         raise _PreflightError(history_error)
     ancestor = upstream_lint._run(
-        ["git", "merge-base", "--is-ancestor", commit, head], tree, timeout=GIT_TIMEOUT
+        ["git", "--no-replace-objects", "merge-base", "--is-ancestor", commit, head],
+        tree,
+        timeout=GIT_TIMEOUT,
     )
     if ancestor.returncode != 0:
         raise _PreflightError(f"commit {commit} is not an ancestor of HEAD ({head})")
@@ -335,18 +338,20 @@ def _check_record_location(config: ProofConfig, path: Path) -> None:
 
 
 def clear_record(config: ProofConfig, descriptor: int | None = None) -> None:
-    """Remove an old record by name through its validated directory descriptor."""
+    """Remove an old record through its validated directory, closing only an owned descriptor."""
     path = config.record
     _check_record_location(config, path)
-    with contextlib.ExitStack() as resources:
-        if descriptor is None:
-            descriptor = _open_record_directory(config)
-            resources.callback(os.close, descriptor)
-        try:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(path.name, dir_fd=descriptor)
-        except OSError as error:
-            raise _PreflightError(f"cannot remove old record {path}: {error}") from error
+    owned = descriptor is None
+    if owned:
+        descriptor = _open_record_directory(config)
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path.name, dir_fd=descriptor)
+    except OSError as error:
+        raise _PreflightError(f"cannot remove old record {path}: {error}") from error
+    finally:
+        if owned:
+            os.close(descriptor)
 
 
 def _open_record_directory(config: ProofConfig) -> int:
@@ -455,10 +460,12 @@ def measure_reverted(
 
 
 def verify_caller_head(tree: Path, head: str, head_ref: str) -> None:
-    """Refuse a moved or missing recorded caller branch or current HEAD with exit 3."""
+    """Check stored refs without replacements and refuse a moved or missing caller HEAD with 3."""
     for reference in (head_ref, "HEAD"):
         result = upstream_lint._run(
-            ["git", "rev-parse", "--verify", f"{reference}^{{commit}}"], tree, timeout=GIT_TIMEOUT
+            ["git", "--no-replace-objects", "rev-parse", "--verify", f"{reference}^{{commit}}"],
+            tree,
+            timeout=GIT_TIMEOUT,
         )
         current = result.stdout.strip() if result.returncode == 0 else "<invalid>"
         if result.timed_out or current != head:

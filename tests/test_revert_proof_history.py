@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
 import unittest.mock
 
@@ -22,6 +23,112 @@ from tests.revert_proof_helpers import (
 
 class RevertProofHistoryTest(RevertProofFixture):
     """Check revert-proof history behavior using isolated Git fixtures."""
+
+    def _side_fix_outside_head(self) -> tuple[str, str]:
+        """Create a side fix absent from an advanced main branch's stored history."""
+        branch = run_git(self.tree, "symbolic-ref", "--short", "HEAD", preserve_config=True)
+        run_git(self.tree, "commit", "--allow-empty", "-qm", "main: advance", preserve_config=True)
+        head = run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
+        run_git(self.tree, "checkout", "-qb", "side", self.base, preserve_config=True)
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        fix = self.commit("avfilter/vf_x: fix side value")
+        run_git(self.tree, "checkout", "-q", branch, preserve_config=True)
+        return fix, head
+
+    def _assert_nonancestor_refused(self, fix: str) -> None:
+        """Require the producer to refuse non-ancestry with exit 2 before publication."""
+        rc, _, error = capture_main(
+            revert_proof.main,
+            "--tree",
+            str(self.tree),
+            "--commit",
+            fix,
+            "--record",
+            str(self.record_path),
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        )
+        self.assertEqual(rc, 2, error)
+        self.assertIn(f"commit {fix} is not an ancestor of HEAD", error)
+        self.assertFalse(self.record_path.exists())
+
+    def test_replaced_head_cannot_invent_fix_ancestry(self) -> None:
+        """A same-tree replacement HEAD cannot make an unrelated side fix an ancestor."""
+        fix, head = self._side_fix_outside_head()
+        tree = run_git(self.tree, "rev-parse", f"{head}^{{tree}}", preserve_config=True)
+        replacement = run_git(
+            self.tree,
+            "commit-tree",
+            tree,
+            "-p",
+            self.base,
+            "-p",
+            fix,
+            "-m",
+            "replacement: invent side ancestry",
+            preserve_config=True,
+        )
+        run_git(self.tree, "replace", head, replacement, preserve_config=True)
+        run_git(self.tree, "merge-base", "--is-ancestor", fix, head, preserve_config=True)
+        self._assert_nonancestor_refused(fix)
+
+    def test_side_fix_without_replace_ref_is_refused(self) -> None:
+        """An unrelated side fix also refuses when no replacement reference exists."""
+        fix, _ = self._side_fix_outside_head()
+        self._assert_nonancestor_refused(fix)
+
+    def test_stored_ancestor_passes_preflight(self) -> None:
+        """A real source fix ancestor remains accepted after HEAD advances."""
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        fix = self.commit("avfilter/vf_x: fix value")
+        run_git(self.tree, "commit", "--allow-empty", "-qm", "main: advance", preserve_config=True)
+        prepared = revert_proof.prepare_tree(self.tree, fix)
+        self.assertEqual(prepared[0], fix)
+        self.assertEqual(prepared[3], ["libavfilter/vf_x.c"])
+
+    def test_clear_record_preserves_descriptor_ownership(self) -> None:
+        """Record removal closes only owned descriptors on both success and unlink failure."""
+        config = revert_proof.ProofConfig(self.tree, self.base, self.record_path, 1, ["unused"])
+        for owned, failed in ((True, False), (True, True), (False, False), (False, True)):
+            descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            self.record_path.write_text("old record", encoding="utf-8")
+            try:
+                with (
+                    self.subTest(owned=owned, failed=failed),
+                    unittest.mock.patch.object(revert_proof, "_check_record_location"),
+                    unittest.mock.patch.object(
+                        revert_proof, "_open_record_directory", return_value=descriptor
+                    ) as opened,
+                    unittest.mock.patch.object(
+                        os,
+                        "unlink",
+                        wraps=os.unlink,
+                        side_effect=PermissionError("planted unlink failure") if failed else None,
+                    ),
+                    unittest.mock.patch.object(os, "close", wraps=os.close) as closed,
+                ):
+                    outcome = (
+                        self.assertRaisesRegex(ValueError, "cannot remove old record")
+                        if failed
+                        else contextlib.nullcontext()
+                    )
+                    with outcome:
+                        revert_proof.clear_record(config, None if owned else descriptor)
+                    if owned:
+                        opened.assert_called_once_with(config)
+                        closed.assert_called_once_with(descriptor)
+                        with self.assertRaises(OSError):
+                            os.fstat(descriptor)
+                    else:
+                        opened.assert_not_called()
+                        closed.assert_not_called()
+                        os.fstat(descriptor)
+                    self.assertEqual(self.record_path.exists(), failed)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
 
     def test_noop_graft_demands_and_accepts_measured_source_proof(self) -> None:
         """A no-op graft keeps the fix visible and measures both runs without moving HEAD."""
