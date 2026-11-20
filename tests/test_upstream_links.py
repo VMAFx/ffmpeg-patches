@@ -19,6 +19,10 @@ from pathlib import Path
 import yaml
 
 from scripts import upstream_links
+from scripts import upstream_links_forge as upstream_forge
+from scripts import upstream_links_manifest as upstream_fills
+from scripts import upstream_links_parse as upstream_parse
+from scripts import upstream_links_scan as upstream_scans
 
 FORGE = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/"
 API = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg"
@@ -133,12 +137,12 @@ class FakeForge:
         """Return the decoded JSON answer for url or raise DriftError."""
         self.read.append(url)
         if url not in self.answers:
-            raise upstream_links.DriftError(f"{url}: HTTP Error 404: Not Found")
+            raise upstream_parse.DriftError(f"{url}: HTTP Error 404: Not Found")
         raw = self.answers[url]
         answer = json.loads(raw) if isinstance(raw, str) else raw
-        if type(answer) is list and len(answer) < upstream_links.PAGE_SIZE and "page=" in url:
+        if type(answer) is list and len(answer) < upstream_forge.PAGE_SIZE and "page=" in url:
             page = int(url.rsplit("page=", 1)[1])
-            total = (page - 1) * upstream_links.PAGE_SIZE + len(answer)
+            total = (page - 1) * upstream_forge.PAGE_SIZE + len(answer)
             return HeaderPage(answer, {"X-Total-Count": str(total)})
         return answer
 
@@ -174,7 +178,7 @@ def run_cli(
     forge: FakeForge,
     *args: str,
     today: date | None = TODAY,
-    sleep: upstream_links.Sleep | None = None,
+    sleep: upstream_forge.Sleep | None = None,
     keep_progress: bool = False,
 ) -> tuple[int, str, str]:
     """Capture CLI results, optionally retaining the separately tested progress line."""
@@ -285,45 +289,45 @@ class IntegerContractTest(unittest.TestCase):
         for value in (True, False, 1.0, None, 0, -1):
             with (
                 self.subTest(value=value),
-                self.assertRaisesRegex(upstream_links.DriftError, "invalid number"),
+                self.assertRaisesRegex(upstream_parse.DriftError, "invalid number"),
             ):
-                upstream_links.normalize_item({"number": value})
+                upstream_forge.normalize_item({"number": value})
 
     def test_normalize_number_accepts_positive_integer(self) -> None:
         """The smallest positive integer remains a normalized pull number."""
-        self.assertEqual(upstream_links.normalize_item(forge_pull(1))["number"], 1)
+        self.assertEqual(upstream_forge.normalize_item(forge_pull(1))["number"], 1)
 
     def test_pull_api_number_rejects_nonintegers(self) -> None:
         """Both booleans, a float and null fail before building a pull URL."""
         for value in (True, False, 1.0, None, 0, -1):
             with (
                 self.subTest(value=value),
-                self.assertRaisesRegex(upstream_links.DriftError, "positive integer"),
+                self.assertRaisesRegex(upstream_parse.DriftError, "positive integer"),
             ):
-                upstream_links.pull_api_url(value)
+                upstream_forge.pull_api_url(value)
 
     def test_pull_api_number_accepts_positive_integer(self) -> None:
         """The smallest positive integer still builds the configured pull URL."""
-        self.assertEqual(upstream_links.pull_api_url(1), f"{API}/pulls/1")
+        self.assertEqual(upstream_forge.pull_api_url(1), f"{API}/pulls/1")
 
     def test_error_context_rejects_noninteger_numbers(self) -> None:
         """Invalid numbers never become pull URLs while reporting envelope errors."""
         for value in (True, False, 1.0, None, 0, -1):
             with (
                 self.subTest(value=value),
-                unittest.mock.patch.object(upstream_links, "pull_api_url") as address,
+                unittest.mock.patch.object(upstream_forge, "pull_api_url") as address,
             ):
-                with self.assertRaises(upstream_links.DriftError):
-                    upstream_links.parse_forge_pull({"number": value}, source="listing")
+                with self.assertRaises(upstream_parse.DriftError):
+                    upstream_forge.parse_forge_pull({"number": value}, source="listing")
                 address.assert_not_called()
 
     def test_error_context_accepts_positive_integer(self) -> None:
         """An otherwise invalid envelope still identifies its positive pull number."""
         with unittest.mock.patch.object(
-            upstream_links, "pull_api_url", return_value=f"{API}/pulls/1"
+            upstream_forge, "pull_api_url", return_value=f"{API}/pulls/1"
         ) as address:
-            with self.assertRaises(upstream_links.DriftError) as caught:
-                upstream_links.parse_forge_pull({"number": 1}, source="listing")
+            with self.assertRaises(upstream_parse.DriftError) as caught:
+                upstream_forge.parse_forge_pull({"number": 1}, source="listing")
             address.assert_called_once_with(1)
             self.assertIn(f"{API}/pulls/1", str(caught.exception))
 
@@ -332,14 +336,14 @@ class IntegerContractTest(unittest.TestCase):
         for value in (True, False, 1.0, None, 0, -1):
             with (
                 self.subTest(value=value),
-                self.assertRaisesRegex(upstream_links.DriftError, "positive numbers"),
+                self.assertRaisesRegex(upstream_parse.DriftError, "positive numbers"),
             ):
-                upstream_links._fill_targets([manifest_entry(1)], [value])
+                upstream_fills._fill_targets([manifest_entry(1)], [value])
 
     def test_fill_targets_accept_positive_integer(self) -> None:
         """A positive integer selects its eligible manifest row for fill."""
         self.assertEqual(
-            upstream_links._fill_targets([manifest_entry(1)], [1]),
+            upstream_fills._fill_targets([manifest_entry(1)], [1]),
             [(1, f"{FORGE}1", set())],
         )
 
@@ -348,16 +352,16 @@ class IntegerContractTest(unittest.TestCase):
         for value in (True, False, 1.0, None, 0, 366):
             with (
                 self.subTest(value=value),
-                self.assertRaisesRegex(upstream_links.DriftError, "--max-age-days"),
+                self.assertRaisesRegex(upstream_parse.DriftError, "--max-age-days"),
             ):
-                upstream_links.fill_window(value, TODAY)
+                upstream_fills.fill_window(value, TODAY)
 
     def test_fill_window_accepts_integer_endpoints(self) -> None:
         """Both inclusive integer endpoints preserve their UTC cutoff dates."""
         for value, day in ((1, "2026-11-11"), (365, "2025-11-12")):
             with self.subTest(value=value):
                 self.assertEqual(
-                    upstream_links.fill_window(value, TODAY).isoformat(),
+                    upstream_fills.fill_window(value, TODAY).isoformat(),
                     f"{day}T00:00:00+00:00",
                 )
 
@@ -366,7 +370,7 @@ class IntegerContractTest(unittest.TestCase):
         for value in (True, False, 1.0, None, 0, -1):
             with (
                 self.subTest(value=value),
-                self.assertRaisesRegex(upstream_links.DriftError, "invalid --pull number"),
+                self.assertRaisesRegex(upstream_parse.DriftError, "invalid --pull number"),
             ):
                 upstream_links._check_targets([], [value])
 
@@ -382,8 +386,8 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
         """Offset conversions outside either calendar boundary are identified errors."""
         for value in ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"):
             with self.subTest(value=value):
-                with self.assertRaises(upstream_links.DriftError) as caught:
-                    upstream_links.parse_timestamp(value, "created_at")
+                with self.assertRaises(upstream_parse.DriftError) as caught:
+                    upstream_parse.parse_timestamp(value, "created_at")
                 self.assertIn(value, str(caught.exception))
                 self.assertIn("created_at", str(caught.exception))
         for value, expected in (
@@ -391,7 +395,7 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
             ("9999-12-31T22:59:59-01:00", "9999-12-31T23:59:59+00:00"),
             ("2026-11-19T12:30:00+02:00", "2026-11-19T10:30:00+00:00"),
         ):
-            self.assertEqual(upstream_links.parse_timestamp(value).isoformat(), expected)
+            self.assertEqual(upstream_parse.parse_timestamp(value).isoformat(), expected)
 
     def test_author_validators_agree_on_controls_and_line_separators(self) -> None:
         """Forge and manifest validators reject every control and line separator alike."""
@@ -400,8 +404,8 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
         for separator in invalid[:69]:
             author = f"alice{separator}bob"
             with self.subTest(code=ord(separator)):
-                with self.assertRaisesRegex(upstream_links.DriftError, "author"):
-                    upstream_links.normalize_item(forge_pull(101) | {"user": {"login": author}})
+                with self.assertRaisesRegex(upstream_parse.DriftError, "author"):
+                    upstream_forge.normalize_item(forge_pull(101) | {"user": {"login": author}})
                 row = {
                     "number": 101,
                     "kind": "pull",
@@ -414,7 +418,7 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
                 upstream_links.series.check_related_item(row, "entry 1", findings)
                 self.assertTrue(any("author" in error for error in findings.errors))
         for author in ("alice", "Forgejo_Fairy", "a.b-c_9", "x" * 256):
-            item = upstream_links.normalize_item(forge_pull(101) | {"user": {"login": author}})
+            item = upstream_forge.normalize_item(forge_pull(101) | {"user": {"login": author}})
             self.assertEqual(item["author"], author)
 
     def test_related_for_matches_files_patch_id_and_subject(self) -> None:
@@ -458,7 +462,7 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
                 "state": "closed",
             },
         ]
-        related = upstream_links.related_for(own, candidates, today=TODAY)
+        related = upstream_forge.related_for(own, candidates, today=TODAY)
         self.assertEqual([r["number"] for r in related], [101, 102, 105])
         self.assertEqual(
             [(r["reason"], r["kind"], r["seen"]) for r in related],
@@ -468,7 +472,7 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
                 ("same-subject", "issue", "2026-11-12"),
             ],
         )
-        loud = upstream_links.overlaps(related)
+        loud = upstream_parse.overlaps(related)
         self.assertEqual([r["number"] for r in loud], [102])
 
     def test_overlaps_filters_closed_same_author_issues_and_early_merges(self) -> None:
@@ -512,9 +516,9 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
                 "merged_at": "2026-11-09T00:00:00Z",
             },
         ]
-        related = upstream_links.related_for(own, candidates, today=TODAY)
+        related = upstream_forge.related_for(own, candidates, today=TODAY)
         self.assertEqual([r["number"] for r in related], [11, 12, 13, 14])
-        self.assertEqual([r["number"] for r in upstream_links.overlaps(related)], [14])
+        self.assertEqual([r["number"] for r in upstream_parse.overlaps(related)], [14])
 
     def test_body_issues_extracts_fixes_closes_and_refs(self) -> None:
         """Read complete hash and configured URL items after closing keywords."""
@@ -524,10 +528,10 @@ class RelatedAndOverlapsPureTest(unittest.TestCase):
             "Closes: #24900\n"
             "Refs https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/24800 and #25052.\n"
         )
-        self.assertEqual(upstream_links.body_issues(body), [24800, 24900, 25010, 25052])
-        self.assertEqual(upstream_links.body_issues(None), [])
-        with self.assertRaises(upstream_links.DriftError):
-            upstream_links.body_issues(123)
+        self.assertEqual(upstream_parse.body_issues(body), [24800, 24900, 25010, 25052])
+        self.assertEqual(upstream_parse.body_issues(None), [])
+        with self.assertRaises(upstream_parse.DriftError):
+            upstream_parse.body_issues(123)
 
 
 class FillAndCheckCommandTest(unittest.TestCase):
@@ -612,7 +616,7 @@ class FillAndCheckCommandTest(unittest.TestCase):
         page = f"{API}/pulls?state=all&sort=recentupdate&limit=50&page=1"
         candidate = forge.answers[page][0]
         candidate["title"] = forge.answers[f"{API}/pulls/10"]["title"]
-        candidate["files"] = [f"other-{n}.c" for n in range(upstream_links.MAX_FILE_ROWS + 1)]
+        candidate["files"] = [f"other-{n}.c" for n in range(upstream_forge.MAX_FILE_ROWS + 1)]
         self.assertEqual(run_cli(self.root, forge, "check")[0], 1)
         rc, out, err = run_cli(self.root, forge, "fill")
         self.assertEqual((rc, err), (0, ""))
@@ -644,7 +648,7 @@ class FillAndCheckCommandTest(unittest.TestCase):
         entries = json.loads((root / "upstream-contributions.json").read_text(encoding="utf-8"))[
             "contributions"
         ]
-        targets = upstream_links._fill_targets(entries, args.pull)
+        targets = upstream_fills._fill_targets(entries, args.pull)
         self.assertTrue(args.dry_run)
         self.assertTrue(match.group(1).startswith("python3 scripts/upstream_links.py "))
         self.assertEqual(len(targets), 2)
@@ -669,7 +673,7 @@ class FillAndCheckCommandTest(unittest.TestCase):
                 "urlopen",
                 side_effect=http.client.HTTPException("planted protocol error"),
             ):
-                rc, out, err = run_cli(self.root, upstream_links.fetch_forge, command)
+                rc, out, err = run_cli(self.root, upstream_forge.fetch_forge, command)
             self.assertEqual((rc, out), (2, ""))
             self.assertIn(f"{API}/pulls/10", err)
             self.assertIn("planted protocol error", err)
@@ -786,8 +790,8 @@ class FillAndCheckCommandTest(unittest.TestCase):
             }
         )
         with (
-            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 1),
-            unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
+            unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 1),
+            unittest.mock.patch.object(upstream_forge, "MAX_FILE_PAGES", 1),
         ):
             rc, out, err = run_cli(self.root, forge, "check")
         self.assertEqual((rc, out), (2, ""))
@@ -842,17 +846,17 @@ class RequestCostTest(unittest.TestCase):
         """Direct fill shares one candidate scan and file memo across all own pulls."""
         forge = FakeForge(self.answers)
         with unittest.mock.patch("time.sleep") as pause, contextlib.redirect_stdout(io.StringIO()):
-            upstream_links.fill_manifest(self.root, forge, today=TODAY)
+            upstream_fills.fill_manifest(self.root, forge, today=TODAY)
         self.assertEqual(len(forge.read), 12)
         self.assertEqual(pause.call_count, 12)
-        pause.assert_called_with(upstream_links.REQUEST_PAUSE_SECONDS)
+        pause.assert_called_with(upstream_forge.REQUEST_PAUSE_SECONDS)
         self.assertEqual(len(forge.read), len(set(forge.read)))
         self.assertEqual(forge.read.count(self.page), 1)
         rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"]
         self.assertTrue(all(len(row["related"]) == 5 for row in rows[:3]))
         second = FakeForge(self.answers)
         with unittest.mock.patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
-            upstream_links.fill_manifest(self.root, second, today=TODAY)
+            upstream_fills.fill_manifest(self.root, second, today=TODAY)
         self.assertEqual(second.read, forge.read)
 
     def test_cli_fill_reads_each_address_once(self) -> None:
@@ -872,7 +876,7 @@ class RequestCostTest(unittest.TestCase):
             url = f"{API}/pulls?state=all&sort=recentupdate&limit=2&page={page}"
             answers[url] = self.candidates[(page - 1) * 2 : page * 2]
         before = self.path.read_bytes()
-        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+        with unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2):
             forge = FakeForge(answers)
             with unittest.mock.patch.object(upstream_links, "request_cap", return_value=13):
                 rc, out, err = run_cli(self.root, forge, "fill")
@@ -887,7 +891,7 @@ class RequestCostTest(unittest.TestCase):
     def test_check_skips_files_for_already_recorded_candidates(self) -> None:
         """Check leaves recorded candidates unfetched while preserving an unrecorded overlap."""
         with unittest.mock.patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
-            upstream_links.fill_manifest(self.root, FakeForge(self.answers), today=TODAY)
+            upstream_fills.fill_manifest(self.root, FakeForge(self.answers), today=TODAY)
         forge = FakeForge(self.answers)
         self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
         self.assertEqual(len(forge.read), 7)
@@ -907,7 +911,7 @@ class RequestCostTest(unittest.TestCase):
     def test_recorded_for_one_target_still_checks_other_targets(self) -> None:
         """A candidate recorded for one pull still needs files for another pull."""
         with unittest.mock.patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
-            upstream_links.fill_manifest(self.root, FakeForge(self.answers), today=TODAY)
+            upstream_fills.fill_manifest(self.root, FakeForge(self.answers), today=TODAY)
         data = json.loads(self.path.read_text(encoding="utf-8"))
         data["contributions"][1]["related"] = []
         self.path.write_text(json.dumps(data), encoding="utf-8")
@@ -979,7 +983,7 @@ class RequestCostTest(unittest.TestCase):
             self.assertIn("count 9", err)
             self.assertIn("cap 8", err)
             self.assertEqual(len(forge.read), 8)
-            self.assertEqual(pauses, [upstream_links.REQUEST_PAUSE_SECONDS] * 8)
+            self.assertEqual(pauses, [upstream_forge.REQUEST_PAUSE_SECONDS] * 8)
             self.assertEqual(self.path.read_bytes(), before)
 
     def test_elapsed_budget_stops_before_and_after_slow_requests(self) -> None:
@@ -987,20 +991,20 @@ class RequestCostTest(unittest.TestCase):
         for elapsed in (270.0, 301.0):
             clock = unittest.mock.Mock(side_effect=[0.0, elapsed, elapsed, elapsed])
             fetch, pause = unittest.mock.Mock(return_value=[]), unittest.mock.Mock()
-            with unittest.mock.patch.object(upstream_links.time, "monotonic", clock):
-                request = upstream_links.RequestBudget(fetch, 10, pause)
-                with self.assertRaisesRegex(upstream_links.DriftError, "incomplete scan.*300"):
+            with unittest.mock.patch.object(upstream_forge.time, "monotonic", clock):
+                request = upstream_forge.RequestBudget(fetch, 10, pause)
+                with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan.*300"):
                     request("https://example.invalid/slow")
             fetch.assert_not_called()
             pause.assert_not_called()
         with unittest.mock.patch.object(
-            upstream_links.time, "monotonic", side_effect=[0.0, 0.0, 0.5, 301.0]
+            upstream_forge.time, "monotonic", side_effect=[0.0, 0.0, 0.5, 301.0]
         ):
-            request = upstream_links.RequestBudget(fetch, 10, pause)
-            with self.assertRaisesRegex(upstream_links.DriftError, "incomplete scan"):
+            request = upstream_forge.RequestBudget(fetch, 10, pause)
+            with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan"):
                 request("https://example.invalid/slow")
         fetch.assert_called_once()
-        pause.assert_called_once_with(upstream_links.REQUEST_PAUSE_SECONDS)
+        pause.assert_called_once_with(upstream_forge.REQUEST_PAUSE_SECONDS)
 
     def test_elapsed_budget_interrupts_a_fetch_that_never_returns(self) -> None:
         """A blocked injected fetch cannot keep the scan alive past its elapsed budget."""
@@ -1015,15 +1019,15 @@ class RequestCostTest(unittest.TestCase):
 
         try:
             with (
-                unittest.mock.patch.object(upstream_links, "SCAN_BUDGET_SECONDS", 0.05),
-                unittest.mock.patch.object(upstream_links, "REQUEST_TIMEOUT", 0),
-                unittest.mock.patch.object(upstream_links, "REQUEST_PAUSE_SECONDS", 0),
+                unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 0.05),
+                unittest.mock.patch.object(upstream_forge, "REQUEST_TIMEOUT", 0),
+                unittest.mock.patch.object(upstream_forge, "REQUEST_PAUSE_SECONDS", 0),
             ):
-                request = upstream_links.RequestBudget(blocked, 2, lambda _: None)
-                start = upstream_links.time.monotonic()
-                with self.assertRaisesRegex(upstream_links.DriftError, "incomplete scan"):
+                request = upstream_forge.RequestBudget(blocked, 2, lambda _: None)
+                start = upstream_forge.time.monotonic()
+                with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan"):
                     request("https://example.invalid/blocked")
-                self.assertLess(upstream_links.time.monotonic() - start, 1)
+                self.assertLess(upstream_forge.time.monotonic() - start, 1)
                 self.assertTrue(entered.is_set())
         finally:
             release.set()
@@ -1032,10 +1036,10 @@ class RequestCostTest(unittest.TestCase):
         """A queued request at expiry cannot replace the incomplete-scan error during cleanup."""
         forge = FakeForge(self.answers)
         with (
-            unittest.mock.patch.object(upstream_links.threading.Thread, "start"),
-            unittest.mock.patch.object(upstream_links, "SCAN_BUDGET_SECONDS", 0.05),
-            unittest.mock.patch.object(upstream_links, "REQUEST_TIMEOUT", 0),
-            unittest.mock.patch.object(upstream_links, "REQUEST_PAUSE_SECONDS", 0),
+            unittest.mock.patch.object(upstream_forge.threading.Thread, "start"),
+            unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 0.05),
+            unittest.mock.patch.object(upstream_forge, "REQUEST_TIMEOUT", 0),
+            unittest.mock.patch.object(upstream_forge, "REQUEST_PAUSE_SECONDS", 0),
         ):
             rc, _, err = run_cli(self.root, forge, "check")
         self.assertEqual(rc, 2)
@@ -1047,7 +1051,7 @@ class RequestCostTest(unittest.TestCase):
         before = self.path.read_bytes()
         for command in ("fill", "check"):
             forge = FakeForge(self.answers)
-            with unittest.mock.patch.object(upstream_links.time, "monotonic", side_effect=[0, 301]):
+            with unittest.mock.patch.object(upstream_forge.time, "monotonic", side_effect=[0, 301]):
                 rc, _, err = run_cli(self.root, forge, command)
             self.assertEqual(rc, 2)
             self.assertIn("incomplete scan", err)
@@ -1068,7 +1072,7 @@ class RequestCostTest(unittest.TestCase):
                 rc = upstream_links.main(args, fetch=forge, today=TODAY, sleep=pauses.append)
             self.assertIn(rc, (0, 1))
             self.assertEqual(len(forge.read), 12)
-            self.assertEqual(pauses, [upstream_links.REQUEST_PAUSE_SECONDS] * 12)
+            self.assertEqual(pauses, [upstream_forge.REQUEST_PAUSE_SECONDS] * 12)
 
     def test_fill_pull_limits_manifest_rows_and_deduplicates(self) -> None:
         """Repeatable --pull limits writes and detail reads to eligible named manifest rows."""
@@ -1152,7 +1156,7 @@ class MeasuredWindowTest(unittest.TestCase):
                 self.assertEqual(len(forge.read), 2 + 12 + 2 + 503)
                 self.assertEqual(len(forge.read), len(set(forge.read)))
                 self.assertEqual(pauses, [0.5] * 519)
-                self.assertLessEqual(len(forge.read), upstream_links.request_cap(2))
+                self.assertLessEqual(len(forge.read), upstream_scans.request_cap(2))
                 self.assertIn("1000", out)
                 self.assertTrue(
                     all(
@@ -1228,22 +1232,22 @@ class MeasuredWindowTest(unittest.TestCase):
             f"{API}/pulls/101/files?limit=50&page=1": [{"filename": "other.c"}],
         }
         with (
-            unittest.mock.patch.object(upstream_links, "MAX_PULL_PAGES", 1),
-            unittest.mock.patch.object(upstream_links, "MAX_CANDIDATES", 1),
-            unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
+            unittest.mock.patch.object(upstream_scans, "MAX_PULL_PAGES", 1),
+            unittest.mock.patch.object(upstream_scans, "MAX_CANDIDATES", 1),
+            unittest.mock.patch.object(upstream_scans, "MAX_FILE_PAGES", 1),
         ):
-            self.assertEqual(upstream_links.request_cap(1), 4)
+            self.assertEqual(upstream_scans.request_cap(1), 4)
             for command in ("fill", "check"):
                 forge, pauses = FakeForge(answers), []
-                request = upstream_links.RequestBudget(
-                    forge, upstream_links.request_cap(1), pauses.append
+                request = upstream_forge.RequestBudget(
+                    forge, upstream_scans.request_cap(1), pauses.append
                 )
                 with contextlib.redirect_stdout(io.StringIO()):
                     if command == "fill":
-                        upstream_links.fill_manifest(self.root, request, dry_run=True, today=TODAY)
+                        upstream_fills.fill_manifest(self.root, request, dry_run=True, today=TODAY)
                     else:
                         upstream_links.check_overlaps(self.root, [], request, today=TODAY)
-                with self.assertRaises(upstream_links.DriftError) as caught:
+                with self.assertRaises(upstream_parse.DriftError) as caught:
                     request("https://example.invalid/one-too-many")
                 message = str(caught.exception)
                 self.assertIn("count 5, cap 4", message)
@@ -1299,7 +1303,7 @@ class FillAgeWindowTest(unittest.TestCase):
         """Stop before old updates, warn only for the old own pull and persist proven links."""
         for flags in (("--dry-run",), ()):
             forge, pauses = FakeForge(self.answers), []
-            with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+            with unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2):
                 rc, out, err = run_cli(
                     self.root, forge, "fill", *flags, sleep=pauses.append, keep_progress=True
                 )
@@ -1341,7 +1345,7 @@ class FillAgeWindowTest(unittest.TestCase):
 
     def test_age_notice_alone_preserves_bytes_without_taking_a_lock(self) -> None:
         """Diagnostics alone cannot rewrite an unchanged manifest or fail on a stale lock."""
-        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+        with unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2):
             self.assertEqual(run_cli(self.root, FakeForge(self.answers), "fill")[0], 0)
         data = json.loads(self.path.read_bytes())
         self.path.write_text(json.dumps(data, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -1350,8 +1354,8 @@ class FillAgeWindowTest(unittest.TestCase):
         lock.write_bytes(b"existing lock")
         for flags in (("--dry-run",), ()):
             with (
-                unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
-                unittest.mock.patch.object(upstream_links.os, "replace") as replace,
+                unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2),
+                unittest.mock.patch.object(upstream_fills.os, "replace") as replace,
             ):
                 rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill", *flags)
             self.assertEqual((rc, err), (0, ""))
@@ -1363,7 +1367,7 @@ class FillAgeWindowTest(unittest.TestCase):
     def test_single_old_pull_uses_same_age_boundary(self) -> None:
         """Selecting only an old pull still terminates at the bounded fill window."""
         forge = FakeForge(self.answers)
-        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+        with unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2):
             rc, out, err = run_cli(self.root, forge, "fill", "--pull", "10", keep_progress=True)
         self.assertEqual((rc, err), (0, ""))
         self.assertEqual(len(forge.read), 6)
@@ -1386,11 +1390,11 @@ class FillAgeWindowTest(unittest.TestCase):
         write_manifest(self.root, [manifest_entry(10, related=[previous]), manifest_entry(20)])
         forge = FakeForge(self.answers)
         with (
-            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+            unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2),
             unittest.mock.patch("time.sleep"),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            lines = upstream_links.fill_manifest(self.root, forge, today=TODAY)
+            lines = upstream_fills.fill_manifest(self.root, forge, today=TODAY)
         self.assertEqual(len(forge.read), 8)
         self.assertEqual(sum("not read" in line for line in lines[:3]), 1)
         data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -1402,7 +1406,7 @@ class FillAgeWindowTest(unittest.TestCase):
         """An own opening equal to the cutoff has no omitted eligible update interval."""
         self.answers[f"{API}/pulls/10"] = forge_pull(10, "2026-10-29")
         forge = FakeForge(self.answers)
-        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+        with unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2):
             rc, out, err = run_cli(self.root, forge, "fill")
         self.assertEqual((rc, err), (0, ""))
         self.assertNotIn("not read", out)
@@ -1414,9 +1418,9 @@ class FillAgeWindowTest(unittest.TestCase):
         self.answers[self.page + "1"] = [forge_pull(101) | {"files": ["other.c", "extra.c"]}]
         forge = FakeForge(self.answers)
         with (
-            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
+            unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2),
             unittest.mock.patch.object(upstream_links, "MAX_CANDIDATES", 1),
-            unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 1),
+            unittest.mock.patch.object(upstream_forge, "MAX_FILE_ROWS", 1),
             unittest.mock.patch.object(upstream_links.upstream_drift, "MAX_SERIES_ENTRIES", 1),
         ):
             rc, out, err = run_cli(self.root, forge, "fill")
@@ -1431,7 +1435,7 @@ class FillAgeWindowTest(unittest.TestCase):
         """Widening the option admits additional old updates without implying full coverage."""
         self.answers[self.page + "2"] = [forge_pull(103, updated="2026-10-20")]
         forge = FakeForge(self.answers)
-        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+        with unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2):
             rc, out, err = run_cli(
                 self.root, forge, "fill", "--max-age-days", "30", keep_progress=True
             )
@@ -1450,8 +1454,8 @@ class FillAgeWindowTest(unittest.TestCase):
         self.answers[self.page + "2"] = [forge_pull(103), forge_pull(104)]
         forge = FakeForge(self.answers)
         with (
-            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
-            unittest.mock.patch.object(upstream_links, "MAX_PULL_PAGES", 2),
+            unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2),
+            unittest.mock.patch.object(upstream_forge, "MAX_PULL_PAGES", 2),
         ):
             rc, out, err = run_cli(self.root, forge, "fill")
         self.assertEqual((rc, out), (2, ""))
@@ -1488,8 +1492,8 @@ class FillAgeWindowTest(unittest.TestCase):
         self.assertIn("calendar range", err)
         self.assertEqual(forge.read, [])
         for value in (True, 1.5, "14", None):
-            with self.assertRaises(upstream_links.DriftError):
-                upstream_links.fill_window(value, TODAY)
+            with self.assertRaises(upstream_parse.DriftError):
+                upstream_fills.fill_window(value, TODAY)
         self.assertEqual(forge.read, [])
 
     def test_nightly_old_snapshot_keeps_its_window_and_does_not_write(self) -> None:
@@ -1503,7 +1507,7 @@ class FillAgeWindowTest(unittest.TestCase):
             forge_pull(102, "2026-06-01", "2026-06-23"),
         ]
         forge = FakeForge(self.answers)
-        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2):
+        with unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2):
             rc, out, err = run_cli(self.root, forge, "check", keep_progress=True)
         self.assertEqual((rc, err), (1, ""))
         self.assertEqual(
@@ -1683,9 +1687,9 @@ class ForgeFileCountTest(unittest.TestCase):
                 )
             answers[self.page.replace("limit=50", "limit=2")] = answers.pop(self.page)
             with (
-                unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
-                unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 2),
-                unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
+                unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2),
+                unittest.mock.patch.object(upstream_forge, "MAX_FILE_ROWS", 2),
+                unittest.mock.patch.object(upstream_forge, "MAX_FILE_PAGES", 1),
             ):
                 rc, out, err = run_cli(self.root, FakeForge(answers), "check")
             self.assertEqual((rc, err), (1, ""))
@@ -1700,8 +1704,8 @@ class ForgeFileCountTest(unittest.TestCase):
     def test_internal_names_remain_separate_from_forge_counts(self) -> None:
         """Keep internal files fixtures usable without interpreting changed_files as names."""
         raw = {"number": 10, "author": "owner", "title": "component: change"}
-        self.assertEqual(upstream_links.normalize_item(raw | {"files": ["a.c"]})["files"], ["a.c"])
-        self.assertEqual(upstream_links.normalize_item(raw | {"changed_files": 15})["files"], [])
+        self.assertEqual(upstream_forge.normalize_item(raw | {"files": ["a.c"]})["files"], ["a.c"])
+        self.assertEqual(upstream_forge.normalize_item(raw | {"changed_files": 15})["files"], [])
 
 
 class OversizedCandidateTest(unittest.TestCase):
@@ -1720,7 +1724,7 @@ class OversizedCandidateTest(unittest.TestCase):
         """Plant a long file listing followed by an independent overlapping candidate."""
         names = [f"other/{index}.c" for index in range(count)]
         if shared:
-            names[min(count, upstream_links.MAX_FILE_ROWS) - 1] = "shared.c"
+            names[min(count, upstream_forge.MAX_FILE_ROWS) - 1] = "shared.c"
         pulls = [forge_pull(101), forge_pull(102)]
         own = forge_pull(10)
         if inline:
@@ -1741,7 +1745,7 @@ class OversizedCandidateTest(unittest.TestCase):
 
     def test_oversized_paged_candidate_reports_overlap_in_read_prefix(self) -> None:
         """A cap-plus-one candidate still reports a shared file in its read prefix."""
-        forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1, shared=True)
+        forge = self.forge_with_files(upstream_forge.MAX_FILE_ROWS + 1, shared=True)
         rc, out, err = run_cli(self.root, forge, "check")
         self.assertEqual((rc, err), (1, ""))
         self.assertIn("10 101 bob same-files open", out)
@@ -1750,7 +1754,7 @@ class OversizedCandidateTest(unittest.TestCase):
 
     def test_oversized_inline_candidate_reports_overlap_in_read_prefix(self) -> None:
         """The metadata string reader also accepts bounded external file evidence."""
-        forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1, shared=True, inline=True)
+        forge = self.forge_with_files(upstream_forge.MAX_FILE_ROWS + 1, shared=True, inline=True)
         rc, out, err = run_cli(self.root, forge, "check")
         self.assertEqual((rc, err), (1, ""))
         self.assertIn("10 101 bob same-files open", out)
@@ -1758,7 +1762,7 @@ class OversizedCandidateTest(unittest.TestCase):
 
     def test_oversized_candidate_is_undecided_and_keeps_other_overlap(self) -> None:
         """An unread possible overlap stays visible and does not hide later candidates."""
-        forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1)
+        forge = self.forge_with_files(upstream_forge.MAX_FILE_ROWS + 1)
         last_page = f"{API}/pulls/101/files?limit=50&page=21"
         forge.answers[last_page] = [{"filename": "shared.c"}]
         rc, out, err = run_cli(self.root, forge, "check")
@@ -1773,7 +1777,7 @@ class OversizedCandidateTest(unittest.TestCase):
 
     def test_inline_nonmatch_is_undecided_without_extra_pages(self) -> None:
         """An oversized inline list is bounded and cannot become a silent nonmatch."""
-        forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1, inline=True)
+        forge = self.forge_with_files(upstream_forge.MAX_FILE_ROWS + 1, inline=True)
         rc, out, err = run_cli(self.root, forge, "check")
         self.assertEqual((rc, err), (1, ""))
         self.assertIn("10 101", out)
@@ -1786,7 +1790,7 @@ class OversizedCandidateTest(unittest.TestCase):
         """An undecided candidate cannot pass check or disappear on the next sighting."""
         before = self.path.read_bytes()
         for _ in range(2):
-            forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1)
+            forge = self.forge_with_files(upstream_forge.MAX_FILE_ROWS + 1)
             forge.answers[f"{API}/pulls/102/files?limit=50&page=1"] = []
             rc, out, err = run_cli(self.root, forge, "check")
             self.assertEqual((rc, err), (1, ""))
@@ -1798,7 +1802,7 @@ class OversizedCandidateTest(unittest.TestCase):
         """Both fill modes expose partial nonmatches and store only proven relations."""
         before = self.path.read_bytes()
         for flags in (("--dry-run",), ()):
-            forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1)
+            forge = self.forge_with_files(upstream_forge.MAX_FILE_ROWS + 1)
             rc, out, err = run_cli(self.root, forge, "fill", *flags)
             self.assertEqual((rc, err), (0, ""))
             self.assertIn("10 101", out)
@@ -1810,7 +1814,7 @@ class OversizedCandidateTest(unittest.TestCase):
         rows = json.loads(self.path.read_text(encoding="utf-8"))["contributions"]
         self.assertEqual([row["number"] for row in rows[0]["related"]], [102])
         rc, out, err = run_cli(
-            self.root, self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1), "check"
+            self.root, self.forge_with_files(upstream_forge.MAX_FILE_ROWS + 1), "check"
         )
         self.assertEqual((rc, err), (1, ""))
         self.assertIn("undecided", out)
@@ -1819,7 +1823,7 @@ class OversizedCandidateTest(unittest.TestCase):
     def test_exact_cap_inline_candidate_uses_normal_path(self) -> None:
         """A complete inline list exactly at the cap is a decided nonmatch or overlap."""
         for shared in (False, True):
-            forge = self.forge_with_files(upstream_links.MAX_FILE_ROWS, inline=True, shared=shared)
+            forge = self.forge_with_files(upstream_forge.MAX_FILE_ROWS, inline=True, shared=shared)
             rc, out, err = run_cli(self.root, forge, "check")
             self.assertEqual((rc, err), (1, ""))
             self.assertNotIn("undecided", out)
@@ -1835,7 +1839,7 @@ class OversizedCandidateTest(unittest.TestCase):
                 for n in range(start, start + 50)
             ]
         # The final page supplies the last two names while remaining shorter than PAGE_SIZE.
-        with unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 902):
+        with unittest.mock.patch.object(upstream_forge, "MAX_FILE_ROWS", 902):
             forge.answers[f"{API}/pulls/101/files?limit=50&page=10"] = [
                 {"filename": "last.c", "previous_filename": "last-old.c"}
             ]
@@ -1849,7 +1853,7 @@ class OversizedCandidateTest(unittest.TestCase):
         before = self.path.read_bytes()
         for inline in (False, True):
             forge = self.forge_with_files(
-                upstream_links.MAX_FILE_ROWS + 1, number=10, inline=inline
+                upstream_forge.MAX_FILE_ROWS + 1, number=10, inline=inline
             )
             rc, out, err = run_cli(self.root, forge, "fill")
             self.assertEqual((rc, out), (2, ""))
@@ -1862,7 +1866,7 @@ class OversizedCandidateTest(unittest.TestCase):
 
     def test_page_cap_is_partial_for_candidate_but_hard_for_own(self) -> None:
         """A full last permitted page is undecided only for an external pull."""
-        with unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1):
+        with unittest.mock.patch.object(upstream_forge, "MAX_FILE_PAGES", 1):
             forge = self.forge_with_files(51)
             rc, out, err = run_cli(self.root, forge, "check")
             self.assertEqual((rc, err), (1, ""))
@@ -1879,14 +1883,14 @@ class OversizedCandidateTest(unittest.TestCase):
     def test_oversized_requests_are_bounded_paced_and_budgeted(self) -> None:
         """Every retained candidate page consumes a paced request from the run budget."""
         for budget, expected in ((24, 1), (23, 2)):
-            forge, pauses = self.forge_with_files(upstream_links.MAX_FILE_ROWS + 1), []
+            forge, pauses = self.forge_with_files(upstream_forge.MAX_FILE_ROWS + 1), []
             with unittest.mock.patch.object(upstream_links, "request_cap", return_value=budget):
                 rc, out, err = run_cli(self.root, forge, "check", sleep=pauses.append)
             self.assertEqual(rc, expected)
             self.assertEqual(len(forge.read), budget)
-            self.assertEqual(pauses, [upstream_links.REQUEST_PAUSE_SECONDS] * budget)
+            self.assertEqual(pauses, [upstream_forge.REQUEST_PAUSE_SECONDS] * budget)
             file_pages = [url for url in forge.read[:24] if "/pulls/101/files?" in url]
-            self.assertEqual(len(file_pages), upstream_links.MAX_FILE_PAGES)
+            self.assertEqual(len(file_pages), upstream_forge.MAX_FILE_PAGES)
             if expected == 2:
                 self.assertEqual(out, "")
                 self.assertIn("count 24, cap 23", err)
@@ -1936,7 +1940,7 @@ class OversizedCandidateTest(unittest.TestCase):
             {"filename": "a.c", "previous_filename": "shared.c"},
             {"filename": "b.c", "previous_filename": "old-b.c"},
         ]
-        with unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 3):
+        with unittest.mock.patch.object(upstream_forge, "MAX_FILE_ROWS", 3):
             rc, out, err = run_cli(self.root, forge, "check")
         self.assertEqual((rc, err), (1, ""))
         self.assertIn("10 101 bob same-files open", out)
@@ -2225,7 +2229,7 @@ class FailClosedForgeTest(unittest.TestCase):
     def assert_published_with_leftover(self, suffix: str, *, both: bool = False) -> Path:
         """Require published bytes, every cleanup leftover and the distinct failure status."""
         unlink = Path.unlink
-        replace = upstream_links.os.replace
+        replace = upstream_fills.os.replace
         failed: list[Path] = []
 
         def publish(source: Path, target: Path) -> None:
@@ -2244,7 +2248,7 @@ class FailClosedForgeTest(unittest.TestCase):
 
         with (
             unittest.mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_cleanup),
-            unittest.mock.patch.object(upstream_links.os, "replace", side_effect=publish),
+            unittest.mock.patch.object(upstream_fills.os, "replace", side_effect=publish),
         ):
             rc, out, err = run_cli(self.root, FakeForge(self.answers), "fill")
         self.assertEqual((rc, err), (3, ""))
@@ -2269,19 +2273,19 @@ class FailClosedForgeTest(unittest.TestCase):
         """Advance a fake clock during sync and inspect publication and sibling cleanup."""
         self.path.write_bytes(self.before)
         now = [0.0]
-        fsync, replace = upstream_links.os.fsync, upstream_links.os.replace
+        fsync, replace = upstream_fills.os.fsync, upstream_fills.os.replace
 
         def sync(fd: int) -> None:
             """Finish real sync before moving the clock to the requested budget boundary."""
             fsync(fd)
-            now[0] = upstream_links.SCAN_BUDGET_SECONDS - remaining
+            now[0] = upstream_forge.SCAN_BUDGET_SECONDS - remaining
 
         with (
             unittest.mock.patch.object(
-                upstream_links.time, "monotonic", side_effect=lambda: now[0]
+                upstream_forge.time, "monotonic", side_effect=lambda: now[0]
             ),
-            unittest.mock.patch.object(upstream_links.os, "fsync", side_effect=sync),
-            unittest.mock.patch.object(upstream_links.os, "replace", wraps=replace) as publish,
+            unittest.mock.patch.object(upstream_fills.os, "fsync", side_effect=sync),
+            unittest.mock.patch.object(upstream_fills.os, "replace", wraps=replace) as publish,
         ):
             rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
         self.assertEqual(rc, expected, err)
@@ -2372,7 +2376,7 @@ class FailClosedForgeTest(unittest.TestCase):
         """A chmod failure returns the existing error status and never publishes bytes."""
         with (
             unittest.mock.patch.object(Path, "chmod", side_effect=OSError("planted chmod failure")),
-            unittest.mock.patch.object(upstream_links.os, "replace") as replace,
+            unittest.mock.patch.object(upstream_fills.os, "replace") as replace,
         ):
             rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
         self.assertEqual(rc, 2, err)
@@ -2383,8 +2387,8 @@ class FailClosedForgeTest(unittest.TestCase):
 
     def test_staging_stays_private_until_written_and_synced(self) -> None:
         """Staging stays private through writing and sync, then chmod precedes replacement."""
-        factory, fsync = tempfile.NamedTemporaryFile, upstream_links.os.fsync
-        chmod, replace = Path.chmod, upstream_links.os.replace
+        factory, fsync = tempfile.NamedTemporaryFile, upstream_fills.os.fsync
+        chmod, replace = Path.chmod, upstream_fills.os.replace
         events: list[str] = []
         self.path.chmod(0o640)
 
@@ -2426,9 +2430,9 @@ class FailClosedForgeTest(unittest.TestCase):
 
         with (
             unittest.mock.patch.object(tempfile, "NamedTemporaryFile", side_effect=prepare),
-            unittest.mock.patch.object(upstream_links.os, "fsync", side_effect=sync),
+            unittest.mock.patch.object(upstream_fills.os, "fsync", side_effect=sync),
             unittest.mock.patch.object(Path, "chmod", autospec=True, side_effect=set_mode),
-            unittest.mock.patch.object(upstream_links.os, "replace", side_effect=publish),
+            unittest.mock.patch.object(upstream_fills.os, "replace", side_effect=publish),
         ):
             rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill")
         self.assertEqual((rc, err), (0, ""))
@@ -2505,7 +2509,7 @@ class FailClosedForgeTest(unittest.TestCase):
 
         with (
             unittest.mock.patch.object(
-                upstream_links.os, "fsync", side_effect=OSError("planted sync")
+                upstream_fills.os, "fsync", side_effect=OSError("planted sync")
             ),
             unittest.mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_cleanup),
         ):
@@ -2622,7 +2626,7 @@ class FailClosedForgeTest(unittest.TestCase):
     def test_successful_atomic_write_is_synced_before_replace(self) -> None:
         """Publish complete bytes only after a sibling file was flushed and synced."""
         events: list[str] = []
-        replace = upstream_links.os.replace if hasattr(upstream_links, "os") else None
+        replace = upstream_fills.os.replace if hasattr(upstream_fills, "os") else None
 
         def sync(descriptor: int) -> None:
             """Record the sync before replacement while the destination still holds old bytes."""
@@ -2665,13 +2669,13 @@ class FailClosedForgeTest(unittest.TestCase):
     def test_clock_is_read_once_and_forge_seen_is_ignored(self) -> None:
         """Every fresh discovery date comes from one local UTC clock read."""
         self.candidate["seen"] = "2000-01-01"
-        real_clock = upstream_links.datetime
-        instant = real_clock(2026, 11, 12, tzinfo=upstream_links.UTC)
-        with unittest.mock.patch.object(upstream_links, "datetime", wraps=real_clock) as clock:
+        real_clock = upstream_parse.datetime
+        instant = real_clock(2026, 11, 12, tzinfo=upstream_parse.UTC)
+        with unittest.mock.patch.object(upstream_parse, "datetime", wraps=real_clock) as clock:
             clock.now.return_value = instant
             rc, _, err = run_cli(self.root, FakeForge(self.answers), "fill", today=None)
         self.assertEqual((rc, err), (0, ""))
-        clock.now.assert_called_once_with(upstream_links.UTC)
+        clock.now.assert_called_once_with(upstream_parse.UTC)
         row = json.loads(self.path.read_bytes())["contributions"][0]["related"][0]
         self.assertEqual(row["seen"], "2026-11-12")
 
@@ -2717,13 +2721,13 @@ class FailClosedForgeTest(unittest.TestCase):
         out = io.StringIO()
         with (
             unittest.mock.patch.object(
-                upstream_links.upstream_drift,
+                upstream_parse.upstream_drift,
                 "repo_api_url",
                 return_value="https://custom.invalid/api/v1/repos/Owner/Repo",
             ),
             contextlib.redirect_stdout(out),
         ):
-            self.assertEqual(upstream_links.body_issues(body), [1, 4])
+            self.assertEqual(upstream_parse.body_issues(body), [1, 4])
         self.assertIn("ignored 2 foreign issue addresses\n", out.getvalue())
 
     def test_invalid_forge_seen_is_not_stored(self) -> None:
@@ -2811,13 +2815,13 @@ class BoundedResponseTest(unittest.TestCase):
     def test_repeated_issue_tokens_have_a_scalar_limit(self) -> None:
         """Repeating one issue cannot evade the reference-loop ceiling."""
         body = "Fixes " + ", ".join(["#1"] * 1025)
-        with self.assertRaisesRegex(upstream_links.DriftError, "references.*1025"):
-            upstream_links.body_issues(body)
+        with self.assertRaisesRegex(upstream_parse.DriftError, "references.*1025"):
+            upstream_parse.body_issues(body)
 
     def test_repeated_issue_tokens_accept_limit_boundary(self) -> None:
         """Exactly 1024 references remain accepted and deduplicated."""
         body = "Fixes " + ", ".join(["#1"] * 1024)
-        self.assertEqual(upstream_links.body_issues(body), [1])
+        self.assertEqual(upstream_parse.body_issues(body), [1])
 
     def test_response_overflow_is_not_parsed(self) -> None:
         """Reject bytes above the ceiling before invoking the JSON decoder."""
@@ -2830,7 +2834,7 @@ class BoundedResponseTest(unittest.TestCase):
             unittest.mock.patch.object(drift.json, "loads", return_value={}) as decode,
             self.assertRaisesRegex(drift.DriftError, "response.*128"),
         ):
-            upstream_links.fetch_forge(f"{API}/pulls/101")
+            upstream_forge.fetch_forge(f"{API}/pulls/101")
         decode.assert_not_called()
 
     def test_duplicate_response_keys_are_rejected(self) -> None:
@@ -2845,9 +2849,9 @@ class BoundedResponseTest(unittest.TestCase):
 
     def test_issue_id_width_is_bounded(self) -> None:
         """Issue ID conversion rejects digits beyond the 20-digit ceiling."""
-        with self.assertRaisesRegex(upstream_links.DriftError, "issue number exceeds 20"):
-            upstream_links.body_issues("Fixes #" + "9" * 21)
-        self.assertEqual(upstream_links.body_issues("Fixes #" + "9" * 20), [int("9" * 20)])
+        with self.assertRaisesRegex(upstream_parse.DriftError, "issue number exceeds 20"):
+            upstream_parse.body_issues("Fixes #" + "9" * 21)
+        self.assertEqual(upstream_parse.body_issues("Fixes #" + "9" * 20), [int("9" * 20)])
 
     def test_response_object_key_ceiling_rejects_overflow(self) -> None:
         """Oversized JSON objects abort before any unbounded duplicate-key traversal."""
@@ -2888,12 +2892,12 @@ class BoundedMatcherInputTest(unittest.TestCase):
         for existing, fresh in ((rows, []), ([], rows)):
             with (
                 self.subTest(existing=bool(existing)),
-                self.assertRaisesRegex(upstream_links.DriftError, "related entries exceed"),
+                self.assertRaisesRegex(upstream_parse.DriftError, "related entries exceed"),
             ):
-                upstream_links.merge_related(existing, fresh)
-        self.assertEqual(upstream_links.merge_related(rows[:cap], []), rows[:cap])
-        self.assertEqual(upstream_links.merge_related([], rows[:cap]), rows[:cap])
-        self.assertEqual(upstream_links.merge_related([], []), [])
+                upstream_fills.merge_related(existing, fresh)
+        self.assertEqual(upstream_fills.merge_related(rows[:cap], []), rows[:cap])
+        self.assertEqual(upstream_fills.merge_related([], rows[:cap]), rows[:cap])
+        self.assertEqual(upstream_fills.merge_related([], []), [])
 
     def test_run_target_ceiling_is_checked_before_fetch(self) -> None:
         """A target above the scope cap errors while empty and exact-cap scopes still work."""
@@ -2906,27 +2910,27 @@ class BoundedMatcherInputTest(unittest.TestCase):
             }
         )
         with unittest.mock.patch.object(upstream_links.upstream_drift, "MAX_SERIES_ENTRIES", 1):
-            with self.assertRaisesRegex(upstream_links.DriftError, "targets exceed 1"):
-                upstream_links.read_run_pulls([target, target], forge)
+            with self.assertRaisesRegex(upstream_parse.DriftError, "targets exceed 1"):
+                upstream_scans.read_run_pulls([target, target], forge)
             self.assertEqual(forge.read, [])
-            own, candidates, _ = upstream_links.read_run_pulls([target], forge)
+            own, candidates, _ = upstream_scans.read_run_pulls([target], forge)
             self.assertEqual(len(own), 1)
             self.assertEqual(candidates, [])
-            self.assertEqual(upstream_links.read_run_pulls([], forge), ([], [], {}))
+            self.assertEqual(upstream_scans.read_run_pulls([], forge), ([], [], {}))
 
     def test_subject_ceiling_rejects_overflow_and_accepts_boundary(self) -> None:
         """Subject normalization cannot store text longer than the title ceiling."""
-        with self.assertRaisesRegex(upstream_links.DriftError, "subject exceeds 4096"):
-            upstream_links.subject_key("x" * 4097)
-        self.assertEqual(upstream_links.subject_key("X" * 4096), "x" * 4096)
-        self.assertEqual(upstream_links.subject_key("lib: short"), "short")
+        with self.assertRaisesRegex(upstream_parse.DriftError, "subject exceeds 4096"):
+            upstream_parse.subject_key("x" * 4097)
+        self.assertEqual(upstream_parse.subject_key("X" * 4096), "x" * 4096)
+        self.assertEqual(upstream_parse.subject_key("lib: short"), "short")
 
     def test_standalone_body_ceiling_is_not_bypassed(self) -> None:
         """The public issue extractor enforces its body bound independently of forge parsing."""
-        with self.assertRaisesRegex(upstream_links.DriftError, "body exceeds 262144"):
-            upstream_links.body_issues("x" * 262145)
-        self.assertEqual(upstream_links.body_issues("x" * 262144), [])
-        self.assertEqual(upstream_links.body_issues("Fixes #1"), [1])
+        with self.assertRaisesRegex(upstream_parse.DriftError, "body exceeds 262144"):
+            upstream_parse.body_issues("x" * 262145)
+        self.assertEqual(upstream_parse.body_issues("x" * 262144), [])
+        self.assertEqual(upstream_parse.body_issues("Fixes #1"), [1])
 
 
 if __name__ == "__main__":
@@ -2948,11 +2952,11 @@ class PaginationBoundaryTest(unittest.TestCase):
                 {f"{url}/files?limit=2&page=1": first, f"{url}/files?limit=2&page=2": tail}
             )
             with (
-                unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
-                unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 4),
-                unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 2),
+                unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2),
+                unittest.mock.patch.object(upstream_forge, "MAX_FILE_ROWS", 4),
+                unittest.mock.patch.object(upstream_forge, "MAX_FILE_PAGES", 2),
             ):
-                files = upstream_links.read_pull_files(url, forge, partial=True)
+                files = upstream_forge.read_pull_files(url, forge, partial=True)
             self.assertEqual(files, ["a", "b", "c", "d"])
             self.assertEqual(files.complete, not tail)
             self.assertEqual(len(forge.read), 2)
@@ -2962,11 +2966,11 @@ class PaginationBoundaryTest(unittest.TestCase):
         url = f"{API}/pulls/10"
         forge = FakeForge({f"{url}/files?limit=2&page=1": [{"filename": "a"}, {"filename": "b"}]})
         with (
-            unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 2),
-            unittest.mock.patch.object(upstream_links, "MAX_FILE_ROWS", 2),
-            unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
+            unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 2),
+            unittest.mock.patch.object(upstream_forge, "MAX_FILE_ROWS", 2),
+            unittest.mock.patch.object(upstream_forge, "MAX_FILE_PAGES", 1),
         ):
-            files = upstream_links.read_pull_files(url, forge, partial=True)
+            files = upstream_forge.read_pull_files(url, forge, partial=True)
         self.assertFalse(files.complete)
         self.assertEqual(len(forge.read), 1)
 
@@ -2978,7 +2982,7 @@ class ServerPaginationTest(unittest.TestCase):
         """Later changed files remain visible after a nonempty short first page."""
         batches = [[{"filename": "a.c"}], [{"filename": "shared.c"}], []]
         fetch = unittest.mock.Mock(side_effect=batches)
-        files = upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+        files = upstream_forge.read_pull_files(f"{API}/pulls/10", fetch)
         self.assertEqual(files, ["a.c", "shared.c"])
         self.assertTrue(files.complete)
         self.assertEqual(fetch.call_count, 3)
@@ -2986,7 +2990,7 @@ class ServerPaginationTest(unittest.TestCase):
     def test_short_pull_pages_without_headers_continue_to_empty(self) -> None:
         """Later candidate metadata remains visible after the server caps page size."""
         fetch = unittest.mock.Mock(side_effect=[[forge_pull(101)], [forge_pull(102)], []])
-        rows = upstream_links.read_candidate_pulls("2026-11-01", fetch)
+        rows = upstream_forge.read_candidate_pulls("2026-11-01", fetch)
         self.assertEqual([row["number"] for row in rows], [101, 102])
         self.assertEqual(fetch.call_count, 3)
 
@@ -3008,9 +3012,9 @@ class ServerPaginationTest(unittest.TestCase):
                 ]
                 fetch = unittest.mock.Mock(side_effect=pages)
                 if candidates:
-                    rows = upstream_links.read_candidate_pulls("2026-11-01", fetch)
+                    rows = upstream_forge.read_candidate_pulls("2026-11-01", fetch)
                 else:
-                    rows = upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+                    rows = upstream_forge.read_pull_files(f"{API}/pulls/10", fetch)
                 self.assertEqual(len(rows), 2)
                 self.assertEqual(fetch.call_count, 2)
 
@@ -3031,9 +3035,9 @@ class ServerPaginationTest(unittest.TestCase):
                     ]
                 )
                 if candidates:
-                    rows = upstream_links.read_candidate_pulls("2026-11-01", fetch)
+                    rows = upstream_forge.read_candidate_pulls("2026-11-01", fetch)
                 else:
-                    rows = upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+                    rows = upstream_forge.read_pull_files(f"{API}/pulls/10", fetch)
                 self.assertEqual(len(rows), 2)
                 self.assertEqual(fetch.call_count, 2)
 
@@ -3047,7 +3051,7 @@ class ServerPaginationTest(unittest.TestCase):
             "Unrelated": "ignored",
         }
         with unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer):
-            page = upstream_links.fetch_forge(f"{API}/pulls")
+            page = upstream_forge.fetch_forge(f"{API}/pulls")
         self.assertEqual(page, [])
         self.assertEqual(
             page.headers, {key: answer.headers[key] for key in ("Link", "X-Total-Count")}
@@ -3060,29 +3064,29 @@ class PaginationLimitTest(unittest.TestCase):
     def test_short_last_page_without_headers_is_incomplete(self) -> None:
         """Neither file nor candidate readers infer completion from a short final page."""
         with (
-            unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", 1),
-            unittest.mock.patch.object(upstream_links, "MAX_PULL_PAGES", 1),
+            unittest.mock.patch.object(upstream_forge, "MAX_FILE_PAGES", 1),
+            unittest.mock.patch.object(upstream_forge, "MAX_PULL_PAGES", 1),
         ):
             fetch = unittest.mock.Mock(return_value=[{"filename": "a.c"}])
-            files = upstream_links.read_pull_files(f"{API}/pulls/10", fetch, partial=True)
+            files = upstream_forge.read_pull_files(f"{API}/pulls/10", fetch, partial=True)
             self.assertFalse(files.complete)
             self.assertEqual(fetch.call_count, 1)
-            with self.assertRaisesRegex(upstream_links.DriftError, "exceeds 1 pages"):
-                upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+            with self.assertRaisesRegex(upstream_parse.DriftError, "exceeds 1 pages"):
+                upstream_forge.read_pull_files(f"{API}/pulls/10", fetch)
             fetch = unittest.mock.Mock(return_value=[forge_pull(101)])
-            with self.assertRaisesRegex(upstream_links.DriftError, "exceeds 1 pages"):
-                upstream_links.read_candidate_pulls("2026-11-01", fetch)
+            with self.assertRaisesRegex(upstream_parse.DriftError, "exceeds 1 pages"):
+                upstream_forge.read_candidate_pulls("2026-11-01", fetch)
             self.assertEqual(fetch.call_count, 1)
 
     def test_link_without_next_proves_completion_on_a_full_page(self) -> None:
         """A server's previous-only link ends either listing without another request."""
         headers = {"Link": '<https://example.invalid/page1>; rel="prev"'}
-        with unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 1):
+        with unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 1):
             fetch = unittest.mock.Mock(return_value=HeaderPage([{"filename": "a.c"}], headers))
-            self.assertTrue(upstream_links.read_pull_files(f"{API}/pulls/10", fetch).complete)
+            self.assertTrue(upstream_forge.read_pull_files(f"{API}/pulls/10", fetch).complete)
             self.assertEqual(fetch.call_count, 1)
             fetch = unittest.mock.Mock(return_value=HeaderPage([forge_pull(101)], headers))
-            self.assertEqual(len(upstream_links.read_candidate_pulls("2026-11-01", fetch)), 1)
+            self.assertEqual(len(upstream_forge.read_candidate_pulls("2026-11-01", fetch)), 1)
             self.assertEqual(fetch.call_count, 1)
 
     def assert_link_pages(self, link: str, *, continues: bool = False) -> None:
@@ -3093,15 +3097,15 @@ class PaginationLimitTest(unittest.TestCase):
                 fetch = unittest.mock.Mock(side_effect=[HeaderPage(batch, {"Link": link}), []])
                 cap = 2 if continues else 1
                 with (
-                    unittest.mock.patch.object(upstream_links, "PAGE_SIZE", 1),
-                    unittest.mock.patch.object(upstream_links, "MAX_FILE_PAGES", cap),
-                    unittest.mock.patch.object(upstream_links, "MAX_PULL_PAGES", cap),
+                    unittest.mock.patch.object(upstream_forge, "PAGE_SIZE", 1),
+                    unittest.mock.patch.object(upstream_forge, "MAX_FILE_PAGES", cap),
+                    unittest.mock.patch.object(upstream_forge, "MAX_PULL_PAGES", cap),
                 ):
                     if candidates:
-                        rows = upstream_links.read_candidate_pulls("2026-11-01", fetch)
+                        rows = upstream_forge.read_candidate_pulls("2026-11-01", fetch)
                         self.assertEqual([row["number"] for row in rows], [101])
                     else:
-                        rows = upstream_links.read_pull_files(f"{API}/pulls/10", fetch)
+                        rows = upstream_forge.read_pull_files(f"{API}/pulls/10", fetch)
                         self.assertEqual(rows, ["a.c"])
                         self.assertTrue(rows.complete)
                 self.assertEqual(fetch.call_count, cap)

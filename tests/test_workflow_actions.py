@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from scripts import upstream_links
+from scripts import upstream_links_forge as upstream_forge
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ACTION = ROOT / ".github/actions/setup-python/action.yml"
@@ -80,9 +80,9 @@ class WorkflowActionsTest(unittest.TestCase):
         )
         job = workflow["jobs"]["links"]
         self.assertNotIn("needs", job)
-        self.assertEqual(job["timeout-minutes"] * 60, 2 * upstream_links.SCAN_BUDGET_SECONDS)
+        self.assertEqual(job["timeout-minutes"] * 60, 2 * upstream_forge.SCAN_BUDGET_SECONDS)
         self.assertLess(
-            upstream_links.SCAN_BUDGET_SECONDS + upstream_links.REQUEST_TIMEOUT,
+            upstream_forge.SCAN_BUDGET_SECONDS + upstream_forge.REQUEST_TIMEOUT,
             job["timeout-minutes"] * 60,
         )
 

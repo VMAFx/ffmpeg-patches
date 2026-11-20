@@ -125,6 +125,10 @@ classDef step fill:#111a35,stroke:#3b82f6,stroke-width:2px,color:#e2e8f0
 | `scripts/series.py` | `check`, `apply`, `export`, the `coverage` and `warnings` gates, the `contributions` table and release `notes` |
 | `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
 | `scripts/upstream_links.py` | Fills linked upstream issues and related pulls, and checks open pulls for overlaps |
+| `scripts/upstream_links_parse.py` | Parses upstream records, issue references and overlap evidence |
+| `scripts/upstream_links_forge.py` | Fetches forge pages within request and scan limits |
+| `scripts/upstream_links_scan.py` | Plans requests and inspects pull overlap candidates |
+| `scripts/upstream_links_manifest.py` | Fills and atomically publishes contribution manifests |
 | `scripts/consumer_stacks.py` | Applies each consumer's patch stack on top of the applied series |
 | `scripts/graph_check.py` | Reports conversion filters FFmpeg inserted on its own into a filtergraph |
 | `scripts/tonemap_parity.py` | Colour difference, time and VRAM of tone-map filter chains against `vf_libplacebo` (ADR-0002) |
