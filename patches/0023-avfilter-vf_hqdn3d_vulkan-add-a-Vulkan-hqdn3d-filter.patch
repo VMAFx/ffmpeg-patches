@@ -151,7 +151,7 @@ index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..20fd10c7f159d3450599317937944a81
  @section hwdownload
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index a8e9bc59e7305f19912b413c03367724f1f12d4c..38d39d201689bda9164e885366cce28fbc98aaee 100644
+index ac3885ec53d9168b957609e2534b2bb591c521ab..cfef04a371792550fc891780828a784f79525998 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -346,7 +346,8 @@ OBJS-$(CONFIG_HFLIP_FILTER)                  += vf_hflip.o
@@ -164,9 +164,9 @@ index a8e9bc59e7305f19912b413c03367724f1f12d4c..38d39d201689bda9164e885366cce28f
  OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
  OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
  OBJS-$(CONFIG_HSVHOLD_FILTER)                += vf_hsvkey.o
-@@ -689,6 +690,7 @@ TESTPROGS = bt2408_hable drawutils filtfmts formats integral zscale_light_levels
+@@ -689,6 +690,7 @@ TOOLS     = graph2dot
+ TESTPROGS = bt2408_hable drawutils filtfmts formats integral zscale_light_levels
  
- TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
  TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
 +TESTPROGS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_vulkan
  
