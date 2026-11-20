@@ -16,7 +16,7 @@ import unittest
 import unittest.mock
 from collections.abc import Callable
 
-from scripts import push_guard, signoff
+from scripts import push_guard
 from tests.helpers import GIT_ENVIRONMENT_NAMES, capture_main
 from tests.helpers import isolated_git_environment as without_repository_variables
 from tests.test_signoff import GitFixture
@@ -127,7 +127,7 @@ def config_guard(
 class ConfigModeTest(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate PR policy unit tests from the separately tested local sign-off reader."""
-        checker = unittest.mock.patch.object(signoff, "check_commits", return_value=None)
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
 
@@ -415,7 +415,7 @@ class ConfigDeadlineTest(unittest.TestCase):
 class ConfigReaderTest(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate remote configuration fixtures and mock the independent sign-off check."""
-        checker = unittest.mock.patch.object(signoff, "check_commits", return_value=None)
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
         # Hooks export GIT_DIR and friends; without this, fixtures would write to the caller's
@@ -629,7 +629,7 @@ def raw_config_reader(cwd: str) -> dict[str, list[str]]:
 class PushGuardTest(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate PR policy unit tests from the separately tested local sign-off reader."""
-        checker = unittest.mock.patch.object(signoff, "check_commits", return_value=None)
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
 
@@ -775,7 +775,7 @@ class BotReviewBodyTest(unittest.TestCase):
 
     def setUp(self) -> None:
         """Isolate PR policy unit tests from the separately tested local sign-off reader."""
-        checker = unittest.mock.patch.object(signoff, "check_commits", return_value=None)
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
 
@@ -1101,7 +1101,7 @@ class ReviewActivityReaderTest(unittest.TestCase):
 class StdinTest(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate PR policy unit tests from the separately tested local sign-off reader."""
-        checker = unittest.mock.patch.object(signoff, "check_commits", return_value=None)
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
 
@@ -1185,7 +1185,7 @@ class StdinTest(unittest.TestCase):
 class RemoteTest(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate PR policy unit tests from the separately tested local sign-off reader."""
-        checker = unittest.mock.patch.object(signoff, "check_commits", return_value=None)
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
 
@@ -1293,7 +1293,7 @@ class RemoteTest(unittest.TestCase):
 class APIReaderTest(unittest.TestCase):
     def setUp(self) -> None:
         """Keep mocked gh subprocess results separate from the local sign-off reader."""
-        checker = unittest.mock.patch.object(signoff, "check_commits", return_value=None)
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
 
@@ -1592,7 +1592,7 @@ class SignoffPushTest(GitFixture):
         """Deletion lines and tag refs bypass both sign-off and PR checks."""
         self.reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
         lines = update(local_sha=ZERO) + f"refs/tags/v1 {LOCAL} refs/tags/v1 {ZERO}\n"
-        with unittest.mock.patch.object(signoff, "check_commits") as checker:
+        with unittest.mock.patch.object(push_guard.signoff, "check_commits") as checker:
             self.assertEqual(self.run_guard(lines)[0], 0)
         checker.assert_not_called()
         self.reader.assert_not_called()
@@ -1614,7 +1614,9 @@ class SignoffPushTest(GitFixture):
         config = unittest.mock.Mock(
             return_value={"origin": [REMOTE, "https://github.com/other/repo"]}
         )
-        with unittest.mock.patch.object(signoff, "check_commits", return_value=None) as checker:
+        with unittest.mock.patch.object(
+            push_guard.signoff, "check_commits", return_value=None
+        ) as checker:
             self.assertEqual(config_guard(self.reader, config, update(local_sha=sha) * 2)[0], 0)
         self.assertEqual(checker.call_args_list, [unittest.mock.call(sha, ZERO)] * 2)
         self.assertEqual(self.reader.call_count, 4)

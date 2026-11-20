@@ -52,7 +52,7 @@ pre-commit:
 commit-msg:
   jobs:
     - name: signoff
-      run: sh .config/lefthook/python.sh scripts/signoff.py --message-file {1}
+      run: sh .config/lefthook/python.sh scripts/signoff.py --message-file '{1}'
 
 post-commit:
   commands:

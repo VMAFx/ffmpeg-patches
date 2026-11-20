@@ -190,7 +190,7 @@ class LefthookPushGuardTest(unittest.TestCase):
                     {
                         "name": "signoff",
                         "run": "sh .config/lefthook/python.sh scripts/signoff.py "
-                        "--message-file {1}",
+                        "--message-file '{1}'",
                     }
                 ]
             },
@@ -676,7 +676,7 @@ class LefthookPushGuardTest(unittest.TestCase):
                     if hook == "commit-msg" and field == "run":
                         self.assertEqual(
                             job.get(field),
-                            "sh .config/lefthook/python.sh scripts/signoff.py --message-file {1}",
+                            "sh .config/lefthook/python.sh scripts/signoff.py --message-file '{1}'",
                         )
                     else:
                         self.assertNotRegex(str(job.get(field, "")), r"\{\d+\}")
@@ -782,6 +782,14 @@ class LefthookPushGuardTest(unittest.TestCase):
 
 class LefthookSignoffTest(GitFixture):
     """Exercise an installed lefthook commit-msg hook with actual two-parent merges."""
+
+    def test_merge_hook_requires_signoff_with_space(self) -> None:
+        """Preserve a message-file argument containing spaces through the installed hook."""
+        repository = self.root / "repository with spaces"
+        repository.mkdir()
+        (self.root / ".git").rename(repository / ".git")
+        self.root = repository
+        self.test_merge_hook_requires_signoff()
 
     def test_merge_hook_requires_signoff(self) -> None:
         """Refuse a merge without sign-off and accept it with the sign-off option."""
