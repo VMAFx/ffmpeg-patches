@@ -1,4 +1,4 @@
-# Paperclip Operating Rules (VMAFx/ffmpeg-patches)
+# Paperclip Operating Rules (vidiko/ffmpeg-patches)
 
 ## Operating Contract
 
