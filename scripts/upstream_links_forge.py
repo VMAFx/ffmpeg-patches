@@ -112,7 +112,7 @@ class _ScanReader:
 def _fetch_worker(
     fetch: Fetch, cap: int, tasks: queue.Queue, answers: queue.Queue, closed: threading.Event
 ) -> None:
-    """Serve at most the admitted request count, stopping on closure or bounded idle time."""
+    """Serve bounded requests, forwarding Exception, KeyboardInterrupt and SystemExit to readers."""
     for _ in range(cap):
         if closed.is_set():
             return
@@ -124,7 +124,7 @@ def _fetch_worker(
             return
         try:
             answer = fetch(url)
-        except BaseException as exc:
+        except (Exception, KeyboardInterrupt, SystemExit) as exc:
             answer = exc
         answers.put_nowait(answer)
 
@@ -179,12 +179,29 @@ def _budgeted(fetch: Fetch, cap: int) -> RequestBudget:
 
 
 class _ForgePage(list):
-    """Keep selected pagination headers with a JSON list without changing its list interface."""
+    """Keep pagination headers with list rows; headers take part in equality between pages."""
+
+    __hash__ = list.__hash__
 
     def __init__(self, rows: list, headers: dict[str, str]) -> None:
         """Retain server evidence for the listing readers only."""
         super().__init__(rows)
         self.headers = headers
+
+    def __eq__(self, other: object) -> bool:
+        """Compare page rows and headers, or just rows for another list."""
+        if isinstance(other, _ForgePage):
+            return super().__eq__(other) and self.headers == other.headers
+        if isinstance(other, list):
+            return super().__eq__(other)
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        """Invert supported equality comparisons and defer other types."""
+        equal = self.__eq__(other)
+        if equal is NotImplemented:
+            return NotImplemented
+        return not equal
 
 
 def fetch_forge(url: str) -> dict | list:

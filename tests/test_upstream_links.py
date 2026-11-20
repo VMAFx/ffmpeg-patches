@@ -119,13 +119,7 @@ PLANTED_OTHER_25950_JSON = """{
 PLANTED_SCENE_SAD_FILES_JSON = '[{"filename": "tests/checkasm/scene_sad.c"}]'
 
 
-class HeaderPage(list):
-    """A fixture listing with explicit server pagination evidence."""
-
-    def __init__(self, rows: list, headers: dict[str, str]) -> None:
-        """Retain fixture headers independently of the listing's row count."""
-        super().__init__(rows)
-        self.headers = headers
+HeaderPage = upstream_forge._ForgePage
 
 
 class FakeForge:
@@ -1067,6 +1061,17 @@ class RequestCostTest(unittest.TestCase):
                 request("https://example.invalid/slow")
         fetch.assert_called_once()
         pause.assert_called_once_with(upstream_forge.REQUEST_PAUSE_SECONDS)
+
+    def test_worker_keyboard_interrupt_reaches_budget_caller_unchanged(self) -> None:
+        """An injected worker interrupt reaches the request caller as the same object."""
+        interrupt = KeyboardInterrupt("planted worker interrupt")
+        fetch = unittest.mock.Mock(side_effect=interrupt)
+        request = upstream_forge.RequestBudget(fetch, 1, lambda _: None)
+        self.addCleanup(request.reader.close)
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            request("https://example.invalid/interrupted")
+        self.assertIs(raised.exception, interrupt)
+        fetch.assert_called_once_with("https://example.invalid/interrupted")
 
     def test_elapsed_budget_interrupts_a_fetch_that_never_returns(self) -> None:
         """A blocked injected fetch cannot keep the scan alive past its elapsed budget."""
@@ -2264,6 +2269,18 @@ class FailClosedForgeTest(unittest.TestCase):
                     [10, 30],
                 )
 
+    def test_system_exit_during_write_cleans_staging(self) -> None:
+        """SystemExit during staging preserves old bytes and removes temporary siblings."""
+        interrupt = SystemExit(23)
+        with (
+            unittest.mock.patch.object(upstream_fills.os, "fsync", side_effect=interrupt),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            run_cli(self.root, FakeForge(self.answers), "fill")
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(list(self.root.iterdir()), [self.path])
+
     def test_keyboard_interrupt_during_write_cleans_staging(self) -> None:
         """KeyboardInterrupt inside a partial write preserves old bytes and cleans siblings."""
         factory = tempfile.NamedTemporaryFile
@@ -2997,6 +3014,37 @@ class BoundedMatcherInputTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForgePageEqualityTest(unittest.TestCase):
+    """Check header-aware page equality and compatibility with ordinary lists."""
+
+    def test_equal_rows_and_headers_are_equal(self) -> None:
+        """Two pages with equal rows and headers compare equal with both operators."""
+        first = HeaderPage([{"number": 1}], {"X-Total-Count": "1"})
+        second = HeaderPage([{"number": 1}], {"X-Total-Count": "1"})
+        self.assertTrue(first == second)
+        self.assertFalse(first != second)
+
+    def test_equal_rows_with_different_headers_are_unequal(self) -> None:
+        """Different pagination headers make pages unequal despite identical rows."""
+        first = HeaderPage([{"number": 1}], {"X-Total-Count": "1"})
+        second = HeaderPage([{"number": 1}], {"X-Total-Count": "2"})
+        self.assertFalse(first == second)
+        self.assertTrue(first != second)
+
+    def test_plain_lists_compare_rows_and_other_types_defer(self) -> None:
+        """List comparisons use rows while non-list comparisons return NotImplemented."""
+        page = HeaderPage([{"number": 1}], {"X-Total-Count": "1"})
+        self.assertTrue(page == [{"number": 1}])
+        self.assertFalse(page != [{"number": 1}])
+        self.assertFalse(page == [{"number": 2}])
+        self.assertTrue(page != [{"number": 2}])
+        empty = HeaderPage([], {})
+        self.assertFalse(empty == 0)
+        self.assertTrue(empty != 0)
+        self.assertIs(empty.__eq__(0), NotImplemented)
+        self.assertIs(empty.__ne__(0), NotImplemented)
 
 
 class PaginationBoundaryTest(unittest.TestCase):

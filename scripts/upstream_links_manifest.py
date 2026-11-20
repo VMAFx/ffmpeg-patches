@@ -212,7 +212,7 @@ def _raise_write_failure(error: BaseException, leftovers: list[str]) -> None:
 def _write_manifest_temp(
     path: Path, original: bytes, rendered: bytes, request: RequestBudget
 ) -> list[str]:
-    """Sync a sibling file and check original bytes and deadline before replacement."""
+    """Sync a sibling; defer Exception, KeyboardInterrupt and SystemExit until cleanup."""
     staging: Path | None = None
     leftovers: list[str] = []
     failure: BaseException | None = None
@@ -230,7 +230,7 @@ def _write_manifest_temp(
             raise DriftError(f"{path}: changed since read; no changes written")
         request.ensure_time()
         os.replace(staging, path)
-    except BaseException as exc:
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
         failure = exc
     finally:
         if staging is not None:
@@ -243,7 +243,7 @@ def _write_manifest_temp(
 def _replace_manifest(
     path: Path, original: bytes, rendered: bytes, request: RequestBudget
 ) -> list[str]:
-    """Serialize cooperating fills within the scan deadline and reject changed content."""
+    """Serialize fills; defer Exception, KeyboardInterrupt and SystemExit until lock cleanup."""
     request.ensure_time()
     lock = path.with_name(f".{path.name}.lock")
     try:
@@ -263,7 +263,7 @@ def _replace_manifest(
                 raise DriftError(f"{path}: changed since read; no changes written")
         leftovers.extend(_write_manifest_temp(path, original, rendered, request))
         published = True
-    except BaseException as exc:
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
         failure = exc
     finally:
         _cleanup_manifest_path(lock, leftovers)
