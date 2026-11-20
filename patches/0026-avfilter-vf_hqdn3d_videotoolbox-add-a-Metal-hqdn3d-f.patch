@@ -91,7 +91,7 @@ index 0a85746f13ce5de161588bc55691a94ea7637e8d..5584aacfb6dc17beaaba851646b6f309
  @section hqdn3d_vulkan
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 37c210380446026e543d1489223afb25297a1272..8d7568de568e0883c932f9e884d17f5505c9c36a 100644
+index 418da809cc0e7e8b67c81082dcad92725a99875d..7a32963404201eb6b58828679f971998480f3d7b 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -349,6 +349,10 @@ OBJS-$(CONFIG_HISTOGRAM_FILTER)              += vf_histogram.o
