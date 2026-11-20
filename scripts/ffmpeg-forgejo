@@ -314,13 +314,27 @@ print(sha)' \
   [ -z "$evidence" ] || require_claim_evidence "$evidence" "$live"
 }
 
-# check_base_and_dependencies SELF BODY BODY-FILE ARGS...: fetch bounded dependency heads, check both claim kinds, and clean up private files; return 80 for stale claims.
+# fetch_dependency_head NUMBER: append a private pull file and checker args in the caller's cleanup scope.
+fetch_dependency_head() {
+  local dependency="$1" response status file
+  [[ "$dependency" =~ ^[1-9][0-9]*$ ]] || die "base check: invalid dependency pull number: $dependency"
+  response="$(pull_status "$dependency")" || die "base check: cannot read dependency pull #$dependency"
+  status="${response%%$'\n'*}"
+  [ "$status" = 200 ] || die "base check: cannot read dependency pull #$dependency (HTTP $status)"
+  file="$(mktemp)" || die "base check: cannot create dependency pull file"
+  dependency_files+=("$file")
+  chmod 600 "$file" || die "base check: cannot protect dependency pull file"
+  printf '%s\n' "${response#*$'\n'}" >"$file" || die "base check: cannot write dependency pull file"
+  args+=(--dependency-json "$dependency=$file")
+}
+
+# check_base_and_dependencies SELF BODY BODY-FILE ARGS...: check claims with bounded fetches and 120-second checker deadlines; clean private files; stale claims return 80.
 check_base_and_dependencies() (
-  local self="$1" body="$2" body_file="$3" dependencies dependency response status file rc
+  local self="$1" body="$2" body_file="$3" dependencies dependency rc
   shift 3
   local -a args=("$@") numbers=() dependency_files=()
   trap 'rm -f -- "${dependency_files[@]}"' EXIT
-  if dependencies="$(python3 -I "${self%/*}/base_claims.py" "${args[@]}" --list-dependencies "$body_file" <<<"$body")"; then
+  if dependencies="$(timeout 120 python3 -I "${self%/*}/base_claims.py" "${args[@]}" --list-dependencies "$body_file" <<<"$body")"; then
     rc=0
   else
     rc=$?
@@ -331,18 +345,10 @@ check_base_and_dependencies() (
     readarray -t numbers <<<"$dependencies"
     [ "${#numbers[@]}" -le 8 ] || die "base check: too many dependency pulls"
     for dependency in "${numbers[@]}"; do
-      [[ "$dependency" =~ ^[1-9][0-9]*$ ]] || die "base check: invalid dependency pull number: $dependency"
-      response="$(pull_status "$dependency")" || die "base check: cannot read dependency pull #$dependency"
-      status="${response%%$'\n'*}"
-      [ "$status" = 200 ] || die "base check: cannot read dependency pull #$dependency (HTTP $status)"
-      file="$(mktemp)" || die "base check: cannot create dependency pull file"
-      dependency_files+=("$file")
-      chmod 600 "$file" || die "base check: cannot protect dependency pull file"
-      printf '%s\n' "${response#*$'\n'}" >"$file" || die "base check: cannot write dependency pull file"
-      args+=(--dependency-json "$dependency=$file")
+      fetch_dependency_head "$dependency"
     done
   fi
-  if python3 -I "${self%/*}/base_claims.py" "${args[@]}" "$body_file" <<<"$body"; then
+  if timeout 120 python3 -I "${self%/*}/base_claims.py" "${args[@]}" "$body_file" <<<"$body"; then
     return 0
   else
     rc=$?

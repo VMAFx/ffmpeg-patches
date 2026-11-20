@@ -37,7 +37,7 @@ DEPENDENCY_HEAD = re.compile(
     r"\b(?:head|ending\s+at|ends\s+at|tip)\b[\s:(]*([0-9a-f]{7,40})\b", re.IGNORECASE
 )
 DEPENDENCY_ANNOTATION = re.compile(
-    r"\s*(?:[,|]\s*)?(?:[a-z]+\s+)*(?:\([^()#&;]*"
+    r"\s*(?:[:,|]\s*)?(?:[a-z]+\s+)*(?:\([^()#&;]*"
     + DEPENDENCY_HEAD.pattern
     + r"[^()#&;]*\)+|"
     + DEPENDENCY_HEAD.pattern
@@ -129,7 +129,7 @@ def _dependency_head_is_historical(
 
 
 def _dependency_member_end(sentence: str, start: int, end: int) -> int:
-    """Consume only adjacent head annotations, leaving list separators and unrelated prose."""
+    """Consume adjacent colon or parenthesized heads, leaving list separators and prose."""
     cursor = start
     for _ in range(end - start + 1):
         annotation = DEPENDENCY_ANNOTATION.match(sentence, cursor, end)
@@ -140,7 +140,7 @@ def _dependency_member_end(sentence: str, start: int, end: int) -> int:
 
 
 def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]]:
-    """Yield led reference lists with each member's own head-span endpoint."""
+    """Yield reference lists with member-local colon or parenthesized head spans."""
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
     for index, first in enumerate(references):
         end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
@@ -174,33 +174,57 @@ def _reject_ambiguous_dependency_list(
         )
 
 
-def _dependency_list_claims(
-    sentence: str, members: list[tuple[re.Match[str], int]]
-) -> list[tuple[int, str | None]]:
-    """Pair member heads with local and lead history, retaining headless list numbers."""
-    heads = [
-        list(DEPENDENCY_HEAD.finditer(sentence, reference.end(), end)) for reference, end in members
-    ]
-    _reject_ambiguous_dependency_list(members, heads)
-    first = members[0][0]
+def _dependency_list_history(
+    sentence: str, first: re.Match[str], heads: list[re.Match[str]]
+) -> tuple[int, bool]:
+    """Locate the lead clause and judge history shared by every list member."""
     lead_start = _dependency_clause_start(sentence, 0, first.start())
-    lead_end = heads[0][0].start(1) if heads[0] else first.end()
+    lead_end = heads[0].start(1) if heads else first.end()
     boundary = next(CLAUSE_BREAK.finditer(sentence, first.end(), lead_end), None)
     lead = sentence[lead_start : boundary.start() if boundary else lead_end]
     historical = HISTORY_WORDS.search(lead) or re.search(r"\bpreviously\b", lead, re.IGNORECASE)
-    claims: list[tuple[int, str | None]] = []
+    return lead_start, bool(historical)
+
+
+def _current_dependency_heads(
+    sentence: str, members: list[tuple[re.Match[str], int]], heads: list[list[re.Match[str]]]
+) -> list[list[re.Match[str]]]:
+    """Filter member heads through unchanged clause history before ambiguity judgement."""
+    first = members[0][0]
+    lead_start, historical = _dependency_list_history(sentence, first, heads[0])
+    current = []
     for (reference, _), member_heads in zip(members, heads, strict=True):
+        clause_start = lead_start if reference is first else reference.start()
+        current.append(
+            [
+                head
+                for head in member_heads
+                if not historical
+                and not _dependency_head_is_historical(sentence, reference, head, clause_start)
+            ]
+        )
+    return current
+
+
+def _dependency_list_claims(
+    sentence: str, members: list[tuple[re.Match[str], int]]
+) -> list[tuple[int, str | None]]:
+    """Pair colon and parenthesized heads, judging history before list ambiguity."""
+    heads = [
+        list(DEPENDENCY_HEAD.finditer(sentence, reference.end(), end)) for reference, end in members
+    ]
+    current = _current_dependency_heads(sentence, members, heads)
+    if any(heads) and not any(current):
+        return []
+    _reject_ambiguous_dependency_list(members, heads)
+    claims: list[tuple[int, str | None]] = []
+    for (reference, _), member_heads in zip(members, current, strict=True):
         number = int(reference.group(1))
         if number == 0:
             continue
         if len(members) > 1:
             claims.append((number, None))
-        clause_start = lead_start if reference is first else reference.start()
-        for head in member_heads:
-            if not historical and not _dependency_head_is_historical(
-                sentence, reference, head, clause_start
-            ):
-                claims.append((number, head.group(1).lower()))
+        claims.extend((number, head.group(1).lower()) for head in member_heads)
     return claims
 
 

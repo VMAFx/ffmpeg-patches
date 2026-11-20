@@ -392,6 +392,81 @@ class BaseClaimsTest(unittest.TestCase):
             base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
         )
 
+    def test_dependency_list_colon_heads_belong_to_their_own_members(self) -> None:
+        """A colon on either list member preserves both reference and head pairs."""
+        for text in (
+            "Depends on #12: head aaaaaaa and #13 (head bbbbbbb)",
+            "Depends on #12 (head aaaaaaa) and #13: head bbbbbbb",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+                )
+
+    def test_dependency_cli_colon_heads_list_both_members(self) -> None:
+        """Listing prints both dependency numbers with a colon on either member."""
+        for text in (
+            "Depends on #12: head aaaaaaa and #13 (head bbbbbbb)",
+            "Depends on #12 (head aaaaaaa) and #13: head bbbbbbb",
+        ):
+            with self.subTest(text=text):
+                body = self.write_fixture("body.md", text)
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc, err = self.run_cli(
+                        "--merge-base", MERGE_BASE, "--list-dependencies", str(body)
+                    )
+                self.assertEqual((rc, err, stdout.getvalue()), (0, "", "12\n13\n"))
+
+    def test_dependency_cli_colon_heads_reject_stale_second_member(self) -> None:
+        """A matching first head cannot hide stale member thirteen across a colon."""
+        dependency = self.dependency_json()
+        for text in (
+            "Depends on #12: head aaaaaaa and #13 (head bbbbbbb)",
+            "Depends on #12 (head aaaaaaa) and #13: head bbbbbbb",
+        ):
+            with self.subTest(text=text):
+                body = self.write_fixture("body.md", text)
+                rc, err = self.run_cli(
+                    "--merge-base",
+                    MERGE_BASE,
+                    "--dependency-json",
+                    f"12={dependency}",
+                    "--dependency-json",
+                    f"13={dependency}",
+                    str(body),
+                )
+                self.assertEqual(rc, 1)
+                self.assertEqual(
+                    err, f"{body}: names head bbbbbbb of #13, the live head of #13 is {'a' * 40}\n"
+                )
+
+    def test_dependency_single_colon_head_is_preserved(self) -> None:
+        """A single colon-separated dependency head retains its original pairing."""
+        self.assertEqual(
+            base_claims.find_dependency_claims("Depends on #12: head aaaaaaa"), [(12, "aaaaaaa")]
+        )
+
+    def test_dependency_list_history_precedes_trailing_head_ambiguity(self) -> None:
+        """Historical reference and head clauses are ignored before ambiguity checks."""
+        for text in (
+            "Previously depends on #12 and #13 (head bbbbbbb)",
+            "Depends on #12 and #13 (previous head bbbbbbb)",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(base_claims.find_dependency_claims(text), [])
+
+    def test_dependency_cli_historical_lists_need_no_dependency_json(self) -> None:
+        """Historical lists pass check mode without any live dependency JSON mappings."""
+        for text in (
+            "Previously depends on #12 and #13 (head bbbbbbb)",
+            "Depends on #12 and #13 (previous head bbbbbbb)",
+        ):
+            with self.subTest(text=text):
+                body = self.write_fixture("body.md", text)
+                rc, err = self.run_cli("--merge-base", MERGE_BASE, str(body))
+                self.assertEqual((rc, err), (0, ""))
+
     def test_dependency_list_limit_boundary_and_duplicate_members(self) -> None:
         """Exactly the distinct limit and repeated list members remain accepted."""
         references = [f"#{number}" for number in range(1, base_claims.MAX_DEPENDENCIES + 1)]
@@ -569,6 +644,25 @@ class BaseClaimsTest(unittest.TestCase):
         rc, err = self.run_cli("--merge-base", MERGE_BASE, str(body))
         self.assertEqual(rc, 2)
         self.assertIn("#12", err)
+
+    def test_dependency_cli_missing_json_file_names_path(self) -> None:
+        """A supplied dependency JSON path that does not exist returns two with its path."""
+        body = self.write_fixture("body.md", "Depends on #12 head aaaaaaa")
+        missing = self.tmp / "missing-dependency.json"
+        rc, err = self.run_cli(
+            "--merge-base", MERGE_BASE, "--dependency-json", f"12={missing}", str(body)
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn(str(missing), err)
+
+    def test_dependency_cli_json_directory_names_path(self) -> None:
+        """A directory supplied as dependency JSON returns two and identifies the path."""
+        body = self.write_fixture("body.md", "Depends on #12 head aaaaaaa")
+        rc, err = self.run_cli(
+            "--merge-base", MERGE_BASE, "--dependency-json", f"12={self.tmp}", str(body)
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn(str(self.tmp), err)
 
     def test_dependency_cli_malformed_option(self) -> None:
         """Malformed dependency mappings and stdin paths return input errors."""
