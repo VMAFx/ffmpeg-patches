@@ -62,7 +62,7 @@ index 1c29a51458b99c37b541946dc15497d47028e9ac..06e09698a80ffd28c9c9b949c1639769
  
  Default is none.
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index a95be8532967122a6a7787aa422b2f47d15e45ab..3a63c4bb1705a0a7a6de73b87b052a840cffa115 100644
+index ffcb8a104f364dddeb16b72432a9f1506775d531..299e1ee523d64973299e562e33fac3083ee0d8be 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -538,7 +538,7 @@ OBJS-$(CONFIG_TLUT2_FILTER)                  += vf_lut2.o framesync.o
@@ -422,7 +422,7 @@ index c5be4b151025ef6d72fca55eb18680e46d77fb2b..deeb1f01574e4912a19ec159f106f3d2
      { "desat",        "desaturation strength", OFFSET(desat), AV_OPT_TYPE_DOUBLE, {.dbl = 2}, 0, DBL_MAX, FLAGS },
      { "peak",         "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index 51d7e83e9e6a809969174d3d4be8e5e8196d33ba..7600997367e61b44ea9f62d964a4b67b490821c1 100644
+index b2b71964a6a7fe36e97c5f3fb81c79f18e52a320..8ac421b78fbdf6ef9d5486f7f93073711210bbe3 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
 @@ -493,6 +493,10 @@ FATE_FILTER-yes += fate-filter-bt2408-hable

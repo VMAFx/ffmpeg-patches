@@ -35,7 +35,7 @@ index cfd3ce3ff4bbba3fc2c19dc81d73ee90eff2ae68..936173d2dc09e50d8f02e8a43afdd2a2
  colorspace @code{ipt-c2}) directly and applies the RPU reshape in the kernel.
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index df4d55c48d898a002d4c4aa75bd66b59827ee35a..80ef9a6c8b50c5884b754081b0d0797a35327881 100644
+index f96b507cec89f08f4d6e88562a53fd8f7666e0d3..dad31c9f1927d1464b7618d9cf59bb971366330a 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -547,7 +547,7 @@ OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
