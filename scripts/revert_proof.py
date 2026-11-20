@@ -100,15 +100,13 @@ class ProofConfig:
 
 
 def git_result(tree: Path, *args: str) -> upstream_lint.RunResult:
-    """Read stored Git objects, except checkout-free registration, with checked diagnostics."""
+    """Read stored Git objects without replace refs and check diagnostics."""
     options = (
         ["-c", "advice.graftFileDeprecated=false"]
         if args and args[0] in ("rev-parse", "diff-tree", "--no-optional-locks")
         else []
     )
-    # Worktree registration with --no-checkout reads no tree or blob content.
-    if not (args[:2] == ("worktree", "add") and "--no-checkout" in args):
-        options.append("--no-replace-objects")
+    options.append("--no-replace-objects")
     result = upstream_lint._run(["git", *options, *args], tree, timeout=GIT_TIMEOUT)
     if result.returncode != 0 or result.timed_out:
         detail = result.stdout.strip() or f"rc={result.returncode}"
@@ -473,7 +471,7 @@ def measure_scratch(
     commit: str | None = None,
     source_paths: list[str] | None = None,
 ) -> int | str:
-    """Measure in a full stored-object checkout with setup hooks disabled and always clean it."""
+    """Disable hooks for scratch registration and reset, measure stored objects, then clean up."""
     directory = Path(
         tempfile.mkdtemp(prefix="ffmpeg-revert-proof-", dir=scratch_parent(config.tree))
     )
@@ -482,9 +480,19 @@ def measure_scratch(
         scratch, config.commit, config.record, config.timeout, config.command
     )
     try:
-        git_out(config.tree, "worktree", "add", "--detach", "--no-checkout", str(scratch), head)
         hooks = directory / "empty-hooks"
         hooks.mkdir()
+        git_out(
+            config.tree,
+            "-c",
+            f"core.hooksPath={hooks}",
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            str(scratch),
+            head,
+        )
         git_out(
             scratch,
             "-c",

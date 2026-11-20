@@ -2291,13 +2291,39 @@ class MakeTargetsTest(unittest.TestCase):
         self.assertIn("SKIPPED", result.stderr)
 
     def test_lengths_local_working_tree_names_ci_scope(self) -> None:
-        """Verify the copied working-tree skip message describes conditional CI coverage."""
+        """Check conditional CI wording in a copied Makefile and restore clone bytes."""
+        makefile = self.clone / "Makefile"
+        self.addCleanup(makefile.write_bytes, makefile.read_bytes())
         shutil.copyfile(series.ROOT / "Makefile", self.clone / "Makefile")
         result = self.run_make("lengths-local")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SKIPPED", result.stderr)
         self.assertIn("series.py scope", result.stderr)
         self.assertNotIn("unconditionally", result.stderr)
+
+    def test_lengths_local_working_tree_restores_clone_makefile(self) -> None:
+        """The working-tree scope test restores committed clone bytes after its cleanups."""
+        makefile = self.clone / "Makefile"
+        self.addCleanup(makefile.write_bytes, makefile.read_bytes())
+        committed = subprocess.run(  # nosec B603 B607 - fixed read-only Git argv in a fixture clone.
+            ["git", "show", "HEAD:Makefile"],
+            cwd=self.clone,
+            env=series.git_env(),
+            capture_output=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Makefile").write_bytes(
+                (series.ROOT / "Makefile").read_bytes() + b"\n# Scope test isolation fixture.\n"
+            )
+            case = type(self)("test_lengths_local_working_tree_names_ci_scope")
+            result = unittest.TestResult()
+            with unittest.mock.patch.object(series, "ROOT", root):
+                case.run(result)
+            self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(makefile.read_bytes(), committed)
 
     def test_lengths_ci_text_matches_workflow_scope(self) -> None:
         """Keep local length-gate claims consistent with the workflow scope condition."""

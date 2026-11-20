@@ -336,9 +336,9 @@ class RevertProofScratchTest(RevertProofFixture):
         additions = 0
 
         def fail_second_add(argv: list[str], cwd: Path, *args: object, **kwargs: object):
-            """Fail creation before registration only for the reverted checkout."""
+            """Fail reverted registration after any per-command Git options."""
             nonlocal additions
-            if argv[:3] == ["git", "worktree", "add"]:
+            if "worktree" in argv and argv[argv.index("worktree") + 1] == "add":
                 additions += 1
                 if additions == 2:
                     return upstream_lint.RunResult(tuple(argv), 1, "reverted setup failed")
@@ -701,8 +701,8 @@ class RevertProofScratchTest(RevertProofFixture):
         removals = []
 
         def fail_before_add(argv: list[str], cwd: Path, *args: object, **kwargs: object):
-            """Reject worktree creation before Git registers any owned path."""
-            if argv[:3] == ["git", "worktree", "add"]:
+            """Reject registration after any per-command Git options."""
+            if "worktree" in argv and argv[argv.index("worktree") + 1] == "add":
                 return upstream_lint.RunResult(tuple(argv), 1, "original creation failure")
             if argv[:3] == ["git", "worktree", "remove"]:
                 removals.append(argv)
@@ -721,9 +721,9 @@ class RevertProofScratchTest(RevertProofFixture):
         real_run = upstream_lint._run
 
         def fail_after_add(argv: list[str], cwd: Path, *args: object, **kwargs: object):
-            """Create the real worktree then report a planted creation failure."""
+            """Report a planted failure after registration with per-command Git options."""
             result = real_run(argv, cwd, *args, **kwargs)
-            if argv[:3] == ["git", "worktree", "add"]:
+            if "worktree" in argv and argv[argv.index("worktree") + 1] == "add":
                 self.assertEqual(result.returncode, 0)
                 return upstream_lint.RunResult(tuple(argv), 1, "planted checkout failure")
             return result
@@ -1077,20 +1077,27 @@ class ScratchReviewRegressionTest(RevertProofFixture):
         cleanup.assert_not_called()
         self.assertFalse(directory.exists())
 
-    def test_scratch_creation_does_not_run_post_checkout_hook(self) -> None:
-        """Scratch setup suppresses hooks without changing hooks used by test commands."""
+    def test_scratch_creation_does_not_run_setup_hooks(self) -> None:
+        """Scratch setup suppresses checkout and reference hooks; test commands keep hooks."""
         fix = self.make_fix()
         marker = self.root / "hook-marker"
+        reference_marker = self.root / "reference-hook-marker"
         hooks = self.root / "hooks"
         hooks.mkdir()
         hook = hooks / "post-checkout"
         hook.write_text(f"#!/bin/sh\nprintf hook >> '{marker}'\n", encoding="ascii")
         hook.chmod(0o755)
+        reference_hook = hooks / "reference-transaction"
+        reference_hook.write_text(
+            f"#!/bin/sh\nprintf reference >> '{reference_marker}'\n", encoding="ascii"
+        )
+        reference_hook.chmod(0o755)
         run_git(self.tree, "config", "core.hooksPath", str(hooks), preserve_config=True)
         rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
         self.assertEqual(rc, 0, error)
         self.assertTrue(self.record_path.is_file())
         self.assertFalse(marker.exists())
+        self.assertFalse(reference_marker.exists())
         rc, _, error = self.run_cli(fix, ["git", "checkout", "--detach", "HEAD"])
         self.assertEqual(rc, 0, error)
         self.assertEqual(marker.read_text(encoding="ascii"), "hookhook")
