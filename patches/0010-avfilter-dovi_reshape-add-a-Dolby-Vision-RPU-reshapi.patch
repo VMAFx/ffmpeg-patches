@@ -37,17 +37,17 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 tests/ref/fate/filter-dovi-reshape
 
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index ce40cf3e65b6ced2e36988998dfc7312a587a840..8423f4cddbd1c92daf93acb0908c284864c80c9c 100644
+index ce40cf3e65b6ced2e36988998dfc7312a587a840..2b1494d42ba94a98d6f1b81e0028873f6a4adaa8 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -684,6 +684,7 @@ SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
+@@ -681,6 +681,7 @@ SKIPHEADERS-$(CONFIG_VAAPI)                  += vaapi_vpp.h stack_internal.h
+ SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
+ SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
+ 
++TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
  TOOLS     = graph2dot
  TESTPROGS = drawutils filtfmts formats integral
  
-+TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
- TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
- 
- TOOLS-$(CONFIG_LIBZMQ) += zmqsend
 diff --git a/libavfilter/dovi_reshape.c b/libavfilter/dovi_reshape.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..cb6faa138357736519201eebad3e333106ebff00
@@ -570,20 +570,20 @@ index 0000000000000000000000000000000000000000..8285ca116ac47e7ea7025659f9b6381e
 +    return fails != 0;
 +}
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index 1b04816f2f805590a4fd3ac83542d78628216ae0..84732a98a2bbfa8efcd241d81641acd715955f25 100644
+index 1b04816f2f805590a4fd3ac83542d78628216ae0..f85e9c9a283fed6a9dcf83872459a6b8ead3d594 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
-@@ -481,6 +481,10 @@ fate-filter-fps-down-eof-pass: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:eo
- fate-filter-fps-start-drop: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:start_time=1.5
- fate-filter-fps-start-fill: CMD = framecrc -lavfi testsrc2=r=7:d=1.5,setpts=PTS+14,fps=3:start_time=1.5
+@@ -1,6 +1,10 @@
+ # Contains the requirements added implicitly if CMD is video_filter.
+ VIDEO_FILTER = $(call ALLYES, $(1:%=%_FILTER) $(2) FILE_PROTOCOL IMAGE2_DEMUXER PGMYUV_DECODER RAWVIDEO_ENCODER NUT_MUXER MD5_PROTOCOL)
  
 +FATE_FILTER-$(CONFIG_DOVI_RESHAPE_FILTER) += fate-filter-dovi-reshape
 +fate-filter-dovi-reshape: libavfilter/tests/dovi_reshape$(EXESUF)
 +fate-filter-dovi-reshape: CMD = run libavfilter/tests/dovi_reshape$(EXESUF)
 +
- DRAWVG_SCRIPT_ALL = $(SRC_PATH)/tests/ref/lavf/drawvg.all
- 
- FATE_FILTER-$(CONFIG_DRAWVG_FILTER) += fate-filter-drawvg-interpreter
+ FATE_FILTER_SAMPLES-$(call FILTERDEMDECENCMUX, PERMS OWDENOISE TRIM SCALE, SMJPEG, MJPEG, RAWVIDEO, RAWVIDEO, PIPE_PROTOCOL) += fate-filter-owdenoise-sample
+ fate-filter-owdenoise-sample: CMD = ffmpeg -auto_conversion_filters -idct simple -i $(TARGET_SAMPLES)/smjpeg/scenwin.mjpg -vf "trim=duration=0.5,perms=random,owdenoise=10:20:20:enable=not(between(t\,0.2\,1.2))" -an -f rawvideo -
+ fate-filter-owdenoise-sample: REF = $(SAMPLES)/filter-reference/owdenoise-scenwin-jpeg.raw
 diff --git a/tests/ref/fate/filter-dovi-reshape b/tests/ref/fate/filter-dovi-reshape
 new file mode 100644
 index 0000000000000000000000000000000000000000..88faf0648db8be4fc6cdd11aafc65e343a7bb924
