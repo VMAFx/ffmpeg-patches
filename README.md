@@ -9,9 +9,9 @@
 
   <!-- Badge block: one group, fixed order. -->
   <!-- 1 release/version -->
-  [![Release](https://img.shields.io/badge/Release-Releases-3b82f6?style=for-the-badge&labelColor=111a35)](https://github.com/VMAFx/ffmpeg-patches/releases)
+  [![Release](https://img.shields.io/badge/Release-Releases-3b82f6?style=for-the-badge&labelColor=111a35)](https://github.com/vidiko/ffmpeg-patches/releases)
   <!-- 3 security/scorecard -->
-  [![OpenSSF Scorecard](https://img.shields.io/badge/OpenSSF-Scorecard-06b6d4?style=for-the-badge&labelColor=111a35)](https://scorecard.dev/viewer/?uri=github.com/VMAFx/ffmpeg-patches)
+  [![OpenSSF Scorecard](https://img.shields.io/badge/OpenSSF-Scorecard-06b6d4?style=for-the-badge&labelColor=111a35)](https://scorecard.dev/viewer/?uri=github.com/vidiko/ffmpeg-patches)
   [![CodeRabbit](https://img.shields.io/badge/Reviews-CodeRabbit-8b5cf6?style=for-the-badge&logo=coderabbit&logoColor=white&labelColor=111a35)](https://coderabbit.ai)
   <!-- 4 standards -->
   [![HISS-21](https://img.shields.io/badge/Standards-HISS--21-06b6d4?style=for-the-badge&logo=nasa&labelColor=111a35)](AGENTS.md)
@@ -22,16 +22,19 @@
   <!-- 6 support -->
   [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-8b5cf6?style=for-the-badge&logo=githubsponsors&logoColor=white&labelColor=111a35)](https://github.com/sponsors/lusoris)
 
-  **Shared FFmpeg fixes for VMAFx projects**
+  **Shared FFmpeg fixes for the VMAFx and Pelorus projects**
 
   *Consumers [`apply`](scripts/series.py) this series first and carry only their own feature patches*
 
 </div>
 
 ffmpeg-patches tracks FFmpeg master ([`series.txt`](series.txt)). Its name
-describes the repository's contents: FFmpeg patches shared by the VMAFx
+describes the repository's contents: FFmpeg patches shared by the VMAFx and Pelorus
 projects ([ADR-0001](docs/adr/0001-shared-fix-series.md)); pronounce it
 "eff-eff-em-peg patches".
+
+The repository moved from the VMAFx GitHub organisation to vidiko on 2026-11-20 with its name unchanged; links to github.com/VMAFx/ffmpeg-patches redirect.
+
 Each patch's state is recorded in the `.toml` sidecar beside it.
 
 **[📖 Architectural Decision Records](docs/adr/README.md)** · [ADR-0001: Shared Fix Series](docs/adr/0001-shared-fix-series.md)
@@ -85,8 +88,8 @@ upstream and a release containing them is pinned.
 
 Consumers:
 
-- [VMAFx/vmafx](https://github.com/VMAFx/vmafx)
-- [VMAFx/pelorus](https://github.com/VMAFx/pelorus)
+- [vidiko/vmafx](https://github.com/vidiko/vmafx)
+- [vidiko/pelorus](https://github.com/vidiko/pelorus)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px', 'primaryColor': '#111a35', 'primaryTextColor': '#e2e8f0', 'primaryBorderColor': '#3b82f6', 'lineColor': '#3b82f6', 'edgeLabelBackground': '#111a35', 'tertiaryColor': '#0b1020'}}}%%
@@ -295,7 +298,7 @@ title, base branch, merge instant or merge commit no longer matches the
 record. Update the record, regenerate the table and bump `checked`.
 
 `consumers.yml` applies the series on the pinned base, then the patch stacks
-of VMAFx/vmafx and VMAFx/pelorus (`ffmpeg-patches/series.txt` on their
+of vidiko/vmafx and vidiko/pelorus (`ffmpeg-patches/series.txt` on their
 default branches) on top, with `git am --3way` as their builds do. It runs
 on every pull request, on `main` and nightly, and fails when a stack no
 longer applies, so a series change that breaks a consumer shows before a
@@ -390,19 +393,19 @@ standards (HISS-21, NASA JPL Power of 10), and local verification instructions.
 
 Check the Actions pages for
 [Series](
-https://github.com/VMAFx/ffmpeg-patches/actions/workflows/series.yml),
+https://github.com/vidiko/ffmpeg-patches/actions/workflows/series.yml),
 [Consumers](
-https://github.com/VMAFx/ffmpeg-patches/actions/workflows/consumers.yml),
+https://github.com/vidiko/ffmpeg-patches/actions/workflows/consumers.yml),
 [FFmpeg Master](
-https://github.com/VMAFx/ffmpeg-patches/actions/workflows/master.yml),
+https://github.com/vidiko/ffmpeg-patches/actions/workflows/master.yml),
 [Upstream Drift](
-https://github.com/VMAFx/ffmpeg-patches/actions/workflows/upstream.yml),
+https://github.com/vidiko/ffmpeg-patches/actions/workflows/upstream.yml),
 [Release](
-https://github.com/VMAFx/ffmpeg-patches/actions/workflows/release.yml),
+https://github.com/vidiko/ffmpeg-patches/actions/workflows/release.yml),
 [Scanners](
-https://github.com/VMAFx/ffmpeg-patches/actions/workflows/scanners.yml),
+https://github.com/vidiko/ffmpeg-patches/actions/workflows/scanners.yml),
 and the [Codacy dashboard](
-https://app.codacy.com/gh/VMAFx/ffmpeg-patches/dashboard).
+https://app.codacy.com/gh/vidiko/ffmpeg-patches/dashboard).
 
 ## Support ffmpeg-patches
 
