@@ -3012,10 +3012,6 @@ class BoundedMatcherInputTest(unittest.TestCase):
         self.assertEqual(upstream_parse.body_issues("Fixes #1"), [1])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ForgePageEqualityTest(unittest.TestCase):
     """Check header-aware page equality and compatibility with ordinary lists."""
 
@@ -3023,26 +3019,26 @@ class ForgePageEqualityTest(unittest.TestCase):
         """Two pages with equal rows and headers compare equal with both operators."""
         first = HeaderPage([{"number": 1}], {"X-Total-Count": "1"})
         second = HeaderPage([{"number": 1}], {"X-Total-Count": "1"})
-        self.assertTrue(first == second)
-        self.assertFalse(first != second)
+        self.assertIs(first == second, True)
+        self.assertIs(first != second, False)
 
     def test_equal_rows_with_different_headers_are_unequal(self) -> None:
         """Different pagination headers make pages unequal despite identical rows."""
         first = HeaderPage([{"number": 1}], {"X-Total-Count": "1"})
         second = HeaderPage([{"number": 1}], {"X-Total-Count": "2"})
-        self.assertFalse(first == second)
-        self.assertTrue(first != second)
+        self.assertIs(first == second, False)
+        self.assertIs(first != second, True)
 
     def test_plain_lists_compare_rows_and_other_types_defer(self) -> None:
         """List comparisons use rows while non-list comparisons return NotImplemented."""
         page = HeaderPage([{"number": 1}], {"X-Total-Count": "1"})
-        self.assertTrue(page == [{"number": 1}])
-        self.assertFalse(page != [{"number": 1}])
-        self.assertFalse(page == [{"number": 2}])
-        self.assertTrue(page != [{"number": 2}])
+        self.assertIs(page == [{"number": 1}], True)
+        self.assertIs(page != [{"number": 1}], False)
+        self.assertIs(page == [{"number": 2}], False)
+        self.assertIs(page != [{"number": 2}], True)
         empty = HeaderPage([], {})
-        self.assertFalse(empty == 0)
-        self.assertTrue(empty != 0)
+        self.assertIs(empty == 0, False)
+        self.assertIs(empty != 0, True)
         self.assertIs(empty.__eq__(0), NotImplemented)
         self.assertIs(empty.__ne__(0), NotImplemented)
 
@@ -3259,3 +3255,7 @@ class PaginationLimitTest(unittest.TestCase):
         ):
             with self.subTest(link=link):
                 self.assert_link_pages(link, continues=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
