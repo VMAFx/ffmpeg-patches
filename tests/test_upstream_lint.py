@@ -23,8 +23,8 @@ import unittest.mock
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
-from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
-from tests.revert_proof_helpers import clone_shallow_side_fix
+from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment, run_git
+from tests.revert_proof_helpers import clone_shallow_side_fix, configure_ssh_signing
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402
@@ -4137,6 +4137,114 @@ class CRulesTest(unittest.TestCase):
 
 class RevertProofStepTest(FixtureTest):
     """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
+
+    def test_signature_display_keeps_fix_and_parent_records_parseable(self) -> None:
+        """Signed commits yield identical proof findings with signature display enabled."""
+        configure_ssh_signing(self.root, self.root.parent)
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.git("add", ".")
+        run_git(
+            self.root,
+            "-c",
+            "commit.gpgsign=true",
+            "commit",
+            "-qm",
+            "avfilter/vf_x: fix signed value",
+            preserve_config=True,
+        )
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.assertIn("gpgsig", self.git("cat-file", "commit", commit))
+        self.git("config", "log.showSignature", "false")
+        unsigned_display = self.proof_step()
+        plain_parents = upstream_lint._commit_history_error(self.root, commit)
+        self.git("config", "log.showSignature", "true")
+        signed_display = self.proof_step()
+        self.assertEqual(
+            (signed_display.rc, signed_display.output),
+            (unsigned_display.rc, unsigned_display.output),
+        )
+        self.assertEqual(upstream_lint._commit_history_error(self.root, commit), plain_parents)
+
+    def test_scan_limits_respect_only_nonblank_waivers(self) -> None:
+        """Path and commit scan caps admit nonblank waivers while retaining their diagnostics."""
+        self.add_fix_commit()
+        for cap, diagnostic in (
+            (1, "commit paths exceed MAX_PATHS=1"),
+            (0, "commit scan exceeds MAX_PATHS=0"),
+        ):
+            with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", cap):
+                for reason, expected in (("manual verification", 0), ("", 1), (" \t ", 1)):
+                    with self.subTest(cap=cap, reason=reason):
+                        step = upstream_lint._revert_proof(
+                            self.root, self.base, "HEAD", waiver=reason
+                        )
+                        self.assertEqual(step.rc, expected, step.output)
+                        self.assertIn(diagnostic, step.output)
+                        if expected == 0:
+                            self.assertTrue(step.output.startswith("waived: manual verification\n"))
+                        else:
+                            self.assertNotIn("waived:", step.output)
+
+    def test_git_runtime_error_cannot_be_waived(self) -> None:
+        """A plain Git failure remains a failing step even with an explicit waiver."""
+        with unittest.mock.patch.object(
+            upstream_lint, "_git", side_effect=RuntimeError("git failed")
+        ):
+            step = upstream_lint._revert_proof(self.root, self.base, "HEAD", waiver="manual")
+        self.assertEqual((step.rc, step.output), (1, "git failed"))
+
+    def test_fifo_record_is_refused_without_waiting_for_writer(self) -> None:
+        """A writerless FIFO produces a regular-file diagnostic within a bounded child."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("os.mkfifo is unavailable; writerless FIFO fixture unsupported")
+        record = self.root.parent / "record.fifo"
+        os.mkfifo(record)
+        program = (
+            "import sys; from pathlib import Path; from scripts import upstream_lint; "
+            "step = upstream_lint._revert_proof(Path(sys.argv[1]), sys.argv[2], 'HEAD', "
+            "(Path(sys.argv[3]),)); print(step.output); sys.exit(step.rc)"
+        )
+        result = subprocess.run(  # nosec B603 - fixed Python and fixture paths, no shell.
+            [sys.executable, "-B", "-c", program, str(self.root), self.base, str(record)],
+            cwd=upstream_lint.REPO_ROOT,
+            env=isolated_git_environment(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"{record}: not a regular file", result.stdout)
+
+    def test_directory_record_is_refused_as_nonregular(self) -> None:
+        """A directory receives the same explicit regular-file diagnostic as a FIFO."""
+        step = self.proof_step(self.root)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"{self.root}: not a regular file", step.output)
+
+    def test_record_descriptors_close_on_success_and_errors(self) -> None:
+        """Regular reads, nonregular refusals and descriptor errors never leak an open file."""
+        record = self.write_record("regular.json", self.valid_record(*self.add_fix_commit()))
+        for path in (record, self.root):
+            with (
+                self.subTest(path=path),
+                unittest.mock.patch.object(os, "close", wraps=os.close) as close,
+            ):
+                upstream_lint._read_revert_proof(path)
+                close.assert_called_once()
+                with self.assertRaises(OSError):
+                    os.fstat(close.call_args.args[0])
+        for operation in ("fstat", "fdopen"):
+            with (
+                self.subTest(operation=operation),
+                unittest.mock.patch.object(
+                    os, operation, side_effect=OSError("planted read failure")
+                ),
+                unittest.mock.patch.object(os, "close", wraps=os.close) as close,
+            ):
+                result = upstream_lint._read_revert_proof(record)
+                self.assertEqual(result[2], f"{record}: not valid JSON")
+                close.assert_called_once()
 
     def test_record_hex_width_and_case_boundaries(self) -> None:
         """Lowercase SHA-256 IDs validate while short and uppercase IDs remain type errors."""

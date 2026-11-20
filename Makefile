@@ -126,10 +126,10 @@ upstream-lint: override export UPSTREAM_REVERT_PROOF := $(value UPSTREAM_REVERT_
 upstream-lint: override export UPSTREAM_NO_REVERT_PROOF_REASON := $(value UPSTREAM_NO_REVERT_PROOF_REASON)
 upstream-lint:
 	@if [ -n "$(UPSTREAM_TREE)" ] && [ -n "$(UPSTREAM_BASE)" ]; then \
-		set -f; set -- scripts/upstream_lint.py --tree "$(UPSTREAM_TREE)" --base "$(UPSTREAM_BASE)"; \
-		for record in $$UPSTREAM_REVERT_PROOF; do set -- "$$@" --revert-proof "$$record"; done; \
+		set -f; set -- scripts/upstream_lint.py "--tree=$(UPSTREAM_TREE)" "--base=$(UPSTREAM_BASE)"; \
+		for record in $$UPSTREAM_REVERT_PROOF; do set -- "$$@" "--revert-proof=$$record"; done; \
 		if [ -n "$$(printf '%s' "$$UPSTREAM_NO_REVERT_PROOF_REASON" | tr -d '[:space:]')" ]; then \
-			set -- "$$@" --no-revert-proof-reason "$$UPSTREAM_NO_REVERT_PROOF_REASON"; \
+			set -- "$$@" "--no-revert-proof-reason=$$UPSTREAM_NO_REVERT_PROOF_REASON"; \
 		fi; \
 		sh .config/lefthook/python.sh "$$@"; \
 	else \

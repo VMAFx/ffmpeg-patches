@@ -8,7 +8,6 @@ import contextlib
 import hashlib
 import io
 import json
-import os
 import shutil
 import subprocess  # nosec B404 - fixed git and make argv in temporary test trees; result types for mocks.
 import tarfile
@@ -21,6 +20,7 @@ from pathlib import Path
 
 from scripts import release_guard, series
 from tests.helpers import init_upstream, run_git
+from tests.make_env import make_environment
 
 LINES = [f"int line_{n} = {n};" for n in range(1, 41)]
 METADATA = 'status = "submitted"\nupstream = "https://example.invalid/pulls/1"\nconsumers = ["a"]\n'
@@ -2215,17 +2215,9 @@ class MakeTargetsTest(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._scratch.cleanup()
 
-    # Variables that would leak an outer FFMPEG_TREE into a spawned make: the
-    # plain environment variable, and the make-flag channels through which
-    # `make verify-all FFMPEG_TREE=<tree>` (the documented command) passes a
-    # command-line assignment down to recipe processes and sub-makes. Scrubbing
-    # all of them makes each spawned make hermetic however the suite was
-    # launched; a test that wants a tree passes it as a make argument, which
-    # overrides the environment either way.
-    _LEAKY_MAKE_VARS = ("FFMPEG_TREE", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS")
-
     def run_make(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        env = {k: v for k, v in os.environ.items() if k not in self._LEAKY_MAKE_VARS}
+        """Run fixture Make without parent flags or an inherited FFmpeg tree."""
+        env = make_environment("FFMPEG_TREE")
         return subprocess.run(  # nosec B603 - make path and arguments are controlled test inputs.
             [self.make, "-s", "-C", str(self.clone), *arguments],
             capture_output=True,
@@ -2299,16 +2291,9 @@ class MakeTargetsTest(unittest.TestCase):
         self.assertIn("SKIPPED", result.stderr)
 
     def test_lengths_local_working_tree_names_ci_scope(self) -> None:
-        """Verify the working-tree skip message describes conditional CI coverage."""
-        env = {k: v for k, v in os.environ.items() if k not in self._LEAKY_MAKE_VARS}
-        result = subprocess.run(  # nosec B603 - make path and arguments are controlled test inputs.
-            [self.make, "-s", "-C", str(series.ROOT), "lengths-local"],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-            env=env,
-        )
+        """Verify the copied working-tree skip message describes conditional CI coverage."""
+        shutil.copyfile(series.ROOT / "Makefile", self.clone / "Makefile")
+        result = self.run_make("lengths-local")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SKIPPED", result.stderr)
         self.assertIn("series.py scope", result.stderr)

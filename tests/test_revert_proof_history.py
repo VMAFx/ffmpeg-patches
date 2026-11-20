@@ -16,6 +16,7 @@ from tests.revert_proof_helpers import (
     FIXED_SOURCE,
     RevertProofFixture,
     clone_shallow_side_fix,
+    configure_ssh_signing,
 )
 
 
@@ -307,3 +308,29 @@ class RevertProofHistoryTest(RevertProofFixture):
         step = upstream_lint._revert_proof(self.tree, self.base, head, (self.record_path,))
         self.assertEqual(step.rc, 0, step.output)
         self.assertIn("1 fix commit(s), 1 revert-proof record(s)", step.output)
+
+
+class SignedHistoryRegressionTest(RevertProofFixture):
+    """Check producer preflight against signature-decorated Git logs."""
+
+    def test_producer_accepts_signature_display_configuration(self) -> None:
+        """Signature display cannot contaminate the producer's parsed parent IDs."""
+        configure_ssh_signing(self.tree, self.root)
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        run_git(self.tree, "add", ".", preserve_config=True)
+        run_git(
+            self.tree,
+            "-c",
+            "commit.gpgsign=true",
+            "commit",
+            "-qm",
+            "avfilter/vf_x: fix signed value",
+            preserve_config=True,
+        )
+        fix = run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
+        self.assertIn("gpgsig", run_git(self.tree, "cat-file", "commit", fix, preserve_config=True))
+        run_git(self.tree, "config", "log.showSignature", "true", preserve_config=True)
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, error)
+        payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["commit"], fix)

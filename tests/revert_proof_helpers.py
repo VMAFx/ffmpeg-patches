@@ -9,6 +9,7 @@ import contextlib
 import io
 import os
 import select
+import shutil
 import subprocess  # nosec B404 - fixture-controlled Python argv, no shell.
 import sys
 import tempfile
@@ -50,6 +51,24 @@ def clone_shallow_side_fix(
     )
     run_git(clone, "merge-base", "--is-ancestor", base, "HEAD", preserve_config=True)
     return base, commit
+
+
+def configure_ssh_signing(tree: Path, directory: Path) -> None:
+    """Configure a disposable SSH signing key or skip when ssh-keygen is unavailable."""
+    keygen = shutil.which("ssh-keygen")
+    if keygen is None:
+        raise unittest.SkipTest(
+            "ssh-keygen is not installed; SSH signed-commit fixture unavailable"
+        )
+    key = directory / "signing-key"
+    subprocess.run(  # nosec B603 - discovered keygen and disposable key path, no shell.
+        [keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    run_git(tree, "config", "gpg.format", "ssh", preserve_config=True)
+    run_git(tree, "config", "user.signingkey", str(key), preserve_config=True)
 
 
 def process_exited(pid: int) -> bool:

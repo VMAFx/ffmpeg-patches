@@ -18,7 +18,9 @@ reverse-apply failure means exit 4, and scratch removal
 failure means exit 5 and names its path; a changed record parent or oversized
 encoded record means exit 2 without publication; an older record is removed before runs
 start, output must be outside the caller work tree and Git administration, and
-the temporary parent must be outside the caller work tree.
+the temporary parent must be outside the caller work tree, selected without probe writes.
+Scratch checkout reads stored objects without replace refs, populates all committed
+paths even for sparse callers, and suppresses setup hooks only; test commands keep hooks.
 Root fix commits are compared against the empty tree; reversing their source
 patch removes the added source files in scratch; conflicts or pathspecs selecting
 non-source paths exit 4. Only sha1 and sha256 object formats are accepted in preflight.
@@ -98,12 +100,15 @@ class ProofConfig:
 
 
 def git_result(tree: Path, *args: str) -> upstream_lint.RunResult:
-    """Return a checked Git result with both raw stdout and decoded diagnostics."""
+    """Read stored Git objects, except checkout-free registration, with checked diagnostics."""
     options = (
         ["-c", "advice.graftFileDeprecated=false"]
         if args and args[0] in ("rev-parse", "diff-tree", "--no-optional-locks")
         else []
     )
+    # Worktree registration with --no-checkout reads no tree or blob content.
+    if not (args[:2] == ("worktree", "add") and "--no-checkout" in args):
+        options.append("--no-replace-objects")
     result = upstream_lint._run(["git", *options, *args], tree, timeout=GIT_TIMEOUT)
     if result.returncode != 0 or result.timed_out:
         detail = result.stdout.strip() or f"rc={result.returncode}"
@@ -267,11 +272,19 @@ def verify_head_run(scratch: Path, rc_head: int | str, head: str) -> int:
 
 
 def scratch_parent(tree: Path) -> Path:
-    """Refuse a temporary parent at or below the resolved caller root."""
-    parent = Path(tempfile.gettempdir()).resolve()
-    if parent.is_relative_to(tree):
-        raise _PreflightError(f"temporary directory must be outside the caller tree: {parent}")
-    return parent
+    """Select a writable directory without probes and refuse caller-contained parents."""
+    candidates = [os.environ[name] for name in ("TMPDIR", "TEMP", "TMP") if os.environ.get(name)]
+    candidates.extend(("/tmp", "/var/tmp", "/usr/tmp"))
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.is_dir() and os.access(path, os.W_OK | os.X_OK):
+            parent = path.resolve()
+            if parent.is_relative_to(tree):
+                raise _PreflightError(
+                    f"temporary directory must be outside the caller tree: {parent}"
+                )
+            return parent
+    raise _PreflightError(f"no usable temporary directory; candidates: {candidates!r}")
 
 
 def cleanup_git(tree: Path, failures: list[str], *args: str) -> None:
@@ -295,11 +308,11 @@ def scratch_registered(tree: Path, scratch: Path) -> bool:
 
 
 def remove_scratch(tree: Path, scratch: Path) -> None:
-    """Remove only owned scratch and its directory, mapping cleanup failures to 5."""
+    """Force-remove only owned scratch, including locked registrations, mapping failures to 5."""
     failures: list[str] = []
     try:
         if scratch_registered(tree, scratch):
-            cleanup_git(tree, failures, "worktree", "remove", "--force", str(scratch))
+            cleanup_git(tree, failures, "worktree", "remove", "--force", "--force", str(scratch))
     except (_PreflightError, OSError, RuntimeError, KeyboardInterrupt) as error:
         failures.append(f"scratch registration lookup: {error}")
     try:
@@ -460,7 +473,7 @@ def measure_scratch(
     commit: str | None = None,
     source_paths: list[str] | None = None,
 ) -> int | str:
-    """Measure one command in its own fresh checkout and always clean its scratch."""
+    """Measure in a full stored-object checkout with setup hooks disabled and always clean it."""
     directory = Path(
         tempfile.mkdtemp(prefix="ffmpeg-revert-proof-", dir=scratch_parent(config.tree))
     )
@@ -469,7 +482,23 @@ def measure_scratch(
         scratch, config.commit, config.record, config.timeout, config.command
     )
     try:
-        git_out(config.tree, "worktree", "add", "--detach", str(scratch), head)
+        git_out(config.tree, "worktree", "add", "--detach", "--no-checkout", str(scratch), head)
+        hooks = directory / "empty-hooks"
+        hooks.mkdir()
+        git_out(
+            scratch,
+            "-c",
+            f"core.hooksPath={hooks}",
+            "-c",
+            "core.sparseCheckout=false",
+            "-c",
+            "core.sparseCheckoutCone=false",
+            "-c",
+            "index.sparse=false",
+            "reset",
+            "--hard",
+            head,
+        )
         if commit is not None:
             return measure_reverted(scratch_config, commit, source_paths or [])
         result = run_test_command(config.command, scratch, config.timeout)

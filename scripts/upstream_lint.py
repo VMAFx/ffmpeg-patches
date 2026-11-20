@@ -219,6 +219,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess  # nosec B404 - explicit argv, process-group cleanup, bounded deadlines.
 import sys
 import tempfile
@@ -1618,8 +1619,12 @@ def fix_word(message: str) -> str | None:
     return match[0] if match else None
 
 
+class _RevertProofScanLimit(RuntimeError):
+    """A bounded history scan exceeded a limit that an explicit proof waiver may cover."""
+
+
 def _commit_paths(tree: Path, commit: str) -> list[str]:
-    """Read all changed paths and refuse overflow before classifying any prefix."""
+    """Read changed paths and raise a waivable scan limit before classifying overflow."""
     paths = list(
         filter(
             None,
@@ -1637,12 +1642,14 @@ def _commit_paths(tree: Path, commit: str) -> list[str]:
         )
     )
     if len(paths) > MAX_PATHS:
-        raise RuntimeError(f"{commit}: commit paths exceed MAX_PATHS={MAX_PATHS}: {len(paths)}")
+        raise _RevertProofScanLimit(
+            f"{commit}: commit paths exceed MAX_PATHS={MAX_PATHS}: {len(paths)}"
+        )
     return paths
 
 
 def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -> str | None:
-    """Reject hidden ancestry and replace refs that change stored commit content."""
+    """Reject hidden ancestry and replaced commit content without signature display noise."""
     raw = _git(
         tree,
         "-c",
@@ -1655,7 +1662,14 @@ def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -
     stored = re.findall(r"^parent ([0-9a-f]+)$", raw.partition("\n\n")[0], re.MULTILINE)
     if parents is None:
         parents = _git(
-            tree, "-c", "advice.graftFileDeprecated=false", "log", "-1", "--format=%P", commit
+            tree,
+            "-c",
+            "advice.graftFileDeprecated=false",
+            "log",
+            "--no-show-signature",
+            "-1",
+            "--format=%P",
+            commit,
         ).strip()
     if stored != parents.split():
         return (
@@ -1691,7 +1705,7 @@ def _fix_commits(
     include_merges: bool = False,
     history_errors: list[str] | None = None,
 ) -> list[tuple[str, str, frozenset[str]]]:
-    """Collect source fixes, including non-fix history findings when a collector is supplied."""
+    """Collect source fixes and history findings, raising a waivable scan limit on overflow."""
     records = list(
         filter(
             None,
@@ -1700,6 +1714,7 @@ def _fix_commits(
                 "-c",
                 "advice.graftFileDeprecated=false",
                 "log",
+                "--no-show-signature",
                 "-z",
                 "--format=%H%n%P%n%B",
                 f"{base}..{head}",
@@ -1707,7 +1722,7 @@ def _fix_commits(
         )
     )
     if len(records) > MAX_PATHS:
-        raise RuntimeError(f"commit scan exceeds MAX_PATHS={MAX_PATHS}: {len(records)}")
+        raise _RevertProofScanLimit(f"commit scan exceeds MAX_PATHS={MAX_PATHS}: {len(records)}")
     fixes: list[tuple[str, str, frozenset[str]]] = []
     for record in records[:MAX_PATHS]:
         commit, _, rest = record.partition("\n")
@@ -1877,13 +1892,25 @@ def _revert_proof_schema_error(payload: dict[str, object]) -> str | None:
     return _revert_proof_type_error(payload)
 
 
+def _read_record_bytes(path: Path) -> bytes:
+    """Open without FIFO blocking, require a regular file and always close its descriptor."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_CLOEXEC
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            return stream.read(MAX_RECORD_BYTES + 1)
+    finally:
+        os.close(descriptor)
+
+
 def _read_revert_proof(
     path: Path,
 ) -> tuple[dict[str, object] | None, str | None, str | None]:
-    """Bound one JSON record before parsing, then validate its keys and field types."""
+    """Read only bounded regular-file JSON records, then validate their keys and field types."""
     try:
-        with path.open("rb") as stream:
-            encoded = stream.read(MAX_RECORD_BYTES + 1)
+        encoded = _read_record_bytes(path)
         if len(encoded) > MAX_RECORD_BYTES:
             return None, None, f"{path}: record exceeds MAX_RECORD_BYTES={MAX_RECORD_BYTES}"
         payload = json.loads(encoded.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
@@ -2004,10 +2031,12 @@ def _revert_proof(
     records: tuple[Path, ...] = (),
     waiver: str = "",
 ) -> Step:
-    """Validate supplied records and source fixes, allowing an explicit waiver even above cap."""
+    """Validate records and source fixes, allowing explicit waivers of scan and claim caps."""
     history_errors: list[str] = []
     try:
         fixes = _fix_commits(tree, base, head, include_merges=True, history_errors=history_errors)
+    except _RevertProofScanLimit as error:
+        return _revert_proof_limit_step(str(error), waiver)
     except RuntimeError as error:
         return Step("revert-proof", 1, str(error))
     summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
@@ -2015,11 +2044,18 @@ def _revert_proof(
         return Step("revert-proof", 0, summary)
     if len(fixes) > MAX_CLAIM_COMMITS:
         cap = f"fix commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(fixes)}"
-        reason = waiver.strip()
-        return Step(
-            "revert-proof", 0 if reason else 1, f"waived: {reason}\n{cap}" if reason else cap
-        )
+        return _revert_proof_limit_step(cap, waiver)
     return _revert_proof_result(tree, head, (fixes, history_errors), records, waiver)
+
+
+def _revert_proof_limit_step(diagnostic: str, waiver: str) -> Step:
+    """Waive only a scan or claim cap with a nonblank reason and retain its diagnostic."""
+    reason = waiver.strip()
+    return Step(
+        "revert-proof",
+        0 if reason else 1,
+        f"waived: {reason}\n{diagnostic}" if reason else diagnostic,
+    )
 
 
 def _revert_proof_result(
@@ -2068,8 +2104,8 @@ def uncited_diagnostic(message: str) -> str | None:
 
 
 def _diagnostic_citation(tree: Path, base: str, head: str) -> Step:
-    """Require a bug report URL or reproducer for compiler-diagnostic workarounds."""
-    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    """Require diagnostic workaround citations using signature-free commit records."""
+    log = _git(tree, "log", "--no-show-signature", "-z", "--format=%H%n%B", f"{base}..{head}")
     findings: list[str] = []
     count = 0
     for record in log.split("\0"):
@@ -2208,8 +2244,8 @@ def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[list[
 
 
 def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
-    """Reject blanket verification claims and unwaived single-hunk multi-site claims."""
-    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    """Reject unsupported claims from signature-free records unless scope is waived."""
+    log = _git(tree, "log", "--no-show-signature", "-z", "--format=%H%n%B", f"{base}..{head}")
     records = list(filter(None, log.split("\0")))
     if len(records) > MAX_CLAIM_COMMITS:
         raise RuntimeError(f"commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(records)}")
