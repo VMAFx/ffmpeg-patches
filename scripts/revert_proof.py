@@ -16,7 +16,8 @@ every outcome the module survives; input errors mean exit 2, HEAD failure or
 movement or a command launch failure means exit 3 without a record,
 reverse-apply failure means exit 4, and scratch removal
 failure means exit 5 and names its path; a changed record parent or oversized
-encoded record means exit 2 without publication; an older record is removed before runs
+encoded record, or a HEAD path using a configured smudge or process filter,
+means exit 2 without publication; an older record is removed before runs
 start, output must be outside the caller work tree and Git administration, and
 the temporary parent must be outside the caller work tree, selected without probe writes.
 Ancestry, caller HEAD checks and scratch checkout read stored objects without replace refs.
@@ -71,6 +72,7 @@ except ModuleNotFoundError:
 DEFAULT_TIMEOUT = 1800
 MAX_TIMEOUT = 7200
 GIT_TIMEOUT = 60
+MAX_HEAD_PATHS = 100_000
 
 
 class _PreflightError(ValueError):
@@ -186,19 +188,54 @@ def _check_object_format(tree: Path) -> None:
         raise _PreflightError(f"unsupported Git object format: {object_format}")
 
 
+def _check_filter_attributes(tree: Path, head: str, paths: list[str], checked: set[str]) -> None:
+    """Refuse active checkout drivers in one bounded batch of HEAD path attributes."""
+    output = git_result(tree, "check-attr", f"--source={head}", "-z", "filter", "--", *paths)
+    fields = output.stdout.removesuffix("\0").split("\0")
+    if len(fields) != 3 * len(paths):
+        raise _PreflightError("unexpected HEAD filter attribute listing")
+    for offset in range(0, 3 * len(paths), 3):
+        path, _, driver = fields[offset : offset + 3]
+        if driver in ("unspecified", "unset", "set") or driver in checked:
+            continue
+        checked.add(driver)
+        for kind in ("smudge", "process"):
+            command = git_result(
+                tree, "config", "get", "--default=", f"filter.{driver}.{kind}"
+            ).stdout.removesuffix("\n")
+            if command:
+                raise _PreflightError(
+                    f"checkout filter {driver!r} ({kind}) used by HEAD path {path!r}"
+                )
+
+
+def _check_checkout_filters(tree: Path, head: str) -> None:
+    """Bound the full HEAD listing and reject configured checkout filters before measurement."""
+    output = git_result(tree, "ls-tree", "-r", "--name-only", "-z", head).stdout
+    paths = output.removesuffix("\0").split("\0") if output else []
+    if len(paths) > MAX_HEAD_PATHS:
+        raise _PreflightError(f"HEAD paths exceed MAX_HEAD_PATHS={MAX_HEAD_PATHS}: {len(paths)}")
+    checked: set[str] = set()
+    for offset in range(0, len(paths), upstream_lint.MAX_PATHS):
+        _check_filter_attributes(
+            tree, head, paths[offset : offset + upstream_lint.MAX_PATHS], checked
+        )
+
+
 def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str], str]:
-    """Validate object format, clean history, stored ancestry and the source path set."""
+    """Validate stored history, source paths and HEAD checkout filters before measurement."""
     _check_object_format(tree)
     if not tree.is_dir():
         raise _PreflightError(f"work tree not found: {tree}")
+    head_ref = git_out(tree, "rev-parse", "--symbolic-full-name", "HEAD").strip()
+    head = git_out(tree, "rev-parse", "--verify", f"{head_ref}^{{commit}}").strip()
+    head_tree = git_out(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
+    _check_checkout_filters(tree, head)
     if tracked_status(tree):
         raise _PreflightError(
             f"dirty tree: uncommitted changes to tracked files that git status shows in {tree}; "
             "the proof is about the commit, not uncommitted work"
         )
-    head_ref = git_out(tree, "rev-parse", "--symbolic-full-name", "HEAD").strip()
-    head = git_out(tree, "rev-parse", "--verify", f"{head_ref}^{{commit}}").strip()
-    head_tree = git_out(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
     commit = git_out(
         tree, "rev-parse", "--verify", "--end-of-options", f"{raw_commit}^{{commit}}"
     ).strip()

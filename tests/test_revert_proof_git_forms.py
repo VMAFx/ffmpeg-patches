@@ -48,8 +48,28 @@ def _run_exception(function: str, call: ast.Call) -> bool:
     )
 
 
+def _has_global_isolation(arguments: list[ast.expr]) -> bool:
+    """Require a literal global prefix with isolation outside consumed -c and -C values."""
+    isolated = False
+    consume = False
+    for argument in arguments[1:]:
+        if not isinstance(argument, ast.Constant) or not isinstance(argument.value, str):
+            return False
+        value = argument.value
+        if consume:
+            consume = False
+            continue
+        if value == "--" or not value.startswith("-"):
+            break
+        if value in ("-c", "-C"):
+            consume = True
+        elif value == "--no-replace-objects":
+            isolated = True
+    return isolated and not consume
+
+
 def _find_git_run_errors(source: str) -> list[int]:
-    """Return unreviewed dynamic calls or literal Git calls missing stored-object isolation."""
+    """Find dynamic calls or Git reads without isolation in the literal global prefix."""
     tree = ast.parse(source)
     functions = [
         n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -66,17 +86,30 @@ def _find_git_run_errors(source: str) -> list[int]:
             findings.append(node.lineno)
             continue
         arguments = node.args[0].elts
-        if (
-            arguments
-            and _is_string(arguments[0], "git")
-            and not any(_is_string(argument, "--no-replace-objects") for argument in arguments)
-        ):
+        if arguments and _is_string(arguments[0], "git") and not _has_global_isolation(arguments):
             findings.append(node.lineno)
     return sorted(findings)
 
 
+def _forwards_git_options(call: ast.Call) -> bool:
+    """Match a literal Git command expanding isolated options before caller arguments."""
+    if not call.args or not isinstance(call.args[0], ast.List):
+        return False
+    arguments = call.args[0].elts
+    return (
+        len(arguments) == 3
+        and _is_string(arguments[0], "git")
+        and all(
+            isinstance(node, ast.Starred)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == name
+            for node, name in zip(arguments[1:], ("options", "args"), strict=True)
+        )
+    )
+
+
 def _find_git_result_append_errors(source: str) -> list[int]:
-    """Require the git_result wrapper to append its isolation option before each run call."""
+    """Require isolation append before each git_result run and forwarding options before args."""
     findings = []
     for function in ast.walk(ast.parse(source)):
         if not isinstance(function, ast.FunctionDef) or function.name != "git_result":
@@ -93,7 +126,7 @@ def _find_git_result_append_errors(source: str) -> list[int]:
             node.lineno
             for node in calls
             if _is_attribute(node.func, "upstream_lint", "_run")
-            and not any(line < node.lineno for line in appends)
+            and (not any(line < node.lineno for line in appends) or not _forwards_git_options(node))
         )
     return sorted(findings)
 
@@ -116,14 +149,27 @@ class RevertProofGitFormsTest(unittest.TestCase):
     """Replay AST rules against planted defects and current production sources."""
 
     def test_git_calls_read_stored_objects(self) -> None:
-        """Literal Git reads require the isolation option outside documented exceptions."""
+        """Literal Git reads require isolation in a literal global-option prefix."""
         for source in (
             'upstream_lint._run(["git", "merge-base", "--is-ancestor", commit, head], tree)',
             'upstream_lint._run(["git", "rev-parse", "--verify", ref], tree)',
             'def measure_reverted():\n    upstream_lint._run(["git", "log"], tree)',
+            'upstream_lint._run(["git", "--", "--no-replace-objects", "log"], tree)',
+            'upstream_lint._run(["git", "log", "--no-replace-objects"], tree)',
+            'upstream_lint._run(["git", dynamic, "--no-replace-objects", "log"], tree)',
+            'upstream_lint._run(["git", "--no-replace-objects", dynamic, "log"], tree)',
+            'upstream_lint._run(["git", "-c", "--no-replace-objects", "log"], tree)',
+            'upstream_lint._run(["git", "-C", "--no-replace-objects", "log"], tree)',
         ):
             with self.subTest(source=source):
                 self.assertEqual(len(_find_git_run_errors(source)), 1)
+        for source in (
+            'upstream_lint._run(["git", "--no-replace-objects", "log"], tree)',
+            'upstream_lint._run(["git", "-c", "x=y", "-C", "dir", '
+            '"--no-replace-objects", "log"], tree)',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(_find_git_run_errors(source), [])
         self.assertEqual(_find_git_run_errors(PRODUCER.read_text(encoding="utf-8")), [])
 
     def test_dynamic_run_requires_documented_exception(self) -> None:
@@ -136,11 +182,15 @@ class RevertProofGitFormsTest(unittest.TestCase):
         self.assertEqual(_find_git_run_errors(PRODUCER.read_text(encoding="utf-8")), [])
 
     def test_git_result_appends_isolation_before_run(self) -> None:
-        """The git_result exemption requires its exact isolation append before the run call."""
+        """The git_result exemption requires isolation append and ordered argv forwarding."""
         for body in (
             'upstream_lint._run(["git", *options, *args], tree)',
             'upstream_lint._run(["git", *options, *args], tree)\n'
             '    options.append("--no-replace-objects")',
+            'options.append("--no-replace-objects")\n    upstream_lint._run(["git", *args], tree)',
+            'options.append("--no-replace-objects")\n'
+            '    upstream_lint._run(["git", *args, *options], tree)',
+            'options.append("--no-replace-objects")\n    upstream_lint._run(command, tree)',
         ):
             with self.subTest(body=body):
                 self.assertEqual(

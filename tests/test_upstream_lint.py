@@ -4138,6 +4138,66 @@ class CRulesTest(unittest.TestCase):
 class RevertProofStepTest(FixtureTest):
     """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
 
+    def test_tree_replacement_cannot_hide_source_fix(self) -> None:
+        """A documentation-only replacement tree cannot hide a stored source-only fix."""
+        self.git("rm", "-rf", ".")
+        self.commit("empty fixture base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavfilter/vf_x.c", SOURCE)
+        self.commit("avfilter/vf_x: fix source value")
+        fix = self.git("rev-parse", "HEAD").strip()
+        stored_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        plain = self.proof_step()
+        self.assertEqual(plain.rc, 1, plain.output)
+        self.assertIn("no revert-proof record", plain.output)
+        self.git("checkout", "--detach", self.base)
+        self.write("doc/manual.txt", "replacement documentation\n")
+        self.commit("doc: replacement fixture")
+        replacement_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        self.git("checkout", "--detach", fix)
+        self.git("replace", stored_tree, replacement_tree)
+        self.assertEqual(
+            self.git("diff-tree", "--name-only", "-r", fix).splitlines()[1:], ["doc/manual.txt"]
+        )
+        replaced = self.proof_step()
+        self.assertEqual((replaced.rc, replaced.output), (plain.rc, plain.output))
+
+    def test_tree_replacement_cannot_change_fix_patch(self) -> None:
+        """Replacing a fix tree with its parent cannot remove stored patch function names."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix source value")
+        fix = self.git("rev-parse", "HEAD").strip()
+        stored_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        parent_tree = self.git("rev-parse", f"{self.base}^{{tree}}").strip()
+        plain = upstream_lint._fix_commits(self.root, self.base, fix)
+        self.assertIn("ff_value", plain[0][2])
+        self.git("replace", stored_tree, parent_tree)
+        self.assertEqual(upstream_lint._fix_commits(self.root, self.base, fix), plain)
+
+    def test_loaded_records_retain_only_verdicts_and_pass_status(self) -> None:
+        """Mixed duplicate records retain verdict strings and pass status without payloads."""
+        commit, head, head_tree = self.add_fix_commit()
+        failing = self.write_record(
+            "failing.json", self.valid_record(commit, head, head_tree, rc_reverted=0)
+        )
+        passing = self.write_record("passing.json", self.valid_record(commit, head, head_tree))
+        loaded = []
+        real_load = upstream_lint._load_revert_proofs
+
+        def capture_load(*args):
+            """Capture the actual retained structure without depending on private arguments."""
+            result = real_load(*args)
+            loaded.append(result)
+            return result
+
+        with unittest.mock.patch.object(upstream_lint, "_load_revert_proofs", capture_load):
+            step = self.proof_step(failing, passing)
+        self.assertEqual((step.rc, step.output), (0, "1 fix commit(s), 2 revert-proof record(s)"))
+        self.assertEqual(
+            loaded,
+            [({commit: (["rc_reverted is 0 (test passes without the fix)"], True)}, {}, [])],
+        )
+
     def test_signature_display_keeps_fix_and_parent_records_parseable(self) -> None:
         """Signed commits yield identical proof findings with signature display enabled."""
         configure_ssh_signing(self.root, self.root.parent)

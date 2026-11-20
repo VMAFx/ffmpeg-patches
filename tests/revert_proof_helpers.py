@@ -83,6 +83,11 @@ def process_exited(pid: int) -> bool:
         return True
 
 
+def count_worktrees(listing: str) -> int:
+    """Count only worktree fields in NUL-delimited Git porcelain output."""
+    return sum(field.startswith("worktree ") for field in listing.split("\0"))
+
+
 class RevertProofFixture(unittest.TestCase):
     """Shared isolated repositories and assertions for the revert-proof test modules."""
 
@@ -135,11 +140,11 @@ class RevertProofFixture(unittest.TestCase):
         self.assertEqual((self.tree / "ignored-user.txt").read_bytes(), b"user ignored\n")
 
     def assert_no_scratch(self) -> None:
-        """Require removed scratch files and the expected number of Git entries."""
+        """Require removed scratch files and count exact NUL-delimited worktree fields."""
         for path in self.scratch_paths[:2]:
             self.assertFalse(path.exists(), str(path))
-        entries = run_git(self.tree, "worktree", "list", "--porcelain", preserve_config=True)
-        self.assertEqual(entries.count("worktree "), getattr(self, "expected_entries", 1), entries)
+        entries = run_git(self.tree, "worktree", "list", "--porcelain", "-z", preserve_config=True)
+        self.assertEqual(count_worktrees(entries), getattr(self, "expected_entries", 1), entries)
 
     def run_cli(
         self,

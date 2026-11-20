@@ -18,6 +18,7 @@ import unittest.mock
 from pathlib import Path
 
 from scripts import revert_proof, upstream_lint
+from tests import revert_proof_helpers
 from tests.helpers import capture_main, run_git
 from tests.revert_proof_helpers import (
     BASE_SOURCE,
@@ -30,6 +31,104 @@ from tests.revert_proof_helpers import (
 
 class RevertProofScratchTest(RevertProofFixture):
     """Check revert-proof scratch behavior using isolated Git fixtures."""
+
+    def test_active_checkout_filter_refuses_before_measurement(self) -> None:
+        """HEAD attributes using a configured smudge or process driver refuse publication."""
+        self.write(".gitattributes", "fixture.txt filter=counter\n")
+        self.write("fixture.txt", "fixture bytes\n")
+        fix = self.make_fix()
+        counter = self.root / "counter"
+        program = (
+            "from pathlib import Path; "
+            f"p = Path({str(counter)!r}); "
+            "n = int(p.read_text()) + 1 if p.exists() else 1; "
+            "p.write_text(str(n)); print(n)"
+        )
+        command = f'{sys.executable} -c "{program}"'
+        for kind in ("smudge", "process"):
+            with self.subTest(kind=kind):
+                run_git(
+                    self.tree, "config", f"filter.counter.{kind}", command, preserve_config=True
+                )
+                with unittest.mock.patch.object(
+                    revert_proof, "measure_scratch", wraps=revert_proof.measure_scratch
+                ) as measure:
+                    rc, _, error = capture_main(
+                        revert_proof.main,
+                        "--tree",
+                        str(self.tree),
+                        "--commit",
+                        fix,
+                        "--record",
+                        str(self.record_path),
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "pass",
+                    )
+                self.assertEqual(rc, 2, error)
+                self.assertIn("counter", error)
+                self.assertIn("fixture.txt", error)
+                self.assertFalse(self.record_path.exists())
+                self.assertFalse(counter.exists())
+                measure.assert_not_called()
+                run_git(self.tree, "config", f"filter.counter.{kind}", "", preserve_config=True)
+
+    def test_hidden_attribute_edit_cannot_hide_head_filter(self) -> None:
+        """An ignored working-tree attribute edit cannot hide an active HEAD checkout filter."""
+        self.write(".gitattributes", "fixture.txt filter=counter\n")
+        self.write("fixture.txt", "fixture bytes\n")
+        fix = self.make_fix()
+        run_git(self.tree, "config", "filter.counter.smudge", "exit 99", preserve_config=True)
+        run_git(
+            self.tree, "update-index", "--assume-unchanged", ".gitattributes", preserve_config=True
+        )
+        self.write(".gitattributes", "fixture.txt !filter\n")
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("counter", error)
+        self.assertIn("fixture.txt", error)
+        self.assertFalse(self.record_path.exists())
+
+    def test_head_filter_scan_path_bound(self) -> None:
+        """The HEAD filter scan refuses overflow and accepts its exact scalar path bound."""
+        fix = self.make_fix()
+        for limit, expected in ((1, 2), (2, 0)):
+            with (
+                self.subTest(limit=limit),
+                unittest.mock.patch.object(revert_proof, "MAX_HEAD_PATHS", limit, create=True),
+            ):
+                rc, _, error = self.run_cli(
+                    fix, [sys.executable, "-c", "pass"], expect_scratch=expected == 0
+                )
+                self.assertEqual(rc, expected, error)
+                if expected == 2:
+                    self.assertIn("HEAD paths exceed MAX_HEAD_PATHS=1: 2", error)
+                    self.assertFalse(self.record_path.exists())
+                else:
+                    self.assertTrue(self.record_path.is_file())
+
+    def test_filter_without_configured_driver_publishes_record(self) -> None:
+        """An attributed HEAD path without a configured checkout command remains measurable."""
+        self.write(".gitattributes", "fixture.txt filter=counter\n")
+        self.write("fixture.txt", "fixture bytes\n")
+        fix = self.make_fix()
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(self.record_path.is_file())
+
+    def test_unused_configured_filter_publishes_record(self) -> None:
+        """A configured filter driver unused by every HEAD path permits publication."""
+        fix = self.make_fix()
+        run_git(self.tree, "config", "filter.counter.smudge", "exit 99", preserve_config=True)
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(self.record_path.is_file())
+
+    def test_worktree_count_uses_nul_field_boundaries(self) -> None:
+        """A worktree path containing the field marker and a newline counts once."""
+        listing = "worktree /fixture/worktree name\nwith newline\0HEAD abc\0detached\0\0"
+        self.assertEqual(revert_proof_helpers.count_worktrees(listing), 1)
 
     def test_environment_refusal_is_no_verdict(self) -> None:
         """An environment refusal in either phase cannot publish a test verdict."""

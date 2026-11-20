@@ -1624,12 +1624,13 @@ class _RevertProofScanLimit(RuntimeError):
 
 
 def _commit_paths(tree: Path, commit: str) -> list[str]:
-    """Read changed paths and raise a waivable scan limit before classifying overflow."""
+    """Read stored changed paths and raise a waivable limit before classifying overflow."""
     paths = list(
         filter(
             None,
             _git(
                 tree,
+                "--no-replace-objects",
                 "diff-tree",
                 "--root",
                 "--no-commit-id",
@@ -1705,7 +1706,7 @@ def _fix_commits(
     include_merges: bool = False,
     history_errors: list[str] | None = None,
 ) -> list[tuple[str, str, frozenset[str]]]:
-    """Collect source fixes and history findings, raising a waivable scan limit on overflow."""
+    """Collect stored source fixes and history findings with waivable scan limits."""
     records = list(
         filter(
             None,
@@ -1740,6 +1741,7 @@ def _fix_commits(
         if any(is_source_path(path) for path in paths[:MAX_PATHS]):
             patch = _git(
                 tree,
+                "--no-replace-objects",
                 "diff-tree",
                 "--no-commit-id",
                 "-r",
@@ -1929,10 +1931,11 @@ def _read_revert_proof(
 
 
 def _record_binding_error(tree: Path, record: dict[str, object]) -> str | None:
-    """Require the recorded head commit tree and the exact fix source path set."""
+    """Require the stored head commit tree and the exact stored fix source path set."""
     resolved = _run(
         [
             "git",
+            "--no-replace-objects",
             "rev-parse",
             "--verify",
             "--end-of-options",
@@ -1973,17 +1976,23 @@ def _record_verdict(record: dict[str, object], head_tree: str, tree: Path) -> st
 def _load_revert_proofs(
     records: tuple[Path, ...],
     fix_ids: frozenset[str],
-) -> tuple[dict[str, list[dict[str, object]]], dict[str, list[str]], list[str]]:
-    """Group validated revert-proof records and errors by fix commit hash."""
+    head_tree: str,
+    tree: Path,
+) -> tuple[dict[str, tuple[list[str], bool]], dict[str, list[str]], list[str]]:
+    """Evaluate matching records immediately, retaining only verdicts, pass flags and errors."""
     if len(records) > MAX_PATHS:
         raise RuntimeError(f"revert-proof records exceed MAX_PATHS={MAX_PATHS}: {len(records)}")
-    by_commit: dict[str, list[dict[str, object]]] = {}
+    by_commit: dict[str, tuple[list[str], bool]] = {}
     errors_by_commit: dict[str, list[str]] = {}
     unmatched_errors: list[str] = []
     for path in records[:MAX_PATHS]:
         payload, commit, error = _read_revert_proof(path)
         if payload is not None and commit in fix_ids:
-            by_commit.setdefault(commit, []).append(payload)
+            verdict = _record_verdict(payload, head_tree, tree)
+            verdicts, passed = by_commit.get(commit, ([], False))
+            if verdict is not None:
+                verdicts.append(verdict)
+            by_commit[commit] = (verdicts, passed or verdict is None)
         elif error is not None and commit in fix_ids:
             errors_by_commit.setdefault(commit, []).append(error)
         elif error is not None:
@@ -1992,12 +2001,10 @@ def _load_revert_proofs(
 
 
 def _commit_revert_findings(
-    tree: Path,
     fix: tuple[str, str, frozenset[str]],
-    head_tree: str,
-    loaded: tuple[dict[str, list[dict[str, object]]], dict[str, list[str]], list[str]],
+    loaded: tuple[dict[str, tuple[list[str], bool]], dict[str, list[str]], list[str]],
 ) -> list[str]:
-    """Return the revert-proof findings for one source fix commit."""
+    """Combine retained errors and verdicts, allowing passes to suppress only verdicts."""
     commit, subject, names = fix
     by_commit, errors_by_commit, _ = loaded
     prefix = f"{commit[:12]}: {subject}"
@@ -2009,11 +2016,8 @@ def _commit_revert_findings(
             "put the fix in its own commit, or pass --no-revert-proof-reason"
         )
         return findings
-    records = by_commit.get(commit, [])
-    verdicts = [
-        verdict for rec in records[:MAX_PATHS] if (verdict := _record_verdict(rec, head_tree, tree))
-    ]
-    if len(records) > len(verdicts):
+    verdicts, passed = by_commit.get(commit, ([], False))
+    if passed:
         return findings
     findings.extend(f"{prefix}: {verdict}" for verdict in verdicts[:MAX_PATHS])
     if not findings:
@@ -2065,17 +2069,19 @@ def _revert_proof_result(
     records: tuple[Path, ...],
     waiver: str,
 ) -> Step:
-    """Collect bounded per-fix and step-scope findings and apply the optional waiver."""
+    """Evaluate records against the stored head tree and collect bounded, waivable findings."""
     fixes, history_errors = history
     summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
-    head_tree = _git(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
+    head_tree = _git(
+        tree, "--no-replace-objects", "rev-parse", "--verify", f"{head}^{{tree}}"
+    ).strip()
     fix_ids = frozenset(commit for commit, _, _ in fixes[:MAX_CLAIM_COMMITS])
-    loaded = _load_revert_proofs(tuple(records), fix_ids)
+    loaded = _load_revert_proofs(tuple(records), fix_ids, head_tree, tree)
     findings: list[str] = [*history_errors, *loaded[2]]
     unproved: list[str] = list(findings)
     for fix in fixes[:MAX_CLAIM_COMMITS]:
         commit, subject, _ = fix
-        commit_findings = _commit_revert_findings(tree, fix, head_tree, loaded)
+        commit_findings = _commit_revert_findings(fix, loaded)
         if commit_findings:
             findings.extend(commit_findings)
             unproved.append(f"{commit[:12]}: {subject}")
