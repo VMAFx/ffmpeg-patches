@@ -5639,11 +5639,17 @@ class SweepTest(ForgejoTest):
     def test_push_holds_review_273e_literal_commitments(self) -> None:
         """Review 273e F1 fenced and indented greater-than commitments must hold."""
 
+        backtick_commitment = (
+            "My commitment is the following literal line:\n"
+            "```text\n> I will fix this in the next push.\n```"
+        )
+        tilde_commitment = (
+            "My commitment is the following literal line:\n"
+            "~~~text\n> I will fix this in the next push.\n~~~"
+        )
         comments = (
-            "My commitment is the following literal line:\n"
-            "```text\n> I will fix this in the next push.\n```",
-            "My commitment is the following literal line:\n"
-            "~~~text\n> I will fix this in the next push.\n~~~",
+            backtick_commitment,
+            tilde_commitment,
             "    > I will fix this in the next push.",
             "\t> I will fix this in the next push.",
         )

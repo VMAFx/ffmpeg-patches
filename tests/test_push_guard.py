@@ -1263,6 +1263,10 @@ class APIReaderTest(unittest.TestCase):
         ) as run:
             self.assertEqual(push_guard.read_pull_requests(REPOSITORY, BRANCH), "[]")
         self.assertEqual(run.call_count, 2)
+        pulls_endpoint = (
+            f"repos/{REPOSITORY}/pulls?head={REPOSITORY.partition('/')[0]}:{BRANCH}"
+            "&state=all&sort=created&direction=desc&per_page=100"
+        )
         run.assert_has_calls(
             [
                 unittest.mock.call(
@@ -1277,8 +1281,7 @@ class APIReaderTest(unittest.TestCase):
                     [
                         "gh",
                         "api",
-                        f"repos/{REPOSITORY}/pulls?head={REPOSITORY.partition('/')[0]}:{BRANCH}"
-                        "&state=all&sort=created&direction=desc&per_page=100",
+                        pulls_endpoint,
                         "--hostname",
                         "github.com",
                     ],

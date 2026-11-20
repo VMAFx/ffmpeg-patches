@@ -593,17 +593,21 @@ class LaneBriefTest(unittest.TestCase):
         """Accept supported invocations and reject the import-style module after another module."""
         content = self.rendered()
         brief = self.root / "brief.md"
+        import_style_first = (
+            "/usr/bin/python3 -B -m unittest tests.test_import_style tests.test_sweep_classes -v"
+        )
+        import_style_last = (
+            "/usr/bin/python3 -B -m unittest tests.test_sweep_classes tests.test_import_style -v"
+        )
         for invocation, expected in (
             ("python -m unittest tests.test_import_style", 0),
             ("/usr/bin/python3 -B -m unittest tests.test_import_style -v", 0),
             (
-                "/usr/bin/python3 -B -m unittest tests.test_import_style "
-                "tests.test_sweep_classes -v",
+                import_style_first,
                 0,
             ),
             (
-                "/usr/bin/python3 -B -m unittest tests.test_sweep_classes "
-                "tests.test_import_style -v",
+                import_style_last,
                 1,
             ),
         ):
