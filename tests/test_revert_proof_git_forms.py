@@ -165,8 +165,10 @@ class RevertProofGitFormsTest(unittest.TestCase):
                 self.assertEqual(len(_find_git_run_errors(source)), 1)
         for source in (
             'upstream_lint._run(["git", "--no-replace-objects", "log"], tree)',
-            'upstream_lint._run(["git", "-c", "x=y", "-C", "dir", '
-            '"--no-replace-objects", "log"], tree)',
+            (
+                'upstream_lint._run(["git", "-c", "x=y", "-C", "dir", '
+                '"--no-replace-objects", "log"], tree)'
+            ),
         ):
             with self.subTest(source=source):
                 self.assertEqual(_find_git_run_errors(source), [])
@@ -185,11 +187,15 @@ class RevertProofGitFormsTest(unittest.TestCase):
         """The git_result exemption requires isolation append and ordered argv forwarding."""
         for body in (
             'upstream_lint._run(["git", *options, *args], tree)',
-            'upstream_lint._run(["git", *options, *args], tree)\n'
-            '    options.append("--no-replace-objects")',
+            (
+                'upstream_lint._run(["git", *options, *args], tree)\n'
+                '    options.append("--no-replace-objects")'
+            ),
             'options.append("--no-replace-objects")\n    upstream_lint._run(["git", *args], tree)',
-            'options.append("--no-replace-objects")\n'
-            '    upstream_lint._run(["git", *args, *options], tree)',
+            (
+                'options.append("--no-replace-objects")\n'
+                '    upstream_lint._run(["git", *args, *options], tree)'
+            ),
             'options.append("--no-replace-objects")\n    upstream_lint._run(command, tree)',
         ):
             with self.subTest(body=body):
