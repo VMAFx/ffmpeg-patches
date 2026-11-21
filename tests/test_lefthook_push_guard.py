@@ -785,17 +785,44 @@ class LefthookSignoffTest(GitFixture):
 
     def test_merge_hook_requires_signoff_with_space(self) -> None:
         """Preserve a message-file argument containing spaces through the installed hook."""
-        repository = self.root / "repository with spaces"
-        repository.mkdir()
-        (self.root / ".git").rename(repository / ".git")
-        self.root = repository
-        self.test_merge_hook_requires_signoff()
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        self._reinit_with_spaced_git_dir()
+        merge_msg = self.git("rev-parse", "--git-path", "MERGE_MSG")
+        self.assertIn(" ", merge_msg, msg="fixture must hand the hook an absolute spaced git path")
+        self._run_merge_hook_signoff_checks(lefthook)
 
     def test_merge_hook_requires_signoff(self) -> None:
         """Refuse a merge without sign-off and accept it with the sign-off option."""
         lefthook = shutil.which("lefthook")
         if lefthook is None:
             self.skipTest("lefthook binary is not on PATH")
+        self._run_merge_hook_signoff_checks(lefthook)
+
+    def _reinit_with_spaced_git_dir(self) -> None:
+        """Point the fixture at a separate git directory whose path contains a space."""
+        dot_git = self.root / ".git"
+        if dot_git.is_dir():
+            shutil.rmtree(dot_git)
+        elif dot_git.is_file():
+            dot_git.unlink()
+        git_dir = self.root.parent / "git dir with space"
+        if git_dir.exists():
+            shutil.rmtree(git_dir)
+        git_dir.mkdir(parents=True)
+        _run_fixture_command(
+            self.root,
+            self.env,
+            ["git", "init", "--separate-git-dir", str(git_dir), "-q", "-b", "main"],
+        )
+        self.git("config", "user.name", "Signoff Fixture")
+        self.git("config", "user.email", "signoff@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        self.git("config", "core.hooksPath", str(self.root / "empty-hooks"))
+
+    def _run_merge_hook_signoff_checks(self, lefthook: str) -> None:
+        """Refuse an unsigned merge and accept the same merge with --signoff."""
         self.commit("base")
         self.git("checkout", "-qb", "topic")
         self.commit("topic")
