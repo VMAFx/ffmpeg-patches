@@ -539,12 +539,17 @@ remains. Apply the downloaded patch with `git apply upstream-drift.patch`,
 review it and submit the update through the usual pull request process.
 
 Each contribution record in `upstream-contributions.json` may also carry two
-optional, append-only lists that do not change the README table:
+optional lists that do not change the README table:
 `fixes_issues` (sorted positive upstream issue numbers named after `Fixes`,
 `Closes` or `Refs` in the pull body) and `related` (sorted objects with
 `number`, `kind` one of `pull` or `issue`, `author`, `reason` one of
 `same-files`, `same-patch-id` or `same-subject`, `state`, and `seen`
-`YYYY-MM-DD` date). Run `python3 scripts/upstream_links.py fill` (`--dry-run`
+`YYYY-MM-DD` date). `fixes_issues` only grows: fill stores the union of the
+stored numbers and the numbers in the pull body. Fill refreshes `related` rows
+in place: a freshly found row replaces the stored row with the same number and
+keeps only that row's first `seen` date, so a pull that changes from open to
+merged updates its `state` (`_fill_entry` and `merge_related` in
+`scripts/upstream_links_manifest.py`). Run `python3 scripts/upstream_links.py fill` (`--dry-run`
 to preview without writing) to populate both fields for open and merged
 manifest records from the forge. Fill and check send GET requests only, post
 nothing and need no credentials. Live matching checks shared files and subjects;
@@ -560,9 +565,12 @@ before this boundary, fill prints `N: candidates updated before DATE not read
 (fill age limit)`. This includes old open candidates that could still overlap;
 the line reports incomplete history, and the manifest makes no claim that
 those candidates were checked. Widen the history with `fill --max-age-days 30`
-(accepted range: 1 through 365 days). A list still filling all 20 pages inside
-the chosen window fails with exit 2 and writes nothing; shorten the window
-to retry. Run
+(accepted range: 1 through 365 days). The candidate list fails with exit 2 and
+writes nothing only when its 20th page ends without completion evidence: no
+empty page, no `Link` header with relations but no `next`, no reached
+`X-Total-Count` and no update older than the window (`read_candidate_pulls` in
+`scripts/upstream_links_forge.py`, `_listing_complete` in
+`scripts/upstream_links_parse.py`); shorten the window to retry. Run
 `python3 scripts/upstream_links.py check` (adding `--pull N` for any open pull
 not yet in the manifest) to list newly discovered potential overlaps;
 it exits 1 when at least one unrecorded related pull by another author is open
@@ -603,6 +611,13 @@ requests for `N` own pulls, `P` list pages and `F` total fetched file pages
 across distinct own and eligible candidate pulls (with one file page per
 pull, the measured two-pull, 12-page window needs at most 519 requests and
 259.5 seconds of pauses plus network time, before author and memo savings).
+`RequestBudget.__call__` in `scripts/upstream_links_forge.py` admits a request
+only while more than `REQUEST_TIMEOUT` plus the 0.5-second pause (30.5 seconds)
+of the scan budget remains. Before request 519 the scan has paused 518 times
+(259 seconds), so less than 10.5 seconds remain for the network and local work
+of the 518 earlier requests. At 25 ms per request, request 514 is the last one
+admitted and the scan exits 2 when request 515 is refused; narrow such a scan
+with `--pull N` or `check --since YYYY-MM-DD`.
 Both commands derive their request cap as
 `N + 20 + (N + 1000) * 20` from the own-pull count, 20 list pages, 1000
 candidate rows and 20 file pages per pull. Before reading files, a progress

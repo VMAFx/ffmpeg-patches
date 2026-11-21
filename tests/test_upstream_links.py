@@ -725,8 +725,8 @@ class FillAndCheckCommandTest(unittest.TestCase):
         before = self.path.read_bytes()
         for command in ("fill", "check"):
             with unittest.mock.patch.object(
-                drift.urllib.request,
-                "urlopen",
+                drift,
+                "open_url",
                 side_effect=http.client.HTTPException("planted protocol error"),
             ):
                 rc, out, err = run_cli(self.root, upstream_forge.fetch_forge, command)
@@ -1074,30 +1074,41 @@ class RequestCostTest(unittest.TestCase):
         fetch.assert_called_once_with("https://example.invalid/interrupted")
 
     def test_elapsed_budget_interrupts_a_fetch_that_never_returns(self) -> None:
-        """A blocked injected fetch cannot keep the scan alive past its elapsed budget."""
+        """A fetch that has started and blocks cannot keep the scan alive past its budget."""
         release = threading.Event()
         entered = threading.Event()
+        armed: list[float] = []
 
         def blocked(url: str) -> list:
             """Model repeated blocking operations inside a single response read."""
             entered.set()
-            release.wait(2)
+            release.wait(5)
             return []
 
-        try:
-            with (
-                unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 0.05),
-                unittest.mock.patch.object(upstream_forge, "REQUEST_TIMEOUT", 0),
-                unittest.mock.patch.object(upstream_forge, "REQUEST_PAUSE_SECONDS", 0),
-            ):
-                request = upstream_forge.RequestBudget(blocked, 2, lambda _: None)
-                start = upstream_forge.time.monotonic()
-                with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan"):
-                    request("https://example.invalid/blocked")
-                self.assertLess(upstream_forge.time.monotonic() - start, 1)
-                self.assertTrue(entered.is_set())
-        finally:
-            release.set()
+        self.addCleanup(release.set)
+        with (
+            unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 0.5),
+            unittest.mock.patch.object(upstream_forge, "REQUEST_TIMEOUT", 0),
+            unittest.mock.patch.object(upstream_forge, "REQUEST_PAUSE_SECONDS", 0),
+        ):
+            start = upstream_forge.time.monotonic()
+            request = upstream_forge.RequestBudget(blocked, 2, lambda _: None)
+            self.addCleanup(request.reader.close)
+            get = request.reader.answers.get
+
+            def get_after_entry(block: bool = True, timeout: float | None = None) -> object:
+                """Arm the production wait only once the worker is inside the blocked fetch."""
+                self.assertTrue(entered.wait(5))
+                armed.append(upstream_forge.time.monotonic())
+                return get(block, timeout)
+
+            request.reader.answers.get = get_after_entry
+            with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan"):
+                request("https://example.invalid/blocked")
+            done = upstream_forge.time.monotonic()
+        self.assertEqual(len(armed), 1)
+        self.assertLess(done - armed[0], 1)
+        self.assertLess(done - start, 6)
 
     def test_worker_cleanup_preserves_timeout_before_worker_starts(self) -> None:
         """A queued request at expiry cannot replace the incomplete-scan error during cleanup."""
@@ -1137,7 +1148,7 @@ class RequestCostTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 rc = upstream_links.main(args, fetch=forge, today=TODAY, sleep=pauses.append)
-            self.assertIn(rc, (0, 1))
+            self.assertEqual(rc, int(command == "check"))
             self.assertEqual(len(forge.read), 12)
             self.assertEqual(pauses, [upstream_forge.REQUEST_PAUSE_SECONDS] * 12)
 
@@ -1261,6 +1272,36 @@ class MeasuredWindowTest(unittest.TestCase):
         self.assertEqual(at_files[0], expected)
         self.assertEqual(output.getvalue().count("expected requests"), 1)
         self.assertEqual(len(forge.read), 520)
+
+    def test_progress_line_is_flushed_before_the_first_files_request(self) -> None:
+        """Flush the request plan so a piped or logged run shows it before the scan starts."""
+        events: list[str] = []
+
+        class RecordingStdout(io.StringIO):
+            """Record a flush once the request plan has been written."""
+
+            def flush(self) -> None:
+                """Note a flush that carries the request plan, then flush normally."""
+                if "expected requests" in self.getvalue():
+                    events.append("flush")
+                super().flush()
+
+        forge = measured_window_forge()
+
+        def fetch(url: str) -> dict | list:
+            """Record the first files request before serving the fixture."""
+            if "/files?" in url and "files" not in events:
+                events.append("files")
+            return forge(url)
+
+        output = RecordingStdout()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            rc = upstream_links.main(
+                ["--root", str(self.root), "check"], fetch, TODAY, sleep=lambda _: None
+            )
+        self.assertEqual(rc, 1)
+        self.assertIn("files", events)
+        self.assertEqual(events[0], "flush")
 
     def test_metadata_filters_keep_old_open_and_strictly_later_merges(self) -> None:
         """Skip author, closed, early or equal merge, self and old-update rows before files."""
@@ -2872,7 +2913,7 @@ class BoundedResponseTest(unittest.TestCase):
             answer = io.BytesIO(b"{}" + b" " * 127)
             with (
                 unittest.mock.patch.object(drift, "MAX_RESPONSE_BYTES", 128, create=True),
-                unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer),
+                unittest.mock.patch.object(drift, "open_url", return_value=answer),
                 self.assertRaisesRegex(drift.DriftError, "response.*128"),
             ):
                 drift.fetch_json(f"{API}/pulls/101", allow_list=allow_list)
@@ -2885,9 +2926,7 @@ class BoundedResponseTest(unittest.TestCase):
                 answer = io.BytesIO(prefix + b" " * (size - 2))
                 with (
                     unittest.mock.patch.object(drift, "MAX_RESPONSE_BYTES", 128, create=True),
-                    unittest.mock.patch.object(
-                        drift.urllib.request, "urlopen", return_value=answer
-                    ),
+                    unittest.mock.patch.object(drift, "open_url", return_value=answer),
                 ):
                     self.assertEqual(
                         drift.fetch_json(f"{API}/pulls/101", allow_list=True), expected
@@ -2909,9 +2948,7 @@ class BoundedResponseTest(unittest.TestCase):
         drift = upstream_links.upstream_drift
         with (
             unittest.mock.patch.object(drift, "MAX_RESPONSE_BYTES", 128, create=True),
-            unittest.mock.patch.object(
-                drift.urllib.request, "urlopen", return_value=io.BytesIO(b"x" * 129)
-            ),
+            unittest.mock.patch.object(drift, "open_url", return_value=io.BytesIO(b"x" * 129)),
             unittest.mock.patch.object(drift.json, "loads", return_value={}) as decode,
             self.assertRaisesRegex(drift.DriftError, "response.*128"),
         ):
@@ -2923,7 +2960,7 @@ class BoundedResponseTest(unittest.TestCase):
         drift = upstream_links.upstream_drift
         answer = io.BytesIO(b'{"number": 1, "number": 2}')
         with (
-            unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer),
+            unittest.mock.patch.object(drift, "open_url", return_value=answer),
             self.assertRaisesRegex(drift.DriftError, "written twice"),
         ):
             drift.fetch_json(f"{API}/pulls/101")
@@ -2939,7 +2976,7 @@ class BoundedResponseTest(unittest.TestCase):
         drift = upstream_links.upstream_drift
         answer = io.BytesIO(json.dumps({str(n): n for n in range(1025)}).encode())
         with (
-            unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer),
+            unittest.mock.patch.object(drift, "open_url", return_value=answer),
             self.assertRaisesRegex(drift.DriftError, "response object exceeds 1024 keys"),
         ):
             drift.fetch_json(f"{API}/pulls/101")
@@ -2949,7 +2986,7 @@ class BoundedResponseTest(unittest.TestCase):
         drift = upstream_links.upstream_drift
         expected = {str(n): n for n in range(1024)}
         answer = io.BytesIO(json.dumps(expected).encode())
-        with unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer):
+        with unittest.mock.patch.object(drift, "open_url", return_value=answer):
             self.assertEqual(drift.fetch_json(f"{API}/pulls/101"), expected)
 
 
@@ -3158,7 +3195,7 @@ class ServerPaginationTest(unittest.TestCase):
             "X-Total-Count": "2",
             "Unrelated": "ignored",
         }
-        with unittest.mock.patch.object(drift.urllib.request, "urlopen", return_value=answer):
+        with unittest.mock.patch.object(drift, "open_url", return_value=answer):
             page = upstream_forge.fetch_forge(f"{API}/pulls")
         self.assertEqual(page, [])
         self.assertEqual(

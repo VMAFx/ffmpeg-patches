@@ -149,6 +149,33 @@ def read_response(answer: object, url: str) -> bytes:
     return content
 
 
+class HttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when its target URL is https."""
+
+    # urllib requires this callback signature, including all six positional arguments.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913, PLR0917
+        """Refuse a non-https redirect target before its request is built or sent."""
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            if fp is not None:
+                fp.close()
+            raise DriftError(f"{req.full_url}: redirect to {newurl} refused; scheme must be https")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Install HTTPS and error processing explicitly, without build_opener's other transports.
+OPENER = urllib.request.OpenerDirector()
+OPENER.add_handler(urllib.request.HTTPSHandler())
+OPENER.add_handler(HttpsRedirectHandler())
+OPENER.add_handler(urllib.request.HTTPDefaultErrorHandler())
+OPENER.add_handler(urllib.request.HTTPErrorProcessor())
+OPENER.add_handler(urllib.request.UnknownHandler())
+
+
+def open_url(request: urllib.request.Request, timeout: float) -> http.client.HTTPResponse:
+    """Open a request through the https-only opener; tests patch this one name."""
+    return OPENER.open(request, timeout=timeout)  # nosec B310 - fetch_json and HttpsRedirectHandler admit https only.
+
+
 def fetch_json(
     url: str, *, allow_list: bool = False, response_headers: dict[str, str] | None = None
 ) -> dict | list:
@@ -157,7 +184,7 @@ def fetch_json(
         raise DriftError(f"{url}: URL scheme must be https")
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as answer:  # nosec B310 - https scheme checked above.
+        with open_url(request, timeout=REQUEST_TIMEOUT) as answer:
             if response_headers is not None:
                 response_headers.clear()
                 for key in ("Link", "X-Total-Count"):

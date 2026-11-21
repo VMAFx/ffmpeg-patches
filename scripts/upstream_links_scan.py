@@ -83,7 +83,8 @@ def _print_request_plan(
             f"window {cutoff.isoformat()}: candidates {len(candidates)}, "
             f"file candidates {len(eligible)}; expected requests {fetch.count + listings} "
             f"(one page per file listing), at most {fetch.count + listings * MAX_FILE_PAGES}; "
-            f"cap {fetch.cap}; same-patch-id not checked live"
+            f"cap {fetch.cap}; same-patch-id not checked live",
+            flush=True,
         )
 
 

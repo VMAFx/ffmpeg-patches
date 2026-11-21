@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import email.message
 import http.client
 import io
 import json
@@ -13,6 +14,8 @@ import subprocess  # nosec B404 - fixed bash workflow command with inert Git and
 import sys
 import tempfile
 import unittest
+import urllib.request
+import urllib.response
 from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -128,7 +131,7 @@ class ResponseReadTest(unittest.TestCase):
         ):
             with (
                 self.subTest(url=url),
-                patch.object(upstream_drift.urllib.request, "urlopen") as opener,
+                patch.object(upstream_drift, "open_url") as opener,
                 patch.object(upstream_drift.urllib.request, "Request") as request,
             ):
                 with self.assertRaises(upstream_drift.DriftError) as caught:
@@ -141,9 +144,7 @@ class ResponseReadTest(unittest.TestCase):
     def test_https_url_reaches_opener(self) -> None:
         """An HTTPS URL still opens with the JSON Accept header and timeout."""
         url = f"{API}1"
-        with patch.object(
-            upstream_drift.urllib.request, "urlopen", return_value=io.BytesIO(b"{}")
-        ) as opener:
+        with patch.object(upstream_drift, "open_url", return_value=io.BytesIO(b"{}")) as opener:
             self.assertEqual(upstream_drift.fetch_json(url), {})
         opener.assert_called_once()
         args, kwargs = opener.call_args
@@ -156,7 +157,7 @@ class ResponseReadTest(unittest.TestCase):
         answer = io.BytesIO(b"{}")
         answer.headers = {"Content-Length": "10"}
         with (
-            patch.object(upstream_drift.urllib.request, "urlopen", return_value=answer),
+            patch.object(upstream_drift, "open_url", return_value=answer),
             self.assertRaisesRegex(upstream_drift.DriftError, "short response.*2.*10") as caught,
         ):
             upstream_drift.fetch_json(f"{API}1")
@@ -173,7 +174,7 @@ class ResponseReadTest(unittest.TestCase):
                 raise http.client.IncompleteRead(b"{", 4)
 
         with (
-            patch.object(upstream_drift.urllib.request, "urlopen", return_value=BrokenResponse()),
+            patch.object(upstream_drift, "open_url", return_value=BrokenResponse()),
             self.assertRaisesRegex(upstream_drift.DriftError, "IncompleteRead") as caught,
         ):
             upstream_drift.fetch_json(f"{API}1")
@@ -185,8 +186,106 @@ class ResponseReadTest(unittest.TestCase):
         for headers in ({"Content-Length": "2"}, {}):
             answer = io.BytesIO(b"{}")
             answer.headers = headers
-            with patch.object(upstream_drift.urllib.request, "urlopen", return_value=answer):
+            with patch.object(upstream_drift, "open_url", return_value=answer):
                 self.assertEqual(upstream_drift.fetch_json(f"{API}1"), {})
+
+
+class FakeTransport(urllib.request.BaseHandler):
+    """Answer the first request with one redirect and record every opened URL."""
+
+    def __init__(self, location: str) -> None:
+        """Keep the redirect target and an empty record of opened URLs."""
+        self.location = location
+        self.opened: list[str] = []
+
+    def answer(self, request: urllib.request.Request) -> urllib.response.addinfourl:
+        """Record the URL; redirect the first request and answer later ones with an object."""
+        self.opened.append(request.full_url)
+        headers = email.message.Message()
+        code = 200
+        if len(self.opened) == 1:
+            headers["Location"] = self.location
+            code = 302
+        response = urllib.response.addinfourl(io.BytesIO(b"{}"), headers, request.full_url, code)
+        response.msg = "Found" if code == 302 else "OK"
+        return response
+
+    https_open = answer
+    http_open = answer
+    ftp_open = answer
+
+
+def redirecting_opener(location: str) -> tuple[urllib.request.OpenerDirector, FakeTransport]:
+    """Build the production redirect rule over a fake transport that redirects once."""
+    transport = FakeTransport(location)
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        transport,
+        upstream_drift.HttpsRedirectHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    return opener, transport
+
+
+class RedirectTest(unittest.TestCase):
+    """Pin the https-only redirect rule of fetch_json without network access."""
+
+    def test_https_redirect_is_followed(self) -> None:
+        """An absolute or relative https target is followed and its answer is read."""
+        target = "https://code.ffmpeg.org/api/v1/repos/FFmpeg/FFmpeg/pulls/2"
+        for location in (target, "/api/v1/repos/FFmpeg/FFmpeg/pulls/2"):
+            opener, transport = redirecting_opener(location)
+            with self.subTest(location=location), patch.object(upstream_drift, "OPENER", opener):
+                self.assertEqual(upstream_drift.fetch_json(f"{API}1"), {})
+                self.assertEqual(transport.opened, [f"{API}1", target])
+
+    def test_non_https_redirect_is_refused_before_the_target_opens(self) -> None:
+        """A plain HTTP or FTP target raises DriftError and is never opened."""
+        for location in ("http://code.ffmpeg.org/api/v1/moved", "ftp://example.invalid/data"):
+            opener, transport = redirecting_opener(location)
+            with (
+                self.subTest(location=location),
+                patch.object(upstream_drift, "OPENER", opener),
+                self.assertRaises(upstream_drift.DriftError) as caught,
+            ):
+                upstream_drift.fetch_json(f"{API}1")
+            self.assertEqual(transport.opened, [f"{API}1"])
+            self.assertIn(location, str(caught.exception))
+            self.assertIn("scheme must be https", str(caught.exception))
+
+    def test_handler_refuses_a_target_without_https_scheme_and_closes_the_answer(self) -> None:
+        """An empty or file target reaching the callback is refused and its body closed."""
+        for newurl in ("", "file:///unused.json"):
+            answer = io.BytesIO(b"")
+            request = urllib.request.Request(f"{API}1")
+            with self.subTest(newurl=newurl), self.assertRaises(upstream_drift.DriftError):
+                upstream_drift.HttpsRedirectHandler().redirect_request(
+                    request, answer, 302, "Found", email.message.Message(), newurl
+                )
+            self.assertTrue(answer.closed)
+
+    def test_module_opener_carries_no_plain_transport(self) -> None:
+        """The module opener has the https rule and no HTTP, FTP, file or data transport."""
+        kinds = [type(handler) for handler in upstream_drift.OPENER.handlers]
+        self.assertEqual(kinds.count(upstream_drift.HttpsRedirectHandler), 1)
+        self.assertIn(urllib.request.HTTPSHandler, kinds)
+        for plain in (
+            urllib.request.HTTPHandler,
+            urllib.request.FTPHandler,
+            urllib.request.FileHandler,
+            urllib.request.DataHandler,
+            urllib.request.HTTPRedirectHandler,
+        ):
+            with self.subTest(plain=plain.__name__):
+                self.assertNotIn(plain, kinds)
+
+    def test_open_url_passes_the_timeout_to_the_module_opener(self) -> None:
+        """open_url sends the request and its timeout through OPENER.open unchanged."""
+        request = urllib.request.Request(f"{API}1")
+        with patch.object(upstream_drift.OPENER, "open", return_value="answer") as opener:
+            self.assertEqual(upstream_drift.open_url(request, timeout=7), "answer")
+        opener.assert_called_once_with(request, timeout=7)
 
 
 class Utf8ReadTest(unittest.TestCase):
@@ -239,8 +338,8 @@ class DriftTest(unittest.TestCase):
     def test_protocol_error_exits_two_without_a_traceback(self) -> None:
         """The drift command reports protocol errors as read failures with their address."""
         with patch.object(
-            upstream_drift.urllib.request,
-            "urlopen",
+            upstream_drift,
+            "open_url",
             side_effect=http.client.HTTPException("planted protocol error"),
         ):
             rc, out, err = self.run_main(upstream_drift.fetch_json)
@@ -525,13 +624,19 @@ class DriftTest(unittest.TestCase):
         self.assertIn("state must be one of", err)
 
     def test_fetch_refuses_an_answer_that_is_not_an_object(self) -> None:
-        """Refuse a forge answer that is not a JSON object or is missing."""
-        for name, text in (("list.json", "[1]"), ("broken.json", "{")):
-            path = self.scratch / name
-            path.write_text(text, encoding="utf-8")
-            with self.subTest(name=name), self.assertRaises(upstream_drift.DriftError):
-                upstream_drift.fetch_json(path.as_uri())
-        with self.assertRaises(upstream_drift.DriftError):
+        """Refuse an https answer that is a list or broken JSON, and any non-https URL."""
+        with (
+            patch.object(upstream_drift, "open_url", return_value=io.BytesIO(b"[1]")),
+            self.assertRaisesRegex(upstream_drift.DriftError, "the answer is not a JSON object"),
+        ):
+            upstream_drift.fetch_json(f"{API}1")
+        with (
+            patch.object(upstream_drift, "open_url", return_value=io.BytesIO(b"{")),
+            self.assertRaises(upstream_drift.DriftError) as caught,
+        ):
+            upstream_drift.fetch_json(f"{API}1")
+        self.assertIsInstance(caught.exception.__cause__, json.JSONDecodeError)
+        with self.assertRaisesRegex(upstream_drift.DriftError, "URL scheme must be https"):
             upstream_drift.fetch_json((self.scratch / "none.json").as_uri())
 
     # Boundary.
