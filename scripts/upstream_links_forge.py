@@ -143,8 +143,8 @@ class RequestBudget:
         self.narrow_option = "--pull N or check --since YYYY-MM-DD"
         self.sleep = sleep if sleep is not None else time.sleep
 
-    def __call__(self, url: str) -> dict | list:
-        """Pause once per admitted request and preserve the underlying per-operation timeout."""
+    def admit(self) -> float:
+        """Count and pace one network request, reserving a full operation timeout."""
         if self.count >= self.cap:
             raise DriftError(
                 f"request budget exceeded: count {self.count + 1}, cap {self.cap}; "
@@ -154,8 +154,17 @@ class RequestBudget:
         self.ensure_time(REQUEST_TIMEOUT + REQUEST_PAUSE_SECONDS)
         self.count += 1
         self.sleep(REQUEST_PAUSE_SECONDS)
-        remaining = self.ensure_time(REQUEST_TIMEOUT)
-        result = self.reader.read(url, remaining)
+        return self.ensure_time(REQUEST_TIMEOUT)
+
+    def __call__(self, url: str) -> dict | list:
+        """Pause once per admitted request and preserve the underlying per-operation timeout."""
+        remaining = self.admit()
+        previous = upstream_drift.REDIRECT_ADMIT
+        upstream_drift.REDIRECT_ADMIT = self.admit
+        try:
+            result = self.reader.read(url, remaining)
+        finally:
+            upstream_drift.REDIRECT_ADMIT = previous
         self.ensure_time()
         return result
 
@@ -445,6 +454,7 @@ def _parse_forge_pull(raw: object, partial_files: bool) -> dict[str, object]:
     item = normalize_item(trusted | {"files": names}, partial_files=partial_files)
     item["inline_files"] = "files" in checked
     item["changed_files"] = checked.get("changed_files")
+    item["revision"] = (checked["head"]["sha"], checked["base"]["ref"])
     body = checked["body"]
     if body is not None and not isinstance(body, str):
         raise DriftError(f"pull {item['number']}: invalid body")
@@ -520,5 +530,18 @@ def _resolved_files(
     """Resolve file names once without trusting the forge's separate count."""
     number = int(item["number"])
     if item["inline_files"]:
-        files.setdefault(number, item["files"])
-    return memoized_files(number, fetch, files, partial=partial)
+        return _item_files(item["files"], number, partial)
+    revision = item.get("revision")
+    cached = files.get(number)
+    if (
+        cached is not None
+        and getattr(cached, "revision", None) is not None
+        and revision != cached.revision
+    ):
+        raise DriftError(
+            f"{pull_api_url(number)}/files: inconsistent pull revision for memoized file list"
+        )
+    resolved = memoized_files(number, fetch, files, partial=partial)
+    if getattr(files[number], "revision", None) is None:
+        files[number].revision = revision
+    return resolved

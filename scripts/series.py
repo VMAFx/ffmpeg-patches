@@ -727,7 +727,11 @@ def _check_related_fields(item: dict, where: str, findings: Findings) -> None:
             )
     author = item["author"]
     if not valid_related_author(author):
-        findings.error(where, "'related' field 'author' must be a non-empty string")
+        findings.error(
+            where,
+            f"'related' field 'author' must be nonblank printable text of at most "
+            f"{MAX_RELATED_AUTHOR_CHARS} characters",
+        )
     if not _valid_day(item["seen"]):
         findings.error(where, "'related' field 'seen' must be a YYYY-MM-DD date")
 

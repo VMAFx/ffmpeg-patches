@@ -189,6 +189,31 @@ class ResponseReadTest(unittest.TestCase):
             with patch.object(upstream_drift, "open_url", return_value=answer):
                 self.assertEqual(upstream_drift.fetch_json(f"{API}1"), {})
 
+    def test_fetch_json_joins_case_insensitive_link_headers(self) -> None:
+        """Split case-insensitive Link fields join with comma-space to match one field."""
+        prev_link = '<https://example.invalid/page1>; rel="prev"'
+        next_link = '<https://example.invalid/page2>; rel="next"'
+        combined = f"{prev_link}, {next_link}"
+        split_headers = email.message.Message()
+        split_headers["Link"] = prev_link
+        split_headers["link"] = next_link
+        split_headers["X-Total-Count"] = "2"
+        single_headers = email.message.Message()
+        single_headers["Link"] = combined
+        single_headers["X-Total-Count"] = "2"
+        for headers in (split_headers, single_headers)[:2]:
+            answer = io.BytesIO(b"[]")
+            answer.headers = headers
+            captured: dict[str, str] = {}
+            with patch.object(upstream_drift, "open_url", return_value=answer):
+                self.assertEqual(
+                    upstream_drift.fetch_json(
+                        f"{API}1", allow_list=True, response_headers=captured
+                    ),
+                    [],
+                )
+            self.assertEqual(captured, {"Link": combined, "X-Total-Count": "2"})
+
 
 class FakeTransport(urllib.request.BaseHandler):
     """Answer the first request with one redirect and record every opened URL."""
@@ -286,6 +311,101 @@ class RedirectTest(unittest.TestCase):
         with patch.object(upstream_drift.OPENER, "open", return_value="answer") as opener:
             self.assertEqual(upstream_drift.open_url(request, timeout=7), "answer")
         opener.assert_called_once_with(request, timeout=7)
+
+    def test_oversized_https_redirect_body_is_refused_without_unsized_drain(self) -> None:
+        """Reject an oversized https redirect body before draining unsized or opening target."""
+        target = f"{API}2"
+        reads: list[int] = []
+
+        class RecordingBytesIO(io.BytesIO):
+            """Record each read size before delegating to the in-memory byte stream."""
+
+            def read(self, size: int | None = -1) -> bytes:
+                """Capture requested read size and return the bounded bytes."""
+                reads.append(-1 if size is None else size)
+                return super().read(size)
+
+        opener, transport = redirecting_opener(target)
+        redirect_body = RecordingBytesIO(b" " * 130)
+
+        def respond(request: urllib.request.Request) -> urllib.response.addinfourl:
+            """Serve the caller-controlled redirect stream first and an empty object second."""
+            transport.opened.append(request.full_url)
+            headers = email.message.Message()
+            first = len(transport.opened) == 1
+            if first:
+                headers["Location"] = target
+            stream = redirect_body if first else io.BytesIO(b"{}")
+            code = 302 if first else 200
+            response = urllib.response.addinfourl(stream, headers, request.full_url, code)
+            response.msg = "Found" if first else "OK"
+            return response
+
+        transport.https_open = respond
+        with (
+            patch.object(upstream_drift, "OPENER", opener),
+            patch.object(upstream_drift, "MAX_RESPONSE_BYTES", 128),
+            self.assertRaisesRegex(upstream_drift.DriftError, "response exceeds 128 bytes"),
+        ):
+            upstream_drift.fetch_json(f"{API}1")
+        self.assertEqual(
+            (transport.opened, reads, redirect_body.closed), ([f"{API}1"], [129], True)
+        )
+        redirect_body = RecordingBytesIO(b" " * 128)
+        transport.opened.clear()
+        with (
+            patch.object(upstream_drift, "OPENER", opener),
+            patch.object(upstream_drift, "MAX_RESPONSE_BYTES", 128),
+        ):
+            self.assertEqual(upstream_drift.fetch_json(f"{API}1"), {})
+        self.assertEqual(transport.opened, [f"{API}1", target])
+
+    def test_https_proxy_handler_routes_https_only_and_keeps_redirect_check(self) -> None:
+        """Route https through HTTPS_PROXY, leave direct https untunneled, refuse http redirect."""
+        seen: list[tuple[str, str | None, str]] = []
+
+        class RecordingHttpsHandler(urllib.request.BaseHandler):
+            """Record host, tunnel host and URL without opening a network socket."""
+
+            def https_open(self, req: urllib.request.Request) -> urllib.response.addinfourl:
+                """Capture proxy routing and redirect when the path ends with /redirect."""
+                seen.append((req.host, getattr(req, "_tunnel_host", None), req.full_url))
+                headers = email.message.Message()
+                code = 200
+                if req.full_url.endswith("/redirect"):
+                    headers["Location"] = "http://code.ffmpeg.org/plain"
+                    code = 302
+                resp = urllib.response.addinfourl(io.BytesIO(b"{}"), headers, req.full_url, code)
+                resp.msg = "Found" if code == 302 else "OK"
+                return resp
+
+        opener = urllib.request.OpenerDirector()
+        for handler in list(upstream_drift.OPENER.handlers)[:8]:
+            if not isinstance(handler, urllib.request.HTTPSHandler):
+                opener.add_handler(handler)
+        opener.add_handler(RecordingHttpsHandler())
+        proxies = {"https": "http://proxy.example.invalid:8443", "http": "http://bad.invalid:80"}
+        with (
+            patch.object(upstream_drift, "OPENER", opener),
+            patch.object(urllib.request, "getproxies", return_value=proxies),
+            patch.object(urllib.request, "proxy_bypass", return_value=False),
+        ):
+            self.assertEqual(upstream_drift.fetch_json(f"{API}1"), {})
+            with self.assertRaisesRegex(upstream_drift.DriftError, "scheme must be https"):
+                upstream_drift.fetch_json(f"{API}1/redirect")
+        with (
+            patch.object(upstream_drift, "OPENER", opener),
+            patch.object(urllib.request, "getproxies", return_value={"http": proxies["http"]}),
+        ):
+            self.assertEqual(upstream_drift.fetch_json(f"{API}2"), {})
+        self.assertEqual(
+            seen,
+            [
+                ("proxy.example.invalid:8443", "code.ffmpeg.org", f"{API}1"),
+                ("proxy.example.invalid:8443", "code.ffmpeg.org", f"{API}1/redirect"),
+                ("code.ffmpeg.org", None, f"{API}2"),
+            ],
+        )
 
 
 class Utf8ReadTest(unittest.TestCase):
@@ -1426,6 +1546,53 @@ class FixTest(unittest.TestCase):
         with self.assertRaisesRegex(upstream_drift.DriftError, "lacks an original snapshot"):
             upstream_drift.write_repairs(self.root, self.data["contributions"], repairs, TODAY)
         self.assertEqual(self.snapshot(), before)
+
+    def test_write_repairs_serializes_with_fill_lock_and_aborts_after_fill(self) -> None:
+        """Hold the sibling lock across compare, writes and rollback; fail if fill published."""
+        lock = self.data_path.with_name(f".{self.data_path.name}.lock")
+        observed: list[tuple[str, bool]] = []
+        read_bytes = Path.read_bytes
+        write_bytes = Path.write_bytes
+
+        def check_read(path: Path) -> bytes:
+            """Record lock presence during the final compare read of the manifest."""
+            if path == self.data_path:
+                observed.append(("read", lock.is_file()))
+            return read_bytes(path)
+
+        def check_write(path: Path, content: bytes) -> int:
+            """Record lock presence during every repair and rollback write."""
+            observed.append(("write", lock.is_file()))
+            return write_bytes(path, content)
+
+        def fail_table(root: Path, *, write: bool) -> int:
+            """Record lock presence during table generation and force rollback."""
+            observed.append(("table", lock.is_file()))
+            return 1
+
+        before = self.snapshot()
+        with (
+            patch.object(Path, "read_bytes", check_read),
+            patch.object(Path, "write_bytes", check_write),
+            patch.object(upstream_drift.series, "contributions", side_effect=fail_table),
+        ):
+            status, _, err = self.fix(pull(1, title="changed"))
+        self.assertEqual(status, 2)
+        self.assertIn("cannot regenerate", err)
+        self.assertFalse(lock.exists())
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(any(kind == "write" and held for kind, held in observed))
+        self.assertTrue(all(held for kind, held in observed if kind in ("write", "table")))
+        self.assertTrue(observed[1][1])
+
+        lock.write_bytes(b"fill lock")
+        with patch.object(Path, "write_bytes") as blocked_write:
+            status, _, err = self.fix(pull(1, title="changed"))
+        self.assertEqual(status, 2)
+        self.assertIn(str(lock), err)
+        blocked_write.assert_not_called()
+        self.assertEqual(lock.read_bytes(), b"fill lock")
+        lock.unlink()
 
 
 class ImportRationaleTest(unittest.TestCase):

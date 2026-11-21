@@ -2113,6 +2113,23 @@ class ContributionsTest(SeriesTestCase):
             "entry 1: 'related' field 'author' must be",
         )
 
+    def test_related_author_error_states_printable_length_rule_without_echoing_value(self) -> None:
+        """State the nonblank printable length rule and omit the rejected author value."""
+        expected = (
+            "entry 1: 'related' field 'author' must be nonblank printable text of at most "
+            f"{series.MAX_RELATED_AUTHOR_CHARS} characters"
+        )
+        for bad, secret in (
+            ("   ", "   "),
+            ("secret-control\x07author", "secret-control"),
+            ("z" * (series.MAX_RELATED_AUTHOR_CHARS + 1), "zzzzzzzz"),
+        )[:3]:
+            with self.subTest(bad=bad[:8]):
+                entry = self.fx.record(1, related=[self.related_item(10, author=bad)])
+                findings = self.check_with([entry, self.fx.record(2)], render=False)
+                self.assert_error(findings, expected)
+                self.assertFalse(any(secret in err for err in findings.errors))
+
     def test_undecided_relation_cannot_masquerade_as_manifest_evidence(self) -> None:
         """Keep undecided file comparisons outside the proven-relation manifest schema."""
         entry = self.fx.record(1, related=[self.related_item(10, reason="same-files-undecided")])

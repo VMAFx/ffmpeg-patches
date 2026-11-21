@@ -26,6 +26,7 @@ cannot run (unsound data file, forge unreachable, unexpected answer).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import json
 import re
@@ -136,17 +137,39 @@ def response_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
+REDIRECT_ADMIT: Callable[[], object] | None = None
+
+
 def read_response(answer: object, url: str) -> bytes:
     """Read at most one byte beyond the response ceiling before JSON decoding."""
     content = answer.read(MAX_RESPONSE_BYTES + 1)
     if len(content) > MAX_RESPONSE_BYTES:
+        answer.close()
         raise DriftError(f"{url}: response exceeds {MAX_RESPONSE_BYTES} bytes")
     declared = getattr(answer, "headers", {}).get("Content-Length")
     if declared is not None and len(content) < int(declared):
+        answer.close()
         raise DriftError(
             f"{url}: short response: received {len(content)} of {declared} declared bytes"
         )
     return content
+
+
+class HttpsProxyHandler(urllib.request.ProxyHandler):
+    """Apply environment or explicit proxy settings to https destinations only."""
+
+    def __init__(self, proxies: dict[str, str] | None = None) -> None:
+        """Keep an explicit proxy mapping or read live environment proxies per request."""
+        super().__init__({})
+        self.https_proxies = proxies
+
+    def https_open(self, req: urllib.request.Request):
+        """Route an https request through the configured https proxy when present."""
+        proxies = urllib.request.getproxies() if self.https_proxies is None else self.https_proxies
+        proxy = {
+            key.lower(): value for key, value in list(proxies.items())[:MAX_RESPONSE_OBJECT_KEYS]
+        }.get("https")
+        return self.proxy_open(req, proxy, "https") if proxy else None
 
 
 class HttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -159,11 +182,22 @@ class HttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
             if fp is not None:
                 fp.close()
             raise DriftError(f"{req.full_url}: redirect to {newurl} refused; scheme must be https")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        if fp is not None:
+            read_response(fp, req.full_url)
+        request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if request is not None and REDIRECT_ADMIT is not None:
+            try:
+                REDIRECT_ADMIT()
+            except BaseException:
+                if fp is not None:
+                    fp.close()
+                raise
+        return request
 
 
 # Install HTTPS and error processing explicitly, without build_opener's other transports.
 OPENER = urllib.request.OpenerDirector()
+OPENER.add_handler(HttpsProxyHandler())
 OPENER.add_handler(urllib.request.HTTPSHandler())
 OPENER.add_handler(HttpsRedirectHandler())
 OPENER.add_handler(urllib.request.HTTPDefaultErrorHandler())
@@ -187,10 +221,17 @@ def fetch_json(
         with open_url(request, timeout=REQUEST_TIMEOUT) as answer:
             if response_headers is not None:
                 response_headers.clear()
-                for key in ("Link", "X-Total-Count"):
-                    value = getattr(answer, "headers", {}).get(key)
-                    if value is not None:
-                        response_headers[key] = value
+                headers = getattr(answer, "headers", {})
+                links = [
+                    v
+                    for k, v in list(headers.items())[:MAX_RESPONSE_OBJECT_KEYS]
+                    if k.lower() == "link" and v is not None
+                ]
+                if links:
+                    response_headers["Link"] = ", ".join(links)
+                total = headers.get("X-Total-Count")
+                if total is not None:
+                    response_headers["X-Total-Count"] = total
             data = json.loads(read_response(answer, url), object_pairs_hook=response_object)
     except (OSError, ValueError, RecursionError, http.client.HTTPException) as exc:
         raise DriftError(f"{url}: {exc}") from exc
@@ -485,6 +526,22 @@ def restore_originals(targets: set[Path], originals: dict[Path, bytes]) -> list[
     return failed
 
 
+@contextlib.contextmanager
+def manifest_lock(root: Path):
+    """Hold the sibling manifest lock across compare, repair writes and rollback."""
+    path = root / series.CONTRIBUTIONS
+    lock = path.with_name(f".{path.name}.lock")
+    try:
+        stream = lock.open("xb")
+    except FileExistsError as exc:
+        raise DriftError(f"{path}: another writer holds {lock}; no repairs written") from exc
+    try:
+        stream.close()
+        yield lock
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date | None) -> None:
     """Write repairs and the table together; restore original bytes on failure."""
     repair_path_limit(len(repairs.originals))
@@ -505,20 +562,21 @@ def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date
     targets = repairs.files.keys() | {root / "README.md"}
     if not targets <= repairs.originals.keys():
         raise DriftError("repair target lacks an original snapshot")
-    for path, content in repairs.originals.items():
-        if path.read_bytes() != content:
-            raise DriftError(f"{path}: changed since read; no repairs written")
-    try:
-        for path, content in repairs.files.items():
-            path.write_bytes(content)
-        if series.contributions(root, write=True) != 0:
-            raise DriftError("cannot regenerate the contribution table")
-    except (OSError, DriftError, series.SeriesError) as exc:
-        failed = restore_originals(targets, repairs.originals)
-        if failed:
-            paths = ", ".join(str(path) for path in failed)
-            raise DriftError(f"{exc}; failed to restore: {paths}") from exc
-        raise
+    with manifest_lock(root):
+        for path, content in list(repairs.originals.items())[:MAX_REPAIR_PATHS]:
+            if path.read_bytes() != content:
+                raise DriftError(f"{path}: changed since read; no repairs written")
+        try:
+            for path, content in list(repairs.files.items())[:MAX_REPAIR_PATHS]:
+                path.write_bytes(content)
+            if series.contributions(root, write=True) != 0:
+                raise DriftError("cannot regenerate the contribution table")
+        except (OSError, DriftError, series.SeriesError) as exc:
+            failed = restore_originals(targets, repairs.originals)
+            if failed:
+                paths = ", ".join(str(path) for path in failed)
+                raise DriftError(f"{exc}; failed to restore: {paths}") from exc
+            raise
     repairs.lines.extend(stale)
 
 

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import email.message
 import http.client
 import io
 import json
@@ -16,6 +17,8 @@ import tempfile
 import threading
 import unittest
 import unittest.mock
+import urllib.request
+import urllib.response
 from datetime import date
 from pathlib import Path
 
@@ -1113,15 +1116,29 @@ class RequestCostTest(unittest.TestCase):
     def test_worker_cleanup_preserves_timeout_before_worker_starts(self) -> None:
         """A queued request at expiry cannot replace the incomplete-scan error during cleanup."""
         forge = FakeForge(self.answers)
-        with (
-            unittest.mock.patch.object(upstream_forge.threading.Thread, "start"),
-            unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 0.05),
-            unittest.mock.patch.object(upstream_forge, "REQUEST_TIMEOUT", 0),
-            unittest.mock.patch.object(upstream_forge, "REQUEST_PAUSE_SECONDS", 0),
+        queued: list[list[object]] = []
+        init = upstream_forge._ScanReader.__init__
+
+        def init_without_worker(reader: upstream_forge._ScanReader, *args: object) -> None:
+            """Capture the queued task at the answer wait and time out immediately."""
+            with unittest.mock.patch.object(upstream_forge.threading.Thread, "start"):
+                init(reader, *args)
+
+            def expire_on_wait(block: bool = True, timeout: float | None = None) -> object:
+                """Verify the request is already queued before raising the wait timeout."""
+                self.assertTrue(reader.tasks.full())
+                queued.append(list(reader.tasks.queue))
+                raise upstream_forge.queue.Empty
+
+            reader.answers.get = expire_on_wait
+
+        with unittest.mock.patch.object(
+            upstream_forge._ScanReader, "__init__", init_without_worker
         ):
             rc, _, err = run_cli(self.root, forge, "check")
         self.assertEqual(rc, 2)
-        self.assertIn("incomplete scan", err)
+        self.assertEqual(queued, [[f"{API}/pulls/10"]])
+        self.assertIn(f"during {API}/pulls/10", err)
         self.assertEqual(forge.read, [])
 
     def test_elapsed_budget_cli_exits_two_without_publishing(self) -> None:
@@ -1184,6 +1201,51 @@ class RequestCostTest(unittest.TestCase):
             forge = FakeForge({})
             self.assertEqual(run_cli(self.root, forge, command), (0, "", ""))
             self.assertEqual(forge.read, [])
+
+    def test_redirect_hops_are_counted_and_paced_in_request_budget(self) -> None:
+        """Count and pace each redirect hop through RequestBudget while direct GETs cost one."""
+        drift = upstream_links.upstream_drift
+        target = f"{API}/pulls/20"
+        opened: list[str] = []
+
+        class RedirectOrDirectHandler(urllib.request.BaseHandler):
+            """Redirect pulls/10 to pulls/20 and serve pulls/20 directly."""
+
+            def https_open(self, req: urllib.request.Request) -> urllib.response.addinfourl:
+                """Record each opened URL and return 302 for pulls/10 or 200 for pulls/20."""
+                opened.append(req.full_url)
+                headers = email.message.Message()
+                redirect = req.full_url == f"{API}/pulls/10"
+                if redirect:
+                    headers["Location"] = target
+                code = 302 if redirect else 200
+                resp = urllib.response.addinfourl(io.BytesIO(b"{}"), headers, req.full_url, code)
+                resp.msg = "Found" if redirect else "OK"
+                return resp
+
+        opener = urllib.request.OpenerDirector()
+        for handler in (
+            RedirectOrDirectHandler(),
+            drift.HttpsRedirectHandler(),
+            urllib.request.HTTPErrorProcessor(),
+        )[:3]:
+            opener.add_handler(handler)
+        pauses: list[float] = []
+        budget = upstream_forge.RequestBudget(upstream_forge.fetch_forge, 3, pauses.append)
+        self.addCleanup(budget.reader.close)
+        with unittest.mock.patch.object(drift, "OPENER", opener):
+            self.assertEqual(budget(target), {})
+            self.assertEqual((budget.count, len(pauses), opened), (1, 1, [target]))
+            self.assertEqual(budget(f"{API}/pulls/10"), {})
+            self.assertEqual(
+                (budget.count, pauses, opened),
+                (3, [0.5, 0.5, 0.5], [target, f"{API}/pulls/10", target]),
+            )
+            capped = upstream_forge.RequestBudget(upstream_forge.fetch_forge, 1, pauses.append)
+            self.addCleanup(capped.reader.close)
+            with self.assertRaisesRegex(upstream_parse.DriftError, "count 2, cap 1"):
+                capped(f"{API}/pulls/10")
+        self.assertEqual(opened, [target, f"{API}/pulls/10", target, f"{API}/pulls/10"])
 
 
 def measured_window_forge() -> FakeForge:
@@ -1816,6 +1878,43 @@ class ForgeFileCountTest(unittest.TestCase):
         raw = {"number": 10, "author": "owner", "title": "component: change"}
         self.assertEqual(upstream_forge.normalize_item(raw | {"files": ["a.c"]})["files"], ["a.c"])
         self.assertEqual(upstream_forge.normalize_item(raw | {"changed_files": 15})["files"], [])
+
+    def test_own_pull_also_in_candidates_uses_each_observations_inline_files_and_checks_revision(
+        self,
+    ) -> None:
+        """Use each observation's inline files; reuse fetched files only for the same revision."""
+        write_manifest(self.root, [manifest_entry(10), manifest_entry(20)])
+        own_10 = forge_pull(10) | {"files": ["shared.c"]}
+        own_20 = forge_pull(20) | {"user": {"login": "bob"}, "files": ["shared.c"]}
+        cand_20 = forge_pull(20) | {"user": {"login": "bob"}, "files": ["other.c"]}
+        forge = FakeForge(
+            {
+                f"{API}/pulls/10": own_10,
+                f"{API}/pulls/20": own_20,
+                self.page: [cand_20],
+            }
+        )
+        self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
+
+        plain_10 = forge_pull(10)
+        plain_20 = forge_pull(20) | {"user": {"login": "bob"}}
+        same_rev = FakeForge(
+            {
+                f"{API}/pulls/10": plain_10,
+                f"{API}/pulls/20": plain_20,
+                f"{API}/pulls/10/files?limit=50&page=1": [{"filename": "shared.c"}],
+                f"{API}/pulls/20/files?limit=50&page=1": [{"filename": "other.c"}],
+                self.page: [dict(plain_20)],
+            }
+        )
+        self.assertEqual(run_cli(self.root, same_rev, "check"), (0, "", ""))
+        self.assertEqual(same_rev.read.count(f"{API}/pulls/20/files?limit=50&page=1"), 1)
+
+        moved_20 = dict(plain_20) | {"head": {"sha": "b" * 40}}
+        diff_rev = FakeForge(same_rev.answers | {self.page: [moved_20]})
+        rc, out, err = run_cli(self.root, diff_rev, "check")
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("inconsistent", err)
 
 
 class OversizedCandidateTest(unittest.TestCase):
@@ -3201,6 +3300,37 @@ class ServerPaginationTest(unittest.TestCase):
         self.assertEqual(
             page.headers, {key: answer.headers[key] for key in ("Link", "X-Total-Count")}
         )
+
+    def test_split_and_single_field_link_headers_both_keep_listing_incomplete(self) -> None:
+        """Split prev/next Link fields and a single joined Link field both stay incomplete."""
+        drift = upstream_links.upstream_drift
+        prev_link = '<https://example.invalid/page1>; rel="prev"'
+        next_link = '<https://example.invalid/page2>; rel="next"'
+        split_msg = email.message.Message()
+        split_msg["Link"] = prev_link
+        split_msg["link"] = next_link
+        single_msg = email.message.Message()
+        single_msg["Link"] = f"{prev_link}, {next_link}"
+        results: list[tuple[bool, list[str], str]] = []
+        for hdrs in (split_msg, single_msg)[:2]:
+            file_ans = io.BytesIO(b'[{"filename": "a.c"}]')
+            file_ans.headers = hdrs
+            pull_ans = io.BytesIO(json.dumps([forge_pull(101)]).encode("utf-8"))
+            pull_ans.headers = hdrs
+            with (
+                unittest.mock.patch.object(upstream_forge, "MAX_FILE_PAGES", 1),
+                unittest.mock.patch.object(upstream_forge, "MAX_PULL_PAGES", 1),
+                unittest.mock.patch.object(drift, "open_url", side_effect=[file_ans, pull_ans]),
+            ):
+                files = upstream_forge.read_pull_files(
+                    f"{API}/pulls/10", upstream_forge.fetch_forge, partial=True
+                )
+                with self.assertRaises(upstream_parse.DriftError) as caught:
+                    upstream_forge.read_candidate_pulls("2026-11-01", upstream_forge.fetch_forge)
+            results.append((files.complete, list(files), str(caught.exception)))
+        self.assertEqual(results[0], results[1])
+        self.assertFalse(results[0][0])
+        self.assertIn("exceeds 1 pages", results[0][2])
 
 
 class PaginationLimitTest(unittest.TestCase):
