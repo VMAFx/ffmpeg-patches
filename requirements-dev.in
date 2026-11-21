@@ -5,7 +5,7 @@ ruff==0.17.5
 # pylint: scripts/lint_mutable_defaults.py PYLINT_VERSION must match.
 pylint==4.1.4
 # numpy: CIEDE2000 arithmetic of scripts/tonemap_parity.py (ADR-0002).
-numpy==2.5.4
+numpy==2.5.5
 # PyYAML: tests read lefthook.yml and workflows.
 pyyaml==6.0.3
 # tree-sitter: scripts/series.py measures C function spans (HISS-04 lengths gate).
