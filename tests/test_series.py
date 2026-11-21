@@ -1735,6 +1735,42 @@ class MasterFormUnionTest(MasterFormCase):
                 blobs = tuple(map(self.store_blob, (ours, base, theirs)))
                 self.assertEqual(series.append_only_hunks(self.fx.tree, blobs), expected)
 
+    def test_stage_union_failure_resets_work_tree(self) -> None:
+        """Verify a stage_union error resets the 3-way conflict and leaves the tree clean."""
+        master = self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE))
+        planted = subprocess.CalledProcessError(128, ["git", "update-index"], "", "fatal: planted")
+        with unittest.mock.patch.object(series, "stage_union", side_effect=planted):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                self.apply()
+            self.assertIs(raised.exception, planted)
+            self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD"), master)
+            self.assert_clean()
+            status, _, err = self.run_main("--master-forms", self.url)
+            self.assertEqual(status, 2)
+            self.assertIn("fatal: planted", err)
+            self.assert_clean()
+        status, out, _ = self.run_main("--master-forms", self.url)
+        self.assertEqual(status, 0)
+        self.assertIn("master-form", out)
+        self.assert_clean()
+
+    def test_nearby_appends_do_not_duplicate_base_line(self) -> None:
+        """Verify two append-only hunks separated by one base line keep that line once."""
+        pull_1, pull_2 = HQDN3D, "TESTPROGS-$(CONFIG_PULL_2) += pull_2"
+        master_1, master_2 = ZSCALE, "TESTPROGS-$(CONFIG_MASTER_2) += master_2"
+        pull = [MAKEFILE[0], pull_1, MAKEFILE[1], pull_2, *MAKEFILE[2:]]
+        master = [MAKEFILE[0], master_1, MAKEFILE[1], master_2, *MAKEFILE[2:]]
+        self.set_sides(UNION_PATH, pull, master)
+        self.assertEqual([s for _, s in self.apply()], ["master-form", "applied"])
+        expected = [MAKEFILE[0], master_1, pull_1, MAKEFILE[1], master_2, pull_2, *MAKEFILE[2:]]
+        merged = self.lines(UNION_PATH)
+        self.assertEqual(merged, expected)
+        for line in MAKEFILE:
+            self.assertEqual(merged.count(line), 1)
+        message = run_git(self.fx.tree, "log", "-1", "--format=%B", "HEAD~1")
+        self.assertIn(f"union merge: {UNION_PATH} (2 append-only hunks)", message)
+        self.assert_clean()
+
     def store_blob(self, lines: list[str]) -> str:
         """Write LINES as a blob of the fixture tree and return its id."""
         write_file_lines(self.fx.tree, "side.mk", lines)

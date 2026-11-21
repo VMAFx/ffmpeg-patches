@@ -1061,7 +1061,11 @@ def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
     if not applied.returncode:
         git(tree, "commit", "-q", "-m", subject)
         return "master-form"
-    unioned = union_conflicts(tree, patch, applied)
+    try:
+        unioned = union_conflicts(tree, patch, applied)
+    except (SeriesError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        git(tree, "reset", "-q", "--hard", "HEAD", check=False)
+        raise
     if unioned is None:
         git(tree, "reset", "-q", "--hard", "HEAD")
         return "conflict"
@@ -1174,7 +1178,13 @@ def conflict_regions(text: str) -> list[list[list[str]]]:
 def stage_union(tree: Path, name: str, stages: dict[int, tuple[str, str]]) -> None:
     """Stage the union merge of one conflicted path and write it to the work tree."""
     blobs = (stages[2][1], stages[1][1], stages[3][1])
-    union = ("merge-file", "--object-id", "--union", f"--marker-size={UNION_MARKER_SIZE}")
+    union = (
+        "merge-file",
+        "--object-id",
+        "--zdiff3",
+        "--union",
+        f"--marker-size={UNION_MARKER_SIZE}",
+    )
     blob = git(tree, *union, *blobs).stdout.strip()
     git(tree, "update-index", "--cacheinfo", f"100644,{blob},{name}")
     git(tree, "checkout-index", "-f", "--", name)
