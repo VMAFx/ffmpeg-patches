@@ -290,6 +290,7 @@ classes:
   - 25879
   definition: Vulkan filter requires `VkPhysicalDevice*Features` unused by its shaders, or compiles shaders using `Int16` or dynamic storage-image array indexing without checking device support.
   question: Do Vulkan feature gates exactly cover shader requirements including Int16 and dynamic storage-image array indexing?
+  check: variant-sweep:vulkan-features
 - id: duplicated-helper-or-predicate
   hits: 2
   pull_requests:

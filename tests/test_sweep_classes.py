@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -12,12 +13,21 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 
 from scripts import review_classes, sweep_doc_claims, sweep_state_advance, variant_sweep
 from tests import test_variant_sweep as fixtures
+from tests.helpers import full_sweep_report
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "variant_sweep.py"
+VALIDATE_SECTIONS = (
+    "    if not REPORT_TABLES.keys() <= sections.keys() or not all(\n"
+    "        validate_section(sections[name], name, sha) for name in REPORT_TABLES\n"
+    "    ):\n"
+    "        return False"
+)
 PLANTED_BASE = "681025faf1add6567b1f97d2f1037d0e764afd0f"
 REFUSED_HEAD = "b48c431d335e7dfab72b1b5fc2ca5d84f441b681"
 FIXED_HEAD = "0f802749f015b7b1786e1778cb2bbf8ff1352e82"
@@ -26,6 +36,35 @@ FIXED_HEAD = "0f802749f015b7b1786e1778cb2bbf8ff1352e82"
 def section(report: str, name: str) -> str:
     """Return one named class section without neighboring class rows."""
     return report.split(f"class: {name}\n", 1)[1].split("class: ", 1)[0]
+
+
+def load_mutant_module(rel_path: str, old: str, new: str, tmp: Path) -> ModuleType:
+    """Load one mutated sweep module copy from a temporary directory."""
+    root = Path(__file__).resolve().parents[1]
+    source = (root / rel_path).read_text(encoding="utf-8")
+    mutant_path = tmp / "mutant.py"
+    mutant_path.write_text(source.replace(old, new, 1), encoding="utf-8")
+    name = f"mutant_{mutant_path.stem}_{id(mutant_path)}"
+    spec = importlib.util.spec_from_file_location(name, mutant_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load mutant from {rel_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cut_vulkan_features_section(report: str) -> str:
+    """Drop only the vulkan-features class block from a full sweep report."""
+    head, tail = report.split("class: vulkan-features\n", 1)
+    _, rest = tail.split("class: port-parity\n", 1)
+    return head + "class: port-parity\n" + rest
+
+
+def cut_port_parity_section(report: str) -> str:
+    """Drop only the port-parity class block from a full sweep report."""
+    head, tail = report.split("class: port-parity\n", 1)
+    _, review = tail.split("\n\nclass: review-classes\n", 1)
+    return head + "class: review-classes\n" + review
 
 
 class SweepClassesTest(unittest.TestCase):
@@ -350,7 +389,7 @@ class SweepClassesTest(unittest.TestCase):
         """An empty diff emits exactly three no-hits sections."""
         result = self.sweep(self.base, "all")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.output.read_text(encoding="utf-8").count("no hits"), 3)
+        self.assertEqual(self.output.read_text(encoding="utf-8").count("no hits"), 5)
         with self.assertRaisesRegex(RuntimeError, "review-classes:"):
             variant_sweep.validate_full_report(self.output, self.base)
         self.output.write_text(
@@ -490,7 +529,7 @@ class SweepRegressionTest(unittest.TestCase):
                 self.assertEqual(sweep_state_advance.member_end(values, start, end), expected)
 
     def test_all_classes_share_deadline(self) -> None:
-        """Unchecked, state, and documentation sweeps receive one aggregate deadline."""
+        """Every sibling sweep receives one aggregate deadline from sweep_all."""
         deadlines = []
         sha = "0" * 40
 
@@ -510,10 +549,10 @@ class SweepRegressionTest(unittest.TestCase):
         ):
             variant_sweep.sweep_all("unused", sha, sha)
         self.assertEqual(first.call_count, 1)
-        self.assertEqual(others.call_count, 2)
-        self.assertEqual(len(deadlines), 3)
+        self.assertEqual(others.call_count, 4)
+        self.assertEqual(len(deadlines), 5)
         self.assertIsInstance(deadlines[0], float)
-        self.assertEqual(deadlines, [deadlines[0]] * 3)
+        self.assertEqual(deadlines, [deadlines[0]] * 5)
 
     def test_checked_doc_version_cells(self) -> None:
         """Checked rows require populated version cells without unresolved TODO words."""
@@ -582,7 +621,7 @@ class FullReportTest(unittest.TestCase):
     """Reject incomplete or unreviewed full reports without importing sweep modules."""
 
     def reviewed_report(self) -> str:
-        """Return a reviewed example containing all three table schemas."""
+        """Return a reviewed example containing all five table schemas."""
         sha = "0" * 40
         return (
             f"class: unchecked-return\nhead: {sha}\n{variant_sweep.TABLE}\n"
@@ -597,6 +636,14 @@ class FullReportTest(unittest.TestCase):
             "| --- | --- | --- | --- | --- | --- |\n"
             "| doc/a.texi:3 | 64x64 | libfoo | 1.2.0 | 2.0.0 | "
             "checked: libfoo 1.2.0 2.0.0 upstream/file.c:7; upstream/other.c:9 |\n"
+            f"class: vulkan-features\nhead: {sha}\n"
+            f"{variant_sweep.REPORT_TABLES['vulkan-features']}\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "no hits\n"
+            f"class: port-parity\nhead: {sha}\n"
+            f"{variant_sweep.REPORT_TABLES['port-parity']}\n"
+            "| --- | --- | --- | --- |\n"
+            "no hits\n"
         ) + variant_sweep.render_review_classes(sha).replace("| TODO |", "| no-variant: fixture |")
 
     def valid(self, report: str) -> bool:
@@ -609,6 +656,34 @@ class FullReportTest(unittest.TestCase):
     def test_reviewed_report(self) -> None:
         """All three sections with reviewed rows satisfy the full validator."""
         self.assertTrue(self.valid(self.reviewed_report()))
+
+    def test_report_tables_fixture_validates(self) -> None:
+        """A forgejo-style fixture built from REPORT_TABLES passes full validation."""
+        self.assertTrue(self.valid(full_sweep_report("0" * 40)))
+
+    def test_report_tables_missing_vulkan_features(self) -> None:
+        """Dropping the vulkan-features section rejects a REPORT_TABLES fixture."""
+        report = full_sweep_report("0" * 40)
+        cut = cut_vulkan_features_section(report)
+        for name in variant_sweep.REPORT_TABLES:
+            if name == "vulkan-features":
+                self.assertNotIn("class: vulkan-features", cut)
+            else:
+                self.assertIn(f"class: {name}", cut)
+        self.assertIn("class: review-classes", cut)
+        self.assertFalse(self.valid(cut))
+
+    def test_report_tables_missing_port_parity(self) -> None:
+        """Dropping the port-parity section rejects a REPORT_TABLES fixture."""
+        report = full_sweep_report("0" * 40)
+        cut = cut_port_parity_section(report)
+        for name in variant_sweep.REPORT_TABLES:
+            if name == "port-parity":
+                self.assertNotIn("class: port-parity", cut)
+            else:
+                self.assertIn(f"class: {name}", cut)
+        self.assertIn("class: review-classes", cut)
+        self.assertFalse(self.valid(cut))
 
     def test_missing_class(self) -> None:
         """A missing doc-claims section fails closed."""
@@ -718,6 +793,85 @@ class FullReportTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class FullReportMutantTest(unittest.TestCase):
+    """Reject one-section cuts on real validators and accept them on planted mutants."""
+
+    def module_valid(self, module: ModuleType, report: str) -> bool:
+        """Validate report text through one loaded variant_sweep module copy."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sweep.md"
+            path.write_text(report, encoding="utf-8")
+            return module.validate_full_report(path, "0" * 40, review_classes.CLASS_FILE)
+
+    def load_validator_mutant(self, old: str, new: str, scratch: Path) -> ModuleType:
+        """Copy validator siblings into scratch and load one mutated validator copy."""
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+        for name in ("review_classes.py", "lane_brief.py"):
+            shutil.copyfile(scripts / name, scratch / name)
+        return load_mutant_module("scripts/variant_sweep.py", old, new, scratch)
+
+    def assert_mutant_kills(
+        self,
+        old: str,
+        new: str,
+        real_check: Callable[[], None],
+        mutant_check: Callable[[ModuleType], None],
+    ) -> None:
+        """Assert the real module passes a check and the mutant copy fails it."""
+        real_check()
+        with tempfile.TemporaryDirectory() as scratch:
+            mutant = self.load_validator_mutant(old, new, Path(scratch))
+            mutant_check(mutant)
+
+    def test_mutant_missing_vulkan_features_section(self) -> None:
+        """A validator that skips vulkan-features must not accept that one-section cut."""
+        cut = cut_vulkan_features_section(full_sweep_report("0" * 40))
+        skip = (
+            '    required = REPORT_TABLES.keys() - {"vulkan-features"}\n'
+            "    if not required <= sections.keys() or not all(\n"
+            "        validate_section(sections[name], name, sha) for name in required\n"
+            "    ):\n"
+            "        return False"
+        )
+
+        def real() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "sweep.md"
+                path.write_text(cut, encoding="utf-8")
+                self.assertFalse(
+                    variant_sweep.validate_full_report(path, "0" * 40, review_classes.CLASS_FILE)
+                )
+
+        def mutant(module: ModuleType) -> None:
+            self.assertTrue(self.module_valid(module, cut))
+
+        self.assert_mutant_kills(VALIDATE_SECTIONS, skip, real, mutant)
+
+    def test_mutant_missing_port_parity_section(self) -> None:
+        """A validator that skips port-parity must not accept that one-section cut."""
+        cut = cut_port_parity_section(full_sweep_report("0" * 40))
+        skip = (
+            '    required = REPORT_TABLES.keys() - {"port-parity"}\n'
+            "    if not required <= sections.keys() or not all(\n"
+            "        validate_section(sections[name], name, sha) for name in required\n"
+            "    ):\n"
+            "        return False"
+        )
+
+        def real() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "sweep.md"
+                path.write_text(cut, encoding="utf-8")
+                self.assertFalse(
+                    variant_sweep.validate_full_report(path, "0" * 40, review_classes.CLASS_FILE)
+                )
+
+        def mutant(module: ModuleType) -> None:
+            self.assertTrue(self.module_valid(module, cut))
+
+        self.assert_mutant_kills(VALIDATE_SECTIONS, skip, real, mutant)
+
+
 class ReplayValidationTest(unittest.TestCase):
     """Refuse invalid replay inputs before any object lookup or CLI invocation."""
 
@@ -820,7 +974,7 @@ class PlantedReplayTest(unittest.TestCase):
     def test_planted_clean_control(self) -> None:
         """The planted base compared with itself produces no hits in every class."""
         report = self.replay(PLANTED_BASE)
-        self.assertEqual(report.count("no hits"), 3)
+        self.assertEqual(report.count("no hits"), 5)
 
     def test_libaom_comparison_claim(self) -> None:
         """The fixed head resolves the above-eight claim to libaom and its 2.0.0 floor."""

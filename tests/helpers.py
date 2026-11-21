@@ -104,6 +104,18 @@ def isolated_git_environment(
     return {name: value for name, value in source.items() if name not in GIT_ENVIRONMENT_NAMES}
 
 
+def full_sweep_report(sha: str) -> str:
+    """Build reviewed sweep tables and all recurring class answers at one head."""
+
+    sections: list[str] = []
+    for name, table in variant_sweep.REPORT_TABLES.items():
+        width = table.count("|") - 1
+        separator = "| " + " | ".join(["---"] * width) + " |"
+        sections.append(f"class: {name}\nhead: {sha}\n\n{table}\n{separator}\nno hits")
+    review = variant_sweep.render_review_classes(sha).replace("| TODO |", "| no-variant: fixture |")
+    return "\n\n".join(sections) + "\n\n" + review
+
+
 def repository_git_environment(
     root: Path, environment: Mapping[str, str] | None = None
 ) -> dict[str, str]:
