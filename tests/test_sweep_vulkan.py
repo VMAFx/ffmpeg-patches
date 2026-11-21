@@ -315,7 +315,6 @@ class VulkanSweepTest(unittest.TestCase):
         ):
             self.vk_report(head)
 
-    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
     def test_port_parity_missing_shader_mask(self) -> None:
         """Port-parity reports none when the CPU masks but the shader does not."""
         cpu = "void f(const uint16_t *src) { uint16_t v = src[0] & 0xFFF0u; (void)v; }\n"
@@ -331,7 +330,6 @@ class VulkanSweepTest(unittest.TestCase):
         report = self.parity_report(head)
         self.assertIn("| mask | none |", report)
 
-    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
     def test_port_parity_shader_mask_site(self) -> None:
         """Port-parity names the shader line when the same mask is present."""
         cpu = "void f(const uint16_t *src) { uint16_t v = src[0] & 0xFFF0u; (void)v; }\n"
@@ -491,7 +489,6 @@ class VulkanSweepTest(unittest.TestCase):
         self.assertIn("no hits", self.vk_report(head))
         self.assertIn("no hits", self.parity_report(head))
 
-    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
     def test_t5_pair_limit_before_slice(self) -> None:
         """t5: two touched filter pairs exceed MAX_PAIRS=1 and raise the named limit error."""
         for stem in ("one", "two"):
@@ -514,7 +511,6 @@ class VulkanSweepTest(unittest.TestCase):
         ):
             sweep_port_parity.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
 
-    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
     def test_t6_second_linked_shader_mask_site(self) -> None:
         """t6: port-parity names the second linked shader when only it applies the mask."""
         cpu = "void f(const uint16_t *src) { uint16_t v = src[0] & 0xFF00u; (void)v; }\n"
@@ -573,16 +569,6 @@ class VulkanMutantHarness(unittest.TestCase):
     vk_report = VulkanSweepTest.vk_report
     parity_report = VulkanSweepTest.parity_report
 
-
-class VulkanMutantTest(VulkanMutantHarness):
-    """Run planted mutants on temporary module copies without editing scripts/."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        """Skip the suite when the Vulkan toolchain is unavailable."""
-        if SKIP_VULKAN:
-            raise unittest.SkipTest(SKIP_REASON)
-
     def assert_mutant_kills(
         self,
         rel_path: str,
@@ -597,97 +583,9 @@ class VulkanMutantTest(VulkanMutantHarness):
             mutant = load_mutant_module(rel_path, old, new, Path(scratch))
             mutant_check(mutant)
 
-    def test_mutant_m1_required_unused(self) -> None:
-        """m1: disabling required-unused detection passes on real and fails on mutant."""
-        head = self.commit_filter(
-            c_vulkan=(
-                "extern const unsigned char ff_test_comp_spv_data[];\n"
-                "int gate(VkPhysicalDeviceVulkan12Features *v12) {\n"
-                "    if (!v12->runtimeDescriptorArray) return -1;\n"
-                "    if (!v12->scalarBlockLayout) return -1;\n"
-                "    return 0;\n"
-                "}\n"
-            ),
-            shader_name="test.comp.glsl",
-            shader=SIMPLE_SHADER,
-        )
 
-        def real() -> None:
-            self.assertIn("| required-unused |", self.vk_report(head))
-
-        def mutant(module: ModuleType) -> None:
-            report = module.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
-            self.assertNotIn("| required-unused |", report)
-
-        self.assert_mutant_kills(
-            "scripts/sweep_vulkan_features.py",
-            "elif site.feature not in used:",
-            "elif False and site.feature not in used:",
-            real,
-            mutant,
-        )
-
-    def test_mutant_m2_dynamic_index(self) -> None:
-        """m2: disabling dynamic index detection passes on real and fails on mutant."""
-        head = self.commit_filter(
-            c_vulkan=(
-                "extern const unsigned char ff_test_comp_spv_data[];\n"
-                "int gate(VkPhysicalDeviceFeatures *feats) {\n"
-                "    if (!feats->shaderStorageImageReadWithoutFormat) return -1;\n"
-                "    return 0;\n"
-                "}\n"
-            ),
-            shader_name="test.comp.glsl",
-            shader=DYNAMIC_SHADER,
-        )
-
-        def real() -> None:
-            self.assertIn("| used-unchecked |", self.vk_report(head))
-
-        def mutant(module: ModuleType) -> None:
-            report = module.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
-            self.assertNotIn("| used-unchecked |", report)
-
-        self.assert_mutant_kills(
-            "scripts/sweep_vulkan_features.py",
-            'if index not in constants and not index.startswith("%int_"):',
-            'if False and index not in constants and not index.startswith("%int_"):',
-            real,
-            mutant,
-        )
-
-    def test_mutant_m3_spirv_scalar(self) -> None:
-        """m3: disabling scalar layout detection passes on real and fails on mutant."""
-        head = self.commit_filter(
-            c_vulkan=(
-                "extern const unsigned char ff_test_comp_spv_data[];\n"
-                "int gate(VkPhysicalDeviceFeatures *feats,\n"
-                "        VkPhysicalDeviceVulkan12Features *v12) {\n"
-                "    if (!feats->shaderStorageImageReadWithoutFormat) return -1;\n"
-                "    if (!v12->runtimeDescriptorArray) return -1;\n"
-                "    if (!v12->scalarBlockLayout) return -1;\n"
-                "    if (!v12->shaderStorageImageArrayNonUniformIndexing) return -1;\n"
-                "    return 0;\n"
-                "}\n"
-            ),
-            shader_name="test.comp.glsl",
-            shader=MATCHED_SHADER,
-        )
-
-        def real() -> None:
-            self.assertIn("no hits", self.vk_report(head))
-
-        def mutant(module: ModuleType) -> None:
-            report = module.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
-            self.assertNotIn("no hits", report)
-
-        self.assert_mutant_kills(
-            "scripts/sweep_vulkan_features.py",
-            "return default_rc != 0 and result.returncode == 0",
-            "return False",
-            real,
-            mutant,
-        )
+class PortParityMutantTest(VulkanMutantHarness):
+    """Run port-parity mutants without requiring the Vulkan toolchain."""
 
     def test_mutant_m4_shader_mask(self) -> None:
         """m4: disabling shader mask matching passes on real and fails on mutant."""
@@ -800,6 +698,108 @@ class VulkanMutantTest(VulkanMutantHarness):
             mutant,
         )
 
+
+class VulkanMutantTest(VulkanMutantHarness):
+    """Run planted mutants on temporary module copies without editing scripts/."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Skip the suite when the Vulkan toolchain is unavailable."""
+        if SKIP_VULKAN:
+            raise unittest.SkipTest(SKIP_REASON)
+
+    def test_mutant_m1_required_unused(self) -> None:
+        """m1: disabling required-unused detection passes on real and fails on mutant."""
+        head = self.commit_filter(
+            c_vulkan=(
+                "extern const unsigned char ff_test_comp_spv_data[];\n"
+                "int gate(VkPhysicalDeviceVulkan12Features *v12) {\n"
+                "    if (!v12->runtimeDescriptorArray) return -1;\n"
+                "    if (!v12->scalarBlockLayout) return -1;\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            shader_name="test.comp.glsl",
+            shader=SIMPLE_SHADER,
+        )
+
+        def real() -> None:
+            self.assertIn("| required-unused |", self.vk_report(head))
+
+        def mutant(module: ModuleType) -> None:
+            report = module.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
+            self.assertNotIn("| required-unused |", report)
+
+        self.assert_mutant_kills(
+            "scripts/sweep_vulkan_features.py",
+            "elif site.feature not in used:",
+            "elif False and site.feature not in used:",
+            real,
+            mutant,
+        )
+
+    def test_mutant_m2_dynamic_index(self) -> None:
+        """m2: disabling dynamic index detection passes on real and fails on mutant."""
+        head = self.commit_filter(
+            c_vulkan=(
+                "extern const unsigned char ff_test_comp_spv_data[];\n"
+                "int gate(VkPhysicalDeviceFeatures *feats) {\n"
+                "    if (!feats->shaderStorageImageReadWithoutFormat) return -1;\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            shader_name="test.comp.glsl",
+            shader=DYNAMIC_SHADER,
+        )
+
+        def real() -> None:
+            self.assertIn("| used-unchecked |", self.vk_report(head))
+
+        def mutant(module: ModuleType) -> None:
+            report = module.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
+            self.assertNotIn("| used-unchecked |", report)
+
+        self.assert_mutant_kills(
+            "scripts/sweep_vulkan_features.py",
+            'if index not in constants and not index.startswith("%int_"):',
+            'if False and index not in constants and not index.startswith("%int_"):',
+            real,
+            mutant,
+        )
+
+    def test_mutant_m3_spirv_scalar(self) -> None:
+        """m3: disabling scalar layout detection passes on real and fails on mutant."""
+        head = self.commit_filter(
+            c_vulkan=(
+                "extern const unsigned char ff_test_comp_spv_data[];\n"
+                "int gate(VkPhysicalDeviceFeatures *feats,\n"
+                "        VkPhysicalDeviceVulkan12Features *v12) {\n"
+                "    if (!feats->shaderStorageImageReadWithoutFormat) return -1;\n"
+                "    if (!v12->runtimeDescriptorArray) return -1;\n"
+                "    if (!v12->scalarBlockLayout) return -1;\n"
+                "    if (!v12->shaderStorageImageArrayNonUniformIndexing) return -1;\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            shader_name="test.comp.glsl",
+            shader=MATCHED_SHADER,
+        )
+
+        def real() -> None:
+            self.assertIn("no hits", self.vk_report(head))
+
+        def mutant(module: ModuleType) -> None:
+            report = module.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
+            self.assertNotIn("no hits", report)
+
+        self.assert_mutant_kills(
+            "scripts/sweep_vulkan_features.py",
+            "return default_rc != 0 and result.returncode == 0",
+            "return False",
+            real,
+            mutant,
+        )
+
     def test_mutant_m7_import_maps(self) -> None:
         """m7: import-time map load passes on real and fails on mutant."""
         missing = Path("/nonexistent/vk-registry-mutant/vk.xml")
@@ -857,6 +857,60 @@ class VulkanMutantTest(VulkanMutantHarness):
             real,
             mutant,
         )
+
+
+class PortParityWithoutToolsTest(VulkanMutantHarness):
+    """Prove port-parity survives missing Vulkan binaries while feature sweeps do not."""
+
+    def test_port_parity_second_shader_with_hidden_tools(self) -> None:
+        """Port-parity names the second linked shader when tool paths are patched away."""
+        missing = Path(self.directory.name) / "no-vulkan-tool"
+        cpu = "void f(const uint16_t *src) { uint16_t v = src[0] & 0xFF00u; (void)v; }\n"
+        c_vulkan = (
+            "extern const unsigned char ff_a_comp_spv_data[];\n"
+            "extern const unsigned char ff_b_comp_spv_data[];\n"
+            "int f(void) { return 0; }\n"
+        )
+        (self.repo / "libavfilter" / "vf_test_vulkan.c").write_text(c_vulkan, encoding="utf-8")
+        (self.repo / "libavfilter" / "vf_test.c").write_text(cpu, encoding="utf-8")
+        (self.repo / "libavfilter" / "vulkan" / "a.comp.glsl").write_text(
+            MASK_SHADER, encoding="utf-8"
+        )
+        (self.repo / "libavfilter" / "vulkan" / "b.comp.glsl").write_text(
+            SECOND_MASKED_SHADER, encoding="utf-8"
+        )
+        (self.repo / "libavfilter" / "fix.c").write_text(
+            (self.repo / "libavfilter" / "fix.c").read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        with (
+            unittest.mock.patch.object(sweep_vulkan_features, "GLSLANG", missing),
+            unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_DIS", missing),
+            unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_VAL", missing),
+        ):
+            report = self.parity_report(head)
+        self.assertRegex(report, r"libavfilter/vulkan/b\.comp\.glsl:\d+")
+
+    def test_vk_report_raises_with_hidden_tools(self) -> None:
+        """Vulkan-feature sweep raises when tool paths are patched away."""
+        missing = Path(self.directory.name) / "no-vulkan-tool"
+        head = self.commit_filter(
+            c_vulkan=(
+                "extern const unsigned char ff_test_comp_spv_data[];\nint f(void){return 0;}\n"
+            ),
+            shader_name="test.comp.glsl",
+            shader=SIMPLE_SHADER,
+        )
+        with (
+            unittest.mock.patch.object(sweep_vulkan_features, "GLSLANG", missing),
+            unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_DIS", missing),
+            unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_VAL", missing),
+            self.assertRaises(sweep_vulkan_features.VulkanFeatureSweepError),
+        ):
+            self.vk_report(head)
 
 
 if __name__ == "__main__":
