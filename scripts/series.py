@@ -1064,7 +1064,7 @@ def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
     try:
         unioned = union_conflicts(tree, patch, applied)
     except (SeriesError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        git(tree, "reset", "-q", "--hard", "HEAD", check=False)
+        reset_failed_union(tree, patch)
         raise
     if unioned is None:
         git(tree, "reset", "-q", "--hard", "HEAD")
@@ -1077,6 +1077,23 @@ def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
             file=sys.stderr,
         )
     return "master-form"
+
+
+def reset_failed_union(tree: Path, patch: Path) -> None:
+    """Reset the checkout to HEAD after a failed union merge, warning on reset failure."""
+    try:
+        result = git(tree, "reset", "-q", "--hard", "HEAD", check=False)
+    except subprocess.TimeoutExpired:
+        outcome = "timed out"
+    else:
+        if not result.returncode:
+            return
+        outcome = f"failed (return code {result.returncode})"
+    print(
+        f"warning: {patch.name}: reset to HEAD after the failed union {outcome}; "
+        "the checkout may still hold conflict stages and patch changes",
+        file=sys.stderr,
+    )
 
 
 def union_conflicts(

@@ -1754,6 +1754,61 @@ class MasterFormUnionTest(MasterFormCase):
         self.assertIn("master-form", out)
         self.assert_clean()
 
+    def test_stage_union_reset_timeout_warns_and_reraises(self) -> None:
+        """Verify a timed-out reset after a stage_union error warns and re-raises the error."""
+        self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE))
+        planted = subprocess.CalledProcessError(128, ["git", "update-index"], "", "fatal: planted")
+        timeout = subprocess.TimeoutExpired(["git", "reset"], series.GIT_TIMEOUT)
+        real_git = series.git
+
+        def reset_times_out(
+            tree: Path, *args: str, **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if args[:1] == ("reset",):
+                raise timeout
+            return real_git(tree, *args, **kwargs)
+
+        err = io.StringIO()
+        with (
+            unittest.mock.patch.object(series, "stage_union", side_effect=planted),
+            unittest.mock.patch.object(series, "git", side_effect=reset_times_out),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            self.apply()
+        self.assertIs(raised.exception, planted)
+        warning = err.getvalue()
+        self.assertTrue(warning.startswith("warning: "), warning)
+        self.assertIn("reset to HEAD after the failed union timed out", warning)
+        self.assertIn("the checkout may still hold conflict stages and patch changes", warning)
+
+    def test_stage_union_reset_failure_warns_and_reraises(self) -> None:
+        """Verify a non-zero reset after a stage_union error warns and re-raises the error."""
+        self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE))
+        planted = subprocess.CalledProcessError(128, ["git", "update-index"], "", "fatal: planted")
+        real_git = series.git
+
+        def reset_fails(
+            tree: Path, *args: str, **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if args[:1] == ("reset",):
+                return subprocess.CompletedProcess(args, 1, "", "fatal: reset failed")
+            return real_git(tree, *args, **kwargs)
+
+        err = io.StringIO()
+        with (
+            unittest.mock.patch.object(series, "stage_union", side_effect=planted),
+            unittest.mock.patch.object(series, "git", side_effect=reset_fails),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            self.apply()
+        self.assertIs(raised.exception, planted)
+        warning = err.getvalue()
+        self.assertTrue(warning.startswith("warning: "), warning)
+        self.assertIn("reset to HEAD after the failed union failed (return code 1)", warning)
+        self.assertIn("the checkout may still hold conflict stages and patch changes", warning)
+
     def test_nearby_appends_do_not_duplicate_base_line(self) -> None:
         """Verify two append-only hunks separated by one base line keep that line once."""
         pull_1, pull_2 = HQDN3D, "TESTPROGS-$(CONFIG_PULL_2) += pull_2"
