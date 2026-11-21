@@ -475,6 +475,13 @@ edit_title() (
   title_unchanged "$number" "$title" && exit 0
   wait_autolabel_done "$number" "$wait"
   require_tested_head "$number" "$head"
+  # The tested head may be an abbreviated prefix, so the final read must name the same
+  # full head as the Autolabel check; a push to a head sharing the prefix fails here.
+  if [ "$tested_live_head" != "${AUTOLABEL_HEAD,,}" ]; then
+    printf 'ffmpeg-forgejo: live head %s differs from head %s the Autolabel check used; retry the edit.\n' \
+      "$tested_live_head" "$AUTOLABEL_HEAD" >&2
+    exit 76
+  fi
   title_unchanged "$number" "$title" && exit 0
   if [ "$apply" = 0 ]; then
     printf 'ffmpeg-forgejo: dry run, would change the title of #%s from: %s\n' "$number" "$old"

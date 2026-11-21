@@ -635,13 +635,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(404, {})
 
     def do_PATCH(self) -> None:
-        """Record pull edits, apply a title or close unless ignored, and acknowledge."""
+        """Record pull edits, apply a /pulls/1 title or close unless ignored, and acknowledge."""
 
         data = self.rfile.read(int(self.headers["Content-Length"])).decode()
         stub = self.stub()
         stub.requests.append(("PATCH", self.path, data))
         payload = json.loads(data)
-        if "title" in payload and not stub.ignore_title_patch:
+        # Only the served pull keeps a title, so a PATCH to another pull fails read-back.
+        if self.path.endswith("/pulls/1") and "title" in payload and not stub.ignore_title_patch:
             stub.title = payload["title"]
             stub.titles = None
         if (
@@ -1177,6 +1178,25 @@ class EditTitleTest(ForgejoTest):
         self.assertIn(A[:12], proc.stderr)
         self.assertIn(B, proc.stderr)
         self.assertEqual(self.patches(stub), [])
+
+    def test_full_head_moves_within_tested_prefix(self) -> None:
+        """A final head sharing the tested prefix but not the Autolabel head exits 76 unpatched."""
+
+        moved = A[:39] + "b"
+        stub = Stub([A, A, A, moved], {A: [[label("success")]]})
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(f"live head {moved} differs from head {A}", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_uppercase_autolabel_head_matches_live_head(self) -> None:
+        """An uppercase API head equals its lowercased final read, so the edit proceeds."""
+
+        upper = A.upper()
+        stub = Stub([upper], {upper: [[label("success")]]})
+        proc = self.edit_title(stub, "new title", "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [{"title": "new title"}])
 
     def test_pending(self) -> None:
         """A running Autolabel job refuses an applied title change with exit 75."""
@@ -5544,7 +5564,7 @@ class EditTitleMutantTest(unittest.TestCase):
     """Require title-edit cases to kill each planted safety-check defect."""
 
     def test_every_mutant_is_caught(self) -> None:
-        """Head, dry-run, read-back, early no-op and same-response title guards kill defects."""
+        """Head, full-head, dry-run, read-back, no-op, response and PATCH guards kill defects."""
 
         source = HELPER.read_text(encoding="utf-8")
         mutations = (
@@ -5572,6 +5592,21 @@ class EditTitleMutantTest(unittest.TestCase):
                 'old="$(parse_pull_title <<<"$TESTED_PULL_BODY")"',
                 'old="$(pull_title "$number")"',
                 "test_title_uses_tested_head_response",
+            ),
+            (
+                'if [ "$tested_live_head" != "${AUTOLABEL_HEAD,,}" ]; then',
+                "if false; then",
+                "test_full_head_moves_within_tested_prefix",
+            ),
+            (
+                '!= "${AUTOLABEL_HEAD,,}" ]; then',
+                '!= "$AUTOLABEL_HEAD" ]; then',
+                "test_uppercase_autolabel_head_matches_live_head",
+            ),
+            (
+                'out="$(api PATCH "/repos/$REPO/pulls/$number" "$body")" || exit 1',
+                'out="$(api PATCH "/repos/$REPO/pulls/2" "$body")" || exit 1',
+                "test_apply",
             ),
         )
         for name, (old, new, test_name) in enumerate(mutations):
