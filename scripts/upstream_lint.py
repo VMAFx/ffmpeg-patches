@@ -45,6 +45,69 @@ and b/ prefixes whatever diff.noprefix says. The same waiver covers a fix the
 changed tests do not name. A test that names the code without running the fixed
 path is not detected.
 
+The revert-proof step requires one measured scripts/revert_proof.py JSON record
+(--revert-proof FILE, repeatable) per source fix commit in base..head.
+Root commits imported through unrelated history are included against the empty
+tree; fix wording and source-path classification apply as for other commits.
+Stored parent headers are compared with Git's visible parents before classification.
+Shallow, grafted or replaced ancestry that hides parents gets an incomplete-history
+finding instead of a snapshot diff; fetch missing history or restore the original
+ancestry. A genuine zero-parent root keeps the empty-tree comparison.
+The shared runner keeps successful Git stdout separate from stderr so advice
+cannot become parsed data; failed and timed-out calls retain stderr diagnostics.
+scripts/revert_proof.py runs the same trusted test command at HEAD and after
+reversing source paths in a separate clean detached scratch checkout; the module
+itself never writes to the caller work tree or index, but the command runs with the rights of the
+user and can reach the caller by absolute path or through the shared Git directory.
+Afterwards it detects only a moved head commit of the recorded ref or current HEAD;
+a record binds content (commit and tree), not provenance.
+Commands needing caller-only ignored or untracked inputs fail at HEAD (exit 3),
+tracked changes that Git status shows are refused, and PWD names scratch.
+Cleanup is attempted after every outcome the module survives, with failed removal
+giving exit 5 and its path; input errors give exit 2, HEAD failure or movement
+gives exit 3 without a record, and reverse-apply failure gives exit 4.
+A command launch failure on either run gives exit 3 without a record; a started
+process keeps its numeric exit code, including 127. The reader rejects timeout
+and launch-error sentinels as no-verdict results.
+An older record is removed before commands start; the tree argument must name the
+root, and output must be outside that root and Git administration.
+The record contains lowercase 40- or 64-hex commit, head, head_tree,
+command, rc_head, rc_reverted and reverted_paths. The step checks that each
+fix commit has a valid record whose head_tree matches head, whose rc_head is 0
+and whose rc_reverted is a nonzero integer. The head must resolve to a commit
+with head_tree, and reverted_paths must equal the sorted source paths of the fix.
+Non-UTF-8 filenames round-trip through filesystem surrogate escapes, stored as
+JSON escapes in UTF-8 records and restored unchanged by the reader.
+Human output renders lone surrogates as visible backslash-u escapes without
+changing Git arguments, stdin or stored records; literal escape spellings can
+look identical, so distinguish them using stored JSON or raw Git path bytes.
+Terminal findings, diagnostics and parser messages escape characters outside the
+destination stream's encoding as visible backslash escapes. Emission failures
+retain the caller's decided status, even when a stream is closed or broken.
+At executable exit, a failed original stdout or stderr flush removes that stream
+from interpreter cleanup; replacement streams remain owned by their callers.
+Parser help, usage and errors always use plain text with colour detection disabled.
+Help wrapping may still query the original standard output's terminal size.
+Optional human reports use UTF-8, retaining valid Unicode and escaping lone
+surrogates; terminal codec fallback does not alter the report file or JSON records.
+End-to-end filename support is claimed only for UTF-8 filesystem encodings;
+other filesystem encodings retain native decode/encode behavior but are unverified.
+Base configuration and script files are extracted as their original blob bytes.
+Raw commit and path lists above MAX_PATHS fail before classification; neither
+list is silently truncated. Command environments have a separate
+MAX_ENV_ENTRIES bound of 16384, leaving ample room for environments with
+hundreds of entries without coupling them to path or commit scans. JSON object
+keys and recorded command arguments have independent MAX_JSON_KEYS and
+MAX_COMMAND_ARGS bounds of 2000 each. The producer refuses commands above the
+shared argument cap before scratch work. Only the executable must be nonempty;
+empty later string arguments remain valid. One valid record for a commit
+satisfies the step; records that are schema-valid but stale or passing without
+the fix are ignored when a valid one exists, while malformed ones remain
+findings. A merge commit that carries fix wording cannot be proven by a revert
+and is refused unless put in its own commit or waived, and more fix commits
+than MAX_CLAIM_COMMITS is a finding of the step. --no-revert-proof-reason TEXT
+waives the step and lists the waived commits.
+
 The diagnostic-citation step fails a commit whose message names a compiler
 diagnostic flag (-W...) together with workaround wording (workaround, false
 positive, silence, suppress, spurious) unless the message carries a GCC
@@ -148,23 +211,27 @@ finding and prints the reason, and never waives an rc 2 result.
 from __future__ import annotations
 
 import argparse
+import functools
+import inspect
 import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess  # nosec B404 - explicit argv, process-group cleanup, bounded deadlines.
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 # Ensure repository root is on sys.path for test/tool imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
+_PROCESS_STREAMS = (("stdout", sys.__stdout__), ("stderr", sys.__stderr__))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -220,6 +287,10 @@ C_RULES_DIFF = (
 )
 MAX_PATHS = 2000
 MAX_CLAIM_COMMITS = 1000
+# Bound environment iteration with ample headroom above hundreds of entries.
+MAX_ENV_ENTRIES = 16384
+MAX_JSON_KEYS = 2000
+MAX_COMMAND_ARGS = 2000
 RUN_TIMEOUT = 1800
 C_RULES_TIMEOUT = 300
 DOCSTRINGS_TIMEOUT = 300
@@ -344,6 +415,9 @@ class RunResult:
     args: tuple[str, ...]
     returncode: int
     stdout: str
+    timed_out: bool = False
+    stdout_bytes: bytes = b""
+    started: bool = True
 
 
 @dataclass(frozen=True)
@@ -351,11 +425,13 @@ class Waivers:
     """Reasons that waive single upstream checks; a blank reason waives nothing."""
 
     no_test: str = ""
+    no_revert_proof: str = ""
     claim: str = ""
     doc: str = ""
     test_program: str = ""
     c_rule: str = ""
     docstring: str = ""
+    revert_proofs: tuple[Path, ...] = ()
 
 
 @dataclass
@@ -383,67 +459,175 @@ def _remaining(timeout: float) -> float:
 
 
 def _reap_timeout(
-    process: subprocess.Popen[bytes], argv: list[str], partial_output: bytes | None = None
+    process: subprocess.Popen[bytes],
+    argv: list[str],
+    partial_output: bytes | None = None,
+    partial_errors: bytes | None = None,
 ) -> RunResult:
     """Kill a timed-out process group and bound the remaining pipe drain."""
     kill_process_group(process)
     try:
-        output, _ = process.communicate(timeout=_remaining(REAP_TIMEOUT))
+        output, errors = process.communicate(timeout=_remaining(REAP_TIMEOUT))
     except subprocess.TimeoutExpired as error:
         output = error.output if error.output is not None else partial_output
-        text = (output or b"").decode("utf-8", errors="replace")
+        errors = error.stderr if error.stderr is not None else partial_errors
+        text = _run_output(output or b"", errors, 124)
         return RunResult(
-            tuple(argv), 124, text + "\ncommand timed out (descendant kept the pipe open)\n"
+            tuple(argv),
+            124,
+            text + "\ncommand timed out (descendant kept the pipe open)\n",
+            timed_out=True,
         )
-    text = output.decode("utf-8", errors="replace")
+    text = _run_output(output, errors, 124)
     if process.returncode == -signal.SIGKILL:
-        return RunResult(tuple(argv), 124, text + "\ncommand timed out\n")
-    return RunResult(tuple(argv), process.returncode, text)
+        return RunResult(tuple(argv), 124, text + "\ncommand timed out\n", timed_out=True)
+    return RunResult(tuple(argv), process.returncode, text, timed_out=True)
 
 
-def _run(argv: list[str], cwd: Path, data: str | None = None, timeout: float = 60) -> RunResult:
-    """Run an allowed tool with isolated Git state and bounded communication."""
+def _command_environment(source: Mapping[str, str], cwd: Path) -> dict[str, str]:
+    """Refuse oversized command environments before preserving bounded isolated entries."""
+    if len(source) > MAX_ENV_ENTRIES:
+        raise ValueError(
+            f"command environment exceeds MAX_ENV_ENTRIES={MAX_ENV_ENTRIES}: {len(source)}"
+        )
+    environment = {
+        name: value
+        for name, value in list(source.items())[:MAX_ENV_ENTRIES]
+        if name not in GIT_ENVIRONMENT_NAMES and not name.startswith(GIT_CONFIG_PREFIXES)
+    }
+    environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
+    environment["PWD"] = str(cwd.resolve())
+    return environment
+
+
+def decode_git_output(output: bytes) -> str:
+    """Decode Git stdout with filesystem escaping so filename bytes round-trip in argv."""
+    return os.fsdecode(output)
+
+
+def display_text(text: str) -> str:
+    """Escape lone surrogates for display without changing Git or record transport."""
+    return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def emit_text(text: str, stream) -> None:
+    """Emit display text in the stream's codec without changing the caller's status."""
     try:
-        _validate_executable(argv)
-    except ValueError as error:
-        return RunResult(tuple(argv), 2, str(error))
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        text = display_text(text).encode(encoding, errors="backslashreplace").decode(encoding)
+        stream.write(text)
+        stream.flush()
+    except Exception:
+        # Emission is best effort; even a broken stream must retain the decided status.
+        return
+
+
+def finish_process_output() -> None:
+    """Flush original process streams and retire failed ones before interpreter shutdown."""
+    for name, stream in _PROCESS_STREAMS[:2]:
+        if stream is None or getattr(sys, name) is not stream:
+            continue
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            # Do not let interpreter cleanup retry a failed process-owned stream.
+            setattr(sys, name, None)
+
+
+class DisplayArgumentParser(argparse.ArgumentParser):
+    """Keep parser formatting plain and escape text at the shared output boundary."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        """Disable parser and formatter colour through their available constructor switches."""
+        if "color" in inspect.signature(argparse.ArgumentParser).parameters:
+            kwargs["color"] = False
+            formatter = kwargs.get("formatter_class", argparse.HelpFormatter)
+            if "color" in inspect.signature(formatter).parameters:
+                kwargs["formatter_class"] = functools.partial(formatter, color=False)
+        super().__init__(*args, **kwargs)
+
+    def _print_message(self, message: str | None, file=None) -> None:
+        """Render parser messages without changing the arguments being parsed."""
+        if message:
+            emit_text(message, sys.stderr if file is None else file)
+
+
+def _run_output(
+    output: bytes, errors: bytes | None, returncode: int, *, git_stdout: bool = False
+) -> str:
+    """Decode machine stdout alone on success and include separate stderr on failure."""
+    if returncode == 0 and git_stdout:
+        return decode_git_output(output)
+    if returncode and errors:
+        output += errors
+    return output.decode("utf-8", errors="replace")
+
+
+def _run(
+    argv: list[str],
+    cwd: Path,
+    data: str | bytes | None = None,
+    timeout: float = 60,
+    *,
+    allow_any_executable: bool = False,
+) -> RunResult:
+    """Run a bounded isolated tool, keeping successful Git stdout free of stderr."""
+    if not allow_any_executable:
+        try:
+            _validate_executable(argv)
+        except ValueError as error:
+            return RunResult(tuple(argv), 2, str(error), started=False)
     if _DEADLINE.get() is not None:
         timeout = min(timeout, _remaining(timeout + REAP_TIMEOUT) - REAP_TIMEOUT)
         if timeout <= 0:
             raise RuntimeError("overall deadline exhausted (reap budget reserved)")
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if name not in GIT_ENVIRONMENT_NAMES and not name.startswith(GIT_CONFIG_PREFIXES)
-    }
-    environment["PRE_COMMIT_NO_CONCURRENCY"] = "1"
+    try:
+        environment = _command_environment(os.environ, cwd)
+    except ValueError as error:
+        return RunResult(tuple(argv), 2, str(error), started=False)
     with subprocess.Popen(  # nosec B603 - _validate_executable enforces the tool allow-list.
         argv,
         cwd=cwd,
         env=environment,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if Path(argv[0]).name == "git" else subprocess.STDOUT,
         start_new_session=True,
         shell=False,
     ) as process:
         try:
-            output, _ = process.communicate(
-                None if data is None else data.encode("utf-8"), timeout=timeout
+            output, errors = process.communicate(
+                os.fsencode(data) if isinstance(data, str) else data, timeout=timeout
             )
             return RunResult(
-                tuple(argv), process.returncode, output.decode("utf-8", errors="replace")
+                tuple(argv),
+                process.returncode,
+                _run_output(
+                    output, errors, process.returncode, git_stdout=Path(argv[0]).name == "git"
+                ),
+                stdout_bytes=output,
             )
         except subprocess.TimeoutExpired as error:
-            return _reap_timeout(process, argv, error.output)
+            return _reap_timeout(process, argv, error.output, error.stderr)
+        except KeyboardInterrupt:
+            _reap_timeout(process, argv)
+            raise
+
+
+def _git_result(tree: Path, *args: str) -> RunResult:
+    """Return checked Git bytes and text or raise with the captured failure."""
+    result: RunResult = _run(["git", *args], tree)
+    if result.returncode or result.timed_out:
+        timeout = " (timed out)" if result.timed_out else ""
+        raise RuntimeError(
+            f"git {shlex.join(args)}: rc={result.returncode}{timeout}\n{result.stdout}"
+        )
+    return result
 
 
 def _git(tree: Path, *args: str) -> str:
     """Return Git output or raise an error with the command's captured result."""
-    result: RunResult = _run(["git", *args], tree)
-    if result.returncode:
-        raise RuntimeError(f"git {shlex.join(args)}: rc={result.returncode}\n{result.stdout}")
-    return result.stdout
+    return _git_result(tree, *args).stdout
 
 
 def _status(tree: Path) -> str:
@@ -468,8 +652,9 @@ def _prepare(tree: Path, base: str, head: str) -> tuple[str, str]:
 
 
 def _base_file(tree: Path, base: str, name: str, scratch: Path) -> Path:
+    """Extract the exact base blob bytes for configuration and script consumers."""
     target = scratch / Path(name).name
-    target.write_text(_git(tree, "show", f"{base}:{name}"), encoding="utf-8")
+    target.write_bytes(_git_result(tree, "show", f"{base}:{name}").stdout_bytes)
     target.chmod(0o700)
     return target
 
@@ -1434,25 +1619,129 @@ def fix_word(message: str) -> str | None:
     return match[0] if match else None
 
 
-def _fix_commits(tree: Path, base: str, head: str) -> list[tuple[str, str, frozenset[str]]]:
-    """Collect source fix commits in base..head with their reachable names."""
-    records = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}").split("\0")
+class _RevertProofScanLimit(RuntimeError):
+    """A bounded history scan exceeded a limit that an explicit proof waiver may cover."""
+
+
+def _commit_paths(tree: Path, commit: str) -> list[str]:
+    """Read stored changed paths and raise a waivable limit before classifying overflow."""
+    paths = list(
+        filter(
+            None,
+            _git(
+                tree,
+                "--no-replace-objects",
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                "-z",
+                commit,
+            ).split("\0"),
+        )
+    )
+    if len(paths) > MAX_PATHS:
+        raise _RevertProofScanLimit(
+            f"{commit}: commit paths exceed MAX_PATHS={MAX_PATHS}: {len(paths)}"
+        )
+    return paths
+
+
+def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -> str | None:
+    """Reject hidden ancestry and replaced commit content without signature display noise."""
+    raw = _git(
+        tree,
+        "-c",
+        "advice.graftFileDeprecated=false",
+        "--no-replace-objects",
+        "cat-file",
+        "commit",
+        commit,
+    )
+    stored = re.findall(r"^parent ([0-9a-f]+)$", raw.partition("\n\n")[0], re.MULTILINE)
+    if parents is None:
+        parents = _git(
+            tree,
+            "-c",
+            "advice.graftFileDeprecated=false",
+            "log",
+            "--no-show-signature",
+            "-1",
+            "--format=%P",
+            commit,
+        ).strip()
+    if stored != parents.split():
+        return (
+            f"{commit}: history is incomplete; fetch missing parents with git fetch --unshallow "
+            "or git fetch --deepen=<commits>, or restore parents hidden by grafts/replace refs"
+        )
+    if raw != _git(tree, "cat-file", "commit", commit):
+        return f"{commit}: history content changed by replace refs; restore stored commit content"
+    return None
+
+
+def _skip_commit_history(
+    tree: Path, commit: str, parents: str, message: str, history_errors: list[str] | None
+) -> bool:
+    """Skip irrelevant non-fixes or collect hidden ancestry before reading source paths."""
+    if history_errors is None and not fix_word(message):
+        return True
+    error = _commit_history_error(tree, commit, parents)
+    if error is None:
+        return False
+    if history_errors is None:
+        raise RuntimeError(error)
+    subject = message.partition("\n")[0].rstrip("\r")
+    history_errors.append(f"{commit[:12]}: {subject}: {error}")
+    return True
+
+
+def _fix_commits(
+    tree: Path,
+    base: str,
+    head: str,
+    *,
+    include_merges: bool = False,
+    history_errors: list[str] | None = None,
+) -> list[tuple[str, str, frozenset[str]]]:
+    """Collect stored source fixes and history findings with waivable scan limits."""
+    records = list(
+        filter(
+            None,
+            _git(
+                tree,
+                "-c",
+                "advice.graftFileDeprecated=false",
+                "log",
+                "--no-show-signature",
+                "-z",
+                "--format=%H%n%P%n%B",
+                f"{base}..{head}",
+            ).split("\0"),
+        )
+    )
+    if len(records) > MAX_PATHS:
+        raise _RevertProofScanLimit(f"commit scan exceeds MAX_PATHS={MAX_PATHS}: {len(records)}")
     fixes: list[tuple[str, str, frozenset[str]]] = []
-    for record in filter(None, records):
-        commit, _, message = record.partition("\n")
+    for record in records[:MAX_PATHS]:
+        commit, _, rest = record.partition("\n")
+        parents, _, message = rest.partition("\n")
         subject = message.partition("\n")[0].rstrip("\r")
+        if _skip_commit_history(tree, commit, parents, message, history_errors):
+            continue
         if not fix_word(message):
             continue
-        paths = [
-            path
-            for path in _git(
-                tree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit
-            ).split("\0")
-            if path
-        ]
-        if any(is_source_path(path) for path in paths):
+        if " " in parents.strip():
+            if include_merges:
+                fixes.append((commit, subject, frozenset()))
+            continue
+        paths = _commit_paths(tree, commit)
+        if any(is_source_path(path) for path in paths[:MAX_PATHS]):
             patch = _git(
                 tree,
+                "--no-replace-objects",
                 "diff-tree",
                 "--no-commit-id",
                 "-r",
@@ -1480,10 +1769,29 @@ def _no_test_step(fixes: list[tuple[str, str, frozenset[str]]], reason: str) -> 
     return Step("regression-test", 1, "\n".join(f"{item}: {suffix}" for item in headed))
 
 
+def _unreached_test_step(unreached: list[tuple[str, str, frozenset[str]]], reason: str) -> Step:
+    """Report or waive changed tests that do not name a source fix file or function."""
+    if reason:
+        headed = [f"{commit[:12]}: {subject}" for commit, subject, _ in unreached[:MAX_PATHS]]
+        return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
+    lines = [
+        f"{commit[:12]}: {subject}: test paths changed but none names "
+        f"{', '.join(sorted(names))}; name the fixed file or function in a test, "
+        "or pass --no-test-reason"
+        for commit, subject, names in unreached[:MAX_PATHS]
+    ]
+    return Step("regression-test", 1, "\n".join(lines))
+
+
 def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
     """Require changed tests that reach each source fix commit by file or function name."""
-    fixes = _fix_commits(tree, base, head)
-    test_paths = [name for name in _changed_paths(tree, base, head) if is_test_path(name)]
+    try:
+        fixes = _fix_commits(tree, base, head)
+    except RuntimeError as error:
+        return Step("regression-test", 1, str(error))
+    test_paths = [
+        name for name in _changed_paths(tree, base, head)[:MAX_PATHS] if is_test_path(name)
+    ]
     summary = f"{len(fixes)} fix commit(s), {len(test_paths)} test path(s) changed"
     if not fixes:
         return Step("regression-test", 0, summary)
@@ -1492,19 +1800,297 @@ def _regression_test(tree: Path, base: str, head: str, waiver: str) -> Step:
         return _no_test_step(fixes, reason)
     range_patch = _git(tree, *DIFF_COMMON, "-U0", base, head)
     words = test_words(range_patch, test_paths)
-    unreached = [fix for fix in fixes if not fix[2] & words]
+    unreached = [fix for fix in fixes[:MAX_PATHS] if not fix[2] & words]
     if not unreached:
         return Step("regression-test", 0, summary)
+    return _unreached_test_step(unreached, reason)
+
+
+HEX_40_OR_64 = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+MAX_RECORD_BYTES = 64 * 1024 * 1024
+REVERT_PROOF_KEYS = frozenset(
+    {
+        "commit",
+        "head",
+        "head_tree",
+        "command",
+        "rc_head",
+        "rc_reverted",
+        "reverted_paths",
+    }
+)
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build a JSON object dictionary while refusing duplicate keys."""
+    if len(pairs) > MAX_JSON_KEYS:
+        raise ValueError(f"JSON object keys exceed MAX_JSON_KEYS={MAX_JSON_KEYS}")
+    result: dict[str, object] = {}
+    for key, value in pairs[:MAX_JSON_KEYS]:
+        if key in result:
+            raise ValueError(f"duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _is_nonempty_str_list(value: object, bound: int) -> bool:
+    """Return whether value is a bounded non-empty list of non-empty strings."""
+    return (
+        isinstance(value, list)
+        and 0 < len(value) <= bound
+        and all(isinstance(item, str) and bool(item) for item in value[:bound])
+    )
+
+
+def _is_command_list(value: object) -> bool:
+    """Accept bounded string arguments, requiring only the executable to be nonempty."""
+    return (
+        isinstance(value, list)
+        and 0 < len(value) <= MAX_COMMAND_ARGS
+        and isinstance(value[0], str)
+        and bool(value[0])
+        and all(isinstance(item, str) for item in value[:MAX_COMMAND_ARGS])
+    )
+
+
+def _valid_hex_fields(payload: dict[str, object]) -> str | None:
+    """Return the first commit or tree field outside lowercase 40- or 64-hex IDs."""
+    for key in ("commit", "head", "head_tree"):
+        value = payload[key]
+        if not isinstance(value, str) or not HEX_40_OR_64.fullmatch(value):
+            return f"wrong value type for {key}"
+    return None
+
+
+def _revert_proof_type_error(payload: dict[str, object]) -> str | None:
+    """Return a field type diagnostic for a revert-proof JSON object, or None."""
+    hex_error = _valid_hex_fields(payload)
+    if hex_error is not None:
+        return hex_error
+    if not _is_command_list(payload["command"]):
+        return "wrong value type for command"
+    rc_head = payload["rc_head"]
+    if not isinstance(rc_head, int) or isinstance(rc_head, bool):
+        return "wrong value type for rc_head"
+    rc_reverted = payload["rc_reverted"]
+    if isinstance(rc_reverted, bool) or (
+        not isinstance(rc_reverted, int) and rc_reverted not in ("timeout", "launch-error")
+    ):
+        return "wrong value type for rc_reverted"
+    paths = payload["reverted_paths"]
+    if not _is_nonempty_str_list(paths, MAX_PATHS) or paths != sorted(paths):
+        return "wrong value type for reverted_paths"
+    return None
+
+
+def _revert_proof_schema_error(payload: dict[str, object]) -> str | None:
+    """Check required keys and field value types of a revert-proof JSON dictionary."""
+    missing = sorted(REVERT_PROOF_KEYS - payload.keys())
+    if missing:
+        return f"missing key: {', '.join(missing)}"
+    extra = sorted(payload.keys() - REVERT_PROOF_KEYS)
+    if extra:
+        return f"extra key: {', '.join(extra)}"
+    return _revert_proof_type_error(payload)
+
+
+def _read_record_bytes(path: Path) -> bytes:
+    """Open without FIFO blocking, require a regular file and always close its descriptor."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_CLOEXEC
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            return stream.read(MAX_RECORD_BYTES + 1)
+    finally:
+        os.close(descriptor)
+
+
+def _read_revert_proof(
+    path: Path,
+) -> tuple[dict[str, object] | None, str | None, str | None]:
+    """Read only bounded regular-file JSON records, then validate their keys and field types."""
+    try:
+        encoded = _read_record_bytes(path)
+        if len(encoded) > MAX_RECORD_BYTES:
+            return None, None, f"{path}: record exceeds MAX_RECORD_BYTES={MAX_RECORD_BYTES}"
+        payload = json.loads(encoded.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None, None, f"{path}: not valid JSON"
+    except ValueError as error:
+        return None, None, f"{path}: {error}"
+    if not isinstance(payload, dict):
+        return None, None, f"{path}: wrong value type (expected JSON object)"
+    raw_commit = payload.get("commit")
+    commit = raw_commit if isinstance(raw_commit, str) else None
+    schema_error = _revert_proof_schema_error(payload)
+    if schema_error is not None:
+        return None, commit, f"{path}: {schema_error}"
+    return payload, str(payload["commit"]), None
+
+
+def _record_binding_error(tree: Path, record: dict[str, object]) -> str | None:
+    """Require the stored head commit tree and the exact stored fix source path set."""
+    resolved = _run(
+        [
+            "git",
+            "--no-replace-objects",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{record['head']}^{{commit}}^{{tree}}",
+        ],
+        tree,
+    )
+    if resolved.returncode != 0 or resolved.timed_out:
+        return "head does not resolve to a commit"
+    if resolved.stdout.strip() != record["head_tree"]:
+        return "head commit tree differs from head_tree"
+    paths = _commit_paths(tree, str(record["commit"]))
+    source_paths = sorted(path for path in paths[:MAX_PATHS] if is_source_path(path))
+    if record["reverted_paths"] != source_paths:
+        return "reverted_paths differ from fix source paths"
+    return None
+
+
+def _record_verdict(record: dict[str, object], head_tree: str, tree: Path) -> str | None:
+    """Return a finding when a validated record does not prove its fix commit at head_tree."""
+    if record["head_tree"] != head_tree:
+        return (
+            f"record for another head tree ({str(record['head_tree'])[:12]}, "
+            f"expected {head_tree[:12]}; stale)"
+        )
+    binding_error = _record_binding_error(tree, record)
+    if binding_error is not None:
+        return binding_error
+    if record["rc_head"] != 0:
+        return f"rc_head is {record['rc_head']}, expected 0"
+    if record["rc_reverted"] == 0:
+        return "rc_reverted is 0 (test passes without the fix)"
+    if record["rc_reverted"] in ("timeout", "launch-error"):
+        return f"rc_reverted is {record['rc_reverted']} (no verdict)"
+    return None
+
+
+def _load_revert_proofs(
+    records: tuple[Path, ...],
+    fix_ids: frozenset[str],
+    head_tree: str,
+    tree: Path,
+) -> tuple[dict[str, tuple[list[str], bool]], dict[str, list[str]], list[str]]:
+    """Evaluate matching records immediately, retaining only verdicts, pass flags and errors."""
+    if len(records) > MAX_PATHS:
+        raise RuntimeError(f"revert-proof records exceed MAX_PATHS={MAX_PATHS}: {len(records)}")
+    by_commit: dict[str, tuple[list[str], bool]] = {}
+    errors_by_commit: dict[str, list[str]] = {}
+    unmatched_errors: list[str] = []
+    for path in records[:MAX_PATHS]:
+        payload, commit, error = _read_revert_proof(path)
+        if payload is not None and commit in fix_ids:
+            verdict = _record_verdict(payload, head_tree, tree)
+            verdicts, passed = by_commit.get(commit, ([], False))
+            if verdict is not None:
+                verdicts.append(verdict)
+            by_commit[commit] = (verdicts, passed or verdict is None)
+        elif error is not None and commit in fix_ids:
+            errors_by_commit.setdefault(commit, []).append(error)
+        elif error is not None:
+            unmatched_errors.append(error)
+    return by_commit, errors_by_commit, unmatched_errors
+
+
+def _commit_revert_findings(
+    fix: tuple[str, str, frozenset[str]],
+    loaded: tuple[dict[str, tuple[list[str], bool]], dict[str, list[str]], list[str]],
+) -> list[str]:
+    """Combine retained errors and verdicts, allowing passes to suppress only verdicts."""
+    commit, subject, names = fix
+    by_commit, errors_by_commit, _ = loaded
+    prefix = f"{commit[:12]}: {subject}"
+    raw_errors = errors_by_commit.get(commit, [])
+    findings = [f"{prefix}: {err}" for err in raw_errors[:MAX_PATHS]]
+    if not names:
+        findings.append(
+            f"{prefix}: merge commit with fix wording cannot be proven by a revert; "
+            "put the fix in its own commit, or pass --no-revert-proof-reason"
+        )
+        return findings
+    verdicts, passed = by_commit.get(commit, ([], False))
+    if passed:
+        return findings
+    findings.extend(f"{prefix}: {verdict}" for verdict in verdicts[:MAX_PATHS])
+    if not findings:
+        findings.append(
+            f"{prefix}: no revert-proof record; run scripts/revert_proof.py "
+            "and pass --revert-proof, or pass --no-revert-proof-reason"
+        )
+    return findings
+
+
+def _revert_proof(
+    tree: Path,
+    base: str,
+    head: str,
+    records: tuple[Path, ...] = (),
+    waiver: str = "",
+) -> Step:
+    """Validate records and source fixes, allowing explicit waivers of scan and claim caps."""
+    history_errors: list[str] = []
+    try:
+        fixes = _fix_commits(tree, base, head, include_merges=True, history_errors=history_errors)
+    except _RevertProofScanLimit as error:
+        return _revert_proof_limit_step(str(error), waiver)
+    except RuntimeError as error:
+        return Step("revert-proof", 1, str(error))
+    summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
+    if not fixes and not history_errors and not records:
+        return Step("revert-proof", 0, summary)
+    if len(fixes) > MAX_CLAIM_COMMITS:
+        cap = f"fix commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(fixes)}"
+        return _revert_proof_limit_step(cap, waiver)
+    return _revert_proof_result(tree, head, (fixes, history_errors), records, waiver)
+
+
+def _revert_proof_limit_step(diagnostic: str, waiver: str) -> Step:
+    """Waive only a scan or claim cap with a nonblank reason and retain its diagnostic."""
+    reason = waiver.strip()
+    return Step(
+        "revert-proof",
+        0 if reason else 1,
+        f"waived: {reason}\n{diagnostic}" if reason else diagnostic,
+    )
+
+
+def _revert_proof_result(
+    tree: Path,
+    head: str,
+    history: tuple[list[tuple[str, str, frozenset[str]]], list[str]],
+    records: tuple[Path, ...],
+    waiver: str,
+) -> Step:
+    """Evaluate records against the stored head tree and collect bounded, waivable findings."""
+    fixes, history_errors = history
+    summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
+    head_tree = _git(
+        tree, "--no-replace-objects", "rev-parse", "--verify", f"{head}^{{tree}}"
+    ).strip()
+    fix_ids = frozenset(commit for commit, _, _ in fixes[:MAX_CLAIM_COMMITS])
+    loaded = _load_revert_proofs(tuple(records), fix_ids, head_tree, tree)
+    findings: list[str] = [*history_errors, *loaded[2]]
+    unproved: list[str] = list(findings)
+    for fix in fixes[:MAX_CLAIM_COMMITS]:
+        commit, subject, _ = fix
+        commit_findings = _commit_revert_findings(fix, loaded)
+        if commit_findings:
+            findings.extend(commit_findings)
+            unproved.append(f"{commit[:12]}: {subject}")
+    if not findings:
+        return Step("revert-proof", 0, summary)
+    reason = waiver.strip()
     if reason:
-        headed = [f"{commit[:12]}: {subject}" for commit, subject, _ in unreached]
-        return Step("regression-test", 0, "\n".join([f"waived: {reason}", *headed]))
-    lines = [
-        f"{commit[:12]}: {subject}: test paths changed but none names "
-        f"{', '.join(sorted(names))}; name the fixed file or function in a test, "
-        "or pass --no-test-reason"
-        for commit, subject, names in unreached
-    ]
-    return Step("regression-test", 1, "\n".join(lines))
+        return Step("revert-proof", 0, "\n".join([f"waived: {reason}", *unproved]))
+    return Step("revert-proof", 1, "\n".join(findings))
 
 
 def _without_signoff(message: str) -> str:
@@ -1524,8 +2110,8 @@ def uncited_diagnostic(message: str) -> str | None:
 
 
 def _diagnostic_citation(tree: Path, base: str, head: str) -> Step:
-    """Require a bug report URL or reproducer for compiler-diagnostic workarounds."""
-    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    """Require diagnostic workaround citations using signature-free commit records."""
+    log = _git(tree, "log", "--no-show-signature", "-z", "--format=%H%n%B", f"{base}..{head}")
     findings: list[str] = []
     count = 0
     for record in log.split("\0"):
@@ -1664,8 +2250,8 @@ def _commit_claim_findings(tree: Path, commit: str, message: str) -> tuple[list[
 
 
 def _claim_scope(tree: Path, base: str, head: str, waiver: str) -> Step:
-    """Reject blanket verification claims and unwaived single-hunk multi-site claims."""
-    log = _git(tree, "log", "-z", "--format=%H%n%B", f"{base}..{head}")
+    """Reject unsupported claims from signature-free records unless scope is waived."""
+    log = _git(tree, "log", "--no-show-signature", "-z", "--format=%H%n%B", f"{base}..{head}")
     records = list(filter(None, log.split("\0")))
     if len(records) > MAX_CLAIM_COMMITS:
         raise RuntimeError(f"commits exceed MAX_CLAIM_COMMITS={MAX_CLAIM_COMMITS}: {len(records)}")
@@ -2255,6 +2841,12 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect(
                 "regression-test", lambda: _regression_test(tree, base, head, waivers.no_test)
             ),
+            _collect(
+                "revert-proof",
+                lambda: _revert_proof(
+                    tree, base, head, waivers.revert_proofs, waivers.no_revert_proof
+                ),
+            ),
             _collect("diagnostic-citation", lambda: _diagnostic_citation(tree, base, head)),
             _collect("claim-scope", lambda: _claim_scope(tree, base, head, waivers.claim)),
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
@@ -2265,9 +2857,32 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
         ]
 
 
+def _add_revert_proof_options(parser: argparse.ArgumentParser) -> None:
+    """Register the revert-proof record option and its waiver option."""
+    parser.add_argument(
+        "--revert-proof",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "measured revert_proof.py JSON record for one fix commit; repeatable "
+            "(one valid record per commit satisfies the step; stale or passing-without-fix "
+            "records are ignored when a valid one exists, malformed ones remain findings)"
+        ),
+    )
+    parser.add_argument(
+        "--no-revert-proof-reason",
+        default="",
+        help=(
+            "why the fix commits in the range carry no revert-proof record; "
+            "waives the revert-proof step"
+        ),
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     """Build the command line parser with the range options and one waiver per step."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = DisplayArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", default="HEAD")
@@ -2280,6 +2895,7 @@ def _parser() -> argparse.ArgumentParser:
             "do not name them; waives the regression-test step"
         ),
     )
+    _add_revert_proof_options(parser)
     parser.add_argument(
         "--claim-reason",
         default="",
@@ -2313,6 +2929,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_report(report: str, target: Path | None) -> bool:
+    """Render a report safely at the terminal and optional UTF-8 file boundary."""
+    try:
+        report = display_text(report)
+        emit_text(report, sys.stdout)
+        if target:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(report, encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        emit_text(f"report: {error}\n", sys.stderr)
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run all upstream checks, print their statuses, and optionally save a report."""
     args = _parser().parse_args(argv)
@@ -2322,11 +2952,13 @@ def main(argv: list[str] | None = None) -> int:
         base, head = _prepare(tree, base, head)
         waivers = Waivers(
             no_test=args.no_test_reason,
+            no_revert_proof=args.no_revert_proof_reason,
             claim=args.claim_reason,
             doc=args.doc_reason,
             test_program=args.test_program_reason,
             c_rule=args.c_rule_reason,
             docstring=args.docstring_reason,
+            revert_proofs=tuple(args.revert_proof),
         )
         steps = _checks(tree, base, head, waivers)
         _remaining(0)
@@ -2339,16 +2971,13 @@ def main(argv: list[str] | None = None) -> int:
         + "\n\n".join(f"step: {step.name} rc: {step.rc}\n{step.output.rstrip()}" for step in steps)
         + "\n"
     )
-    print(report, end="")
-    if args.report:
-        try:
-            args.report.parent.mkdir(parents=True, exist_ok=True)
-            args.report.write_text(report, encoding="utf-8")
-        except OSError as error:
-            print(f"report: {error}", file=sys.stderr)
-            return 2
+    if not _write_report(report, args.report):
+        return 2
     return 2 if steps[0].name == "preflight" else int(any(step.rc for step in steps))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        finish_process_output()

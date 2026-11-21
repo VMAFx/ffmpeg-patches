@@ -124,10 +124,22 @@ lengths-local:
 # Pre-POST checks using the upstream base's own policy and developer.texi rules:
 # Only allow-listed patcheck categories block; other added-line hints need review.
 #   make upstream-lint UPSTREAM_TREE=/path/to/ffmpeg UPSTREAM_BASE=<revision>
+# UPSTREAM_REVERT_PROOF: whitespace-separated record files; whitespace in filenames unsupported.
+# UPSTREAM_NO_REVERT_PROOF_REASON: nonblank waiver, forwarded without changing its bytes.
+#   make upstream-lint UPSTREAM_TREE=/path/to/ffmpeg UPSTREAM_BASE=main UPSTREAM_REVERT_PROOF='one.json two.json' UPSTREAM_NO_REVERT_PROOF_REASON='manual verification'
 # This optional checkout is distinct from the applied-series length checkout.
+UPSTREAM_REVERT_PROOF ?=
+UPSTREAM_NO_REVERT_PROOF_REASON ?=
+upstream-lint: override export UPSTREAM_REVERT_PROOF := $(value UPSTREAM_REVERT_PROOF)
+upstream-lint: override export UPSTREAM_NO_REVERT_PROOF_REASON := $(value UPSTREAM_NO_REVERT_PROOF_REASON)
 upstream-lint:
 	@if [ -n "$(UPSTREAM_TREE)" ] && [ -n "$(UPSTREAM_BASE)" ]; then \
-		sh .config/lefthook/python.sh scripts/upstream_lint.py --tree "$(UPSTREAM_TREE)" --base "$(UPSTREAM_BASE)"; \
+		set -f; set -- scripts/upstream_lint.py "--tree=$(UPSTREAM_TREE)" "--base=$(UPSTREAM_BASE)"; \
+		for record in $$UPSTREAM_REVERT_PROOF; do set -- "$$@" "--revert-proof=$$record"; done; \
+		if [ -n "$$(printf '%s' "$$UPSTREAM_NO_REVERT_PROOF_REASON" | tr -d '[:space:]')" ]; then \
+			set -- "$$@" "--no-revert-proof-reason=$$UPSTREAM_NO_REVERT_PROOF_REASON"; \
+		fi; \
+		sh .config/lefthook/python.sh "$$@"; \
 	else \
 		{ \
 		  echo 'upstream-lint: SKIPPED - both UPSTREAM_TREE and UPSTREAM_BASE required.'; \
