@@ -2593,12 +2593,13 @@ def _c_rules_copy_source(source: Path, target: Path, attributes: set[bytes]) -> 
 
 def _c_rules_scan_root(
     tree: Path, paths: list[str], directory: str
-) -> tuple[Path, list[str], list[str]]:
+) -> tuple[Path, list[str], list[str], list[str]]:
     """Copy contained supported files, skipping directories, unsupported syntax and escapes."""
     attributes, notices = _c_rules_attributes(tree)
     root = Path(directory) / "sources"
     root.mkdir()
     escaped: list[str] = []
+    unread: list[str] = []
     if not _c_rules_inside(tree / "libavutil/attributes.h", tree):
         escaped.append("libavutil/attributes.h")
     for index in range(len(paths)):
@@ -2616,35 +2617,16 @@ def _c_rules_scan_root(
             notices.append(f"error: {_waiver_text(name)}: {reason}")
             continue
         if source.is_dir():
+            unread.append(name)
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         reason = _c_rules_copy_source(source, target, attributes)
-        notice = f"informational: {_waiver_text(name)}: {reason}"
-        if reason and notice not in notices:
-            notices.append(notice)
-    return root, notices, escaped
-
-
-def _c_rules_unread_source(path: Path) -> bool:
-    """Classify directories and unsupported source syntax for existing unread waivers."""
-    if path.is_dir():
-        return True
-    try:
-        _c_rules_read_source(path)
-    except ValueError:
-        return True
-    except OSError:
-        return False
-    return False
-
-
-def _c_rules_file_paths(
-    tree: Path, paths: list[str], escaped: list[str], unread_paths: list[str]
-) -> list[str]:
-    """Exclude escaped paths and record directories and unsupported source syntax as unread."""
-    paths = [path for path in paths if path not in escaped]
-    unread_paths.extend(path for path in paths if _c_rules_unread_source(tree / path))
-    return [path for path in paths if path not in unread_paths]
+        if reason:
+            unread.append(name)
+            notice = f"informational: {_waiver_text(name)}: {reason}"
+            if notice not in notices:
+                notices.append(notice)
+    return root, notices, escaped, unread
 
 
 def _c_rules_scan(
@@ -2685,8 +2667,9 @@ def _c_rules(
     paths = list(touched_by_path)
     unread_paths: list[str] = []
     with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
-        scan_root, notices, escaped = _c_rules_scan_root(tree, paths, directory)
-        paths = _c_rules_file_paths(tree, paths, escaped, unread_paths)
+        scan_root, notices, escaped, unread = _c_rules_scan_root(tree, paths, directory)
+        unread_paths.extend(unread)
+        paths = [path for path in paths if path not in escaped and path not in unread_paths]
         unread_waivers = tuple(entry for entry in unread_waivers if entry.path not in escaped)
         if not paths:
             unused = _unread_report(unread_paths, unread_waivers)

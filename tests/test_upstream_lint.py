@@ -4257,6 +4257,43 @@ class CRulesScratchTest(FixtureTest):
             step = self.scan_source("void clean(void) { av_malloc(8); }\n")
         self.assert_header_escape(step)
 
+    def test_r4_unsupported_source_classified_from_single_read(self) -> None:
+        """Scratch preparation classifies an unsupported source without reading it a second time."""
+        supported = "libavfilter/vf_ok.c"
+        planted = "libavfilter/vf_x.c"
+        self.write(supported, "int ok(void) { return 0; }\n")
+        self.write(planted, "int unread(void) { return 0; }\n")
+        self.commit()
+        supported_path = self.root / supported
+        planted_path = self.root / planted
+        real_read = upstream_lint._c_rules_read_source
+        counts: dict[Path, int] = {}
+
+        def read_once(path: Path) -> bytes:
+            """Fail only the first read of the planted source and delegate every other read."""
+            counts[path] = counts.get(path, 0) + 1
+            if path == planted_path and counts[path] == 1:
+                raise ValueError("fixture unsupported")
+            return real_read(path)
+
+        with (
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_read_source", side_effect=read_once
+            ),
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_scan", wraps=upstream_lint._c_rules_scan
+            ) as scan,
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count(f"unread: {planted}:"), 1, step.output)
+        self.assertIn(f"no waiver: {planted}:", step.output)
+        scan_paths = scan.call_args.args[1]
+        self.assertNotIn(planted, scan_paths)
+        self.assertIn(supported, scan_paths)
+        self.assertEqual(counts.get(supported_path), 1)
+        self.assertEqual(counts.get(planted_path), 1)
+
     def test_attribute_parser_failure_is_blanked(self) -> None:
         """A discovered attribute cannot make an otherwise clean step exit two."""
         source = (
@@ -4388,7 +4425,7 @@ class CRulesBlankingTest(unittest.TestCase):
                 return real_read(path)
 
             with unittest.mock.patch.object(Path, "read_bytes", read):
-                root, notices, escaped = upstream_lint._c_rules_scan_root(
+                root, notices, escaped, _ = upstream_lint._c_rules_scan_root(
                     tree, ["libavutil/unread.c"], directory
                 )
             target = root / "libavutil/unread.c"
@@ -4433,6 +4470,18 @@ class CRulesBlankingTest(unittest.TestCase):
         )
         expected_zero = balanced_zero[: -len(b"CALL(1)\n")] + b"       \n"
         self.assertEqual(upstream_lint._c_rules_blank(balanced_zero, set()), expected_zero)
+
+    def test_conditional_arms_closing_function_blank_following_macro_call(self) -> None:
+        """All conditional arms closing a function return to file scope for macro blanking."""
+        source = (
+            b"#define CALL(x) (x)\nint f(void)\n{\n#if A\n    return 1;\n}\n#else\n"
+            b"    return 2;\n}\n#endif\nCALL(1)\n"
+        )
+        expected = source[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(source, set()), expected)
+        elif_source = source.replace(b"#else\n", b"#elif B\n    return 3;\n}\n#else\n")
+        elif_expected = elif_source[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(elif_source, set()), elif_expected)
 
     def test_conditional_directive_fail_safe_preserves_macro_calls(self) -> None:
         """Raw directive mismatches and unbalanced conditionals disable macro blanking only."""
@@ -4503,7 +4552,7 @@ class CRulesTest(unittest.TestCase):
             unittest.mock.patch.object(
                 upstream_lint,
                 "_c_rules_scan_root",
-                side_effect=lambda tree, paths, directory: (tree, [], []),
+                side_effect=lambda tree, paths, directory: (tree, [], [], []),
             ),
             unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
             unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
@@ -4524,7 +4573,7 @@ class CRulesTest(unittest.TestCase):
             unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
             unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
             unittest.mock.patch.object(
-                upstream_lint, "_c_rules_scan_root", return_value=(sentinel, [], [])
+                upstream_lint, "_c_rules_scan_root", return_value=(sentinel, [], [], [])
             ) as prepare,
         ):
             step = upstream_lint._c_rules(self.tree, "base", "head", "")
