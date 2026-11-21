@@ -2513,6 +2513,35 @@ def _c_rules_blank_words(raw: bytes, clean: str, words: re.Pattern[bytes]) -> by
     return bytes(blanked)
 
 
+def _c_rules_depths(lines: list[bytes], code: list[str], directive_count: int) -> list[int]:
+    """Track per-line brace depth across preprocessor conditional arms, or -1 on mismatch."""
+    depths: list[int] = []
+    stack: list[tuple[int, set[int]]] = []
+    depth = 0
+    raw_directives = 0
+    valid = True
+    for index in range(len(lines)):
+        clean = code[index]
+        match = re.match(rb"[ \t]*#[ \t]*([A-Za-z_]\w*)", lines[index])
+        word = match[1] if not clean.strip() and match is not None else b""
+        raw_directives += bool(word)
+        if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < len(lines):
+            stack.append((depth, set()))
+        elif word in {b"elif", b"else"} and stack:
+            stack[-1][1].add(depth)
+            depth = stack[-1][0]
+        elif word == b"endif" and stack:
+            _, ends = stack.pop()
+            valid = valid and ends <= {depth}
+        elif word in {b"if", b"ifdef", b"ifndef", b"elif", b"else", b"endif"}:
+            return [-1] * len(lines)
+        depths.append(depth if valid else -1)
+        depth += clean.count("{") - clean.count("}")
+    if raw_directives != directive_count or stack:
+        return [-1] * len(lines)
+    return depths
+
+
 def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     """Blank code attributes and file-scope macro calls, preserving all noncode bytes."""
     code, directives = _c_lex_lines(source.decode("latin-1"))
@@ -2521,13 +2550,13 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     )
     words = re.compile(rb"\b(?:" + b"|".join(sorted(attributes)) + rb")\b") if attributes else None
     lines = source.split(b"\n")
-    depth = 0
+    depths = _c_rules_depths(lines, code, len(directives))
     at_boundary = True
     for index in range(len(lines)):
         raw, clean = lines[index], code[index]
         invocation = re.fullmatch(rb"[ \t]*[A-Za-z_]\w*[ \t]*\(.*\)[ \t\r]*", raw)
         if (
-            depth == 0
+            depths[index] == 0
             and at_boundary
             and invocation
             and _c_rules_macro_call(clean, names)
@@ -2541,7 +2570,6 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
             stripped = clean.rstrip(" \t\r\f\v")
             if stripped:
                 at_boundary = stripped[-1] in {";", "}"}
-        depth += clean.count("{") - clean.count("}")
     return b"\n".join(lines)
 
 

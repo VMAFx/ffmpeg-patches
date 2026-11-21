@@ -4398,6 +4398,62 @@ class CRulesBlankingTest(unittest.TestCase):
             self.assertEqual(notices, [])
             self.assertEqual(escaped, [])
 
+    def test_conditional_arms_track_shared_starting_depth(self) -> None:
+        """Conditional arms restart from the entry depth and disable blanking on divergence."""
+        c3_source = (
+            b"#define CALL(x) (x)\nint f(void)\n{\n#if A\n    return 1;\n}\n#else\n"
+            b"    return 2;\n}\n#endif\nint g(void)\n{\n    CALL(1)\n    ;\n}\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(c3_source, set()), c3_source)
+        c3_boundary = c3_source.replace(b"{\n    CALL(1)\n", b"{\n    int x = 0;\n    CALL(1)\n")
+        self.assertEqual(upstream_lint._c_rules_blank(c3_boundary, set()), c3_boundary)
+        elif_source = c3_boundary.replace(b"#if A\n", b"#ifdef A\n").replace(
+            b"#else\n", b"#elif B\n    return 3;\n}\n#else\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(elif_source, set()), elif_source)
+        ifndef_source = c3_boundary.replace(b"#if A\n", b"#ifndef A\n")
+        self.assertEqual(upstream_lint._c_rules_blank(ifndef_source, set()), ifndef_source)
+        diverged_first_closes = (
+            b"#define CALL(x) (x)\nint f(void)\n{\n#if A\n    return 1;\n}\n#else\n"
+            b"    return 2;\n#endif\n}\nCALL(1)\n"
+        )
+        self.assertEqual(
+            upstream_lint._c_rules_blank(diverged_first_closes, set()), diverged_first_closes
+        )
+        diverged_second_closes = (
+            b"#define CALL(x) (x)\nint f(void)\n{\n#if A\n    return 1;\n#else\n"
+            b"    return 2;\n}\n#endif\nCALL(1)\n"
+        )
+        self.assertEqual(
+            upstream_lint._c_rules_blank(diverged_second_closes, set()), diverged_second_closes
+        )
+        balanced_zero = (
+            b"#define CALL(x) (x)\n#if A\nint f(void) { return 1; }\n#else\n"
+            b"int f(void) { return 2; }\n#endif\nCALL(1)\n"
+        )
+        expected_zero = balanced_zero[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(balanced_zero, set()), expected_zero)
+
+    def test_conditional_directive_fail_safe_preserves_macro_calls(self) -> None:
+        """Raw directive mismatches and unbalanced conditionals disable macro blanking only."""
+        comment_else = b"#define CALL(x) (x)\n/* comment\n#else\n*/\nCALL(1)\n"
+        self.assertEqual(upstream_lint._c_rules_blank(comment_else, set()), comment_else)
+        nested_comment_else = (
+            b"#define CALL(x) (x)\n#if A\n/* comment\n#else\n*/\n#endif\nCALL(1)\n"
+        )
+        self.assertEqual(
+            upstream_lint._c_rules_blank(nested_comment_else, set()), nested_comment_else
+        )
+        unbalanced_directives = (b"#elif A", b"#else", b"#endif", b"#if A")
+        for index in range(len(unbalanced_directives)):
+            directive = unbalanced_directives[index]
+            unbalanced = b"#define CALL(x) (x)\nCALL(1)\n" + directive + b"\nav_mark CALL(1)\n"
+            expected = b"#define CALL(x) (x)\nCALL(1)\n" + directive + b"\n        CALL(1)\n"
+            self.assertEqual(
+                upstream_lint._c_rules_blank(unbalanced, {b"av_mark"}),
+                expected,
+            )
+
 
 class CRulesTest(unittest.TestCase):
     """Unit coverage of the c-rules allow-list, argv, working directory and waiver."""
