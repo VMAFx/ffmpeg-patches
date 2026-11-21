@@ -143,8 +143,9 @@ class ChecksumsTest(unittest.TestCase):
 
 class SignerTest(unittest.TestCase):
     def test_keyless_identity_is_release_build_at_the_ref(self) -> None:
+        """Bind keyless verification to the repository release workflow and ref."""
         args = release_guard.parse_args(
-            ["verify", "S", "S.json", "--workflow-of", "VMAFx/ffmpeg-patches", "refs/tags/v1.0.0"]
+            ["verify", "S", "S.json", "--workflow-of", "vidiko/ffmpeg-patches", "refs/tags/v1.0.0"]
         )
         self.assertEqual(
             release_guard.cosign_arguments(args),
@@ -152,7 +153,7 @@ class SignerTest(unittest.TestCase):
                 "cosign", "verify-blob", "--bundle", "S.json",
                 "--certificate-identity",
                 (
-                    "https://github.com/VMAFx/ffmpeg-patches/.github/workflows/release-build.yml"
+                    "https://github.com/vidiko/ffmpeg-patches/.github/workflows/release-build.yml"
                     "@refs/tags/v1.0.0"
                 ),
                 "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
@@ -278,10 +279,13 @@ def step(workflow: str, name: str) -> str:
 # A guard whose failure the step swallows reports green while the release is broken.
 SWALLOWED = re.compile(r"continue-on-error|\|\|\s*(true|:|exit 0)\b|set \+e|; *true$|&& *true$")
 
+RELEASE_TAG_PATTERN = (
+    r'python3 scripts/release_guard\.py tag "\$GITHUB_REF_TYPE" "\$GITHUB_REF_NAME"'
+    r' "\$GITHUB_SHA" >> "\$GITHUB_OUTPUT"$'
+)
 GUARDS = {
     ("release-build.yml", "Release tag shape"): [
-        r'python3 scripts/release_guard\.py tag "\$GITHUB_REF_TYPE" "\$GITHUB_REF_NAME"'
-        r' "\$GITHUB_SHA" >> "\$GITHUB_OUTPUT"$',
+        RELEASE_TAG_PATTERN,
     ],
     ("release-build.yml", "Verify the SHA256SUMS signature"): [
         (

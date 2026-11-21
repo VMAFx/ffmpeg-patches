@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import importlib.util
 import io
 import os
 import re
@@ -50,17 +51,27 @@ ARGS = [
 ]
 
 
-def process_alive(pid: int) -> bool:
-    """Return whether a process exists and has not exited."""
+def _signal_probe(pid: int) -> bool:
+    """Return whether the signal probe finds the process."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    return True
+
+
+def process_alive(pid: int) -> bool:
+    """Return whether a process exists and has not exited."""
+    if not _signal_probe(pid):
+        return False
     stat = Path(f"/proc/{pid}/stat")
     try:
         state = stat.read_text(encoding="utf-8").rpartition(")")[2].split()[0]
+    except ProcessLookupError:
+        return False
     except FileNotFoundError:
-        return True
+        # No stat entry: procfs absent, or the process was reaped after the first probe.
+        return _signal_probe(pid)
     return state not in {"Z", "X"}
 
 
@@ -251,6 +262,29 @@ class LaneBriefTest(unittest.TestCase):
             self.assertTrue(process_alive(123))
         with patch("os.kill", side_effect=ProcessLookupError):
             self.assertFalse(process_alive(123))
+
+    def test_process_alive_reaped_during_read(self) -> None:
+        """Treat a process reaped during the procfs read as gone."""
+        with patch("os.kill"), patch.object(Path, "read_text", side_effect=ProcessLookupError):
+            self.assertFalse(process_alive(123))
+
+    def test_process_alive_reaped_before_read(self) -> None:
+        """Treat a process reaped before the procfs read as gone."""
+        with (
+            patch("os.kill", side_effect=[None, ProcessLookupError]) as signal_probe,
+            patch.object(Path, "read_text", side_effect=FileNotFoundError),
+        ):
+            self.assertFalse(process_alive(123))
+            self.assertEqual(signal_probe.call_count, 2)
+
+    def test_process_alive_without_procfs(self) -> None:
+        """Treat a process passing both signal probes as alive without procfs."""
+        with (
+            patch("os.kill") as signal_probe,
+            patch.object(Path, "read_text", side_effect=FileNotFoundError),
+        ):
+            self.assertTrue(process_alive(123))
+            self.assertEqual(signal_probe.call_count, 2)
 
     def constant_names(self, tree: ast.Module) -> set[str]:
         """Collect module-level constant names from assignments."""
@@ -513,6 +547,151 @@ class LaneBriefTest(unittest.TestCase):
         )
         self.assertNotIn("<modules>", brief.read_text(encoding="utf-8"))
 
+    def test_brief_without_import_style_refused(self) -> None:
+        """Accept complete briefs and reject briefs missing the import-style module."""
+        content = self.rendered()
+        brief = self.root / "brief.md"
+        brief.write_text(content, encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 0, error)
+        brief.write_text(content.replace("tests.test_import_style", ""), encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 1)
+        self.assertIn("missing required line: -m unittest tests.test_import_style", error)
+        self.assertIn("python -m unittest tests.test_import_style", content)
+
+    def test_import_style_requirement_is_exact_module_name(self) -> None:
+        """Reject the path form and accept the dotted module with a trailing flag."""
+        content = self.rendered()
+        brief = self.root / "brief.md"
+        brief.write_text(
+            content.replace("tests.test_import_style", "tests/test_import_style.py"),
+            encoding="utf-8",
+        )
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 1)
+        self.assertIn("missing required line: -m unittest tests.test_import_style", error)
+        brief.write_text(
+            content.replace("tests.test_import_style", "tests.test_import_style -v"),
+            encoding="utf-8",
+        )
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 0, error)
+
+    def test_import_style_prose_mention_refused(self) -> None:
+        """Reject a brief naming the import-style module only in its task text."""
+        content = self.rendered().replace("python -m unittest tests.test_import_style", "")
+        content = content.replace("task: work", "task: inspect tests.test_import_style")
+        self.assertIn("task: inspect tests.test_import_style", content)
+        brief = self.root / "brief.md"
+        brief.write_text(content, encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief))
+        self.assertEqual(rc, 1)
+        self.assertIn("missing required line: -m unittest tests.test_import_style", error)
+
+    def test_import_style_accepts_real_invocations(self) -> None:
+        """Accept supported invocations and reject the import-style module after another module."""
+        content = self.rendered()
+        brief = self.root / "brief.md"
+        import_style_first = (
+            "/usr/bin/python3 -B -m unittest tests.test_import_style tests.test_sweep_classes -v"
+        )
+        import_style_last = (
+            "/usr/bin/python3 -B -m unittest tests.test_sweep_classes tests.test_import_style -v"
+        )
+        for invocation, expected in (
+            ("python -m unittest tests.test_import_style", 0),
+            ("/usr/bin/python3 -B -m unittest tests.test_import_style -v", 0),
+            (
+                import_style_first,
+                0,
+            ),
+            (
+                import_style_last,
+                1,
+            ),
+        ):
+            with self.subTest(invocation=invocation):
+                brief.write_text(
+                    content.replace("python -m unittest tests.test_import_style", invocation),
+                    encoding="utf-8",
+                )
+                rc, _, error = self.run_cli("check", str(brief))
+                self.assertEqual(rc, expected, error)
+                if expected:
+                    self.assertIn(
+                        "missing required line: -m unittest tests.test_import_style", error
+                    )
+
+    def test_import_style_similar_module_refused(self) -> None:
+        """Reject similarly named modules instead of the required unittest module."""
+        template = self.rendered()
+        invocation = "-m unittest tests.test_import_style"
+        required = lane_brief.read_required(CONFIG)
+        for suffix in ("s", "_extra", ".py", "2"):
+            with self.subTest(module=f"tests.test_import_style{suffix}"):
+                content = template.replace(invocation, invocation + suffix)
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    rc = lane_brief.check(content, "brief", required)
+                self.assertEqual(rc, 1)
+                self.assertIn(f"missing required line: {invocation}", error.getvalue())
+
+    def test_entry_boundary_characters(self) -> None:
+        """Accept only allowed entry endings and search beyond rejected occurrences."""
+        item = "required entry"
+        for follower in (" ", "\n", "\t", "", "`", '"', ")", ",", ":", ";", ". ", "."):
+            with self.subTest(accepted=follower):
+                self.assertTrue(lane_brief.has_entry(item + follower, item))
+        for follower in ("s", "_", "2", "-", "/", ".p"):
+            with self.subTest(refused=follower):
+                self.assertFalse(lane_brief.has_entry(item + follower, item))
+        self.assertTrue(lane_brief.has_entry(f"{item}s then {item} ", item))
+
+    def test_entry_adjacent_occurrences_use_real_suffix(self) -> None:
+        """Check adjacent occurrences against their real suffixes in the original text."""
+        item = "-m unittest tests.test_import_style"
+        self.assertFalse(lane_brief.has_entry(item + item + "s", item))
+        self.assertTrue(lane_brief.has_entry(item + item + " ", item))
+
+    def test_entry_overlapping_occurrence_counts(self) -> None:
+        """Accept an overlapping occurrence that ends at an allowed token boundary."""
+        self.assertTrue(lane_brief.has_entry("aaaa", "aaa"))
+        self.assertFalse(lane_brief.has_entry("aaab", "aaa"))
+
+    def test_entry_suffix_check_reads_two_characters(self) -> None:
+        """Pass at most two trailing characters to the token-boundary check."""
+        content = "a" * 59_999 + "\n"
+        with patch.object(lane_brief, "ends_token", wraps=lane_brief.ends_token) as spy:
+            self.assertTrue(lane_brief.has_entry(content, "a"))
+            spy.assert_called()
+            self.assertTrue(lane_brief.has_entry("aaaa", "aaa"))
+            self.assertFalse(lane_brief.has_entry("aaab", "aaa"))
+        for call in spy.call_args_list:
+            self.assertLessEqual(len(call.args[0]), 2)
+
+    def test_plain_substring_mutant_killed(self) -> None:
+        """Expose the similar-module false acceptance when plain matching is restored."""
+        source = (ROOT / "scripts" / "lane_brief.py").read_text(encoding="utf-8")
+        original = "not has_entry(content, item)"
+        self.assertEqual(source.count(original), 1)
+        mutant_path = self.root / "lane_brief_mutant.py"
+        mutant_path.write_text(source.replace(original, "item not in content"), encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("lane_brief_mutant", mutant_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        mutant = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mutant)
+        content = self.rendered().replace("tests.test_import_style", "tests.test_import_styles")
+        required = lane_brief.read_required(CONFIG)
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(mutant.check(content, "mutant", required), 0)
+            self.assertEqual(lane_brief.check(content, "real", required), 1)
+        self.assertEqual(
+            error.getvalue(), "real: missing required line: -m unittest tests.test_import_style\n"
+        )
+
     def test_each_missing_required_line_fails(self) -> None:
         """Reject each independently removed required substring."""
         content = self.rendered()
@@ -663,6 +842,7 @@ class LaneBriefTest(unittest.TestCase):
                 "ruff format --check scripts tests",
                 "docstring_diff.py --cached",
                 "no commit, no push",
+                "-m unittest tests.test_import_style",
             ],
         )
 
@@ -670,7 +850,7 @@ class LaneBriefTest(unittest.TestCase):
         """Accept maximum list and item lengths and reject values above them."""
         config = self.root / "config.yaml"
         brief = self.root / "brief.md"
-        brief.write_text("a" * 201, encoding="utf-8")
+        brief.write_text("a " + "a" * 200, encoding="utf-8")
         for count, length, expected, reason in (
             (32, 1, 0, ""),
             (33, 1, 2, "32 items"),

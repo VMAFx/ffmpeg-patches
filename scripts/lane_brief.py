@@ -4,6 +4,8 @@
 """Render or check a lane brief against repository standards.
 
 The check command with a runner first runs scripts/lane_isolation.py on the worktree.
+Required entries must end at an allowed token boundary.
+Runner dependencies load on demand so copied validators can reuse the YAML reader.
 
 Usage: lane_brief.py render --branch B --task T --finding F --fix X --tests S --paths P --modules M
        lane_brief.py check BRIEF [--config FILE] [--runner PATH] [--worktree DIR]
@@ -13,6 +15,7 @@ Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
 from __future__ import annotations
 
 import argparse
+import importlib
 import io
 import os
 import re
@@ -26,9 +29,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts import lane_isolation  # noqa: E402
-from scripts.process_group import kill_process_group, read_bounded  # noqa: E402
-
 TEMPLATE = ROOT / "scripts" / "lane_brief_template.md"
 CONFIG = ROOT / ".config" / "lane-brief.yaml"
 NAMES = ("task", "branch", "n", "r", "finding", "fix", "tests", "paths", "modules")
@@ -38,6 +38,9 @@ MAX_LINES = 10000
 MAX_LINE_SIZE = 65536
 RUNNER_TIMEOUT = 120
 RUNNER_OUTPUT_LIMIT = 65536
+# Allow-list of characters that end a required entry; whitespace, end of text,
+# and a period followed by whitespace or end of text also end it.
+ENTRY_ENDINGS = '`"),:;'
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -64,8 +67,8 @@ def bounded_lines(path: Path) -> list[str]:
     return [line.decode("utf-8") for line in lines]
 
 
-def read_required(path: Path) -> list[str]:
-    """Read and validate the required substrings from a bounded YAML document."""
+def read_yaml(path: Path) -> object:
+    """Read bounded safe YAML while rejecting duplicate mapping keys."""
     try:
         import yaml  # noqa: PLC0415 - optional parser dependency.
     except ImportError as error:
@@ -100,7 +103,12 @@ def read_required(path: Path) -> list[str]:
             loader.dispose()
     except yaml.YAMLError as error:
         raise ValueError(f"{path}: invalid YAML: {error}") from error
-    return validate_required(path, document)
+    return document
+
+
+def read_required(path: Path) -> list[str]:
+    """Read and validate the required substrings from a bounded YAML document."""
+    return validate_required(path, read_yaml(path))
 
 
 def validate_required(path: Path, document: object) -> list[str]:
@@ -123,9 +131,36 @@ def validate_required(path: Path, document: object) -> list[str]:
     return result
 
 
+def ends_token(rest: str) -> bool:
+    """Return whether text after an entry begins with an allowed token boundary."""
+    if not rest or rest[0].isspace() or rest[0] in ENTRY_ENDINGS:
+        return True
+    return rest[0] == "." and (len(rest) == 1 or rest[1].isspace())
+
+
+def has_entry(content: str, item: str) -> bool:
+    """Return False for an empty entry or whether any occurrence ends at a token boundary."""
+    if not item:
+        return False
+    start = 0
+    for _ in range(len(content) - len(item) + 1):
+        index = content.find(item, start)
+        if index < 0:
+            return False
+        end = index + len(item)
+        if ends_token(content[end : end + 2]):
+            return True
+        start = index + 1
+    return False
+
+
 def check(content: str, label: str, required: list[str]) -> int:
     """Print each missing requirement and unfilled placeholder."""
-    errors = [f"{label}: missing required line: {item}" for item in required if item not in content]
+    errors = [
+        f"{label}: missing required line: {item}"
+        for item in required
+        if not has_entry(content, item)
+    ]
     errors.extend(
         f"{label}: unfilled placeholder <{name}>" for name in NAMES if f"<{name}>" in content
     )
@@ -179,15 +214,18 @@ def render_brief(args: argparse.Namespace) -> int:
 
 def read_runner_output(process: subprocess.Popen[bytes], deadline: float) -> bytes:
     """Read runner output within the byte limit and monotonic deadline."""
+    process_group = importlib.import_module("scripts.process_group")
     if process.stdout is None:
         raise OSError("runner stdout pipe unavailable")
-    return read_bounded(process, (process.stdout,), deadline, RUNNER_OUTPUT_LIMIT, RUNNER_TIMEOUT)[
-        0
-    ]
+    return process_group.read_bounded(
+        process, (process.stdout,), deadline, RUNNER_OUTPUT_LIMIT, RUNNER_TIMEOUT
+    )[0]
 
 
 def run_runner(argv: list[str]) -> tuple[bytes, int]:
     """Run and reap a runner while collecting bounded combined output."""
+    lane_isolation = importlib.import_module("scripts.lane_isolation")
+    process_group = importlib.import_module("scripts.process_group")
     process = subprocess.Popen(  # nosec B603 - configured runner path, explicit argv, no shell.
         argv,
         env=lane_isolation.git_environment(),
@@ -203,7 +241,7 @@ def run_runner(argv: list[str]) -> tuple[bytes, int]:
         return output, process.returncode
     finally:
         if not completed or process.poll() != 0:
-            kill_process_group(process)
+            process_group.kill_process_group(process)
         try:
             process.wait(timeout=5)
         finally:
@@ -232,6 +270,7 @@ def check_runner(runner: Path, brief: Path, worktree: Path) -> int:
 
 def check_isolation(worktree: Path) -> int:
     """Refuse unsafe lane worktrees before the runner can start."""
+    lane_isolation = importlib.import_module("scripts.lane_isolation")
     try:
         lines = lane_isolation.refusals(worktree)
     except (lane_isolation.IsolationError, OSError) as error:

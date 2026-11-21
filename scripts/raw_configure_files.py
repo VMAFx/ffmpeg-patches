@@ -589,10 +589,35 @@ def _body_candidates(
     return _nested_candidates(nested, context, cd_targets, budget)
 
 
+def _candidate_key(candidate: _Candidate, cwd: Path) -> _Candidate:
+    """Key a candidate by resolved path; a path that does not exist keeps its literal operand."""
+    try:
+        path = Path(candidate.operand)
+        resolved = (path if path.is_absolute() else cwd / path).resolve(strict=True)
+        return candidate._replace(operand=str(resolved))
+    except (OSError, RuntimeError):
+        return candidate
+
+
+def _unseen_candidates(
+    candidates: list[_Candidate], cwd: Path, seen: set[_Candidate]
+) -> list[_Candidate]:
+    """Filter candidates whose resolved keys are not yet in the visited set."""
+    fresh: list[_Candidate] = []
+    for candidate in candidates:
+        key = _candidate_key(candidate, cwd)
+        if key not in seen:
+            seen.add(key)
+            fresh.append(candidate)
+    return fresh
+
+
 def _inspect_files(
     worklist: list[_Candidate], context: InspectionContext, budget: BodyBudget
 ) -> Path | None:
-    """Drain ordered nested scripts without reentering any body or source inspection."""
+    """Drain ordered nested scripts inspecting each distinct candidate once."""
+    seen: set[_Candidate] = set()
+    worklist = _unseen_candidates(worklist, context.cwd, seen)
     for _ in range(MAX_SCRIPT_FILES + 1):
         if not worklist:
             return None
@@ -602,16 +627,20 @@ def _inspect_files(
             return res
         if res is None:
             continue
+        resolved = (
+            Path(cur.operand).resolve()
+            if Path(cur.operand).is_absolute()
+            else (context.cwd / cur.operand).resolve()
+        )
         file_context = context._replace(
             directory_changed=cur.directory_changed,
-            script_dir=Path(cur.operand).resolve().parent
-            if Path(cur.operand).is_absolute()
-            else (context.cwd / cur.operand).resolve().parent,
+            script_dir=resolved.parent,
+            script_path=resolved,
         )
         candidates = _body_candidates(res, file_context, budget)
         if isinstance(candidates, Path):
             return Path(f"{cur.operand} ({candidates})")
-        worklist.extend(reversed(candidates))
+        worklist.extend(reversed(_unseen_candidates(candidates, context.cwd, seen)))
     if worklist:
         return Path("more nested scripts than inspect limit")
     return None
@@ -628,7 +657,8 @@ def inspect_sourced_file(operand: str, context: InspectionContext) -> tuple[Path
     """Inspect a source in its caller's scan and expose its final directory state."""
     budget = BodyBudget()
     directory_state = [context.directory_changed]
-    file_context = context._replace(script_dir=(context.cwd / operand).resolve().parent)
+    resolved = (context.cwd / operand).resolve()
+    file_context = context._replace(script_dir=resolved.parent, script_path=resolved)
     candidates = _body_candidates(
         f". {shlex.quote(operand)}", file_context, budget, directory_state
     )

@@ -3,7 +3,7 @@
 -include .config/praetor/engine.mk
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 .PHONY: all dev-deps verify-all compile-context compile-context-verify caveman-sources audit docstrings semgrep build test lint lint-mutable-defaults apply filter-deps lengths lengths-local upstream-lint dist doctor
-.PHONY: fairy-requests
+.PHONY: fairy-requests test-budgeted
 
 DOCSTRING_BASE ?= origin/main
 SEMGREP ?= semgrep
@@ -54,10 +54,22 @@ semgrep:
 build:
 	@sh .config/lefthook/python.sh scripts/series.py check
 
+# Unit tests run class tasks in UNIT_JOBS worker processes; the independent forgejo
+# methods use singleton tasks so its large classes cannot serialize the run.
+# series.yml jobs.check.timeout-minutes supplies the limit; the wrapper applies
+# UNIT_BUDGET_SHARE to job elapsed (including prerequisites) and unit wall time.
+# CI supplies its first-step timestamp; local test starts the clock before prerequisites.
+# The runner hook reports the slowest scheduled suites and their summed-time shares.
+# Set UNIT_JOBS on the make command line to change the worker count.
+UNIT_JOBS ?= 4
+
 # The temporary leak guard fails a run that leaves files in its temporary directory.
 # Unit tests ignore the host git configuration, as on CI, so a test that needs a git identity fails locally too.
-test: dev-deps build lint
-	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh .config/lefthook/python.sh scripts/tmp_leak_guard.py -- sh .config/lefthook/python.sh -m unittest discover -s tests
+test:
+	@SERIES_JOB_STARTED_AT="$${SERIES_JOB_STARTED_AT-$$(date +%s)}" $(MAKE) test-budgeted
+
+test-budgeted: dev-deps build lint
+	@GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh .config/lefthook/python.sh scripts/unit_test_budget.py -- sh .config/lefthook/python.sh -m unittest_parallel -j $(UNIT_JOBS) --level class -s tests --runner scripts.unit_test_budget.TimedSuiteRunner
 
 lint: lint-mutable-defaults
 	@sh .config/lefthook/python.sh -m ruff check scripts tests
@@ -79,16 +91,20 @@ filter-deps:
 
 # HISS-04 function-length gate on the applied series. It needs the series
 # applied to an FFmpeg checkout (base..HEAD, one commit per patch), so it is
-# not in the default local gate; CI runs it unconditionally. Run it directly:
+# not in the default local gate. CI runs it on every push to main and every
+# release run; on a non-draft pull request only when scripts/series.py scope
+# selects ffmpeg work. Draft or out-of-scope pull requests skip it. Run directly:
 #   make lengths FFMPEG_TREE=/path/to/applied-ffmpeg
 lengths:
 	@test -n "$(FFMPEG_TREE)" || { echo 'set FFMPEG_TREE to an FFmpeg checkout with the series applied' >&2; exit 1; }
 	@sh .config/lefthook/python.sh scripts/series.py lengths "$(FFMPEG_TREE)"
 
 # verify-all hook for the applied-tree length gate: run it when FFMPEG_TREE
-# names an applied checkout, otherwise skip loudly (never a silent pass) so a
-# tree-less local run says plainly that only CI will catch an over-length
-# function. `make verify-all FFMPEG_TREE=<applied tree>` runs the full gate.
+# names an applied checkout, otherwise skip loudly (never a silent pass).
+# CI runs it on every push to main and every release run; on a non-draft pull
+# request only when scripts/series.py scope selects ffmpeg work. Draft or
+# out-of-scope pull requests skip it; a tree-less local run cannot catch it.
+# `make verify-all FFMPEG_TREE=<applied tree>` runs the full gate.
 lengths-local:
 	@if [ -n "$(FFMPEG_TREE)" ]; then \
 		sh .config/lefthook/python.sh scripts/series.py lengths "$(FFMPEG_TREE)"; \
@@ -98,8 +114,10 @@ lengths-local:
 		  echo '  The HISS-04 applied-tree function-length gate needs the series'; \
 		  echo '  applied to an FFmpeg checkout. Before pushing a patch change run:'; \
 		  echo '    make verify-all FFMPEG_TREE=<applied FFmpeg tree>'; \
-		  echo '  (see "Apply the series" in README.md). CI enforces this gate'; \
-		  echo '  unconditionally, so a tree-less local run cannot catch it.'; \
+		  echo '  (see "Get started" in README.md). CI runs this gate on every'; \
+		  echo '  push to main and every release run; on a non-draft pull request only'; \
+		  echo '  when scripts/series.py scope selects ffmpeg work. Draft or out-of-scope'; \
+		  echo '  pull requests skip it; a tree-less local run cannot catch it.'; \
 		} >&2; \
 	fi
 

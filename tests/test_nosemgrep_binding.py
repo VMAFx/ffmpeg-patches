@@ -40,6 +40,18 @@ TEXT_TOKENS = re.compile(
     r"|`(?:\\[\s\S]|[^`\\])*`|/\*[\s\S]*?\*/"
     r"|(?P<comment>\#[^\n\r]*|//[^\n\r]*)"
 )
+# The reviewed binding shape of scripts/upstream_lint.py at b807bae, kept as planted-test input.
+_REVIEWED_POPEN_BINDING = (
+    "    with subprocess.Popen(\n"
+    "        # semgrep-reason (expires 2026-11-14): allow-listed argv[0], verified refs, no shell\n"
+    "        # nosemgrep: "
+    "python.lang.security.audit.dangerous-subprocess-use-tainted-env-args."
+    "dangerous-subprocess-use-tainted-env-args  # noqa: E501\n"
+    "        argv,\n"
+    "        cwd=cwd,\n"
+    "    ) as process:\n"
+    "        process.wait()\n"
+)
 
 
 def local_rule_ids(source: str) -> set[str]:
@@ -294,14 +306,15 @@ class NosemgrepBindingTest(unittest.TestCase):
                 with self.subTest(filename=filename, newline=newline):
                     source = "x = 1\f\n" + bound_source(marker=marker)
                     source = source.replace("\nrun()", "\n\nrun()")
+                    expected_error = (
+                        f"{filename}:3: R3 misplaced suppression: "
+                        "standalone line immediately before code required"
+                    )
                     self.assertEqual(
                         find_nosemgrep_offenders(
                             source.replace("\n", newline), set(), filename=filename, today=TODAY
                         ),
-                        [
-                            f"{filename}:3: R3 misplaced suppression: "
-                            "standalone line immediately before code required"
-                        ],
+                        [expected_error],
                     )
 
     def test_unicode_separator_preserves_valid_binding(self) -> None:
@@ -384,7 +397,7 @@ class NosemgrepBindingTest(unittest.TestCase):
         self.assert_rule(source.replace("E501", "E999"), "R1")
 
     def test_real_upstream_lint(self) -> None:
-        """The existing reviewed suppression is valid on the task's reference date."""
+        """The real scripts/upstream_lint.py carries no invalid suppression."""
 
         source = (ROOT / "scripts/upstream_lint.py").read_text(encoding="utf-8")
         self.assertEqual(
@@ -394,10 +407,34 @@ class NosemgrepBindingTest(unittest.TestCase):
             [],
         )
 
-    def test_real_file_without_reason(self) -> None:
-        """Removing only the real reason yields exactly one missing-reason offender."""
+    def test_reviewed_binding_is_valid(self) -> None:
+        """The reviewed Popen binding fixture is valid on its reference date."""
 
-        source = (ROOT / "scripts/upstream_lint.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            find_nosemgrep_offenders(
+                _REVIEWED_POPEN_BINDING,
+                set(),
+                filename="scripts/upstream_lint.py",
+                today=date(2026, 11, 4),
+            ),
+            [],
+        )
+
+    def test_reviewed_binding_expires_after_date(self) -> None:
+        """The reviewed Popen binding fixture expires on the day after its deadline."""
+
+        offenders = find_nosemgrep_offenders(
+            _REVIEWED_POPEN_BINDING,
+            set(),
+            filename="scripts/upstream_lint.py",
+            today=date(2026, 11, 15),
+        )
+        self.assertTrue(any(": R5 " in item for item in offenders), offenders)
+
+    def test_reviewed_binding_without_reason(self) -> None:
+        """Removing the reason on the reviewed binding fixture yields an R4 offender."""
+
+        source = _REVIEWED_POPEN_BINDING
         planted = re.sub(r"^.*# semgrep-reason[^\n]*\n", "", source, flags=re.MULTILINE)
         offenders = find_nosemgrep_offenders(
             planted, set(), filename="scripts/upstream_lint.py", today=date(2026, 11, 4)
@@ -405,10 +442,10 @@ class NosemgrepBindingTest(unittest.TestCase):
         self.assertEqual(len(offenders), 1, offenders)
         self.assertIn(": R4 ", offenders[0])
 
-    def test_real_file_without_ids(self) -> None:
-        """Removing the real IDs leaves a detectable bare suppression."""
+    def test_reviewed_binding_without_ids(self) -> None:
+        """Removing rule IDs on the reviewed binding fixture leaves a bare suppression."""
 
-        source = (ROOT / "scripts/upstream_lint.py").read_text(encoding="utf-8")
+        source = _REVIEWED_POPEN_BINDING
         planted = re.sub(r"(# nosemgrep):[^\n]*", r"\1", source)
         self.assert_rule(planted, "R1")
 

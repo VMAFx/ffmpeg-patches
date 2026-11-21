@@ -1,5 +1,5 @@
 task: <task>
-repo: VMAFx/ffmpeg-patches, worktree = cwd, branch <branch>. issue #<n>, round <r>.
+repo: vidiko/ffmpeg-patches, worktree = cwd, branch <branch>. issue #<n>, round <r>.
 finding / problem: <finding>
 fix: <fix>; HISS: no recursion, bounded loops, functions <= 60 LOC, typed, timeout on every I/O call.
 Configure FFmpeg builds only through `scripts/ffmpeg_configure.py`.
@@ -8,6 +8,7 @@ tests: <tests>; positive, negative, boundary; one-line docstring on every new te
 planted red: run the new tests against the unfixed code first; record rc + failure line.
 run ONLY (with .lane/venv python), after `git add` of your changed files:
   `python -m unittest <modules>`
+  `python -m unittest tests.test_import_style`  (reads sources only; mixed import forms fail the repository gate)
   `ruff check scripts tests`; `ruff format --check scripts tests`
   `python scripts/lint_mutable_defaults.py`; `python -c 'import scripts.series'`
   `python -I scripts/docstring_diff.py --cached`  (docstring check on staged changes; rc must be 0)

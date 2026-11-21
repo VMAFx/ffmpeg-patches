@@ -18,20 +18,19 @@ The accepted formats are the planar 4:2:0 yuv420p and the two-plane
 formats of the VideoToolbox frames context: nv12, nv16 and nv24 at 8
 bits, p010, p210 and p410 at 10 bits, p216 and p416 at 16 bits.
 
-tools/hqdn3d_reset_test now also runs the Metal filter with a vt
-argument.
+libavfilter/tests/hqdn3d_vulkan now also runs the Metal filter with a
+vt argument.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
  configure                                     |    1 +
  doc/filters.texi                              |   33 +
- libavfilter/Makefile                          |    4 +
+ libavfilter/Makefile                          |    5 +
  libavfilter/allfilters.c                      |    1 +
  .../metal/vf_hqdn3d_videotoolbox.metal        |  325 +++++
- libavfilter/vf_hqdn3d_videotoolbox.m          | 1075 +++++++++++++++++
- tools/Makefile                                |    1 +
- tools/hqdn3d_reset_test.c                     |   63 +-
- 8 files changed, 1487 insertions(+), 16 deletions(-)
+ libavfilter/tests/hqdn3d_vulkan.c             |   23 +-
+ libavfilter/vf_hqdn3d_videotoolbox.m          | 1105 +++++++++++++++++
+ 7 files changed, 1492 insertions(+), 1 deletion(-)
  create mode 100644 libavfilter/metal/vf_hqdn3d_videotoolbox.metal
  create mode 100644 libavfilter/vf_hqdn3d_videotoolbox.m
 
@@ -48,7 +47,7 @@ index d386cc831d5e7265f8f73f42692a91ea57bdf4cb..0ebe83a5ae70d894b284b8715cc98628
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 863863b8fbce453eacf4da88bf5ea9881eb12fd0..e214440837b7de9c586a35d579a59f5ebd088a92 100644
+index 0a85746f13ce5de161588bc55691a94ea7637e8d..5584aacfb6dc17beaaba851646b6f309da3aef5d 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15857,6 +15857,39 @@ The filter accepts the same options as @ref{hqdn3d}:
@@ -92,7 +91,7 @@ index 863863b8fbce453eacf4da88bf5ea9881eb12fd0..e214440837b7de9c586a35d579a59f5e
  @section hqdn3d_vulkan
  
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index e56c74a5112d13865067a14ccd1b82c99dcd4fa1..cf69310e9c5291ea27f6456d2d03743206a52a96 100644
+index 418da809cc0e7e8b67c81082dcad92725a99875d..7a32963404201eb6b58828679f971998480f3d7b 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -349,6 +349,10 @@ OBJS-$(CONFIG_HISTOGRAM_FILTER)              += vf_histogram.o
@@ -106,6 +105,14 @@ index e56c74a5112d13865067a14ccd1b82c99dcd4fa1..cf69310e9c5291ea27f6456d2d037432
  OBJS-$(CONFIG_HQDN3D_VULKAN_FILTER)          += vf_hqdn3d_vulkan.o hqdn3d_coefs.o vulkan.o vulkan_filter.o
  OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
  OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
+@@ -699,6 +703,7 @@ TOOLS-$(CONFIG_LIBZMQ) += zmqsend
+ # hqdn3d_vulkan also tests the other hqdn3d GPU filters; list it once.
+ TESTPROGS-$(CONFIG_HQDN3D_CUDA_FILTER) += hqdn3d_vulkan
+ TESTPROGS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_vulkan
++TESTPROGS-$(CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER) += hqdn3d_vulkan
+ TESTPROGS-yes := $(sort $(TESTPROGS-yes))
+ 
+ clean::
 diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
 index 81c1f2c8a8d38e38b40a2b6bfb3e8f05fbbbc627..5ecf9a8698318dd84d5d3723df2053a2c9f20304 100644
 --- a/libavfilter/allfilters.c
@@ -449,12 +456,74 @@ index 0000000000000000000000000000000000000000..30f3e40acfd806be2a861a553a721ebd
 +                                    coef_tables, params, (int)x, max_norm);
 +    }
 +}
+diff --git a/libavfilter/tests/hqdn3d_vulkan.c b/libavfilter/tests/hqdn3d_vulkan.c
+index 8050b17cefaf1665d0d608eec88f522d88673dd3..9ac064436c816bef93ac1625049a06367de49bb0 100644
+--- a/libavfilter/tests/hqdn3d_vulkan.c
++++ b/libavfilter/tests/hqdn3d_vulkan.c
+@@ -111,6 +111,10 @@ static enum AVPixelFormat get_gpu_pix_fmt(enum AVHWDeviceType hw_type)
+ #if CONFIG_HQDN3D_OPENCL_FILTER
+     case AV_HWDEVICE_TYPE_OPENCL:
+         return AV_PIX_FMT_OPENCL;
++#endif
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
++        return AV_PIX_FMT_VIDEOTOOLBOX;
+ #endif
+     default:
+         return AV_PIX_FMT_NONE;
+@@ -365,6 +369,10 @@ static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
+ #if CONFIG_HQDN3D_OPENCL_FILTER
+     case AV_HWDEVICE_TYPE_OPENCL:
+         return "hqdn3d_opencl";
++#endif
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
++        return "hqdn3d_videotoolbox";
+ #endif
+     default:
+         return NULL;
+@@ -1131,6 +1139,8 @@ static enum AVHWDeviceType get_default_hw_type(void)
+     return AV_HWDEVICE_TYPE_CUDA;
+ #elif CONFIG_HQDN3D_OPENCL_FILTER
+     return AV_HWDEVICE_TYPE_OPENCL;
++#elif CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++    return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+ #else
+     return AV_HWDEVICE_TYPE_NONE;
+ #endif
+@@ -1171,6 +1181,17 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
+ #endif
+     }
+ 
++    if (strcmp(arg, "vt") == 0 || strncmp(arg, "vt:", 3) == 0) {
++#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
++        *hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
++        *dev_idx = arg[2] == ':' ? arg + 3 : NULL;
++        return 0;
++#else
++        fprintf(stderr, "VideoToolbox support is not built\n");
++        return AVERROR(ENOSYS);
++#endif
++    }
++
+ #if CONFIG_HQDN3D_VULKAN_FILTER
+     *hw_type = AV_HWDEVICE_TYPE_VULKAN;
+     *dev_idx = strncmp(arg, "vk:", 3) == 0 ? arg + 3 : arg;
+@@ -1193,7 +1214,7 @@ int main(int argc, char **argv)
+     int refused_10 = 0, refused_444 = 0;
+ 
+     if (argc > 2) {
+-        fprintf(stderr, "Usage: %s [[vk:|cuda:|ocl:]device index]\n", argv[0]);
++        fprintf(stderr, "Usage: %s [[vk:|cuda:|ocl:]device index | vt[:index]]\n", argv[0]);
+         return 1;
+     }
+     err = parse_device_arg(argc >= 2 ? argv[1] : NULL, &t.hw_type, &dev_idx);
 diff --git a/libavfilter/vf_hqdn3d_videotoolbox.m b/libavfilter/vf_hqdn3d_videotoolbox.m
 new file mode 100644
-index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e7679273cc0ff1
+index 0000000000000000000000000000000000000000..9f75b2cbf65455f50d9f936f732f54984484eed7
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_videotoolbox.m
-@@ -0,0 +1,1075 @@
+@@ -0,0 +1,1105 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -497,6 +566,11 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +#include "vf_hqdn3d.h"
 +#include "hqdn3d_coefs.h"
 +
++/* FFmpeg releases without the frame parameter check on filter inputs lack this flag. */
++#ifndef FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE
++#define FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE 0
++#endif
++
 +extern char ff_vf_hqdn3d_videotoolbox_metallib_data[];
 +extern unsigned int ff_vf_hqdn3d_videotoolbox_metallib_len;
 +
@@ -537,10 +611,14 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +    id<MTLComputePipelineState> mtlPipelineVertPlanar;
 +    id<MTLComputePipelineState> mtlPipelineVertSemiplanar;
 +
++    /* The V plane of planar formats has its own parameter buffers: all
++     * dispatches of a frame share one command buffer, which reads them later. */
 +    id<MTLBuffer> mtlParamsHorizLuma;
 +    id<MTLBuffer> mtlParamsHorizChroma;
++    id<MTLBuffer> mtlParamsHorizChromaV;
 +    id<MTLBuffer> mtlParamsVertLuma;
 +    id<MTLBuffer> mtlParamsVertChroma;
++    id<MTLBuffer> mtlParamsVertChromaV;
 +
 +    id<MTLBuffer> mtlTablesBuffer;
 +    id<MTLBuffer> mtlHBuffer;
@@ -564,7 +642,7 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +    AVBufferRef *out_frames_ref;
 +} HQDN3DVTContext API_AVAILABLE(macos(10.11), ios(8.0));
 +
-+#define HQDN3D_VT_CTX_SIZE (sizeof(void*) * 24 + sizeof(double) * 4 + sizeof(int) * 12)
++#define HQDN3D_VT_CTX_SIZE (sizeof(void*) * 26 + sizeof(double) * 4 + sizeof(int) * 12)
 +
 +typedef struct HQDN3DTextures {
 +    CVMetalTextureRef in_y;
@@ -600,8 +678,10 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +
 +    ff_objc_release(&s->mtlParamsHorizLuma);
 +    ff_objc_release(&s->mtlParamsHorizChroma);
++    ff_objc_release(&s->mtlParamsHorizChromaV);
 +    ff_objc_release(&s->mtlParamsVertLuma);
 +    ff_objc_release(&s->mtlParamsVertChroma);
++    ff_objc_release(&s->mtlParamsVertChromaV);
 +
 +    ff_objc_release(&s->mtlFuncHorizPlanar);
 +    ff_objc_release(&s->mtlFuncHorizSemiplanar);
@@ -655,12 +735,16 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +                                                      options:MTLResourceStorageModeShared];
 +    s->mtlParamsHorizChroma = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
 +                                                        options:MTLResourceStorageModeShared];
++    s->mtlParamsHorizChromaV = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
++                                                          options:MTLResourceStorageModeShared];
 +    s->mtlParamsVertLuma = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
 +                                                    options:MTLResourceStorageModeShared];
 +    s->mtlParamsVertChroma = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
 +                                                      options:MTLResourceStorageModeShared];
-+    if (!s->mtlParamsHorizLuma || !s->mtlParamsHorizChroma ||
-+        !s->mtlParamsVertLuma || !s->mtlParamsVertChroma) {
++    s->mtlParamsVertChromaV = [s->mtlDevice newBufferWithLength:sizeof(struct mtlHqdn3dParams)
++                                                         options:MTLResourceStorageModeShared];
++    if (!s->mtlParamsHorizLuma || !s->mtlParamsHorizChroma || !s->mtlParamsHorizChromaV ||
++        !s->mtlParamsVertLuma || !s->mtlParamsVertChroma || !s->mtlParamsVertChromaV) {
 +        av_log(ctx, AV_LOG_ERROR, "Failed to allocate Metal parameter buffers\n");
 +        return AVERROR(ENOMEM);
 +    }
@@ -1057,6 +1141,19 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +            if (err < 0)
 +                return err;
 +            s->first_frame = 1;
++        } else {
++            FilterLink *outl = ff_filter_link(ctx->outputs[0]);
++            AVHWFramesContext *out_hwfc = outl->hw_frames_ctx ?
++                (AVHWFramesContext *)outl->hw_frames_ctx->data : NULL;
++
++            /* The first frame may differ from the configured output link. */
++            if (in->width  != ctx->outputs[0]->w ||
++                in->height != ctx->outputs[0]->h ||
++                !out_hwfc || out_hwfc->sw_format != hwfc->sw_format) {
++                err = create_out_frames_ctx(ctx, in);
++                if (err < 0)
++                    return err;
++            }
 +        }
 +        s->sw_format = hwfc->sw_format;
 +        s->width = in->width;
@@ -1212,8 +1309,9 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +{
 +    id<MTLTexture> in_planes[2] = { tex->mtl_in_c1, tex->mtl_in_c2 };
 +    int offs[2] = { off_u, off_v };
++    id<MTLBuffer> params[2] = { s->mtlParamsHorizChroma, s->mtlParamsHorizChromaV };
 +    for (int i = 0; i < 2; i++) {
-+        struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)s->mtlParamsHorizChroma.contents;
++        struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)params[i].contents;
 +        *p = (struct mtlHqdn3dParams){
 +            .h_offset = offs[i],
 +            .spatial_offset = spatial_offset,
@@ -1226,7 +1324,7 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +        [encoder setTexture:in_planes[i] atIndex:0];
 +        [encoder setBuffer:s->mtlHBuffer offset:0 atIndex:0];
 +        [encoder setBuffer:s->mtlTablesBuffer offset:0 atIndex:1];
-+        [encoder setBuffer:s->mtlParamsHorizChroma offset:0 atIndex:2];
++        [encoder setBuffer:params[i] offset:0 atIndex:2];
 +        ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipelineHorizPlanar, encoder, ch, 1);
 +    }
 +}
@@ -1317,8 +1415,9 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +    id<MTLTexture> in_planes[2] = { tex->mtl_in_c1, tex->mtl_in_c2 };
 +    id<MTLTexture> out_planes[2] = { tex->mtl_out_c1, tex->mtl_out_c2 };
 +    int offs[2] = { off_u, off_v };
++    id<MTLBuffer> params[2] = { s->mtlParamsVertChroma, s->mtlParamsVertChromaV };
 +    for (int i = 0; i < 2; i++) {
-+        struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)s->mtlParamsVertChroma.contents;
++        struct mtlHqdn3dParams *p = (struct mtlHqdn3dParams *)params[i].contents;
 +        *p = (struct mtlHqdn3dParams){
 +            .h_offset = offs[i],
 +            .fa_offset = offs[i],
@@ -1337,7 +1436,7 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +        [encoder setBuffer:s->mtlHBuffer offset:0 atIndex:0];
 +        [encoder setBuffer:s->mtlFrameAntBuffer offset:0 atIndex:1];
 +        [encoder setBuffer:s->mtlTablesBuffer offset:0 atIndex:2];
-+        [encoder setBuffer:s->mtlParamsVertChroma offset:0 atIndex:3];
++        [encoder setBuffer:params[i] offset:0 atIndex:3];
 +        ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipelineVertPlanar, encoder, cw, 1);
 +    }
 +}
@@ -1527,129 +1626,6 @@ index 0000000000000000000000000000000000000000..68aa0096a81f65f68d982cdf58e76792
 +    FILTER_INPUTS(hqdn3d_videotoolbox_inputs),
 +    FILTER_OUTPUTS(hqdn3d_videotoolbox_outputs),
 +    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VIDEOTOOLBOX),
-+    .flags_internal  = FF_FILTER_FLAG_HWFRAME_AWARE,
++    .flags_internal  = FF_FILTER_FLAG_HWFRAME_AWARE | FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE,
 +    .process_command = process_command,
 +};
-diff --git a/tools/Makefile b/tools/Makefile
-index 4929128fdaf11dc7b09d5bff4b7c71ba315e2131..672647e7913d7f7408e12cdea7e62f426efab9ef 100644
---- a/tools/Makefile
-+++ b/tools/Makefile
-@@ -2,6 +2,7 @@ TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher
- TOOLS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_reset_test
- TOOLS-$(CONFIG_HQDN3D_CUDA_FILTER)   += hqdn3d_reset_test
- TOOLS-$(CONFIG_HQDN3D_OPENCL_FILTER) += hqdn3d_reset_test
-+TOOLS-$(CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER) += hqdn3d_reset_test
- TOOLS-yes := $(sort $(TOOLS-yes))
- TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
- TOOLS-$(CONFIG_ZLIB) += cws2fws
-diff --git a/tools/hqdn3d_reset_test.c b/tools/hqdn3d_reset_test.c
-index 413fd848807edf68c4ff17d40a8804659b98babb..88cfbd76fca2e093b14bb543a3728c41b5ef868e 100644
---- a/tools/hqdn3d_reset_test.c
-+++ b/tools/hqdn3d_reset_test.c
-@@ -118,6 +118,10 @@ static int create_gpu_frames_ctx(AVBufferRef *device_ref, int w, int h,
- #if CONFIG_HQDN3D_OPENCL_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-         hwfc->format = AV_PIX_FMT_OPENCL;
-+#endif
-+#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
-+        hwfc->format = AV_PIX_FMT_VIDEOTOOLBOX;
- #endif
-     hwfc->sw_format = sw_format;
-     hwfc->width     = w;
-@@ -303,6 +307,10 @@ static int init_gpu_buffersrc(AVFilterGraph *graph, const AVFilter *buf_filt,
- #if CONFIG_HQDN3D_OPENCL_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-         par->format = AV_PIX_FMT_OPENCL;
-+#endif
-+#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
-+        par->format = AV_PIX_FMT_VIDEOTOOLBOX;
- #endif
-     par->width         = 128;
-     par->height        = 72;
-@@ -336,6 +344,10 @@ static const char *get_gpu_filter_name(enum AVHWDeviceType hw_type)
- #if CONFIG_HQDN3D_OPENCL_FILTER
-     if (hw_type == AV_HWDEVICE_TYPE_OPENCL)
-         return "hqdn3d_opencl";
-+#endif
-+#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+    if (hw_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
-+        return "hqdn3d_videotoolbox";
- #endif
-     return NULL;
- }
-@@ -552,6 +564,30 @@ static int setup_all(const char *dev_idx,
-     return 0;
- }
- 
-+static int parse_default_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const char **dev_idx)
-+{
-+#if CONFIG_HQDN3D_VULKAN_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_VULKAN;
-+    *dev_idx = arg;
-+    return 0;
-+#elif CONFIG_HQDN3D_CUDA_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_CUDA;
-+    *dev_idx = arg;
-+    return 0;
-+#elif CONFIG_HQDN3D_OPENCL_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_OPENCL;
-+    *dev_idx = arg;
-+    return 0;
-+#elif CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+    *hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-+    *dev_idx = arg;
-+    return 0;
-+#else
-+    av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
-+    return AVERROR(ENOSYS);
-+#endif
-+}
-+
- static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const char **dev_idx)
- {
-     if (strncmp(arg, "cuda:", 5) == 0) {
-@@ -584,23 +620,18 @@ static int parse_device_arg(const char *arg, enum AVHWDeviceType *hw_type, const
-         return AVERROR(ENOSYS);
- #endif
-     }
--
--#if CONFIG_HQDN3D_VULKAN_FILTER
--    *hw_type = AV_HWDEVICE_TYPE_VULKAN;
--    *dev_idx = arg;
--    return 0;
--#elif CONFIG_HQDN3D_CUDA_FILTER
--    *hw_type = AV_HWDEVICE_TYPE_CUDA;
--    *dev_idx = arg;
--    return 0;
--#elif CONFIG_HQDN3D_OPENCL_FILTER
--    *hw_type = AV_HWDEVICE_TYPE_OPENCL;
--    *dev_idx = arg;
--    return 0;
-+    if (strcmp(arg, "vt") == 0 || strncmp(arg, "vt:", 3) == 0) {
-+#if CONFIG_HQDN3D_VIDEOTOOLBOX_FILTER
-+        *hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-+        *dev_idx = (arg[2] == ':') ? arg + 3 : NULL;
-+        return 0;
- #else
--    av_log(NULL, AV_LOG_ERROR, "No supported backend built\n");
--    return AVERROR(ENOSYS);
-+        av_log(NULL, AV_LOG_ERROR, "VideoToolbox backend not built\n");
-+        return AVERROR(ENOSYS);
- #endif
-+    }
-+
-+    return parse_default_device_arg(arg, hw_type, dev_idx);
- }
- 
- int main(int argc, char **argv)
-@@ -616,7 +647,7 @@ int main(int argc, char **argv)
-     int err, any_diff = 0, frames_ok = 0;
- 
-     if (argc < 2) {
--        fprintf(stderr, "Usage: %s <[cuda:|vk:|ocl:]device index>\n", argv[0]);
-+        fprintf(stderr, "Usage: %s <[cuda:|vk:|ocl:|vt]device index>\n", argv[0]);
-         return 1;
-     }
- 

@@ -39,7 +39,7 @@ def run_ruff_fixture(source: str) -> subprocess.CompletedProcess[str]:
 
 
 class RuffPolicyTest(unittest.TestCase):
-    """Verify that Ruff rejects empty exception handlers."""
+    """Verify repository Ruff policy against planted and clean fixtures."""
 
     def test_typed_except_pass_fails(self) -> None:
         """A typed exception handler containing only pass must fail with S110."""
@@ -77,3 +77,15 @@ class RuffPolicyTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("S110", result.stdout)
+
+    def test_collection_implicit_concat_fails(self) -> None:
+        """An implicit string concatenation in a list must fail with ISC004."""
+        result = run_ruff_fixture('values = ["left" "right"]\n')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ISC004", result.stdout)
+
+    def test_collection_named_local_passes(self) -> None:
+        """A named local holding the concatenation must pass without ISC004."""
+        result = run_ruff_fixture('value = ("left" "right")\nvalues = [value]\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("ISC004", result.stdout)

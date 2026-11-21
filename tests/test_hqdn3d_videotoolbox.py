@@ -12,8 +12,8 @@ patch (validate_format and doc/filters.texi) must equal FORMATS; that case
 runs on every host, and a patch text with one format dropped must fail it.
 
 Temporal state must reset where the CPU filter resets it: on a graph rebuild
-and on an in-graph frame size change, which tools/hqdn3d_reset_test checks
-with a vt argument.
+and on an in-graph frame size change, which libavfilter/tests/hqdn3d_vulkan
+checks with a vt argument.
 
 The planted wrong case is a luma strength of 4.5 against the CPU default of
 4, which the comparison must refuse.
@@ -22,8 +22,10 @@ The device cases need an FFmpeg built with the series on macOS with Metal:
 
     VT_FFMPEG=/path/to/ffmpeg python3 -m unittest tests.test_hqdn3d_videotoolbox
 
-The in-graph reset case also needs HQDN3D_RESET_TOOL=/path/to/tools/hqdn3d_reset_test.
-Without the variables the cases are skipped.
+The in-graph reset case also needs
+HQDN3D_RESET_TOOL=/path/to/libavfilter/tests/hqdn3d_vulkan (make
+libavfilter/tests/hqdn3d_vulkan in the FFmpeg build). Without the variables
+the cases are skipped.
 """
 
 from __future__ import annotations
