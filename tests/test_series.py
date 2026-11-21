@@ -877,7 +877,30 @@ class ApplyTest(SeriesTestCase):
             self.assertIn(f"| `{name}` | applied |", text)
 
 
-class MasterFormTest(SeriesTestCase):
+class MasterFormCase(SeriesTestCase):
+    """Entry points shared by the tests that apply master forms from a local forge."""
+
+    url: str
+
+    def apply(self, keep_going: bool = False) -> series.Results:
+        """Apply the series onto the fixture tree in master mode."""
+        return series.apply_series(self.fx.root, self.fx.tree, False, keep_going, self.url)
+
+    def run_main(self, *arguments: str) -> tuple[int, str, str]:
+        """Run the apply command; return (status, stdout, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--root", str(self.fx.root), "apply", str(self.fx.tree), *arguments]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = series.main(argv)
+        return status, out.getvalue(), err.getvalue()
+
+    def assert_clean(self) -> None:
+        """Assert a clean work tree with no am session."""
+        self.assertEqual(run_git(self.fx.tree, "status", "--porcelain"), "")
+        self.assertFalse(series.am_in_progress(self.fx.tree))
+
+
+class MasterFormTest(MasterFormCase):
     def setUp(self) -> None:
         super().setUp()
         self.forge = Path(self._scratch.name) / "forge"
@@ -913,20 +936,6 @@ class MasterFormTest(SeriesTestCase):
             record = self.fx.record(2)
         self.fx.write_records([self.fx.record(1), record])
 
-    def apply(self, keep_going: bool = False) -> series.Results:
-        return series.apply_series(self.fx.root, self.fx.tree, False, keep_going, self.url)
-
-    def run_main(self, *arguments: str) -> tuple[int, str, str]:
-        out, err = io.StringIO(), io.StringIO()
-        argv = ["--root", str(self.fx.root), "apply", str(self.fx.tree), *arguments]
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            status = series.main(argv)
-        return status, out.getvalue(), err.getvalue()
-
-    def assert_clean(self) -> None:
-        self.assertEqual(run_git(self.fx.tree, "status", "--porcelain"), "")
-        self.assertFalse(series.am_in_progress(self.fx.tree))
-
     def test_fetches_and_applies_pr_head_on_moved_master(self) -> None:
         """Verify fetches and applies pr head on moved master."""
         self.assertNotEqual(
@@ -956,13 +965,15 @@ class MasterFormTest(SeriesTestCase):
         self.assertIn(f"| `{self.fx.names[0]}` | master-form |", report.read_text(encoding="utf-8"))
 
     def test_conflict_cleans_tree_and_keep_going_exits_one(self) -> None:
+        """Verify a lib.c conflict cleans the tree, names its reason and exits one."""
         commit_edit(self.fx.tree, 6, "int line_7 = 700;", "conflicting master")
         conflicted = run_git(self.fx.tree, "rev-parse", "HEAD")
         self.assertEqual([s for _, s in self.apply()], ["conflict", "not-tried"])
         self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD"), conflicted)
         self.assert_clean()
         status, out, err = self.run_main("--master-forms", self.url, "--keep-going")
-        self.assertEqual((status, err), (1, ""))
+        note = "master form conflict in lib.c: not in the union allow-list"
+        self.assertEqual((status, err), (1, f"note: {self.fx.names[0]}: {note}\n"))
         self.assertIn("conflict", out)
         self.assertIn("applied", out)
         self.assert_clean()
@@ -1544,6 +1555,281 @@ class MasterFormTest(SeriesTestCase):
         findings = series.Findings()
         self.assertEqual(series.master_form_parts(self.fx.root, self.fx.names, findings), {})
         self.assertEqual(findings.errors, [])
+
+
+MAKEFILE = ["TESTPROGS-$(CONFIG_A) += a", "TESTPROGS-$(CONFIG_DRAWVG) += drawvg", "", "OTHER = 1"]
+ZSCALE = "TESTPROGS-$(CONFIG_ZSCALE_FILTER) += zscale_light_levels"
+HQDN3D = "TESTPROGS-$(CONFIG_HQDN3D_VULKAN_FILTER) += hqdn3d_vulkan"
+UNION_PATH = "libavfilter/Makefile"
+NEAR_PATHS = ("libavcodec/Makefile", "x/libavfilter/Makefile", "libavfilter/Makefile.orig")
+COUNT_REASON = "diff3 output does not match its conflict count"
+
+
+def appended(*lines: str) -> list[str]:
+    """The fixture Makefile with LINES added after its drawvg line."""
+    return [*MAKEFILE[:2], *lines, *MAKEFILE[2:]]
+
+
+def write_file_lines(tree: Path, name: str, lines: list[str]) -> None:
+    """Write one fixture file from its ordered lines, creating its directory."""
+    path = tree / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class MasterFormUnionTest(MasterFormCase):
+    """Master forms whose only conflicts are adjacent appends in libavfilter/Makefile."""
+
+    def setUp(self) -> None:
+        """Commit the Makefile fixtures as M1 and clone the tree as the local forge."""
+        super().setUp()
+        for name in (UNION_PATH, *NEAR_PATHS):
+            write_file_lines(self.fx.tree, name, MAKEFILE)
+        run_git(self.fx.tree, "add", "--", UNION_PATH, *NEAR_PATHS)
+        run_git(self.fx.tree, "commit", "-q", "-m", "add Makefiles")
+        self.m1 = run_git(self.fx.tree, "rev-parse", "HEAD")
+        self.forge = Path(self._scratch.name) / "forge"
+        run_git(Path(self._scratch.name), "clone", "-q", str(self.fx.tree), str(self.forge))
+        self.url = str(self.forge)
+        self.head = ""
+
+    def set_sides(self, name: str, pull: list[str], master: list[str] | None) -> str:
+        """Commit both forms of NAME on M1 (master None: none yet); return the master commit."""
+        run_git(self.forge, "checkout", "-q", "-B", "pr", self.m1)
+        write_file_lines(self.forge, name, pull)
+        run_git(self.forge, "commit", "-q", "-am", "PR: Makefile")
+        self.record_head()
+        self.fx.reset(self.m1)
+        if master is not None:
+            write_file_lines(self.fx.tree, name, master)
+            run_git(self.fx.tree, "commit", "-q", "-am", "master: Makefile")
+        return run_git(self.fx.tree, "rev-parse", "HEAD")
+
+    def record_head(self) -> None:
+        """Record the forge head as the master form of patch 1."""
+        self.head = run_git(self.forge, "rev-parse", "HEAD")
+        self.fx.patch(1).with_suffix(".toml").write_text(
+            METADATA + f'master_form = {{ base = "{self.m1}", head = "{self.head}" }}\n',
+            encoding="utf-8",
+        )
+
+    def edit_pull(self, index: int, text: str) -> None:
+        """Add a lib.c edit to the pull and record the new head."""
+        commit_edit(self.forge, index, text, "PR: lib")
+        self.record_head()
+
+    def lines(self, name: str) -> list[str]:
+        """The lines of one fixture tree file."""
+        return (self.fx.tree / name).read_text(encoding="utf-8").splitlines()
+
+    def assert_refused(self, master: str, note: str | None) -> None:
+        """Assert both entry points refuse the form and keep MASTER; NOTE is the stderr tail."""
+        self.assertEqual([s for _, s in self.apply()], ["conflict", "not-tried"])
+        self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD"), master)
+        self.assert_clean()
+        status, out, err = self.run_main("--master-forms", self.url)
+        self.assertEqual(status, 1)
+        self.assertIn("conflict", out)
+        if note is not None:
+            self.assertEqual(err, f"note: {self.fx.names[0]}: master form conflict{note}\n")
+        self.assert_clean()
+
+    def test_adjacent_appends_merge_keeping_both_lines(self) -> None:
+        """Verify adjacent appends after one base line merge with both lines kept."""
+        master = self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE))
+        self.assertEqual([s for _, s in self.apply()], ["master-form", "applied"])
+        self.assertEqual(self.lines(UNION_PATH), appended(ZSCALE, HQDN3D))
+        self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD~2"), master)
+        subject = f"{self.fx.names[0]}: master form {self.m1[:12]}..{self.head[:12]}"
+        body = f"union merge: {UNION_PATH} (1 append-only hunks)"
+        message = run_git(self.fx.tree, "log", "-1", "--format=%B", "HEAD~1")
+        self.assertEqual(message, f"{subject}\n\n{body}")
+        self.assert_clean()
+        self.fx.reset(master)
+        status, out, err = self.run_main("--master-forms", self.url)
+        note = f"master form union merge in {UNION_PATH}: 1 append-only hunks"
+        self.assertEqual((status, err), (0, f"note: {self.fx.names[0]}: {note}\n"))
+        self.assertIn("master-form", out)
+        self.assert_clean()
+
+    def test_changed_base_line_still_refuses(self) -> None:
+        """Verify both sides changing the same Makefile line still refuse."""
+        pull = [MAKEFILE[0], MAKEFILE[1] + " pull", *MAKEFILE[2:]]
+        master = [MAKEFILE[0], MAKEFILE[1] + " master", *MAKEFILE[2:]]
+        self.assert_refused(self.set_sides(UNION_PATH, pull, master), None)
+
+    def test_changed_base_line_note_names_reason(self) -> None:
+        """Verify the changed-base-line refusal names the file and its reason."""
+        pull = [MAKEFILE[0], MAKEFILE[1] + " pull", *MAKEFILE[2:]]
+        master = [MAKEFILE[0], MAKEFILE[1] + " master", *MAKEFILE[2:]]
+        reason = "hunk changes base lines (not append-only)"
+        self.assert_refused(self.set_sides(UNION_PATH, pull, master), f" in {UNION_PATH}: {reason}")
+
+    def test_paths_outside_allow_list_refuse(self) -> None:
+        """Verify adjacent appends in near-miss paths refuse as outside the allow-list."""
+        for name in NEAR_PATHS:
+            with self.subTest(name=name):
+                master = self.set_sides(name, appended(HQDN3D), appended(ZSCALE))
+                self.assert_refused(master, f" in {name}: not in the union allow-list")
+
+    def test_deleted_makefile_refuses_without_conflict_entry(self) -> None:
+        """Verify a master that deleted the Makefile refuses with the apply error."""
+        self.set_sides(UNION_PATH, appended(HQDN3D), None)
+        run_git(self.fx.tree, "rm", "-q", "--", UNION_PATH)
+        run_git(self.fx.tree, "commit", "-q", "-m", "master: drop Makefile")
+        master = run_git(self.fx.tree, "rev-parse", "HEAD")
+        error = f"error: {UNION_PATH}: does not exist in index"
+        self.assert_refused(master, f": 3-way apply failed without a conflict entry: {error}")
+
+    def test_mode_changed_makefile_refuses(self) -> None:
+        """Verify a Makefile whose mode changed on master refuses as a mode conflict."""
+        self.set_sides(UNION_PATH, appended(HQDN3D), None)
+        write_file_lines(self.fx.tree, UNION_PATH, appended(ZSCALE))
+        (self.fx.tree / UNION_PATH).chmod(0o755)
+        run_git(self.fx.tree, "commit", "-q", "-am", "master: executable Makefile")
+        master = run_git(self.fx.tree, "rev-parse", "HEAD")
+        self.assert_refused(master, f" in {UNION_PATH}: add, delete or mode conflict")
+
+    def test_conflict_outside_allow_list_refuses_whole_patch(self) -> None:
+        """Verify a lib.c conflict refuses the patch although the Makefile would merge."""
+        self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE))
+        self.edit_pull(4, "int line_5 = 50;")
+        commit_edit(self.fx.tree, 4, "int line_5 = 500;", "master: lib")
+        master = run_git(self.fx.tree, "rev-parse", "HEAD")
+        self.assert_refused(master, " in lib.c: not in the union allow-list")
+        self.assertEqual(self.lines(UNION_PATH), appended(ZSCALE))
+
+    def test_line_already_on_master_is_kept_once(self) -> None:
+        """Verify a pull line master already carries is kept once."""
+        master = self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE, HQDN3D))
+        self.edit_pull(6, "int line_7 = 70;")
+        self.assertEqual([s for _, s in self.apply()], ["master-form", "applied"])
+        self.assertEqual(self.lines(UNION_PATH), appended(ZSCALE, HQDN3D))
+        self.assertEqual(self.lines("lib.c")[6], "int line_7 = 70;")
+        self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD~2"), master)
+        self.assert_clean()
+
+    def test_marker_line_refuses_as_collision(self) -> None:
+        """Verify a side line that starts like a conflict marker refuses the merge."""
+        marker = "=" * series.UNION_MARKER_SIZE + " x"
+        master = self.set_sides(UNION_PATH, appended(marker), appended(ZSCALE))
+        self.assert_refused(master, f" in {UNION_PATH}: marker collision")
+
+    def test_partial_stages_and_extra_sections_refuse(self) -> None:
+        """Verify missing stages and a diff3 region with an extra section refuse by name."""
+        blob = run_git(self.fx.tree, "rev-parse", f"{self.m1}:{UNION_PATH}")
+        partial = {2: ("100644", blob), 3: ("100644", blob)}
+        reason = series.union_eligible(self.fx.tree, UNION_PATH, partial)
+        self.assertEqual(reason, ("add, delete or mode conflict", 0))
+        sides = (appended(ZSCALE), MAKEFILE, appended("=" * series.UNION_MARKER_SIZE))
+        reason = series.append_only_hunks(self.fx.tree, tuple(map(self.store_blob, sides)))
+        self.assertEqual(reason, (COUNT_REASON, 0))
+
+    def test_hunk_count_boundary_at_diff3_exit_limit(self) -> None:
+        """Verify 127 append-only regions pass and 128 refuse: diff3 exit stops at 127."""
+        for count, expected in ((1, ("", 1)), (127, ("", 127)), (128, (COUNT_REASON, 0))):
+            with self.subTest(count=count):
+                base = [f"B{index} = {index}" for index in range(count)]
+                ours = [line for i, kept in enumerate(base) for line in (kept, f"O{i} = 1")]
+                theirs = [line for i, kept in enumerate(base) for line in (kept, f"T{i} = 1")]
+                blobs = tuple(map(self.store_blob, (ours, base, theirs)))
+                self.assertEqual(series.append_only_hunks(self.fx.tree, blobs), expected)
+
+    def test_stage_union_failure_resets_work_tree(self) -> None:
+        """Verify a stage_union error resets the 3-way conflict and leaves the tree clean."""
+        master = self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE))
+        planted = subprocess.CalledProcessError(128, ["git", "update-index"], "", "fatal: planted")
+        with unittest.mock.patch.object(series, "stage_union", side_effect=planted):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                self.apply()
+            self.assertIs(raised.exception, planted)
+            self.assertEqual(run_git(self.fx.tree, "rev-parse", "HEAD"), master)
+            self.assert_clean()
+            status, _, err = self.run_main("--master-forms", self.url)
+            self.assertEqual(status, 2)
+            self.assertIn("fatal: planted", err)
+            self.assert_clean()
+        status, out, _ = self.run_main("--master-forms", self.url)
+        self.assertEqual(status, 0)
+        self.assertIn("master-form", out)
+        self.assert_clean()
+
+    def test_stage_union_reset_timeout_warns_and_reraises(self) -> None:
+        """Verify a timed-out reset after a stage_union error warns and re-raises the error."""
+        self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE))
+        planted = subprocess.CalledProcessError(128, ["git", "update-index"], "", "fatal: planted")
+        timeout = subprocess.TimeoutExpired(["git", "reset"], series.GIT_TIMEOUT)
+        real_git = series.git
+
+        def reset_times_out(
+            tree: Path, *args: str, **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if args[:1] == ("reset",):
+                raise timeout
+            return real_git(tree, *args, **kwargs)
+
+        err = io.StringIO()
+        with (
+            unittest.mock.patch.object(series, "stage_union", side_effect=planted),
+            unittest.mock.patch.object(series, "git", side_effect=reset_times_out),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            self.apply()
+        self.assertIs(raised.exception, planted)
+        warning = err.getvalue()
+        self.assertTrue(warning.startswith("warning: "), warning)
+        self.assertIn("reset to HEAD after the failed union timed out", warning)
+        self.assertIn("the checkout may still hold conflict stages and patch changes", warning)
+
+    def test_stage_union_reset_failure_warns_and_reraises(self) -> None:
+        """Verify a non-zero reset after a stage_union error warns and re-raises the error."""
+        self.set_sides(UNION_PATH, appended(HQDN3D), appended(ZSCALE))
+        planted = subprocess.CalledProcessError(128, ["git", "update-index"], "", "fatal: planted")
+        real_git = series.git
+
+        def reset_fails(
+            tree: Path, *args: str, **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if args[:1] == ("reset",):
+                return subprocess.CompletedProcess(args, 1, "", "fatal: reset failed")
+            return real_git(tree, *args, **kwargs)
+
+        err = io.StringIO()
+        with (
+            unittest.mock.patch.object(series, "stage_union", side_effect=planted),
+            unittest.mock.patch.object(series, "git", side_effect=reset_fails),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            self.apply()
+        self.assertIs(raised.exception, planted)
+        warning = err.getvalue()
+        self.assertTrue(warning.startswith("warning: "), warning)
+        self.assertIn("reset to HEAD after the failed union failed (return code 1)", warning)
+        self.assertIn("the checkout may still hold conflict stages and patch changes", warning)
+
+    def test_nearby_appends_do_not_duplicate_base_line(self) -> None:
+        """Verify two append-only hunks separated by one base line keep that line once."""
+        pull_1, pull_2 = HQDN3D, "TESTPROGS-$(CONFIG_PULL_2) += pull_2"
+        master_1, master_2 = ZSCALE, "TESTPROGS-$(CONFIG_MASTER_2) += master_2"
+        pull = [MAKEFILE[0], pull_1, MAKEFILE[1], pull_2, *MAKEFILE[2:]]
+        master = [MAKEFILE[0], master_1, MAKEFILE[1], master_2, *MAKEFILE[2:]]
+        self.set_sides(UNION_PATH, pull, master)
+        self.assertEqual([s for _, s in self.apply()], ["master-form", "applied"])
+        expected = [MAKEFILE[0], master_1, pull_1, MAKEFILE[1], master_2, pull_2, *MAKEFILE[2:]]
+        merged = self.lines(UNION_PATH)
+        self.assertEqual(merged, expected)
+        for line in MAKEFILE:
+            self.assertEqual(merged.count(line), 1)
+        message = run_git(self.fx.tree, "log", "-1", "--format=%B", "HEAD~1")
+        self.assertIn(f"union merge: {UNION_PATH} (2 append-only hunks)", message)
+        self.assert_clean()
+
+    def store_blob(self, lines: list[str]) -> str:
+        """Write LINES as a blob of the fixture tree and return its id."""
+        write_file_lines(self.fx.tree, "side.mk", lines)
+        return run_git(self.fx.tree, "hash-object", "-w", "side.mk")
 
 
 class MainTest(SeriesTestCase):

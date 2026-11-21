@@ -143,6 +143,11 @@ GIT_IDENTITY = ("-c", "user.name=ffmpeg-patches", "-c", "user.email=ffmpeg-patch
 GIT_TIMEOUT = 600
 FETCH_TIMEOUT = 300
 GIT_POLICY = ("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false")
+# Allow-list of exact paths (never a pattern) where a master form conflict may be
+# union-merged: both sides add filter test program lines after the same base line.
+UNION_MERGE_PATHS = frozenset({"libavfilter/Makefile"})
+UNION_MARKER_SIZE = 32
+UNION_MARKERS = tuple(char * UNION_MARKER_SIZE for char in "<|=>")
 FORMAT_PATCH = (
     "format-patch",
     "--zero-commit",
@@ -1052,11 +1057,154 @@ def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
         path = Path(scratch) / "master.patch"
         path.write_text(diff, encoding="utf-8")
         applied = git(tree, "apply", "--3way", "--index", str(path), check=False)
-    if applied.returncode:
+    subject = f"{patch.name}: master form {base[:12]}..{head[:12]}"
+    if not applied.returncode:
+        git(tree, "commit", "-q", "-m", subject)
+        return "master-form"
+    try:
+        unioned = union_conflicts(tree, patch, applied)
+    except (SeriesError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        reset_failed_union(tree, patch)
+        raise
+    if unioned is None:
         git(tree, "reset", "-q", "--hard", "HEAD")
         return "conflict"
-    git(tree, "commit", "-q", "-m", f"{patch.name}: master form {base[:12]}..{head[:12]}")
+    body = "\n".join(f"union merge: {name} ({hunks} append-only hunks)" for name, hunks in unioned)
+    git(tree, "commit", "-q", "-m", f"{subject}\n\n{body}")
+    for name, hunks in unioned:
+        print(
+            f"note: {patch.name}: master form union merge in {name}: {hunks} append-only hunks",
+            file=sys.stderr,
+        )
     return "master-form"
+
+
+def reset_failed_union(tree: Path, patch: Path) -> None:
+    """Reset the checkout to HEAD after a failed union merge, warning on reset failure."""
+    try:
+        result = git(tree, "reset", "-q", "--hard", "HEAD", check=False)
+    except subprocess.TimeoutExpired:
+        outcome = "timed out"
+    else:
+        if not result.returncode:
+            return
+        outcome = f"failed (return code {result.returncode})"
+    print(
+        f"warning: {patch.name}: reset to HEAD after the failed union {outcome}; "
+        "the checkout may still hold conflict stages and patch changes",
+        file=sys.stderr,
+    )
+
+
+def union_conflicts(
+    tree: Path, patch: Path, applied: subprocess.CompletedProcess[str]
+) -> list[tuple[str, int]] | None:
+    """Union-merge every conflicted path of a 3-way apply; None when one path refuses."""
+    unmerged = read_unmerged(tree)
+    if not unmerged:
+        first = next(iter(applied.stderr.splitlines()), "")
+        reason = f"3-way apply failed without a conflict entry: {first}"
+        print(f"note: {patch.name}: master form conflict: {reason}", file=sys.stderr)
+        return None
+    checked = [(name, *union_eligible(tree, name, unmerged[name])) for name in sorted(unmerged)]
+    refused = [(name, reason) for name, reason, _ in checked if reason]
+    for name, reason in refused:
+        print(f"note: {patch.name}: master form conflict in {name}: {reason}", file=sys.stderr)
+    if refused:
+        return None
+    for name, _, _ in checked:
+        stage_union(tree, name, unmerged[name])
+    return [(name, hunks) for name, _, hunks in checked]
+
+
+def read_unmerged(tree: Path) -> dict[str, dict[int, tuple[str, str]]]:
+    """Map each unmerged index path to its stages: stage number to (mode, blob)."""
+    entries: dict[str, dict[int, tuple[str, str]]] = {}
+    for record in git(tree, "ls-files", "-u", "-z").stdout.split("\0"):
+        if not record:
+            continue
+        meta, _, name = record.partition("\t")
+        fields = meta.split(" ")
+        if len(fields) != 3 or fields[2] not in {"1", "2", "3"} or not name:
+            raise SeriesError(f"unexpected ls-files -u record: {record!r}")
+        entries.setdefault(name, {})[int(fields[2])] = (fields[0], fields[1])
+    return entries
+
+
+def union_eligible(tree: Path, name: str, stages: dict[int, tuple[str, str]]) -> tuple[str, int]:
+    """Return (refusal reason or "", append-only hunk count) for one conflicted path."""
+    if name not in UNION_MERGE_PATHS:
+        return "not in the union allow-list", 0
+    if sorted(stages) != [1, 2, 3] or any(mode != "100644" for mode, _ in stages.values()):
+        return "add, delete or mode conflict", 0
+    blobs = (stages[2][1], stages[1][1], stages[3][1])
+    if marker_collision(tree, blobs):
+        return "marker collision", 0
+    return append_only_hunks(tree, blobs)
+
+
+def marker_collision(tree: Path, blobs: tuple[str, ...]) -> bool:
+    """Whether any side has a line starting with a union merge conflict marker run."""
+    for blob in blobs:
+        text = git(tree, "cat-file", "blob", blob).stdout
+        if any(line.startswith(UNION_MARKERS) for line in text.splitlines()):
+            return True
+    return False
+
+
+def append_only_hunks(tree: Path, blobs: tuple[str, ...]) -> tuple[str, int]:
+    """Return (refusal reason or "", hunk count) from the diff3 merge of ours, base, theirs."""
+    merged = git(
+        tree,
+        "merge-file",
+        "--object-id",
+        "-p",
+        "--diff3",
+        f"--marker-size={UNION_MARKER_SIZE}",
+        *blobs,
+        check=False,
+    )
+    regions = conflict_regions(merged.stdout)
+    if not regions or merged.returncode != len(regions) or any(len(r) != 3 for r in regions):
+        return "diff3 output does not match its conflict count", 0
+    if any(base for _, base, _ in regions):
+        return "hunk changes base lines (not append-only)", 0
+    return "", len(regions)
+
+
+def conflict_regions(text: str) -> list[list[list[str]]]:
+    """Split diff3 output into [ours, base, theirs] line lists, one per conflict region."""
+    regions: list[list[list[str]]] = []
+    sections: list[list[str]] = []
+    for line in text.splitlines():
+        run = line[:UNION_MARKER_SIZE]
+        if run == UNION_MARKERS[0]:
+            sections = [[]]
+        elif not sections:
+            continue
+        elif run in UNION_MARKERS[1:3]:
+            sections.append([])
+        elif run == UNION_MARKERS[3]:
+            regions.append(sections)
+            sections = []
+        else:
+            sections[-1].append(line)
+    return regions
+
+
+def stage_union(tree: Path, name: str, stages: dict[int, tuple[str, str]]) -> None:
+    """Stage the union merge of one conflicted path and write it to the work tree."""
+    blobs = (stages[2][1], stages[1][1], stages[3][1])
+    union = (
+        "merge-file",
+        "--object-id",
+        "--zdiff3",
+        "--union",
+        f"--marker-size={UNION_MARKER_SIZE}",
+    )
+    blob = git(tree, *union, *blobs).stdout.strip()
+    git(tree, "update-index", "--cacheinfo", f"100644,{blob},{name}")
+    git(tree, "checkout-index", "-f", "--", name)
 
 
 def apply_for_master(tree: Path, patch: Path, url: str) -> str:
