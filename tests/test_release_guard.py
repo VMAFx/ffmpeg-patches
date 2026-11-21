@@ -279,10 +279,13 @@ def step(workflow: str, name: str) -> str:
 # A guard whose failure the step swallows reports green while the release is broken.
 SWALLOWED = re.compile(r"continue-on-error|\|\|\s*(true|:|exit 0)\b|set \+e|; *true$|&& *true$")
 
+RELEASE_TAG_PATTERN = (
+    r'python3 scripts/release_guard\.py tag "\$GITHUB_REF_TYPE" "\$GITHUB_REF_NAME"'
+    r' "\$GITHUB_SHA" >> "\$GITHUB_OUTPUT"$'
+)
 GUARDS = {
     ("release-build.yml", "Release tag shape"): [
-        r'python3 scripts/release_guard\.py tag "\$GITHUB_REF_TYPE" "\$GITHUB_REF_NAME"'
-        r' "\$GITHUB_SHA" >> "\$GITHUB_OUTPUT"$',
+        RELEASE_TAG_PATTERN,
     ],
     ("release-build.yml", "Verify the SHA256SUMS signature"): [
         (

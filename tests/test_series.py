@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess  # nosec B404 - fixed git and make argv in temporary test trees; result types for mocks.
 import tarfile
@@ -1033,7 +1036,7 @@ class MasterFormTest(SeriesTestCase):
         commit_edit(self.fx.tree, 10, "int line_11 = 110;", "latest master")
         tested = self._shallow_master_form(depth=2)
         self.set_upstream(fixed)
-        run_git(tested, "fetch", "-q", "--depth=1", f"file://{self.fx.tree}", fixed)
+        run_git(tested, "fetch", "--no-tags", "-q", "--depth=1", f"file://{self.fx.tree}", fixed)
         self.assertEqual(series.git(tested, "cat-file", "-e", f"{fixed}^{{commit}}").returncode, 0)
         self.assertEqual(
             series.git(
@@ -1061,12 +1064,19 @@ class MasterFormTest(SeriesTestCase):
         run_git(tested, "init", "-q")
         run_git(tested, "remote", "add", "origin", f"file://{self.fx.tree}")
         run_git(
-            tested, "fetch", "-q", "--shallow-exclude=refs/tags/shallow-base", "origin", "tested"
+            tested,
+            "fetch",
+            "--no-tags",
+            "-q",
+            "--shallow-exclude=refs/tags/shallow-base",
+            "origin",
+            "tested",
         )
         run_git(tested, "checkout", "-q", "--detach", "FETCH_HEAD")
         run_git(
             tested,
             "fetch",
+            "--no-tags",
             "-q",
             "--depth=1",
             "origin",
@@ -1084,7 +1094,7 @@ class MasterFormTest(SeriesTestCase):
         self.fx.reset(self.master)
         tested = self._shallow_master_form(depth=1)
         self.set_upstream(fixed)
-        run_git(tested, "fetch", "-q", "--depth=1", f"file://{self.fx.tree}", fixed)
+        run_git(tested, "fetch", "--no-tags", "-q", "--depth=1", f"file://{self.fx.tree}", fixed)
         self.assertEqual(
             series.git(
                 tested, "merge-base", "--is-ancestor", fixed, "HEAD", check=False
@@ -2190,6 +2200,240 @@ DIST_FILES = (
     "README.md",
     "REUSE.toml",
 )
+
+
+def _fetch_follows_tags(options: list[str]) -> bool:
+    """Identify history-limited options that allow automatic tag following."""
+    limits = {"--depth", "--deepen", "--shallow-since", "--shallow-exclude"}
+    return any(word.split("=", 1)[0] in limits for word in options) and not (
+        {"--no-tags", "-n"} & set(options)
+    )
+
+
+def _python_shallow_fetches_without_no_tags(text: str) -> list[tuple[int, str]]:
+    """Return lines and constant arguments of Python fetch calls or argv literals."""
+    offenders = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Call):
+            arguments = node.args
+        elif isinstance(node, ast.List):
+            arguments = node.elts
+        else:
+            continue
+        words = [
+            argument.value
+            for argument in arguments
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+        ]
+        if "fetch" in words and _fetch_follows_tags(words[words.index("fetch") + 1 :]):
+            offenders.append((node.lineno, " ".join(words)))
+    return sorted(offenders)
+
+
+def _shell_simple_commands(line: str) -> list[list[str]]:
+    """Split shell control operators with shlex while preserving quoted words."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars="&|;")
+    lexer.whitespace_split = True
+    commands: list[list[str]] = [[]]
+    for word in list(lexer):
+        if word in {"&&", "||", ";", "|", "&"}:
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    return commands
+
+
+def _git_fetch_options(words: list[str]) -> list[str]:
+    """Find a wrapped Git fetch and skip global options before its subcommand."""
+    if "git" not in words:
+        return []
+    skip_until = 0
+    for index in range(words.index("git") + 1, len(words)):
+        word = words[index]
+        if index < skip_until:
+            continue
+        if word in {"-C", "-c"}:
+            skip_until = index + 2
+        elif not word.startswith("-"):
+            return words[index + 1 :] if word == "fetch" else []
+    return []
+
+
+def _shallow_fetches_without_no_tags(text: str) -> list[tuple[int, str]]:
+    """Return physical line numbers and joined shallow fetches that can follow tags."""
+    offenders = []
+    for match in re.finditer(r"(?:[^\n]*\\\n)*[^\n]+", text):
+        line = match.group().replace("\\\n", " ")
+        number = text.count("\n", 0, match.start()) + 1
+        try:
+            commands = _shell_simple_commands(line)
+        except ValueError:
+            offenders.append((number, "unreadable shell line: " + line))
+            continue
+        if any(_fetch_follows_tags(_git_fetch_options(words)) for words in commands):
+            offenders.append((number, line.strip()))
+    return offenders
+
+
+class ShallowFetchTagsTest(unittest.TestCase):
+    """Keep history-limiting shell fetches from following unrelated upstream tags."""
+
+    LIMITED_FETCHES = (
+        "git -C x fetch -q --depth=1 origin tag",
+        "git -C x fetch -q --depth 1 origin tag",
+        "git fetch --shallow-exclude=ref origin master",
+        "git fetch --shallow-exclude ref origin master",
+        "git fetch --deepen=5 origin master",
+        "git fetch --deepen 5 origin master",
+        "git fetch --shallow-since=2026-01-01 origin master",
+        "git fetch --shallow-since 2026-01-01 origin master",
+        "git fetch origin tag \\\n  --depth=1",
+    )
+
+    def test_repository_shallow_fetches_disable_tag_following(self) -> None:
+        """Name every shell fetch that limits history without disabling tag following."""
+        paths = sorted(series.ROOT.glob(".github/workflows/*.yml"))
+        paths += sorted(series.ROOT.glob(".github/actions/*/action.yml"))
+        paths += sorted(series.ROOT.glob("scripts/*.sh"))
+        for path in paths:
+            for number, command in _shallow_fetches_without_no_tags(
+                path.read_text(encoding="utf-8")
+            ):
+                with self.subTest(path=str(path.relative_to(series.ROOT)), line=number):
+                    self.fail(f"{path.relative_to(series.ROOT)}:{number}: {command}")
+
+    def test_limited_fetches_without_no_tags_are_reported(self) -> None:
+        """Detect each history limit and join backslash-continued fetch commands."""
+        for command in self.LIMITED_FETCHES:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    _shallow_fetches_without_no_tags(command),
+                    [(1, command.replace("\\\n", " "))],
+                )
+
+    def test_limited_fetches_with_no_tags_are_allowed(self) -> None:
+        """Accept explicit no-tags on each fetch, including its continued line."""
+        for command in self.LIMITED_FETCHES:
+            with self.subTest(command=command):
+                safe = command.replace("fetch ", "fetch --no-tags ", 1)
+                self.assertEqual(_shallow_fetches_without_no_tags(safe), [])
+        continued = "git fetch origin tag \\\n  --no-tags --depth=1"
+        self.assertEqual(_shallow_fetches_without_no_tags(continued), [])
+
+    def test_consumers_clone_and_unlimited_fetch_are_out_of_scope(self) -> None:
+        """Exclude consumers.yml:191's shallow clone and fetches without history limits."""
+        self.assertEqual(_shallow_fetches_without_no_tags("git fetch origin master"), [])
+        self.assertEqual(_shallow_fetches_without_no_tags("git clone --depth=1 url"), [])
+        consumer_clone = (
+            'git clone -q --depth=1 --filter=blob:none --sparse "${branch[@]}" \\\n'
+            '  "$url" "$directory"'
+        )
+        self.assertEqual(_shallow_fetches_without_no_tags(consumer_clone), [])
+
+    def test_comments_explicit_tags_and_empty_text(self) -> None:
+        """Ignore comments and empty text while reporting an explicit shallow tags fetch."""
+        self.assertEqual(_shallow_fetches_without_no_tags("# git fetch --depth=1"), [])
+        explicit = "git fetch --tags --depth=1 origin master"
+        self.assertEqual(_shallow_fetches_without_no_tags(explicit), [(1, explicit)])
+        self.assertEqual(_shallow_fetches_without_no_tags(""), [])
+
+    PYTHON_LIMITED_FETCHES = (
+        'run_git(t, "fetch", "-q", "--depth=1", "u", "r")',
+        'series.git(t, "fetch", "--depth", "1", "u", "r")',
+        'other(t, "fetch", "--shallow-exclude=x", "u", "r")',
+        'run_git(t, "fetch", "--deepen=2", "u", "r")',
+        '["git", "fetch", "--depth=1", "origin"]',
+        'run_git(t, "fetch", "--shallow-exclude", "x", "u", "r")',
+        'run_git(t, "fetch", "--deepen", "2", "u", "r")',
+        'run_git(t, "fetch", "--shallow-since=x", "u", "r")',
+        'run_git(t, "fetch", "--shallow-since", "x", "u", "r")',
+        'subprocess.run(["git", "fetch", "--depth=1", "origin"])',
+    )
+
+    def test_repository_python_shallow_fetches_disable_tag_following(self) -> None:
+        """Name Python fetch calls and argv literals that can follow tags."""
+        paths = sorted(series.ROOT.glob("tests/*.py"))
+        paths += sorted(series.ROOT.glob("scripts/*.py"))
+        for path in paths:
+            for number, command in _python_shallow_fetches_without_no_tags(
+                path.read_text(encoding="utf-8")
+            ):
+                with self.subTest(path=str(path.relative_to(series.ROOT)), line=number):
+                    self.fail(f"{path.relative_to(series.ROOT)}:{number}: {command}")
+
+    def test_python_limited_fetches_are_reported(self) -> None:
+        """Detect constant positional fetch arguments and literal argv elements."""
+        for source in self.PYTHON_LIMITED_FETCHES:
+            with self.subTest(source=source):
+                findings = _python_shallow_fetches_without_no_tags("\n" + source)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0][0], 2)
+                self.assertIn("fetch", findings[0][1])
+
+    def test_python_no_tags_and_out_of_scope_calls_are_allowed(self) -> None:
+        """Accept both no-tags spellings and ignore unlimited fetches and clones."""
+        for source in self.PYTHON_LIMITED_FETCHES:
+            for option in ("--no-tags", "-n"):
+                with self.subTest(source=source, option=option):
+                    safe = source.replace('"fetch",', f'"fetch", "{option}",', 1)
+                    self.assertEqual(_python_shallow_fetches_without_no_tags(safe), [])
+        for source in ('run_git(t, "fetch", "origin")', 'git("clone", "--depth=1")'):
+            self.assertEqual(_python_shallow_fetches_without_no_tags(source), [])
+
+    def test_python_dynamic_options_and_multiline_calls(self) -> None:
+        """Ignore nonconstant options and report the opening line of a split call."""
+        for source in (
+            'run_git(t, "fetch", f"--depth={depth}", "origin")',
+            'run_git(t, "fetch", limit, "origin")',
+            'run_git(t, "fetch", f"--depth=1", "origin")',
+            "",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(_python_shallow_fetches_without_no_tags(source), [])
+        source = '\nrun_git(\n t, "fetch",\n "--depth=1", "origin"\n)'
+        self.assertEqual(
+            _python_shallow_fetches_without_no_tags(source),
+            [(2, "fetch --depth=1 origin")],
+        )
+
+    def test_shell_short_no_tags_is_allowed(self) -> None:
+        """Accept Git's short option for disabling tag following."""
+        self.assertEqual(_shallow_fetches_without_no_tags("git fetch -n --depth=1 origin x"), [])
+
+    def test_shell_control_operators_separate_fetches(self) -> None:
+        """Keep a later safe fetch from concealing an earlier unsafe command."""
+        for operator in ("&&", "||", ";", "|", "&"):
+            command = f"git -C d fetch --depth=1 a {operator} git fetch --no-tags b"
+            with self.subTest(operator=operator):
+                self.assertEqual(_shallow_fetches_without_no_tags(command), [(1, command)])
+                safe = command.replace("--depth=1", "--no-tags --depth=1")
+                self.assertEqual(_shallow_fetches_without_no_tags(safe), [])
+
+    def test_shell_prefixes_and_git_global_options(self) -> None:
+        """Find wrapped Git commands and skip global options before the subcommand."""
+        commands = (
+            "if git fetch --depth=1 origin x; then",
+            "env X=1 git fetch --depth=1 origin x",
+            "timeout 60 git fetch --depth=1 origin x",
+            "VAR=value git fetch --depth=1 origin x",
+            "then ! git fetch --depth=1 origin x",
+            "git -c protocol.version=2 fetch --depth=1 origin x",
+            "git --git-dir=d fetch --depth=1 origin x",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(_shallow_fetches_without_no_tags(command), [(1, command)])
+                safe = command.replace("fetch ", "fetch --no-tags ")
+                self.assertEqual(_shallow_fetches_without_no_tags(safe), [])
+
+    def test_unreadable_shell_line_is_reported(self) -> None:
+        """Report malformed shell text with its physical line instead of raising."""
+        command = 'git fetch --depth=1 o "x'
+        self.assertEqual(
+            _shallow_fetches_without_no_tags("echo done\n" + command),
+            [(2, "unreadable shell line: " + command)],
+        )
+        self.assertEqual(_shallow_fetches_without_no_tags("echo done\n# comment"), [])
 
 
 class MakeTargetsTest(unittest.TestCase):
