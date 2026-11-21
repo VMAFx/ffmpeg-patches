@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from scripts import review_classes, unit_test_budget
+from scripts.raw_configure_body import bash_parser
 from tests.helpers import isolated_git_environment
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,7 +36,20 @@ BODY = "new body\nline two\n"
 NOW = "2026-11-06T09:00:00Z"
 OVERLAP_FILE = "libavfilter/vf_find_rect.c"
 HELPER_SUBCOMMANDS = frozenset(
-    {"close", "comment", "edit-body", "issue", "pr", "push", "fairy-reviews", "overlap", "reply"}
+    {
+        "close",
+        "comment",
+        "edit-body",
+        "issue",
+        "pr",
+        "push",
+        "fairy-reviews",
+        "overlap",
+        "reply",
+        "reviewers",
+        "landed",
+        "fork",
+    }
 )
 
 
@@ -118,6 +132,28 @@ def git_output(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def commit_tree(repo: Path, tree: str, message: str, *parents: str) -> str:
+    """Create one fixture commit with explicit identity, tree, parents, and signing disabled."""
+    args = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid"]
+    args.extend(["-c", "commit.gpgSign=false", "commit-tree", tree, "-m", message])
+    for index in range(len(parents)):
+        args.extend(["-p", parents[index]])
+    return git_output(repo, *args)
+
+
+def shared_merge_tips(repo: Path, shared_count: int) -> tuple[str, str]:
+    """Create independent merge tips sharing two long lines with two best merge bases."""
+    tree = git_output(repo, "rev-parse", "master^{tree}")
+    root = git_output(repo, "rev-parse", "master")
+    tips = [root, root]
+    for side in range(2):
+        for number in range(shared_count):
+            tips[side] = commit_tree(repo, tree, f"shared {side} {number}", tips[side])
+    head = commit_tree(repo, tree, "head merge", tips[0], tips[1])
+    base = commit_tree(repo, tree, "base merge", tips[1], tips[0])
+    return head, base
+
+
 def full_sweep_report(sha: str) -> str:
     """Build reviewed sweep tables and all recurring class answers at one head."""
 
@@ -156,7 +192,9 @@ def copy_sweep_validator(scripts: Path) -> None:
     shutil.copyfile(review_classes.CLASS_FILE, config / review_classes.CLASS_FILE.name)
 
 
-def advance_upstream(tmp: Path, upstream: Path, path: str, text: str) -> str:
+def advance_upstream(
+    tmp: Path, upstream: Path, path: str, text: str, *, author: str = "Test"
+) -> str:
     """Clone upstream under tmp, commit text at path on master, and push."""
 
     work = Path(tempfile.mkdtemp(prefix="upstream-work-", dir=tmp))
@@ -168,7 +206,7 @@ def advance_upstream(tmp: Path, upstream: Path, path: str, text: str) -> str:
     git(
         work,
         "-c",
-        "user.name=Test",
+        f"user.name={author}",
         "-c",
         "user.email=test@example.invalid",
         "-c",
@@ -520,6 +558,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Return the scripted fork branch commit or a failed read."""
 
         if len(parts) > 3 and parts[-2] == "branches":
+            callback = getattr(stub, "on_branch", None)
+            if callback is not None:
+                callback()
             self.reply(stub.branch_status, {"commit": {"id": stub.branch_head}})
             return True
         return False
@@ -586,6 +627,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         data = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
         self.stub().requests.append(("POST", self.path, data))
+        callback = getattr(self.stub(), "on_post", None)
+        if callback is not None:
+            callback(self.path)
         if self.path.endswith("/pulls"):
             self.reply(201, {"number": 1, "html_url": "stub/pulls/1"})
         elif self.path.endswith("/pulls/1/requested_reviewers"):
@@ -639,6 +683,8 @@ class ForgejoTest(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.tmp = Path(scratch.name)
+        self.helper_tmp = self.tmp / "helper-tmp"
+        self.helper_tmp.mkdir()
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
         tool = bin_dir / "secret-tool"
@@ -689,6 +735,7 @@ class ForgejoTest(unittest.TestCase):
             FFMPEG_FORGEJO_API=f"http://127.0.0.1:{server.server_port}/api/v1",
             FFMPEG_FORGEJO_GIT=str(self.upstream),
             FFMPEG_FORGEJO_POLL="0",
+            TMPDIR=str(self.helper_tmp),
         )
         env.update(env_updates or {})
         return env
@@ -728,6 +775,526 @@ class ForgejoTest(unittest.TestCase):
         return [json.loads(data)["body"] for got, _, data in stub.requests if got == method]
 
 
+def plant_content_removal_failure(
+    bin_dir: Path, scratch: Path, content: bytes | tuple[bytes, ...]
+) -> Path:
+    """Install an rm stub that retains private files matching any supplied byte string."""
+    real_rm = shutil.which("rm")
+    if real_rm is None:
+        raise RuntimeError("rm missing")
+    refused = scratch / "refused-removal.txt"
+    wrapper = bin_dir / "rm"
+    contents = (content,) if isinstance(content, bytes) else content
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+        "path = Path(sys.argv[-1])\n"
+        f"if path.is_file() and path.read_bytes() in {contents!r}:\n"
+        f"    with Path({str(refused)!r}).open('a', encoding='utf-8') as record:\n"
+        "        record.write(str(path) + '\\n')\n"
+        "    raise SystemExit(1)\n"
+        f"os.execv({real_rm!r}, [{real_rm!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return refused
+
+
+def assert_private_removal_failed(
+    case: unittest.TestCase,
+    result: subprocess.CompletedProcess[str],
+    refused: Path,
+    status: int = 1,
+) -> None:
+    """Require the real status, one final path diagnostic, and the surviving private file."""
+    path = Path(refused.read_text(encoding="utf-8").strip())
+    message = f"ffmpeg-forgejo: cannot delete {path}."
+    case.assertEqual(result.returncode, status, result.stderr)
+    lines = result.stderr.splitlines()
+    case.assertTrue(lines, result.stderr)
+    case.assertEqual(lines[-1], message)
+    case.assertEqual(lines.count(message), 1)
+    case.assertTrue(path.exists())
+
+
+def plant_accepted_header_failure(bin_dir: Path, scratch: Path) -> tuple[Path, Path]:
+    """Fail removal of a fixture header only after the selected successful write."""
+    real_rm = shutil.which("rm")
+    if real_rm is None:
+        raise RuntimeError("rm missing")
+    marker = scratch / "write-accepted"
+    refused = scratch / "refused-removal.txt"
+    wrapper = bin_dir / "rm"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+        "path = Path(sys.argv[-1])\n"
+        f"if Path({str(marker)!r}).exists() and path.is_file() "
+        "and path.read_bytes() == b'Authorization: token testtoken\\n':\n"
+        f"    with Path({str(refused)!r}).open('a', encoding='utf-8') as record:\n"
+        "        record.write(str(path) + '\\n')\n"
+        "    raise SystemExit(1)\n"
+        f"os.execv({real_rm!r}, [{real_rm!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return marker, refused
+
+
+def write_request_paths(stub: Stub) -> list[tuple[str, str]]:
+    """Return write methods and paths with an explicit request-count bound."""
+    return [
+        (stub.requests[index][0], stub.requests[index][1])
+        for index in range(len(stub.requests))
+        if stub.requests[index][0] in {"POST", "PATCH"}
+    ]
+
+
+class ForkStub(Stub):
+    """Script repository existence reads without changing the shared forge stub."""
+
+    def __init__(
+        self, repository_status: int, polls: dict[str, list[list[dict]]] | None = None
+    ) -> None:
+        """Keep the repository response status alongside the shared request history."""
+        super().__init__(polls=polls)
+        self.repository_status = repository_status
+
+
+class ForkHandler(Handler):
+    """Extend the shared HTTP handler with repository reads and fork creation."""
+
+    def _dispatch_get(
+        self, stub: ForkStub, url: urllib.parse.SplitResult, parts: list[str]
+    ) -> bool:
+        """Serve the scripted repository status and delegate all other existing routes."""
+        if url.path == f"/api/v1/repos/{stub.login}/FFmpeg":
+            if stub.repository_status == 302:
+                self.send_response(302)
+                self.send_header("Location", "/api/v1/missing-repository")
+                self.end_headers()
+                return True
+            self.reply(stub.repository_status, {"message": "repository read"})
+            return True
+        return super()._dispatch_get(stub, url, parts)
+
+    def do_POST(self) -> None:
+        """Record a fork creation and preserve the shared handler for other writes."""
+        if self.path == "/api/v1/repos/FFmpeg/FFmpeg/forks":
+            data = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
+            self.stub().requests.append(("POST", self.path, data))
+            self.reply(201, {})
+            return
+        super().do_POST()
+
+
+class ForkExistenceTest(ForgejoTest):
+    """Permit fork creation only after a successful request proves HTTP not-found."""
+
+    def fork_command(self, stub: ForkStub) -> subprocess.CompletedProcess[str]:
+        """Run fork through the shared fixture with a fixed login and local temporary files."""
+        with unittest.mock.patch(__name__ + ".Handler", ForkHandler):
+            return self.run_command(
+                stub,
+                "fork",
+                env_updates={"FFMPEG_FORGEJO_LOGIN": "tester", "TMPDIR": str(self.tmp)},
+            )
+
+    def test_not_found_creates_fork(self) -> None:
+        """A clean HTTP 404 permits one fork POST and exposes its acceptance and success."""
+        stub = ForkStub(404)
+        result = self.fork_command(stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("write accepted: /repos/FFmpeg/FFmpeg/forks", result.stderr)
+        self.assertEqual(
+            stub.requests,
+            [
+                ("GET", "/api/v1/repos/tester/FFmpeg", ""),
+                ("POST", "/api/v1/repos/FFmpeg/FFmpeg/forks", "{}\n"),
+            ],
+        )
+        self.assertIn("forked FFmpeg/FFmpeg to ", result.stdout)
+
+    def test_curl_redirect_config_cannot_turn_redirect_into_absence(self) -> None:
+        """Configured redirect following cannot turn a redirected 404 into fork permission."""
+        real_curl = shutil.which("curl")
+        self.assertIsNotNone(real_curl)
+        config = self.tmp / "curlrc"
+        config.write_text("location\n", encoding="utf-8")
+        wrapper = self.bin_dir / "curl"
+        wrapper.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(str(real_curl))} -q "
+            f'--config {shlex.quote(str(config))} "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        statuses = (302, 404)
+        for index in range(len(statuses)):
+            with self.subTest(status=statuses[index]):
+                stub = ForkStub(statuses[index])
+                result = self.fork_command(stub)
+                self.assertEqual(result.returncode, 1 if index == 0 else 0, result.stderr)
+                paths = [stub.requests[n][1] for n in range(len(stub.requests))]
+                self.assertNotIn("/api/v1/missing-repository", paths)
+                self.assertEqual(len(write_request_paths(stub)), index)
+                if index == 0:
+                    self.assertIn("unexpected HTTP status 302", result.stderr)
+
+    def test_existing_repository_does_not_write(self) -> None:
+        """An existing repository still succeeds without sending a create request."""
+        stub = ForkStub(200)
+        result = self.fork_command(stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(stub.requests, [("GET", "/api/v1/repos/tester/FFmpeg", "")])
+        self.assertTrue(result.stdout.rstrip().endswith("/tester/FFmpeg exists"))
+
+    def test_other_http_statuses_stop_before_create(self) -> None:
+        """Authorization, server, and redirect responses cannot stand in for absence."""
+        statuses = (401, 403, 500, 302)
+        for index in range(len(statuses)):
+            with self.subTest(status=statuses[index]):
+                stub = ForkStub(statuses[index])
+                result = self.fork_command(stub)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"unexpected HTTP status {statuses[index]}", result.stderr)
+                self.assertIn("/repos/tester/FFmpeg", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(stub.requests, [("GET", "/api/v1/repos/tester/FFmpeg", "")])
+
+    def test_transport_failures_keep_diagnostic_and_never_attempt_create(self) -> None:
+        """Transport statuses, including 44, never authorize even an attempted POST."""
+        statuses = (7, 44)
+        log = self.tmp / "curl-requests.txt"
+        curl = self.bin_dir / "curl"
+        for index in range(len(statuses)):
+            with self.subTest(status=statuses[index]):
+                log.write_text("", encoding="utf-8")
+                curl.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s\\n' \"$*\" >>{shlex.quote(str(log))}\n"
+                    "printf 'curl: planted transport failure\\n' >&2\n"
+                    f"exit {statuses[index]}\n",
+                    encoding="utf-8",
+                )
+                curl.chmod(0o755)
+                stub = ForkStub(404)
+                result = self.fork_command(stub)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("curl: planted transport failure", result.stderr)
+                self.assertEqual(result.stdout, "")
+                requests = log.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(requests), 1, requests)
+                self.assertIn("-X GET", requests[0])
+                self.assertEqual(stub.requests, [])
+
+    def test_read_cleanup_failure_never_authorizes_create(self) -> None:
+        """Header cleanup failure overrides both a successful read and HTTP not-found."""
+        statuses = (200, 404)
+        refused = plant_content_removal_failure(
+            self.bin_dir, self.tmp, b"Authorization: token testtoken\n"
+        )
+        for index in range(len(statuses)):
+            with self.subTest(status=statuses[index]):
+                refused.write_text("", encoding="utf-8")
+                stub = ForkStub(statuses[index])
+                result = self.fork_command(stub)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                paths = refused.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(paths), 1)
+                message = f"ffmpeg-forgejo: cannot delete {paths[0]}."
+                self.assertEqual(result.stderr.splitlines().count(message), 1)
+                self.assertTrue(Path(paths[0]).exists())
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(stub.requests, [("GET", "/api/v1/repos/tester/FFmpeg", "")])
+
+
+class PrivateRemovalTest(ForgejoTest):
+    """Exercise cleanup failures across main flow, conditional calls, and EXIT traps."""
+
+    def test_create_header_cleanup_failure_exposes_accepted_pull(self) -> None:
+        """An accepted create remains visible when only its private-header removal fails."""
+        marker, refused = plant_accepted_header_failure(self.bin_dir, self.tmp)
+        stub = Stub(reviewers=[["alice"]])
+
+        def accepted(path: str) -> None:
+            """Arm header removal failure only on the successful pull create endpoint."""
+            if path.endswith("/pulls"):
+                marker.touch()
+
+        stub.on_post = accepted
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertIn("write accepted: stub/pulls/1", result.stderr)
+        self.assertEqual(write_request_paths(stub), [("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls")])
+        self.assertEqual(stub.requested_users, [])
+
+    def test_fork_payload_cleanup_failure_exposes_accepted_fork(self) -> None:
+        """A failed fork payload removal retains both the accepted and forked messages."""
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, b"{}\n")
+        stub = ForkStub(404)
+        with unittest.mock.patch(__name__ + ".Handler", ForkHandler):
+            result = self.run_command(stub, "fork")
+        assert_private_removal_failed(self, result, refused)
+        self.assertIn("write accepted:", result.stderr)
+        self.assertIn("forked FFmpeg/FFmpeg to", result.stdout)
+        self.assertEqual(write_request_paths(stub), [("POST", "/api/v1/repos/FFmpeg/FFmpeg/forks")])
+
+    def test_merge_cleanup_stops_main_flow_before_any_write(self) -> None:
+        """A private merge-output removal failure stops PR before any write reaches the stub."""
+        tree = git_output(self.repo, "rev-parse", "topic^{tree}")
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, f"{tree}\n".encode())
+        stub = Stub(reviewers=[["alice"]])
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(write_request_paths(stub), [])
+
+    def test_overlap_cleanup_failure_stops_conditional_pr_before_post(self) -> None:
+        """Conditional overlap cleanup cannot turn a failed candidate deletion into success."""
+        refused = plant_content_removal_failure(
+            self.bin_dir, self.tmp, OVERLAP_FILE.encode() + b"\0"
+        )
+        stub = Stub(reviewers=[["alice"]])
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(write_request_paths(stub), [])
+        self.assertEqual(stub.requested_users, [])
+
+    def test_pull_reader_cleanup_failure_stops_tested_comment_before_post(self) -> None:
+        """A checked pull-status substitution propagates header cleanup failure before POST."""
+        refused = plant_content_removal_failure(
+            self.bin_dir, self.tmp, b"Authorization: token testtoken\n"
+        )
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate head={A} tree=/w\n", encoding="utf-8")
+        stub = Stub()
+        result = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "--evidence",
+            str(evidence),
+            "1",
+            str(self.tmp / "body.md"),
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(len(stub.requests), 1)
+        self.assertEqual(stub.requests[0][:2], ("GET", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1"))
+        self.assertEqual(write_request_paths(stub), [])
+
+    def test_api_exit_cleanup_failure_stops_pr_before_post(self) -> None:
+        """An API header EXIT cleanup failure survives checked substitutions and stops PR."""
+        refused = plant_content_removal_failure(
+            self.bin_dir, self.tmp, b"Authorization: token testtoken\n"
+        )
+        stub = Stub(reviewers=[["alice"]])
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(len(stub.requests), 1)
+        self.assertEqual(stub.requests[0][:2], ("GET", "/api/v1/user"))
+
+    def test_exit_cleanup_failure_changes_success_to_one(self) -> None:
+        """A successful comment body still exits 1 when its EXIT snapshot removal fails."""
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, BODY.encode())
+        stub = Stub()
+        result = self.run_command(
+            stub, "comment", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertIn("stub/issues/1#issuecomment-1", result.stdout)
+        self.assertEqual(self.sent_bodies(stub, "POST"), [BODY])
+
+    def test_exit_cleanup_failure_keeps_earlier_refusal_status(self) -> None:
+        """A failed EXIT cleanup keeps an earlier duplicate refusal's status 78."""
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, BODY.encode())
+        stub = Stub()
+        stub.comments[1] = [
+            {"user": {"login": "tester"}, "id": 81918, "body": BODY, "html_url": "stub/81918"}
+        ]
+        result = self.run_command(
+            stub, "comment", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused, status=78)
+        self.assertIn("own comment 81918", result.stderr)
+        self.assertEqual(write_request_paths(stub), [])
+
+    def test_main_payload_cleanup_stops_after_pr_post_before_reviewer_post(self) -> None:
+        """A failed payload removal prints the created pull URL and stops before reviewer writes."""
+        content = json.dumps(
+            {"head": "tester:topic", "base": "master", "title": "title", "body": BODY}
+        )
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, f"{content}\n".encode())
+        stub = Stub(reviewers=[["alice"]])
+        result = self.run_command(
+            stub, "pr", "--sweep", str(self.sweep), "topic", "title", str(self.tmp / "body.md")
+        )
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(write_request_paths(stub), [("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls")])
+        self.assertEqual(result.stdout, "stub/pulls/1\n")
+        self.assertEqual(stub.requested_users, [])
+
+    def test_standalone_landed_explains_before_failed_cleanup(self) -> None:
+        """Standalone landed prints its explanation before cleanup fails with status 1."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        tree = git_output(self.repo, "rev-parse", "topic^{tree}")
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, f"{tree}\n".encode())
+        stub = Stub()
+        result = self.run_command(stub, "landed", "topic")
+        assert_private_removal_failed(self, result, refused)
+        self.assertIn(git_output(self.repo, "rev-parse", "topic")[:12], result.stdout)
+        self.assertEqual(stub.requests, [])
+
+    def test_exit_cleanup_tries_both_private_reply_paths(self) -> None:
+        """Reply EXIT cleanup tries both failed paths once while retaining the earlier status."""
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, (BODY.encode(), b""))
+        stub = Stub()
+        stub.review_comments[7] = copy.deepcopy(THREAD)
+        stub.review_comments[7].append(
+            {"user": {"login": "tester"}, "id": 81918, "body": BODY, "html_url": "stub/81918"}
+        )
+        result = self.run_command(
+            stub, "reply", "--no-test-claims", "1", "7", "85995", str(self.tmp / "body.md")
+        )
+        self.assertEqual(result.returncode, 78, result.stderr)
+        paths = refused.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(len(set(paths)), 2)
+        lines = result.stderr.splitlines()
+        for index in range(len(paths)):
+            self.assertTrue(Path(paths[index]).exists())
+            self.assertEqual(lines.count(f"ffmpeg-forgejo: cannot delete {paths[index]}."), 1)
+        self.assertEqual(lines[-1], f"ffmpeg-forgejo: cannot delete {paths[-1]}.")
+        self.assertEqual(write_request_paths(stub), [])
+
+
+def plant_landed_fetch_marker(bin_dir: Path, scratch: Path) -> Path:
+    """Mark the real final landed fetch without replacing any Git proof or isolation."""
+    real_git = shutil.which("git")
+    if real_git is None:
+        raise RuntimeError("git missing")
+    marker = scratch / "landed-fetch"
+    wrapper = bin_dir / "git"
+    wrapper.write_text(
+        '#!/bin/sh\ncase " $* " in *refs/ffmpeg-forgejo/landed-base-*) '
+        f": >{shlex.quote(str(marker))};; esac\n"
+        f'exec {shlex.quote(real_git)} "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return marker
+
+
+class PostLandedHeadTest(ForgejoTest):
+    """Recheck every mutable outbound head after the real landed fetch."""
+
+    def final_head_command(
+        self, verb: str, outcome: str
+    ) -> tuple[subprocess.CompletedProcess[str], Stub, list[bool]]:
+        """Change or fail only reads after the real landed fetch for one outbound verb."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        changed = sha[:-1] + ("0" if sha[-1] != "0" else "1")
+        marker = plant_landed_fetch_marker(self.bin_dir, self.tmp)
+        reads: list[bool] = []
+        stub = Stub(heads=[sha], reviewers=[["alice"]], branch_head=sha)
+        stub.review_comments[7] = copy.deepcopy(THREAD)
+
+        def refresh() -> None:
+            """Record the fetch boundary and inject only the selected late response."""
+            if write_request_paths(stub):
+                return
+            landed = marker.exists()
+            reads.append(landed)
+            if landed and outcome == "changed":
+                stub.heads = [changed]
+                stub.branch_head = changed
+            if landed and outcome == "failed":
+                stub.pull_status = 500
+                stub.branch_status = 500
+
+        stub.on_pull = refresh
+        stub.on_branch = refresh
+        if verb == "pr":
+            args = ["pr", "--sweep", str(self.sweep), "topic", "title"]
+        else:
+            evidence = self.tmp / "evidence.md"
+            evidence.write_text(f"- test: fate tree=/w head={sha[:12]}\n", encoding="utf-8")
+            args = [verb, "--tested-head", sha[:12], "--evidence", str(evidence), "1"]
+            if verb == "reply":
+                args.extend(["7", "85995"])
+        result = self.run_command(stub, *args, str(self.tmp / "body.md"))
+        self.assertTrue(marker.exists(), result.stderr)
+        return result, stub, reads
+
+    def assert_final_head_result(self, verb: str, outcome: str) -> None:
+        """Pin the last full-head read, exact refusal status, and absence of writes."""
+        result, stub, reads = self.final_head_command(verb, outcome)
+        expected = 0 if outcome == "unchanged" else 1 if verb == "pr" or outcome == "failed" else 76
+        self.assertEqual(result.returncode, expected, result.stderr)
+        self.assertEqual(reads, [False] * {"pr": 1, "comment": 3, "reply": 2}[verb] + [True])
+        writes = write_request_paths(stub)
+        if outcome == "unchanged":
+            paths = {
+                "pr": "pulls",
+                "comment": "issues/1/comments",
+                "reply": "pulls/1/reviews/7/comments",
+            }
+            path = paths[verb]
+            self.assertIn(("POST", f"/api/v1/repos/FFmpeg/FFmpeg/{path}"), writes)
+        else:
+            message = (
+                "fork branch"
+                if verb == "pr"
+                else "cannot read the head"
+                if outcome == "failed"
+                else "does not match live head"
+            )
+            self.assertIn(message, result.stderr)
+            self.assertEqual(writes, [])
+
+    def test_changed_head_during_landed_check_refuses_pr(self) -> None:
+        """A fork head changed during final fetching cannot create a pull."""
+        self.assert_final_head_result("pr", "changed")
+
+    def test_failed_head_read_after_landed_check_refuses_pr(self) -> None:
+        """A failed final fork read cannot create a pull."""
+        self.assert_final_head_result("pr", "failed")
+
+    def test_unchanged_head_after_landed_check_creates_pr(self) -> None:
+        """An unchanged final fork head still creates a pull."""
+        self.assert_final_head_result("pr", "unchanged")
+
+    def test_changed_head_during_landed_check_refuses_comment(self) -> None:
+        """A changed full head sharing the tested prefix cannot receive a comment."""
+        self.assert_final_head_result("comment", "changed")
+
+    def test_failed_head_read_after_landed_check_refuses_comment(self) -> None:
+        """A failed final pull read cannot receive a tested comment."""
+        self.assert_final_head_result("comment", "failed")
+
+    def test_unchanged_head_after_landed_check_posts_comment(self) -> None:
+        """An unchanged final full head still receives a tested comment."""
+        self.assert_final_head_result("comment", "unchanged")
+
+    def test_changed_head_during_landed_check_refuses_reply(self) -> None:
+        """A changed full head sharing the tested prefix cannot receive a reply."""
+        self.assert_final_head_result("reply", "changed")
+
+    def test_failed_head_read_after_landed_check_refuses_reply(self) -> None:
+        """A failed final pull read cannot receive a tested reply."""
+        self.assert_final_head_result("reply", "failed")
+
+    def test_unchanged_head_after_landed_check_posts_reply(self) -> None:
+        """An unchanged final full head still receives a tested reply."""
+        self.assert_final_head_result("reply", "unchanged")
+
+
 class RunCommandTest(ForgejoTest):
     def test_unknown_subcommand_is_rejected_before_any_request(self) -> None:
         """An unknown helper subcommand raises before the stub receives a request."""
@@ -736,6 +1303,236 @@ class RunCommandTest(ForgejoTest):
         with self.assertRaises(ValueError):
             self.run_command(stub, "unknown")
         self.assertEqual(stub.requests, [])
+
+    def test_usage_documents_landed_note_comment_path(self) -> None:
+        """Printed usage routes landed-head notes through comments without test claims."""
+        result = subprocess.run(  # nosec B603 - fixed bash, repository helper path, no shell.
+            ["bash", str(self.helper)],
+            cwd=self.repo,
+            env=isolated_git_environment(preserve_config=True),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "a note about a landed head goes through comment --no-test-claims; "
+            "there is no separate note option",
+            result.stdout,
+        )
+        self.assertLess(
+            result.stdout.index("needs no token"),
+            result.stdout.index("a note about a landed head goes through comment --no-test-claims"),
+        )
+
+
+class LandedTest(ForgejoTest):
+    """Check landed ranges against a real local upstream without outbound writes."""
+
+    def landed(
+        self, *, env_updates: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Check the topic and require cleanup without any API request."""
+        stub = Stub()
+        result = self.run_command(stub, "landed", "topic", env_updates=env_updates)
+        self.assertEqual(stub.requests, [])
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+        return result
+
+    def test_identical_patch_under_another_author_is_landed(self) -> None:
+        """An identical patch under another author names the matching base commit."""
+        base = advance_upstream(
+            self.tmp, self.upstream, OVERLAP_FILE, "topic\n", author="Maintainer"
+        )
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn(base[:12], result.stdout)
+        self.assertIn(git_output(self.repo, "rev-parse", "topic")[:12], result.stdout)
+
+    def test_landed_patch_with_unrelated_base_advance(self) -> None:
+        """A later base change in another file does not hide a landed patch."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        advance_upstream(self.tmp, self.upstream, "other.txt", "later\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn(base[:12], result.stdout)
+
+    def test_different_conflicting_patch_is_not_landed(self) -> None:
+        """A conflicting change with a different stable patch ID remains unlanded."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "different\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "not landed\n")
+
+    def test_unrelated_base_advance_is_not_landed(self) -> None:
+        """An unrelated base commit cannot match the topic patch."""
+        advance_upstream(self.tmp, self.upstream, "other.txt", "other\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "not landed\n")
+
+    def test_partially_landed_two_commit_range_is_not_landed(self) -> None:
+        """A two-commit range remains unlanded when only its first patch matches."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        (self.repo / "second.txt").write_text("second\n", encoding="utf-8")
+        git(self.repo, "add", "second.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "second topic patch",
+        )
+        result = self.landed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "not landed\n")
+
+    def test_unfetchable_base_fails_closed(self) -> None:
+        """An unreachable local base exits one without claiming not landed."""
+        result = self.landed(env_updates={"FFMPEG_FORGEJO_GIT": str(self.tmp / "missing.git")})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot fetch", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_reverted_topic_has_no_change_left(self) -> None:
+        """An unlanded change and its revert leave no change against an advanced base."""
+        topic = git_output(self.repo, "rev-parse", "topic")
+        (self.repo / OVERLAP_FILE).write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", OVERLAP_FILE)
+        git(
+            self.repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "revert topic patch",
+        )
+        reverted = git_output(self.repo, "rev-parse", "topic")
+        advance_upstream(self.tmp, self.upstream, "other.txt", "other\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn(f"{topic[:12]}: no change left against the base\n", result.stdout)
+        self.assertIn(f"{reverted[:12]}: no change left against the base\n", result.stdout)
+
+    def test_head_at_merge_base_has_no_change_left(self) -> None:
+        """A head with no own commit leaves the live base unchanged and exits 82."""
+        git(
+            self.repo,
+            "update-ref",
+            "refs/heads/topic",
+            git_output(self.repo, "rev-parse", "master"),
+        )
+        advance_upstream(self.tmp, self.upstream, "other.txt", "other\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertEqual(result.stdout, "no change left against the base\n")
+
+    def crisscross_head(self) -> tuple[str, str]:
+        """Install two independently merged shared histories as the live base and topic."""
+        head, base = shared_merge_tips(self.repo, 257)
+        self.assertEqual(
+            len(git_output(self.repo, "merge-base", "--all", head, base).splitlines()), 2
+        )
+        git(self.upstream, "fetch", "-q", str(self.repo), base)
+        git(self.upstream, "update-ref", "refs/heads/master", base)
+        git(self.repo, "update-ref", "refs/heads/topic", head)
+        return head, base
+
+    def test_shared_crisscross_commits_do_not_exhaust_own_cap(self) -> None:
+        """Shared commits behind two merge bases do not prevent equal trees from landing."""
+        head, base = self.crisscross_head()
+        self.assertEqual(git_output(self.repo, "rev-list", "--count", f"{base}..{head}"), "1")
+        self.assertEqual(git_output(self.repo, "rev-list", "--count", f"{head}..{base}"), "1")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("no change left against the base", result.stdout)
+
+    def test_crisscross_own_commits_still_obey_cap(self) -> None:
+        """One more genuinely head-only commit than the cap remains refused with shared history."""
+        head, base = self.crisscross_head()
+        tree = git_output(self.repo, "rev-parse", f"{head}^{{tree}}")
+        for number in range(256):
+            head = commit_tree(self.repo, tree, f"own {number}", head)
+        git(self.repo, "update-ref", "refs/heads/topic", head)
+        self.assertEqual(git_output(self.repo, "rev-list", "--count", f"{base}..{head}"), "257")
+        result = self.landed()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("landed-check range exceeds 256 commits", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_own_range_over_commit_cap_is_refused(self) -> None:
+        """A range of 257 own commits exceeds the documented 256 cap and exits one."""
+        parent = git_output(self.repo, "rev-parse", "topic")
+        tree = git_output(self.repo, "rev-parse", "topic^{tree}")
+        for number in range(256):
+            parent = git_output(
+                self.repo,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit-tree",
+                tree,
+                "-p",
+                parent,
+                "-m",
+                f"topic commit {number}",
+            )
+        git(self.repo, "update-ref", "refs/heads/topic", parent)
+        result = self.landed()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("landed-check range exceeds 256 commits", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_private_state_removal_failure_overrides_landed_status(self) -> None:
+        """Either failed filesystem removal names its path and overrides landed status."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        real_rm = shutil.which("rm")
+        self.assertIsNotNone(real_rm)
+        refused = self.tmp / "refused-removal.txt"
+        wrapper = self.bin_dir / "rm"
+        clean_tmp = self.tmp / "landed-tmp"
+        clean_tmp.mkdir()
+        for index in range(2):
+            option = ("-rf", "-f")[index]
+            with self.subTest(option=option):
+                wrapper.write_text(
+                    "#!/bin/bash\n"
+                    f'if [ "$1" = {shlex.quote(option)} ]; then\n'
+                    f'  printf "%s\\n" "${{@: -1}}" >{shlex.quote(str(refused))}\n'
+                    "  exit 1\nfi\n"
+                    f'exec {shlex.quote(str(real_rm))} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+                result = self.landed(env_updates={"TMPDIR": str(clean_tmp)})
+                path = refused.read_text(encoding="utf-8").strip()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                message = f"ffmpeg-forgejo: cannot delete {path}."
+                lines = result.stderr.splitlines()
+                self.assertEqual(lines[-1], message)
+                self.assertEqual(lines.count(message), 1)
+                self.assertTrue(Path(path).exists())
+
+    def test_matching_patch_remains_landed_after_conflicting_base_edit(self) -> None:
+        """Stable patch IDs prove landing even when later base edits conflict."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "later base edit\n")
+        result = self.landed()
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn(base[:12], result.stdout)
 
 
 class FixtureCleanupTest(unittest.TestCase):
@@ -1495,8 +2292,256 @@ THREAD = [
 ]
 
 
+class WriteResponseHandler(ForkHandler):
+    """Override selected write responses without persisting or following them."""
+
+    def scripted_write(self, method: str) -> bool:
+        """Record a selected write and return its exact HTTP status and response bytes."""
+        stub = self.stub()
+        scripted = getattr(stub, "write_responses", {}).get((method, self.path))
+        if scripted is None:
+            return False
+        data = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
+        stub.requests.append((method, self.path, data))
+        callback = getattr(stub, "on_write", None)
+        if callback is not None:
+            callback(self.path)
+        code, body = scripted
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        if code == 302:
+            self.send_header("Location", "/api/v1/unexpected-redirect")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def do_POST(self) -> None:
+        """Use a scripted POST response or the shared fixture's ordinary behavior."""
+        if not self.scripted_write("POST"):
+            super().do_POST()
+
+    def do_PATCH(self) -> None:
+        """Use a scripted PATCH response or the shared fixture's ordinary behavior."""
+        if not self.scripted_write("PATCH"):
+            super().do_PATCH()
+
+
+class WriteStatusTest(ForgejoTest):
+    """Require an HTTP success before receipts, addresses, or subsequent writes."""
+
+    def write_case(self, verb: str) -> tuple[ForkStub, list[str], tuple[str, str]]:
+        """Prepare the existing fork, pull, and review fixtures for one write verb."""
+        stub = ForkStub(404, polls={A: [[label("success")]]} if verb == "edit-body" else None)
+        stub.reviewers = [["alice"]]
+        stub.review_comments[7] = copy.deepcopy(THREAD)
+        body = str(self.tmp / "body.md")
+        cases = {
+            "fork": (["fork"], "POST", "forks"),
+            "pr": (["pr", "--sweep", str(self.sweep), "topic", "title", body], "POST", "pulls"),
+            "reply": (
+                ["reply", "--no-test-claims", "1", "7", "85995", body],
+                "POST",
+                "pulls/1/reviews/7/comments",
+            ),
+            "issue": (["issue", "title", body], "POST", "issues"),
+            "comment": (["comment", "--no-test-claims", "1", body], "POST", "issues/1/comments"),
+            "edit-body": (["edit-body", "--no-test-claims", "1", body], "PATCH", "pulls/1"),
+            "close": (["close", "1", body], "POST", "issues/1/comments"),
+            "reviewers": (["reviewers", "1", "bob"], "POST", "pulls/1/requested_reviewers"),
+        }
+        args, method, suffix = cases[verb]
+        return stub, args, (method, "/api/v1/repos/FFmpeg/FFmpeg/" + suffix)
+
+    def run_write_case(
+        self,
+        verb: str,
+        status: int | None = None,
+        data: bytes = b"",
+        cleanup: bool = False,
+        target: tuple[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], ForkStub, Path | None]:
+        """Run one write with an optional raw response and write-armed header refusal."""
+        stub, args, default_target = self.write_case(verb)
+        if status is not None:
+            stub.write_responses = {target or default_target: (status, data)}
+        refused = None
+        if cleanup:
+            marker, refused = plant_accepted_header_failure(self.bin_dir, self.tmp)
+
+            def arm_failure(path: str) -> None:
+                """Refuse header removal only after the selected write reaches the server."""
+                marker.touch()
+
+            stub.on_write = arm_failure
+        with unittest.mock.patch(__name__ + ".Handler", WriteResponseHandler):
+            result = self.run_command(stub, *args)
+        return result, stub, refused
+
+    def assert_redirect_refused(self, verb: str, cleanup: bool = False) -> None:
+        """Require a rejected empty redirect, one attempted write, and checked cleanup."""
+        result, stub, refused = self.run_write_case(verb, 302, cleanup=cleanup)
+        _, _, target = self.write_case(verb)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("write accepted:", result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing " + target[1][7:], result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(write_request_paths(stub), [target])
+        self.assertEqual(stub.requests[-1][:2], target)
+        if cleanup:
+            self.assertIsNotNone(refused)
+            assert_private_removal_failed(self, result, refused)
+
+    def assert_one_receipt(self, verb: str) -> None:
+        """Require the native 2xx response to expose exactly one acceptance receipt."""
+        result, stub, _ = self.run_write_case(verb)
+        _, _, target = self.write_case(verb)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("write accepted:"), 1, result.stderr)
+        self.assertEqual(write_request_paths(stub)[0], target)
+
+    def assert_empty_success_receipted(self, verb: str, status: int) -> None:
+        """A 204 still records HTTP acceptance while JSON consumers may refuse later."""
+        result, stub, _ = self.run_write_case(verb, 204)
+        _, _, target = self.write_case(verb)
+        self.assertEqual(result.returncode, status, result.stderr)
+        self.assertEqual(result.stderr.count("write accepted:"), 1, result.stderr)
+        self.assertIn("write accepted: " + target[1][7:], result.stderr)
+        self.assertEqual(write_request_paths(stub), [target])
+
+    def test_fork_redirect_refused_and_2xx_receipted_once(self) -> None:
+        """An empty fork redirect refuses while a created fork is receipted exactly once."""
+        self.assert_redirect_refused("fork")
+        self.assert_one_receipt("fork")
+        self.assert_empty_success_receipted("fork", 0)
+
+    def test_pr_redirect_refused_and_2xx_receipted_once(self) -> None:
+        """An empty pull redirect stops reviewers while a created pull has one receipt."""
+        self.assert_redirect_refused("pr")
+        self.assert_one_receipt("pr")
+        self.assert_empty_success_receipted("pr", 1)
+
+    def test_reply_redirect_refused_and_2xx_receipted_once(self) -> None:
+        """An empty reply redirect stops read-back while a stored reply has one receipt."""
+        self.assert_redirect_refused("reply")
+        self.assert_one_receipt("reply")
+        self.assert_empty_success_receipted("reply", 1)
+
+    def test_fork_redirect_with_header_cleanup_refusal_has_no_receipt(self) -> None:
+        """A redirected fork cannot print acceptance even when header cleanup refuses."""
+        self.assert_redirect_refused("fork", cleanup=True)
+
+    def test_pr_redirect_with_header_cleanup_refusal_has_no_receipt(self) -> None:
+        """A redirected pull cannot print acceptance even when header cleanup refuses."""
+        self.assert_redirect_refused("pr", cleanup=True)
+
+    def test_reply_redirect_with_header_cleanup_refusal_has_no_receipt(self) -> None:
+        """A redirected reply cannot print acceptance even when header cleanup refuses."""
+        self.assert_redirect_refused("reply", cleanup=True)
+
+    def assert_address_redirect_refused(self, verb: str) -> None:
+        """Reject a redirect's valid JSON address while retaining its 2xx control."""
+        data = b'{"html_url":"stub/address","number":1}'
+        result, stub, _ = self.run_write_case(verb, 302, data)
+        _, _, target = self.write_case(verb)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing " + target[1][7:], result.stderr)
+        self.assertNotIn("stub/address", result.stdout)
+        self.assertEqual(write_request_paths(stub), [target])
+        self.assertEqual(stub.requests[-1][:2], target)
+        control, _, _ = self.run_write_case(verb, 200, data)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertIn("stub/address", control.stdout)
+
+    def test_issue_redirect_cannot_print_address(self) -> None:
+        """Issue creation prints an address only after a successful HTTP response."""
+        self.assert_address_redirect_refused("issue")
+
+    def test_comment_redirect_cannot_print_address(self) -> None:
+        """Comment creation prints an address only after a successful HTTP response."""
+        self.assert_address_redirect_refused("comment")
+
+    def test_body_edit_redirect_cannot_print_address(self) -> None:
+        """A pull body edit prints an address only after a successful HTTP response."""
+        self.assert_address_redirect_refused("edit-body")
+
+    def test_close_comment_redirect_cannot_send_close(self) -> None:
+        """A redirected close comment cannot expose its address or send the close PATCH."""
+        self.assert_address_redirect_refused("close")
+
+    def test_reviewer_redirect_stops_readback(self) -> None:
+        """A redirected reviewer request stops before the success listing is read."""
+        result, stub, _ = self.run_write_case("reviewers", 302)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing /repos/", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(stub.requests[-1][0], "POST")
+
+    def test_bot_reviewer_redirect_stops_readback(self) -> None:
+        """A redirected bot reviewer request stops before reviewer confirmation reads."""
+        target = ("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1/requested_reviewers")
+        result, stub, _ = self.run_write_case("pr", 302, target=target)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing " + target[1][7:], result.stderr)
+        self.assertEqual(result.stderr.count("write accepted:"), 1)
+        self.assertEqual(stub.requests[-1][:2], target)
+
+    def test_close_patch_redirect_stops_confirmation(self) -> None:
+        """A redirected close PATCH stops before the closed-state confirmation read."""
+        target = ("PATCH", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1")
+        result, stub, _ = self.run_write_case("close", 302, target=target)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unexpected HTTP status 302 writing " + target[1][7:], result.stderr)
+        self.assertEqual(stub.requests[-1][:2], target)
+
+
 class ReplyTest(ForgejoTest):
     """The reply verb answers a review comment inside its thread."""
+
+    def test_unlanded_tested_head_reply_still_posts(self) -> None:
+        """A tested review reply on a real unlanded head still posts and reads back."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={sha}\n", encoding="utf-8")
+        stub = self.stub(heads=[sha])
+        result = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            sha,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.payloads(stub)), 1)
+        self.assertEqual(self.payloads(stub)[0]["body"], BODY)
+
+    def test_landed_tested_head_reply_is_refused_before_post(self) -> None:
+        """A tested review reply on a landed head exits 82 before its POST."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        sha = git_output(self.repo, "rev-parse", "topic")
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate tree=/w head={sha}\n", encoding="utf-8")
+        stub = self.stub(heads=[sha])
+        result = self.run_command(
+            stub,
+            "reply",
+            "--tested-head",
+            sha,
+            "--evidence",
+            str(evidence),
+            "1",
+            "7",
+            "85995",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("already on the live base", result.stderr)
+        self.assertEqual(result.stderr.splitlines()[-1], f"{sha[:12]}: {base[:12]}")
+        self.assertEqual(write_request_paths(stub), [])
 
     def test_reply_filler_is_refused_before_any_request(self) -> None:
         """A filler reply exits 81 before any token or review-comment request."""
@@ -1527,6 +2572,43 @@ class ReplyTest(ForgejoTest):
             for method, path, data in stub.requests
             if method == "POST" and "/reviews/" in path and path.endswith("/comments")
         ]
+
+    def test_reply_payload_removal_failure_is_not_retried(self) -> None:
+        """A failed payload removal exposes acceptance without claiming verified read-back."""
+
+        control = self.stub()
+        body = str(self.tmp / "body.md")
+        clean = self.reply(control, "85995", body)
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        posts = [
+            control.requests[index][2]
+            for index in range(len(control.requests))
+            if control.requests[index][0] == "POST"
+        ]
+        self.assertEqual(len(posts), 1)
+        refused = plant_content_removal_failure(self.bin_dir, self.tmp, posts[0].encode())
+        stub = self.stub()
+        result = self.reply(stub, "85995", body)
+        self.assertTrue(refused.is_file(), "reply payload removal was not attempted")
+        paths = refused.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(paths), 1, "reply payload removal was retried")
+        assert_private_removal_failed(self, result, refused)
+        self.assertEqual(Path(paths[0]).read_bytes(), posts[0].encode())
+        self.assertEqual(
+            write_request_paths(stub),
+            [("POST", "/api/v1/repos/FFmpeg/FFmpeg/pulls/1/reviews/7/comments")],
+        )
+        self.assertNotIn("replied ", result.stdout)
+        self.assertIn("write accepted:", result.stderr)
+        self.assertIn("read-back not verified", result.stderr)
+        self.assertEqual(
+            sum(
+                stub.requests[index][0] == "GET"
+                and "/reviews/7/comments" in stub.requests[index][1]
+                for index in range(len(stub.requests))
+            ),
+            1,
+        )
 
     def test_reply_copies_the_anchor_of_the_answered_comment(self) -> None:
         """Replying to a review comment posts at its file, line, and range."""
@@ -1742,6 +2824,48 @@ class ReplyTest(ForgejoTest):
 class TestClaimHeadTest(ForgejoTest):
     """Validate evidence before accepting claims about a tested head."""
 
+    def test_unlanded_tested_head_body_edit_still_patches(self) -> None:
+        """A tested PR body edit on a real unlanded head still sends its PATCH."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha], {sha: [[label("success")]]})
+        result = self.edit_body(stub, "--tested-head", sha, "--evidence", self.evidence(sha))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.patches(stub), [BODY])
+
+    def test_head_change_during_landed_check_refuses_body_edit(self) -> None:
+        """A new full head sharing the tested prefix after landed checking cannot reach PATCH."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        suffix = "0" if sha[-1] != "0" else "1"
+        changed = sha[:-1] + suffix
+        stub = Stub([sha] * 4 + [changed], {sha: [[label("success")]]})
+        prefix = sha[:12]
+        result = self.edit_body(stub, "--tested-head", prefix, "--evidence", self.evidence(prefix))
+        self.assertEqual(result.returncode, 76, result.stderr)
+        self.assertIn(f"tested head {sha} does not match live head {changed}", result.stderr)
+        self.assertEqual(stub.head_reads, 5)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_failed_head_read_after_landed_check_refuses_body_edit(self) -> None:
+        """A malformed final head read fails closed after a successful landed check."""
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha] * 4 + [None], {sha: [[label("success")]]})
+        result = self.edit_body(stub, "--tested-head", sha, "--evidence", self.evidence(sha))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot read the head", result.stderr)
+        self.assertEqual(stub.head_reads, 5)
+        self.assertEqual(self.patches(stub), [])
+
+    def test_landed_tested_head_body_edit_is_refused_before_patch(self) -> None:
+        """A tested PR body edit on a landed head exits 82 before its PATCH."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha], {sha: [[label("success")]]})
+        result = self.edit_body(stub, "--tested-head", sha, "--evidence", self.evidence(sha))
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("already on the live base", result.stderr)
+        self.assertEqual(result.stderr.splitlines()[-1], f"{sha[:12]}: {base[:12]}")
+        self.assertEqual(self.patches(stub), [])
+
     def test_comment_filler_is_refused_before_any_request(self) -> None:
         """A filler comment exits 81 before any token, head or comment request."""
         (self.tmp / "body.md").write_text("Would you like me to add a test?\n", encoding="utf-8")
@@ -1787,18 +2911,19 @@ class TestClaimHeadTest(ForgejoTest):
         self,
         stub: Stub,
         *,
+        head: str = A,
         path_first: Path | None = None,
         env_updates: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run a tested-head comment with the shared issue and body arguments."""
+        """Run a tested comment with matching evidence for the supplied head."""
 
         return self.run_command(
             stub,
             "comment",
             "--tested-head",
-            A,
+            head,
             "--evidence",
-            self.evidence(),
+            self.evidence(head),
             "1",
             str(self.tmp / "body.md"),
             path_first=path_first,
@@ -1819,6 +2944,68 @@ class TestClaimHeadTest(ForgejoTest):
         """Return bodies sent by pull-body PATCH requests."""
 
         return self.sent_bodies(stub, "PATCH")
+
+    def test_landed_tested_head_comment_is_refused(self) -> None:
+        """A tested comment on a landed head exits 82 before any POST."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha])
+        result = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            sha,
+            "--evidence",
+            self.evidence(sha),
+            "1",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("already on the live base", result.stderr)
+        self.assertIn(base[:12], result.stderr)
+        self.assertEqual(self.posts(stub), [])
+
+    def test_landed_no_test_claims_comment_is_posted(self) -> None:
+        """A comment without test claims can explain a landing without a special option."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        sha = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([sha])
+        result = self.run_command(
+            stub,
+            "comment",
+            "--no-test-claims",
+            "1",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.posts(stub), [BODY])
+
+    def test_removed_landed_note_option_is_usage_error(self) -> None:
+        """The removed landed-note option exits 64 before any forge request."""
+        stub = Stub()
+        result = self.comment(stub, "--landed-note", "--no-test-claims")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("usage: comment", result.stderr)
+        self.assertEqual(self.posts(stub), [])
+        self.assertEqual(stub.requests, [])
+
+    def test_unresolvable_tested_head_is_refused_before_post(self) -> None:
+        """A live head missing locally reaches the landed check and names the head."""
+        stub = Stub([A])
+        result = self.run_command(
+            stub,
+            "comment",
+            "--tested-head",
+            A,
+            "--evidence",
+            self.evidence(A),
+            "1",
+            str(self.tmp / "body.md"),
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"cannot resolve landed-check head {A}", result.stderr)
+        self.assertTrue(stub.requests)
+        self.assertTrue(all(method == "GET" for method, _, _ in stub.requests))
 
     def test_own_duplicate_comment_is_refused(self) -> None:
         """A whitespace-equivalent own reply exits 78 without a POST."""
@@ -2052,15 +3239,16 @@ class TestClaimHeadTest(ForgejoTest):
     def test_evidence_size_boundary(self) -> None:
         """Evidence at one MiB is accepted and larger evidence is refused."""
 
-        claim = f"- test: fate tree=/w head={A}\n"
+        head = git_output(self.repo, "rev-parse", "topic")
+        claim = f"- test: fate tree=/w head={head}\n"
         padding = "#" * 200 + "\n"
         remainder = 1048576 - len(claim)
         content = claim + padding * (remainder // len(padding)) + "#" * (remainder % len(padding))
         for extra in ("", "x"):
             with self.subTest(extra=extra):
-                stub = Stub([A])
+                stub = Stub([head])
                 evidence = self.evidence(content=content + extra)
-                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                proc = self.comment(stub, "--tested-head", head, "--evidence", evidence)
                 self.assertEqual(proc.returncode, 76 if extra else 0, proc.stderr)
                 if extra:
                     self.assertIn(f"{evidence}: evidence larger than 1 MiB", proc.stderr)
@@ -2080,12 +3268,13 @@ class TestClaimHeadTest(ForgejoTest):
     def test_evidence_line_count_boundary(self) -> None:
         """Ten thousand lines are accepted and an extra line is refused."""
 
-        claim = f"- test: fate tree=/w head={A}\n"
+        head = git_output(self.repo, "rev-parse", "topic")
+        claim = f"- test: fate tree=/w head={head}\n"
         for count in (10000, 10001):
             with self.subTest(count=count):
-                stub = Stub([A])
+                stub = Stub([head])
                 evidence = self.evidence(content=claim + "#\n" * (count - 1))
-                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                proc = self.comment(stub, "--tested-head", head, "--evidence", evidence)
                 self.assertEqual(proc.returncode, 0 if count == 10000 else 76, proc.stderr)
                 if count == 10001:
                     self.assertIn(f"{evidence}:10001: too many lines", proc.stderr)
@@ -2096,12 +3285,13 @@ class TestClaimHeadTest(ForgejoTest):
     def test_evidence_line_length_boundary(self) -> None:
         """A 65536-byte line is accepted and a longer line is refused."""
 
-        claim = f"- test: fate tree=/w head={A}\n"
+        head = git_output(self.repo, "rev-parse", "topic")
+        claim = f"- test: fate tree=/w head={head}\n"
         for length in (65536, 65537):
             with self.subTest(length=length):
-                stub = Stub([A])
+                stub = Stub([head])
                 evidence = self.evidence(content=claim + "#" * (length - 1) + "\n")
-                proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+                proc = self.comment(stub, "--tested-head", head, "--evidence", evidence)
                 self.assertEqual(proc.returncode, 0 if length == 65536 else 76, proc.stderr)
                 if length == 65537:
                     self.assertIn(f"{evidence}:2: line longer than 65536 bytes", proc.stderr)
@@ -2122,11 +3312,13 @@ class TestClaimHeadTest(ForgejoTest):
     def test_evidence_prefix_and_control_are_accepted(self) -> None:
         """A matching short head with a control line on another head posts."""
 
-        stub = Stub([A])
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head])
         evidence = self.evidence(
-            content=f"- control: red run head={STALE}\n  test: fate tree=/w head={A[:12].upper()}\n"
+            content=f"- control: red run head={STALE}\n"
+            f"  test: fate tree=/w head={head[:12].upper()}\n"
         )
-        proc = self.comment(stub, "--tested-head", A, "--evidence", evidence)
+        proc = self.comment(stub, "--tested-head", head, "--evidence", evidence)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
 
@@ -2214,9 +3406,10 @@ class TestClaimHeadTest(ForgejoTest):
         """The tested-head pull read preserves headers configured in curlrc."""
 
         (self.tmp / ".curlrc").write_text('header = "X-Curlrc: 1"\n', encoding="utf-8")
-        stub = Stub()
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head])
         proc = self.comment_body(
-            stub, env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)}
+            stub, head=head, env_updates={"HOME": str(self.tmp), "CURL_HOME": str(self.tmp)}
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(stub.pull_headers[0].get("X-Curlrc"), "1")
@@ -2253,9 +3446,10 @@ class TestClaimHeadTest(ForgejoTest):
     def test_matching_prefix_and_full_head_are_posted(self) -> None:
         """Both matching head prefixes and full hashes authorize a comment."""
 
-        for tested in (LIVE[:12], LIVE):
+        head = git_output(self.repo, "rev-parse", "topic")
+        for tested in (head[:12], head):
             with self.subTest(tested=tested):
-                stub = Stub([LIVE])
+                stub = Stub([head])
                 proc = self.comment(
                     stub, "--tested-head", tested, "--evidence", self.evidence(tested)
                 )
@@ -2275,9 +3469,10 @@ class TestClaimHeadTest(ForgejoTest):
     def test_comment_current_live_base_is_posted(self) -> None:
         """A live PR body naming the current merge base authorizes the comment POST."""
 
-        stub = Stub([LIVE])
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head])
         stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
-        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        proc = self.comment(stub, "--tested-head", head, "--evidence", self.evidence(head))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
 
@@ -2285,10 +3480,11 @@ class TestClaimHeadTest(ForgejoTest):
         """Rewriting the comment body file during pull reads cannot alter the posted text."""
 
         body_path = self.tmp / "body.md"
-        stub = Stub([LIVE])
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head])
         stub.pull_body = f"Base: FFmpeg master {MERGE_BASE[:12]}.\n"
         stub.on_pull = lambda: body_path.write_text("changed\n", encoding="utf-8")
-        proc = self.comment(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        proc = self.comment(stub, "--tested-head", head, "--evidence", self.evidence(head))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.posts(stub), [BODY])
 
@@ -2317,13 +3513,14 @@ class TestClaimHeadTest(ForgejoTest):
     def test_short_tested_head_checks_evidence_against_live_head(self) -> None:
         """Both writes reject a different full head sharing the tested prefix."""
 
-        other = LIVE[:7] + ("1" if LIVE[7] != "1" else "2") + LIVE[8:]
+        head = git_output(self.repo, "rev-parse", "topic")
+        other = head[:7] + ("1" if head[7] != "1" else "2") + head[8:]
         for command, method in ((self.comment, "POST"), (self.edit_body, "PATCH")):
-            for evidence_head, expected in ((other, 76), (LIVE, 0), (LIVE[:7], 0)):
+            for evidence_head, expected in ((other, 76), (head, 0), (head[:7], 0)):
                 with self.subTest(command=command.__name__, evidence_head=evidence_head):
-                    stub = Stub([LIVE], {LIVE: [[label("success")]]})
+                    stub = Stub([head], {head: [[label("success")]]})
                     proc = command(
-                        stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(evidence_head)
+                        stub, "--tested-head", head[:7], "--evidence", self.evidence(evidence_head)
                     )
                     self.assertEqual(proc.returncode, expected, proc.stderr)
                     self.assertEqual(self.sent_bodies(stub, method), [] if expected else [BODY])
@@ -2352,9 +3549,10 @@ class TestClaimHeadTest(ForgejoTest):
     def test_edit_body_abbreviated_evidence_same_head_edits(self) -> None:
         """Abbreviated evidence still edits when every read returns the same head."""
 
-        stub = Stub([LIVE, LIVE, LIVE, LIVE], {LIVE: [[label("success")]]})
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head, head, head, head], {head: [[label("success")]]})
         proc = self.edit_body(
-            stub, "--tested-head", LIVE[:7], "--evidence", self.evidence(LIVE[:7])
+            stub, "--tested-head", head[:7], "--evidence", self.evidence(head[:7])
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.patches(stub)), 1)
@@ -2408,10 +3606,22 @@ class TestClaimHeadTest(ForgejoTest):
     def test_edit_body_matching_tested_head_is_patched(self) -> None:
         """A matching tested-head prefix authorizes the body PATCH."""
 
-        stub = Stub([A], {A: [[label("success")]]})
-        proc = self.edit_body(stub, "--tested-head", A[:12], "--evidence", self.evidence(A[:12]))
+        head = git_output(self.repo, "rev-parse", "topic")
+        stub = Stub([head], {head: [[label("success")]]})
+        proc = self.edit_body(
+            stub, "--tested-head", head[:12], "--evidence", self.evidence(head[:12])
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.patches(stub), [BODY])
+
+    def test_edit_body_unresolvable_tested_head_is_refused_before_patch(self) -> None:
+        """Matching evidence cannot authorize an edit when the tested head is not a commit."""
+
+        stub = Stub([LIVE], {LIVE: [[label("success")]]})
+        proc = self.edit_body(stub, "--tested-head", LIVE, "--evidence", self.evidence(LIVE))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"cannot resolve landed-check head {LIVE}", proc.stderr)
+        self.assertEqual(write_request_paths(stub), [])
 
     def test_edit_body_requires_exactly_one_claim_option(self) -> None:
         """Body edits require exactly one claim mode and make no invalid PATCH."""
@@ -2466,12 +3676,19 @@ class FairyRequestTestBase(unittest.TestCase):
         for name, body in {
             "secret-tool": "printf 'fixture-token\\n'",
             "git": (
+                'if [ "$1" = --no-replace-objects ]; then shift; fi; '
                 'case "$1" in fetch|diff) exit 0;; '
                 "config) exit 1;; "
+                f"merge-base) echo {MERGE_BASE};; "
+                f'rev-list) if [ "$3" = {MERGE_BASE}..{FAIRY_FIXTURE_HEAD} ]; '
+                f"then echo {FAIRY_FIXTURE_HEAD}; fi; exit 0;; "
+                'patch-id) if read -r commit; then printf "fixture-patch %s\\n" "$commit"; '
+                "fi; exit 0;; "
                 "hash-object) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904;; "
                 "merge-tree) echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; "
                 '-c) case " $* " in *" merge-tree "*)'
-                " echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; esac; exit 97;; "
+                " echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904; exit 0;; "
+                '*" diff-tree "*) cat; exit 0;; esac; exit 97;; '
                 "update-ref) exit 0;; "
                 'rev-parse) if [ "$2" = --git-path ]; then echo "$PWD/fixture-git-dir/$3"; '
                 f"else echo {FAIRY_FIXTURE_HEAD}; fi;; *) exit 97;; esac"
@@ -3719,10 +4936,67 @@ class SweepTest(ForgejoTest):
         self.sweep_requests = stub.requests
         return result
 
+    def final_base_command(self, command: str, outcome: str) -> subprocess.CompletedProcess[str]:
+        """Move upstream during validation and check the final fetched base before any write."""
+        original = git_output(self.repo, "rev-parse", "master")
+        git(self.upstream, "update-ref", "refs/heads/master", original)
+        if outcome == "clean":
+            advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "early conflict\n")
+        stub = Stub(reviewers=[["alice"]])
+        pulls = stub.pulls
+        moved = []
+
+        def move_base(query: dict[str, list[str]]) -> list[dict]:
+            """Advance the base once after the early merge check and before the final fetch."""
+            if not moved:
+                git(self.upstream, "update-ref", "refs/heads/master", original)
+                if outcome == "landed":
+                    advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+                path = "other.txt" if outcome == "clean" else OVERLAP_FILE
+                moved.append(advance_upstream(self.tmp, self.upstream, path, "final base\n"))
+            return pulls(query)
+
+        with unittest.mock.patch.object(stub, "pulls", side_effect=move_base):
+            result = self.sweep_command(command, "--sweep", str(self.sweep), stub=stub)
+        self.assertEqual(len(moved), 1, result.stderr)
+        if outcome != "clean":
+            self.assertFalse((self.tmp / "push-argv.json").exists())
+            self.assertEqual(write_request_paths(stub), [])
+        return result
+
+    def test_final_base_conflict_stops_push_and_pr(self) -> None:
+        """A base that starts clean and becomes conflicting exits 73 before either write."""
+        commands = ("push", "pr")
+        for index in range(len(commands)):
+            with self.subTest(command=commands[index]):
+                result = self.final_base_command(commands[index], "conflict")
+                self.assertEqual(result.returncode, 73, result.stderr)
+                self.assertIn("does not merge cleanly", result.stderr)
+
+    def test_final_base_landing_precedes_conflict(self) -> None:
+        """Landing on the final base takes status 82 even when that same base conflicts."""
+        commands = ("push", "pr")
+        for index in range(len(commands)):
+            with self.subTest(command=commands[index]):
+                result = self.final_base_command(commands[index], "landed")
+                self.assertEqual(result.returncode, 82, result.stderr)
+                self.assertIn("already on the live base", result.stderr)
+
+    def test_final_clean_base_clears_earlier_conflict(self) -> None:
+        """A clean final base allows both writes despite a conflict in the early snapshot."""
+        commands = ("push", "pr")
+        for index in range(len(commands)):
+            with self.subTest(command=commands[index]):
+                result = self.final_base_command(commands[index], "clean")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_push_refuses_head_conflicting_with_live_base(self) -> None:
         """Refuse push when the swept head conflicts with the live upstream base."""
 
         base_sha = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        landed = self.run_command(Stub(), "landed", "topic")
+        self.assertEqual(landed.returncode, 0, landed.stderr)
+        self.assertEqual(landed.stdout, "not landed\n")
         result = self.sweep_command("push", "--sweep", str(self.sweep))
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertIn("does not merge cleanly into live master", result.stderr)
@@ -3730,6 +5004,160 @@ class SweepTest(ForgejoTest):
         self.assertIn(OVERLAP_FILE, result.stderr)
         self.assertFalse((self.tmp / "push-argv.json").exists())
         self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def plant_first_file_removal_failure(self) -> tuple[Path, Path, Path]:
+        """Install an rm wrapper that fails once on the first private merge file."""
+        real_rm = shutil.which("rm")
+        self.assertIsNotNone(real_rm)
+        refused = self.tmp / "refused-removal.txt"
+        refused.unlink(missing_ok=True)
+        wrapper = self.bin_dir / "rm"
+        clean_tmp = self.tmp / "merge-tmp"
+        clean_tmp.mkdir(exist_ok=True)
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            f'if [ "$1" = -f ] && [ ! -e {shlex.quote(str(refused))} ]; then\n'
+            f'  printf "%s\\n" "${{@: -1}}" >{shlex.quote(str(refused))}\n'
+            "  exit 1\nfi\n"
+            f'exec {shlex.quote(str(real_rm))} "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        return wrapper, refused, clean_tmp
+
+    def assert_first_file_removal_failed(
+        self, result: subprocess.CompletedProcess[str], refused: Path
+    ) -> None:
+        """Assert status 1 and a single final cannot-delete stderr line for the kept file."""
+        path = refused.read_text(encoding="utf-8").strip()
+        self.assertTrue(path)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        message = f"ffmpeg-forgejo: cannot delete {path}."
+        lines = result.stderr.splitlines()
+        self.assertEqual(lines[-1], message)
+        self.assertEqual(lines.count(message), 1)
+        self.assertTrue(Path(path).exists())
+
+    def test_push_first_private_file_removal_failure_stops_before_push(self) -> None:
+        """A failed removal of the first private merge file stops push with status 1."""
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        wrapper, refused, clean_tmp = self.plant_first_file_removal_failure()
+        result = self.sweep_command(
+            "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+        )
+        self.assert_first_file_removal_failed(result, refused)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        wrapper.unlink()
+        control = self.sweep_command(
+            "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+        )
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertTrue((self.tmp / "push-argv.json").exists())
+
+    def test_pr_first_private_file_removal_failure_stops_before_writes(self) -> None:
+        """A failed removal of the first private merge file stops PR creation before writes."""
+        advance_upstream(self.tmp, self.upstream, "other.txt", "upstream\n")
+        wrapper, refused, clean_tmp = self.plant_first_file_removal_failure()
+        stub = Stub(reviewers=[["alice"]])
+        result = self.sweep_command(
+            "pr",
+            "--sweep",
+            str(self.sweep),
+            stub=stub,
+            env_updates={"TMPDIR": str(clean_tmp)},
+        )
+        self.assert_first_file_removal_failed(result, refused)
+        self.assertEqual(self.sweep_requests, [])
+        self.assertEqual(stub.requested_users, [])
+        wrapper.unlink()
+        control_stub = Stub(reviewers=[["alice"]])
+        control = self.sweep_command(
+            "pr",
+            "--sweep",
+            str(self.sweep),
+            stub=control_stub,
+            env_updates={"TMPDIR": str(clean_tmp)},
+        )
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertIn("stub/pulls/1", control.stdout)
+        self.assertEqual(control_stub.requested_users, ["alice", "Forgejo_Fairy"])
+
+    def test_conflict_first_private_file_removal_failure_overrides_conflict(self) -> None:
+        """A failed removal on the merge-conflict path exits 1 without deferring status 73."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "upstream\n")
+        wrapper, refused, clean_tmp = self.plant_first_file_removal_failure()
+        result = self.sweep_command(
+            "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+        )
+        self.assert_first_file_removal_failed(result, refused)
+        self.assertNotIn("does not merge cleanly", result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        wrapper.unlink()
+        control = self.sweep_command(
+            "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+        )
+        self.assertEqual(control.returncode, 73, control.stderr)
+        self.assertIn("does not merge cleanly into live master", control.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_landed_first_private_file_removal_failure_overrides_landed_status(self) -> None:
+        """A failed removal of the first private merge file on a landed head exits 1, not 82."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        for index in range(2):
+            if index == 1:
+                advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "later base edit\n")
+            with self.subTest(conflicting=bool(index)):
+                wrapper, refused, clean_tmp = self.plant_first_file_removal_failure()
+                result = self.sweep_command(
+                    "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+                )
+                self.assert_first_file_removal_failed(result, refused)
+                self.assertNotIn("already on the live base", result.stderr)
+                self.assertFalse((self.tmp / "push-argv.json").exists())
+                wrapper.unlink()
+                control = self.sweep_command(
+                    "push", "--sweep", str(self.sweep), env_updates={"TMPDIR": str(clean_tmp)}
+                )
+                self.assertEqual(control.returncode, 82, control.stderr)
+                self.assertIn("already on the live base", control.stderr)
+                self.assertFalse((self.tmp / "push-argv.json").exists())
+
+    def test_push_refuses_landed_head_before_sending(self) -> None:
+        """A landed head exits 82 without reaching Git push or API writes."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        result = self.sweep_command("push", "--sweep", str(self.sweep))
+        self.assertEqual(result.returncode, 82, result.stderr)
+        self.assertIn("already on the live base", result.stderr)
+        self.assertIn(base[:12], result.stderr)
+        self.assertFalse((self.tmp / "push-argv.json").exists())
+        self.assertFalse(any(method == "POST" for method, _, _ in self.sweep_requests))
+        self.assertEqual(git_output(self.repo, "for-each-ref", "refs/ffmpeg-forgejo"), "")
+
+    def test_landed_conflicting_head_precedes_clean_merge_refusal(self) -> None:
+        """Both push and PR report landing before a later base conflict."""
+        base = advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "later base edit\n")
+        for command in ("push", "pr"):
+            with self.subTest(command=command):
+                result = self.sweep_command(command, "--sweep", str(self.sweep))
+                self.assertEqual(result.returncode, 82, result.stderr)
+                self.assertIn(base[:12], result.stderr)
+                self.assertFalse((self.tmp / "push-argv.json").exists())
+                self.assertFalse(any(method == "POST" for method, _, _ in self.sweep_requests))
+
+    def test_invalid_bot_login_precedes_landed_refusal(self) -> None:
+        """An invalid reviewer wins even when the landed patch later conflicts."""
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "topic\n")
+        advance_upstream(self.tmp, self.upstream, OVERLAP_FILE, "later base edit\n")
+        result = self.sweep_command(
+            "pr",
+            "--sweep",
+            str(self.sweep),
+            env_updates={"FFMPEG_FORGEJO_BOT_REVIEWER": "bad@login"},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("not a login: bad@login", result.stderr)
+        self.assertEqual(self.sweep_requests, [])
 
     def test_pr_refuses_head_conflicting_with_live_base(self) -> None:
         """Refuse PR creation when the swept head conflicts with the live upstream base."""
@@ -5114,6 +6542,277 @@ MUTANTS = {
 }
 
 
+def api_read_redirect_streams(node, streams: tuple[bool, bool]) -> tuple[bool, bool]:
+    """Track stdout and stderr concealment in the shell's left-to-right redirect order."""
+    destinations = list(streams)
+    children = node.named_children
+    for index in range(len(children)):
+        if children[index].type != "file_redirect":
+            continue
+        redirect = re.fullmatch(rb"([0-9]*)\s*(&>>?|>&|>>?)\s*(.*)", children[index].text)
+        if redirect is None:
+            continue
+        descriptor, operator, target = redirect.groups()
+        target = target.strip()
+        if operator.startswith(b"&") or (operator == b">&" and not target.isdigit()):
+            destinations = [True, True]
+        elif (descriptor or b"1") in {b"1", b"2"}:
+            hidden = True
+            if operator == b">&" and target in {b"1", b"2"}:
+                hidden = destinations[int(target) - 1]
+            destinations[int(descriptor or b"1") - 1] = hidden
+    return destinations[0], destinations[1]
+
+
+def api_read_pipeline_children(node, streams: tuple[bool, bool]) -> list | None:
+    """Route pipeline stages and apply trailing redirects only to the final stage."""
+    pipeline = node
+    if node.type == "redirected_statement" and node.named_children[0].type == "pipeline":
+        pipeline = node.named_children[0]
+    if pipeline.type != "pipeline":
+        return None
+    pending = []
+    children = pipeline.named_children
+    for index in range(len(children)):
+        child = children[index]
+        following = child.next_sibling
+        last = index == len(children) - 1
+        destinations = streams if last else (True, streams[1])
+        if last and pipeline != node:
+            destinations = api_read_redirect_streams(node, destinations)
+        combined = following is not None and following.text == b"|&"
+        pending.append((child, destinations, combined))
+    return pending
+
+
+def api_read_command(node) -> bool:
+    """Recognize repository existence checks and GET calls without interpreting literal data."""
+    if node.type != "command":
+        return False
+    name = node.child_by_field_name("name")
+    arguments = node.children_by_field_name("argument")
+    return name is not None and (
+        name.text == b"api_exists"
+        or (name.text == b"api" and bool(arguments) and arguments[0].text.strip(b"\"'") == b"GET")
+    )
+
+
+def api_read_diagnostic_violations(source: str) -> list[int]:
+    """Reject concealed API read diagnostics while preserving shell descriptor ordering."""
+    parser = bash_parser()
+    if isinstance(parser, str):
+        raise ValueError(parser)
+    raw = source.encode("utf-8")
+    root = parser.parse(raw).root_node
+    if root.has_error:
+        raise ValueError("cannot inspect API reads in malformed Bash")
+    pending = [(root, (False, False), False)]
+    violations = []
+    for _ in range(4 * len(raw) + 1):
+        if not pending:
+            return violations
+        node, streams, combined = pending.pop()
+        pipeline = api_read_pipeline_children(node, streams)
+        if pipeline is not None:
+            pending.extend(pipeline)
+            continue
+        if node.type == "command_substitution":
+            streams = (True, streams[1])
+        streams = api_read_redirect_streams(node, streams)
+        if combined:
+            streams = (streams[0], streams[0])
+        if streams[1] and api_read_command(node):
+            violations.append(node.start_point.row + 1)
+        if node.type not in {"comment", "heredoc_body", "raw_string"}:
+            children = node.named_children
+            pending.extend((children[index], streams, False) for index in range(len(children)))
+    raise ValueError("API read inspection exceeded its numeric node bound")
+
+
+def shell_function_measurements(source: str) -> dict[str, tuple[int, int]]:
+    """Count physical lines and command, test, assignment, and control nodes per function."""
+    parser = bash_parser()
+    if isinstance(parser, str):
+        raise ValueError(parser)
+    raw = source.encode("ascii")
+    root = parser.parse(raw).root_node
+    if root.has_error:
+        raise ValueError("cannot measure malformed Bash")
+    kinds = {"command", "test_command", "variable_assignment", "if_statement"}
+    kinds.update({"for_statement", "while_statement", "case_statement"})
+    measurements = {}
+    children = root.named_children
+    for index in range(len(children)):
+        function = children[index]
+        if function.type != "function_definition":
+            continue
+        pending = [function]
+        statements = 0
+        for _ in range(4 * len(function.text) + 1):
+            if not pending:
+                break
+            node = pending.pop()
+            if node.type in {"declaration_command", "heredoc_body"}:
+                continue
+            statements += node.type in kinds
+            pending.extend(node.named_children)
+        if pending:
+            raise ValueError("function measurement exceeded its numeric node bound")
+        name = function.child_by_field_name("name").text.decode("ascii")
+        measurements[name] = (function.end_point.row - function.start_point.row + 1, statements)
+    return measurements
+
+
+class ShellFunctionSizeTest(unittest.TestCase):
+    """Keep the refactored proof and receipt helpers within the review's size limits."""
+
+    def test_refactored_functions_fit_limits(self) -> None:
+        """Every round-13 shell function fits sixty lines and forty counted statements."""
+        names = (
+            "api_write_result",
+            "api",
+            "check_overlap_snapshot",
+            "check_pr_overlap_result",
+            "check_merge_tree_capture",
+            "neutral_merge_tree",
+            "landed_merge_result",
+            "check_landed",
+        )
+        sizes = shell_function_measurements(HELPER.read_text(encoding="ascii"))
+        for index in range(len(names)):
+            with self.subTest(function=names[index]):
+                lines, statements = sizes[names[index]]
+                self.assertLessEqual(lines, 60)
+                self.assertLessEqual(statements, 40)
+
+    def test_statement_boundary_counts_commands_but_not_local_or_heredoc(self) -> None:
+        """Forty statements fit and one additional command exceeds the review ceiling."""
+        body = "local ignored=1\ncat <<'PY'\nliteral text\nPY\n" + ":\n" * 39
+        boundary = shell_function_measurements("fixture() {\n" + body + "}\n")
+        planted = shell_function_measurements("fixture() {\n" + body + ":\n}\n")
+        self.assertEqual(boundary["fixture"][1], 40)
+        self.assertEqual(planted["fixture"][1], 41)
+
+
+class ApiReadSourceTest(unittest.TestCase):
+    """Guard every API read against discarded failure diagnostics, including planted callers."""
+
+    def test_helper_api_reads_keep_failure_diagnostics(self) -> None:
+        """No API read may discard stderr, regardless of its caller's write path or spelling."""
+        self.assertEqual(api_read_diagnostic_violations(HELPER.read_text(encoding="utf-8")), [])
+
+    def test_planted_absence_on_any_failure_callers_are_rejected(self) -> None:
+        """New paths, negation, substitutions, and grouped redirects cannot hide read failures."""
+        source = HELPER.read_text(encoding="utf-8")
+        callers = (
+            "if api GET /other >/dev/null 2>&1; then :; else api POST /create; fi",
+            "if ! api GET /other 2>/dev/null; then api POST /create; fi",
+            "api GET /other &>/dev/null || api POST /create",
+            'if out="$(api GET /other 2>/dev/null)"; then :; else api POST /create; fi',
+            "if api \\\nGET /other >/dev/null 2>&1; then :; else api POST /create; fi",
+            "{ if api GET /other; then :; else api POST /create; fi; } 2>/dev/null",
+            "if api_exists /other 2>/dev/null; then :; else api POST /create; fi",
+        )
+        for index in range(len(callers)):
+            with self.subTest(caller=callers[index]):
+                self.assertTrue(api_read_diagnostic_violations(source + "\n" + callers[index]))
+
+    def test_api_read_guard_allows_stdout_discard_and_literal_examples(self) -> None:
+        """Discarding JSON stdout and quoting or commenting examples keeps stderr available."""
+        source = (
+            "# if api GET /other 2>/dev/null; then :; else api POST /create; fi\n"
+            "printf '%s' 'api GET /other 2>/dev/null'\n"
+            "if api GET /other >/dev/null; then :; else exit 1; fi\n"
+        )
+        self.assertEqual(api_read_diagnostic_violations(source), [])
+
+    def test_combined_pipe_to_discarding_sink_is_rejected(self) -> None:
+        """Piping both output streams to a discarding consumer hides the API diagnostic."""
+        source = "api GET /other |& cat >/dev/null\n"
+        self.assertEqual(api_read_diagnostic_violations(source), [1])
+
+    def test_plain_pipe_to_discarding_sink_keeps_stderr(self) -> None:
+        """A plain stdout pipe leaves the API diagnostic on inherited standard error."""
+        source = "api GET /other | cat >/dev/null\n"
+        self.assertEqual(api_read_diagnostic_violations(source), [])
+
+    def test_redirect_order_keeps_inherited_stdout_available(self) -> None:
+        """Duplicating inherited stdout before discarding stdout leaves the diagnostic visible."""
+        visible = "api GET /other 2>&1 >/dev/null\n"
+        discarded = "api GET /other >/dev/null 2>&1\n"
+        self.assertEqual(api_read_diagnostic_violations(visible), [])
+        self.assertEqual(api_read_diagnostic_violations(discarded), [1])
+
+    def test_last_pipe_stage_redirect_does_not_hide_first_stderr(self) -> None:
+        """Redirects on a pipeline's sink leave the first stage's inherited stderr visible."""
+        visible = "api GET /other | cat >/dev/null 2>&1\n"
+        discarded = "api GET /other 2>&1 | cat >/dev/null\n"
+        self.assertEqual(api_read_diagnostic_violations(visible), [])
+        self.assertEqual(api_read_diagnostic_violations(discarded), [1])
+
+    def test_api_read_guard_rejects_unparseable_source(self) -> None:
+        """Malformed shell input cannot silently remove a caller from the source check."""
+        with self.assertRaisesRegex(ValueError, "malformed Bash"):
+            api_read_diagnostic_violations("if api GET /other 2>/dev/null; then")
+
+
+def private_removal_violations(source: str) -> list[int]:
+    """Return removal-token lines outside the single canonical private cleanup function."""
+    functions = list(re.finditer(r"(?ms)^remove_private_files\(\) \{\n.*?^\}\n", source))
+    if len(functions) != 1:
+        raise ValueError("exactly one private removal function required")
+    function = functions[0]
+    masked = (
+        source[: function.start()]
+        + re.sub(r"[^\n]", " ", function.group())
+        + source[function.end() :]
+    )
+    lines = masked.splitlines()
+    command = re.compile(r"(?<![\w-])(?:rm|rmdir|unlink|shred|-delete)(?![\w-])")
+    return [
+        index + 1
+        for index in range(len(lines))
+        if not lines[index].lstrip().startswith("#") and command.search(lines[index])
+    ]
+
+
+class PrivateRemovalSourceTest(unittest.TestCase):
+    """Require a single removal implementation and reject planted bypass commands."""
+
+    def test_helper_removals_use_the_private_cleanup_function(self) -> None:
+        """Every literal filesystem removal in the helper belongs to its canonical function."""
+        self.assertEqual(private_removal_violations(HELPER.read_text(encoding="utf-8")), [])
+
+    def test_planted_removal_commands_outside_cleanup_are_rejected(self) -> None:
+        """Bare commands, wrappers, traps, and find deletion cannot bypass the source guard."""
+        source = HELPER.read_text(encoding="utf-8")
+        commands = (
+            'rm -f "$body"',
+            '/bin/rm -f "$body"',
+            'command rm -f "$body"',
+            "trap 'rm -f \"$body\"' EXIT",
+            'rmdir "$body"',
+            'unlink "$body"',
+            'shred -u "$body"',
+            'find "$dir" -delete',
+            'printf "#"; rm -f "$body"',
+        )
+        for index in range(len(commands)):
+            with self.subTest(command=commands[index]):
+                self.assertEqual(
+                    private_removal_violations(source + commands[index] + "\n"),
+                    [len(source.splitlines()) + 1],
+                )
+
+    def test_private_removal_guard_requires_one_implementation(self) -> None:
+        """A missing or duplicate cleanup function fails the source guard closed."""
+        source = HELPER.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            private_removal_violations(source.replace("remove_private_files() {", "other() {"))
+        with self.assertRaises(ValueError):
+            private_removal_violations(source + "remove_private_files() {\n  :\n}\n")
+
+
 def top_level_trap_locals(source: str) -> list[str]:
     """Return names a top-level EXIT trap expands that some function also declares local."""
 
@@ -5222,8 +6921,20 @@ class TopLevelTrapTest(unittest.TestCase):
             [],
             "top-level EXIT trap expands a function-local name",
         )
-        self.assertEqual(source.count('trap \'rm -f "$reply_snapshot" "$reply_payload"\' EXIT'), 1)
-        self.assertEqual(source.count("trap 'rm -f \"$close_payload\"' EXIT"), 1)
+        # Registry entries, rather than dispatch-local names, own both payloads.
+        self.assertIn("private_temp reply_payload || exit 1", source)
+        self.assertIn("private_temp close_payload || exit 1", source)
+        self.assertIn("trap 'cleanup_exit \"$?\"' EXIT", source)
+
+    def test_wrapped_trap_naming_function_local_is_rejected(self) -> None:
+        """A replacement top-level trap expanding local body still fails the safety test."""
+        source = HELPER.read_text(encoding="utf-8")
+        planted = source + "\ntrap 'cleanup_exit \"$body\"' EXIT\n"
+        with (
+            unittest.mock.patch.object(Path, "read_text", return_value=planted),
+            self.assertRaisesRegex(AssertionError, "top-level EXIT trap"),
+        ):
+            self.test_helper_traps_name_no_function_local()
 
     def test_planted_shadowed_trap_is_found(self) -> None:
         """Shadowed top-level EXIT traps in dispatch branches or at column zero are reported."""
@@ -5438,8 +7149,7 @@ class CloseMutantTest(unittest.TestCase):
 
 
 class ReplyMutantTest(unittest.TestCase):
-    """Reply mutants dropping the anchor copy, range read-back or body snapshot,
-    or shadowing the payload trap, are caught."""
+    """Catch reply mutants dropping anchor, range, snapshot or registry ownership."""
 
     def test_reply_mutants_are_caught(self) -> None:
         """Each planted anchor-copy defect fails its targeted reply test case."""
@@ -5466,15 +7176,38 @@ class ReplyMutantTest(unittest.TestCase):
             "old_position dropped",
         )
         reply_branch = source.split("\n  reply)\n", 1)[1].split("\n    ;;\n", 1)[0]
-        self.assertEqual(reply_branch.count("reply_payload"), 5, "mutation site missing")
-        self.assertEqual(source.count(reply_branch), 1, "mutation site missing")
+        # Guard the exact replacement site independently of declarations and other uses.
+        payload_old = "private_temp reply_payload || exit 1"
+        self.assertEqual(reply_branch.count(payload_old), 1, "mutation site missing")
+        self.assertEqual(source.count(payload_old), 1, "mutation site missing")
         assert_mutant_killed(
             self,
             source,
-            (reply_branch, reply_branch.replace("reply_payload", "body")),
+            (
+                payload_old,
+                'private_temp reply_payload || exit 1; PRIVATE_FILES["$reply_payload"]=0',
+            ),
             (ReplyTest, "test_moved_head_exit_removes_the_reply_payload"),
-            "reply payload trap shadowed by a function local",
+            "reply payload registration dropped",
         )
+
+    def test_reply_payload_cleanup_mutants_are_caught(self) -> None:
+        """Retrying a failed removal or dropping registration fails its targeted test."""
+        source = HELPER.read_text(encoding="utf-8")
+        mutations = (
+            ('PRIVATE_FILES["$path"]=0', 'PRIVATE_FILES["$path"]=1'),
+            ('PRIVATE_FILES["$path"]=0', ":"),
+        )
+        for index in range(len(mutations)):
+            with self.subTest(mutant=mutations[index]):
+                self.assertEqual(source.count(mutations[index][0]), 1, "mutation site missing")
+                assert_mutant_killed(
+                    self,
+                    source,
+                    mutations[index],
+                    (ReplyTest, "test_reply_payload_removal_failure_is_not_retried"),
+                    "failed removal kept in registry",
+                )
 
     def test_reply_snapshot_and_range_mutants_are_caught(self) -> None:
         """Each planted snapshot or range defect fails its targeted reply test case."""
@@ -5518,6 +7251,518 @@ class ReplyMutantTest(unittest.TestCase):
             (ReplyTest, "test_reply_stored_with_another_range_fails_read_back"),
             "reply read-back ignores the line range",
         )
+
+
+class PrivateTempOwnershipTest(unittest.TestCase):
+    """Keep intentional removal failures inside the fixture that owns their cleanup."""
+
+    helper: Path = HELPER
+
+    def run_fixture_cases(self, cases: tuple[tuple[type[ForgejoTest], str], ...]) -> None:
+        """Run success and failed-removal commands and require empty TMPDIR after teardown."""
+        with tempfile.TemporaryDirectory(prefix="forgejo-leak-check-") as scratch:
+            root = Path(scratch)
+            for index in range(len(cases)):
+                base, name = cases[index]
+                with self.subTest(case=name):
+                    with (
+                        unittest.mock.patch.dict(os.environ, {"TMPDIR": str(root)}),
+                        unittest.mock.patch.object(tempfile, "tempdir", str(root)),
+                    ):
+                        case = base(name)
+                        case.helper = self.helper
+                        result = unittest.TestResult()
+                        case.run(result)
+                    self.assertTrue(result.wasSuccessful(), (result.failures, result.errors))
+                    self.assertEqual(list(root.iterdir()), [], "fixture leaked private files")
+
+    def test_review_payload_success_and_failure_leave_no_files(self) -> None:
+        """The 132-byte review payload is removed after successful and failed-removal replies."""
+        self.run_fixture_cases(
+            (
+                (ReplyTest, "test_reply_copies_the_anchor_of_the_answered_comment"),
+                (ReplyTest, "test_reply_payload_removal_failure_is_not_retried"),
+            )
+        )
+
+    def test_body_snapshot_success_and_failure_leave_no_files(self) -> None:
+        """The 18-byte body snapshot stays owned through successful and failing comments."""
+        self.run_fixture_cases(
+            (
+                (TestClaimHeadTest, "test_landed_no_test_claims_comment_is_posted"),
+                (PrivateRemovalTest, "test_exit_cleanup_failure_changes_success_to_one"),
+            )
+        )
+
+    def test_header_success_and_failure_leave_no_files(self) -> None:
+        """Authorization headers never outlive successful reads or injected deletion failures."""
+        self.run_fixture_cases(
+            (
+                (OverlapVerbTest, "test_no_overlap_reports_none"),
+                (
+                    PrivateRemovalTest,
+                    "test_pull_reader_cleanup_failure_stops_tested_comment_before_post",
+                ),
+            )
+        )
+
+    def test_merge_output_success_and_failure_leave_no_files(self) -> None:
+        """The 41-byte merge output stays owned on normal completion and failed removal."""
+        self.run_fixture_cases(
+            (
+                (LandedTest, "test_unrelated_base_advance_is_not_landed"),
+                (PrivateRemovalTest, "test_merge_cleanup_stops_main_flow_before_any_write"),
+            )
+        )
+
+    def test_candidates_success_and_failure_leave_no_files(self) -> None:
+        """The 27-byte candidate list stays owned on normal overlap checks and failed removal."""
+        self.run_fixture_cases(
+            (
+                (OverlapVerbTest, "test_no_overlap_reports_none"),
+                (
+                    PrivateRemovalTest,
+                    "test_overlap_cleanup_failure_stops_conditional_pr_before_post",
+                ),
+            )
+        )
+
+    def test_pr_payload_success_and_failure_leave_no_files(self) -> None:
+        """The 93-byte PR payload stays owned through successful writes and failed removal."""
+        self.run_fixture_cases(
+            (
+                (PullRequestOverlapTest, "test_nonoverlapping_open_pull_allows_creation"),
+                (
+                    PrivateRemovalTest,
+                    "test_main_payload_cleanup_stops_after_pr_post_before_reviewer_post",
+                ),
+            )
+        )
+
+    def test_empty_payload_success_and_failure_leave_no_files(self) -> None:
+        """Empty reply payloads are cleaned after normal replies and duplicate refusals."""
+        self.run_fixture_cases(
+            (
+                (ReplyTest, "test_reply_copies_the_anchor_of_the_answered_comment"),
+                (PrivateRemovalTest, "test_exit_cleanup_tries_both_private_reply_paths"),
+            )
+        )
+
+
+def reject_private_write(handler: Handler) -> None:
+    """Record a request body and reject its write without accessing external services."""
+    data = handler.rfile.read(int(handler.headers["Content-Length"])).decode()
+    handler.stub().requests.append(("POST", handler.path, data))
+    handler.reply(500, {"message": "planted write failure"})
+
+
+class PrivateTempExitTest(ForgejoTest):
+    """Require the helper itself to clean state before returning from failed writes."""
+
+    def install_allocation_signal(self, signal: str, withhold_path: bool = False) -> None:
+        """Signal the allocating shell after real creation and before returning the path."""
+        real_mktemp = shutil.which("mktemp")
+        self.assertIsNotNone(real_mktemp)
+        wrapper = self.bin_dir / "mktemp"
+        tail = 'kill -KILL "$BASHPID"' if withhold_path else 'printf "%s\\n" "$path"'
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            f'path="$({shlex.quote(str(real_mktemp))} "$@")" || exit 1\n'
+            f'kill -{signal} "$PPID" || exit 1\n'
+            f"{tail}\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+
+    def test_creation_signals_remove_files_and_directories_before_return(self) -> None:
+        """All three creation-time signals preserve their status and leave live TMPDIR empty."""
+        signals = (("HUP", 129), ("INT", 130), ("TERM", 143))
+        commands = (
+            ("reply", "--no-test-claims", "1", "7", "85995", str(self.tmp / "body.md")),
+            ("landed", "topic"),
+        )
+        for index in range(len(signals) * len(commands)):
+            signal, status = signals[index % len(signals)]
+            command = commands[index // len(signals)]
+            with self.subTest(signal=signal, command=command[0]):
+                clean_tmp = self.tmp / f"creation-tmp-{index}"
+                clean_tmp.mkdir()
+                self.install_allocation_signal(signal)
+                stub = Stub()
+                result = self.run_command(stub, *command, env_updates={"TMPDIR": str(clean_tmp)})
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(stub.requests, [])
+                self.assertTrue(self.tmp.is_dir())
+                self.assertTrue(clean_tmp.is_dir())
+                self.assertEqual(list(clean_tmp.iterdir()), [])
+
+    def test_killed_allocator_cannot_register_an_unreported_name(self) -> None:
+        """An allocator killed before printing its name leaves an undiscoverable empty file."""
+        self.install_allocation_signal("TERM", withhold_path=True)
+        result = self.run_command(
+            Stub(), "reply", "--no-test-claims", "1", "7", "85995", str(self.tmp / "body.md")
+        )
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertTrue(self.tmp.is_dir())
+        self.assertTrue(self.helper_tmp.is_dir())
+        retained = list(self.helper_tmp.iterdir())
+        self.assertEqual(len(retained), 1)
+        self.assertTrue(retained[0].is_file())
+        self.assertEqual(retained[0].read_bytes(), b"")
+
+    def test_signals_during_exit_cleanup_finish_all_removals(self) -> None:
+        """Signals during failed-reply cleanup cannot interrupt removal of either owned file."""
+        real_rm = shutil.which("rm")
+        self.assertIsNotNone(real_rm)
+        (self.tmp / "body.md").write_text("", encoding="utf-8")
+        signals = ("HUP", "INT", "TERM")
+        for index in range(len(signals)):
+            with self.subTest(signal=signals[index]):
+                clean_tmp = self.tmp / f"exit-signal-tmp-{index}"
+                clean_tmp.mkdir()
+                wrapper = self.bin_dir / "rm"
+                wrapper.write_text(
+                    "#!/bin/bash\n"
+                    f'kill -{signals[index]} "$PPID" || exit 1\n'
+                    f'exec {shlex.quote(str(real_rm))} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+                result = self.run_command(
+                    Stub(),
+                    "reply",
+                    "--no-test-claims",
+                    "1",
+                    "7",
+                    "85995",
+                    str(self.tmp / "body.md"),
+                    env_updates={"TMPDIR": str(clean_tmp)},
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("empty body file", result.stderr)
+                self.assertTrue(clean_tmp.is_dir())
+                self.assertEqual(list(clean_tmp.iterdir()), [])
+
+    def test_signal_before_first_exit_cleanup_command_removes_both_files(self) -> None:
+        """A signal on EXIT entry must clean directly before the original cleanup starts."""
+        source = self.helper.read_text(encoding="utf-8")
+        old = "  trap 'cleanup_exit \"$?\"' EXIT"
+        new = '  trap \'kill -TERM "$BASHPID"; cleanup_exit "$?"\' EXIT'
+        self.assertEqual(source.count(old), 1)
+        (self.tmp / "body.md").write_text("", encoding="utf-8")
+        with (
+            mutant_case(source, old, new, ForgejoTest, "ExitEntry") as case,
+            unittest.mock.patch.object(self, "helper", case.helper),
+        ):
+            result = self.run_command(
+                Stub(),
+                "reply",
+                "--no-test-claims",
+                "1",
+                "7",
+                "85995",
+                str(self.tmp / "body.md"),
+            )
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertIn("empty body file", result.stderr)
+        self.assertTrue(self.helper_tmp.is_dir())
+        self.assertEqual(list(self.helper_tmp.iterdir()), [])
+
+    def test_comment_http_failure_and_success_remove_snapshot_and_json(self) -> None:
+        """Comment snapshots and JSON bodies disappear on success and HTTP failure."""
+        for index in range(2):
+            stub = Stub()
+            clean_tmp = self.tmp / f"comment-tmp-{index}"
+            clean_tmp.mkdir()
+            patch = (
+                unittest.mock.patch.object(Handler, "do_POST", reject_private_write)
+                if index
+                else contextlib.nullcontext()
+            )
+            with patch:
+                result = self.run_command(
+                    stub,
+                    "comment",
+                    "--no-test-claims",
+                    "1",
+                    str(self.tmp / "body.md"),
+                    env_updates={"TMPDIR": str(clean_tmp)},
+                )
+            self.assertEqual(result.returncode, 1 if index else 0, result.stderr)
+            self.assertEqual(self.sent_bodies(stub, "POST"), [BODY])
+            self.assertEqual(list(clean_tmp.iterdir()), [])
+
+    def test_second_reply_allocation_failure_removes_the_empty_snapshot(self) -> None:
+        """Remove empty reply state on success and second-allocation failure."""
+        real_mktemp = shutil.which("mktemp")
+        self.assertIsNotNone(real_mktemp)
+        marker = self.tmp / "allocated"
+        for index in range(2):
+            clean_tmp = self.tmp / f"allocation-tmp-{index}"
+            clean_tmp.mkdir()
+            if index:
+                wrapper = self.bin_dir / "mktemp"
+                wrapper.write_text(
+                    "#!/bin/sh\n"
+                    f"if [ -s {shlex.quote(str(marker))} ]; then exit 1; fi\n"
+                    f"printf x >{shlex.quote(str(marker))}\n"
+                    f'exec {shlex.quote(str(real_mktemp))} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+            stub = Stub()
+            stub.review_comments[7] = copy.deepcopy(THREAD)
+            result = self.run_command(
+                stub,
+                "reply",
+                "--no-test-claims",
+                "1",
+                "7",
+                "85995",
+                str(self.tmp / "body.md"),
+                env_updates={"TMPDIR": str(clean_tmp)},
+            )
+            self.assertEqual(result.returncode, 1 if index else 0, result.stderr)
+            self.assertEqual(list(clean_tmp.iterdir()), [])
+
+    def test_pull_reader_signal_removes_headers_and_responses(self) -> None:
+        """Pull-reader headers and response files are cleaned on success and all three signals."""
+        real_curl = shutil.which("curl")
+        self.assertIsNotNone(real_curl)
+        sha = git_output(self.repo, "rev-parse", "topic")
+        evidence = self.tmp / "evidence.md"
+        evidence.write_text(f"- test: fate head={sha} tree=/w\n", encoding="utf-8")
+        signals = (None, "HUP", "INT", "TERM")
+        for index in range(len(signals)):
+            clean_tmp = self.tmp / f"pull-tmp-{index}"
+            clean_tmp.mkdir()
+            if signals[index]:
+                wrapper = self.bin_dir / "curl"
+                wrapper.write_text(
+                    "#!/bin/bash\n"
+                    'case " $* " in *" -o "*) '
+                    f'kill -{signals[index]} "$PPID"; exit 22;; esac\n'
+                    f'exec {shlex.quote(str(real_curl))} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+            result = self.run_command(
+                Stub(heads=[sha]),
+                "comment",
+                "--tested-head",
+                sha,
+                "--evidence",
+                str(evidence),
+                "1",
+                str(self.tmp / "body.md"),
+                env_updates={"TMPDIR": str(clean_tmp)},
+            )
+            self.assertEqual(result.returncode, 1 if index else 0, result.stderr)
+            self.assertEqual(list(clean_tmp.iterdir()), [])
+
+
+def require_private_allocator_contract(function: str) -> None:
+    """Require the one approved allocation form with signal deferral and both registrations."""
+    protected = (
+        "  private_cleanup_scope\n"
+        "  PRIVATE_BUSY=1\n"
+        '  private_path="$(mktemp "$@")" || private_rc=$?\n'
+        '  if [ "$private_rc" -eq 0 ]; then\n'
+        '    PRIVATE_ORDER+=("$private_path")\n'
+        '    PRIVATE_FILES["$private_path"]=1\n'
+        '    printf -v "$private_target" \'%s\' "$private_path" || private_rc=$?\n'
+        "  fi\n"
+        "  PRIVATE_BUSY=0\n"
+        "  private_signal 0\n"
+        '  return "$private_rc"\n'
+    )
+    if function.count(protected) != 1:
+        raise ValueError("allocator must defer signals through registration and assignment")
+
+
+def captured_private_allocator_calls(source: str) -> list[int]:
+    """Reject allocator calls whose registry would be isolated in a captured or piped shell."""
+    parser = bash_parser()
+    if isinstance(parser, str):
+        raise ValueError(parser)
+    raw = source.encode("utf-8")
+    root = parser.parse(raw).root_node
+    if root.has_error:
+        raise ValueError("cannot inspect private allocations in malformed Bash")
+    pending = [(root, False)]
+    violations = []
+    for _ in range(4 * len(raw) + 1):
+        if not pending:
+            return violations
+        node, captured = pending.pop()
+        if node.type == "function_definition":
+            captured = False
+        captured = (
+            captured
+            or node.type in {"command_substitution", "process_substitution", "pipeline"}
+            or (
+                node.type == "subshell"
+                and node.parent is not None
+                and node.parent.type != "function_definition"
+            )
+        )
+        if captured and node.type == "command":
+            name = node.child_by_field_name("name")
+            if name is not None and name.text == b"private_temp":
+                violations.append(node.start_point.row + 1)
+        if node.type not in {"comment", "heredoc_body", "raw_string"}:
+            children = node.named_children
+            pending.extend((children[index], captured) for index in range(len(children)))
+    raise ValueError("private allocation inspection exceeded its numeric node bound")
+
+
+def private_temp_violations(source: str) -> list[int]:
+    """Allow only direct allocator calls and the canonical allocation and handler forms."""
+    masked = source
+    expected = (("private_temp", "mktemp", 1), ("private_cleanup_scope", "trap", 4))
+    for index in range(len(expected)):
+        name, command, count = expected[index]
+        functions = list(re.finditer(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", masked))
+        if len(functions) != 1:
+            raise ValueError(f"exactly one {name} function required")
+        function = functions[0]
+        if name == "private_temp":
+            require_private_allocator_contract(function.group())
+        if len(re.findall(rf"\b{command}\b", function.group())) != count:
+            raise ValueError(f"{name} must contain {count} {command} commands")
+        masked = (
+            masked[: function.start()]
+            + re.sub(r"[^\n]", " ", function.group())
+            + masked[function.end() :]
+        )
+    lines = masked.splitlines()
+    approved_call = re.compile(
+        r"\s*private_temp [A-Za-z_][A-Za-z0-9_]*(?: -d)? \|\| "
+        r'(?:exit 1|return 1|die "[^"\n]*"|\{)'
+    )
+    violations = [
+        index + 1
+        for index in range(len(lines))
+        if not lines[index].lstrip().startswith("#")
+        and re.search(r"\b(?:mktemp|trap|private_temp)\b", lines[index])
+        and not approved_call.fullmatch(lines[index])
+    ]
+    return sorted(set(violations + captured_private_allocator_calls(masked)))
+
+
+class PrivateTempSourceTest(unittest.TestCase):
+    """Reject unregistered temporary state and replacement exit or signal handlers."""
+
+    helper: Path = HELPER
+
+    def test_only_registry_allocates_temporary_state_and_installs_handlers(self) -> None:
+        """All allocations and EXIT, HUP, INT and TERM traps belong to the registry."""
+        source = self.helper.read_text(encoding="utf-8")
+        self.assertEqual(private_temp_violations(source), [])
+        self.assertEqual(len(re.findall(r"\btrap\s+'[^']*'\s+EXIT\b", source)), 1)
+        signals = ("HUP", "INT", "TERM")
+        for index in range(len(signals)):
+            pattern = rf"\btrap\s+'[^']*'\s+{signals[index]}\b"
+            self.assertEqual(len(re.findall(pattern, source)), 1)
+
+    def test_planted_allocations_and_handler_replacements_are_rejected(self) -> None:
+        """Bare or wrapped allocations and trap resets cannot bypass registry ownership."""
+        source = self.helper.read_text(encoding="utf-8")
+        planted = (
+            'body="$(mktemp)"',
+            "/usr/bin/mktemp -d",
+            "command mktemp",
+            "trap - EXIT",
+            "trap 'exit 1' EXIT",
+            "trap - INT TERM HUP",
+        )
+        for index in range(len(planted)):
+            with self.subTest(command=planted[index]):
+                self.assertEqual(
+                    private_temp_violations(source + planted[index] + "\n"),
+                    [len(source.splitlines()) + 1],
+                )
+
+    def test_missing_or_duplicate_registry_functions_fail_closed(self) -> None:
+        """Deleting or duplicating either canonical function cannot make the count vacuous."""
+        source = self.helper.read_text(encoding="utf-8")
+        names = ("private_temp", "private_cleanup_scope")
+        for index in range(len(names)):
+            with self.subTest(function=names[index]):
+                with self.assertRaises(ValueError):
+                    private_temp_violations(source.replace(f"{names[index]}() {{", "other() {"))
+                with self.assertRaises(ValueError):
+                    private_temp_violations(source + f"{names[index]}() {{\n  :\n}}\n")
+
+    def test_dropped_allocator_registrations_are_caught_by_source_guard(self) -> None:
+        """Removing either allocator registration must fail the real source check on a copy."""
+        source = self.helper.read_text(encoding="utf-8")
+        registrations = (
+            '    PRIVATE_ORDER+=("$private_path")\n',
+            '    PRIVATE_FILES["$private_path"]=1\n',
+        )
+        for index in range(len(registrations)):
+            with self.subTest(registration=registrations[index]):
+                self.assertEqual(source.count(registrations[index]), 1)
+                assert_mutant_killed(
+                    self,
+                    source,
+                    (registrations[index], ""),
+                    (
+                        PrivateTempSourceTest,
+                        "test_only_registry_allocates_temporary_state_and_installs_handlers",
+                    ),
+                    "allocator registration removed",
+                )
+
+    def test_substitution_allocator_is_caught_by_source_guard(self) -> None:
+        """Moving a caller into a substitution must fail the source check on a mutated copy."""
+        source = self.helper.read_text(encoding="utf-8")
+        old = "    private_temp reply_snapshot || exit 1"
+        self.assertEqual(source.count(old), 1)
+        replacements = (
+            '    reply_snapshot="$(private_temp reply_snapshot)" || exit 1',
+            '    reply_snapshot="$(\n    private_temp reply_snapshot || exit 1\n    )"',
+        )
+        for index in range(len(replacements)):
+            with self.subTest(replacement=replacements[index]):
+                assert_mutant_killed(
+                    self,
+                    source,
+                    (old, replacements[index]),
+                    (
+                        PrivateTempSourceTest,
+                        "test_only_registry_allocates_temporary_state_and_installs_handlers",
+                    ),
+                    "allocator in command substitution loses parent ownership",
+                )
+
+    def test_other_allocator_call_forms_are_rejected(self) -> None:
+        """Wrappers, unchecked calls, pipelines and grouped substitutions fail the allow-list."""
+        source = self.helper.read_text(encoding="utf-8")
+        planted = (
+            "private_temp body",
+            "command private_temp body || exit 1",
+            "private_temp body || exit 1; echo bypass",
+            'body="$(\nprivate_temp body || exit 1\n)"',
+            "private_temp body || exit 1\n",
+            "(\nprivate_temp body || exit 1\n)",
+            "private_temp body || exit 1 | cat",
+            "cat <(\nprivate_temp body || exit 1\n)",
+        )
+        for index in range(len(planted)):
+            with self.subTest(command=planted[index]):
+                findings = private_temp_violations(source + planted[index] + "\n")
+                if index == 4:
+                    self.assertEqual(findings, [])
+                else:
+                    self.assertTrue(findings)
+
+    def test_allocator_guard_rejects_malformed_shell(self) -> None:
+        """Malformed shell cannot hide an allocator from the parent-ownership check."""
+        source = self.helper.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "malformed Bash"):
+            private_temp_violations(source + "if true; then\n")
 
 
 def load_tests(
