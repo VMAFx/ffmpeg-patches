@@ -40,6 +40,8 @@ REPORT_TABLES = {
     "unchecked-return": TABLE,
     "state-advance": "| file:line | expression | first earlier error return line | disposition |",
     "doc-claims": "| file:line | claim text | library | oldest | newest | disposition |",
+    "vulkan-features": "| file:line | feature | shader evidence | direction | disposition |",
+    "port-parity": "| file:line | normalization | shader site | disposition |",
 }
 REVIEW_TABLE = "| class | question | disposition |"
 REVIEW_SEPARATOR = "| --- | --- | --- |"
@@ -778,7 +780,7 @@ def validate_review_classes(lines: list[str], sha: str, classes: list[dict]) -> 
 
 
 def validate_full_report(path: Path, sha: str, class_file: Path = CLASS_FILE) -> bool:
-    """Require the three reviewed sweep tables plus all recurring review class answers."""
+    """Require every REPORT_TABLES sweep section plus all recurring review class answers."""
     with path.open("rb") as stream:
         data = stream.read(MAX_REPORT_BYTES + 1)
     check_limit("report size", len(data), MAX_REPORT_BYTES)
@@ -830,7 +832,7 @@ def sweep_all(directory: str, base: str, head: str) -> str:
     metadata = report.splitlines()
     base = metadata[1].removeprefix("base: ")
     head = metadata[2].removeprefix("head: ")
-    for name in ("state_advance", "doc_claims"):
+    for name in ("state_advance", "doc_claims", "vulkan_features", "port_parity"):
         report += "\n" + sweep_class(name, directory, base, head, deadline)
         check_limit("report size", len(report.encode("utf-8")), MAX_REPORT_BYTES)
     report += "\n" + render_review_classes(head)

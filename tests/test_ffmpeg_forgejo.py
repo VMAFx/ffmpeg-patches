@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from scripts import review_classes, unit_test_budget
-from tests.helpers import isolated_git_environment
+from tests.helpers import full_sweep_report, isolated_git_environment
 
 ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "ffmpeg-forgejo"
@@ -116,35 +116,6 @@ def git_output(repo: Path, *args: str) -> str:
         text=True,
         timeout=120,
     ).stdout.strip()
-
-
-def full_sweep_report(sha: str) -> str:
-    """Build reviewed sweep tables and all recurring class answers at one head."""
-
-    rows = "".join(
-        f"| {item['id']} | {item['question']} | no-variant: fixture |\n"
-        for item in review_classes.load_classes()
-    )
-    return (
-        "class: unchecked-return\n"
-        f"head: {sha}\n\n"
-        "| file:line | callee | kind | same file as fix | disposition |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "no hits\n\n"
-        "class: state-advance\n"
-        f"head: {sha}\n\n"
-        "| file:line | expression | first earlier error return line | disposition |\n"
-        "| --- | --- | --- | --- |\n"
-        "no hits\n\n"
-        "class: doc-claims\n"
-        f"head: {sha}\n\n"
-        "| file:line | claim text | library | oldest | newest | disposition |\n"
-        "| --- | --- | --- | --- | --- | --- |\n"
-        "no hits\n"
-    ) + (
-        f"\nclass: review-classes\nhead: {sha}\n\n"
-        "| class | question | disposition |\n| --- | --- | --- |\n" + rows
-    )
 
 
 def copy_sweep_validator(scripts: Path) -> None:
