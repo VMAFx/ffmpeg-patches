@@ -51,7 +51,7 @@ index 231c6b67c5dd7564633dc0801adc81cf676ea575..c8c4e002e95f06aac7a5e2caccd0d2a9
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 20fd10c7f159d3450599317937944a81257574a5..c77fb72188d1abbe09d72ada1cf43298d9d7c6b4 100644
+index 7b65d803d57ab355f5ce1d7e4c8264f719217f2b..01028dcb99508819ec946e761e431cdfc36d1a58 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15792,6 +15792,38 @@ The command accepts the same syntax of the corresponding option.
