@@ -226,13 +226,17 @@ class BaseClaimsTest(unittest.TestCase):
         """Review examples and uppercase heads yield normalized dependency claims."""
         cases = (
             (
-                "Depends on #25664: the first three commits are that PR's series, "
-                "currently ending at c35b0e1fce.",
+                (
+                    "Depends on #25664: the first three commits are that PR's series, "
+                    "currently ending at c35b0e1fce."
+                ),
                 [(25664, "c35b0e1fce")],
             ),
             (
-                "This branch is stacked on pull request 25726 (head edd7328845e3); "
-                "only the last three commits are new here.",
+                (
+                    "This branch is stacked on pull request 25726 (head edd7328845e3); "
+                    "only the last three commits are new here."
+                ),
                 [(25726, "edd7328845e3")],
             ),
             ("on top of PR #12 (head: ABCDEF1)", [(12, "abcdef1")]),
