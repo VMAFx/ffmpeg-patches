@@ -276,7 +276,14 @@ The checks cover:
 A nightly run applies the series onto FFmpeg master with
 `series.py apply TREE --master-forms https://code.ffmpeg.org/FFmpeg/FFmpeg.git`.
 It fetches each recorded `master_form` and applies that PR diff instead of
-the pinned-release patch. A pull request that carries several patches records
+the pinned-release patch. A master form that conflicts only in
+`libavfilter/Makefile`, where each conflict region adds lines after the same
+base line and changes none, is merged keeping the lines of both sides
+(`UNION_MERGE_PATHS` in `scripts/series.py`); the run names the file and the
+hunk count on stderr and in the commit message. A conflict in any other file,
+a deleted or mode-changed file, or a region that changes base lines still
+reports the patch as a conflict, with its reason on stderr. A pull request
+that carries several patches records
 its master_form on the last of them; the earlier ones report in-master-form
 and are included only if that form applies. A recorded `upstream_commit`
 that is an ancestor of the tested master reports the patch as upstream without
