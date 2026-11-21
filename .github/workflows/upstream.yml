@@ -62,3 +62,16 @@ jobs:
       - name: Fail when drift needs review or could not be checked
         if: ${{ !cancelled() && (steps.patch.outputs.changed == 'true' || steps.drift.outcome == 'failure') }}
         run: exit 1
+  links:
+    name: upstream overlap scan
+    runs-on: ubuntu-26.04
+    # Twice SCAN_BUDGET_SECONDS; test_workflow_actions checks the relationship.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+      - name: Check open pull requests for upstream overlaps
+        id: links
+        run: python3 scripts/upstream_links.py check

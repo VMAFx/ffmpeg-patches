@@ -2023,6 +2023,151 @@ class ContributionsTest(SeriesTestCase):
         self.assertEqual((status, out), (1, ""))
         self.assertIn("series.txt", err)
 
+    def related_item(self, number: int = 10, **changes: object) -> dict[str, object]:
+        """Build a valid related object for contribution schema tests."""
+        base: dict[str, object] = {
+            "number": number,
+            "kind": "pull",
+            "author": "other",
+            "reason": "same-files",
+            "state": "open",
+            "seen": "2026-11-12",
+        }
+        return base | changes
+
+    def test_valid_fixes_issues_and_related_pass_without_changing_table(self) -> None:
+        """Accept a contribution entry carrying valid fixes_issues and related lists."""
+        before_table = self.run_main()[1]
+        related = [
+            self.related_item(10, kind="issue", reason="same-subject", state="closed"),
+            self.related_item(20, kind="pull", reason="same-files", state="open"),
+            self.related_item(30, kind="pull", reason="same-patch-id", state="merged"),
+        ]
+        first = self.fx.record(1, fixes_issues=[100, 200], related=related)
+        self.assertEqual(self.check_with([first, self.fx.record(2)]).errors, [])
+        self.assertEqual(self.run_main()[1], before_table)
+
+    def test_fixes_issues_rules_fail_with_position_and_field(self) -> None:
+        """Reject malformed fixes_issues types, non-positive values, duplicates, order and cap."""
+        cases = (
+            ("not-a-list", "entry 1: 'fixes_issues' must be a list"),
+            ([0], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([-3], "entry 1: 'fixes_issues' items must be positive integers"),
+            (["1"], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([True], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([False], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([1.0], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([None], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([5, 5], "entry 1: 'fixes_issues' must not contain duplicates"),
+            ([9, 4], "entry 1: 'fixes_issues' must be sorted by number"),
+            (
+                list(range(1, series.MAX_FIXES_ISSUES + 2)),
+                f"entry 1: 'fixes_issues' exceeds cap of {series.MAX_FIXES_ISSUES}",
+            ),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                entries = [self.fx.record(1, fixes_issues=value), self.fx.record(2)]
+                self.assert_error(self.check_with(entries, render=False), expected)
+
+    def test_related_number_rejects_nonintegers_without_returning_them(self) -> None:
+        """Invalid related numbers report an error and return None independently."""
+        for value in (True, False, 1.0, None, 0, -1):
+            with self.subTest(value=value):
+                findings = series.Findings()
+                result = series.check_related_item(
+                    self.related_item(1) | {"number": value}, "entry 1", findings
+                )
+                self.assert_error(findings, "'number' must be a positive integer")
+                self.assertIsNone(result)
+
+    def test_related_number_accepts_positive_integer(self) -> None:
+        """The smallest positive related number returns unchanged without findings."""
+        findings = series.Findings()
+        result = series.check_related_item(self.related_item(1), "entry 1", findings)
+        self.assertEqual(findings.errors, [])
+        self.assertEqual(result, 1)
+
+    def test_related_list_and_key_rules_fail_with_position_and_field(self) -> None:
+        """Reject non-list related fields, non-object items, unknown keys, missing keys and cap."""
+        missing = self.related_item(10)
+        del missing["seen"]
+        cap_items = [self.related_item(n) for n in range(1, series.MAX_RELATED + 2)]
+        cases = (
+            ("not-a-list", "entry 1: 'related' must be a list"),
+            (["not-an-object"], "entry 1: 'related' items must be objects"),
+            ([self.related_item(10, extra="x")], "entry 1: 'related' has unknown key 'extra'"),
+            ([missing], "entry 1: 'related' lacks key 'seen'"),
+            (cap_items, f"entry 1: 'related' exceeds cap of {series.MAX_RELATED}"),
+        )
+        for value, expected in cases:
+            with self.subTest(expected=expected):
+                entries = [self.fx.record(1, related=value), self.fx.record(2)]
+                self.assert_error(self.check_with(entries, render=False), expected)
+
+    def test_related_author_carriage_return_is_an_identified_finding(self) -> None:
+        """Manifest validation rejects carriage returns before rendering diagnostics."""
+        entry = self.fx.record(1, related=[self.related_item(10, author="alice\rbob")])
+        self.assert_error(
+            self.check_with([entry, self.fx.record(2)], render=False),
+            "entry 1: 'related' field 'author' must be",
+        )
+
+    def test_related_author_error_states_printable_length_rule_without_echoing_value(self) -> None:
+        """State the nonblank printable length rule and omit the rejected author value."""
+        expected = (
+            "entry 1: 'related' field 'author' must be nonblank printable text of at most "
+            f"{series.MAX_RELATED_AUTHOR_CHARS} characters"
+        )
+        for bad, secret in (
+            ("   ", "   "),
+            ("secret-control\x07author", "secret-control"),
+            ("z" * (series.MAX_RELATED_AUTHOR_CHARS + 1), "zzzzzzzz"),
+        )[:3]:
+            with self.subTest(bad=bad[:8]):
+                entry = self.fx.record(1, related=[self.related_item(10, author=bad)])
+                findings = self.check_with([entry, self.fx.record(2)], render=False)
+                self.assert_error(findings, expected)
+                self.assertFalse(any(secret in err for err in findings.errors))
+
+    def test_undecided_relation_cannot_masquerade_as_manifest_evidence(self) -> None:
+        """Keep undecided file comparisons outside the proven-relation manifest schema."""
+        entry = self.fx.record(1, related=[self.related_item(10, reason="same-files-undecided")])
+        self.assert_error(
+            self.check_with([entry, self.fx.record(2)], render=False),
+            "entry 1: 'related' field 'reason' must be",
+        )
+
+    def test_related_item_field_and_order_rules_fail_with_position_and_field(self) -> None:
+        """Reject invalid related field values, duplicate numbers and unsorted related lists."""
+        cases = (
+            ([self.related_item(0)], "entry 1: 'related' field 'number' must be a positive"),
+            ([self.related_item(-1)], "entry 1: 'related' field 'number' must be a positive"),
+            (
+                [self.related_item(10) | {"number": True}],
+                "entry 1: 'related' field 'number' must be a positive",
+            ),
+            ([self.related_item(10, kind="commit")], "entry 1: 'related' field 'kind' must be"),
+            ([self.related_item(10, author=" ")], "entry 1: 'related' field 'author' must be"),
+            ([self.related_item(10, author="a\nb")], "entry 1: 'related' field 'author' must be"),
+            ([self.related_item(10, reason="other")], "entry 1: 'related' field 'reason' must be"),
+            ([self.related_item(10, state="draft")], "entry 1: 'related' field 'state' must be"),
+            ([self.related_item(10, seen="2026-02-30")], "entry 1: 'related' field 'seen' must be"),
+            ([self.related_item(10, seen="yesterday")], "entry 1: 'related' field 'seen' must be"),
+            (
+                [self.related_item(10), self.related_item(10)],
+                "entry 1: 'related' must not contain duplicate numbers",
+            ),
+            (
+                [self.related_item(20), self.related_item(10)],
+                "entry 1: 'related' must be sorted by number",
+            ),
+        )
+        for value, expected in cases:
+            with self.subTest(expected=expected):
+                entries = [self.fx.record(1, related=value), self.fx.record(2)]
+                self.assert_error(self.check_with(entries, render=False), expected)
+
 
 class ExportTest(SeriesTestCase):
     def test_round_trip_is_byte_identical(self) -> None:

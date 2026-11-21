@@ -20,17 +20,21 @@
         require a human to drop the patch and remain drift findings.
 
 Exit status: 0 when no unfixed drift remains, 1 on drift, 2 when the tool
-cannot run (unsound data file, forge unreachable, unexpected answer).
+cannot run (unsound data file, forge unreachable, unexpected answer), 3 when
+--fix wrote repairs but could not remove the manifest lock.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import http.client
 import json
 import re
 import sys
+import threading
 import tomllib
-import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -44,14 +48,29 @@ except ModuleNotFoundError:
     from scripts import forge_settings, series
 
 Fetch = Callable[[str], dict]
+REQUEST_TIMEOUT = 30
+# Allow 50 ordinary pull bodies per page while bounding decoding and allocation.
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# Forge envelopes need far fewer keys; bound duplicate checks within each JSON object.
+MAX_RESPONSE_OBJECT_KEYS = 1024
 MAX_SERIES_ENTRIES = 4096
 MAX_SIDECAR_LINES = 4096
 MAX_REPAIR_PATHS = MAX_SERIES_ENTRIES + 2
+PUBLISHED_WITH_LEFTOVERS = 3
 STATE_TO_STATUS = {v: k for k, v in series.FORGE_STATES.items()}
 
 
 class DriftError(Exception):
     """The comparison cannot run; main() exits 2."""
+
+
+class _RepairLines(list[str]):
+    """Carry lock cleanup leftovers without changing the two-list fix_drift return shape."""
+
+    def __init__(self) -> None:
+        """Initialize an empty repair diagnostic list and its leftover collection."""
+        super().__init__()
+        self.leftovers: list[str] = []
 
 
 @dataclass
@@ -60,7 +79,7 @@ class Repairs:
 
     files: dict[Path, bytes] = field(default_factory=dict)
     originals: dict[Path, bytes] = field(default_factory=dict)
-    lines: list[str] = field(default_factory=list)
+    lines: _RepairLines = field(default_factory=_RepairLines)
 
 
 def bounded_lines(path: Path, content: bytes, limit: int) -> list[str]:
@@ -101,6 +120,14 @@ def bounded_series(root: Path, findings: series.Findings, repairs: Repairs | Non
     return names
 
 
+def repo_api_url() -> str:
+    """Return the Forgejo API base URL for the configured repository."""
+    try:
+        return f"{forge_settings.api_base()}/repos/{forge_settings.repo()}"
+    except ValueError as exc:
+        raise DriftError(str(exc)) from exc
+
+
 def api_url(url: str, number: int | None = None) -> str:
     """Return the Forgejo API URL for a pull request."""
     match = series.pull_url_pattern().fullmatch(url) if isinstance(url, str) else None
@@ -110,13 +137,140 @@ def api_url(url: str, number: int | None = None) -> str:
     return f"{host}/api/v1/repos/{owner}/{repository}/pulls/{number}"
 
 
-def fetch_json(url: str) -> dict:
+def response_object(pairs: list[tuple[str, object]]) -> dict:
+    """Reject duplicate response keys with bounded linear work per decoded object."""
+    if len(pairs) > MAX_RESPONSE_OBJECT_KEYS:
+        raise ValueError(f"response object exceeds {MAX_RESPONSE_OBJECT_KEYS} keys")
+    result: dict = {}
+    for key, value in pairs[:MAX_RESPONSE_OBJECT_KEYS]:
+        if key in result:
+            raise ValueError(f"key {key!r} is written twice")
+        result[key] = value
+    return result
+
+
+_REDIRECT_STATE = threading.local()
+
+
+@contextlib.contextmanager
+def redirect_admit(admit: Callable[[], object] | None):
+    """Bind a per-request redirect admission check on the active fetch thread."""
+    previous = getattr(_REDIRECT_STATE, "admit", None)
+    _REDIRECT_STATE.admit = admit
+    try:
+        yield
+    finally:
+        _REDIRECT_STATE.admit = previous
+
+
+def read_response(answer: object, url: str) -> bytes:
+    """Read at most one byte beyond the response ceiling before JSON decoding."""
+    content = answer.read(MAX_RESPONSE_BYTES + 1)
+    if len(content) > MAX_RESPONSE_BYTES:
+        answer.close()
+        raise DriftError(f"{url}: response exceeds {MAX_RESPONSE_BYTES} bytes")
+    declared = getattr(answer, "headers", {}).get("Content-Length")
+    if declared is not None and len(content) < int(declared):
+        answer.close()
+        raise DriftError(
+            f"{url}: short response: received {len(content)} of {declared} declared bytes"
+        )
+    return content
+
+
+class HttpsProxyHandler(urllib.request.ProxyHandler):
+    """Apply environment or explicit proxy settings to https destinations only."""
+
+    def __init__(self, proxies: dict[str, str] | None = None) -> None:
+        """Keep an explicit proxy mapping or read live environment proxies per request."""
+        super().__init__({})
+        self.https_proxies = proxies
+
+    def https_open(self, req: urllib.request.Request):
+        """Route an https request through the configured https proxy when present."""
+        proxies = urllib.request.getproxies() if self.https_proxies is None else self.https_proxies
+        proxy = {
+            key.lower(): value for key, value in list(proxies.items())[:MAX_RESPONSE_OBJECT_KEYS]
+        }.get("https")
+        return self.proxy_open(req, proxy, "https") if proxy else None
+
+
+class HttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when its target URL is https."""
+
+    # urllib requires this callback signature, including all six positional arguments.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913, PLR0917
+        """Refuse a non-https redirect target before its request is built or sent."""
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            if fp is not None:
+                fp.close()
+            raise DriftError(f"{req.full_url}: redirect to {newurl} refused; scheme must be https")
+        if fp is not None:
+            read_response(fp, req.full_url)
+        request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if request is not None:
+            request.remove_header("Proxy-authorization")
+            admit = getattr(_REDIRECT_STATE, "admit", None)
+            if admit is not None:
+                try:
+                    admit()
+                except BaseException:
+                    if fp is not None:
+                        fp.close()
+                    raise
+        return request
+
+
+def build_https_opener(
+    https_handler: urllib.request.BaseHandler | None = None,
+    proxies: dict[str, str] | None = None,
+) -> urllib.request.OpenerDirector:
+    """Install HTTPS and error processing without build_opener's other transports."""
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(HttpsProxyHandler(proxies))
+    opener.add_handler(urllib.request.HTTPSHandler() if https_handler is None else https_handler)
+    opener.add_handler(HttpsRedirectHandler())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    opener.add_handler(urllib.request.UnknownHandler())
+    return opener
+
+
+OPENER = build_https_opener()
+
+
+def open_url(request: urllib.request.Request, timeout: float) -> http.client.HTTPResponse:
+    """Open a request through the https-only opener; tests patch this one name."""
+    return OPENER.open(request, timeout=timeout)  # nosec B310 - fetch_json and HttpsRedirectHandler admit https only.
+
+
+def fetch_json(
+    url: str, *, allow_list: bool = False, response_headers: dict[str, str] | None = None
+) -> dict | list:
+    """Fetch HTTPS JSON as an object, or a list when allow_list is set."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise DriftError(f"{url}: URL scheme must be https")
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=30) as answer:
-            data = json.load(answer)
-    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        with open_url(request, timeout=REQUEST_TIMEOUT) as answer:
+            if response_headers is not None:
+                response_headers.clear()
+                headers = getattr(answer, "headers", {})
+                links = [
+                    v
+                    for k, v in list(headers.items())[:MAX_RESPONSE_OBJECT_KEYS]
+                    if k.lower() == "link" and v is not None
+                ]
+                if links:
+                    response_headers["Link"] = ", ".join(links)
+                total = headers.get("X-Total-Count")
+                if total is not None:
+                    response_headers["X-Total-Count"] = total
+            data = json.loads(read_response(answer, url), object_pairs_hook=response_object)
+    except (OSError, ValueError, RecursionError, http.client.HTTPException) as exc:
         raise DriftError(f"{url}: {exc}") from exc
+    if allow_list and isinstance(data, list):
+        return data
     if not isinstance(data, dict):
         raise DriftError(f"{url}: the answer is not a JSON object")
     return data
@@ -406,6 +560,51 @@ def restore_originals(targets: set[Path], originals: dict[Path, bytes]) -> list[
     return failed
 
 
+def cleanup_manifest_path(path: Path, leftovers: list[str]) -> None:
+    """Collect every cleanup failure without replacing the error that caused cleanup."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        leftovers.append(f"leftover: {path}: cleanup failed: {exc}")
+
+
+def raise_write_failure(error: BaseException, leftovers: list[str]) -> None:
+    """Report the original failure with all cleanup paths, preserving interrupts."""
+    if isinstance(error, DriftError) and not leftovers:
+        raise error
+    if isinstance(error, (OSError, DriftError, series.SeriesError)):
+        raise DriftError("; ".join([str(error), *leftovers])) from error
+    for line in leftovers[:2]:
+        error.add_note(line)
+    raise error
+
+
+@contextlib.contextmanager
+def manifest_lock(root: Path, leftovers: list[str] | None = None):
+    """Hold the sibling manifest lock across compare, repair writes and rollback."""
+    path = root / series.CONTRIBUTIONS
+    lock = path.with_name(f".{path.name}.lock")
+    try:
+        stream = lock.open("xb")
+    except FileExistsError as exc:
+        raise DriftError(
+            f"{path}: another writer holds {lock}; no repairs written; "
+            f"stale only after you confirm no fill and no --fix repair is running "
+            f"for this manifest; then review and remove {lock} before retrying"
+        ) from exc
+    collected = leftovers if leftovers is not None else []
+    failure: BaseException | None = None
+    try:
+        stream.close()
+        yield lock
+    except BaseException as exc:
+        failure = exc
+    finally:
+        cleanup_manifest_path(lock, collected)
+    if failure is not None:
+        raise_write_failure(failure, collected)
+
+
 def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date | None) -> None:
     """Write repairs and the table together; restore original bytes on failure."""
     repair_path_limit(len(repairs.originals))
@@ -426,20 +625,21 @@ def write_repairs(root: Path, entries: list[dict], repairs: Repairs, today: date
     targets = repairs.files.keys() | {root / "README.md"}
     if not targets <= repairs.originals.keys():
         raise DriftError("repair target lacks an original snapshot")
-    for path, content in repairs.originals.items():
-        if path.read_bytes() != content:
-            raise DriftError(f"{path}: changed since read; no repairs written")
-    try:
-        for path, content in repairs.files.items():
-            path.write_bytes(content)
-        if series.contributions(root, write=True) != 0:
-            raise DriftError("cannot regenerate the contribution table")
-    except (OSError, DriftError, series.SeriesError) as exc:
-        failed = restore_originals(targets, repairs.originals)
-        if failed:
-            paths = ", ".join(str(path) for path in failed)
-            raise DriftError(f"{exc}; failed to restore: {paths}") from exc
-        raise
+    with manifest_lock(root, getattr(repairs.lines, "leftovers", None)):
+        for path, content in list(repairs.originals.items())[:MAX_REPAIR_PATHS]:
+            if path.read_bytes() != content:
+                raise DriftError(f"{path}: changed since read; no repairs written")
+        try:
+            for path, content in list(repairs.files.items())[:MAX_REPAIR_PATHS]:
+                path.write_bytes(content)
+            if series.contributions(root, write=True) != 0:
+                raise DriftError("cannot regenerate the contribution table")
+        except (OSError, DriftError, series.SeriesError) as exc:
+            failed = restore_originals(targets, repairs.originals)
+            if failed:
+                paths = ", ".join(str(path) for path in failed)
+                raise DriftError(f"{exc}; failed to restore: {paths}") from exc
+            raise
     repairs.lines.extend(stale)
 
 
@@ -502,7 +702,7 @@ def fix_drift(root: Path, fetch: Fetch, today: date | None) -> tuple[list[str], 
 
 
 def main(argv: list[str], fetch: Fetch = fetch_json, today: date | None = None) -> int:
-    """Exit 0 with no unfixed drift, 1 on drift, 2 when the tool cannot run."""
+    """Exit 0 when clean, 1 on drift, 2 on error, or 3 when --fix leaves its lock."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument(
@@ -518,7 +718,7 @@ def main(argv: list[str], fetch: Fetch = fetch_json, today: date | None = None) 
 
     try:
         series.pull_url_pattern()
-        fixed = []
+        fixed: list[str] = _RepairLines()
         if args.fix:
             lines, fixed = fix_drift(args.root, cached_fetch, today)
         else:
@@ -535,6 +735,11 @@ def main(argv: list[str], fetch: Fetch = fetch_json, today: date | None = None) 
     for line in lines:
         print(f"::error title=Upstream drift::{line}")
     print(f"{len(cache)} pull request(s) read from the forge, {len(lines)} field(s) drifted.")
+    leftovers = getattr(fixed, "leftovers", ())
+    for line in leftovers[:1]:
+        print(line, file=sys.stderr)
+    if leftovers:
+        return PUBLISHED_WITH_LEFTOVERS
     return 1 if lines else 0
 
 

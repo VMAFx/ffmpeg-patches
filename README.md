@@ -127,6 +127,11 @@ classDef step fill:#111a35,stroke:#3b82f6,stroke-width:2px,color:#e2e8f0
 | `upstream-contributions.json` | Upstream pull-request records and states; source of the contributions table |
 | `scripts/series.py` | `check`, `apply`, `export`, the `coverage` and `warnings` gates, the `contributions` table and release `notes` |
 | `scripts/upstream_drift.py` | Compares `upstream-contributions.json` with the FFmpeg forge |
+| `scripts/upstream_links.py` | Fills linked upstream issues and related pulls, and checks open pulls for overlaps |
+| `scripts/upstream_links_parse.py` | Parses upstream records, issue references and overlap evidence |
+| `scripts/upstream_links_forge.py` | Fetches forge pages within request and scan limits |
+| `scripts/upstream_links_scan.py` | Plans requests and inspects pull overlap candidates |
+| `scripts/upstream_links_manifest.py` | Fills and atomically publishes contribution manifests |
 | `scripts/consumer_stacks.py` | Applies each consumer's patch stack on top of the applied series |
 | `scripts/graph_check.py` | Reports conversion filters FFmpeg inserted on its own into a filtergraph |
 | `scripts/tonemap_parity.py` | Colour difference, time and VRAM of tone-map filter chains against `vf_libplacebo` (ADR-0002) |
@@ -525,13 +530,171 @@ even when the forge records match; `--fix` repairs a stale table without changin
 the checked date. Concurrent edits detected before writing abort the repair
 without changing any files. A merged or closed
 `covered_by` pull request still needs human review before dropping its patch;
-`--fix` reports it and exits 1. Tool errors exit 2.
+`--fix` reports it and exits 1. Tool errors exit 2; if `--fix` writes its
+repairs but cannot remove the sibling manifest lock, it prints the `fixed:`
+lines, reports the `leftover:` lock on standard error and exits 3.
 
 The daily upstream workflow runs `--fix` with read-only repository permissions.
 Changes appear in its job summary and the `upstream-drift` artifact as
 `upstream-drift.patch`; the job fails whenever changes need review or drift
 remains. Apply the downloaded patch with `git apply upstream-drift.patch`,
 review it and submit the update through the usual pull request process.
+
+Each contribution record in `upstream-contributions.json` may also carry two
+optional lists that do not change the README table:
+`fixes_issues` (sorted positive upstream issue numbers named after `Fixes`,
+`Closes` or `Refs` in the pull body) and `related` (sorted objects with
+`number`, `kind` one of `pull` or `issue`, `author`, `reason` one of
+`same-files`, `same-patch-id` or `same-subject`, `state`, and `seen`
+`YYYY-MM-DD` date). `fixes_issues` only grows: fill stores the union of the
+stored numbers and the numbers in the pull body. Fill refreshes `related` rows
+in place: a freshly found row replaces the stored row with the same number and
+keeps only that row's first `seen` date, so a pull that changes from open to
+merged updates its `state` (`_fill_entry` and `merge_related` in
+`scripts/upstream_links_manifest.py`). Run `python3 scripts/upstream_links.py fill` (`--dry-run`
+to preview without writing) to populate both fields for open and merged
+manifest records from the forge. Fill and check send GET requests only, post
+nothing and need no credentials. Live matching checks shared files and subjects;
+same-patch-id is not checked live, and forge-supplied patch IDs are ignored.
+The schema retains that reason for separately supplied evidence. Repeat
+`--pull N` to fill only named open or merged manifest rows, for example
+`python3 scripts/upstream_links.py fill --dry-run --pull 24970 --pull 24973`.
+Candidate pulls are scanned once per run from the later of the earliest scoped
+opening and UTC midnight 14 days before the run date
+(`DEFAULT_FILL_MAX_AGE_DAYS`); each pull's changed files are fetched at most
+once. For every own pull opened
+before this boundary, fill prints `N: candidates updated before DATE not read
+(fill age limit)`. This includes old open candidates that could still overlap;
+the line reports incomplete history, and the manifest makes no claim that
+those candidates were checked. Widen the history with `fill --max-age-days 30`
+(accepted range: 1 through 365 days). The candidate list fails with exit 2 and
+writes nothing only when its 20th page ends without completion evidence: no
+empty page, no `Link` header with relations but no `next`, no reached
+`X-Total-Count` and no update older than the window (`read_candidate_pulls` in
+`scripts/upstream_links_forge.py`, `_listing_complete` in
+`scripts/upstream_links_parse.py`); shorten the window to retry. Run
+`python3 scripts/upstream_links.py check` (adding `--pull N` for any open pull
+not yet in the manifest) to list newly discovered potential overlaps;
+it exits 1 when at least one unrecorded related pull by another author is open
+or merged after the own pull was opened, and the daily `upstream.yml` job runs
+this check alongside `upstream_drift.py`. By default, `check` scans updates
+since the manifest's `checked` date minus 7 days; `check --since YYYY-MM-DD`
+overrides that window for a catch-up run. Recorded related rows do not trigger
+candidate file reads. A candidate recorded for one own pull can still need
+files for another. Same-author candidates, closed unmerged candidates and
+candidates merged at or before the own pull opened are skipped before file
+reads; candidates updated before an own pull opened are also skipped. Older
+open candidates remain eligible when their updates fall inside the run window
+and at or after that own opening. Every remaining candidate can
+match files even when its subject differs. Existing related
+records are retained; skipped candidates produce no new records.
+When a candidate's file listing is incomplete at the 1000-name or 20-page
+limit without a proven shared file, `fill --dry-run`, `fill` and `check` print
+its pull number, the number of files read and `same-files undecided`; it is
+not recorded as a relation, and `check` exits 1 for the undecided comparison.
+A proven shared file in a partial prefix remains a relation, with an explicit
+incomplete-files diagnostic. Same-files matching remains a broad signal.
+File and candidate pagination stops on an empty page, a server `Link` header
+with relations but no next relation, or a reached `X-Total-Count`. Each Link
+entry's `rel` parameter is read independently of parameter order, case and
+quoting, with space-separated relation values. Only the exact `next` relation
+continues; unknown relations still prove completion. An entry without `rel`
+supplies no relation evidence. A short nonempty page alone never proves
+completion; the next page is read within the 20-page budget.
+At exactly the name cap, an available extra page is read without retaining more
+names: empty proves completion and more names prove overflow. If all file pages
+are used without completion evidence, external candidates remain undecided and
+own pull listings fail with exit 2.
+
+Each run pauses 0.5 seconds before every request, including the first, and
+retains the 30-second timeout of each blocking network operation
+(`REQUEST_TIMEOUT`). A first fill costs `N + P + F`
+requests for `N` own pulls, `P` list pages and `F` total fetched file pages
+across distinct own and eligible candidate pulls (with one file page per
+pull, the measured two-pull, 12-page window needs at most 519 requests and
+259.5 seconds of pauses plus network time, before author and memo savings).
+`RequestBudget.__call__` in `scripts/upstream_links_forge.py` admits a request
+only while more than `REQUEST_TIMEOUT` plus the 0.5-second pause (30.5 seconds)
+of the scan budget remains. Before request 519 the scan has paused 518 times
+(259 seconds), so less than 10.5 seconds remain for the network and local work
+of the 518 earlier requests. At 25 ms per request, request 514 is the last one
+admitted and the scan exits 2 when request 515 is refused; narrow such a scan
+with `--pull N` or `check --since YYYY-MM-DD`.
+Both commands derive their request cap as
+`N + 20 + (N + 1000) * 20` from the own-pull count, 20 list pages, 1000
+candidate rows and 20 file pages per pull. Before reading files, a progress
+line gives the candidate count, expected requests assuming one file page per
+pull and a file-page upper bound.
+The monotonic `SCAN_BUDGET_SECONDS` budget is 300 seconds for network waits
+in either command; detected exhaustion prints `incomplete scan` and exits 2
+before publishing. Admission reserves pacing and a full network-operation
+timeout, and elapsed time is checked again after pacing and each fetch.
+A single read-only daemon worker performs
+each fetch; waiting ends at the remaining scan budget even if the socket keeps
+making progress. Fill checks the same deadline during preparation and
+immediately before atomic replacement; detected expiry refuses publication with
+exit 2 and attempts staging-file and lock cleanup with the error reporting
+described below.
+Local CPU work and local file operations are not interrupted, so the budget is
+not a hard whole-run time limit. On detected expiry no further fetch is
+admitted; the process can exit while the outstanding read finishes. Overlaps run
+in a separate workflow job, independent of drift, with a timeout of twice that
+budget (10 minutes); a workflow test pins this relationship.
+The maximum 4096 own pulls admit 106036 requests:
+53018 seconds of pacing, or 3234098 seconds including one 30-second blocking
+operation per request, so the request cap alone cannot bound job time.
+A request above the cap exits 2 with its
+count, cap, window start, candidate count and narrowing option. A failure
+before publication leaves the manifest unchanged and reports the original error
+together with every failed staging-file or lock cleanup path (exit 2). After
+replacement, cleanup failure exits 3 with
+`published ...; cleanup incomplete; exit 3` and one `leftover:` line per failed
+cleanup path; the published manifest stays in place.
+Status 3 is reserved for completed manifest or `--fix` writes with leftover
+cleanup files; clean fills and repairs
+exit 0.
+Check exits 0 without overlaps, 1 for overlaps or undecided file comparisons,
+and both commands exit 2 for read, input or incomplete-scan errors. Check writes
+nothing and cannot reach status 3. Treat status 3 as a visible failure requiring
+cleanup review before another writing fill or `--fix` repair; do not roll back
+the published bytes.
+Fill keeps its sibling temporary file private until content is written and
+synced, then copies only the manifest's user/group/other read, write and execute
+bits before atomic replacement. Set-id and sticky bits are not copied; a mode
+change failure aborts before publication with exit 2.
+Age and incomplete-file notices print independently of record changes on both
+dry-run and writing paths. When records are unchanged, fill preserves the exact
+manifest bytes and takes no lock. Fill refuses content changed since the initial
+read; writing fills and `upstream_drift.py --fix` share an exclusive sibling
+lock. A leftover lock blocks writing fills and `--fix` repairs with its path
+(relative to the working directory when
+`--root` is relative) and a stale-lock rule: confirm no fill and no `--fix`
+repair is running for that
+manifest, then review and
+remove the lock before retrying. No automatic lock
+removal occurs. Other writers must coordinate
+with that lock to exclude edits during the final compare-and-replace step.
+Missing or malformed decision fields, responses over 16 MiB, titles or paths
+over 4096 characters, names over 256 characters, bodies over 256 Ki characters,
+inline file lists over 2000 names, duplicate JSON keys, and JSON objects over
+1024 keys fail with exit 2. Related authors use the shared
+`MAX_RELATED_AUTHOR_CHARS` limit of 256; only nonblank printable text is
+accepted, excluding every control character and line separator before
+diagnostics. Issue parsing permits
+at most 64 clauses and 1024 references, including repeats; excess is an error.
+Each closing clause starts a comma-, `and`- or `or`-separated item list.
+Only whole `#N` items and exact configured repository issue URLs are local.
+Repository-prefixed hashes (including the configured repository) and foreign
+issue URLs are ignored and counted in one line per pull. Prose, unhashed
+numbers, versions and hashes glued to words end the list.
+Shorten a fill with `fill --max-age-days N`, select a
+later-opening `fill --pull N`, or narrow a check
+with `check --since YYYY-MM-DD`. The week-long margin revisits recent updates
+around the drift snapshot, which can advance independently of the link scan;
+fill preserves that snapshot date. The fill age limit does not apply to check;
+its effective window remains the later of the earliest scoped opening and
+the checked date minus 7 days (or `--since`). Related `seen` dates record
+proven links, not coverage of unread history.
 
 ### Licence
 

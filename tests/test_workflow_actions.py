@@ -12,6 +12,8 @@ from pathlib import Path
 
 import yaml
 
+from scripts import upstream_links_forge as upstream_forge
+
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ACTION = ROOT / ".github/actions/setup-python/action.yml"
 BASE_ACTION = ROOT / ".github/actions/load-base/action.yml"
@@ -70,6 +72,19 @@ class WorkflowActionsTest(unittest.TestCase):
     def assert_base_loading_is_shared(self, text: str) -> None:
         """Reject inline base exports outside the shared action."""
         self.assertNotIn('base.env >> "$GITHUB_ENV"', text)
+
+    def test_overlap_job_timeout_tracks_scan_budget(self) -> None:
+        """Give overlap scans their own job and a timeout derived from their budget."""
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/upstream.yml").read_text(encoding="utf-8")
+        )
+        job = workflow["jobs"]["links"]
+        self.assertNotIn("needs", job)
+        self.assertEqual(job["timeout-minutes"] * 60, 2 * upstream_forge.SCAN_BUDGET_SECONDS)
+        self.assertLess(
+            upstream_forge.SCAN_BUDGET_SECONDS + upstream_forge.REQUEST_TIMEOUT,
+            job["timeout-minutes"] * 60,
+        )
 
     def test_python_setup_has_single_owner(self) -> None:
         """Only the Python composite action may use actions/setup-python directly."""

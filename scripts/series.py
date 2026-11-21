@@ -45,6 +45,9 @@
 Exit status: 0 on success, 1 on findings or a failed apply, 2 when the
 tool cannot run (unreadable series files, unusable checkout).
 
+MAX_RELATED_AUTHOR_CHARS bounds related authors to 256 nonblank printable
+characters; controls and line separators are rejected.
+
 Every git call runs without global or system configuration, so user
 settings (apply.whitespace, am.keepcr, format.*, hooks) cannot change what
 is applied or exported.
@@ -129,6 +132,13 @@ CONTRIBUTION_KEYS = (
     "project",
     "note",
 )
+OPTIONAL_CONTRIBUTION_KEYS = ("fixes_issues", "related")
+RELATED_KEYS = ("number", "kind", "author", "reason", "state", "seen")
+RELATED_KINDS = ("pull", "issue")
+RELATED_REASONS = ("same-files", "same-patch-id", "same-subject")
+MAX_FIXES_ISSUES = 64
+MAX_RELATED_AUTHOR_CHARS = 256
+MAX_RELATED = 256
 # Patch status in the metadata -> state of its pull request on the forge.
 FORGE_STATES = {"submitted": "open", "merged": "merged", "rejected": "closed"}
 DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -661,14 +671,125 @@ def read_contributions(root: Path, findings: Findings) -> dict | None:
     return data
 
 
+def _valid_day(raw: object) -> bool:
+    """Return True when raw is a calendar YYYY-MM-DD date string."""
+    if not isinstance(raw, str) or not DAY.fullmatch(raw):
+        return False
+    try:
+        date.fromisoformat(raw)
+    except ValueError:
+        return False
+    return True
+
+
+def check_fixes_issues(entry: dict, where: str, findings: Findings) -> None:
+    """Validate the optional fixes_issues list on a contribution record."""
+    if "fixes_issues" not in entry:
+        return
+    issues = entry["fixes_issues"]
+    if not isinstance(issues, list):
+        findings.error(where, "'fixes_issues' must be a list")
+        return
+    if len(issues) > MAX_FIXES_ISSUES:
+        findings.error(where, f"'fixes_issues' exceeds cap of {MAX_FIXES_ISSUES}")
+        return
+    for item in issues[:MAX_FIXES_ISSUES]:
+        if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
+            findings.error(where, "'fixes_issues' items must be positive integers")
+            return
+    if len(set(issues)) != len(issues):
+        findings.error(where, "'fixes_issues' must not contain duplicates")
+    if issues != sorted(issues):
+        findings.error(where, "'fixes_issues' must be sorted by number")
+
+
+def valid_related_author(raw: object) -> bool:
+    """Allow bounded nonblank printable account text, excluding controls and line separators."""
+    return (
+        isinstance(raw, str)
+        and 0 < len(raw) <= MAX_RELATED_AUTHOR_CHARS
+        and bool(raw.strip())
+        and all(char.isprintable() for char in raw[:MAX_RELATED_AUTHOR_CHARS])
+    )
+
+
+def _check_related_fields(item: dict, where: str, findings: Findings) -> None:
+    """Validate the field values of a related object whose required keys are present."""
+    for field_name, allowed in (
+        ("kind", RELATED_KINDS),
+        ("reason", RELATED_REASONS),
+        ("state", tuple(FORGE_STATES.values())),
+    ):
+        value = item[field_name]
+        if not isinstance(value, str) or value not in allowed:
+            findings.error(
+                where, f"'related' field {field_name!r} must be one of {', '.join(allowed)}"
+            )
+    author = item["author"]
+    if not valid_related_author(author):
+        findings.error(
+            where,
+            f"'related' field 'author' must be nonblank printable text of at most "
+            f"{MAX_RELATED_AUTHOR_CHARS} characters",
+        )
+    if not _valid_day(item["seen"]):
+        findings.error(where, "'related' field 'seen' must be a YYYY-MM-DD date")
+
+
+def check_related_item(item: object, where: str, findings: Findings) -> int | None:
+    """Validate one object of a contribution's related list and return its number."""
+    if not isinstance(item, dict):
+        findings.error(where, "'related' items must be objects")
+        return None
+    before = len(findings.errors)
+    for key in sorted(set(item) - set(RELATED_KEYS))[:MAX_RELATED]:
+        findings.error(where, f"'related' has unknown key {key!r}")
+    for key in RELATED_KEYS:
+        if key not in item:
+            findings.error(where, f"'related' lacks key {key!r}")
+    if len(findings.errors) != before:
+        return None
+    number = item["number"]
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        findings.error(where, "'related' field 'number' must be a positive integer")
+    _check_related_fields(item, where, findings)
+    return (
+        number if isinstance(number, int) and not isinstance(number, bool) and number > 0 else None
+    )
+
+
+def check_related(entry: dict, where: str, findings: Findings) -> None:
+    """Validate the optional related list on a contribution record."""
+    if "related" not in entry:
+        return
+    related = entry["related"]
+    if not isinstance(related, list):
+        findings.error(where, "'related' must be a list")
+        return
+    if len(related) > MAX_RELATED:
+        findings.error(where, f"'related' exceeds cap of {MAX_RELATED}")
+        return
+    numbers: list[int] = []
+    for item in related[:MAX_RELATED]:
+        num = check_related_item(item, where, findings)
+        if num is not None:
+            numbers.append(num)
+    if len(numbers) == len(related):
+        if len(set(numbers)) != len(numbers):
+            findings.error(where, "'related' must not contain duplicate numbers")
+        if numbers != sorted(numbers):
+            findings.error(where, "'related' must be sorted by number")
+
+
 def entry_shape_ok(entry: object, position: int, findings: Findings) -> bool:
-    """Exactly the known keys, `number` an integer, every other value a string."""
+    """Validate required and optional contribution keys, types and list invariants."""
     where = f"{CONTRIBUTIONS}: entry {position}"
     if not isinstance(entry, dict):
         findings.error(where, "is not an object")
         return False
     before = len(findings.errors)
-    for key in sorted(set(entry) - set(CONTRIBUTION_KEYS)):
+    allowed = set(CONTRIBUTION_KEYS) | set(OPTIONAL_CONTRIBUTION_KEYS)
+    for key in sorted(set(entry) - allowed)[:MAX_RELATED]:
         findings.error(where, f"unknown key {key!r}")
     for key in CONTRIBUTION_KEYS:
         if key not in entry:
@@ -677,6 +798,8 @@ def entry_shape_ok(entry: object, position: int, findings: Findings) -> bool:
             findings.error(where, "'number' must be an integer")
         elif key != "number" and not isinstance(entry[key], str):
             findings.error(where, f"{key!r} must be a string")
+    check_fixes_issues(entry, where, findings)
+    check_related(entry, where, findings)
     return len(findings.errors) == before
 
 
