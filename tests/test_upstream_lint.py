@@ -1295,13 +1295,13 @@ class ClaimScopeTest(unittest.TestCase):
 
     def test_speed_claim_detected(self) -> None:
         """An encode or decode speed claim without an end-to-end figure returns its phrase."""
-        benchmark_message = (
+        benchmark_claim = (
             "avcodec/x: paint maps once\n\nThe map painter benchmark ran seven rounds, "
             "so encoding is 10x faster.\n"
         )
         cases = (
             (
-                benchmark_message,
+                benchmark_claim,
                 "encoding is 10x faster",
             ),
             ("avcodec/x: cache maps\n\nThis gives faster encoding.\n", "faster encoding"),

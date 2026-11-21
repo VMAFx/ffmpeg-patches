@@ -6,6 +6,38 @@
 # The rules live here, not in the Semgrep Registry, so a run needs no network
 # and the rule set changes only with this file.
 rules:
+  - id: os-open-create-mode-wider-than-owner
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Creating a file with group or other permissions can expose private data.
+      Pass an explicit owner-only mode such as 0o600 to os.open with os.O_CREAT.
+    patterns:
+      - pattern-either:
+          - pattern: os.open($PATH, $FLAGS, ...)
+          - pattern: os.open($PATH, flags=$FLAGS, ...)
+      - metavariable-pattern:
+          metavariable: $FLAGS
+          pattern: <... os.O_CREAT ...>
+      - pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern: os.open($PATH, $FLAGS, ...)
+                  - pattern: os.open($PATH, flags=$FLAGS, ...)
+              - pattern-not: os.open($PATH, $FLAGS, $MODE, ...)
+              - pattern-not: os.open(..., mode=$MODE, ...)
+          - patterns:
+              - pattern-either:
+                  - pattern: os.open($PATH, $FLAGS, $MODE, ...)
+                  - pattern: os.open(..., mode=$MODE, ...)
+              # Check literal syntax before comparison: dynamic modes need review.
+              - metavariable-regex:
+                  metavariable: $MODE
+                  regex: '^(?:0[oO][0-7_]+|0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*)$'
+              - metavariable-comparison:
+                  metavariable: $MODE
+                  comparison: $MODE & 0o077 != 0
+
   - id: subprocess-shell-true
     languages: [python]
     severity: ERROR

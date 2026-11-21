@@ -36,9 +36,9 @@ jobs:
         run: |
           git init -q ffmpeg
           git -C ffmpeg remote add origin "$FFMPEG_REMOTE"
-          git -C ffmpeg fetch -q --shallow-exclude="refs/tags/${FFMPEG_TAG}" origin master
+          git -C ffmpeg fetch -q --no-tags --shallow-exclude="refs/tags/${FFMPEG_TAG}" origin master
           git -C ffmpeg checkout -q --detach FETCH_HEAD
-          git -C ffmpeg fetch -q --depth=1 origin "refs/tags/${FFMPEG_TAG}:refs/tags/${FFMPEG_TAG}"
+          git -C ffmpeg fetch -q --no-tags --depth=1 origin "refs/tags/${FFMPEG_TAG}:refs/tags/${FFMPEG_TAG}"
           git -C ffmpeg log -1 --format='FFmpeg master %H %cs %s'
       - name: Apply every patch and report
         run: |
