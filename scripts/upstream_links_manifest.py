@@ -58,7 +58,7 @@ else:
     )
 
 
-PUBLISHED_WITH_LEFTOVERS = 3
+PUBLISHED_WITH_LEFTOVERS = upstream_drift.PUBLISHED_WITH_LEFTOVERS
 # Bound first-fill history even when the manifest contains months-old own pulls.
 DEFAULT_FILL_MAX_AGE_DAYS = 14
 MIN_FILL_MAX_AGE_DAYS = 1
@@ -192,23 +192,6 @@ def _fill_window_lines(own_pulls: list[dict], cutoff: datetime) -> list[str]:
     ]
 
 
-def _cleanup_manifest_path(path: Path, leftovers: list[str]) -> None:
-    """Collect every cleanup failure without replacing the error that caused cleanup."""
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        leftovers.append(f"leftover: {path}: cleanup failed: {exc}")
-
-
-def _raise_write_failure(error: BaseException, leftovers: list[str]) -> None:
-    """Report the original failure with all cleanup paths, preserving interrupts."""
-    if isinstance(error, (OSError, DriftError)):
-        raise DriftError("; ".join([str(error), *leftovers])) from error
-    for line in leftovers[:2]:
-        error.add_note(line)
-    raise error
-
-
 def _write_manifest_temp(
     path: Path, original: bytes, rendered: bytes, request: RequestBudget
 ) -> list[str]:
@@ -234,9 +217,9 @@ def _write_manifest_temp(
         failure = exc
     finally:
         if staging is not None:
-            _cleanup_manifest_path(staging, leftovers)
+            upstream_drift.cleanup_manifest_path(staging, leftovers)
     if failure is not None:
-        _raise_write_failure(failure, leftovers)
+        upstream_drift.raise_write_failure(failure, leftovers)
     return leftovers
 
 
@@ -251,8 +234,8 @@ def _replace_manifest(
     except FileExistsError as exc:
         raise DriftError(
             f"{path}: another fill holds {lock}; no changes written; "
-            f"stale only after you confirm no fill is running for this manifest; "
-            f"then review and remove {lock} before retrying"
+            f"stale only after you confirm no fill and no --fix repair is running "
+            f"for this manifest; then review and remove {lock} before retrying"
         ) from exc
     published = False
     leftovers: list[str] = []
@@ -266,9 +249,9 @@ def _replace_manifest(
     except (Exception, KeyboardInterrupt, SystemExit) as exc:
         failure = exc
     finally:
-        _cleanup_manifest_path(lock, leftovers)
+        upstream_drift.cleanup_manifest_path(lock, leftovers)
     if failure is not None:
-        _raise_write_failure(failure, leftovers)
+        upstream_drift.raise_write_failure(failure, leftovers)
     if published and leftovers:
         leftovers.append(f"published {path}; cleanup incomplete; exit {PUBLISHED_WITH_LEFTOVERS}")
     return leftovers

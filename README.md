@@ -530,7 +530,9 @@ even when the forge records match; `--fix` repairs a stale table without changin
 the checked date. Concurrent edits detected before writing abort the repair
 without changing any files. A merged or closed
 `covered_by` pull request still needs human review before dropping its patch;
-`--fix` reports it and exits 1. Tool errors exit 2.
+`--fix` reports it and exits 1. Tool errors exit 2; if `--fix` writes its
+repairs but cannot remove the sibling manifest lock, it prints the `fixed:`
+lines, reports the `leftover:` lock on standard error and exits 3.
 
 The daily upstream workflow runs `--fix` with read-only repository permissions.
 Changes appear in its job summary and the `upstream-drift` artifact as
@@ -648,13 +650,14 @@ together with every failed staging-file or lock cleanup path (exit 2). After
 replacement, cleanup failure exits 3 with
 `published ...; cleanup incomplete; exit 3` and one `leftover:` line per failed
 cleanup path; the published manifest stays in place.
-Status 3 is exclusive to this published-with-leftovers state; clean fills
+Status 3 is reserved for completed manifest or `--fix` writes with leftover
+cleanup files; clean fills and repairs
 exit 0.
 Check exits 0 without overlaps, 1 for overlaps or undecided file comparisons,
 and both commands exit 2 for read, input or incomplete-scan errors. Check writes
 nothing and cannot reach status 3. Treat status 3 as a visible failure requiring
-cleanup review before another writing fill; do not roll back the published
-bytes.
+cleanup review before another writing fill or `--fix` repair; do not roll back
+the published bytes.
 Fill keeps its sibling temporary file private until content is written and
 synced, then copies only the manifest's user/group/other read, write and execute
 bits before atomic replacement. Set-id and sticky bits are not copied; a mode
@@ -662,9 +665,11 @@ change failure aborts before publication with exit 2.
 Age and incomplete-file notices print independently of record changes on both
 dry-run and writing paths. When records are unchanged, fill preserves the exact
 manifest bytes and takes no lock. Fill refuses content changed since the initial
-read; concurrent writing fills use an exclusive sibling lock. A leftover lock
-blocks writing fills with its path (relative to the working directory when
-`--root` is relative) and a stale-lock rule: confirm no fill is running for that
+read; writing fills and `upstream_drift.py --fix` share an exclusive sibling
+lock. A leftover lock blocks writing fills and `--fix` repairs with its path
+(relative to the working directory when
+`--root` is relative) and a stale-lock rule: confirm no fill and no `--fix`
+repair is running for that
 manifest, then review and
 remove the lock before retrying. No automatic lock
 removal occurs. Other writers must coordinate

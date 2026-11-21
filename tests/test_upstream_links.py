@@ -1127,7 +1127,7 @@ class RequestCostTest(unittest.TestCase):
             def expire_on_wait(block: bool = True, timeout: float | None = None) -> object:
                 """Verify the request is already queued before raising the wait timeout."""
                 self.assertTrue(reader.tasks.full())
-                queued.append(list(reader.tasks.queue))
+                queued.append([url for url, _ in list(reader.tasks.queue)[:1]])
                 raise upstream_forge.queue.Empty
 
             reader.answers.get = expire_on_wait
@@ -1246,6 +1246,53 @@ class RequestCostTest(unittest.TestCase):
             with self.assertRaisesRegex(upstream_parse.DriftError, "count 2, cap 1"):
                 capped(f"{API}/pulls/10")
         self.assertEqual(opened, [target, f"{API}/pulls/10", target, f"{API}/pulls/10"])
+
+    def test_redirect_after_reader_timeout_still_charges_issuing_budget(self) -> None:
+        """A worker redirect hop after reader timeout still runs the issuing budget's admit."""
+        drift = upstream_links.upstream_drift
+        entered = threading.Event()
+        timed_out = threading.Event()
+        finished = threading.Event()
+        outcomes: list[object] = []
+
+        def late_redirect(url: str) -> dict:
+            """Wait for the reader timeout, then run the real redirect handler in the worker."""
+            entered.set()
+            if not timed_out.wait(0.5):
+                return {}
+            try:
+                request = urllib.request.Request(url)
+                drift.HttpsRedirectHandler().redirect_request(
+                    request, None, 302, "Found", email.message.Message(), f"{API}/pulls/20"
+                )
+            except BaseException as exc:
+                outcomes.append(exc)
+            finally:
+                finished.set()
+            return {}
+
+        with (
+            unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 0.05),
+            unittest.mock.patch.object(upstream_forge, "REQUEST_TIMEOUT", 0),
+            unittest.mock.patch.object(upstream_forge, "REQUEST_PAUSE_SECONDS", 0),
+        ):
+            budget = upstream_forge.RequestBudget(late_redirect, 1, lambda _: None)
+            self.addCleanup(budget.reader.close)
+            get = budget.reader.answers.get
+
+            def get_after_entry(block: bool = True, timeout: float | None = None) -> object:
+                """Wait for worker entry before letting the short answer wait time out."""
+                self.assertTrue(entered.wait(0.5))
+                return get(block, timeout)
+
+            budget.reader.answers.get = get_after_entry
+            with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan"):
+                budget(f"{API}/pulls/10")
+            timed_out.set()
+            self.assertTrue(finished.wait(0.5))
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], upstream_parse.DriftError)
+        self.assertIn("count 2, cap 1", str(outcomes[0]))
 
 
 def measured_window_forge() -> FakeForge:
@@ -1885,16 +1932,22 @@ class ForgeFileCountTest(unittest.TestCase):
         """Use each observation's inline files; reuse fetched files only for the same revision."""
         write_manifest(self.root, [manifest_entry(10), manifest_entry(20)])
         own_10 = forge_pull(10) | {"files": ["shared.c"]}
-        own_20 = forge_pull(20) | {"user": {"login": "bob"}, "files": ["shared.c"]}
-        cand_20 = forge_pull(20) | {"user": {"login": "bob"}, "files": ["other.c"]}
+        own_20 = forge_pull(20) | {"user": {"login": "bob"}}
+        cand_20 = forge_pull(20) | {
+            "user": {"login": "bob"},
+            "head": {"sha": "b" * 40},
+            "files": ["other.c"],
+        }
         forge = FakeForge(
             {
                 f"{API}/pulls/10": own_10,
                 f"{API}/pulls/20": own_20,
+                f"{API}/pulls/20/files?limit=50&page=1": [{"filename": "shared.c"}],
                 self.page: [cand_20],
             }
         )
         self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
+        self.assertEqual(forge.read.count(f"{API}/pulls/20/files?limit=50&page=1"), 1)
 
         plain_10 = forge_pull(10)
         plain_20 = forge_pull(20) | {"user": {"login": "bob"}}
@@ -2568,7 +2621,7 @@ class FailClosedForgeTest(unittest.TestCase):
         self.assertEqual(rc, 2, err)
         self.assertIn(str(lock), err)
         self.assertIn("stale", err)
-        self.assertIn("confirm no fill is running", err)
+        self.assertIn("confirm no fill and no --fix repair is running", err)
         self.assertIn("remove", err)
         self.assertEqual(self.path.read_bytes(), published)
 

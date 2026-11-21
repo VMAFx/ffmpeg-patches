@@ -87,9 +87,11 @@ class _ScanReader:
             daemon=True,
         ).start()
 
-    def read(self, url: str, remaining: float) -> dict | list:
+    def read(
+        self, url: str, remaining: float, admit: Callable[[], object] | None = None
+    ) -> dict | list:
         """Wait for this response only until the scan's remaining elapsed budget."""
-        self.tasks.put_nowait(url)
+        self.tasks.put_nowait((url, admit))
         try:
             answer = self.answers.get(timeout=remaining)
         except queue.Empty as exc:
@@ -117,13 +119,15 @@ def _fetch_worker(
         if closed.is_set():
             return
         try:
-            url = tasks.get(timeout=SCAN_BUDGET_SECONDS)
+            task = tasks.get(timeout=SCAN_BUDGET_SECONDS)
         except queue.Empty:
             return
-        if url is None or closed.is_set():
+        if task is None or closed.is_set():
             return
+        url, admit = task
         try:
-            answer = fetch(url)
+            with upstream_drift.redirect_admit(admit):
+                answer = fetch(url)
         except (Exception, KeyboardInterrupt, SystemExit) as exc:
             answer = exc
         answers.put_nowait(answer)
@@ -159,12 +163,7 @@ class RequestBudget:
     def __call__(self, url: str) -> dict | list:
         """Pause once per admitted request and preserve the underlying per-operation timeout."""
         remaining = self.admit()
-        previous = upstream_drift.REDIRECT_ADMIT
-        upstream_drift.REDIRECT_ADMIT = self.admit
-        try:
-            result = self.reader.read(url, remaining)
-        finally:
-            upstream_drift.REDIRECT_ADMIT = previous
+        result = self.reader.read(url, remaining, self.admit)
         self.ensure_time()
         return result
 

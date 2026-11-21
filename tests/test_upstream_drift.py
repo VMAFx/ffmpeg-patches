@@ -379,11 +379,7 @@ class RedirectTest(unittest.TestCase):
                 resp.msg = "Found" if code == 302 else "OK"
                 return resp
 
-        opener = urllib.request.OpenerDirector()
-        for handler in list(upstream_drift.OPENER.handlers)[:8]:
-            if not isinstance(handler, urllib.request.HTTPSHandler):
-                opener.add_handler(handler)
-        opener.add_handler(RecordingHttpsHandler())
+        opener = upstream_drift.build_https_opener(RecordingHttpsHandler())
         proxies = {"https": "http://proxy.example.invalid:8443", "http": "http://bad.invalid:80"}
         with (
             patch.object(upstream_drift, "OPENER", opener),
@@ -406,6 +402,53 @@ class RedirectTest(unittest.TestCase):
                 ("code.ffmpeg.org", None, f"{API}2"),
             ],
         )
+        for handler in upstream_drift.OPENER.handlers[:8]:
+            self.assertIs(handler.parent, upstream_drift.OPENER)
+
+    def test_https_redirect_drops_proxy_authorization_on_bypassed_hop(self) -> None:
+        """Keep Proxy-authorization on proxied hops and drop it when a redirect bypasses proxy."""
+        requests: list[urllib.request.Request] = []
+        target = "https://direct.example.invalid/api/v1/repos/FFmpeg/FFmpeg/pulls/2"
+
+        class RecordingHttpsHandler(urllib.request.BaseHandler):
+            """Record each request and redirect the first hop to the second destination."""
+
+            def https_open(self, req: urllib.request.Request) -> urllib.response.addinfourl:
+                """Store the request; respond with 302 on the first request and 200 after."""
+                requests.append(req)
+                headers = email.message.Message()
+                first = len(requests) == 1
+                if first:
+                    headers["Location"] = target
+                code = 302 if first else 200
+                resp = urllib.response.addinfourl(io.BytesIO(b"{}"), headers, req.full_url, code)
+                resp.msg = "Found" if first else "OK"
+                return resp
+
+        proxies = {"https": "http://user:secret@proxy.example.invalid:8443"}
+        opener = upstream_drift.build_https_opener(RecordingHttpsHandler(), proxies=proxies)
+        with (
+            patch.object(upstream_drift, "OPENER", opener),
+            patch.object(urllib.request, "proxy_bypass", return_value=False),
+        ):
+            self.assertEqual(upstream_drift.fetch_json(f"{API}1"), {})
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(requests[0].has_header("Proxy-authorization"))
+        self.assertTrue(requests[1].has_header("Proxy-authorization"))
+        self.assertIn("Proxy-authorization", requests[1].headers)
+        requests.clear()
+        with (
+            patch.object(upstream_drift, "OPENER", opener),
+            patch.object(
+                urllib.request, "proxy_bypass", side_effect=lambda host: host.startswith("direct.")
+            ),
+        ):
+            self.assertEqual(upstream_drift.fetch_json(f"{API}1"), {})
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(requests[0].has_header("Proxy-authorization"))
+        for name in ("Proxy-authorization", "Proxy-Authorization"):
+            self.assertFalse(requests[1].has_header(name))
+            self.assertNotIn(name, requests[1].headers)
 
 
 class Utf8ReadTest(unittest.TestCase):
@@ -1590,8 +1633,75 @@ class FixTest(unittest.TestCase):
             status, _, err = self.fix(pull(1, title="changed"))
         self.assertEqual(status, 2)
         self.assertIn(str(lock), err)
+        self.assertIn("confirm no fill and no --fix repair is running", err)
         blocked_write.assert_not_called()
         self.assertEqual(lock.read_bytes(), b"fill lock")
+        lock.unlink()
+
+    def test_fix_lock_cleanup_failure_keeps_repairs_and_exits_three(self) -> None:
+        """Keep written repairs, print fixed lines, report the leftover lock and exit 3."""
+        lock = self.data_path.with_name(f".{self.data_path.name}.lock")
+        unlink = Path.unlink
+
+        def fail_lock_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            """Fail unlinking the manifest lock after repairs are written."""
+            if path == lock:
+                raise OSError("planted lock unlink")
+            unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=fail_lock_unlink):
+            status, out, err = self.fix(pull(1, title="changed"))
+        self.assertEqual(status, 3)
+        self.assertIn("fixed: 1: title is 'changed' on the forge", out)
+        self.assertEqual(err.strip(), f"leftover: {lock}: cleanup failed: planted lock unlink")
+        self.assertTrue(lock.is_file())
+        self.assertEqual(
+            json.loads(self.data_path.read_bytes())["contributions"][0]["title"], "changed"
+        )
+        self.assertIn("changed", self.readme.read_text(encoding="utf-8"))
+        lock.unlink()
+
+    def test_fix_rollback_and_lock_cleanup_failures_report_both_paths(self) -> None:
+        """Report failed-to-restore paths and the leftover lock together with exit 2."""
+        lock = self.data_path.with_name(f".{self.data_path.name}.lock")
+        original = self.data_path.read_bytes()
+        write_bytes = Path.write_bytes
+        unlink = Path.unlink
+
+        def fail_restore(path: Path, content: bytes) -> int:
+            """Fail restoring the manifest after a table failure."""
+            if path == self.data_path and content == original:
+                raise OSError("restore denied")
+            return write_bytes(path, content)
+
+        def fail_lock_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            """Fail unlinking the manifest lock after rollback fails."""
+            if path == lock:
+                raise OSError("planted lock unlink")
+            unlink(path, *args, **kwargs)
+
+        with (
+            patch.object(upstream_drift.series, "contributions", return_value=1),
+            patch.object(Path, "write_bytes", fail_restore),
+            patch.object(Path, "unlink", autospec=True, side_effect=fail_lock_unlink),
+        ):
+            status, out, err = self.fix(pull(1, title="changed"))
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("cannot regenerate the contribution table", err)
+        self.assertIn(f"failed to restore: {self.data_path}", err)
+        self.assertIn(f"leftover: {lock}: cleanup failed: planted lock unlink", err)
+        self.assertTrue(lock.is_file())
+        lock.unlink()
+        with (
+            patch.object(Path, "unlink", autospec=True, side_effect=fail_lock_unlink),
+            self.assertRaises(KeyboardInterrupt) as caught,
+            upstream_drift.manifest_lock(self.root),
+        ):
+            raise KeyboardInterrupt("planted interrupt")
+        self.assertIn(
+            f"leftover: {lock}: cleanup failed: planted lock unlink",
+            getattr(caught.exception, "__notes__", []),
+        )
         lock.unlink()
 
 
