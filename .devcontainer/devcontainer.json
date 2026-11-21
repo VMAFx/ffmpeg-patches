@@ -1,5 +1,5 @@
 {
-  "name": "VMAFx/ffmpeg-patches",
+  "name": "vidiko/ffmpeg-patches",
   "build": {
     "dockerfile": "Dockerfile.praetor",
     "context": "."

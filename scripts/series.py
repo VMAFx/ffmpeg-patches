@@ -1812,7 +1812,11 @@ def scope_reasons(
         gpu_test = path == "tests/helpers.py" or bool(
             re.fullmatch(r"tests/test_(?:hqdn3d|tonemap)_.*\.py", path)
         )
-        if path in ffmpeg or path.startswith(("patches/", ".config/clang-tidy/")) or gpu_test:
+        if (
+            path in ffmpeg
+            or path.startswith(("patches/", ".config/clang-tidy/", ".config/cppcheck/"))
+            or gpu_test
+        ):
             reasons["ffmpeg"].append(path)
         if path in infra or path == "scripts/tonemap_parity.py" or gpu_test:
             reasons["parity"].append(path)

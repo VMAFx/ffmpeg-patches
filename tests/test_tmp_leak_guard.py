@@ -17,6 +17,8 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+from scripts import tmp_leak_guard
+
 GUARD = Path(__file__).resolve().parent.parent / "scripts" / "tmp_leak_guard.py"
 
 # Guard gets this share of outer timeout so its timeout path (tree kill, root cleanup) runs first.
@@ -116,6 +118,51 @@ class TmpLeakGuardTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 124)
         self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def run_with_outcome(
+        self, command: list[str], timeout: float
+    ) -> tuple[int, tmp_leak_guard.GuardOutcome, str]:
+        """Capture real guard provenance, stderr and cleanup in the fixture's directory."""
+        outcome = tmp_leak_guard.GuardOutcome(timed_out=True)
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.object(tempfile, "tempdir", str(self.outer_dir)),
+            contextlib.redirect_stderr(output),
+        ):
+            rc = tmp_leak_guard.run_guard(command[0], command[1:], timeout, outcome=outcome)
+        self.assertEqual(list(self.outer_dir.iterdir()), [])
+        return rc, outcome, output.getvalue()
+
+    def test_child_statuses_do_not_mark_timeout(self) -> None:
+        """Completed children preserve reserved-looking codes and clear stale timeout facts."""
+        statuses = (0, 1, 2, 124, 127)
+        for index in range(len(statuses)):
+            status = statuses[index]
+            with self.subTest(status=status):
+                rc, outcome, output = self.run_with_outcome(
+                    [sys.executable, "-I", "-c", f"import sys; sys.exit({status})"], 15
+                )
+                self.assertEqual(rc, status)
+                self.assertFalse(outcome.timed_out)
+                self.assertEqual(output, "")
+
+    def test_real_timeout_sets_outcome(self) -> None:
+        """A deadline expiry records its own fact and keeps the legacy timeout status."""
+        rc, outcome, output = self.run_with_outcome(
+            [sys.executable, "-I", "-c", "import time; time.sleep(30)"], 0.1
+        )
+        self.assertEqual(rc, 124)
+        self.assertTrue(outcome.timed_out)
+        self.assertIn("exceeded the 0.1 s deadline", output)
+
+    def test_missing_executable_does_not_mark_timeout(self) -> None:
+        """A spawn failure retains status 127 without carrying a stale timeout verdict."""
+        rc, outcome, output = self.run_with_outcome(
+            [str(self.outer_dir / "nonexistent-command")], 15
+        )
+        self.assertEqual(rc, 127)
+        self.assertFalse(outcome.timed_out)
+        self.assertIn("tmp leak guard:", output)
 
     def test_missing_command_after_separator_fails_with_rc_2(self) -> None:
         """Invoking the guard without a command after the separator exits with code two."""
@@ -257,6 +304,25 @@ class TmpLeakGuardTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("cannot scan", stderr_buf.getvalue())
         self.assertEqual(list(self.outer_dir.iterdir()), [])
+
+    def test_unregistered_module_outcomes_are_independent(self) -> None:
+        """A path-loaded guard needs no registry entry and keeps outcome values independent."""
+        name = "_tmp_leak_guard_unregistered"
+        self.assertNotIn(name, sys.modules)
+        spec = importlib.util.spec_from_file_location(name, GUARD)
+        if spec is None or spec.loader is None:
+            self.fail("failed to load tmp_leak_guard spec")
+        guard_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard_mod)
+        self.assertNotIn(name, sys.modules)
+
+        first = guard_mod.GuardOutcome()
+        second = guard_mod.GuardOutcome()
+        self.assertEqual(first, second)
+        first.timed_out = True
+        self.assertTrue(first.timed_out)
+        self.assertFalse(second.timed_out)
+        self.assertEqual(first, guard_mod.GuardOutcome(timed_out=True))
 
     def test_kill_command_uses_process_tree(self) -> None:
         """The command termination helper delegates to kill_process_tree."""

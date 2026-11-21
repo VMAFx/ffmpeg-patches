@@ -14,6 +14,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts import upstream_lint
+
 ROOT = Path(__file__).resolve().parent.parent
 # Semgrep prints a rule configuration warning on stderr and still exits 0.
 RULE_WARNING_RE = re.compile(r"^Rule \S+ contains .*$", re.MULTILINE)
@@ -520,11 +522,18 @@ def _find_enclosing_function(
     return None
 
 
-def _run_semgrep(fixture: Path, scratch: Path) -> dict:
+def _run_semgrep(
+    fixture: Path,
+    scratch: Path,
+    config: Path | None = None,
+    *,
+    allow_errors: bool = False,
+) -> dict:
     """Run semgrep scan on a fixture inside scratch with isolated TMPDIR; fail on a rule warning."""
     semgrep_bin = shutil.which("semgrep")
     if semgrep_bin is None:
         raise RuntimeError("semgrep executable not found on PATH")
+    rules_path = ROOT / ".semgrep.yml" if config is None else config
     env = os.environ.copy()
     env["TMPDIR"] = str(scratch)
     env.setdefault("XDG_CONFIG_HOME", str(scratch))
@@ -533,7 +542,7 @@ def _run_semgrep(fixture: Path, scratch: Path) -> dict:
             semgrep_bin,
             "scan",
             "--config",
-            str(ROOT / ".semgrep.yml"),
+            str(rules_path),
             "--json",
             "--metrics",
             "off",
@@ -551,9 +560,9 @@ def _run_semgrep(fixture: Path, scratch: Path) -> dict:
         raise RuntimeError(f"semgrep exited with code {proc.returncode}: {proc.stderr}")
     rule_warnings = RULE_WARNING_RE.findall(proc.stderr)
     if rule_warnings:
-        raise RuntimeError(f"semgrep rule warnings for .semgrep.yml: {rule_warnings}")
+        raise RuntimeError(f"semgrep rule warnings for {rules_path.name}: {rule_warnings}")
     data: dict = json.loads(proc.stdout)
-    if data.get("errors"):
+    if data.get("errors") and not allow_errors:
         raise RuntimeError(f"semgrep reported execution errors: {data['errors']}")
     scanned = data.get("paths", {}).get("scanned", [])
     if len(scanned) == 0:
@@ -713,3 +722,187 @@ class SemgrepRulesTest(unittest.TestCase):
             _flagged_in_fixture(SUBTEST_CLEANUP_FIXTURE, "subtest-cleanup-outside-finally"),
             _expected_flagged(SUBTEST_CLEANUP_FIXTURE),
         )
+
+    def test_os_open_create_mode_wider_than_owner_rule(self) -> None:
+        """Creation defaults and wide literal modes flag exactly the unsafe cases."""
+        cases = {
+            "case_flagged_default": "os.open(path, os.O_CREAT)",
+            "case_flagged_644": "os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)",
+            "case_flagged_640": "os.open(path, os.O_CREAT | os.O_WRONLY, 0o640)",
+            "case_flagged_666": "os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)",
+            "case_flagged_777": "os.open(path, os.O_CREAT, 0o777)",
+            "case_flagged_default_dir_fd": "os.open(path, os.O_CREAT, dir_fd=directory)",
+            "case_flagged_keyword_mode": "os.open(path, os.O_CREAT, mode=0o644)",
+            "case_flagged_keyword_flags": "os.open(path, flags=os.O_CREAT, mode=0o640)",
+            "case_flagged_keyword_default": "os.open(path, flags=os.O_CREAT)",
+            "case_flagged_other_execute": "os.open(path, os.O_CREAT, 0o601)",
+            "case_flagged_group_execute": "os.open(path, os.O_CREAT, 0o610)",
+            "case_flagged_decimal": "os.open(path, os.O_CREAT, 420)",
+            "case_flagged_group_write": "os.open(path, os.O_CREAT, 0o620)",
+            "case_flagged_other_write": "os.open(path, os.O_CREAT, 0o602)",
+            "case_flagged_hex": "os.open(path, os.O_CREAT, 0x1A4)",
+            "case_flagged_binary": "os.open(path, os.O_CREAT, 0b110100100)",
+            "case_flagged_underscores": "os.open(path, os.O_CREAT, 0o6_4_4)",
+            "case_ok_600": "os.open(path, os.O_CREAT, 0o600)",
+            "case_ok_400": "os.open(path, os.O_CREAT, 0o400)",
+            "case_ok_700": "os.open(path, os.O_CREAT, mode=0o700)",
+            "case_ok_zero": "os.open(path, os.O_CREAT, 0)",
+            "case_ok_no_create": "os.open(path, os.O_RDONLY)",
+            "case_ok_wide_without_create": "os.open(path, os.O_WRONLY | os.O_EXCL, 0o666)",
+            "case_ok_dynamic_mode": "os.open(path, os.O_CREAT, mode)",
+            "case_ok_other_open": "other.open(path, os.O_CREAT, 0o777)",
+            "case_ok_builtin_open": "open(path, os.O_CREAT, 0o777)",
+        }
+        functions = [
+            f'def {name}(path, mode):\n    """Exercise one mode boundary."""\n    return {call}\n'
+            for name, call in cases.items()
+        ]
+        source = "import os\n\n" + "\n".join(functions)
+        expected = {
+            "case_flagged_default",
+            "case_flagged_644",
+            "case_flagged_640",
+            "case_flagged_666",
+            "case_flagged_777",
+            "case_flagged_default_dir_fd",
+            "case_flagged_keyword_mode",
+            "case_flagged_keyword_flags",
+            "case_flagged_keyword_default",
+            "case_flagged_other_execute",
+            "case_flagged_group_execute",
+            "case_flagged_decimal",
+            "case_flagged_group_write",
+            "case_flagged_other_write",
+            "case_flagged_hex",
+            "case_flagged_binary",
+            "case_flagged_underscores",
+        }
+        self.assertEqual(
+            _flagged_in_fixture(source, "os-open-create-mode-wider-than-owner"), expected
+        )
+
+
+FFMPEG_C_DECLARATIONS = (
+    "typedef struct SessionHandle { int ready; } SessionHandle;\n"
+    "int ff_rtsp_connect(SessionHandle *handle);\n"
+    "void ff_rtsp_close_streams(SessionHandle *handle);\n"
+    "void ff_rtsp_close_connections(SessionHandle *handle);\n"
+    "void ff_network_close(void);\n"
+    "int start_recording_step(SessionHandle *handle);\n\n"
+)
+
+FFMPEG_PLANTED_WRITE_HEADER = (
+    FFMPEG_C_DECLARATIONS
+    + "static int mux_write_header(SessionHandle *handle)\n"
+    + "{\n"
+    + "    int status = ff_rtsp_connect(handle);\n"
+    + "    if (status < 0)\n"
+    + "        return status;\n"
+    + "    status = start_recording_step(handle);\n"
+    + "    if (status < 0) {\n"
+    + "        ff_rtsp_close_streams(handle);\n"
+    + "        ff_rtsp_close_connections(handle);\n"
+    + "        return status;\n"
+    + "    }\n"
+    + "    return 0;\n"
+    + "}\n"
+)
+
+
+def _scan_ffmpeg_c(source: str) -> list[dict]:
+    """Scan synthetic C source with .semgrep-ffmpeg.yml and return its result entries."""
+    with tempfile.TemporaryDirectory() as scratch_name:
+        scratch_path = Path(scratch_name)
+        fixture_file = scratch_path / "fixture.c"
+        fixture_file.write_text(source, encoding="utf-8")
+        data = _run_semgrep(fixture_file, scratch_path, config=ROOT / ".semgrep-ffmpeg.yml")
+        return list(data.get("results", []))
+
+
+class FfmpegRuleIdTest(unittest.TestCase):
+    """upstream_lint keeps the check_id text after its last dot, so rule ids carry no dot."""
+
+    def test_rule_ids_carry_no_dot(self) -> None:
+        """Every id key in .semgrep-ffmpeg.yml exists and contains no dot."""
+        text = upstream_lint.SEMGREP_FFMPEG_RULES.read_text(encoding="utf-8")
+        ids = re.findall(r"^\s*(?:-\s*)?id:\s*(\S+)", text, re.MULTILINE)
+        self.assertTrue(ids, "no id key read from .semgrep-ffmpeg.yml")
+        self.assertEqual([rule_id for rule_id in ids if "." in rule_id], [])
+
+
+@unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
+class FfmpegSemgrepRulesTest(unittest.TestCase):
+    """Verify .semgrep-ffmpeg.yml C rules against synthetic FFmpeg call fixtures."""
+
+    def test_planted_write_header_missing_network_close_flagged(self) -> None:
+        """Planted connect-then-close failure without ff_network_close flags the close line."""
+        results = _scan_ffmpeg_c(FFMPEG_PLANTED_WRITE_HEADER)
+        close_line = next(
+            index
+            for index, line in enumerate(FFMPEG_PLANTED_WRITE_HEADER.splitlines(), 1)
+            if "ff_rtsp_close_connections(handle);" in line
+        )
+        self.assertEqual(len(results), 1)
+        self.assertTrue(
+            results[0]["check_id"].endswith("ffmpeg-rtsp-connect-failure-without-network-close")
+        )
+        self.assertEqual(results[0]["start"]["line"], close_line)
+
+    def test_write_header_with_network_close_passes(self) -> None:
+        """Calling ff_network_close between ff_rtsp_close_connections and return passes."""
+        fixed = FFMPEG_PLANTED_WRITE_HEADER.replace(
+            "        ff_rtsp_close_connections(handle);\n        return status;\n",
+            "        ff_rtsp_close_connections(handle);\n"
+            "        ff_network_close();\n"
+            "        return status;\n",
+        )
+        self.assertEqual(_scan_ffmpeg_c(fixed), [])
+
+    def test_close_function_with_network_close_passes(self) -> None:
+        """A close function calling ff_rtsp_close_connections then ff_network_close passes."""
+        source = (
+            FFMPEG_C_DECLARATIONS
+            + "static int mux_close(SessionHandle *handle)\n"
+            + "{\n"
+            + "    ff_rtsp_close_streams(handle);\n"
+            + "    ff_rtsp_close_connections(handle);\n"
+            + "    ff_network_close();\n"
+            + "    return 0;\n"
+            + "}\n"
+        )
+        self.assertEqual(_scan_ffmpeg_c(source), [])
+
+    def test_close_connections_without_rtsp_connect_passes(self) -> None:
+        """A function without ff_rtsp_connect that closes connections and returns passes."""
+        source = (
+            FFMPEG_C_DECLARATIONS
+            + "static int drop_connections_only(SessionHandle *handle)\n"
+            + "{\n"
+            + "    ff_rtsp_close_connections(handle);\n"
+            + "    return -1;\n"
+            + "}\n"
+        )
+        self.assertEqual(_scan_ffmpeg_c(source), [])
+
+    def test_partial_parsing_c_source_still_matches_and_parses(self) -> None:
+        """Real Semgrep PartialParsing JSON and findings pass upstream_lint's allow-list."""
+        partial_fn = "void unparsed_fn(void)\n{\n    int broken = ;\n}\n\n"
+        source = partial_fn + FFMPEG_PLANTED_WRITE_HEADER
+        with tempfile.TemporaryDirectory() as scratch_name:
+            scratch_path = Path(scratch_name)
+            fixture_file = scratch_path / "partial.c"
+            fixture_file.write_text(source, encoding="utf-8")
+            data = _run_semgrep(
+                fixture_file,
+                scratch_path,
+                config=ROOT / ".semgrep-ffmpeg.yml",
+                allow_errors=True,
+            )
+            json_out = scratch_path / "out.json"
+            json_out.write_text(json.dumps(data), encoding="utf-8")
+            parsed = upstream_lint._read_semgrep_json(json_out)
+        self.assertTrue(data.get("errors"), data)
+        self.assertIsNotNone(parsed, data.get("errors"))
+        matches, partial_paths = parsed or ([], [])
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(len(partial_paths), len(data["errors"]))

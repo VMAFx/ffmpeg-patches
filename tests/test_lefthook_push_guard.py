@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess  # nosec B404 - fixed git/installed lefthook argv in temporary fixture repos.
 import tempfile
 import unittest
 from collections.abc import Iterator
@@ -138,6 +140,36 @@ def iter_hook_jobs(root: Path) -> Iterator[tuple[str, int, dict]]:
             yield hook, index, job
 
 
+def _run_fixture_command(root: Path, env: dict[str, str], command: list[str]) -> None:
+    """Run a fixture setup command with isolated Git settings and a deadline."""
+    subprocess.run(  # nosec B603 - fixed Git argv list; no shell; timeout set.
+        command, cwd=root, env=env, check=True, capture_output=True, text=True, timeout=30
+    )
+
+
+def _init_fixture_repository(root: Path, env: dict[str, str]) -> None:
+    """Commit a tracked file so lefthook exercises both script and run jobs."""
+    _run_fixture_command(root, env, ["git", "init"])
+    (root / "fixture.txt").write_text("hook fixture\n", encoding="utf-8")
+    _run_fixture_command(root, env, ["git", "add", "fixture.txt"])
+    _run_fixture_command(
+        root,
+        env,
+        [
+            "git",
+            "-c",
+            "user.name=Lefthook Fixture",
+            "-c",
+            "user.email=lefthook@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "Initialize hook fixture",
+        ],
+    )
+
+
 class LefthookPushGuardTest(unittest.TestCase):
     """Lefthook skips pre-push run: jobs when there are no push files.
 
@@ -146,9 +178,11 @@ class LefthookPushGuardTest(unittest.TestCase):
     """
 
     def test_push_guard_is_first_unfiltered_script_job(self) -> None:
+        """Keep the unfiltered guard first and stop later jobs on its failure."""
         config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
         pre_push = config["pre-push"]
         self.assertIs(pre_push["parallel"], False)
+        self.assertIs(pre_push.get("piped"), True, "pre-push must stop after a failing job")
         self.assertIn("jobs", pre_push, "push-guard must be a script job")
         self.assertTrue(pre_push["jobs"], "pre-push must have a push-guard job")
         guard = pre_push["jobs"][0]
@@ -169,6 +203,46 @@ class LefthookPushGuardTest(unittest.TestCase):
             'exec sh .config/lefthook/python.sh scripts/push_guard.py "$@"',
             script.read_text(encoding="utf-8"),
         )
+
+    def test_failing_pre_push_guard_stops_later_jobs(self) -> None:
+        """A failed first script prevents later script and run jobs from executing."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        pre_push = {key: value for key, value in config["pre-push"].items() if key != "jobs"}
+        pre_push["jobs"] = [
+            {"name": "guard", "script": "fail.sh", "runner": "sh"},
+            {"name": "gate-script", "script": "mark.sh", "runner": "sh"},
+            {"name": "gate-run", "run": "touch ran-run"},
+        ]
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_fixture_repository(root, env)
+            (root / "lefthook.yml").write_text(
+                yaml.safe_dump({"pre-push": pre_push}), encoding="utf-8"
+            )
+            scripts = root / ".lefthook" / "pre-push"
+            scripts.mkdir(parents=True)
+            for name, content in (("fail.sh", "exit 1\n"), ("mark.sh", "touch ran-second\n")):
+                script = scripts / name
+                script.write_text(content, encoding="utf-8")
+                script.chmod(0o755)
+            result = subprocess.run(  # nosec B603 - fixed lefthook argv list; no shell; timeout set.
+                [lefthook, "run", "pre-push"],
+                check=False,
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            for marker in ("ran-second", "ran-run"):
+                with self.subTest(marker=marker):
+                    self.assertFalse((root / marker).exists(), f"later job ran: {marker}")
 
     def test_contributions_table_regenerates_and_stages_readme(self) -> None:
         """Regenerate and stage README only when contribution data is staged."""

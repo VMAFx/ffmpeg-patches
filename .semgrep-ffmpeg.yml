@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Lusoris
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Semgrep rules for FFmpeg C sources, run by the c-rules step of
+# scripts/upstream_lint.py through scripts/semgrep_scan.sh over changed files.
+rules:
+  # After ff_rtsp_connect() succeeds, every teardown exit must call ff_network_close()
+  # to balance its network init (review of upstream FFmpeg pull request 25618, November 2026).
+  - id: ffmpeg-rtsp-connect-failure-without-network-close
+    languages: [c]
+    severity: ERROR
+    message: >-
+      ff_rtsp_connect() leaves ff_network_init() active once it succeeds; call
+      ff_network_close() after ff_rtsp_close_connections() before returning.
+    patterns:
+      - pattern-inside: |
+          $RET $FUNC(...) {
+            ...
+            <... ff_rtsp_connect(...) ...>;
+            ...
+          }
+      - pattern: |
+          ff_rtsp_close_connections(...);
+          ...
+          return ...;
+      - pattern-not: |
+          ff_rtsp_close_connections(...);
+          ...
+          ff_network_close(...);
+          ...
+          return ...;

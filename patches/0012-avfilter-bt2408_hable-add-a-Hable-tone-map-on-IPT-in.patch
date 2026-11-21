@@ -32,18 +32,18 @@ Signed-off-by: lusoris <lusoris@proton.me>
  create mode 100644 tests/ref/fate/filter-bt2408-hable
 
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 8ae4e0a8c36002f901e5fa4a2ef548bff59ae488..a95be8532967122a6a7787aa422b2f47d15e45ab 100644
+index 1c121bfa096ee4924bc5c4cc3a777ba1c1428ed9..ffcb8a104f364dddeb16b72432a9f1506775d531 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -683,7 +683,7 @@ SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
- SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
+@@ -684,7 +684,7 @@ SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
  
+ TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
  TOOLS     = graph2dot
 -TESTPROGS = drawutils filtfmts formats integral
 +TESTPROGS = bt2408_hable drawutils filtfmts formats integral
  
- TESTPROGS-$(CONFIG_DOVI_RESHAPE_FILTER) += dovi_reshape
  TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
+ 
 diff --git a/libavfilter/bt2408_hable.c b/libavfilter/bt2408_hable.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..6425ece06d13ca3a81ca0072a3016a93cd4ace25
@@ -481,12 +481,12 @@ index 0000000000000000000000000000000000000000..52edc725b8528815211f9cc24bae67ed
 +    return fails != 0;
 +}
 diff --git a/tests/fate/filter-video.mak b/tests/fate/filter-video.mak
-index db310a856d0fee0cdd238dac6df3ddc253d172be..51d7e83e9e6a809969174d3d4be8e5e8196d33ba 100644
+index 68ad212c7ff887321ababbda74df0f591080c6d5..b2b71964a6a7fe36e97c5f3fb81c79f18e52a320 100644
 --- a/tests/fate/filter-video.mak
 +++ b/tests/fate/filter-video.mak
-@@ -489,6 +489,10 @@ FATE_FILTER-$(CONFIG_DOVI_RESHAPE_FILTER) += fate-filter-dovi-reshape-graph
- fate-filter-dovi-reshape-graph: libavfilter/tests/dovi_reshape$(EXESUF)
- fate-filter-dovi-reshape-graph: CMD = run libavfilter/tests/dovi_reshape$(EXESUF) filter
+@@ -489,6 +489,10 @@ fate-filter-fps-down-eof-pass: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:eo
+ fate-filter-fps-start-drop: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:start_time=1.5
+ fate-filter-fps-start-fill: CMD = framecrc -lavfi testsrc2=r=7:d=1.5,setpts=PTS+14,fps=3:start_time=1.5
  
 +FATE_FILTER-yes += fate-filter-bt2408-hable
 +fate-filter-bt2408-hable: libavfilter/tests/bt2408_hable$(EXESUF)

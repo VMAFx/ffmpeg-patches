@@ -51,17 +51,27 @@ ARGS = [
 ]
 
 
-def process_alive(pid: int) -> bool:
-    """Return whether a process exists and has not exited."""
+def _signal_probe(pid: int) -> bool:
+    """Return whether the signal probe finds the process."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    return True
+
+
+def process_alive(pid: int) -> bool:
+    """Return whether a process exists and has not exited."""
+    if not _signal_probe(pid):
+        return False
     stat = Path(f"/proc/{pid}/stat")
     try:
         state = stat.read_text(encoding="utf-8").rpartition(")")[2].split()[0]
+    except ProcessLookupError:
+        return False
     except FileNotFoundError:
-        return True
+        # No stat entry: procfs absent, or the process was reaped after the first probe.
+        return _signal_probe(pid)
     return state not in {"Z", "X"}
 
 
@@ -252,6 +262,29 @@ class LaneBriefTest(unittest.TestCase):
             self.assertTrue(process_alive(123))
         with patch("os.kill", side_effect=ProcessLookupError):
             self.assertFalse(process_alive(123))
+
+    def test_process_alive_reaped_during_read(self) -> None:
+        """Treat a process reaped during the procfs read as gone."""
+        with patch("os.kill"), patch.object(Path, "read_text", side_effect=ProcessLookupError):
+            self.assertFalse(process_alive(123))
+
+    def test_process_alive_reaped_before_read(self) -> None:
+        """Treat a process reaped before the procfs read as gone."""
+        with (
+            patch("os.kill", side_effect=[None, ProcessLookupError]) as signal_probe,
+            patch.object(Path, "read_text", side_effect=FileNotFoundError),
+        ):
+            self.assertFalse(process_alive(123))
+            self.assertEqual(signal_probe.call_count, 2)
+
+    def test_process_alive_without_procfs(self) -> None:
+        """Treat a process passing both signal probes as alive without procfs."""
+        with (
+            patch("os.kill") as signal_probe,
+            patch.object(Path, "read_text", side_effect=FileNotFoundError),
+        ):
+            self.assertTrue(process_alive(123))
+            self.assertEqual(signal_probe.call_count, 2)
 
     def constant_names(self, tree: ast.Module) -> set[str]:
         """Collect module-level constant names from assignments."""
@@ -560,17 +593,21 @@ class LaneBriefTest(unittest.TestCase):
         """Accept supported invocations and reject the import-style module after another module."""
         content = self.rendered()
         brief = self.root / "brief.md"
+        import_style_first = (
+            "/usr/bin/python3 -B -m unittest tests.test_import_style tests.test_sweep_classes -v"
+        )
+        import_style_last = (
+            "/usr/bin/python3 -B -m unittest tests.test_sweep_classes tests.test_import_style -v"
+        )
         for invocation, expected in (
             ("python -m unittest tests.test_import_style", 0),
             ("/usr/bin/python3 -B -m unittest tests.test_import_style -v", 0),
             (
-                "/usr/bin/python3 -B -m unittest tests.test_import_style "
-                "tests.test_sweep_classes -v",
+                import_style_first,
                 0,
             ),
             (
-                "/usr/bin/python3 -B -m unittest tests.test_sweep_classes "
-                "tests.test_import_style -v",
+                import_style_last,
                 1,
             ),
         ):

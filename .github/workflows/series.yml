@@ -21,7 +21,7 @@ env:
   # The Praetor engine of this repository. No job here runs it: the local hooks
   # and `make verify-all` read this pin through .config/lefthook/engine.sh, so
   # a newer praetorctl on a workstation cannot change what the gates decide.
-  PRAETOR_REF: ea8f20b9d936eb10c276b383fc45c3e1c8775322
+  PRAETOR_REF: ae21a8040ff52cf91b94303d25db3d098529ecdf
 
 concurrency:
   # In a called run the context is the caller's, so the workflow name keeps a
@@ -84,6 +84,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
+      - name: Record job budget start
+        run: echo "SERIES_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
       - *stop-on-draft
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event.pull_request.draft != true
@@ -101,7 +103,10 @@ jobs:
       - name: Install cosign
         if: github.event.pull_request.draft != true
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
-      # The Makefile test target runs the unit suite in UNIT_JOBS=4 worker processes (unittest-parallel) to stay under timeout-minutes.
+      # make test uses UNIT_JOBS=4 processes, class tasks and singleton forgejo methods.
+      # unit_test_budget.py reads this job's timeout-minutes as the sole limit source,
+      # reports job elapsed from the first step and unit wall time against its shared budget.
+      # The leak guard wraps the unit run; the runner reports the slowest suite timings.
       - name: Series check, lint and unit tests
         if: github.event.pull_request.draft != true
         run: make test
@@ -183,30 +188,82 @@ jobs:
       - name: Lint the C sources of this repository with clang-tidy and cppcheck
         # The list is the clang_tidy lane of .standards.yaml. The DV5 fixture
         # generator (ADR-0002) compiles against the pinned FFmpeg headers, taken
-        # as system headers so that only the generator is judged.
+        # as system headers so that only the generator is judged. The Vulkan
+        # loader finds the exported entry point of the fault layer with dlsym;
+        # .config/cppcheck/vulkan-layer.cfg names it as an entry point, so
+        # cppcheck knows its caller. The fault layer reads secure_getenv and
+        # strnlen, which glibc declares under _GNU_SOURCE; the flag comes from
+        # the command line because clang-tidy rejects a reserved identifier
+        # defined in the source.
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         run: |
           clang-tidy --version | head -2
           cppcheck --version
           mapfile -t sources < .config/clang-tidy/sources.txt
-          clang-tidy --quiet "${sources[@]}" -- -std=c17 -isystem ffmpeg -isystem build
+          clang-tidy --quiet "${sources[@]}" -- -std=c17 -D_GNU_SOURCE -isystem ffmpeg -isystem build
           cppcheck --enable=all --std=c17 --check-level=exhaustive --error-exitcode=1 \
-            --suppress=missingIncludeSystem --suppress=checkersReport "${sources[@]}"
+            --suppress=missingIncludeSystem --suppress=checkersReport \
+            --library=.config/cppcheck/vulkan-layer.cfg "${sources[@]}"
       - name: Build FFmpeg, its tools and test programs
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         working-directory: build
         run: make -j"$(nproc)" build 2>&1 | tee build.log
       - name: Run the FATE tests that need no samples
+        # fate-filter-hqdn3d-vulkan (0023) runs libavfilter/tests/hqdn3d_vulkan,
+        # which needs a Vulkan device and exits nonzero without one; the next
+        # step runs it on lavapipe.
         if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
         working-directory: build
         run: |
-          mapfile -t targets < <(make -s fate-list | grep '^fate-')
+          mapfile -t targets < <(make -s fate-list | grep '^fate-' \
+            | grep -vx 'fate-filter-hqdn3d-vulkan')
           if [ "${#targets[@]}" -eq 0 ]; then
             echo "::error::FFmpeg listed no FATE target"
             exit 1
           fi
           echo "FATE targets: ${#targets[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           make -j"$(nproc)" -k "${targets[@]}" 2>&1 | tee -a build.log
+      - name: Run fate-filter-hqdn3d-vulkan and the fence fault tests on lavapipe
+        # The FATE step above leaves out fate-filter-hqdn3d-vulkan (0023), as
+        # libavfilter/tests/hqdn3d_vulkan needs a Vulkan device. The hosted
+        # runner has no GPU, so Mesa lavapipe runs it on the CPU. The step runs
+        # for every pull request in series scope, not only in GPU parity scope.
+        # It then runs tests.test_hqdn3d_vulkan_fault (0023), which loads
+        # tests/fixtures/vk_fault/vk_fault_layer.c as a Vulkan layer and
+        # requires every injected failure to end FFmpeg within 30 seconds with
+        # a nonzero exit.
+        if: github.event.pull_request.draft != true && env.IN_SCOPE == 'true'
+        run: |
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+          lvp=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' | head -1)
+          if [ -z "$lvp" ]; then
+            echo "::error::lavapipe is not installed"
+            exit 1
+          fi
+          export VK_DRIVER_FILES="$lvp"
+          if ! build/ffmpeg -hide_banner -nostdin -v verbose -init_hw_device vulkan=vk:0 \
+            -f lavfi -i nullsrc=d=0.04 -f null - > probe.log 2>&1 \
+            || ! grep -qi llvmpipe probe.log; then
+            cat probe.log
+            echo "::error::vulkan=vk:0 did not open llvmpipe"
+            exit 1
+          fi
+          if ! make -C build fate-filter-hqdn3d-vulkan 2>&1 | tee fate-hqdn3d.log; then
+            echo "::error::fate-filter-hqdn3d-vulkan failed on lavapipe"
+            exit 1
+          fi
+          export VK_FFMPEG="$PWD/build/ffmpeg" VK_DEVICE=0
+          fault=0
+          python3 -m unittest -v tests.test_hqdn3d_vulkan_fault > fault.log 2>&1 || fault=$?
+          cat fault.log
+          if grep "skipped 'set VK_" fault.log; then
+            echo "::error::a fence fault case was skipped instead of run"
+            exit 1
+          fi
+          if [ "$fault" -ne 0 ]; then
+            echo "::error::tests.test_hqdn3d_vulkan_fault exited $fault"
+            exit 1
+          fi
       - name: Compare the hqdn3d and tonemap GPU filters with the CPU filters on software devices
         # ADR-0004: the GPU hqdn3d filters must give the CPU filter's samples;
         # tonemap_opencl and tonemap_vulkan must stay within one code value of
@@ -216,6 +273,8 @@ jobs:
         # is not used: it offers FFmpeg no planar or semi-planar image format.
         # The loaders see only those drivers; the step fails when FFmpeg opens
         # another device or when a device case is skipped instead of run.
+        # The in-graph reset cases run libavfilter/tests/hqdn3d_vulkan on
+        # the same devices; the step before runs fate-filter-hqdn3d-vulkan.
         if: >-
           github.event.pull_request.draft != true && env.IN_SCOPE == 'true' &&
           (needs.scope.result != 'success' || needs.scope.outputs.parity == 'true')
@@ -246,14 +305,15 @@ jobs:
           }
           probe vulkan=vk:0 llvmpipe
           probe opencl=ocl:0.0 rusticl
+          export HQDN3D_RESET_TOOL="$PWD/build/libavfilter/tests/hqdn3d_vulkan"
           python3 -m unittest -v -k matches_cpu -k temporal_only -k graph_rebuild \
-            -k unsupported_format -k planted -k MismatchRule \
+            -k in_graph_resize -k unsupported_format -k planted -k MismatchRule \
             tests.test_hqdn3d_vulkan tests.test_hqdn3d_opencl 2>&1 | tee parity.log
           hqdn3d=${PIPESTATUS[0]}
           python3 -m unittest -v tests.test_tonemap_vulkan tests.test_tonemap_opencl 2>&1 \
             | tee -a parity.log
           tonemap=${PIPESTATUS[0]}
-          if grep -E "skipped 'set (VK|OCL)_" parity.log; then
+          if grep -E "skipped 'set (VK|OCL)_|skipped 'set HQDN3D_RESET_TOOL" parity.log; then
             echo "::error::a device case was skipped instead of run"
             exit 1
           fi
