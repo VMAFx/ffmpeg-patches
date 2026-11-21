@@ -3524,7 +3524,7 @@ class PreCommitResolutionTest(unittest.TestCase):
         upstream_lint._validate_executable([executable, "run"])
 
 
-@unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed")
+@unittest.skipUnless(shutil.which(os.environ.get("SEMGREP") or "semgrep"), "semgrep not installed")
 class CRulesScratchTest(FixtureTest):
     """Exercise scratch preparation and real scanner results on synthetic sources."""
 
@@ -4355,6 +4355,22 @@ class CRulesBlankingTest(unittest.TestCase):
             "\n".join(retained[:2] + [" " * len(line) for line in removed] + retained[2:]) + "\n"
         )
         self.assertEqual(upstream_lint._c_rules_blank(source.encode(), set()), expected.encode())
+
+    def test_open_declaration_retains_macro_call_until_completed(self) -> None:
+        """Open declarations retain macro call lines while completed declarations blank them."""
+        open_decl = b"#define VALUE(x) (x)\nstatic int n =\n    VALUE(1)\n    ;\n"
+        self.assertEqual(upstream_lint._c_rules_blank(open_decl, set()), open_decl)
+        completed = b"#define VALUE(x) (x)\nstatic int a;\nVALUE(1)\n"
+        expected = b"#define VALUE(x) (x)\nstatic int a;\n        \n"
+        self.assertEqual(upstream_lint._c_rules_blank(completed, set()), expected)
+
+    def test_unclosed_comment_with_paren_after_call_is_retained(self) -> None:
+        """A trailing comment opener with a parenthesis keeps the macro call line intact."""
+        source = b"#define BUILD(x) (x)\nBUILD(x) /* note )\n still comment */\n"
+        blanked = upstream_lint._c_rules_blank(source, set())
+        self.assertEqual(blanked, source)
+        self.assertIn(b"/*", blanked)
+        self.assertIn(b"*/", blanked)
 
     def test_unread_requested_path_remains_original_link(self) -> None:
         """A read failure preserves the original inaccessible path for the scanner."""

@@ -2522,13 +2522,25 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     words = re.compile(rb"\b(?:" + b"|".join(sorted(attributes)) + rb")\b") if attributes else None
     lines = source.split(b"\n")
     depth = 0
+    at_boundary = True
     for index in range(len(lines)):
         raw, clean = lines[index], code[index]
         invocation = re.fullmatch(rb"[ \t]*[A-Za-z_]\w*[ \t]*\(.*\)[ \t\r]*", raw)
-        if depth == 0 and invocation and _c_rules_macro_call(clean, names):
+        if (
+            depth == 0
+            and at_boundary
+            and invocation
+            and _c_rules_macro_call(clean, names)
+            and not raw[clean.rfind(")") + 1 :].strip(b" \t\r")
+        ):
             lines[index] = re.sub(rb"[^\r]", b" ", raw)
-        elif words is not None:
-            lines[index] = _c_rules_blank_words(raw, clean, words)
+            at_boundary = True
+        else:
+            if words is not None:
+                lines[index] = _c_rules_blank_words(raw, clean, words)
+            stripped = clean.rstrip(" \t\r\f\v")
+            if stripped:
+                at_boundary = stripped[-1] in {";", "}"}
         depth += clean.count("{") - clean.count("}")
     return b"\n".join(lines)
 
