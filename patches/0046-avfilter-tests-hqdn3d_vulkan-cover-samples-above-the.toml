@@ -1,0 +1,18 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx", "pelorus"]
+origin = "test for the depth mask that 0023 adds to the hqdn3d_vulkan shaders, split from 0023 so that no state of the series before 0045 feeds a sample above the bit depth into the unmasked CPU filter"
+release_only = "a split of the 9.0 series only: master contains the CPU mask of 0045, and the FFmpeg pull request 25879 form recorded on 0023 (head de601453) already carries this case and its reference line, so applying it there would add the case twice"
+notes = """
+Adds a case to libavfilter/tests/hqdn3d_vulkan.c: a 2x2 yuv420p12 \
+frame whose luma rows hold 1000 and 5120 (5120 sets a bit above the \
+12-bit depth) runs through hqdn3d and hqdn3d_vulkan, and the outputs \
+must match. fate-filter-hqdn3d-vulkan prints one more line, \
+upper 0 2 2 same luma 1000 1022 1000 1021, 22 lines in all. The case \
+shares the frame allocation and the run with the negative-value case \
+of 0023. It needs the CPU mask of 0045: without it, hqdn3d indexes \
+past its lookup tables for 5120. Upstream, the test commit of pull \
+request 25879 (head de601453, pushed 2026-11-21) adds the same case. The \
+status stays unsubmitted because the series metadata has no form for \
+a later patch whose content rides in the master form of an earlier \
+patch; drop this patch with 0023 once 25879 is in the base."""

@@ -1,0 +1,18 @@
+status = "unsubmitted"
+upstream = ""
+consumers = ["vmafx", "pelorus"]
+origin = "backport of FFmpeg master f824f2e1cd46940754d5c5844113d61eb25d7e05 (Michael Niedermayer, 2026-11-14, on master since 2026-11-19)"
+notes = """
+Already on FFmpeg master; release/9.0 does not carry it (checked \
+2026-11-20 against release/9.0 d59078794d). Drop the patch once the \
+pinned base contains the commit. The commit reached master without a \
+pull request, so this sidecar has no upstream link and keeps status \
+unsubmitted: status merged needs a pull request record in \
+upstream-contributions.json. On master the apply finds its lines and \
+reports the patch as a drop candidate. It applies to the series \
+unchanged after 0044. \
+hqdn3d reads a sample with bits above the depth of its format as an \
+index past the end of its lookup tables; the commit masks each sample \
+to its depth in the C code and the x86 assembly. The GPU filters of \
+0023 to 0026 mask each sample the same way before their shift, and \
+0046 checks the Vulkan filter against the masked CPU output."""

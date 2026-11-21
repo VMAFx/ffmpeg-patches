@@ -27,10 +27,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  doc/filters.texi                              |   33 +
  libavfilter/Makefile                          |    5 +
  libavfilter/allfilters.c                      |    1 +
- .../metal/vf_hqdn3d_videotoolbox.metal        |  325 +++++
+ .../metal/vf_hqdn3d_videotoolbox.metal        |  326 +++++
  libavfilter/tests/hqdn3d_vulkan.c             |   23 +-
  libavfilter/vf_hqdn3d_videotoolbox.m          | 1105 +++++++++++++++++
- 7 files changed, 1492 insertions(+), 1 deletion(-)
+ 7 files changed, 1493 insertions(+), 1 deletion(-)
  create mode 100644 libavfilter/metal/vf_hqdn3d_videotoolbox.metal
  create mode 100644 libavfilter/vf_hqdn3d_videotoolbox.m
 
@@ -47,7 +47,7 @@ index d386cc831d5e7265f8f73f42692a91ea57bdf4cb..0ebe83a5ae70d894b284b8715cc98628
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 0a85746f13ce5de161588bc55691a94ea7637e8d..5584aacfb6dc17beaaba851646b6f309da3aef5d 100644
+index d4a85fbcecd0c4991f5d8d29cb0f01e045ae7234..1b81597fa260b8aca13a25f0d0cb47198ee3e07b 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15857,6 +15857,39 @@ The filter accepts the same options as @ref{hqdn3d}:
@@ -127,10 +127,10 @@ index 81c1f2c8a8d38e38b40a2b6bfb3e8f05fbbbc627..5ecf9a8698318dd84d5d3723df2053a2
  extern const FFFilter ff_vf_hstack;
 diff --git a/libavfilter/metal/vf_hqdn3d_videotoolbox.metal b/libavfilter/metal/vf_hqdn3d_videotoolbox.metal
 new file mode 100644
-index 0000000000000000000000000000000000000000..30f3e40acfd806be2a861a553a721ebdfeca2d8b
+index 0000000000000000000000000000000000000000..9bb8f7feb166e51dca331a9bc737113098867eb8
 --- /dev/null
 +++ b/libavfilter/metal/vf_hqdn3d_videotoolbox.metal
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,326 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -184,6 +184,7 @@ index 0000000000000000000000000000000000000000..30f3e40acfd806be2a861a553a721ebd
 +{
 +    uint shift = 16u - s_depth;
 +    uint sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    sample_val &= (1u << s_depth) - 1u;
 +    uint rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
 +    return (sample_val << shift) + rounding;
 +}

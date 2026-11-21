@@ -59,20 +59,20 @@ hqdn3d does.
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
  configure                                     |    1 +
- doc/filters.texi                              |   46 +
+ doc/filters.texi                              |   49 +
  libavfilter/Makefile                          |    4 +-
  libavfilter/allfilters.c                      |    1 +
  libavfilter/hqdn3d_coefs.c                    |   58 +
  libavfilter/hqdn3d_coefs.h                    |   57 +
  libavfilter/tests/hqdn3d_vulkan.c             | 1047 +++++++++++++++++
  libavfilter/vf_hqdn3d.c                       |   33 +-
- libavfilter/vf_hqdn3d_vulkan.c                |  938 +++++++++++++++
+ libavfilter/vf_hqdn3d_vulkan.c                |  985 ++++++++++++++++
  libavfilter/vulkan/Makefile                   |    2 +
- .../vulkan/hqdn3d_horizontal.comp.glsl        |  160 +++
- libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  233 ++++
+ .../vulkan/hqdn3d_horizontal.comp.glsl        |  161 +++
+ libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  234 ++++
  tests/fate/hw.mak                             |    4 +
  tests/ref/fate/filter-hqdn3d-vulkan           |   21 +
- 14 files changed, 2574 insertions(+), 31 deletions(-)
+ 14 files changed, 2626 insertions(+), 31 deletions(-)
  create mode 100644 libavfilter/hqdn3d_coefs.c
  create mode 100644 libavfilter/hqdn3d_coefs.h
  create mode 100644 libavfilter/tests/hqdn3d_vulkan.c
@@ -94,10 +94,10 @@ index b1656f0f803081cecc0f9ac7136c2d08d0494ca1..231c6b67c5dd7564633dc0801adc81cf
  iccgen_filter_deps="lcms2"
  identity_filter_select="scene_sad"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..20fd10c7f159d3450599317937944a81257574a5 100644
+index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..7b65d803d57ab355f5ce1d7e4c8264f719217f2b 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -15792,6 +15792,52 @@ The command accepts the same syntax of the corresponding option.
+@@ -15792,6 +15792,55 @@ The command accepts the same syntax of the corresponding option.
  If the specified expression is not valid, it is kept at its current
  value.
  
@@ -111,6 +111,9 @@ index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..20fd10c7f159d3450599317937944a81
 +format maximum, which these formats cannot store, this filter writes the
 +format maximum.
 +The filter refuses a frame whose software format differs from the link's.
++The Vulkan frames must allow unsigned integer storage image views, and the
++device must support at least two storage image descriptors per plane in a
++compute shader.
 +The filter also refuses a device on which one of these shader or storage
 +features is not enabled: @code{shaderInt16}, @code{storageBuffer16BitAccess},
 +@code{scalarBlockLayout},
@@ -1428,10 +1431,10 @@ index 98c05e886c20dea9b4adff6f6075afb4abbfe204..d066a0e75bb927300a19ccddfb80ba21
  static int config_input(AVFilterLink *inlink)
 diff --git a/libavfilter/vf_hqdn3d_vulkan.c b/libavfilter/vf_hqdn3d_vulkan.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..85f0c9a056615412aab29f3f4d2b4494bef0a2a0
+index 0000000000000000000000000000000000000000..5068cbd75185cff011f47236c8c96cfcdf669446
 --- /dev/null
 +++ b/libavfilter/vf_hqdn3d_vulkan.c
-@@ -0,0 +1,938 @@
+@@ -0,0 +1,985 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -1578,6 +1581,41 @@ index 0000000000000000000000000000000000000000..85f0c9a056615412aab29f3f4d2b4494
 +               av_get_pix_fmt_name(sw_format));
 +        return AVERROR(ENOSYS);
 +    }
++}
++
++/* Storage descriptors use unsigned integer views, not the backing image formats. */
++static int check_frame_views(AVFilterContext *ctx, const AVFrame *frame)
++{
++    const AVHWFramesContext *hwfc = (const AVHWFramesContext *)frame->hw_frames_ctx->data;
++    const AVVulkanFramesContext *vkfc = hwfc->hwctx;
++    const VkImageFormatListCreateInfo *list;
++
++    if (!(vkfc->usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
++        !(vkfc->img_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
++        av_log(ctx, AV_LOG_ERROR, "Vulkan frames must allow mutable-format storage images\n");
++        return AVERROR(ENOTSUP);
++    }
++
++    list = ff_vk_find_struct(vkfc->create_pnext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
++    if (list && list->viewFormatCount) {
++        const VkFormat *formats = av_vkfmt_from_pixfmt(hwfc->sw_format);
++        const int planes = av_pix_fmt_count_planes(hwfc->sw_format);
++
++        for (int p = 0; p < planes; p++) {
++            const VkFormat fmt = ff_vk_map_fmt_to_rep(formats[p], FF_VK_REP_UINT);
++            uint32_t i;
++
++            for (i = 0; i < list->viewFormatCount; i++)
++                if (list->pViewFormats[i] == fmt)
++                    break;
++            if (i == list->viewFormatCount) {
++                av_log(ctx, AV_LOG_ERROR, "Vulkan frames do not allow unsigned view format %d\n", fmt);
++                return AVERROR(ENOTSUP);
++            }
++        }
++    }
++
++    return 0;
 +}
 +
 +/* Set default filter strengths and initialize the Vulkan context, returning 0 on success. */
@@ -1825,6 +1863,12 @@ index 0000000000000000000000000000000000000000..85f0c9a056615412aab29f3f4d2b4494
 +    if (err < 0)
 +        return err;
 +
++    if (2 * planes > vkctx->props.properties.limits.maxPerStageDescriptorStorageImages) {
++        av_log(ctx, AV_LOG_ERROR, "Vulkan device supports fewer than %d storage images per stage\n",
++               2 * planes);
++        return AVERROR(ENOTSUP);
++    }
++
 +    s->qf = ff_vk_qf_find(vkctx, VK_QUEUE_COMPUTE_BIT, 0);
 +    if (!s->qf) {
 +        av_log(ctx, AV_LOG_ERROR, "Device has no compute queues\n");
@@ -2067,6 +2111,10 @@ index 0000000000000000000000000000000000000000..85f0c9a056615412aab29f3f4d2b4494
 +    if (err < 0)
 +        return err;
 +
++    err = check_frame_views(ctx, in);
++    if (err < 0)
++        return err;
++
 +    if (!s->initialized) {
 +        s->hsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_w;
 +        s->vsub = av_pix_fmt_desc_get(hwfc->sw_format)->log2_chroma_h;
@@ -2294,7 +2342,9 @@ index 0000000000000000000000000000000000000000..85f0c9a056615412aab29f3f4d2b4494
 +        return err;
 +    }
 +
-+    err = exec_filter(s, in, out);
++    err = check_frame_views(ctx, out);
++    if (err >= 0)
++        err = exec_filter(s, in, out);
 +    if (err < 0) {
 +        av_frame_free(&in);
 +        av_frame_free(&out);
@@ -2385,10 +2435,10 @@ index f81542dcb9d8e40debcb11dd5eddb8ff34e4fa3e..4434028f839d0495c0c861eed63b581b
  OBJS-$(CONFIG_SCDET_VULKAN_FILTER) += vulkan/scdet.comp.spv.o
 diff --git a/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl b/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl
 new file mode 100644
-index 0000000000000000000000000000000000000000..22193402437fab2d94548bcde5054e0067f76849
+index 0000000000000000000000000000000000000000..e0c749af8a77a36a3e28ac8f2a2dd4769b130607
 --- /dev/null
 +++ b/libavfilter/vulkan/hqdn3d_horizontal.comp.glsl
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,161 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -2420,7 +2470,7 @@ index 0000000000000000000000000000000000000000..22193402437fab2d94548bcde5054e00
 +#extension GL_EXT_shader_image_load_formatted : require
 +#extension GL_EXT_nonuniform_qualifier : require
 +
-+layout (local_size_x_id = 253, local_size_y_id = 254, local_size_z_id = 255) in;
++layout (local_size_x = 1, local_size_y = 32) in;
 +
 +/* The filter sets this to the plane count of the frame format. */
 +layout (constant_id = 0) const uint planes = 3;
@@ -2467,6 +2517,7 @@ index 0000000000000000000000000000000000000000..22193402437fab2d94548bcde5054e00
 +{
 +    uint shift = 16u - s_depth;
 +    uint sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    sample_val &= (1u << s_depth) - 1u;
 +    uint rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
 +    return (sample_val << shift) + rounding;
 +}
@@ -2551,10 +2602,10 @@ index 0000000000000000000000000000000000000000..22193402437fab2d94548bcde5054e00
 +}
 diff --git a/libavfilter/vulkan/hqdn3d_vertical.comp.glsl b/libavfilter/vulkan/hqdn3d_vertical.comp.glsl
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a4d78e11e1780e44a412e2594cad292e2a4c25b
+index 0000000000000000000000000000000000000000..7aec109fff49c3dcec9d8f21c2c77d12a85a47e4
 --- /dev/null
 +++ b/libavfilter/vulkan/hqdn3d_vertical.comp.glsl
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,234 @@
 +/*
 + * Copyright (c) 2003 Daniel Moreno <comac AT comac DOT darktech DOT org>
 + * Copyright (c) 2010 Baptiste Coudurier
@@ -2586,7 +2637,7 @@ index 0000000000000000000000000000000000000000..2a4d78e11e1780e44a412e2594cad292
 +#extension GL_EXT_shader_image_load_formatted : require
 +#extension GL_EXT_nonuniform_qualifier : require
 +
-+layout (local_size_x_id = 253, local_size_y_id = 254, local_size_z_id = 255) in;
++layout (local_size_x = 32, local_size_y = 1) in;
 +
 +/* The filter sets this to the plane count of the frame format. */
 +layout (constant_id = 0) const uint planes = 3;
@@ -2649,6 +2700,7 @@ index 0000000000000000000000000000000000000000..2a4d78e11e1780e44a412e2594cad292
 +{
 +    uint shift = 16u - s_depth;
 +    uint sample_val = (s_msb != 0u) ? (raw >> shift) : raw;
++    sample_val &= (1u << s_depth) - 1u;
 +    uint rounding = (shift > 0u) ? (((1u << shift) - 1u) >> 1u) : 0u;
 +    return (sample_val << shift) + rounding;
 +}
