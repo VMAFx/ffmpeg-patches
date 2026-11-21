@@ -24,6 +24,10 @@ WRAPPED_AVFRAME_DECODER: lavfi emits wrapped_avframe video packets, so an encode
 alone cannot satisfy decoding. Templates are reported without expansion,
 macro argument transforms such as `$(2:%=%_DECODER)` are not expanded,
 multi-file variables are reported unresolved, and audio PCM decoders are not checked.
+It also flags a touched CMD that names one tests/data directory both under
+`$(TARGET_PATH)/` and relative, because TARGET_EXEC programs see the target view
+while shell words see the host view; single-root commands and CLEANFILES are not
+checked.
 
 The regression-test step fails when a commit whose subject or body, outside its
 Signed-off-by lines, says fix, fixes or fixed or names a defect (bug,
@@ -650,6 +654,12 @@ LAVFI_FORMAT = re.compile(r"(?:^|\s)-f\s+lavfi(?=\s|$)")
 LAVFI_OPTION = re.compile(r"^-[\w:]+$")
 LAVFI_NAME = re.compile(r"""^["']?([a-z0-9_]+)(?=[=,;\s"']|$)""")
 FATE_REQUIRED = ("LAVFI_INDEV", "WRAPPED_AVFRAME_DECODER")
+FATE_ROOTED_DATA = re.compile(
+    r"""\$\(TARGET_PATH\)/tests/data/([A-Za-z0-9_.-]+)(?=[/ \t"';|)<>]|\Z)"""
+)
+FATE_RELATIVE_DATA = re.compile(
+    r"""(?:^|[ \t=<>"'])tests/data/([A-Za-z0-9_.-]+)(?=[/ \t"';|)<>]|\Z)"""
+)
 
 
 @dataclass(frozen=True)
@@ -1199,17 +1209,59 @@ def _fate_diagnostics(path: str, parsed: FateFile, touched: set[int], report: Fa
                 )
 
 
+def _fate_mixed_data(command: str) -> list[str]:
+    """Return sorted tests/data directory names used both rooted and relative."""
+    rooted = set(FATE_ROOTED_DATA.findall(command))
+    if not rooted:
+        return []
+    return sorted(rooted & set(FATE_RELATIVE_DATA.findall(command)))
+
+
+def _fate_paths(
+    path: str,
+    variants: list[FateEntry],
+    changes: tuple[set[int], set[int] | frozenset[int]],
+    report: FateReport,
+    base: FateFile | None,
+) -> None:
+    """Report mixed-root commands changed in lines, target ownership or command text."""
+    added, deleted = changes
+    for command in variants:
+        changed = (
+            _fate_touched(command, added)
+            or bool(deleted.intersection(range(command.line.first, command.line.last)))
+            or (
+                base is not None
+                and not any(
+                    entry.command == command.command
+                    for entry in base.commands.get(command.target.text, [])
+                )
+            )
+        )
+        label = "finding" if changed else "pre-existing (untouched)"
+        for directory in _fate_mixed_data(command.command):
+            report.findings += int(changed)
+            report.lines.append(
+                f"{label}: {path}:{command.line.first}: {command.target.text}: "
+                f"tests/data/{directory} named with and without $(TARGET_PATH)/; "
+                f"run every access through $(TARGET_PATH)/tests/data/{directory}"
+            )
+
+
 def _fate_check(
     path: str,
     parsed: FateFile,
-    added: set[int],
+    changes: tuple[set[int], set[int] | frozenset[int]],
     sources: dict[str, str],
     base: FateFile | None = None,
 ) -> FateReport:
-    """Check each registration against all video variants and its own touched provenance."""
+    """Check paths against base commands and video registrations against changed lines."""
+    added, deleted = changes
+    touched = added | deleted
     report = FateReport()
-    _fate_diagnostics(path, parsed, added, report)
+    _fate_diagnostics(path, parsed, touched, report)
     for name, variants in parsed.commands.items():
+        _fate_paths(path, variants, changes, report, base)
         if "$(" in name:
             continue
         video = [
@@ -1223,10 +1275,12 @@ def _fate_check(
         old_video = base is not None and any(
             "video" in _fate_kinds(entry, sources) for entry in base.commands.get(name, [])
         )
-        newly_video = not old_video and any(_fate_touched(entry, added) for entry in video)
+        newly_video = not old_video and any(_fate_touched(entry, touched) for entry in video)
         registrations = parsed.registrations.get(name, [])
-        touched = added | ({entry.line.first for entry in registrations} if newly_video else set())
-        _fate_video(path, video[0], registrations, touched, report)
+        video_touched = touched | (
+            {entry.line.first for entry in registrations} if newly_video else set()
+        )
+        _fate_video(path, video[0], registrations, video_touched, report)
     return report
 
 
@@ -1237,11 +1291,11 @@ def _fate_file(
     sources: dict[str, str],
     context: FateContext | None = None,
 ) -> FateReport:
-    """Expose pure head/base parsing, injected catalogs and deletion-aware checking."""
+    """Expose pure head/base parsing, injected catalogs and split added/deletion sets."""
     context = context or FateContext()
     base = _fate_parse(context.base, context.macros) if context.base is not None else None
     return _fate_check(
-        path, _fate_parse(source, context.macros), added | context.deleted, sources, base
+        path, _fate_parse(source, context.macros), (added, context.deleted), sources, base
     )
 
 
@@ -1251,7 +1305,8 @@ def _fate_summary(report: FateReport, rc: int = 0) -> Step:
         f"{report.checked} lavfi video test(s) checked, {report.audio} audio skipped, "
         f"{report.unclassified} unclassified, {report.unresolved} unresolved, "
         f"{report.findings} finding(s); "
-        "FATE dependencies: wrapped_avframe decoder"
+        "FATE dependencies: wrapped_avframe decoder; "
+        "FATE paths: $(TARGET_PATH)/tests/data"
     )
     return Step("fate-deps", rc or int(report.findings > 0), "\n".join([*report.lines, summary]))
 
@@ -1294,7 +1349,7 @@ def _fate_merge(report: FateReport, result: FateReport) -> None:
 
 
 def _fate_deps(tree: Path, base: str, head: str) -> Step:
-    """Check changed FATE files with lazily loaded head filter and macro catalogs."""
+    """Check changed FATE files from split diff line sets and lazy head catalogs."""
     report, sources, macros, rc = FateReport(), None, None, 0
     try:
         names = _changed_paths(tree, base, head, "tests/fate/*.mak", added_or_modified=True)
@@ -1316,9 +1371,9 @@ def _fate_deps(tree: Path, base: str, head: str) -> Step:
             )
             if sources is None and needs_sources:
                 sources = _fate_sources(_git(tree, "show", f"{head}:libavfilter/allfilters.c"))
-            touched = _added_lines(patch) | _deleted_lines(patch)
+            changes = (_added_lines(patch), _deleted_lines(patch))
             old_parsed = _fate_parse(old, macros or frozenset()) if old is not None else None
-            _fate_merge(report, _fate_check(name, parsed, touched, sources or {}, old_parsed))
+            _fate_merge(report, _fate_check(name, parsed, changes, sources or {}, old_parsed))
     except (OSError, RuntimeError, ValueError) as error:
         rc = 2
         report.lines.append(str(error))

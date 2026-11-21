@@ -23,7 +23,7 @@ import unittest.mock
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
-from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
+from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment, run_git
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402
@@ -593,6 +593,16 @@ FATE_RED = (
     '-f lavfi -i "testsrc2=s=64x64:r=1:d=1,format=yuv420p10le" '
     '-vf "scale,format=gbrp10le" -frames:v 1 -f null none\n'
 )
+FATE_DASH_MIXED = (
+    "FATE_DASH-$(call ALLYES, LAVFI_INDEV TESTSRC2_FILTER "
+    "WRAPPED_AVFRAME_DECODER DASH_MUXER) += fate-dash-single-file-trim\n"
+    "fate-dash-single-file-trim: CMD = mkdir -p tests/data/dash_single_file_trim && \\\n"
+    '    run $(FFMPEG) -nostdin -f lavfi -i "testsrc2=s=64x64:r=1:d=2" \\\n'
+    "    $(TARGET_PATH)/tests/data/dash_single_file_trim/out.mpd "
+    "2>tests/data/dash_single_file_trim/err.log && \\\n"
+    '    sed -n "/failed to delete/p" tests/data/dash_single_file_trim/err.log && \\\n'
+    "    test -s tests/data/dash_single_file_trim/media.mp4\n"
+)
 FATE_SOURCES = {"testsrc2": "video", "sine": "audio", "movie": "mixed"}
 FILTER_DECLARATIONS = (
     "extern const FFFilter ff_vsrc_testsrc2;\n"
@@ -602,18 +612,43 @@ FILTER_DECLARATIONS = (
 
 
 class FateDepsTest(unittest.TestCase):
-    """Exercise lavfi dependency parsing without Git or external commands."""
+    """Exercise fate-deps dependency and mixed-root path checks."""
+
+    def check_diff(
+        self, base_source: str, head_source: str, path: str = "tests/fate/x.mak"
+    ) -> upstream_lint.Step:
+        """Run _fate_deps across committed base and head FATE trees."""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "tree"
+            template = Path(directory) / "template"
+            tree.mkdir()
+            template.mkdir()
+            run_git(tree, "init", "-q", f"--template={template}")
+            target = tree / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(base_source, encoding="utf-8")
+            run_git(tree, "add", path)
+            run_git(tree, "commit", "-q", "-m", "tests/fate: add base")
+            base = run_git(tree, "rev-parse", "HEAD")
+            target.write_text(head_source, encoding="utf-8")
+            run_git(tree, "add", path)
+            run_git(tree, "commit", "-q", "-m", "tests/fate: update head")
+            head = run_git(tree, "rev-parse", "HEAD")
+            return upstream_lint._fate_deps(tree, base, head)
 
     def check_source(
-        self, source: str = FATE_RED, added: set[int] | None = None
+        self,
+        source: str = FATE_RED,
+        added: set[int] | None = None,
+        path: str = "tests/fate/filter-video.mak",
+        sources: dict[str, str] | None = None,
     ) -> upstream_lint.Step:
         """Parse one changed FATE file with fixture source declarations."""
         self.assertTrue(hasattr(upstream_lint, "_fate_file"), "fate-deps parser missing")
         if added is None:
             added = set(range(1, len(source.splitlines()) + 1))
-        report = upstream_lint._fate_file(
-            "tests/fate/filter-video.mak", source, added, FATE_SOURCES
-        )
+        catalog = FATE_SOURCES if sources is None else sources
+        report = upstream_lint._fate_file(path, source, added, catalog)
         return upstream_lint._fate_summary(report)
 
     def test_planted_missing_decoder_fails(self) -> None:
@@ -1049,6 +1084,326 @@ class FateDepsTest(unittest.TestCase):
                 self.assertEqual(
                     self.check_source(head + "fate-x: CMD = -f lavfi -i testsrc2\n", touched).rc, 1
                 )
+
+    def test_planted_mixed_target_path_fails(self) -> None:
+        """A touched CMD mixing $(TARGET_PATH) and relative tests/data fails."""
+        step = self.check_source(FATE_DASH_MIXED, path="tests/fate/dashenc.mak")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count("finding:"), 1)
+        self.assertIn(
+            "finding: tests/fate/dashenc.mak:2: fate-dash-single-file-trim: "
+            "tests/data/dash_single_file_trim named with and without $(TARGET_PATH)/; "
+            "run every access through $(TARGET_PATH)/tests/data/dash_single_file_trim",
+            step.output,
+        )
+        self.assertTrue(
+            step.output.endswith(
+                "FATE dependencies: wrapped_avframe decoder; FATE paths: $(TARGET_PATH)/tests/data"
+            )
+        )
+
+    def test_all_rooted_target_path_passes(self) -> None:
+        """Rooting every tests/data access under $(TARGET_PATH)/ passes."""
+        rooted = FATE_DASH_MIXED.replace("$(TARGET_PATH)/", "").replace(
+            "tests/data/", "$(TARGET_PATH)/tests/data/"
+        )
+        step = self.check_source(rooted, path="tests/fate/dashenc.mak")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output.count("finding:"), 0)
+
+    def test_all_relative_tests_data_passes(self) -> None:
+        """Single-root relative tests/data accesses without $(TARGET_PATH) pass."""
+        relative = FATE_DASH_MIXED.replace("$(TARGET_PATH)/", "")
+        self.assertNotIn("$(TARGET_PATH)", relative)
+        step = self.check_source(relative, path="tests/fate/dashenc.mak")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output.count("finding:"), 0)
+
+    def test_untouched_mixed_target_path_is_nonfailing(self) -> None:
+        """An untouched mixed tests/data command reports pre-existing without failing."""
+        step = self.check_source(FATE_DASH_MIXED, set(), path="tests/fate/dashenc.mak")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output.count("finding:"), 0)
+        self.assertEqual(step.output.count("pre-existing (untouched):"), 1)
+        self.assertIn(
+            "pre-existing (untouched): tests/fate/dashenc.mak:2: fate-dash-single-file-trim: "
+            "tests/data/dash_single_file_trim named with and without $(TARGET_PATH)/; "
+            "run every access through $(TARGET_PATH)/tests/data/dash_single_file_trim",
+            step.output,
+        )
+
+    def test_distinct_tests_data_directories_pass(self) -> None:
+        """Rooted tests/data/a alongside relative tests/data/b in one CMD passes."""
+        source = (
+            "FATE_X-yes += fate-x\n"
+            "fate-x: CMD = mkdir -p tests/data/b && "
+            "run $(FFMPEG) -i $(SAMPLES)/x.raw $(TARGET_PATH)/tests/data/a/out.nut\n"
+        )
+        step = self.check_source(source)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output.count("finding:"), 0)
+
+    def test_relative_tests_data_prefix_boundaries(self) -> None:
+        """Allow-listed prefixes count as relative while slash-prefixed roots do not."""
+        for prefix in ("", "echo ", "echo\t", "out=", "<", "2>", '"', "'"):
+            suffix = prefix if prefix in ('"', "'") else ""
+            with self.subTest(prefix=prefix):
+                source = (
+                    "FATE_X-yes += fate-x\n"
+                    f"fate-x: CMD = {prefix}tests/data/x/err.log{suffix} "
+                    "$(TARGET_PATH)/tests/data/x/out.mpd\n"
+                )
+                step = self.check_source(source)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("tests/data/x named with and without $(TARGET_PATH)/", step.output)
+        for other_root in ("$(SRC_PATH)/tests/data/x", "foo/tests/data/x"):
+            with self.subTest(other_root=other_root):
+                source = (
+                    "FATE_X-yes += fate-x\n"
+                    f"fate-x: CMD = run $(FFMPEG) -i {other_root} $(TARGET_PATH)/tests/data/x\n"
+                )
+                clean = self.check_source(source)
+                self.assertEqual(clean.rc, 0, clean.output)
+
+    def test_cleanfiles_relative_next_to_rooted_cmd_passes(self) -> None:
+        """Relative paths in CLEANFILES do not conflict with a rooted CMD."""
+        rooted = FATE_DASH_MIXED.replace("$(TARGET_PATH)/", "").replace(
+            "tests/data/", "$(TARGET_PATH)/tests/data/"
+        )
+        cleanfiles = (
+            "CLEANFILES += tests/data/dash_single_file_trim/out.mpd "
+            "tests/data/dash_single_file_trim/err.log "
+            "tests/data/dash_single_file_trim/media.mp4\n"
+        )
+        step = self.check_source(rooted + cleanfiles, path="tests/fate/dashenc.mak")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output.count("finding:"), 0)
+
+    def test_two_mixed_directories_in_one_command_give_two_findings(self) -> None:
+        """Each mixed tests/data directory in one CMD produces its own finding."""
+        source = (
+            "FATE_X-yes += fate-x\n"
+            "fate-x: CMD = mkdir -p tests/data/dir_a tests/data/dir-b.1 && "
+            "run $(FFMPEG) $(TARGET_PATH)/tests/data/dir_a/a.nut "
+            "$(TARGET_PATH)/tests/data/dir-b.1/b.nut\n"
+        )
+        step = self.check_source(source)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count("finding:"), 2)
+        self.assertIn("tests/data/dir-b.1 named with and without $(TARGET_PATH)/", step.output)
+        self.assertIn("tests/data/dir_a named with and without $(TARGET_PATH)/", step.output)
+
+    def test_plain_mixed_command_needs_no_filter_catalog(self) -> None:
+        """Plain and unresolved-target CMDs fail on mixed paths with an empty source map."""
+        for target in ("fate-plain", "$(FATE_PLAIN)"):
+            with self.subTest(target=target):
+                source = (
+                    f"FATE_X-yes += {target}\n"
+                    f"{target}: CMD = mkdir -p tests/data/plain && "
+                    "run $(FFMPEG) -i $(SAMPLES)/x.raw $(TARGET_PATH)/tests/data/plain/out.nut\n"
+                )
+                step = self.check_source(source, path="tests/fate/plain.mak", sources={})
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(step.output.count("finding:"), 1)
+                self.assertIn(
+                    f"finding: tests/fate/plain.mak:2: {target}: "
+                    "tests/data/plain named with and without $(TARGET_PATH)/",
+                    step.output,
+                )
+
+    def test_distinct_tests_data_name_continuations_pass(self) -> None:
+        """Distinct tests/data names sharing a prefix before + pass in both root orders."""
+        for command in (
+            "cat tests/data/x/log $(TARGET_PATH)/tests/data/x+extra/out",
+            "cat tests/data/x+extra/log $(TARGET_PATH)/tests/data/x/out",
+        ):
+            with self.subTest(command=command):
+                step = self.check_source(f"FATE_X-yes += fate-x\nfate-x: CMD = {command}\n")
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertNotIn("finding:", step.output)
+
+    def test_tests_data_boundary_allowlist(self) -> None:
+        """Each allow-listed boundary after tests/data/x still flags mixed-root access."""
+        cases = (
+            ("/", "cat tests/data/x/log $(TARGET_PATH)/tests/data/x/out"),
+            (" ", "cat tests/data/x $(TARGET_PATH)/tests/data/x end"),
+            ("\t", "cat tests/data/x\t$(TARGET_PATH)/tests/data/x\tend"),
+            ('"', 'cat "tests/data/x" "$(TARGET_PATH)/tests/data/x"'),
+            ("'", "cat 'tests/data/x' '$(TARGET_PATH)/tests/data/x'"),
+            (";", "echo tests/data/x; echo $(TARGET_PATH)/tests/data/x; true"),
+            ("|", "echo tests/data/x| cat $(TARGET_PATH)/tests/data/x| cat"),
+            (")", "(echo tests/data/x) (echo $(TARGET_PATH)/tests/data/x)"),
+            ("<", "cat tests/data/x<in $(TARGET_PATH)/tests/data/x<in"),
+            (">", "cat tests/data/x>out $(TARGET_PATH)/tests/data/x>out"),
+            ("end-rooted", "cat tests/data/x/log $(TARGET_PATH)/tests/data/x"),
+            ("end-relative", "cat $(TARGET_PATH)/tests/data/x/out tests/data/x"),
+        )
+        for boundary, command in cases:
+            with self.subTest(boundary=boundary):
+                step = self.check_source(f"FATE_X-yes += fate-x\nfate-x: CMD = {command}\n")
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("tests/data/x named with and without $(TARGET_PATH)/", step.output)
+
+    def test_tests_data_refused_continuations_pass(self) -> None:
+        """Non-boundary characters right after x yield no directory match in either form."""
+        for char in ("+", "$", ",", ":", "@", "\\"):
+            for command in (
+                f"cat tests/data/x/log $(TARGET_PATH)/tests/data/x{char}extra/out",
+                f"cat tests/data/x{char}extra/log $(TARGET_PATH)/tests/data/x/out",
+            ):
+                with self.subTest(char=char, command=command):
+                    step = self.check_source(f"FATE_X-yes += fate-x\nfate-x: CMD = {command}\n")
+                    self.assertEqual(step.rc, 0, step.output)
+                    self.assertNotIn("finding:", step.output)
+
+    def test_tests_data_patterns_enforce_name_boundary(self) -> None:
+        """Both tests/data patterns match whole directory names and never truncate prefixes."""
+        for sample in (
+            "$(TARGET_PATH)/tests/data/x+extra/out",
+            " tests/data/x+extra/out",
+            "$(TARGET_PATH)/tests/data/dir_x+extra/out",
+            " tests/data/dir_x+extra/out",
+            "$(TARGET_PATH)/tests/data/x\n",
+            " tests/data/x\n",
+        ):
+            with self.subTest(sample=sample):
+                self.assertEqual(upstream_lint.FATE_ROOTED_DATA.findall(sample), [])
+                self.assertEqual(upstream_lint.FATE_RELATIVE_DATA.findall(sample), [])
+        self.assertEqual(
+            upstream_lint.FATE_ROOTED_DATA.findall("$(TARGET_PATH)/tests/data/x/out"), ["x"]
+        )
+        self.assertEqual(upstream_lint.FATE_RELATIVE_DATA.findall(" tests/data/x/out"), ["x"])
+
+    def test_unrelated_deletion_after_mixed_target_path_passes(self) -> None:
+        """Deleting an unrelated line after an unchanged mixed-root CMD stays pre-existing."""
+        unchanged = (
+            "FATE_X-yes += fate-x\n"
+            "fate-x: CMD = mkdir -p tests/data/x && "
+            "run $(FFMPEG) -i $(SAMPLES)/x.raw $(TARGET_PATH)/tests/data/x/out.nut\n"
+        )
+        step = self.check_diff(unchanged + "# unrelated line\n", unchanged)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertNotIn("finding:", step.output)
+        self.assertIn(
+            "pre-existing (untouched): tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_target_provenance_deletion_mixed_target_path_fails(self) -> None:
+        """Deleting a target override makes its reassigned mixed-root CMD a finding."""
+        command = "$(TARGETS): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        base = "TARGETS = fate-x\nTARGETS = fate-y\n" + command
+        head = "TARGETS = fate-x\n" + command
+        step = self.check_diff(base, head)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_target_provenance_deletion_with_different_base_command_fails(self) -> None:
+        """A reassigned mixed-root CMD differs from its target's existing base CMD."""
+        command = "$(T): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        tail = command + "fate-x: CMD = true\n"
+        base = "T = fate-x\nT = fate-z\n" + tail
+        head = "T = fate-x\n" + tail
+        step = self.check_diff(base, head)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_comment_deletion_with_different_base_command_passes(self) -> None:
+        """Deleting a comment preserves a mixed-root CMD despite another base CMD."""
+        command = "$(T): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        tail = command + "fate-x: CMD = true\n"
+        base = "T = fate-x\n# note\n" + tail
+        head = "T = fate-x\n" + tail
+        step = self.check_diff(base, head)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertNotIn("finding:", step.output)
+        self.assertIn(
+            "pre-existing (untouched): tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_unrelated_deletion_after_target_assignment_passes(self) -> None:
+        """Deleting unrelated text after an assignment leaves its mixed-root CMD untouched."""
+        assignment = "TARGETS = fate-x\n"
+        command = "$(TARGETS): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        for unrelated in ("# unrelated comment\n", "\n", "UNRELATED = value\n"):
+            with self.subTest(unrelated=unrelated):
+                step = self.check_diff(assignment + unrelated + command, assignment + command)
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertNotIn("finding:", step.output)
+                self.assertIn(
+                    "pre-existing (untouched): tests/fate/x.mak:2: fate-x: "
+                    "tests/data/x named with and without $(TARGET_PATH)/",
+                    step.output,
+                )
+
+    def test_target_assignment_rename_mixed_target_path_fails(self) -> None:
+        """Editing a target assignment makes its renamed mixed-root CMD a finding."""
+        command = "$(TARGETS): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        step = self.check_diff("TARGETS = fate-y\n" + command, "TARGETS = fate-x\n" + command)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_shifted_unchanged_mixed_target_path_passes(self) -> None:
+        """Adding an unrelated comment shifts lines without touching the mixed-root CMD."""
+        unchanged = (
+            "TARGETS = fate-x\n"
+            "$(TARGETS): CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x\n"
+        )
+        step = self.check_diff(unchanged, "# unrelated comment\n" + unchanged)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertNotIn("finding:", step.output)
+        self.assertIn(
+            "pre-existing (untouched): tests/fate/x.mak:3: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_continuation_deletion_inside_mixed_target_path_fails(self) -> None:
+        """Deleting a middle continuation line inside a mixed-root CMD fails."""
+        first = (
+            "FATE_X-yes += fate-x\n"
+            "fate-x: CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x && \\\n"
+        )
+        middle = "    echo middle && \\\n"
+        last = "    true\n"
+        step = self.check_diff(first + middle + last, first + last)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
+
+    def test_added_line_inside_mixed_target_path_fails(self) -> None:
+        """Changing one physical line of a mixed-root CMD fails."""
+        first = (
+            "FATE_X-yes += fate-x\n"
+            "fate-x: CMD = mkdir -p tests/data/x $(TARGET_PATH)/tests/data/x && \\\n"
+        )
+        base = first + "    echo before && \\\n    true\n"
+        head = first + "    echo after && \\\n    true\n"
+        step = self.check_diff(base, head)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(
+            "finding: tests/fate/x.mak:2: fate-x: "
+            "tests/data/x named with and without $(TARGET_PATH)/",
+            step.output,
+        )
 
 
 class DiagnosticCitationTest(unittest.TestCase):
@@ -2878,6 +3233,19 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: fate-deps rc: 0", output)
+
+    def test_fate_mixed_target_path_fails(self) -> None:
+        """A committed FATE file with the planted mixed tests/data command fails fate-deps."""
+        self.write("tests/fate/dashenc.mak", FATE_DASH_MIXED)
+        self.commit("fate/dashenc: add single-file trim test")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: fate-deps rc: 1", output)
+        self.assertIn(
+            "finding: tests/fate/dashenc.mak:2: fate-dash-single-file-trim: "
+            "tests/data/dash_single_file_trim named with and without $(TARGET_PATH)/",
+            output,
+        )
 
     def test_fate_missing_allfilters_is_error(self) -> None:
         """A needed source catalog missing at head fails the step explicitly."""
