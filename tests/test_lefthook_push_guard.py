@@ -807,10 +807,10 @@ class LefthookSignoffTest(GitFixture):
             shutil.rmtree(dot_git)
         elif dot_git.is_file():
             dot_git.unlink()
-        git_dir = self.root.parent / "git dir with space"
-        if git_dir.exists():
-            shutil.rmtree(git_dir)
-        git_dir.mkdir(parents=True)
+        spaced_owner = tempfile.TemporaryDirectory()
+        self.addCleanup(spaced_owner.cleanup)
+        git_dir = Path(spaced_owner.name) / "git dir with space"
+        git_dir.mkdir()
         _run_fixture_command(
             self.root,
             self.env,
