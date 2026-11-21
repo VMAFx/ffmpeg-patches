@@ -29,3 +29,98 @@ rules:
           ff_network_close(...);
           ...
           return ...;
+
+  # Derive pointers after checking allocation results (review of upstream FFmpeg pull request 25480, November 2026):
+  # in one function, an allocated pointer feeds a NULL-fallback ternary followed by a
+  # NULL check of the pointer or destination. Earlier checks never exclude a match.
+  # Unchecked allocation: add a failure check and return the error before deriving pointers.
+  # Checked earlier: the ternary null test is redundant; remove it, or retain it with
+  # an adjacent rule-specific suppression comment and a semgrep-reason explaining why.
+  # No control flow, data flow, macro expansion, alias tracking, or struct-member tracking.
+  # Original eight scope pins (syntactic matches, not proof of safety or reachability):
+  # - use-before-check: reported by plain shape
+  # - log-only-later-check: reported by plain shape
+  # - stale-later-check: reported by plain shape
+  # - second-ternary: reported by plain shape
+  # - conditional-early-check: now reported, redundant reading
+  # - earlier-allocation-check: now reported, without data flow
+  # - goto-into-ternary: now reported, without control flow
+  # - unbraced-inner-loop-break: now reported, without control flow
+  # Additional pins: macro-assertion-before-ternary, reassigned-buffer-before-ternary,
+  # earlier-destination-check, and cast-in-earlier-check are reported by plain shape.
+  # Outside the shape: no later check, other function/variable, non-allocator call,
+  # no ternary, non-NULL fallback, wrapped ternary, alias-only or member-only checks.
+  # Pinned in tests/test_semgrep_rules.py.
+  - id: ffmpeg-null-ternary-after-allocation
+    languages: [c]
+    severity: ERROR
+    message: >-
+      An allocated buffer feeds a NULL-fallback ternary before a later NULL check.
+      If the allocation has no failure check, add one and return the error before
+      deriving the pointer. If the buffer was checked earlier, the ternary null
+      test is redundant: remove it, or keep it with a rule-specific suppression
+      comment and a semgrep-reason stating why. This syntactic rule does not see
+      control flow, data flow, macro expansion, aliases, or struct members.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              $BUF_TYPE *$BUF = $ALLOC(...);
+              ...
+              $DST_TYPE *$DST = $TERNARY;
+          - pattern-inside: |
+              $BUF_TYPE *$BUF = $ALLOC(...);
+              ...
+              $DST = $TERNARY;
+          - pattern-inside: |
+              $BUF = $ALLOC(...);
+              ...
+              $DST_TYPE *$DST = $TERNARY;
+          - pattern-inside: |
+              $BUF = $ALLOC(...);
+              ...
+              $DST = $TERNARY;
+      - pattern-either:
+          - pattern-inside: |
+              $DST_TYPE *$DST = $TERNARY;
+              ...
+              if ($CHECK) {
+                ...
+              }
+          - pattern-inside: |
+              $DST = $TERNARY;
+              ...
+              if ($CHECK) {
+                ...
+              }
+      - metavariable-regex:
+          metavariable: $ALLOC
+          regex: ^(av_malloc|av_mallocz|av_malloc_array|av_calloc|av_realloc|av_realloc_array|av_memdup|malloc|calloc|realloc)$
+      - metavariable-pattern:
+          metavariable: $CHECK
+          pattern-either:
+            - pattern: '!$BUF'
+            - pattern: '$BUF == NULL'
+            - pattern: 'NULL == $BUF'
+            - pattern: '... || !$BUF || ...'
+            - pattern: '... || $BUF == NULL || ...'
+            - pattern: '... || NULL == $BUF || ...'
+            - pattern: '!$DST'
+            - pattern: '$DST == NULL'
+            - pattern: 'NULL == $DST'
+            - pattern: '... || !$DST || ...'
+            - pattern: '... || $DST == NULL || ...'
+            - pattern: '... || NULL == $DST || ...'
+      - pattern-either:
+          - pattern: '$DST_TYPE *$DST = $BUF ? $VALUE : NULL;'
+          - pattern: '$DST = $BUF ? $VALUE : NULL;'
+          - pattern: '$DST_TYPE *$DST = !$BUF ? NULL : $VALUE;'
+          - pattern: '$DST = !$BUF ? NULL : $VALUE;'
+          - pattern: '$DST_TYPE *$DST = $BUF != NULL ? $VALUE : NULL;'
+          - pattern: '$DST = $BUF != NULL ? $VALUE : NULL;'
+          - pattern: '$DST_TYPE *$DST = NULL != $BUF ? $VALUE : NULL;'
+          - pattern: '$DST = NULL != $BUF ? $VALUE : NULL;'
+          - pattern: '$DST_TYPE *$DST = $BUF == NULL ? NULL : $VALUE;'
+          - pattern: '$DST = $BUF == NULL ? NULL : $VALUE;'
+          - pattern: '$DST_TYPE *$DST = NULL == $BUF ? NULL : $VALUE;'
+          - pattern: '$DST = NULL == $BUF ? NULL : $VALUE;'
+      - focus-metavariable: $TERNARY

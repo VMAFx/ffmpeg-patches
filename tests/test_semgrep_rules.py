@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts import upstream_lint
+from scripts import unit_test_budget, upstream_lint
 
 ROOT = Path(__file__).resolve().parent.parent
 # Semgrep prints a rule configuration warning on stderr and still exits 0.
@@ -808,6 +808,240 @@ FFMPEG_PLANTED_WRITE_HEADER = (
     + "}\n"
 )
 
+FFMPEG_ALLOCATION_DECLARATIONS = """\
+#define NULL ((void *)0)
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+void *av_malloc(unsigned long size);
+void *av_mallocz(unsigned long size);
+void *av_malloc_array(unsigned long count, unsigned long size);
+enum { DST_RECT_BUF_SIZE = 128, DST_RECT_OFFSET = 16 };
+
+"""
+
+FFMPEG_PLANTED_ALLOCATION_TERNARY_DECLARATIONS = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+void fail(void);
+
+static int reviewed(void)
+{
+    uint16_t *dst0_buf = av_malloc_array(DST_RECT_BUF_SIZE, sizeof(*dst0_buf));
+    uint16_t *dst1_buf = av_malloc_array(DST_RECT_BUF_SIZE, sizeof(*dst1_buf));
+    uint8_t *dst0 = dst0_buf ? (uint8_t *)(dst0_buf + DST_RECT_OFFSET) : NULL;
+    uint8_t *dst1 = dst1_buf ? (uint8_t *)(dst1_buf + DST_RECT_OFFSET) : NULL;
+    uint8_t *src0 = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *src1 = av_malloc(DST_RECT_BUF_SIZE);
+    if (!dst0 || !dst1 || !src0 || !src1)
+        fail();
+    return 0;
+}
+"""
+)
+
+FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int assigned(void)
+{
+    uint8_t *buffer, *dst;
+    buffer = av_mallocz(DST_RECT_BUF_SIZE);
+    dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+)
+
+FFMPEG_CHECKED_ALLOCATION = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int accepted(void)
+{
+    uint8_t *dst0, *dst1;
+    uint16_t *dst0_buf = av_malloc_array(DST_RECT_BUF_SIZE, sizeof(*dst0_buf));
+    uint16_t *dst1_buf = av_malloc_array(DST_RECT_BUF_SIZE, sizeof(*dst1_buf));
+    if (!dst0_buf || !dst1_buf)
+        return -1;
+    dst0 = (uint8_t *)(dst0_buf + DST_RECT_OFFSET);
+    dst1 = (uint8_t *)(dst1_buf + DST_RECT_OFFSET);
+    return 0;
+}
+"""
+)
+
+FFMPEG_PARAMETER_NULL_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static void optional_buffer(uint8_t *buffer)
+{
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return;
+}
+"""
+)
+
+FFMPEG_ALLOCATION_OTHER_ELSE = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static void fallback_buffer(uint8_t *other)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : other;
+    if (!buffer)
+        return;
+}
+"""
+)
+
+FFMPEG_ALLOCATION_SEPARATE_FUNCTION = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static void allocate_buffer(void)
+{
+    uint8_t *buffer = av_mallocz(DST_RECT_BUF_SIZE);
+}
+
+static void optional_buffer(uint8_t *buffer)
+{
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return;
+}
+"""
+)
+
+FFMPEG_UNCHECKED_ALLOCATION_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+void consume_buffer(uint8_t *dst);
+
+static void unchecked(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    consume_buffer(dst);
+}
+"""
+)
+
+FFMPEG_REASSIGNED_ALLOCATION_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int reassigned(uint8_t *other)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    buffer = other;
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+)
+
+FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int null_checked(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    if (buffer == NULL)
+        return -1;
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+)
+
+FFMPEG_LATER_OR_CHECKED_ALLOCATION_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int later_checked(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *other = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!other || !buffer)
+        return -1;
+    return 0;
+}
+"""
+)
+
+FFMPEG_REALLOCATED_ALLOCATION_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+static int reallocated(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    if (!buffer)
+        return -1;
+    buffer = av_mallocz(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+)
+
+
+FFMPEG_DESTINATION_WRITE_TERNARY = (
+    FFMPEG_ALLOCATION_DECLARATIONS
+    + """\
+void consume_optional(uint8_t *dst);
+
+static int destination_write(uint8_t *other)
+{
+    DECLARATIONS
+    ALLOCATION;
+    TERNARY;
+    consume_optional(dst);
+    dst = other;
+    if (CHECK) {
+        return -1;
+    }
+    return 0;
+}
+"""
+)
+
+FFMPEG_DESTINATION_WRITE_FORMS = (
+    ("", "uint8_t *buffer", "uint8_t *dst"),
+    ("uint8_t *dst;", "uint8_t *buffer", "dst"),
+    ("uint8_t *buffer;", "buffer", "uint8_t *dst"),
+    ("uint8_t *buffer, *dst;", "buffer", "dst"),
+)
+
+
+def _buffer_ternary_lines(source: str) -> list[int]:
+    """Derive exact expected lines from buffer ternary statements in the fixture."""
+    lines = source.splitlines()
+    return [index + 1 for index in range(len(lines)) if " = buffer ? " in lines[index]]
+
+
+def _earlier_nonnull_ternary_source(check: str) -> str:
+    """Keep a later NULL check while replacing only the earlier check condition."""
+    return FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace("if (buffer == NULL)", f"if ({check})", 1)
+
+
+def _earlier_check_frame_source(check: str, frame: int, name: str) -> str:
+    """Build a named allocation/ternary frame with earlier check statements."""
+    declarations, allocation, destination = FFMPEG_DESTINATION_WRITE_FORMS[frame]
+    return (
+        FFMPEG_DESTINATION_WRITE_TERNARY.replace("destination_write", name)
+        .replace("DECLARATIONS", declarations)
+        .replace("ALLOCATION", f"{allocation} = av_malloc(128)")
+        .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+        .replace(f"    {destination} = buffer ?", f"    {check}\n    {destination} = buffer ?", 1)
+        .replace("CHECK", "!buffer")
+    )
+
 
 def _scan_ffmpeg_c(source: str) -> list[dict]:
     """Scan synthetic C source with .semgrep-ffmpeg.yml and return its result entries."""
@@ -817,6 +1051,15 @@ def _scan_ffmpeg_c(source: str) -> list[dict]:
         fixture_file.write_text(source, encoding="utf-8")
         data = _run_semgrep(fixture_file, scratch_path, config=ROOT / ".semgrep-ffmpeg.yml")
         return list(data.get("results", []))
+
+
+def _ternary_finding_lines(source: str) -> list[int]:
+    """Return 1-based start lines for ffmpeg-null-ternary-after-allocation matches."""
+    return [
+        item["start"]["line"]
+        for item in _scan_ffmpeg_c(source)
+        if item["check_id"].split(".")[-1] == "ffmpeg-null-ternary-after-allocation"
+    ]
 
 
 class FfmpegRuleIdTest(unittest.TestCase):
@@ -833,6 +1076,702 @@ class FfmpegRuleIdTest(unittest.TestCase):
 @unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
 class FfmpegSemgrepRulesTest(unittest.TestCase):
     """Verify .semgrep-ffmpeg.yml C rules against synthetic FFmpeg call fixtures."""
+
+    def test_many_allocations_without_ternaries_do_not_timeout(self) -> None:
+        """A 272-line allocation/check fixture finishes within Semgrep's default timeout."""
+        source = (
+            "void fixture(void) {\n"
+            + "".join(
+                f"    value{i} = av_malloc(8);\n    target{i} = next();\n"
+                f"    if (!value{i}) {{ fail(); }}\n"
+                for i in range(90)
+            )
+            + "}\n"
+        )
+        self.assertEqual(_scan_ffmpeg_c(source), [])
+
+    def test_planted_allocation_ternary_declarations_flagged(self) -> None:
+        """Flag both reviewed pointer declarations on their ternary lines."""
+        results = _scan_ffmpeg_c(FFMPEG_PLANTED_ALLOCATION_TERNARY_DECLARATIONS)
+        expected_lines = {
+            index
+            for index, line in enumerate(
+                FFMPEG_PLANTED_ALLOCATION_TERNARY_DECLARATIONS.splitlines(), 1
+            )
+            if " ? " in line
+        }
+        self.assertEqual(len(results), 2)
+        self.assertEqual({item["start"]["line"] for item in results}, expected_lines)
+        self.assertEqual(
+            {item["check_id"].split(".")[-1] for item in results},
+            {"ffmpeg-null-ternary-after-allocation"},
+        )
+
+    def test_planted_allocation_ternary_assignment_flagged(self) -> None:
+        """Flag a ternary assignment after an assigned av_mallocz result."""
+        results = _scan_ffmpeg_c(FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT)
+        ternary_line = next(
+            index
+            for index, line in enumerate(
+                FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT.splitlines(), 1
+            )
+            if " ? " in line
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"]["line"], ternary_line)
+        self.assertEqual(
+            results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
+        )
+
+    def test_planted_allocation_ternary_early_check_reported(self) -> None:
+        """Checked earlier: reported as the redundant reading."""
+        source = FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT.replace(
+            "    dst = buffer ? buffer + DST_RECT_OFFSET : NULL;\n",
+            "    if (!buffer) return -1;\n    dst = buffer ? buffer + DST_RECT_OFFSET : NULL;\n",
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_use_before_check_reported_plain_shape(self) -> None:
+        """Report use-before-check by plain shape because the rule does not follow flow."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int use_before_check(uint8_t **out)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    *out = dst;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_log_only_later_check_reported_plain_shape(self) -> None:
+        """Report log-only-later-check by plain shape because the rule does not follow flow."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+void log_failure(void);
+
+static int log_only_later_check(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        log_failure();
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_stale_later_check_reported_plain_shape(self) -> None:
+        """Report stale-later-check by plain shape because the rule does not follow flow."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int stale_later_check(uint8_t *other)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    buffer = other;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_second_ternary_reported_plain_shape(self) -> None:
+        """Report second-ternary by plain shape because the rule does not follow flow."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int second_ternary(uint8_t *other)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    dst = other ? other + DST_RECT_OFFSET : NULL;
+    if (!dst)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_same_buffer_two_ternaries_reported(self) -> None:
+        """Report both same-buffer ternaries with distinct offsets before the later check."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int same_buffer_two_ternaries(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    dst = buffer ? buffer + 2 * DST_RECT_OFFSET : NULL;
+    if (!dst)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_conditional_early_check(self) -> None:
+        """Checked earlier: reported as the redundant reading."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int conditional_early_check(int required)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    if (required) {
+        if (!buffer)
+            return -1;
+    }
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_earlier_allocation_check(self) -> None:
+        """Report an earlier allocation check without tracking which allocation it guards."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+void av_free(void *ptr);
+
+static int earlier_allocation_check(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    if (!buffer)
+        return -1;
+    av_free(buffer);
+    buffer = av_mallocz(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_goto_into_ternary(self) -> None:
+        """Report an earlier check with a goto without interpreting control flow."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int goto_into_ternary(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    if (!buffer)
+        goto reach_ternary;
+reach_ternary:
+    ;
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_ternary_scope_unbraced_inner_loop_break(self) -> None:
+        """Report an earlier check with an inner-loop break without interpreting flow."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int unbraced_inner_loop_break(void)
+{
+    for (int outer = 0; outer < 2; outer++) {
+        uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+        if (!buffer)
+            for (int inner = 0; inner < 1; inner++)
+                break;
+        uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+        if (!buffer)
+            return -1;
+    }
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_checked_allocation_without_ternary_passes(self) -> None:
+        """Accept pointer assignments after an allocation failure check."""
+        self.assertEqual(_scan_ffmpeg_c(FFMPEG_CHECKED_ALLOCATION), [])
+
+    def test_parameter_null_ternary_passes(self) -> None:
+        """Accept a parameter ternary with a later check; adding an allocation reports it."""
+        source = FFMPEG_PARAMETER_NULL_TERNARY
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace(
+            "    uint8_t *dst =",
+            "    buffer = av_malloc(DST_RECT_BUF_SIZE);\n    uint8_t *dst =",
+        )
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_allocation_ternary_with_other_else_passes(self) -> None:
+        """Accept an allocation ternary whose fallback is another pointer."""
+        self.assertEqual(_scan_ffmpeg_c(FFMPEG_ALLOCATION_OTHER_ELSE), [])
+
+    def test_checked_allocation_ternary_with_null_else_flagged(self) -> None:
+        """Flag the checked non-NULL fallback fixture when only its fallback becomes NULL."""
+        source = FFMPEG_ALLOCATION_OTHER_ELSE.replace(" : other;", " : NULL;")
+        self.assertEqual(len(_scan_ffmpeg_c(source)), 1)
+
+    def test_replaced_buffer_before_later_check_reported_plain_shape(self) -> None:
+        """Report replaced buffer before later check by plain shape without flow."""
+        checks = ("!buffer", "buffer == NULL", "!other || !buffer", "!other || buffer == NULL")
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            for check in checks:
+                with self.subTest(allocation=allocation, destination=destination, check=check):
+                    source = (
+                        FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                            "ALLOCATION", f"{allocation} = av_malloc(128)"
+                        )
+                        .replace("DECLARATIONS", declarations)
+                        .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                        .replace("dst = other;", "buffer = other;")
+                        .replace("CHECK", check)
+                    )
+                    ternary_line = next(
+                        index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+                    )
+                    self.assertEqual(_ternary_finding_lines(source), [ternary_line])
+
+    def test_original_buffer_later_check_flagged(self) -> None:
+        """Keep later buffer checks when no assignment replaces the allocation result."""
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            with self.subTest(allocation=allocation, destination=destination):
+                source = (
+                    FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                        "ALLOCATION", f"{allocation} = av_malloc(128)"
+                    )
+                    .replace("DECLARATIONS", declarations)
+                    .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                    .replace("    dst = other;\n", "")
+                    .replace("CHECK", "!buffer")
+                )
+                self.assertEqual(len(_scan_ffmpeg_c(source)), 1)
+
+    def test_fallthrough_buffer_check_before_ternary_reported(self) -> None:
+        """Checked earlier: reported as the redundant reading."""
+        bodies = ("log_failure();", "if (DST_RECT_BUF_SIZE == 0) return -1;")
+        for body_index in range(len(bodies)):
+            body = bodies[body_index]
+            with self.subTest(body=body):
+                source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+                    "if (buffer == NULL)\n        return -1;",
+                    f"if (buffer == NULL) {{ {body} }}",
+                )
+                self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_exiting_buffer_checks_before_ternary_reported(self) -> None:
+        """Checked earlier: reported as the redundant reading."""
+        exit_kinds = ("return", "goto", "break", "continue")
+        for exit_index in range(len(exit_kinds)):
+            exit_kind = exit_kinds[exit_index]
+            with self.subTest(exit_kind=exit_kind):
+                source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY
+                if exit_kind == "goto":
+                    source = source.replace("return -1;", "goto failed;", 1).replace(
+                        "    return 0;", "    return 0;\nfailed:\n    return -1;"
+                    )
+                elif exit_kind in ("break", "continue"):
+                    source = (
+                        source.replace("{\n", "{\n    for (int i = 0; i < 2; i++) {\n", 1)
+                        .replace("return -1;", f"{exit_kind};", 1)
+                        .replace("    return 0;", "    }\n    return 0;")
+                    )
+                self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_multiline_ternary_span_covers_fallback(self) -> None:
+        """Report only the three-line ternary expression, including its NULL fallback."""
+        source = FFMPEG_LATER_OR_CHECKED_ALLOCATION_TERNARY.replace(
+            "buffer ? buffer + DST_RECT_OFFSET : NULL",
+            "buffer\n        ? buffer + DST_RECT_OFFSET\n        : NULL",
+        )
+        results = _scan_ffmpeg_c(source)
+        lines = source.splitlines()
+        start = next(index for index, line in enumerate(lines, 1) if "*dst =" in line)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"]["line"], start)
+        self.assertEqual(results[0]["end"]["line"], start + 2)
+        self.assertEqual(results[0]["start"]["col"], lines[start - 1].index("= buffer") + 3)
+        self.assertEqual(results[0]["end"]["col"], lines[start + 1].index(";") + 1)
+        wrapped = FFMPEG_LATER_OR_CHECKED_ALLOCATION_TERNARY.replace(
+            "buffer ? buffer + DST_RECT_OFFSET : NULL",
+            "choose(buffer ? buffer + DST_RECT_OFFSET : NULL)",
+        )
+        self.assertEqual(_scan_ffmpeg_c(wrapped), [])
+
+    def test_allocation_in_separate_function_passes(self) -> None:
+        """Keep bindings local despite a later check; removing the function boundary reports."""
+        source = FFMPEG_ALLOCATION_SEPARATE_FUNCTION
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("}\n\nstatic void optional_buffer(uint8_t *buffer)\n{\n", "")
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_unchecked_allocation_ternary_passes(self) -> None:
+        """Accept a ternary propagating allocation failure without a separate check."""
+        self.assertEqual(_scan_ffmpeg_c(FFMPEG_UNCHECKED_ALLOCATION_TERNARY), [])
+
+    def test_reassigned_allocation_ternary_reported_plain_shape(self) -> None:
+        """Report reassignment before the ternary by plain shape, as without reassignment."""
+        source = FFMPEG_REASSIGNED_ALLOCATION_TERNARY
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+        control = source.replace("    buffer = other;\n", "")
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_unrelated_earlier_conditions_keep_ternary_finding(self) -> None:
+        """Report ternaries when an earlier condition does not directly test the buffer."""
+        checks = (
+            "flag",
+            "ready()",
+            "flag > 0",
+            "record_attempt(buffer)",
+            "buffer->field",
+            "buffer[0]",
+            "flag && record_attempt(buffer)",
+            "buffer + 1",
+            "buffer > other",
+            "!flag",
+            "flag != NULL",
+        )
+        for index in range(len(checks)):
+            with self.subTest(check=checks[index]):
+                source = _earlier_nonnull_ternary_source(checks[index])
+                self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_earlier_assert_macro_reported_plain_shape(self) -> None:
+        """Report a macro assertion before the ternary because macros are not earlier ifs."""
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+            "static int null_checked(void)",
+            (
+                "#define av_assert0(condition) do { if (!(condition)) return -1; } while (0)\n"
+                "static int null_checked(void)"
+            ),
+        ).replace("    if (buffer == NULL)\n        return -1;", "    av_assert0(buffer);", 1)
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_null_checked_allocation_ternary_reported(self) -> None:
+        """Checked earlier: reported as the redundant reading."""
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_allocation_ternary_without_earlier_check_flagged(self) -> None:
+        """Report the shared fixture ternary when only its earlier NULL check is removed."""
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+            "    if (buffer == NULL)\n        return -1;\n", "", 1
+        )
+        ternary_line = next(
+            index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+        )
+        self.assertEqual(_ternary_finding_lines(source), [ternary_line])
+
+    def test_later_or_checked_allocation_ternary_flagged(self) -> None:
+        """Flag the ternary when a later OR condition checks the same buffer."""
+        source = FFMPEG_LATER_OR_CHECKED_ALLOCATION_TERNARY
+        results = _scan_ffmpeg_c(source)
+        ternary_line = next(
+            index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"]["line"], ternary_line)
+        self.assertEqual(
+            results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
+        )
+
+    def test_later_derived_pointer_check_without_braces_flagged(self) -> None:
+        """Flag a ternary whose derived pointer is checked later without braces."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int derived_checked(void)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    uint8_t *dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!dst)
+        return -1;
+    return 0;
+}
+"""
+        )
+        results = _scan_ffmpeg_c(source)
+        ternary_line = next(
+            index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"]["line"], ternary_line)
+        self.assertEqual(
+            results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
+        )
+
+    def test_overwritten_destination_then_destination_check_reported_plain_shape(self) -> None:
+        """Report overwritten destination then destination check by plain shape."""
+        checks = ("!dst", "dst == NULL", "!other || !dst", "!other || dst == NULL")
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            for check in checks:
+                with self.subTest(allocation=allocation, destination=destination, check=check):
+                    source = (
+                        FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                            "ALLOCATION", f"{allocation} = av_malloc(128)"
+                        )
+                        .replace("DECLARATIONS", declarations)
+                        .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                        .replace("CHECK", check)
+                    )
+                    ternary_line = next(
+                        index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+                    )
+                    self.assertEqual(_ternary_finding_lines(source), [ternary_line])
+
+    def test_overwritten_destination_with_later_or_earlier_buffer_check(self) -> None:
+        """Report all four frames both with and without an earlier buffer check."""
+        failure_check = "if (!buffer) {\n        return -1;\n    }"
+        for frame in range(len(FFMPEG_DESTINATION_WRITE_FORMS)):
+            declarations, allocation, destination = FFMPEG_DESTINATION_WRITE_FORMS[frame]
+            for earlier in range(2):
+                with self.subTest(allocation=allocation, destination=destination, earlier=earlier):
+                    source = (
+                        FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                            "ALLOCATION", f"{allocation} = av_malloc(128)"
+                        )
+                        .replace("DECLARATIONS", declarations)
+                        .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                        .replace("CHECK", "!buffer")
+                    )
+                    if earlier:
+                        source = source.replace(
+                            f"    {destination} = buffer ?",
+                            "    " + failure_check + f"\n    {destination} = buffer ?",
+                            1,
+                        )
+                    ternary_line = next(
+                        index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+                    )
+                    expected = [ternary_line]
+                    self.assertEqual(_ternary_finding_lines(source), expected)
+
+    def test_destination_assigned_after_check_flagged(self) -> None:
+        """Keep the ternary finding when its destination is assigned only after the check."""
+        for declarations, allocation, destination in FFMPEG_DESTINATION_WRITE_FORMS:
+            with self.subTest(allocation=allocation, destination=destination):
+                source = (
+                    FFMPEG_DESTINATION_WRITE_TERNARY.replace(
+                        "ALLOCATION", f"{allocation} = av_malloc(128)"
+                    )
+                    .replace("DECLARATIONS", declarations)
+                    .replace("TERNARY", f"{destination} = buffer ? buffer + 16 : NULL")
+                    .replace("CHECK", "!dst")
+                    .replace("    dst = other;\n", "")
+                    .replace("    return 0;", "    dst = other;\n    return 0;")
+                )
+                results = _scan_ffmpeg_c(source)
+                ternary_line = next(
+                    index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+                )
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["start"]["line"], ternary_line)
+
+    def test_later_buffer_check_without_braces_flagged(self) -> None:
+        """Flag a ternary whose buffer is checked later without braces."""
+        source = FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT.replace(
+            "buffer = av_mallocz(DST_RECT_BUF_SIZE);",
+            "buffer = av_malloc(DST_RECT_BUF_SIZE);",
+        )
+        results = _scan_ffmpeg_c(source)
+        ternary_line = next(
+            index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"]["line"], ternary_line)
+        self.assertEqual(
+            results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
+        )
+
+    def test_derived_pointer_checked_before_ternary_flagged(self) -> None:
+        """Report earlier destination and buffer checks without excluding either ternary."""
+        source = (
+            FFMPEG_ALLOCATION_DECLARATIONS
+            + """\
+static int earlier_derived_check(uint8_t *dst)
+{
+    uint8_t *buffer = av_malloc(DST_RECT_BUF_SIZE);
+    if (!dst)
+        return -1;
+    dst = buffer ? buffer + DST_RECT_OFFSET : NULL;
+    if (!buffer)
+        return -1;
+    return 0;
+}
+"""
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+        control = source.replace("if (!dst)", "if (!buffer)", 1)
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_braced_derived_null_equality_flagged(self) -> None:
+        """Flag a later braced NULL equality checking only the derived pointer."""
+        source = FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT.replace(
+            "if (!buffer)\n        return -1;",
+            "if (dst == NULL) {\n        return -1;\n    }",
+        )
+        results = _scan_ffmpeg_c(source)
+        ternary_line = next(
+            index for index, line in enumerate(source.splitlines(), 1) if " ? " in line
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"]["line"], ternary_line)
+        self.assertEqual(
+            results[0]["check_id"].split(".")[-1], "ffmpeg-null-ternary-after-allocation"
+        )
+
+    def test_earlier_or_buffer_null_equality_reported(self) -> None:
+        """Checked earlier: reported as the redundant reading."""
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+            "if (buffer == NULL)\n        return -1;",
+            "if (buffer == NULL || DST_RECT_BUF_SIZE == 0) {\n        return -1;\n    }",
+        )
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_reallocated_allocation_ternary_reported(self) -> None:
+        """Report reallocation after an earlier check without tracking allocation identities."""
+        source = FFMPEG_REALLOCATED_ALLOCATION_TERNARY
+        self.assertEqual(_ternary_finding_lines(source), _buffer_ternary_lines(source))
+
+    def test_earlier_check_spellings_reported(self) -> None:
+        """Checked earlier: reported as the redundant reading in every frame and context."""
+        checks = (
+            "buffer",
+            "!buffer",
+            "buffer == NULL",
+            "NULL == buffer",
+            "buffer != NULL",
+            "NULL != buffer",
+            "(unsigned char)buffer",
+            "!(unsigned char)buffer",
+            "(void *)buffer",
+            "!(void *)buffer",
+            "(uint8_t *)buffer",
+            "(void *)buffer == NULL",
+            "buffer == (void *)0",
+            "buffer != (void *)0",
+            "buffer == (0)",
+        )
+        contexts = ("{}", "flag && {} && ready()", "flag || {} || ready()")
+        sources = []
+        for frame in range(4):
+            for index in range(len(checks)):
+                for context in range(len(contexts)):
+                    condition = contexts[context].format(checks[index])
+                    sources.append(
+                        _earlier_check_frame_source(
+                            f"if ({condition}) return -1;",
+                            frame,
+                            f"spelling_{frame}_{index}_{context}",
+                        )
+                    )
+        source = "\n".join(sources)
+        expected = _buffer_ternary_lines(source)
+        self.assertEqual(len(expected), 4 * len(checks) * len(contexts))
+        self.assertEqual(_ternary_finding_lines(source), expected)
+
+    def test_review_d1_double_negation_and_zero_checks_reported(self) -> None:
+        """D1: checked earlier via double negation or zero comparisons reports every frame."""
+        checks = ("!!buffer", "buffer == 0", "0 == buffer", "buffer != 0", "0 != buffer")
+        contexts = ("{}", "flag && {} && ready()", "flag || {} || ready()")
+        sources = []
+        for frame in range(4):
+            for index in range(len(checks)):
+                for context in range(len(contexts)):
+                    condition = contexts[context].format(checks[index])
+                    sources.append(
+                        _earlier_check_frame_source(
+                            f"if ({condition}) return -1;", frame, f"d1_{frame}_{index}_{context}"
+                        )
+                    )
+        source = "\n".join(sources)
+        expected = _buffer_ternary_lines(source)
+        self.assertEqual(len(expected), 60)
+        self.assertEqual(_ternary_finding_lines(source), expected)
+
+    def test_review_d2_separate_cast_and_plain_checks_reported(self) -> None:
+        """D2: checked earlier via separate cast and plain checks reports every frame."""
+        cast = "if ((void *)buffer) return -1;"
+        plain = "if (buffer) return -1;"
+        checks = (
+            f"{cast}\n    {plain}",
+            f"{plain}\n    {cast}",
+            "if (buffer && (unsigned char)buffer) return -1;",
+            "if (buffer || (unsigned char)buffer) return -1;",
+        )
+        sources = []
+        for frame in range(4):
+            for index in range(len(checks)):
+                sources.append(
+                    _earlier_check_frame_source(checks[index], frame, f"d2_{frame}_{index}")
+                )
+        source = "\n".join(sources)
+        expected = _buffer_ternary_lines(source)
+        self.assertEqual(len(expected), 16)
+        self.assertEqual(_ternary_finding_lines(source), expected)
+
+    def test_redundant_ternary_reasoned_suppression(self) -> None:
+        """Suppress a checked-earlier ternary with an adjacent rule ID and reason."""
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(
+            "    uint8_t *dst = buffer ?",
+            (
+                "    // semgrep-reason (expires 2026-12-19): "
+                "preserve the optional-buffer interface\n"
+                "    // nosemgrep: ffmpeg-null-ternary-after-allocation\n"
+                "    uint8_t *dst = buffer ?"
+            ),
+        )
+        self.assertEqual(_ternary_finding_lines(source), [])
+        control = source.replace("    // nosemgrep: ffmpeg-null-ternary-after-allocation\n", "")
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_other_buffer_and_nonallocator_boundaries(self) -> None:
+        """Keep other-variable and non-allocator fixtures quiet beside a matching control."""
+        control = FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT
+        boundaries = (
+            control.replace("buffer = av_mallocz", "other = av_mallocz"),
+            control.replace("av_mallocz(DST_RECT_BUF_SIZE)", "lookup_buffer(DST_RECT_BUF_SIZE)"),
+        )
+        for index in range(len(boundaries)):
+            with self.subTest(boundary=index):
+                self.assertEqual(_ternary_finding_lines(boundaries[index]), [])
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
+
+    def test_alias_and_struct_member_checks_out_of_scope(self) -> None:
+        """Require a plain later buffer check rather than following aliases or members."""
+        control = FFMPEG_PLANTED_ALLOCATION_TERNARY_ASSIGNMENT
+        aliases = (
+            ("uint8_t *alias = buffer;", "!alias"),
+            ("struct { uint8_t *buffer; } state; state.buffer = buffer;", "!state.buffer"),
+        )
+        for index in range(len(aliases)):
+            setup, check = aliases[index]
+            with self.subTest(check=check):
+                source = control.replace("if (!buffer)", f"{setup}\n    if ({check})")
+                self.assertEqual(_ternary_finding_lines(source), [])
+        self.assertEqual(_ternary_finding_lines(control), _buffer_ternary_lines(control))
 
     def test_planted_write_header_missing_network_close_flagged(self) -> None:
         """Planted connect-then-close failure without ff_network_close flags the close line."""
@@ -906,3 +1845,12 @@ class FfmpegSemgrepRulesTest(unittest.TestCase):
         matches, partial_paths = parsed or ([], [])
         self.assertEqual(len(matches), 1)
         self.assertEqual(len(partial_paths), len(data["errors"]))
+
+
+def load_tests(
+    loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None
+) -> unittest.TestSuite:
+    """Schedule independent methods separately without changing test IDs or bodies."""
+    # No module/class fixtures: each method owns its scratch tree.
+    # Singleton suites let --level class preserve class fixtures in other modules.
+    return unit_test_budget.individual_test_suites(tests)

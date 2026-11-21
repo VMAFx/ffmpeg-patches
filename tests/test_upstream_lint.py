@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess  # nosec B404 - fixed commands in disposable Git repositories.
 import sys
@@ -21,6 +22,7 @@ import tempfile
 import unittest
 import unittest.mock
 from dataclasses import FrozenInstanceError
+from datetime import date
 from pathlib import Path
 
 from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
@@ -2016,6 +2018,7 @@ class FixtureTest(unittest.TestCase):
         self.write("tools/check_commit_msg.sh", FAKE_MESSAGE)
         self.write("tools/patcheck", FAKE_PATCHECK)
         self.write("libavfilter/vf_x.c", SOURCE)
+        self.write("libavutil/attributes.h", "#define av_fixture_tag\n")
         self.write("libavfilter/allfilters.c", FILTER_DECLARATIONS)
         self.commit("avfilter/vf_x: initial fixture")
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -3521,6 +3524,986 @@ class PreCommitResolutionTest(unittest.TestCase):
         upstream_lint._validate_executable([executable, "run"])
 
 
+@unittest.skipUnless(shutil.which(os.environ.get("SEMGREP") or "semgrep"), "semgrep not installed")
+class CRulesScratchTest(FixtureTest):
+    """Exercise scratch preparation and real scanner results on synthetic sources."""
+
+    def setUp(self) -> None:
+        """Isolate scanner temporary files in a cleanup-managed directory per test."""
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = unittest.mock.patch.dict(os.environ, {"TMPDIR": directory.name})
+        self.addCleanup(environment.stop)
+        environment.start()
+
+    def scan_source(self, source: str) -> upstream_lint.Step:
+        """Commit one synthetic source and run only the real c-rules step."""
+        self.write("libavfilter/vf_x.c", source)
+        self.commit()
+        return upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+
+    def assert_blanked(self, source: bytes, expected: bytes) -> None:
+        """Assert exact scratch bytes, byte length and every newline offset."""
+        blanked = upstream_lint._c_rules_blank(source, {b"av_fixture_tag"})
+        self.assertEqual(blanked, expected)
+        self.assertEqual(len(blanked), len(source))
+        self.assertEqual(
+            [index for index, byte in enumerate(blanked) if byte == 10],
+            [index for index, byte in enumerate(source) if byte == 10],
+        )
+
+    def _r5_allocation(self) -> bytes:
+        """Return the fourth review's allocation finding without an attribute prefix."""
+        return (
+            b"void fixture(void) {\n"
+            b"    unsigned char *buffer = av_malloc(8);\n"
+            b"    unsigned char *dst = buffer ? buffer + 4 : NULL;\n"
+            b"    if (!buffer) { fail(); }\n}\n"
+        )
+
+    def _r5_scan(
+        self,
+        source: bytes,
+        unread: tuple[upstream_lint.UnreadWaiver, ...] = (),
+        header_requested: bool = False,
+    ) -> tuple[upstream_lint.Step, dict[str, bytes]]:
+        """Run the real step on review-style touched paths and retain scratch bytes."""
+        name = "libavfilter/vf_x.c"
+        (self.root / name).write_bytes(source)
+        paths = [name, "libavutil/attributes.h"] if header_requested else [name]
+        captured: dict[str, bytes] = {}
+
+        def capture(argv, cwd, data=None, timeout=60):
+            """Capture every accepted scratch source before running the real scanner."""
+            self.assertEqual(argv[:2], ["bash", str(upstream_lint.SEMGREP_SCAN)])
+            (cwd / ".git").mkdir(exist_ok=True)
+            captured.update({path: (cwd / path).read_bytes() for path in argv[5:]})
+            return self.real_run(argv, cwd, data, timeout)
+
+        with (
+            unittest.mock.patch.object(
+                upstream_lint,
+                "_c_rules_touched",
+                return_value={path: set(range(1, 100)) for path in paths},
+            ),
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=capture),
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "", unread)
+        return step, captured
+
+    def _r5_assert_copy(self, source: bytes, copies: dict[str, bytes]) -> None:
+        """Require the scanned function to retain exact bytes, length and newline offsets."""
+        blanked = copies["libavfilter/vf_x.c"]
+        self.assertEqual(blanked, source)
+        self.assertEqual(len(blanked), len(source))
+        self.assertEqual(
+            [index for index, byte in enumerate(blanked) if byte in (10, 13)],
+            [index for index, byte in enumerate(source) if byte in (10, 13)],
+        )
+
+    def _r6_assert_unread(self, source: bytes, waived: bool = False) -> None:
+        """Require token splices to use the exact existing unread and dated-waiver report."""
+        name = "libavfilter/vf_x.c"
+        waiver = upstream_lint.UnreadWaiver(name, "fixture", "B", date(2026, 11, 23), False)
+        step, copies = self._r5_scan(source, (waiver,) if waived else ())
+        reason = "line splice inside code between two non-blank bytes is not supported"
+        self.assertEqual(step.rc, 0 if waived else 1, step.output)
+        self.assertEqual(copies, {})
+        self.assertEqual(step.output.count(reason), 1)
+        self.assertEqual(step.output.count(name), 3)
+        self.assertIn(f"informational: {name}: {reason}", step.output)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"{'waived' if waived else 'no waiver'}: {name}:", step.output)
+        self.assertNotIn("finding:", step.output)
+
+    def _r6_assert_scanned(self, source: bytes, line: int, path_count: int = 1) -> None:
+        """Require boundary controls to retain the exact scratch bytes and physical finding."""
+        step, copies = self._r5_scan(source)
+        self._r5_assert_copy(source, copies)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"finding: libavfilter/vf_x.c:{line}:", step.output)
+        self.assertEqual(step.output.count("finding:"), 1)
+        self.assertEqual(step.output.count("libavfilter/vf_x.c"), path_count)
+        self.assertNotIn("unread:", step.output)
+        self.assertNotIn("line splice inside code", step.output)
+
+    def test_r6_identifier_splice(self) -> None:
+        """The review's LF-split allocator is unread instead of silently hiding its finding."""
+        source = self._r5_allocation().replace(b"av_malloc(", b"av_mal\\\nloc(")
+        self._r6_assert_unread(source)
+
+    def test_r6_identifier_crlf(self) -> None:
+        """The review's CRLF-split allocator is unread with the same exact diagnostic."""
+        source = self._r5_allocation().replace(b"av_malloc(", b"av_mal\\\r\nloc(")
+        self._r6_assert_unread(source)
+
+    def test_r6_two_splices(self) -> None:
+        """The review's adjacent splice run is checked across both removed newlines."""
+        source = self._r5_allocation().replace(b"av_malloc(", b"av_mal\\\n\\\nloc(")
+        self._r6_assert_unread(source)
+
+    def test_r6_code_token_boundaries(self) -> None:
+        """Non-blank code splices also fail closed beside operators and noncode boundaries."""
+        for suffix in (b"a+\\\nb;\n", b'"a"\\\n"b";\n', b"/* end */\\\nint x;\n"):
+            with self.subTest(suffix=suffix):
+                self._r6_assert_unread(self._r5_allocation() + suffix)
+
+    def test_r6_token_splices_waived(self) -> None:
+        """A live dated unread waiver applies to each of the three split allocator shapes."""
+        for splice in (b"\\\n", b"\\\r\n", b"\\\n\\\n"):
+            with self.subTest(splice=splice):
+                source = self._r5_allocation().replace(b"av_malloc(", b"av_mal" + splice + b"loc(")
+                self._r6_assert_unread(source, waived=True)
+
+    def test_r6_attributes_token_splice(self) -> None:
+        """An incidental header with a code-token splice contributes no words and is named once."""
+        reason = "line splice inside code between two non-blank bytes is not supported"
+        for splice in (b"\\\n", b"\\\r\n", b"\\\n\\\n"):
+            with self.subTest(splice=splice):
+                header = b"#define av_malloc\nint sp" + splice + b"lit;\n"
+                (self.root / "libavutil/attributes.h").write_bytes(header)
+                self.assertEqual(
+                    upstream_lint._c_rules_attributes(self.root),
+                    (set(), [f"informational: libavutil/attributes.h: {reason}"]),
+                )
+                step, copies = self._r5_scan(self._r5_allocation())
+                self._r5_assert_copy(self._r5_allocation(), copies)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(step.output.count("libavutil/attributes.h"), 1)
+                self.assertEqual(step.output.count(reason), 1)
+                self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1)
+                self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
+
+    def test_r6_requested_header_token_splice(self) -> None:
+        """A requested unsupported header uses unread waivers without duplicating its reason."""
+        name = "libavutil/attributes.h"
+        reason = "line splice inside code between two non-blank bytes is not supported"
+        (self.root / name).write_bytes(b"#define av_fixture_tag\nint sp\\\nlit;\n")
+        waiver = upstream_lint.UnreadWaiver(name, "fixture", "B", date(2026, 11, 23), False)
+        for unread in ((), (waiver,)):
+            with self.subTest(unread=unread):
+                step, copies = self._r5_scan(b"int clean;\n", unread, header_requested=True)
+                self.assertEqual(step.rc, 0 if unread else 1, step.output)
+                self.assertEqual(copies, {"libavfilter/vf_x.c": b"int clean;\n"})
+                self.assertEqual(step.output.count(name), 3)
+                self.assertEqual(step.output.count(reason), 1)
+                self.assertIn(f"unread: {name}:", step.output)
+                self.assertIn(f"{'waived' if unread else 'no waiver'}: {name}:", step.output)
+
+    def test_r6_boundary_code_blank_before(self) -> None:
+        """Boundary control: a blank before a code splice preserves bytes and findings."""
+        source = self._r5_allocation().replace(
+            b"    if (!buffer)", b"    a + \\\nb;\n    if (!buffer)"
+        )
+        self._r6_assert_scanned(source, 3)
+
+    def test_r6_boundary_code_blank_after(self) -> None:
+        """Boundary control: a blank after a code splice preserves bytes and findings."""
+        source = self._r5_allocation().replace(
+            b"    if (!buffer)", b"    a +\\\n b;\n    if (!buffer)"
+        )
+        self._r6_assert_scanned(source, 3)
+
+    def test_r6_boundary_string_splice(self) -> None:
+        """Boundary control: a token splice inside a string literal remains supported."""
+        source = b'const char *s = "av_fix\\\nture_tag";\n' + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_character_splice(self) -> None:
+        """Boundary control: a splice inside a character literal remains supported."""
+        source = b"int c = 'a\\\n';\n" + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_block_comment_splice(self) -> None:
+        """Boundary control: a token splice inside a block comment remains supported."""
+        source = b"/* av_fix\\\nture_tag */\n" + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_define_splice(self) -> None:
+        """Boundary control: a token splice inside a multiline define remains supported."""
+        source = b"#define KEEP av_fix\\\nture_tag\n" + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_backslash_eof(self) -> None:
+        """Boundary control: a final backslash without a newline is not a splice."""
+        source = self._r5_allocation() + b"#define KEEP av_fixture_tag \\"
+        self._r6_assert_scanned(source, 3)
+
+    def test_r6_boundary_splice_eof(self) -> None:
+        """Boundary control: a splice at EOF has no following byte and stays supported."""
+        source = self._r5_allocation() + b"#define KEEP av_fixture_tag \\\n"
+        self._r6_assert_scanned(source, 3)
+
+    def test_r6_boundary_splice_offset_zero(self) -> None:
+        """Boundary control: the review's leading splice has no preceding byte."""
+        source = b"\\\n/* prefix */ #define KEEP av_fixture_tag\n" + self._r5_allocation()
+        self._r6_assert_scanned(source, 5)
+
+    def test_r6_boundary_unsplit_allocation(self) -> None:
+        """Boundary control: an unsplit allocation reports the line-three finding and rc one."""
+        self._r6_assert_scanned(self._r5_allocation(), 3)
+
+    def test_r5_split_comment_opener(self) -> None:
+        """Phase 2 hides commented allocation definitions across repeated LF and CRLF splices."""
+        for newline in (b"\n", b"\r\n"):
+            for count in (1, 3):
+                with self.subTest(newline=newline, count=count):
+                    header = b"/" + (b"\\" + newline) * count
+                    header += b"*" + newline + b"#define av_malloc" + newline + b"*/" + newline
+                    (self.root / "libavutil/attributes.h").write_bytes(header)
+                    names, notices = upstream_lint._c_rules_attributes(self.root)
+                    source = self._r5_allocation()
+                    step, copies = self._r5_scan(source)
+                    self._r5_assert_copy(source, copies)
+                    self.assertEqual(names, set())
+                    self.assertEqual(notices, [])
+                    self.assertEqual(step.rc, 1, step.output)
+                    self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
+
+    def test_r5_boundary_plain_comment_opener(self) -> None:
+        """Boundary control: an ordinary comment opener hides the allocation definition."""
+        (self.root / "libavutil/attributes.h").write_bytes(b"/*\n#define av_malloc\n*/\n")
+        self.assertEqual(upstream_lint._c_rules_attributes(self.root), (set(), []))
+        source = self._r5_allocation()
+        step, copies = self._r5_scan(source)
+        self._r5_assert_copy(source, copies)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
+
+    def test_r5_phase2_delimiters(self) -> None:
+        """Spliced quotes, line-comment openers and block closers retain only noncode words."""
+        for newline in (b"\n", b"\r\n"):
+            splice = b"\\" + newline
+            cases = (
+                b'"' + splice + b"\\" + splice + b'"av_fixture_tag";',
+                b"/" + splice * 2 + b"/ av_fixture_tag",
+                b"/* av_fixture_tag *" + splice * 2 + b"/",
+            )
+            for prefix in cases:
+                with self.subTest(newline=newline, prefix=prefix):
+                    self.assert_blanked(
+                        prefix + newline + b"av_fixture_tag int code;" + newline,
+                        prefix + newline + b"               int code;" + newline,
+                    )
+
+    def test_r5_spliced_directive_tokens(self) -> None:
+        """Logical directives recognize definitions and comment prefixes across splices."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                splice = b"\\" + newline
+                prefix = b"/" + splice + b"* leading *" + splice + b"/ " + splice
+                directive = prefix + b"#def" + splice + b"ine av_fixture_tag" + newline
+                (self.root / "libavutil/attributes.h").write_bytes(directive)
+                self.assertEqual(
+                    upstream_lint._c_rules_attributes(self.root), ({b"av_fixture_tag"}, [])
+                )
+                self.assert_blanked(
+                    directive + b"av_fixture_tag int code;" + newline,
+                    directive + b"               int code;" + newline,
+                )
+
+    def test_r5_boundary_nonnewline_backslash(self) -> None:
+        """Boundary control: a backslash before an asterisk does not form a comment opener."""
+        self.assert_blanked(
+            b"/\\* av_fixture_tag */\nav_fixture_tag int code;\n",
+            b"/\\*                */\n               int code;\n",
+        )
+
+    def test_r5_bare_cr_source_unread(self) -> None:
+        """A bare CR directive boundary is unread and never reaches the scanner."""
+        source = (b"#define KEEP av_fixture_tag\n" + self._r5_allocation()).replace(b"\n", b"\r")
+        step, copies = self._r5_scan(source)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(copies, {})
+        self.assertEqual(step.output.count("bare CR line endings are not supported"), 1)
+        self.assertIn("unread: libavfilter/vf_x.c:", step.output)
+        self.assertIn("no waiver: libavfilter/vf_x.c:", step.output)
+
+    def test_r5_bare_cr_source_waived(self) -> None:
+        """The existing dated unread waiver applies to a bare CR source."""
+        source = (b"#define KEEP av_fixture_tag\n" + self._r5_allocation()).replace(b"\n", b"\r")
+        waiver = upstream_lint.UnreadWaiver(
+            "libavfilter/vf_x.c", "fixture", "B", date(2026, 11, 23), False
+        )
+        step, copies = self._r5_scan(source, (waiver,))
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(copies, {})
+        self.assertEqual(step.output.count("bare CR line endings are not supported"), 1)
+        self.assertIn("unread: libavfilter/vf_x.c:", step.output)
+        self.assertIn("waived: libavfilter/vf_x.c:", step.output)
+
+    def test_r5_bare_cr_attributes_header(self) -> None:
+        """A bare CR attributes header contributes no words and is diagnosed exactly once."""
+        (self.root / "libavutil/attributes.h").write_bytes(b"#define av_malloc\r")
+        names, notices = upstream_lint._c_rules_attributes(self.root)
+        self.assertEqual(names, set())
+        self.assertEqual(
+            notices,
+            ["informational: libavutil/attributes.h: bare CR line endings are not supported"],
+        )
+        for requested in (False, True):
+            with self.subTest(requested=requested):
+                source = self._r5_allocation()
+                step, copies = self._r5_scan(source, header_requested=requested)
+                self._r5_assert_copy(source, copies)
+                self.assertEqual(set(copies), {"libavfilter/vf_x.c"})
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(step.output.count("libavutil/attributes.h:"), 1 + 2 * requested)
+                self.assertEqual(step.output.count("bare CR line endings are not supported"), 1)
+                self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
+
+    def test_r5_boundary_supported_line_endings(self) -> None:
+        """Boundary control: LF and CRLF directive boundaries retain the allocation finding."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                source = (b"#define KEEP token\n" + self._r5_allocation()).replace(b"\n", newline)
+                step, copies = self._r5_scan(source)
+                self._r5_assert_copy(source, copies)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("finding: libavfilter/vf_x.c:4:", step.output)
+                self.assertNotIn("unread:", step.output)
+
+    def test_r3_spliced_line_comments(self) -> None:
+        """LF and CRLF splices keep the next physical line inside a line comment."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                comment = b"// continued " + bytes([92]) + newline + b"av_fixture_tag" + newline
+                self.assert_blanked(
+                    comment + b"av_fixture_tag int code;\n",
+                    comment + b"               int code;\n",
+                )
+
+    def test_r3_spliced_header_comment(self) -> None:
+        """A definition on a spliced comment line contributes no attribute words."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                header = self.root / "libavutil/attributes.h"
+                prefix = b"// continued " + bytes([92]) + newline
+                header.write_bytes(
+                    prefix + b"#define av_buffer" + newline + b"#define av_fixture_tag\n"
+                )
+                names, notices = upstream_lint._c_rules_attributes(self.root)
+                self.assertEqual(names, {b"av_fixture_tag"})
+                self.assertEqual(notices, [])
+
+    def test_r3_boundary_spliced_literals(self) -> None:
+        """Boundary control: spliced strings and characters retain every literal byte."""
+        for quote in (b'"', b"'"):
+            for newline in (b"\n", b"\r\n"):
+                with self.subTest(quote=quote, newline=newline):
+                    literal = (
+                        quote + b"continued " + bytes([92]) + newline + b"av_fixture_tag" + quote
+                    )
+                    self.assert_blanked(
+                        literal + b";\nav_fixture_tag int code;\n",
+                        literal + b";\n               int code;\n",
+                    )
+
+    def test_r3_unterminated_block_comment(self) -> None:
+        """An unterminated block comment masks through the end of the source."""
+        for suffix in (b"", b"\n", b"\\"):
+            with self.subTest(suffix=suffix):
+                tail = b"/* av_fixture_tag\nav_fixture_tag" + suffix
+                self.assert_blanked(
+                    b"av_fixture_tag int code;\n" + tail,
+                    b"               int code;\n" + tail,
+                )
+
+    def test_r3_unterminated_literals(self) -> None:
+        """Unterminated strings and characters mask through EOF including a trailing escape."""
+        for quote in (b'"', b"'"):
+            for suffix in (b"", b"\\"):
+                with self.subTest(quote=quote, suffix=suffix):
+                    tail = quote + b"av_fixture_tag\nav_fixture_tag" + suffix
+                    self.assert_blanked(
+                        b"av_fixture_tag int code;\n" + tail,
+                        b"               int code;\n" + tail,
+                    )
+
+    def test_r3_boundary_unspliced_line_comment(self) -> None:
+        """Boundary control: an unspliced line comment ends at its physical newline."""
+        self.assert_blanked(
+            b"// av_fixture_tag\nav_fixture_tag int code;\n",
+            b"// av_fixture_tag\n               int code;\n",
+        )
+
+    def test_r3_comment_prefixed_directive(self) -> None:
+        """A comment-prefixed directive protects its spliced physical continuation."""
+        directive = b"/* leading */ #define KEEP \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(
+            directive + b"av_fixture_tag int code;\n",
+            directive + b"               int code;\n",
+        )
+
+    def test_r3_directive_spanning_block_comment(self) -> None:
+        """A directive continues across block comments and stops after their closing line."""
+        for middle in (b"", b"av_fixture_tag\n"):
+            with self.subTest(middle=middle):
+                directive = b"#define KEEP /* open\n" + middle + b"*/ av_fixture_tag int keep;\n"
+                self.assert_blanked(
+                    directive + b"av_fixture_tag int code;\n",
+                    directive + b"               int code;\n",
+                )
+
+    def test_r3_boundary_hash_after_code(self) -> None:
+        """Boundary control: a hash after ordinary code cannot start a directive."""
+        self.assert_blanked(
+            b"int x; # y \\\nav_fixture_tag int code;\n",
+            b"int x; # y \\\n               int code;\n",
+        )
+
+    def test_r3_boundary_hash_after_literal(self) -> None:
+        """Boundary control: masking a literal cannot turn a later hash into a directive."""
+        for quote in (b'"', b"'"):
+            with self.subTest(quote=quote):
+                prefix = b"/* leading */ " + quote + b"literal" + quote + b" # y "
+                prefix += bytes([92, 10])
+                self.assert_blanked(
+                    prefix + b"av_fixture_tag int code;\n",
+                    prefix + b"               int code;\n",
+                )
+
+    def escaping_header(self) -> Path:
+        """Establish an unchanged escaping header in the disposable fixture base."""
+        target = self.root.parent / "outside.h"
+        target.write_bytes(b"#define av_fixture_tag\n")
+        header = self.root / "libavutil/attributes.h"
+        header.unlink()
+        header.symlink_to(target)
+        self.commit("avutil/attributes: establish escaping fixture header")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        return target
+
+    def assert_header_escape(self, step: upstream_lint.Step) -> None:
+        """Require an unwaivable escape status and exactly one header diagnostic."""
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertEqual(step.output.count("libavutil/attributes.h"), 1, step.output)
+        self.assertIn("resolves outside the checked tree", step.output)
+
+    def test_r3_escaping_header_keeps_finding(self) -> None:
+        """An escaping header fails closed without suppressing another source's finding."""
+        self.escaping_header()
+        step = self.scan_source(self.allocation_source())
+        self.assert_header_escape(step)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+
+    def test_r3_escaping_header_cannot_be_waived(self) -> None:
+        """Neither a finding reason nor a dated unread waiver excuses a header escape."""
+        self.escaping_header()
+        self.write("libavfilter/vf_x.c", self.allocation_source())
+        self.commit()
+        waiver = upstream_lint.UnreadWaiver(
+            "libavutil/attributes.h", "fixture", "B", date(2026, 11, 23), False
+        )
+        step = upstream_lint._c_rules(self.root, self.base, "HEAD", "fixture", (waiver,))
+        self.assert_header_escape(step)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+
+    def test_r3_escaping_header_keeps_unread_status(self) -> None:
+        """A header escape retains both findings and unread statuses for other requested sources."""
+        self.escaping_header()
+        name, other = "libavfilter/vf_unread.c", "libavfilter/vf_x.c"
+        self.write(name, "int unread;\n")
+        self.write(other, self.allocation_source())
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": [name, other]},
+                "results": [
+                    {
+                        "path": other,
+                        "check_id": "ffmpeg-null-ternary-after-allocation",
+                        "start": {"line": 1},
+                        "end": {"line": 1},
+                        "extra": {"message": "fixture finding"},
+                    }
+                ],
+                "errors": [{"type": "Syntax error", "path": name}],
+            }
+        )
+        with (
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command),
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_touched", return_value={name: {1}, other: {1}}
+            ),
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assert_header_escape(step)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"no waiver: {name}:", step.output)
+        self.assertIn(f"finding: {other}:1:", step.output)
+
+    def test_r3_requested_directories_are_unread(self) -> None:
+        """Requested root and subdirectories use the existing unread waiver rules."""
+        for name in (".", "libavfilter"):
+            waiver = upstream_lint.UnreadWaiver(name, "fixture", "B", date(2026, 11, 23), False)
+            for reason, unread, rc in (("", (), 1), ("fixture", (), 1), ("", (waiver,), 0)):
+                with self.subTest(name=name, reason=reason, unread=unread):
+                    with unittest.mock.patch.object(
+                        upstream_lint, "_c_rules_touched", return_value={name: {1}}
+                    ):
+                        step = upstream_lint._c_rules(self.root, self.base, "HEAD", reason, unread)
+                    self.assertIsInstance(step, upstream_lint.Step)
+                    self.assertEqual(step.rc, rc, step.output)
+                    self.assertIn(f"unread: {name}:", step.output)
+                    self.assertIn(f"{'waived' if unread else 'no waiver'}: {name}:", step.output)
+
+    def test_r3_requested_directory_keeps_other_finding(self) -> None:
+        """An unread directory does not suppress scanning an ordinary requested source."""
+        self.write("libavfilter/vf_x.c", self.allocation_source())
+        with unittest.mock.patch.object(
+            upstream_lint, "_c_rules_touched", return_value={".": {1}, "libavfilter/vf_x.c": {1}}
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unread: .:", step.output)
+        self.assertIn("no waiver: .:", step.output)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+
+    def test_r3_requested_header_directory_is_unread(self) -> None:
+        """A requested attributes-header directory reaches the ordinary unread report."""
+        name = "libavutil/attributes.h"
+        header = self.root / name
+        header.unlink()
+        header.mkdir()
+        with unittest.mock.patch.object(
+            upstream_lint, "_c_rules_touched", return_value={name: {1}}
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertIsInstance(step, upstream_lint.Step)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"no waiver: {name}:", step.output)
+
+    def test_d1_attributes_only_in_code(self) -> None:
+        """Attribute words inside literals and comments remain byte-identical."""
+        tail = (
+            b'const char *text = "av_fixture_tag";\n'
+            b"int marker = 'x';\nint multichar = 'av_fixture_tag';\n"
+            b"/* av_fixture_tag\n   av_fixture_tag */\n"
+            b"// av_fixture_tag\n"
+        )
+        self.assert_blanked(
+            b"av_fixture_tag int code;\n" + tail,
+            b"               int code;\n" + tail,
+        )
+
+    def test_d1_attribute_discovery_ignores_noncode(self) -> None:
+        """Only real object-like attribute definitions are discovered."""
+        self.write(
+            "libavutil/attributes.h",
+            "/*\n#define av_buffer\n*/\n"
+            'const char *text = "\\\n#define av_string\\\n";\n'
+            "#define av_mark\n",
+        )
+        names, notices = upstream_lint._c_rules_attributes(self.root)
+        self.assertEqual(names, {b"av_mark"})
+        self.assertEqual(notices, [])
+
+    def test_d1_macro_discovery_ignores_noncode(self) -> None:
+        """Commented and quoted function macros cannot blank standalone calls."""
+        source = (
+            b"/*\n#define BUILD(x, n) int x;\n*/\nBUILD(x, 1)\n"
+            b'const char *text = "\\\n#define QUOTED(x) x\\\n";\nQUOTED(x)\n'
+        )
+        self.assert_blanked(source, source)
+
+    def test_d2_two_line_directive_and_code_boundary(self) -> None:
+        """A directive continuation is preserved and following code is blanked."""
+        directive = b"#define KEEP \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(
+            directive + b"av_fixture_tag int code;\n",
+            directive + b"               int code;\n",
+        )
+
+    def test_d2_three_line_directive(self) -> None:
+        """Every physical line of a three-line directive stays identical."""
+        source = b"#define KEEP \\\n    av_fixture_tag \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(source, source)
+
+    def test_d2_commented_hash_does_not_start_directive(self) -> None:
+        """A hash inside a block comment cannot exempt following ordinary code."""
+        prefix = b"/*\n#define KEEP \\\n*/ "
+        self.assert_blanked(
+            prefix + b"av_fixture_tag int code;\n",
+            prefix + b"               int code;\n",
+        )
+
+    def allocation_source(self) -> str:
+        """Return a one-line allocation finding that overlaps a committed symlink hunk."""
+        return (
+            "void fixture(void) { unsigned char *buffer = av_malloc(8); "
+            "unsigned char *dst = buffer ? buffer + 4 : NULL; "
+            "if (!buffer) { fail(); } }\n"
+        )
+
+    def commit_linked_source(self, internal: bool = False) -> Path:
+        """Commit a requested symlink with its target inside the disposable fixture parent."""
+        target = self.root / "fixtures/linked.c" if internal else self.root.parent / "outside.c"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.allocation_source(), encoding="utf-8")
+        source = self.root / "libavfilter/vf_x.c"
+        source.unlink()
+        source.symlink_to("before.c")
+        self.commit("avfilter/vf_x: establish linked source")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        source.unlink()
+        source.symlink_to(target)
+        self.commit()
+        return target
+
+    def test_d3_escaping_source_cannot_be_waived(self) -> None:
+        """An escaping source is never read or scanned and neither waiver can excuse it."""
+        target = self.commit_linked_source()
+        waiver = upstream_lint.UnreadWaiver(
+            "libavfilter/vf_x.c", "fixture", "B", date(2026, 11, 23), False
+        )
+        real_read = Path.read_bytes
+
+        def read(path):
+            """Reject any attempted read of the escaping requested source."""
+            self.assertNotEqual(path.resolve(), target)
+            return real_read(path)
+
+        for reason, unread in (("", ()), ("fixture", ()), ("fixture", (waiver,))):
+            with self.subTest(reason=reason, unread=unread):
+                with unittest.mock.patch.object(Path, "read_bytes", read):
+                    step = upstream_lint._c_rules(self.root, self.base, "HEAD", reason, unread)
+                self.assertEqual(step.rc, 2, step.output)
+                self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1, step.output)
+                self.assertIn("resolves outside the checked tree", step.output)
+                self.assertNotIn("ffmpeg-null-ternary-after-allocation", step.output)
+
+    def test_d3_escaping_source_keeps_other_findings(self) -> None:
+        """Rejecting one source still scans and reports an ordinary requested source."""
+        self.commit_linked_source()
+        self.write("libavfilter/vf_other.c", self.allocation_source())
+        self.commit()
+        step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1, step.output)
+        self.assertIn("resolves outside the checked tree", step.output)
+        self.assertIn("finding: libavfilter/vf_other.c:1:", step.output)
+        self.assertNotIn("finding: libavfilter/vf_x.c:", step.output)
+
+    def test_d3_escaping_source_keeps_unread_status(self) -> None:
+        """Rejecting one source retains unread and waiver statuses for another source."""
+        self.commit_linked_source()
+        name = "libavfilter/vf_unread.c"
+        self.write(name, "int unread;\n")
+        self.commit()
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": [name]},
+                "results": [],
+                "errors": [{"type": "Syntax error", "path": name}],
+            }
+        )
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1, step.output)
+        self.assertIn("resolves outside the checked tree", step.output)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"no waiver: {name}:", step.output)
+
+    def test_d3_scratch_target_cannot_escape(self) -> None:
+        """An absolute in-tree source cannot redirect a scratch write outside its root."""
+        name = str(self.root / "libavfilter/vf_x.c")
+        with tempfile.TemporaryDirectory() as directory:
+            with unittest.mock.patch.object(Path, "write_bytes") as write:
+                prepared = upstream_lint._c_rules_scan_root(self.root, [name], directory)
+            write.assert_not_called()
+        self.assertEqual(len(prepared[1]), 1)
+        self.assertIn(upstream_lint._waiver_text(name), prepared[1][0])
+        self.assertIn("resolves outside the scratch root", prepared[1][0])
+
+    def test_d3_internal_source_symlink_is_scanned(self) -> None:
+        """A requested symlink resolving inside the tree retains normal finding status."""
+        self.commit_linked_source(internal=True)
+        step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+        self.assertNotIn("resolves outside", step.output)
+
+    def test_d3_escaping_header_is_not_read(self) -> None:
+        """An escaping header is never read, contributes no attributes and fails the step closed."""
+        target = self.escaping_header()
+        source = b"av_fixture_tag int code;\n"
+        self.write("libavfilter/vf_x.c", source.decode("ascii"))
+        real_read = Path.read_bytes
+
+        def read(path):
+            """Reject any attempted read through the escaping attributes header."""
+            self.assertNotEqual(path.resolve(), target)
+            return real_read(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with unittest.mock.patch.object(Path, "read_bytes", read):
+                prepared = upstream_lint._c_rules_scan_root(
+                    self.root, ["libavfilter/vf_x.c"], directory
+                )
+            blanked = (prepared[0] / "libavfilter/vf_x.c").read_bytes()
+        self.assertEqual(blanked, source)
+        self.assertEqual(len(blanked), len(source))
+        self.assertEqual(
+            [index for index, byte in enumerate(blanked) if byte == 10],
+            [index for index, byte in enumerate(source) if byte == 10],
+        )
+        self.assertEqual(len(prepared[1]), 1)
+        self.assertIn("libavutil/attributes.h", prepared[1][0])
+        self.assertIn("resolves outside the checked tree", prepared[1][0])
+        with unittest.mock.patch.object(Path, "read_bytes", read):
+            step = self.scan_source("void clean(void) { av_malloc(8); }\n")
+        self.assert_header_escape(step)
+
+    def test_r4_unsupported_source_classified_from_single_read(self) -> None:
+        """Scratch preparation classifies an unsupported source without reading it a second time."""
+        supported = "libavfilter/vf_ok.c"
+        planted = "libavfilter/vf_x.c"
+        self.write(supported, "int ok(void) { return 0; }\n")
+        self.write(planted, "int unread(void) { return 0; }\n")
+        self.commit()
+        supported_path = self.root / supported
+        planted_path = self.root / planted
+        real_read = upstream_lint._c_rules_read_source
+        counts: dict[Path, int] = {}
+
+        def read_once(path: Path) -> bytes:
+            """Fail only the first read of the planted source and delegate every other read."""
+            counts[path] = counts.get(path, 0) + 1
+            if path == planted_path and counts[path] == 1:
+                raise ValueError("fixture unsupported")
+            return real_read(path)
+
+        with (
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_read_source", side_effect=read_once
+            ),
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_scan", wraps=upstream_lint._c_rules_scan
+            ) as scan,
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count(f"unread: {planted}:"), 1, step.output)
+        self.assertIn(f"no waiver: {planted}:", step.output)
+        scan_paths = scan.call_args.args[1]
+        self.assertNotIn(planted, scan_paths)
+        self.assertIn(supported, scan_paths)
+        self.assertEqual(counts.get(supported_path), 1)
+        self.assertEqual(counts.get(planted_path), 1)
+
+    def test_attribute_parser_failure_is_blanked(self) -> None:
+        """A discovered attribute cannot make an otherwise clean step exit two."""
+        source = (
+            "av_fixture_tag SampleContext *make_sample(void) { return NULL; }\n"
+            "void trigger(void) { av_malloc(8); }\n"
+        )
+        step = self.scan_source(source)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 finding(s)", step.output)
+        self.assertEqual((self.root / "libavfilter/vf_x.c").read_text(encoding="utf-8"), source)
+
+    def test_missing_attributes_header_is_reported(self) -> None:
+        """An absent attributes header is named even when the scan has no findings."""
+        (self.root / "libavutil/attributes.h").unlink()
+        step = self.scan_source("void trigger(void) { av_malloc(8); }\n")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("missing libavutil/attributes.h", step.output)
+
+    def test_finding_after_attribute_keeps_original_coordinates(self) -> None:
+        """Blanking preserves the byte offset, line and column of a later ternary."""
+        line = "    av_fixture_tag unsigned char *dst = buffer ? buffer + 4 : NULL;"
+        source = (
+            "void fixture(void) {\n    unsigned char *buffer = av_malloc(8);\n"
+            + line
+            + "\n    if (!buffer) { fail(); }\n}\n"
+        )
+        self.write("libavfilter/vf_x.c", source)
+        self.commit()
+        captured = []
+
+        def capture(argv, cwd, data=None, timeout=60):
+            """Retain scanner JSON before the scratch directory is removed."""
+            result = self.real_run(argv, cwd, data, timeout)
+            if argv[:2] != ["bash", str(upstream_lint.SEMGREP_SCAN)]:
+                return result
+            path = next(
+                arg.removeprefix("--json-output=")
+                for arg in argv
+                if arg.startswith("--json-output=")
+            )
+            captured.extend(json.loads(Path(path).read_text(encoding="utf-8"))["results"])
+            return result
+
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=capture):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(len(captured), 1)
+        start = captured[0]["start"]
+        self.assertEqual(start["line"], 3)
+        self.assertEqual(start["col"], line.index("buffer ?") + 1)
+        self.assertEqual(start["offset"], source.index("buffer ?"))
+
+
+class CRulesBlankingTest(unittest.TestCase):
+    """Pin discovery, lexical boundaries, scope and unread-source preservation."""
+
+    def test_attribute_discovery_and_byte_preservation(self) -> None:
+        """Only discovered object macros are blanked outside directive lines."""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            (tree / "libavutil").mkdir()
+            header = (
+                b"# define av_mark\n#define attribute_hint 1\n"
+                b"#define av_call(x) x\n#define other 1\n"
+            )
+            (tree / "libavutil/attributes.h").write_bytes(header)
+            names, notices = upstream_lint._c_rules_attributes(tree)
+        self.assertEqual(names, {b"av_mark", b"attribute_hint"})
+        self.assertEqual(notices, [])
+        source = b"#define KEEP av_mark\r\n\xff av_mark av_mark_extra attribute_hint av_call(1)\r\n"
+        expected = (
+            b"#define KEEP av_mark\r\n\xff         av_mark_extra                av_call(1)\r\n"
+        )
+        blanked = upstream_lint._c_rules_blank(source, names)
+        self.assertEqual(blanked, expected)
+        self.assertEqual(len(blanked), len(source))
+
+    def test_only_standalone_file_scope_macro_calls_are_blanked(self) -> None:
+        """Local macro discovery requires balanced calls and leaves directives and bodies intact."""
+        removed = ["  BUILD(alpha, nested(1))", 'BUILD("(", beta)']
+        retained = [
+            "#define BUILD(name, arg) int name(void) { return arg; }",
+            "#define KEEP BUILD(directive, 1)",
+            "BUILD(with_semicolon, 1);",
+            "UNKNOWN(1)",
+            "BUILD(1)(2)",
+            "BUILD(unbalanced, (1)",
+            "BUILD(comment, 1) /* tail */",
+            "/* prefix */ BUILD(comment, 1)",
+            "void fixture(void) {",
+            "  BUILD(local, 1)",
+            "}",
+        ]
+        source = "\n".join(retained[:2] + removed + retained[2:]) + "\n"
+        expected = (
+            "\n".join(retained[:2] + [" " * len(line) for line in removed] + retained[2:]) + "\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(source.encode(), set()), expected.encode())
+
+    def test_open_declaration_retains_macro_call_until_completed(self) -> None:
+        """Open declarations retain macro call lines while completed declarations blank them."""
+        open_decl = b"#define VALUE(x) (x)\nstatic int n =\n    VALUE(1)\n    ;\n"
+        self.assertEqual(upstream_lint._c_rules_blank(open_decl, set()), open_decl)
+        completed = b"#define VALUE(x) (x)\nstatic int a;\nVALUE(1)\n"
+        expected = b"#define VALUE(x) (x)\nstatic int a;\n        \n"
+        self.assertEqual(upstream_lint._c_rules_blank(completed, set()), expected)
+
+    def test_unclosed_comment_with_paren_after_call_is_retained(self) -> None:
+        """A trailing comment opener with a parenthesis keeps the macro call line intact."""
+        source = b"#define BUILD(x) (x)\nBUILD(x) /* note )\n still comment */\n"
+        blanked = upstream_lint._c_rules_blank(source, set())
+        self.assertEqual(blanked, source)
+        self.assertIn(b"/*", blanked)
+        self.assertIn(b"*/", blanked)
+
+    def test_unread_requested_path_remains_original_link(self) -> None:
+        """A read failure preserves the original inaccessible path for the scanner."""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "tree"
+            (tree / "libavutil").mkdir(parents=True)
+            (tree / "libavutil/attributes.h").write_bytes(b"#define av_mark\n")
+            source = tree / "libavutil/unread.c"
+            real_read = Path.read_bytes
+
+            def read(path):
+                """Plant an inaccessible requested source without affecting the header."""
+                if path == source:
+                    raise PermissionError("fixture unread source")
+                return real_read(path)
+
+            with unittest.mock.patch.object(Path, "read_bytes", read):
+                root, notices, escaped, _ = upstream_lint._c_rules_scan_root(
+                    tree, ["libavutil/unread.c"], directory
+                )
+            target = root / "libavutil/unread.c"
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(target.readlink(), source)
+            self.assertFalse(target.exists())
+            self.assertEqual(notices, [])
+            self.assertEqual(escaped, [])
+
+    def test_conditional_arms_track_shared_starting_depth(self) -> None:
+        """Conditional arms restart from the entry depth and disable blanking on divergence."""
+        c3_source = (
+            b"#define CALL(x) (x)\nint f(void)\n{\n#if A\n    return 1;\n}\n#else\n"
+            b"    return 2;\n}\n#endif\nint g(void)\n{\n    CALL(1)\n    ;\n}\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(c3_source, set()), c3_source)
+        c3_boundary = c3_source.replace(b"{\n    CALL(1)\n", b"{\n    int x = 0;\n    CALL(1)\n")
+        self.assertEqual(upstream_lint._c_rules_blank(c3_boundary, set()), c3_boundary)
+        elif_source = c3_boundary.replace(b"#if A\n", b"#ifdef A\n").replace(
+            b"#else\n", b"#elif B\n    return 3;\n}\n#else\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(elif_source, set()), elif_source)
+        ifndef_source = c3_boundary.replace(b"#if A\n", b"#ifndef A\n")
+        self.assertEqual(upstream_lint._c_rules_blank(ifndef_source, set()), ifndef_source)
+        diverged_first_closes = (
+            b"#define CALL(x) (x)\nint f(void)\n{\n#if A\n    return 1;\n}\n#else\n"
+            b"    return 2;\n#endif\n}\nCALL(1)\n"
+        )
+        self.assertEqual(
+            upstream_lint._c_rules_blank(diverged_first_closes, set()), diverged_first_closes
+        )
+        diverged_second_closes = (
+            b"#define CALL(x) (x)\nint f(void)\n{\n#if A\n    return 1;\n#else\n"
+            b"    return 2;\n}\n#endif\nCALL(1)\n"
+        )
+        self.assertEqual(
+            upstream_lint._c_rules_blank(diverged_second_closes, set()), diverged_second_closes
+        )
+        balanced_zero = (
+            b"#define CALL(x) (x)\n#if A\nint f(void) { return 1; }\n#else\n"
+            b"int f(void) { return 2; }\n#endif\nCALL(1)\n"
+        )
+        expected_zero = balanced_zero[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(balanced_zero, set()), expected_zero)
+
+    def test_conditional_arms_closing_function_blank_following_macro_call(self) -> None:
+        """All conditional arms closing a function return to file scope for macro blanking."""
+        source = (
+            b"#define CALL(x) (x)\nint f(void)\n{\n#if A\n    return 1;\n}\n#else\n"
+            b"    return 2;\n}\n#endif\nCALL(1)\n"
+        )
+        expected = source[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(source, set()), expected)
+        elif_source = source.replace(b"#else\n", b"#elif B\n    return 3;\n}\n#else\n")
+        elif_expected = elif_source[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(elif_source, set()), elif_expected)
+
+    def test_conditional_directive_fail_safe_preserves_macro_calls(self) -> None:
+        """Raw directive mismatches and unbalanced conditionals disable macro blanking only."""
+        comment_else = b"#define CALL(x) (x)\n/* comment\n#else\n*/\nCALL(1)\n"
+        self.assertEqual(upstream_lint._c_rules_blank(comment_else, set()), comment_else)
+        nested_comment_else = (
+            b"#define CALL(x) (x)\n#if A\n/* comment\n#else\n*/\n#endif\nCALL(1)\n"
+        )
+        self.assertEqual(
+            upstream_lint._c_rules_blank(nested_comment_else, set()), nested_comment_else
+        )
+        unbalanced_directives = (b"#elif A", b"#else", b"#endif", b"#if A")
+        for index in range(len(unbalanced_directives)):
+            directive = unbalanced_directives[index]
+            unbalanced = b"#define CALL(x) (x)\nCALL(1)\n" + directive + b"\nav_mark CALL(1)\n"
+            expected = b"#define CALL(x) (x)\nCALL(1)\n" + directive + b"\n        CALL(1)\n"
+            self.assertEqual(
+                upstream_lint._c_rules_blank(unbalanced, {b"av_mark"}),
+                expected,
+            )
+
+
 class CRulesTest(unittest.TestCase):
     """Unit coverage of the c-rules allow-list, argv, working directory and waiver."""
 
@@ -3561,16 +4544,43 @@ class CRulesTest(unittest.TestCase):
             )
         return upstream_lint.RunResult(tuple(argv), self.stub_rc, self.stub_stdout)
 
-    def run_c_rules(self, waiver: str = "") -> upstream_lint.Step:
-        """Execute _c_rules through _collect with _git and _run stubbed."""
+    def run_c_rules(
+        self, waiver: str = "", unread: tuple[upstream_lint.UnreadWaiver, ...] = ()
+    ) -> upstream_lint.Step:
+        """Execute _c_rules with identity scan-root, Git and scanner fixtures."""
         with (
+            unittest.mock.patch.object(
+                upstream_lint,
+                "_c_rules_scan_root",
+                side_effect=lambda tree, paths, directory: (tree, [], [], []),
+            ),
             unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
             unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
         ):
             return upstream_lint._collect(
                 "c-rules",
-                lambda: upstream_lint._c_rules(self.tree, "base", "head", waiver),
+                lambda: (
+                    upstream_lint._c_rules(self.tree, "base", "head", waiver, unread)
+                    if unread
+                    else upstream_lint._c_rules(self.tree, "base", "head", waiver)
+                ),
             )
+
+    def test_scan_root_controls_scanner_cwd(self) -> None:
+        """The scanner uses the helper root while keeping requested paths relative."""
+        sentinel = Path("/fixture/scratch-sources")
+        with (
+            unittest.mock.patch.object(upstream_lint, "_git", side_effect=self.fake_git),
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.fake_run),
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_scan_root", return_value=(sentinel, [], [], [])
+            ) as prepare,
+        ):
+            step = upstream_lint._c_rules(self.tree, "base", "head", "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(self.calls[0][1], sentinel)
+        self.assertEqual(self.calls[0][0][5:], ["libavformat/rtspenc.c"])
+        self.assertEqual(prepare.call_args.args[:2], (self.tree, ["libavformat/rtspenc.c"]))
 
     def inter_hunk_fixture(self) -> FixtureTest:
         """Create real Git hunks around an unchanged defect with context fusion enabled."""
@@ -3799,8 +4809,209 @@ class CRulesTest(unittest.TestCase):
                 self.assertEqual(step.rc, 0, step.output)
                 self.assertIn("informational: libavformat/rtsp.c: PartialParsing", step.output)
 
+    def syntax_error_payload(self, **changes: object) -> dict[str, object]:
+        """Build the measured unread-file error with allow-listed scalar metadata."""
+        error = {
+            "type": "Syntax error",
+            "path": "libavformat/rtspenc.c",
+            "code": 3,
+            "level": "warn",
+            "message": "the rules could not parse this source",
+        }
+        error.update(changes)
+        return {
+            "paths": {"scanned": ["libavformat/rtspenc.c"]},
+            "results": [],
+            "errors": [error],
+        }
+
+    def assert_unread_reported(self) -> None:
+        """Require a visible unread-file failure before testing a rejected variant."""
+        self.stub_json = json.dumps(self.syntax_error_payload())
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unread: libavformat/rtspenc.c:", step.output)
+
+    def test_unread_requested_file_fails(self) -> None:
+        """An unread requested file fails visibly for scanner exits zero and one."""
+        for status in range(2):
+            with self.subTest(status=status):
+                self.stub_rc = status
+                self.stub_json = json.dumps(self.syntax_error_payload())
+                step = self.run_c_rules()
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn(
+                    (
+                        "unread: libavformat/rtspenc.c: rules could not read this file; "
+                        "touched lines need a check by hand"
+                    ),
+                    step.output,
+                )
+                self.assertNotIn("0 finding(s)", step.output)
+                self.assertNotIn("waived:", step.output)
+
+    def test_unread_requested_file_waived_with_reason(self) -> None:
+        """A free reason no longer waives an unread file; blank reasons also fail."""
+        self.stub_json = json.dumps(self.syntax_error_payload())
+        reasons = ("  touched lines checked by hand  ", "   ")
+        for index in range(len(reasons)):
+            step = self.run_c_rules(reasons[index])
+            self.assertEqual(step.rc, 1, step.output)
+            self.assertIn("unread: libavformat/rtspenc.c:", step.output)
+            self.assertIn("no waiver: libavformat/rtspenc.c:", step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_unread_file_and_real_finding_both_reported(self) -> None:
+        """Unread files, touched findings and partial notes remain visible together."""
+        self.diff_names += "libavformat/rtsp.c\0"
+        self.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.syntax_error_payload()
+        payload["paths"] = {"scanned": ["libavformat/rtspenc.c", "libavformat/rtsp.c"]}
+        payload["results"] = [
+            {
+                "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                "path": "libavformat/rtsp.c",
+                "start": {"line": 11},
+                "end": {"line": 11},
+                "extra": {"message": "missing ff_network_close()"},
+            }
+        ]
+        payload["errors"].append({"type": "PartialParsing", "path": "libavformat/rtsp.c"})
+        self.stub_rc = 1
+        self.stub_json = json.dumps(payload)
+        reasons = ("", "checked both paths by hand")
+        for index in range(len(reasons)):
+            with self.subTest(reason=reasons[index]):
+                step = self.run_c_rules(reasons[index])
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("unread: libavformat/rtspenc.c:", step.output)
+                self.assertIn("finding: libavformat/rtsp.c:11:", step.output)
+                self.assertIn("missing ff_network_close()", step.output)
+                self.assertIn("informational: libavformat/rtsp.c: PartialParsing", step.output)
+                if index:
+                    self.assertIn("waived: checked both paths by hand", step.output)
+
+    def test_unread_unrequested_path_is_unwaivable(self) -> None:
+        """A syntax error outside the requested paths stays non-waivable rc two."""
+        self.assert_unread_reported()
+        self.stub_json = json.dumps(self.syntax_error_payload(path="libavformat/rtsp.c"))
+        reasons = ("", "checked by hand")
+        for index in range(len(reasons)):
+            step = self.run_c_rules(reasons[index])
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_unread_missing_path_is_unwaivable(self) -> None:
+        """A syntax error without a file path stays non-waivable rc two."""
+        self.assert_unread_reported()
+        payload = self.syntax_error_payload()
+        del payload["errors"][0]["path"]
+        self.stub_json = json.dumps(payload)
+        reasons = ("", "checked by hand")
+        for index in range(len(reasons)):
+            step = self.run_c_rules(reasons[index])
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_unread_unknown_type_is_unwaivable(self) -> None:
+        """An unknown error type on a requested path stays non-waivable rc two."""
+        self.assert_unread_reported()
+        self.stub_json = json.dumps(self.syntax_error_payload(type="FutureError"))
+        reasons = ("", "checked by hand")
+        for index in range(len(reasons)):
+            step = self.run_c_rules(reasons[index])
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
+
+    def test_unread_invalid_metadata_is_unwaivable(self) -> None:
+        """Reject empty paths, unknown fields and metadata types outside the allow-list."""
+        self.assert_unread_reported()
+        variants = (
+            {"path": ""},
+            {"path": ["libavformat/rtspenc.c"]},
+            {"type": ["Syntax error"]},
+            {"code": "3"},
+            {"code": True},
+            {"code": 3.0},
+            {"code": 4},
+            {"level": ["warn"]},
+            {"level": "error"},
+            {"message": {"text": "syntax error"}},
+            {"unexpected": "value"},
+            {"unexpected": []},
+        )
+        for index in range(len(variants)):
+            self.stub_json = json.dumps(self.syntax_error_payload(**variants[index]))
+            reasons = ("", "checked by hand")
+            for reason in range(len(reasons)):
+                with self.subTest(variant=variants[index], reason=reasons[reason]):
+                    step = self.run_c_rules(reasons[reason])
+                    self.assertEqual(step.rc, 2, step.output)
+                    self.assertNotIn("waived:", step.output)
+
+    def test_unread_error_code_exact_integer_boundary(self) -> None:
+        """Accept only built-in integer code three, preserving the missing-key default."""
+
+        class IntegerSubclass(int):
+            """Represent an ordinary integer subclass at the metadata boundary."""
+
+        path = "libavformat/rtspenc.c"
+        requested = frozenset({path})
+        cases = (
+            ("int three", 3, path),
+            ("true", True, None),
+            ("false", False, None),
+            ("float", 3.0, None),
+            ("string", "3", None),
+            ("none", None, None),
+            ("other int", 4, None),
+            ("subclass three", IntegerSubclass(3), None),
+            ("subclass other", IntegerSubclass(4), None),
+        )
+        for index in range(len(cases)):
+            label, code, expected = cases[index]
+            with self.subTest(case=label):
+                error = self.syntax_error_payload(code=code)["errors"][0]
+                self.assertEqual(upstream_lint._syntax_error_path(error, requested), expected)
+        error = self.syntax_error_payload()["errors"][0]
+        del error["code"]
+        self.assertEqual(upstream_lint._syntax_error_path(error, requested), path)
+
+    def test_multiple_unread_files_each_reported_once(self) -> None:
+        """Every unread requested file gets one review line despite duplicate errors."""
+        self.diff_names += "libavformat/rtsp.c\0"
+        self.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.syntax_error_payload()
+        payload["paths"] = {"scanned": ["libavformat/rtspenc.c", "libavformat/rtsp.c"]}
+        payload["errors"] += [
+            payload["errors"][0],
+            {"type": "Syntax error", "path": "libavformat/rtsp.c"},
+        ]
+        self.stub_json = json.dumps(payload)
+        step = self.run_c_rules()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count("unread: libavformat/rtspenc.c:"), 1)
+        self.assertEqual(step.output.count("unread: libavformat/rtsp.c:"), 1)
+
+    def test_unread_collector_requires_requested_paths(self) -> None:
+        """A reader without requested paths or an unread collector cannot hide unread files."""
+        raw = self.syntax_error_payload()
+        requested = frozenset({"libavformat/rtspenc.c"})
+        unread: list[str] = []
+        parsed = upstream_lint._read_semgrep_lists(
+            raw["results"], raw["errors"], requested, unread_paths=unread
+        )
+        self.assertEqual(parsed, ([], []))
+        self.assertEqual(unread, ["libavformat/rtspenc.c"])
+        self.assertIsNone(
+            upstream_lint._read_semgrep_lists(raw["results"], raw["errors"], requested)
+        )
+        self.assertIsNone(
+            upstream_lint._read_semgrep_lists(raw["results"], raw["errors"], unread_paths=[])
+        )
+
     def test_other_error_type_gives_rc_two(self) -> None:
-        """Any error type other than PartialParsing gives step rc 2 with status and output."""
+        """An unrequested syntax error gives step rc 2 with command status and output."""
         self.stub_stdout = "rule parse error\n"
         self.stub_json = json.dumps(
             {
@@ -4000,6 +5211,555 @@ class CRulesTest(unittest.TestCase):
                 )
                 step = self.run_c_rules()
                 self.assertEqual(step.rc, 2, step.output)
+
+
+class UnreadWaiverTest(unittest.TestCase):
+    """Fixture-only dated unread-file waivers with a fixed injected run date."""
+
+    def setUp(self) -> None:
+        """Create the scanner stub and a category C waiver entered on November 9."""
+        self.fixture = CRulesTest()
+        self.fixture.setUp()
+        self.entry = {
+            "path": "libavformat/rtspenc.c",
+            "rule": "c-rules-unread",
+            "reason": "touched lines checked by hand",
+            "category": "C",
+            "entered": "2026-11-09",
+        }
+        self.today = date(2026, 11, 18)
+
+    def run_case(
+        self,
+        entries: list[dict[str, object]] | None = None,
+        *,
+        reason: str = "",
+        unread: bool = True,
+    ) -> upstream_lint.Step:
+        """Parse CLI waivers and collect only the c-rules step with scanner fixtures."""
+        entries = entries if entries is not None else [self.entry]
+        values = [json.dumps(entries[index]) for index in range(len(entries))]
+        return self.run_values(values, reason=reason, unread=unread)
+
+    def run_values(
+        self,
+        values: list[str],
+        *,
+        reason: str = "",
+        unread: bool = True,
+        report: Path | None = None,
+    ) -> upstream_lint.Step:
+        """Capture CLI output, exit status and preparation with raw waiver arguments."""
+        argv = ["--tree", ".", "--base", "base", "--c-rule-reason", reason]
+        for index in range(len(values)):
+            argv.extend(["--c-rule-unread-waiver", values[index]])
+        if report is not None:
+            argv.extend(["--report", str(report)])
+        if unread:
+            self.fixture.stub_json = json.dumps(self.fixture.syntax_error_payload())
+        captured: list[upstream_lint.Step] = []
+
+        def checks(tree, base, head, waivers):
+            """Capture one c-rules result without running any other pipeline step."""
+            captured.append(
+                self.fixture.run_c_rules(waivers.c_rule, getattr(waivers, "unread", ()))
+            )
+            return captured
+
+        self.clock = unittest.mock.Mock(return_value=self.today)
+        self.preparation = unittest.mock.Mock(return_value=("base", "head"))
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.object(upstream_lint, "_prepare", self.preparation),
+            unittest.mock.patch.object(upstream_lint, "_checks", side_effect=checks),
+            unittest.mock.patch.object(upstream_lint, "_TODAY", self.clock, create=True),
+            contextlib.redirect_stdout(output),
+        ):
+            self.process_rc = upstream_lint.main(argv)
+        self.output = output.getvalue()
+        return captured[0]
+
+    def assert_usage(self, entries: list[dict[str, object]], field: str) -> None:
+        """Require field-specific exit two before any preparation or scanner call."""
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(SystemExit) as caught:
+            self.run_case(entries)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn(field, output.getvalue())
+        self.assertNotIn("unrecognized arguments", output.getvalue())
+        self.assertEqual(self.fixture.calls, [])
+
+    def assert_value_usage(self, values: list[str], expected: str) -> str:
+        """Require a bounded usage error before preparation or scanner execution."""
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.object(sys, "argv", ["upstream_lint.py"]),
+            contextlib.redirect_stderr(output),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            usage = upstream_lint._parser().format_usage()
+            self.run_values(values)
+        self.assertEqual(caught.exception.code, 2)
+        message = output.getvalue().splitlines()[-1]
+        self.assertIn(expected, message)
+        self.assertLessEqual(len(message), 256)
+        self.assertLessEqual(len(output.getvalue()), len(usage) + 257)
+        self.assertEqual(output.getvalue().count("error:"), 1)
+        self.preparation.assert_not_called()
+        self.assertEqual(self.fixture.calls, [])
+        return message
+
+    def test_date_source_called_once(self) -> None:
+        """All waivers use exactly one reading of the injectable date source."""
+        self.run_case([])
+        self.clock.assert_called_once_with()
+
+    def test_live_waiver(self) -> None:
+        """One exact live waiver passes and prints its category, expiry and reason."""
+        step = self.run_case()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("waived: libavformat/rtspenc.c: category C, expires 2026-11-19", step.output)
+        self.assertIn(self.entry["reason"], step.output)
+
+    def test_expired_waiver(self) -> None:
+        """An expired exception fails even with the legacy free reason supplied."""
+        self.today = date(2026, 11, 20)
+        step = self.run_case(reason="checked by hand")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("expired: libavformat/rtspenc.c: category C, expired 2026-11-19", step.output)
+        self.assertNotIn("waived:", step.output)
+
+    def test_expiry_day_and_day_after(self) -> None:
+        """Expiry day passes; the following day fails with the same expiry date."""
+        for day in range(19, 21):
+            with self.subTest(day=day):
+                self.today = date(2026, 11, day)
+                step = self.run_case()
+                self.assertEqual(step.rc, day - 19, step.output)
+                self.assertIn("2026-11-19", step.output)
+
+    def test_no_waiver(self) -> None:
+        """An unread file needs an exact dated waiver and names the missing path."""
+        step = self.run_case([])
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("no waiver: libavformat/rtspenc.c", step.output)
+
+    def test_free_reason_alone(self) -> None:
+        """The free finding reason cannot excuse an unread file."""
+        step = self.run_case([], reason="checked by hand")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("no waiver: libavformat/rtspenc.c", step.output)
+
+    def test_two_unread_files_one_waiver(self) -> None:
+        """One waiver leaves the second unread path failing and explicitly unwaived."""
+        self.fixture.diff_names += "libavformat/rtsp.c\0"
+        self.fixture.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.fixture.syntax_error_payload()
+        payload["paths"] = {"scanned": [self.entry["path"], "libavformat/rtsp.c"]}
+        payload["errors"].append({"type": "Syntax error", "path": "libavformat/rtsp.c"})
+        self.fixture.stub_json = json.dumps(payload)
+        step = self.run_case(unread=False)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("waived: libavformat/rtspenc.c: category C", step.output)
+        self.assertIn("no waiver: libavformat/rtsp.c:", step.output)
+
+    def test_two_live_waivers(self) -> None:
+        """Repeating the option grants a separate live waiver to each unread file."""
+        self.fixture.diff_names += "libavformat/rtsp.c\0"
+        self.fixture.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.fixture.syntax_error_payload()
+        payload["paths"] = {"scanned": [self.entry["path"], "libavformat/rtsp.c"]}
+        payload["errors"].append({"type": "Syntax error", "path": "libavformat/rtsp.c"})
+        self.fixture.stub_json = json.dumps(payload)
+        step = self.run_case(
+            [self.entry, {**self.entry, "path": "libavformat/rtsp.c"}], unread=False
+        )
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(step.output.count("waived:"), 2)
+
+    def test_unused_waiver(self) -> None:
+        """A waiver for a readable file fails rather than silently accumulating."""
+        step = self.run_case(unread=False)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unused waiver: libavformat/rtspenc.c", step.output)
+
+    def test_unused_waiver_without_sources(self) -> None:
+        """A waiver is unused even when no changed C sources trigger a scanner run."""
+        self.fixture.diff_names = ""
+        step = self.run_case(unread=False)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unused waiver: libavformat/rtspenc.c", step.output)
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_unused_order_with_sources(self) -> None:
+        """Unused and unread statuses sort by exact path in either argument order."""
+        paths = ("a.c", "z.c")
+        entries = [{**self.entry, "path": paths[index]} for index in range(len(paths))]
+        expected = [
+            "unused waiver: a.c",
+            (
+                "unread: libavformat/rtspenc.c: rules could not read this file; "
+                "touched lines need a check by hand"
+            ),
+            "no waiver: libavformat/rtspenc.c: pass --c-rule-unread-waiver",
+            "unused waiver: z.c",
+        ]
+        for index in range(2):
+            with self.subTest(reverse=index):
+                step = self.run_case(entries[:: 1 if index == 0 else -1])
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(step.output.splitlines(), expected)
+
+    def test_unused_order_without_sources(self) -> None:
+        """Unused statuses sort identically without sources in either argument order."""
+        self.fixture.diff_names = ""
+        paths = ("a.c", "z.c")
+        entries = [{**self.entry, "path": paths[index]} for index in range(len(paths))]
+        for index in range(2):
+            with self.subTest(reverse=index):
+                step = self.run_case(entries[:: 1 if index == 0 else -1], unread=False)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertEqual(
+                    step.output.splitlines(), ["unused waiver: a.c", "unused waiver: z.c"]
+                )
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_path_is_exact(self) -> None:
+        """A different spelling waives no unread path and is reported unused."""
+        step = self.run_case([{**self.entry, "path": "./libavformat/rtspenc.c"}])
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("no waiver: libavformat/rtspenc.c", step.output)
+        self.assertIn("unused waiver: ./libavformat/rtspenc.c", step.output)
+
+    def test_categories_and_a_boundaries(self) -> None:
+        """Fixed categories and A's one-day and ninety-day limits share date validation."""
+        cases = (
+            ("B", None, "2026-11-12"),
+            ("C", None, "2026-11-19"),
+            ("D", None, "2027-03-09"),
+            ("A", "2026-11-10", "2026-11-10"),
+            ("A", "2027-02-07", "2027-02-07"),
+        )
+        self.today = date(2026, 11, 9)
+        for index in range(len(cases)):
+            category, expires, expected = cases[index]
+            with self.subTest(category=category, expires=expires):
+                entry = {**self.entry, "category": category}
+                if expires:
+                    entry["expires"] = expires
+                step = self.run_case([entry])
+                self.assertEqual(step.rc, 0, step.output)
+                self.assertIn(f"category {category}, expires {expected}", step.output)
+
+    def test_usage_unknown_field(self) -> None:
+        """Unknown fields cannot silently extend the waiver schema."""
+        self.assert_usage([{**self.entry, "extra": "typo"}], "extra")
+
+    def test_usage_long_unknown_key(self) -> None:
+        """A ten-thousand-character unknown key produces a bounded cut diagnostic."""
+        value = json.dumps({**self.entry, "x" * 10000: "typo"})
+        message = self.assert_value_usage([value], "unknown field: " + "x" * 157 + "...")
+        self.assertTrue(message.endswith("x" * 157 + "..."))
+
+    def test_usage_long_duplicate_path(self) -> None:
+        """A ten-thousand-character duplicate path is bounded before scanning."""
+        value = json.dumps({**self.entry, "path": "x" * 10000})
+        self.assert_value_usage([value, value], "duplicate waiver for " + "x" * 157 + "...")
+
+    def test_usage_long_duplicate_key(self) -> None:
+        """Duplicate JSON keys share the escaped 160-character diagnostic limit."""
+        key = json.dumps("x" * 10000)
+        value = "{" + key + ":1," + key + ":2}"
+        self.assert_value_usage([value], "duplicate field: " + "x" * 157 + "...")
+
+    def test_usage_control_values_are_escaped(self) -> None:
+        """Unknown keys, duplicate keys and duplicate paths escape control characters."""
+        key = "line\n\r\t\x1b\x00"
+        encoded = json.dumps(key)
+        values = (
+            json.dumps({**self.entry, key: "typo"}),
+            "{" + encoded + ":1," + encoded + ":2}",
+            json.dumps({**self.entry, "path": key}),
+        )
+        for index in range(len(values)):
+            with self.subTest(kind=index):
+                arguments = [values[index]] * (2 if index == 2 else 1)
+                self.assert_value_usage(arguments, r"line\n\r\t\u001b\u0000")
+
+    def test_usage_oversize_argument_before_json(self) -> None:
+        """Arguments above 65536 characters fail before JSON decoding or scanning."""
+        with unittest.mock.patch.object(upstream_lint.json, "loads") as decode:
+            self.assert_value_usage([" " * 65537], "waiver exceeds 65536 characters")
+        decode.assert_not_called()
+
+    def test_argument_length_boundary(self) -> None:
+        """An exactly 65536-character legitimate waiver remains accepted."""
+        entry = {**self.entry, "reason": ""}
+        entry["reason"] = "x" * (65536 - len(json.dumps(entry)))
+        value = json.dumps(entry)
+        self.assertEqual(len(value), 65536)
+        step = self.run_values([value])
+        self.assertEqual(self.process_rc, 0, self.output)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("expires 2026-11-19: " + entry["reason"], step.output)
+
+    def test_argument_capacity_for_long_path_and_reason(self) -> None:
+        """The input budget fits a 4096-character path and 1024-character reason."""
+        entry = {
+            **self.entry,
+            "path": "\U00010000" * 4096,
+            "reason": "\U00010000" * 1024,
+            "expires": "2026-11-19",
+        }
+        value = json.dumps(entry)
+        self.assertLessEqual(len(value), 65536)
+        step = self.run_values([value])
+        self.assertEqual(self.process_rc, 1, self.output)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("unused waiver: " + r"\ud800\udc00" * 4096, step.output)
+
+    def test_reason_control_text_stays_on_one_line(self) -> None:
+        """Accepted multiline reasons appear escaped on one physical waiver line."""
+        step = self.run_case([{**self.entry, "reason": "checked\nnext\r\t\x1b line"}])
+        self.assertEqual(self.process_rc, 0, self.output)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertEqual(len(step.output.splitlines()), 2)
+        self.assertTrue(step.output.endswith(r"checked\nnext\r\t\u001b line"))
+
+    def test_path_control_text_stays_on_one_line(self) -> None:
+        """Exact multiline paths stay escaped for live, expired, missing and unused statuses."""
+        path = "dir/line\nnext\r\t\x1b.c"
+        display = r"dir/line\nnext\r\t\u001b.c"
+        entries = upstream_lint._parse_unread_waivers(
+            [json.dumps({**self.entry, "path": path})], self.today
+        )
+        live = upstream_lint._unread_report([path], entries)
+        self.assertEqual(live.rc, 0, live.output)
+        self.assertEqual(len(live.output.splitlines()), 2)
+        self.assertIn(f"waived: {display}: category C", live.output)
+        missing = upstream_lint._unread_report([path], ())
+        self.assertEqual(missing.rc, 1, missing.output)
+        self.assertEqual(len(missing.output.splitlines()), 2)
+        self.assertIn(f"no waiver: {display}:", missing.output)
+        expired_entries = upstream_lint._parse_unread_waivers(
+            [json.dumps({**self.entry, "path": path})], date(2026, 11, 20)
+        )
+        expired = upstream_lint._unread_report([path], expired_entries)
+        self.assertEqual(expired.rc, 1, expired.output)
+        self.assertEqual(len(expired.output.splitlines()), 2)
+        self.assertIn(f"expired: {display}: category C", expired.output)
+        step = self.run_case([{**self.entry, "path": path}])
+        self.assertEqual(self.process_rc, 1, self.output)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(len(step.output.splitlines()), 3)
+        self.assertIn(f"unused waiver: {display}", step.output)
+
+    def two_source_payload(self) -> dict[str, object]:
+        """Add a second changed C source beside the default unread source."""
+        self.fixture.diff_names += "libavformat/rtsp.c\0"
+        self.fixture.patches["libavformat/rtsp.c"] = "@@ -10,0 +11 @@\n+x\n"
+        payload = self.fixture.syntax_error_payload()
+        payload["paths"] = {"scanned": [self.entry["path"], "libavformat/rtsp.c"]}
+        return payload
+
+    def test_mixed_expired_and_live_waivers(self) -> None:
+        """A live waiver beside an expired waiver cannot clear the run's failure."""
+        self.today = date(2026, 11, 20)
+        payload = self.two_source_payload()
+        payload["errors"].append({"type": "Syntax error", "path": "libavformat/rtsp.c"})
+        self.fixture.stub_json = json.dumps(payload)
+        live = {**self.entry, "path": "libavformat/rtsp.c", "entered": "2026-11-19"}
+        step = self.run_case([self.entry, live], unread=False)
+        self.assertEqual(self.process_rc, 1, self.output)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(
+            step.output.splitlines(),
+            [
+                (
+                    "unread: libavformat/rtsp.c: rules could not read this file; "
+                    "touched lines need a check by hand"
+                ),
+                (
+                    "waived: libavformat/rtsp.c: category C, expires 2026-11-29: "
+                    "touched lines checked by hand"
+                ),
+                (
+                    "unread: libavformat/rtspenc.c: rules could not read this file; "
+                    "touched lines need a check by hand"
+                ),
+                "expired: libavformat/rtspenc.c: category C, expired 2026-11-19",
+            ],
+        )
+
+    def test_readable_finding_beside_unread_waiver(self) -> None:
+        """A dated unread waiver leaves readable findings needing their own free reason."""
+        payload = self.two_source_payload()
+        payload["results"] = [
+            {
+                "check_id": "ffmpeg-rtsp-connect-failure-without-network-close",
+                "path": "libavformat/rtsp.c",
+                "start": {"line": 11},
+                "end": {"line": 11},
+                "extra": {"message": "missing ff_network_close()"},
+            }
+        ]
+        self.fixture.stub_rc = 1
+        self.fixture.stub_json = json.dumps(payload)
+        reasons = ("", "checked finding by hand")
+        for index in range(len(reasons)):
+            with self.subTest(reason=reasons[index]):
+                step = self.run_case(reason=reasons[index], unread=False)
+                self.assertEqual(self.process_rc, 1 - index, self.output)
+                self.assertEqual(step.rc, 1 - index, step.output)
+                expected = [
+                    (
+                        "finding: libavformat/rtsp.c:11: "
+                        "ffmpeg-rtsp-connect-failure-without-network-close: "
+                        "missing ff_network_close()"
+                    ),
+                    (
+                        "unread: libavformat/rtspenc.c: rules could not read this file; "
+                        "touched lines need a check by hand"
+                    ),
+                    (
+                        "waived: libavformat/rtspenc.c: category C, expires 2026-11-19: "
+                        "touched lines checked by hand"
+                    ),
+                ]
+                if index:
+                    expected.insert(0, "waived: checked finding by hand")
+                else:
+                    expected.append("fix the flagged path, or pass --c-rule-reason")
+                self.assertEqual(step.output.splitlines(), expected)
+
+    def test_unread_report_matches_stdout(self) -> None:
+        """The report option saves exactly the unread and unused statuses on stdout."""
+        values = [json.dumps(self.entry), json.dumps({**self.entry, "path": "z.c"})]
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.txt"
+            step = self.run_values(values, report=report)
+            self.assertEqual(self.process_rc, 1, self.output)
+            self.assertEqual(step.rc, 1, step.output)
+            self.assertEqual(report.read_text(encoding="utf-8"), self.output)
+        self.assertEqual(
+            step.output.splitlines(),
+            [
+                (
+                    "unread: libavformat/rtspenc.c: rules could not read this file; "
+                    "touched lines need a check by hand"
+                ),
+                (
+                    "waived: libavformat/rtspenc.c: category C, expires 2026-11-19: "
+                    "touched lines checked by hand"
+                ),
+                "unused waiver: z.c",
+            ],
+        )
+
+    def test_usage_waiver_count_limit(self) -> None:
+        """More than 2000 waivers fail usage before parsing, preparation or scanning."""
+        with unittest.mock.patch.object(upstream_lint.json, "loads") as decode:
+            self.assert_value_usage([json.dumps(self.entry)] * 2001, "at most 2000 waivers")
+        decode.assert_not_called()
+
+    def test_usage_missing_fields(self) -> None:
+        """Every required field is named when missing from a waiver."""
+        fields = sorted(self.entry)
+        for index in range(len(fields)):
+            entry = self.entry.copy()
+            del entry[fields[index]]
+            self.assert_usage([entry], fields[index])
+
+    def test_usage_empty_reason_and_field_types(self) -> None:
+        """Empty or non-string fields fail usage validation before scanning."""
+        cases = (
+            ("reason", ""),
+            ("reason", "   "),
+            ("reason", None),
+            ("path", ""),
+            ("path", []),
+            ("entered", 20261109),
+            ("expires", ""),
+        )
+        for index in range(len(cases)):
+            field, value = cases[index]
+            self.assert_usage([{**self.entry, field: value}], field)
+
+    def test_usage_category(self) -> None:
+        """Unknown categories fail instead of acquiring an arbitrary interval."""
+        self.assert_usage([{**self.entry, "category": "E"}], "category")
+
+    def test_usage_rule(self) -> None:
+        """Only the unread result class accepts this waiver."""
+        self.assert_usage([{**self.entry, "rule": "PartialParsing"}], "rule")
+
+    def test_usage_invalid_dates(self) -> None:
+        """Invalid calendar dates and non-ISO spellings name the date field."""
+        cases = (
+            ("entered", "2026-02-30"),
+            ("entered", "20261109"),
+            ("entered", "2026-1-09"),
+            ("expires", "2026-02-30"),
+            ("expires", "20261119"),
+            ("expires", "2026-11-19T00:00:00"),
+        )
+        for index in range(len(cases)):
+            field, value = cases[index]
+            self.assert_usage([{**self.entry, field: value}], field)
+
+    def test_usage_future_entered(self) -> None:
+        """An exception cannot be recorded after the run's injected day."""
+        self.assert_usage([{**self.entry, "entered": "2026-11-19"}], "entered")
+
+    def test_usage_category_intervals(self) -> None:
+        """Fixed interval mismatches and A's missing or out-of-range expiry fail."""
+        cases = (
+            ("B", "2026-11-13"),
+            ("C", "2026-11-18"),
+            ("D", "2027-03-08"),
+            ("A", None),
+            ("A", "2026-11-09"),
+            ("A", "2027-02-08"),
+            ("A", "2026-11-08"),
+        )
+        for index in range(len(cases)):
+            category, expires = cases[index]
+            entry = {**self.entry, "category": category}
+            if expires:
+                entry["expires"] = expires
+            self.assert_usage([entry], "expires")
+
+    def test_usage_duplicate_file(self) -> None:
+        """Repeated paths are usage errors even when the supplied reasons differ."""
+        self.assert_usage([self.entry, {**self.entry, "reason": "second review"}], "path")
+
+    def test_usage_json_and_duplicate_fields(self) -> None:
+        """Malformed JSON, non-objects and repeated fields are explicit usage errors."""
+        values = ("{", "[]", "null", '{"path":"one","path":"two"}')
+        for index in range(len(values)):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output), self.assertRaises(SystemExit) as caught:
+                upstream_lint.main(
+                    ["--tree", ".", "--base", "base", "--c-rule-unread-waiver", values[index]]
+                )
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("JSON" if index < 3 else "path", output.getvalue())
+            self.assertNotIn("unrecognized arguments", output.getvalue())
+
+    def test_unread_waiver_cannot_waive_tool_errors(self) -> None:
+        """Valid dated waivers leave tool, warning and JSON failures at rc two."""
+        cases = (
+            (127, "", self.fixture.syntax_error_payload()),
+            (0, "semgrep_scan: warning", self.fixture.syntax_error_payload()),
+            (0, "", {"paths": {"scanned": []}, "results": [], "errors": []}),
+            (0, "", {**self.fixture.syntax_error_payload(), "errors": [{"type": "Other"}]}),
+        )
+        for index in range(len(cases)):
+            self.fixture.stub_rc, self.fixture.stub_stdout, payload = cases[index]
+            self.fixture.stub_json = json.dumps(payload)
+            step = self.run_case(reason="manual review", unread=False)
+            self.assertEqual(step.rc, 2, step.output)
+            self.assertNotIn("waived:", step.output)
 
 
 if __name__ == "__main__":
